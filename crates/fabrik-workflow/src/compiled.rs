@@ -71,21 +71,6 @@ pub enum CompiledStateNode {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         on_error: Option<ErrorTransition>,
     },
-    Effect {
-        connector: String,
-        input: Expression,
-        next: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        timeout: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        retry: Option<RetryPolicy>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        config: Option<StepConfig>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        output_var: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        on_error: Option<ErrorTransition>,
-    },
     WaitForEvent {
         event_type: String,
         next: String,
@@ -563,36 +548,6 @@ impl CompiledWorkflowArtifact {
         }
     }
 
-    pub fn effect_retry(
-        &self,
-        effect_state: &str,
-    ) -> Result<Option<&RetryPolicy>, CompiledWorkflowError> {
-        let state = self
-            .workflow
-            .states
-            .get(effect_state)
-            .ok_or_else(|| CompiledWorkflowError::UnknownState(effect_state.to_owned()))?;
-        match state {
-            CompiledStateNode::Effect { retry, .. } => Ok(retry.as_ref()),
-            _ => Err(CompiledWorkflowError::NotWaitingOnEffect(effect_state.to_owned())),
-        }
-    }
-
-    pub fn effect_timeout(
-        &self,
-        effect_state: &str,
-    ) -> Result<Option<&str>, CompiledWorkflowError> {
-        let state = self
-            .workflow
-            .states
-            .get(effect_state)
-            .ok_or_else(|| CompiledWorkflowError::UnknownState(effect_state.to_owned()))?;
-        match state {
-            CompiledStateNode::Effect { timeout, .. } => Ok(timeout.as_deref()),
-            _ => Err(CompiledWorkflowError::NotWaitingOnEffect(effect_state.to_owned())),
-        }
-    }
-
     pub fn step_details(
         &self,
         step_state: &str,
@@ -627,150 +582,6 @@ impl CompiledWorkflowArtifact {
                 Ok((handler.clone(), config.clone()))
             }
             _ => Err(CompiledWorkflowError::NotWaitingOnStep(step_state.to_owned())),
-        }
-    }
-
-    pub fn effect_descriptor(
-        &self,
-        effect_state: &str,
-    ) -> Result<(String, Option<StepConfig>), CompiledWorkflowError> {
-        let state = self
-            .workflow
-            .states
-            .get(effect_state)
-            .ok_or_else(|| CompiledWorkflowError::UnknownState(effect_state.to_owned()))?;
-        match state {
-            CompiledStateNode::Effect { connector, config, .. } => {
-                Ok((connector.clone(), config.clone()))
-            }
-            _ => Err(CompiledWorkflowError::NotWaitingOnEffect(effect_state.to_owned())),
-        }
-    }
-
-    pub fn effect_details(
-        &self,
-        effect_state: &str,
-        execution_state: &ArtifactExecutionState,
-    ) -> Result<(String, Option<StepConfig>, Value), CompiledWorkflowError> {
-        let state = self
-            .workflow
-            .states
-            .get(effect_state)
-            .ok_or_else(|| CompiledWorkflowError::UnknownState(effect_state.to_owned()))?;
-        match state {
-            CompiledStateNode::Effect { connector, input, config, .. } => {
-                let mut execution_state = execution_state.clone();
-                let input = evaluate_expression(input, &mut execution_state, &self.helpers)?;
-                Ok((connector.clone(), config.clone(), input))
-            }
-            _ => Err(CompiledWorkflowError::NotWaitingOnEffect(effect_state.to_owned())),
-        }
-    }
-
-    pub fn execute_after_effect_completion(
-        &self,
-        effect_state: &str,
-        effect_id: &str,
-        output: &Value,
-        execution_state: ArtifactExecutionState,
-    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
-        self.execute_after_effect_completion_with_turn(
-            effect_state,
-            effect_id,
-            output,
-            execution_state,
-            Self::synthetic_turn_context("effect_completion"),
-        )
-    }
-
-    pub fn execute_after_effect_completion_with_turn(
-        &self,
-        effect_state: &str,
-        effect_id: &str,
-        output: &Value,
-        mut execution_state: ArtifactExecutionState,
-        turn_context: ExecutionTurnContext,
-    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
-        execution_state.turn_context = Some(turn_context);
-        let state = self
-            .workflow
-            .states
-            .get(effect_state)
-            .ok_or_else(|| CompiledWorkflowError::UnknownState(effect_state.to_owned()))?;
-        match state {
-            CompiledStateNode::Effect { next, output_var, .. } if effect_state == effect_id => {
-                if let Some(output_var) = output_var {
-                    execution_state.bindings.insert(output_var.clone(), output.clone());
-                }
-                self.execute_from_state(next, execution_state, false)
-            }
-            CompiledStateNode::Effect { .. } => Err(CompiledWorkflowError::UnexpectedEffect {
-                expected: effect_state.to_owned(),
-                received: effect_id.to_owned(),
-            }),
-            _ => Err(CompiledWorkflowError::NotWaitingOnEffect(effect_state.to_owned())),
-        }
-    }
-
-    pub fn execute_after_effect_failure(
-        &self,
-        effect_state: &str,
-        effect_id: &str,
-        error: &str,
-        execution_state: ArtifactExecutionState,
-    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
-        self.execute_after_effect_failure_with_turn(
-            effect_state,
-            effect_id,
-            error,
-            execution_state,
-            Self::synthetic_turn_context("effect_failure"),
-        )
-    }
-
-    pub fn execute_after_effect_failure_with_turn(
-        &self,
-        effect_state: &str,
-        effect_id: &str,
-        error: &str,
-        mut execution_state: ArtifactExecutionState,
-        turn_context: ExecutionTurnContext,
-    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
-        execution_state.turn_context = Some(turn_context);
-        let state = self
-            .workflow
-            .states
-            .get(effect_state)
-            .ok_or_else(|| CompiledWorkflowError::UnknownState(effect_state.to_owned()))?;
-        match state {
-            CompiledStateNode::Effect { on_error: Some(on_error), .. }
-                if effect_state == effect_id =>
-            {
-                if let Some(error_var) = &on_error.error_var {
-                    execution_state
-                        .bindings
-                        .insert(error_var.clone(), Value::String(error.to_owned()));
-                }
-                self.execute_from_state(&on_error.next, execution_state, false)
-            }
-            CompiledStateNode::Effect { on_error: None, .. } if effect_state == effect_id => {
-                Ok(CompiledExecutionPlan {
-                    workflow_version: self.definition_version,
-                    final_state: effect_state.to_owned(),
-                    emissions: vec![ExecutionEmission {
-                        event: WorkflowEvent::WorkflowFailed { reason: error.to_owned() },
-                        state: Some(effect_state.to_owned()),
-                    }],
-                    execution_state,
-                    context: Some(Value::String(error.to_owned())),
-                    output: Some(Value::String(error.to_owned())),
-                })
-            }
-            CompiledStateNode::Effect { .. } => Err(CompiledWorkflowError::UnexpectedEffect {
-                expected: effect_state.to_owned(),
-                received: effect_id.to_owned(),
-            }),
-            _ => Err(CompiledWorkflowError::NotWaitingOnEffect(effect_state.to_owned())),
         }
     }
 
@@ -827,34 +638,21 @@ impl CompiledWorkflowArtifact {
                         evaluate_expression(step_input, &mut execution_state, &self.helpers)?;
                     context = Some(input.clone());
                     emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+                    let (activity_type, config) = self.step_descriptor(&current_state)?;
                     emissions.push(ExecutionEmission {
-                        event: WorkflowEvent::StepScheduled {
-                            step_id: current_state.clone(),
+                        event: WorkflowEvent::ActivityTaskScheduled {
+                            activity_id: current_state.clone(),
+                            activity_type,
+                            task_queue: "default".to_owned(),
                             attempt: 1,
                             input,
-                        },
-                        state: Some(current_state.clone()),
-                    });
-                    return Ok(CompiledExecutionPlan {
-                        workflow_version: self.definition_version,
-                        final_state: current_state,
-                        emissions,
-                        execution_state,
-                        context,
-                        output,
-                    });
-                }
-                CompiledStateNode::Effect { connector, input: effect_input, .. } => {
-                    let input =
-                        evaluate_expression(effect_input, &mut execution_state, &self.helpers)?;
-                    context = Some(input.clone());
-                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
-                    emissions.push(ExecutionEmission {
-                        event: WorkflowEvent::EffectRequested {
-                            effect_id: current_state.clone(),
-                            connector: connector.clone(),
-                            attempt: 1,
-                            input,
+                            config: config.map(|config| {
+                                serde_json::to_value(config).expect("step config serializes")
+                            }),
+                            state: Some(current_state.clone()),
+                            schedule_to_start_timeout_ms: None,
+                            start_to_close_timeout_ms: None,
+                            heartbeat_timeout_ms: None,
                         },
                         state: Some(current_state.clone()),
                     });
@@ -995,9 +793,6 @@ impl CompiledStateNode {
             Self::Step { next, on_error, .. } => next
                 .iter()
                 .map(String::as_str)
-                .chain(on_error.iter().map(|transition| transition.next.as_str()))
-                .collect(),
-            Self::Effect { next, on_error, .. } => std::iter::once(next.as_str())
                 .chain(on_error.iter().map(|transition| transition.next.as_str()))
                 .collect(),
             Self::WaitForEvent { next, .. } | Self::WaitForTimer { next, .. } => {
@@ -1273,10 +1068,6 @@ pub enum CompiledWorkflowError {
     NotWaitingOnStep(String),
     #[error("unexpected step completion, expected {expected}, received {received}")]
     UnexpectedStep { expected: String, received: String },
-    #[error("compiled workflow state {0} is not waiting on an effect")]
-    NotWaitingOnEffect(String),
-    #[error("unexpected effect completion, expected {expected}, received {received}")]
-    UnexpectedEffect { expected: String, received: String },
     #[error("compiled workflow step {0} is missing a continuation")]
     MissingContinuation(String),
     #[error("unknown helper function {0}")]
@@ -1373,8 +1164,8 @@ mod tests {
         let plan = artifact.execute_from_state("branch", plan.execution_state, false).unwrap();
         assert!(matches!(
             plan.emissions.last(),
-            Some(ExecutionEmission { event: WorkflowEvent::StepScheduled { step_id, .. }, .. })
-            if step_id == "step"
+            Some(ExecutionEmission { event: WorkflowEvent::ActivityTaskScheduled { activity_id, .. }, .. })
+            if activity_id == "step"
         ));
     }
 
@@ -1477,96 +1268,5 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(state.markers.len(), 1);
         assert_eq!(state.pending_markers.len(), 1);
-    }
-
-    fn effect_artifact() -> CompiledWorkflowArtifact {
-        let workflow = CompiledWorkflow {
-            initial_state: "effect".to_owned(),
-            states: BTreeMap::from([
-                (
-                    "effect".to_owned(),
-                    CompiledStateNode::Effect {
-                        connector: "core.echo".to_owned(),
-                        input: Expression::Identifier { name: "input".to_owned() },
-                        next: "done".to_owned(),
-                        timeout: Some("30s".to_owned()),
-                        retry: None,
-                        config: None,
-                        output_var: Some("result".to_owned()),
-                        on_error: Some(ErrorTransition {
-                            next: "fail".to_owned(),
-                            error_var: Some("err".to_owned()),
-                        }),
-                    },
-                ),
-                (
-                    "done".to_owned(),
-                    CompiledStateNode::Succeed {
-                        output: Some(Expression::Identifier { name: "result".to_owned() }),
-                    },
-                ),
-                (
-                    "fail".to_owned(),
-                    CompiledStateNode::Fail {
-                        reason: Some(Expression::Identifier { name: "err".to_owned() }),
-                    },
-                ),
-            ]),
-        };
-        CompiledWorkflowArtifact::new(
-            "effect-demo",
-            1,
-            "test",
-            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
-            workflow,
-        )
-    }
-
-    #[test]
-    fn executes_effect_path() {
-        let artifact = effect_artifact();
-        let plan = artifact.execute_trigger(&json!({"message": "hello"})).unwrap();
-        assert!(matches!(
-            plan.emissions.last(),
-            Some(ExecutionEmission {
-                event: WorkflowEvent::EffectRequested { effect_id, connector, .. },
-                ..
-            }) if effect_id == "effect" && connector == "core.echo"
-        ));
-    }
-
-    #[test]
-    fn resumes_after_effect_completion() {
-        let artifact = effect_artifact();
-        let plan = artifact
-            .execute_after_effect_completion(
-                "effect",
-                "effect",
-                &json!({"done": true}),
-                ArtifactExecutionState::default(),
-            )
-            .unwrap();
-        assert!(matches!(
-            plan.emissions.last(),
-            Some(ExecutionEmission { event: WorkflowEvent::WorkflowCompleted { .. }, .. })
-        ));
-    }
-
-    #[test]
-    fn resumes_after_effect_failure() {
-        let artifact = effect_artifact();
-        let plan = artifact
-            .execute_after_effect_failure(
-                "effect",
-                "effect",
-                "boom",
-                ArtifactExecutionState::default(),
-            )
-            .unwrap();
-        assert!(matches!(
-            plan.emissions.last(),
-            Some(ExecutionEmission { event: WorkflowEvent::WorkflowFailed { reason }, .. })
-                if reason == "boom"
-        ));
     }
 }

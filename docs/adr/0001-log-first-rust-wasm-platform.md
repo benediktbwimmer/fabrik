@@ -36,7 +36,7 @@ We will build `fabrik` as a log-first workflow engine with:
 - arbitrary user activity workers outside the workflow executor hot path
 - PostgreSQL as the initial control, visibility, and snapshot metadata store
 
-Optional sandboxed runtimes such as Wasm may still be useful for managed extensions, but they are not the primary activity model of the product.
+Sandboxed runtimes such as Wasm remain a potential future extension for managed multi-tenant activity sandboxing, but they are not the primary activity model. See ADR 0004 for the rationale behind this scope change.
 
 ## Rationale
 

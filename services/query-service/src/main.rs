@@ -14,7 +14,7 @@ use fabrik_config::{HttpServiceConfig, PostgresConfig, QueryRuntimeConfig, Redpa
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
-    QueryRetentionCutoffs, QueryRetentionPruneResult, WorkflowEffectRecord, WorkflowRunRecord,
+    QueryRetentionCutoffs, QueryRetentionPruneResult, WorkflowActivityRecord, WorkflowRunRecord,
     WorkflowSignalRecord, WorkflowStateSnapshot, WorkflowStore,
 };
 use fabrik_workflow::{
@@ -62,8 +62,8 @@ struct WorkflowHistoryResponse {
     continue_reason: Option<String>,
     event_count: usize,
     page: PageInfo,
-    effect_attempt_count: usize,
-    effect_attempts: Vec<WorkflowEffectRecord>,
+    activity_attempt_count: usize,
+    activity_attempts: Vec<WorkflowActivityRecord>,
     events: Vec<EventEnvelope<WorkflowEvent>>,
 }
 
@@ -80,8 +80,8 @@ struct WorkflowReplayResponse {
     continue_reason: Option<String>,
     event_count: usize,
     last_event_type: String,
-    effect_attempt_count: usize,
-    effect_attempts: Vec<WorkflowEffectRecord>,
+    activity_attempt_count: usize,
+    activity_attempts: Vec<WorkflowActivityRecord>,
     projection_matches_store: Option<bool>,
     replay_source: ReplaySource,
     snapshot: Option<ReplaySnapshotSummary>,
@@ -103,13 +103,13 @@ struct ReplaySnapshotSummary {
 }
 
 #[derive(Debug, Serialize)]
-struct WorkflowEffectsResponse {
+struct WorkflowActivitiesResponse {
     tenant_id: String,
     instance_id: String,
     run_id: String,
     page: PageInfo,
-    effect_count: usize,
-    effects: Vec<WorkflowEffectRecord>,
+    activity_count: usize,
+    activities: Vec<WorkflowActivityRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,7 +158,7 @@ struct PageInfo {
 struct RetentionPolicyResponse {
     history_retention_days: Option<u64>,
     run_retention_days: Option<u64>,
-    effect_retention_days: Option<u64>,
+    activity_retention_days: Option<u64>,
     signal_retention_days: Option<u64>,
     snapshot_retention_days: Option<u64>,
     retention_sweep_interval_seconds: u64,
@@ -190,7 +190,7 @@ async fn main() -> Result<()> {
         max_page_size = query.max_page_size,
         history_retention_days = ?query.history_retention_days,
         run_retention_days = ?query.run_retention_days,
-        effect_retention_days = ?query.effect_retention_days,
+        activity_retention_days = ?query.activity_retention_days,
         signal_retention_days = ?query.signal_retention_days,
         snapshot_retention_days = ?query.snapshot_retention_days,
         retention_sweep_interval_seconds = query.retention_sweep_interval_seconds,
@@ -237,16 +237,16 @@ async fn main() -> Result<()> {
         get(get_latest_workflow_snapshot),
     )
     .route(
-        "/tenants/{tenant_id}/workflows/{instance_id}/effects",
-        get(get_current_workflow_effects),
+        "/tenants/{tenant_id}/workflows/{instance_id}/activities",
+        get(get_current_workflow_activities),
     )
     .route(
         "/tenants/{tenant_id}/workflows/{instance_id}/signals",
         get(get_current_workflow_signals),
     )
     .route(
-        "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/effects",
-        get(get_workflow_effects_for_run),
+        "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/activities",
+        get(get_workflow_activities_for_run),
     )
     .route(
         "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/signals",
@@ -386,11 +386,11 @@ async fn get_latest_workflow_snapshot(
     }
 }
 
-async fn get_current_workflow_effects(
+async fn get_current_workflow_activities(
     Path((tenant_id, instance_id)): Path<(String, String)>,
     Query(pagination): Query<PaginationQuery>,
     State(state): State<AppState>,
-) -> Result<Json<WorkflowEffectsResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<WorkflowActivitiesResponse>, (StatusCode, Json<ErrorResponse>)> {
     let instance = state
         .store
         .get_instance(&tenant_id, &instance_id)
@@ -407,7 +407,7 @@ async fn get_current_workflow_effects(
             )
         })?;
     let response =
-        load_workflow_effects(&state, &tenant_id, &instance_id, &instance.run_id, pagination)
+        load_workflow_activities(&state, &tenant_id, &instance_id, &instance.run_id, pagination)
             .await
             .map_err(internal_error)?;
     Ok(Json(response))
@@ -440,12 +440,12 @@ async fn get_current_workflow_signals(
     Ok(Json(response))
 }
 
-async fn get_workflow_effects_for_run(
+async fn get_workflow_activities_for_run(
     Path((tenant_id, instance_id, run_id)): Path<(String, String, String)>,
     Query(pagination): Query<PaginationQuery>,
     State(state): State<AppState>,
-) -> Result<Json<WorkflowEffectsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let response = load_workflow_effects(&state, &tenant_id, &instance_id, &run_id, pagination)
+) -> Result<Json<WorkflowActivitiesResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let response = load_workflow_activities(&state, &tenant_id, &instance_id, &run_id, pagination)
         .await
         .map_err(internal_error)?;
     Ok(Json(response))
@@ -538,7 +538,7 @@ fn retention_policy_response(config: &QueryRuntimeConfig) -> RetentionPolicyResp
     RetentionPolicyResponse {
         history_retention_days: config.history_retention_days,
         run_retention_days: config.run_retention_days,
-        effect_retention_days: config.effect_retention_days,
+        activity_retention_days: config.activity_retention_days,
         signal_retention_days: config.signal_retention_days,
         snapshot_retention_days: config.snapshot_retention_days,
         retention_sweep_interval_seconds: config.retention_sweep_interval_seconds,
@@ -569,9 +569,9 @@ async fn load_workflow_history(
     let page = resolve_page(&state.query, &pagination);
     let total = history.len();
     let events = history.iter().skip(page.offset).take(page.limit).cloned().collect::<Vec<_>>();
-    let effect_attempts = state
+    let activity_attempts = state
         .store
-        .list_effects_for_run_page(
+        .list_activities_for_run_page(
             tenant_id,
             instance_id,
             run_id,
@@ -593,42 +593,42 @@ async fn load_workflow_history(
         continue_reason: run.and_then(|run| run.continue_reason),
         event_count: total,
         page: build_page_info(&page, total, events.len()),
-        effect_attempt_count: state
+        activity_attempt_count: state
             .store
-            .count_effect_attempts_for_run(tenant_id, instance_id, run_id)
+            .count_activities_for_run(tenant_id, instance_id, run_id)
             .await? as usize,
-        effect_attempts,
+        activity_attempts,
         events,
     })
 }
 
-async fn load_workflow_effects(
+async fn load_workflow_activities(
     state: &AppState,
     tenant_id: &str,
     instance_id: &str,
     run_id: &str,
     pagination: PaginationQuery,
-) -> Result<WorkflowEffectsResponse> {
+) -> Result<WorkflowActivitiesResponse> {
     let page = resolve_page(&state.query, &pagination);
     let total =
-        state.store.count_effect_attempts_for_run(tenant_id, instance_id, run_id).await? as usize;
-    let effects = state
+        state.store.count_activities_for_run(tenant_id, instance_id, run_id).await? as usize;
+    let activities = state
         .store
-        .list_effects_for_run_page(
+        .list_activities_for_run_page(
             tenant_id,
             instance_id,
             run_id,
-            i64::try_from(page.limit).context("effects page limit exceeds i64")?,
-            i64::try_from(page.offset).context("effects page offset exceeds i64")?,
+            i64::try_from(page.limit).context("activities page limit exceeds i64")?,
+            i64::try_from(page.offset).context("activities page offset exceeds i64")?,
         )
         .await?;
-    Ok(WorkflowEffectsResponse {
+    Ok(WorkflowActivitiesResponse {
         tenant_id: tenant_id.to_owned(),
         instance_id: instance_id.to_owned(),
         run_id: run_id.to_owned(),
-        page: build_page_info(&page, total, effects.len()),
-        effect_count: total,
-        effects,
+        page: build_page_info(&page, total, activities.len()),
+        activity_count: total,
+        activities,
     })
 }
 
@@ -824,9 +824,9 @@ async fn replay_workflow_run(
         .last()
         .map(|event| event.event_type.clone())
         .ok_or_else(|| anyhow::anyhow!("workflow history unexpectedly empty after replay"))?;
-    let effect_attempts = state
+    let activity_attempts = state
         .store
-        .list_effects_for_run(&current_instance.tenant_id, &current_instance.instance_id, run_id)
+        .list_activities_for_run(&current_instance.tenant_id, &current_instance.instance_id, run_id)
         .await?;
     let mut projection_matches_store = (current_instance.run_id == active_trace.final_state.run_id)
         .then(|| same_projection(current_instance, &active_trace.final_state));
@@ -856,8 +856,8 @@ async fn replay_workflow_run(
         continue_reason: run.and_then(|run| run.continue_reason),
         event_count: history.len(),
         last_event_type,
-        effect_attempt_count: effect_attempts.len(),
-        effect_attempts,
+        activity_attempt_count: activity_attempts.len(),
+        activity_attempts,
         projection_matches_store,
         replay_source: active_trace.source.clone(),
         snapshot: snapshot_summary,
@@ -908,8 +908,8 @@ async fn run_retention_sweeper(
                 .run_retention_days
                 .and_then(|days| chrono::Duration::try_days(days as i64))
                 .map(|duration| now - duration),
-            effect_run_closed_before: config
-                .effect_retention_days
+            activity_run_closed_before: config
+                .activity_retention_days
                 .and_then(|days| chrono::Duration::try_days(days as i64))
                 .map(|duration| now - duration),
             signal_run_closed_before: config

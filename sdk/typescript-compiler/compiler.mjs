@@ -893,24 +893,10 @@ class WorkflowLowerer {
       }, awaitExpression);
     }
     if (method === "sideEffect") {
-      if (call.arguments.length < 1 || call.arguments.length > 3) {
-        throw compilerError(
-          `await ctx.sideEffect() requires a connector name, optional input, and optional options`,
-          call,
-        );
-      }
-      const options = call.arguments[2] ? compileEffectOptions(call.arguments[2]) : {};
-      return this.addState("effect", {
-        type: "effect",
-        connector: literalString(call.arguments[0], "ctx.sideEffect connector"),
-        input: call.arguments[1]
-          ? compileExpression(call.arguments[1])
-          : { kind: "literal", value: null },
-        timeout: options.timeout,
-        next: nextState,
-        output_var: targetVar ?? undefined,
-        on_error: errorTarget ?? undefined,
-      }, awaitExpression);
+      throw compilerError(
+        `await ctx.sideEffect() is no longer supported for host-backed work; use ctx.activity() instead`,
+        call,
+      );
     }
     if (method === "httpRequest") {
       const requestArg = call.arguments[0];

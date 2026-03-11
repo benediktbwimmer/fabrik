@@ -57,7 +57,7 @@ struct ContinueAsNewRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct CancelEffectRequest {
+struct CancelActivityRequest {
     #[serde(default = "default_cancel_reason")]
     reason: String,
     #[serde(default)]
@@ -88,10 +88,10 @@ struct ContinueAsNewResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct CancelEffectResponse {
+struct CancelActivityResponse {
     instance_id: String,
     run_id: String,
-    effect_id: String,
+    activity_id: String,
     attempt: u32,
     event_id: Uuid,
     status: &'static str,
@@ -147,8 +147,8 @@ async fn main() -> Result<()> {
         post(continue_as_new),
     )
     .route(
-        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/effects/{effect_id}/cancel",
-        post(cancel_effect),
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/activities/{activity_id}/cancel",
+        post(cancel_activity),
     )
     .with_state(AppState {
         publisher: WorkflowPublisher::new(&broker, "ingest-service").await?,
@@ -535,11 +535,11 @@ async fn continue_as_new(
     ))
 }
 
-async fn cancel_effect(
-    Path((tenant_id, instance_id, effect_id)): Path<(String, String, String)>,
+async fn cancel_activity(
+    Path((tenant_id, instance_id, activity_id)): Path<(String, String, String)>,
     State(state): State<AppState>,
-    Json(request): Json<CancelEffectRequest>,
-) -> Result<(StatusCode, Json<CancelEffectResponse>), (StatusCode, String)> {
+    Json(request): Json<CancelActivityRequest>,
+) -> Result<(StatusCode, Json<CancelActivityResponse>), (StatusCode, String)> {
     let instance = state
         .store
         .get_instance(&tenant_id, &instance_id)
@@ -571,21 +571,21 @@ async fn cancel_effect(
             format!("workflow instance {instance_id} has no pinned artifact hash"),
         )
     })?;
-    let active_effect = state
+    let active_activity = state
         .store
-        .get_latest_active_effect(&tenant_id, &instance_id, &instance.run_id, &effect_id)
+        .get_latest_active_activity(&tenant_id, &instance_id, &instance.run_id, &activity_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| {
             (
                 StatusCode::CONFLICT,
-                format!("effect {effect_id} is not currently active on workflow {instance_id}"),
+                format!("activity {activity_id} is not currently active on workflow {instance_id}"),
             )
         })?;
 
-    let payload = WorkflowEvent::EffectCancelled {
-        effect_id: effect_id.clone(),
-        attempt: active_effect.attempt,
+    let payload = WorkflowEvent::ActivityTaskCancellationRequested {
+        activity_id: activity_id.clone(),
+        attempt: active_activity.attempt,
         reason: request.reason,
         metadata: request.metadata,
     };
@@ -606,11 +606,11 @@ async fn cancel_effect(
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(CancelEffectResponse {
+        Json(CancelActivityResponse {
             instance_id,
             run_id: instance.run_id,
-            effect_id,
-            attempt: active_effect.attempt,
+            activity_id,
+            attempt: active_activity.attempt,
             event_id: envelope.event_id,
             status: "accepted",
         }),

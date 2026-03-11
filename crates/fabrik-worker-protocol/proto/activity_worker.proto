@@ -1,0 +1,96 @@
+syntax = "proto3";
+
+package fabrik.worker.v1;
+
+message PollActivityTaskRequest {
+  string tenant_id = 1;
+  string task_queue = 2;
+  string worker_id = 3;
+  string worker_build_id = 4;
+  uint64 poll_timeout_ms = 5;
+}
+
+message ActivityTask {
+  string tenant_id = 1;
+  string definition_id = 2;
+  uint32 definition_version = 3;
+  string artifact_hash = 4;
+  string instance_id = 5;
+  string run_id = 6;
+  string activity_id = 7;
+  string activity_type = 8;
+  string task_queue = 9;
+  uint32 attempt = 10;
+  string input_json = 11;
+  string config_json = 12;
+  string state = 13;
+  int64 scheduled_at_unix_ms = 14;
+  int64 lease_expires_at_unix_ms = 15;
+  uint64 start_to_close_timeout_ms = 16;
+  uint64 heartbeat_timeout_ms = 17;
+  bool cancellation_requested = 18;
+  uint64 schedule_to_start_timeout_ms = 19;
+}
+
+message PollActivityTaskResponse {
+  ActivityTask task = 1;
+}
+
+message CompleteActivityTaskRequest {
+  string tenant_id = 1;
+  string instance_id = 2;
+  string run_id = 3;
+  string activity_id = 4;
+  uint32 attempt = 5;
+  string worker_id = 6;
+  string worker_build_id = 7;
+  string output_json = 8;
+}
+
+message FailActivityTaskRequest {
+  string tenant_id = 1;
+  string instance_id = 2;
+  string run_id = 3;
+  string activity_id = 4;
+  uint32 attempt = 5;
+  string worker_id = 6;
+  string worker_build_id = 7;
+  string error = 8;
+}
+
+message RecordActivityHeartbeatRequest {
+  string tenant_id = 1;
+  string instance_id = 2;
+  string run_id = 3;
+  string activity_id = 4;
+  uint32 attempt = 5;
+  string worker_id = 6;
+  string worker_build_id = 7;
+  string details_json = 8;
+}
+
+message RecordActivityHeartbeatResponse {
+  bool cancellation_requested = 1;
+}
+
+message ReportActivityTaskCancelledRequest {
+  string tenant_id = 1;
+  string instance_id = 2;
+  string run_id = 3;
+  string activity_id = 4;
+  uint32 attempt = 5;
+  string worker_id = 6;
+  string worker_build_id = 7;
+  string reason = 8;
+  string metadata_json = 9;
+}
+
+message Ack {}
+
+service ActivityWorkerApi {
+  rpc PollActivityTask(PollActivityTaskRequest) returns (PollActivityTaskResponse);
+  rpc CompleteActivityTask(CompleteActivityTaskRequest) returns (Ack);
+  rpc FailActivityTask(FailActivityTaskRequest) returns (Ack);
+  rpc RecordActivityHeartbeat(RecordActivityHeartbeatRequest) returns (RecordActivityHeartbeatResponse);
+  rpc ReportActivityTaskCancelled(ReportActivityTaskCancelledRequest) returns (Ack);
+}

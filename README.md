@@ -77,7 +77,7 @@ The target platform must support:
 
 ## Repository Status
 
-This repository is still in an early implementation phase. Parts of the current codebase reflect an older, more constrained model centered around steps, effects, and connector workers. Those constraints are no longer the product direction.
+This repository is still in an early implementation phase. The runtime is centered on compiled workflow execution, durable activity-task history, and external activity workers polled through `matching-service`.
 
 The documentation under `docs/` now reflects the new target architecture:
 
@@ -146,5 +146,6 @@ node sdk/typescript-compiler/compiler.mjs \
 - [Architecture Decision Record 0001](/Users/bene/code/fabrik/docs/adr/0001-log-first-rust-wasm-platform.md)
 - [Architecture Decision Record 0002](/Users/bene/code/fabrik/docs/adr/0002-code-authored-compiled-workflows.md)
 - [Architecture Decision Record 0003](/Users/bene/code/fabrik/docs/adr/0003-execution-invariants.md)
+- [Architecture Decision Record 0004](/Users/bene/code/fabrik/docs/adr/0004-temporal-parity-pivot.md)
 - [SDK + Compiler Direction](/Users/bene/code/fabrik/docs/sdk-compiler.md)
 - [Semantic Specs Index](/Users/bene/code/fabrik/docs/spec/README.md)

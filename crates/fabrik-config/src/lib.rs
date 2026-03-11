@@ -9,6 +9,36 @@ pub struct HttpServiceConfig {
     pub log_filter: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrpcServiceConfig {
+    pub name: String,
+    pub port: u16,
+    pub log_filter: String,
+}
+
+impl GrpcServiceConfig {
+    pub fn from_env(
+        env_prefix: &str,
+        default_name: &str,
+        default_port: u16,
+    ) -> Result<Self, ConfigError> {
+        let port_key = format!("{env_prefix}_PORT");
+        let port = match env::var(&port_key) {
+            Ok(raw) => raw
+                .parse::<u16>()
+                .map_err(|_| ConfigError::InvalidPort { key: port_key.clone(), value: raw })?,
+            Err(env::VarError::NotPresent) => default_port,
+            Err(err) => {
+                return Err(ConfigError::UnreadableEnv { key: port_key, source: err });
+            }
+        };
+
+        let log_filter = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned());
+
+        Ok(Self { name: default_name.to_owned(), port, log_filter })
+    }
+}
+
 impl HttpServiceConfig {
     pub fn from_env(
         env_prefix: &str,
@@ -74,10 +104,32 @@ pub struct QueryRuntimeConfig {
     pub max_page_size: usize,
     pub history_retention_days: Option<u64>,
     pub run_retention_days: Option<u64>,
-    pub effect_retention_days: Option<u64>,
+    pub activity_retention_days: Option<u64>,
     pub signal_retention_days: Option<u64>,
     pub snapshot_retention_days: Option<u64>,
     pub retention_sweep_interval_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchingRuntimeConfig {
+    pub lease_ttl_seconds: u64,
+    pub heartbeat_publish_interval_ms: u64,
+    pub sweep_interval_ms: u64,
+    pub max_rebuild_tasks: i64,
+}
+
+impl MatchingRuntimeConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Ok(Self {
+            lease_ttl_seconds: read_u64_with_default("MATCHING_LEASE_TTL_SECONDS", 30)?,
+            heartbeat_publish_interval_ms: read_u64_with_default(
+                "MATCHING_HEARTBEAT_PUBLISH_INTERVAL_MS",
+                30_000,
+            )?,
+            sweep_interval_ms: read_u64_with_default("MATCHING_SWEEP_INTERVAL_MS", 500)?,
+            max_rebuild_tasks: read_i64_with_default("MATCHING_MAX_REBUILD_TASKS", 10_000)?,
+        })
+    }
 }
 
 impl QueryRuntimeConfig {
@@ -87,7 +139,7 @@ impl QueryRuntimeConfig {
             max_page_size: read_usize_with_default("QUERY_MAX_PAGE_SIZE", 500)?,
             history_retention_days: read_optional_u64("QUERY_HISTORY_RETENTION_DAYS")?,
             run_retention_days: read_optional_u64("QUERY_RUN_RETENTION_DAYS")?,
-            effect_retention_days: read_optional_u64("QUERY_EFFECT_RETENTION_DAYS")?,
+            activity_retention_days: read_optional_u64("QUERY_ACTIVITY_RETENTION_DAYS")?,
             signal_retention_days: read_optional_u64("QUERY_SIGNAL_RETENTION_DAYS")?,
             snapshot_retention_days: read_optional_u64("QUERY_SNAPSHOT_RETENTION_DAYS")?,
             retention_sweep_interval_seconds: read_u64_with_default(
@@ -103,7 +155,7 @@ pub struct ExecutorRuntimeConfig {
     pub cache_capacity: usize,
     pub snapshot_interval_events: u64,
     pub continue_as_new_event_threshold: Option<u64>,
-    pub continue_as_new_effect_attempt_threshold: Option<u64>,
+    pub continue_as_new_activity_attempt_threshold: Option<u64>,
     pub continue_as_new_run_age_seconds: Option<u64>,
 }
 
@@ -118,8 +170,8 @@ impl ExecutorRuntimeConfig {
             continue_as_new_event_threshold: read_optional_u64(
                 "EXECUTOR_CONTINUE_AS_NEW_EVENT_THRESHOLD",
             )?,
-            continue_as_new_effect_attempt_threshold: read_optional_u64(
-                "EXECUTOR_CONTINUE_AS_NEW_EFFECT_ATTEMPT_THRESHOLD",
+            continue_as_new_activity_attempt_threshold: read_optional_u64(
+                "EXECUTOR_CONTINUE_AS_NEW_ACTIVITY_ATTEMPT_THRESHOLD",
             )?,
             continue_as_new_run_age_seconds: read_optional_u64(
                 "EXECUTOR_CONTINUE_AS_NEW_RUN_AGE_SECONDS",
@@ -246,6 +298,16 @@ fn read_i32_with_default(key: &str, default: i32) -> Result<i32, ConfigError> {
     }
 }
 
+fn read_i64_with_default(key: &str, default: i64) -> Result<i64, ConfigError> {
+    match env::var(key) {
+        Ok(raw) => raw
+            .parse::<i64>()
+            .map_err(|_| ConfigError::InvalidI64 { key: key.to_owned(), value: raw }),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
+    }
+}
+
 fn read_optional_u64(key: &str) -> Result<Option<u64>, ConfigError> {
     match env::var(key) {
         Ok(raw) if raw.trim().is_empty() => Ok(None),
@@ -270,6 +332,8 @@ pub enum ConfigError {
     InvalidU64 { key: String, value: String },
     #[error("environment variable {key} must be a valid i32, got {value}")]
     InvalidI32 { key: String, value: String },
+    #[error("environment variable {key} must be a valid i64, got {value}")]
+    InvalidI64 { key: String, value: String },
 }
 
 #[cfg(test)]

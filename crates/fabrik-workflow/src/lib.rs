@@ -330,11 +330,22 @@ impl WorkflowDefinition {
 
             match state {
                 StateNode::Step { .. } => {
+                    let handler = self.step_handler(&current_state)?.to_owned();
+                    let config = self.step_config(&current_state)?.cloned().map(|config| {
+                        serde_json::to_value(config).expect("step config serializes")
+                    });
                     emissions.push(ExecutionEmission {
-                        event: WorkflowEvent::StepScheduled {
-                            step_id: current_state.clone(),
+                        event: WorkflowEvent::ActivityTaskScheduled {
+                            activity_id: current_state.clone(),
+                            activity_type: handler,
+                            task_queue: "default".to_owned(),
                             attempt: 1,
                             input: last_output.clone(),
+                            config,
+                            state: Some(current_state.clone()),
+                            schedule_to_start_timeout_ms: None,
+                            start_to_close_timeout_ms: None,
+                            heartbeat_timeout_ms: None,
                         },
                         state: Some(current_state.clone()),
                     });
@@ -647,32 +658,33 @@ impl WorkflowInstanceState {
                 self.status = WorkflowStatus::Running;
                 self.context = Some(payload.clone());
             }
-            WorkflowEvent::StepScheduled { .. }
-            | WorkflowEvent::EffectRequested { .. }
+            WorkflowEvent::ActivityTaskScheduled { .. }
+            | WorkflowEvent::ActivityTaskStarted { .. }
+            | WorkflowEvent::ActivityTaskHeartbeatRecorded { .. }
+            | WorkflowEvent::ActivityTaskCancellationRequested { .. }
             | WorkflowEvent::TimerScheduled { .. }
             | WorkflowEvent::TimerFired { .. } => {
                 self.status = WorkflowStatus::Running;
             }
-            WorkflowEvent::StepCompleted { output, .. } => {
+            WorkflowEvent::ActivityTaskCompleted { output, .. } => {
                 self.status = WorkflowStatus::Running;
                 self.context = Some(output.clone());
             }
-            WorkflowEvent::EffectCompleted { output, .. } => {
-                self.status = WorkflowStatus::Running;
-                self.context = Some(output.clone());
-            }
-            WorkflowEvent::StepFailed { error, .. }
-            | WorkflowEvent::EffectFailed { error, .. }
-            | WorkflowEvent::EffectCancelled { reason: error, .. }
-            | WorkflowEvent::WorkflowFailed { reason: error } => {
+            WorkflowEvent::ActivityTaskFailed { error, .. }
+            | WorkflowEvent::ActivityTaskCancelled { reason: error, .. } => {
                 self.status = WorkflowStatus::Failed;
                 self.output = Some(Value::String(error.clone()));
                 self.context = Some(Value::String(error.clone()));
             }
-            WorkflowEvent::EffectTimedOut { .. } => {
+            WorkflowEvent::ActivityTaskTimedOut { .. } => {
                 self.status = WorkflowStatus::Failed;
-                self.output = Some(Value::String("effect timed out".to_owned()));
-                self.context = Some(Value::String("effect timed out".to_owned()));
+                self.output = Some(Value::String("activity timed out".to_owned()));
+                self.context = Some(Value::String("activity timed out".to_owned()));
+            }
+            WorkflowEvent::WorkflowFailed { reason: error } => {
+                self.status = WorkflowStatus::Failed;
+                self.output = Some(Value::String(error.clone()));
+                self.context = Some(Value::String(error.clone()));
             }
             WorkflowEvent::WorkflowCompleted { output } => {
                 self.status = WorkflowStatus::Completed;
@@ -846,10 +858,10 @@ pub fn replay_compiled_history_trace(
                         advanced = true;
                     }
                 }
-                WorkflowEvent::StepCompleted { step_id, output, .. } => {
+                WorkflowEvent::ActivityTaskCompleted { activity_id, output, .. } => {
                     execution = artifact.execute_after_step_completion_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
-                        step_id,
+                        activity_id,
                         output,
                         replayed.artifact_execution.clone().unwrap_or_default(),
                         ExecutionTurnContext {
@@ -859,23 +871,10 @@ pub fn replay_compiled_history_trace(
                     )?;
                     advanced = true;
                 }
-                WorkflowEvent::EffectCompleted { effect_id, output, .. } => {
-                    execution = artifact.execute_after_effect_completion_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        effect_id,
-                        output,
-                        replayed.artifact_execution.clone().unwrap_or_default(),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    advanced = true;
-                }
-                WorkflowEvent::StepFailed { step_id, error, .. } => {
+                WorkflowEvent::ActivityTaskFailed { activity_id, error, .. } => {
                     execution = artifact.execute_after_step_failure_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
-                        step_id,
+                        activity_id,
                         error,
                         replayed.artifact_execution.clone().unwrap_or_default(),
                         ExecutionTurnContext {
@@ -885,11 +884,11 @@ pub fn replay_compiled_history_trace(
                     )?;
                     advanced = true;
                 }
-                WorkflowEvent::EffectFailed { effect_id, error, .. } => {
-                    execution = artifact.execute_after_effect_failure_with_turn(
+                WorkflowEvent::ActivityTaskTimedOut { activity_id, .. } => {
+                    execution = artifact.execute_after_step_failure_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
-                        effect_id,
-                        error,
+                        activity_id,
+                        "activity timed out",
                         replayed.artifact_execution.clone().unwrap_or_default(),
                         ExecutionTurnContext {
                             event_id: event.event_id,
@@ -898,23 +897,10 @@ pub fn replay_compiled_history_trace(
                     )?;
                     advanced = true;
                 }
-                WorkflowEvent::EffectTimedOut { effect_id, .. } => {
-                    execution = artifact.execute_after_effect_failure_with_turn(
+                WorkflowEvent::ActivityTaskCancelled { activity_id, reason, .. } => {
+                    execution = artifact.execute_after_step_failure_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
-                        effect_id,
-                        "effect timed out",
-                        replayed.artifact_execution.clone().unwrap_or_default(),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    advanced = true;
-                }
-                WorkflowEvent::EffectCancelled { effect_id, reason, .. } => {
-                    execution = artifact.execute_after_effect_failure_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        effect_id,
+                        activity_id,
                         reason,
                         replayed.artifact_execution.clone().unwrap_or_default(),
                         ExecutionTurnContext {
@@ -986,10 +972,10 @@ pub fn replay_compiled_history_trace_from_snapshot(
                         apply_compiled_execution(&mut replayed, &execution);
                     }
                 }
-                WorkflowEvent::StepCompleted { step_id, output, .. } => {
+                WorkflowEvent::ActivityTaskCompleted { activity_id, output, .. } => {
                     let execution = artifact.execute_after_step_completion_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
-                        step_id,
+                        activity_id,
                         output,
                         replayed.artifact_execution.clone().unwrap_or_default(),
                         ExecutionTurnContext {
@@ -999,23 +985,10 @@ pub fn replay_compiled_history_trace_from_snapshot(
                     )?;
                     apply_compiled_execution(&mut replayed, &execution);
                 }
-                WorkflowEvent::EffectCompleted { effect_id, output, .. } => {
-                    let execution = artifact.execute_after_effect_completion_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        effect_id,
-                        output,
-                        replayed.artifact_execution.clone().unwrap_or_default(),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    apply_compiled_execution(&mut replayed, &execution);
-                }
-                WorkflowEvent::StepFailed { step_id, error, .. } => {
+                WorkflowEvent::ActivityTaskFailed { activity_id, error, .. } => {
                     let execution = artifact.execute_after_step_failure_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
-                        step_id,
+                        activity_id,
                         error,
                         replayed.artifact_execution.clone().unwrap_or_default(),
                         ExecutionTurnContext {
@@ -1025,11 +998,11 @@ pub fn replay_compiled_history_trace_from_snapshot(
                     )?;
                     apply_compiled_execution(&mut replayed, &execution);
                 }
-                WorkflowEvent::EffectFailed { effect_id, error, .. } => {
-                    let execution = artifact.execute_after_effect_failure_with_turn(
+                WorkflowEvent::ActivityTaskTimedOut { activity_id, .. } => {
+                    let execution = artifact.execute_after_step_failure_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
-                        effect_id,
-                        error,
+                        activity_id,
+                        "activity timed out",
                         replayed.artifact_execution.clone().unwrap_or_default(),
                         ExecutionTurnContext {
                             event_id: event.event_id,
@@ -1038,23 +1011,10 @@ pub fn replay_compiled_history_trace_from_snapshot(
                     )?;
                     apply_compiled_execution(&mut replayed, &execution);
                 }
-                WorkflowEvent::EffectTimedOut { effect_id, .. } => {
-                    let execution = artifact.execute_after_effect_failure_with_turn(
+                WorkflowEvent::ActivityTaskCancelled { activity_id, reason, .. } => {
+                    let execution = artifact.execute_after_step_failure_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
-                        effect_id,
-                        "effect timed out",
-                        replayed.artifact_execution.clone().unwrap_or_default(),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    apply_compiled_execution(&mut replayed, &execution);
-                }
-                WorkflowEvent::EffectCancelled { effect_id, reason, .. } => {
-                    let execution = artifact.execute_after_effect_failure_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        effect_id,
+                        activity_id,
                         reason,
                         replayed.artifact_execution.clone().unwrap_or_default(),
                         ExecutionTurnContext {
@@ -1105,7 +1065,7 @@ fn should_skip_replay_event(
 }
 
 fn is_internal_control_timer(timer_id: &str) -> bool {
-    timer_id.starts_with("effect-timeout:") || timer_id.starts_with("retry:")
+    timer_id.starts_with("retry:")
 }
 
 fn replay_checkpoint(state: &WorkflowInstanceState) -> ReplayCheckpoint {
@@ -1361,15 +1321,12 @@ mod tests {
         );
         states.insert(
             "wait_timer".to_owned(),
-            CompiledStateNode::WaitForTimer {
-                timer_ref: "5s".to_owned(),
-                next: "effect".to_owned(),
-            },
+            CompiledStateNode::WaitForTimer { timer_ref: "5s".to_owned(), next: "echo".to_owned() },
         );
         states.insert(
-            "effect".to_owned(),
-            CompiledStateNode::Effect {
-                connector: "core.echo".to_owned(),
+            "echo".to_owned(),
+            CompiledStateNode::Step {
+                handler: "core.echo".to_owned(),
                 input: Expression::Object {
                     fields: BTreeMap::from([
                         (
@@ -1382,8 +1339,7 @@ mod tests {
                         ),
                     ]),
                 },
-                next: "done".to_owned(),
-                timeout: None,
+                next: Some("done".to_owned()),
                 retry: None,
                 config: None,
                 output_var: Some("echoed".to_owned()),
@@ -1676,26 +1632,34 @@ mod tests {
             &[("state", "wait_timer")],
             Some("timer:wait_timer"),
         );
-        let effect_requested = test_event(
-            "EffectRequested",
+        let activity_scheduled = test_event(
+            "ActivityTaskScheduled",
             run_id,
-            WorkflowEvent::EffectRequested {
-                effect_id: "effect".to_owned(),
-                connector: "core.echo".to_owned(),
+            WorkflowEvent::ActivityTaskScheduled {
+                activity_id: "echo".to_owned(),
+                activity_type: "core.echo".to_owned(),
+                task_queue: "default".to_owned(),
                 attempt: 1,
                 input: echoed.clone(),
+                config: None,
+                state: Some("echo".to_owned()),
+                schedule_to_start_timeout_ms: None,
+                start_to_close_timeout_ms: None,
+                heartbeat_timeout_ms: None,
             },
-            &[("state", "effect")],
+            &[("state", "echo")],
         );
-        let effect_completed = test_event(
-            "EffectCompleted",
+        let activity_completed = test_event(
+            "ActivityTaskCompleted",
             run_id,
-            WorkflowEvent::EffectCompleted {
-                effect_id: "effect".to_owned(),
+            WorkflowEvent::ActivityTaskCompleted {
+                activity_id: "echo".to_owned(),
                 attempt: 1,
                 output: echoed.clone(),
+                worker_id: "worker-1".to_owned(),
+                worker_build_id: "build-1".to_owned(),
             },
-            &[("state", "effect")],
+            &[("state", "echo")],
         );
         let completed = test_event(
             "WorkflowCompleted",
@@ -1717,8 +1681,8 @@ mod tests {
             signal,
             timer_scheduled.clone(),
             timer_fired.clone(),
-            effect_requested,
-            effect_completed,
+            activity_scheduled,
+            activity_completed,
             completed,
         ];
 
@@ -1816,25 +1780,33 @@ mod tests {
                 Some("timer:wait_timer"),
             ),
             test_event(
-                "EffectRequested",
+                "ActivityTaskScheduled",
                 run_id,
-                WorkflowEvent::EffectRequested {
-                    effect_id: "effect".to_owned(),
-                    connector: "core.echo".to_owned(),
+                WorkflowEvent::ActivityTaskScheduled {
+                    activity_id: "echo".to_owned(),
+                    activity_type: "core.echo".to_owned(),
+                    task_queue: "default".to_owned(),
                     attempt: 1,
                     input: echoed.clone(),
+                    config: None,
+                    state: Some("echo".to_owned()),
+                    schedule_to_start_timeout_ms: None,
+                    start_to_close_timeout_ms: None,
+                    heartbeat_timeout_ms: None,
                 },
-                &[("state", "effect")],
+                &[("state", "echo")],
             ),
             test_event(
-                "EffectCompleted",
+                "ActivityTaskCompleted",
                 run_id,
-                WorkflowEvent::EffectCompleted {
-                    effect_id: "effect".to_owned(),
+                WorkflowEvent::ActivityTaskCompleted {
+                    activity_id: "echo".to_owned(),
                     attempt: 1,
                     output: echoed.clone(),
+                    worker_id: "worker-1".to_owned(),
+                    worker_build_id: "build-1".to_owned(),
                 },
-                &[("state", "effect")],
+                &[("state", "echo")],
             ),
             test_event(
                 "WorkflowCompleted",
@@ -1884,7 +1856,7 @@ mod tests {
         assert!(matches!(
             plan.emissions.last(),
             Some(ExecutionEmission {
-                event: WorkflowEvent::StepScheduled { step_id, attempt, .. },
+                event: WorkflowEvent::ActivityTaskScheduled { activity_id: step_id, attempt, .. },
                 ..
             }) if step_id == "first" && *attempt == 1
         ));

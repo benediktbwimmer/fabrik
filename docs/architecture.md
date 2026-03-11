@@ -265,3 +265,25 @@ It is trying to replace Temporal by preserving the workflow model users want whi
 - replay efficiency
 
 That means compiled workflows plus arbitrary activities, not compiled workflows instead of arbitrary activities.
+
+## Future Directions
+
+### Wasm-Sandboxed Activity Execution
+
+The current architecture runs activities as arbitrary user code in worker processes. This is correct for Temporal parity and for the broadest possible activity ecosystem.
+
+However, multi-tenant hosted deployments may benefit from an optional sandboxed activity execution mode using Wasm (Wasmtime / WASI):
+
+- tenant-uploaded activity modules could run under resource limits without dedicated worker infrastructure
+- sandboxed execution would provide stronger isolation than process-level separation alone
+- Wasm modules are versionable, content-addressable artifacts that fit naturally with the existing artifact-pinning model
+- language flexibility through compilation targets (Rust, Go, C, AssemblyScript, etc.)
+
+This would not replace the general activity worker model. It would be an additional execution mode available for tenants or activity types where sandboxing is more valuable than full runtime flexibility.
+
+Relevant design questions for a future Wasm extension:
+
+- host function surface: what capabilities should sandboxed activities be able to access?
+- resource limits: CPU time, memory, and network access controls per tenant
+- artifact registry: versioned Wasm module storage and deployment
+- integration with worker versioning: how sandboxed modules interact with build-ID routing

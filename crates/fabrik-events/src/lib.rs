@@ -110,30 +110,70 @@ pub enum WorkflowEvent {
         marker_id: String,
         value: Value,
     },
-    EffectRequested {
-        effect_id: String,
-        connector: String,
+    ActivityTaskScheduled {
+        activity_id: String,
+        activity_type: String,
+        task_queue: String,
         attempt: u32,
         input: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schedule_to_start_timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_to_close_timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        heartbeat_timeout_ms: Option<u64>,
     },
-    EffectCompleted {
-        effect_id: String,
+    ActivityTaskStarted {
+        activity_id: String,
         attempt: u32,
-        output: Value,
+        worker_id: String,
+        worker_build_id: String,
     },
-    EffectFailed {
-        effect_id: String,
+    ActivityTaskHeartbeatRecorded {
+        activity_id: String,
         attempt: u32,
-        error: String,
+        worker_id: String,
+        worker_build_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<Value>,
     },
-    EffectTimedOut {
-        effect_id: String,
-        attempt: u32,
-    },
-    EffectCancelled {
-        effect_id: String,
+    ActivityTaskCancellationRequested {
+        activity_id: String,
         attempt: u32,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<Value>,
+    },
+    ActivityTaskCompleted {
+        activity_id: String,
+        attempt: u32,
+        output: Value,
+        worker_id: String,
+        worker_build_id: String,
+    },
+    ActivityTaskFailed {
+        activity_id: String,
+        attempt: u32,
+        error: String,
+        worker_id: String,
+        worker_build_id: String,
+    },
+    ActivityTaskTimedOut {
+        activity_id: String,
+        attempt: u32,
+        worker_id: String,
+        worker_build_id: String,
+    },
+    ActivityTaskCancelled {
+        activity_id: String,
+        attempt: u32,
+        reason: String,
+        worker_id: String,
+        worker_build_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<Value>,
     },
@@ -150,21 +190,6 @@ pub enum WorkflowEvent {
         signal_id: String,
         signal_type: String,
         payload: Value,
-    },
-    StepScheduled {
-        step_id: String,
-        attempt: u32,
-        input: Value,
-    },
-    StepCompleted {
-        step_id: String,
-        attempt: u32,
-        output: Value,
-    },
-    StepFailed {
-        step_id: String,
-        attempt: u32,
-        error: String,
     },
     TimerScheduled {
         timer_id: String,
@@ -188,17 +213,17 @@ impl WorkflowEvent {
             Self::WorkflowStarted => "WorkflowStarted",
             Self::WorkflowArtifactPinned => "WorkflowArtifactPinned",
             Self::MarkerRecorded { .. } => "MarkerRecorded",
-            Self::EffectRequested { .. } => "EffectRequested",
-            Self::EffectCompleted { .. } => "EffectCompleted",
-            Self::EffectFailed { .. } => "EffectFailed",
-            Self::EffectTimedOut { .. } => "EffectTimedOut",
-            Self::EffectCancelled { .. } => "EffectCancelled",
+            Self::ActivityTaskScheduled { .. } => "ActivityTaskScheduled",
+            Self::ActivityTaskStarted { .. } => "ActivityTaskStarted",
+            Self::ActivityTaskHeartbeatRecorded { .. } => "ActivityTaskHeartbeatRecorded",
+            Self::ActivityTaskCancellationRequested { .. } => "ActivityTaskCancellationRequested",
+            Self::ActivityTaskCompleted { .. } => "ActivityTaskCompleted",
+            Self::ActivityTaskFailed { .. } => "ActivityTaskFailed",
+            Self::ActivityTaskTimedOut { .. } => "ActivityTaskTimedOut",
+            Self::ActivityTaskCancelled { .. } => "ActivityTaskCancelled",
             Self::WorkflowContinuedAsNew { .. } => "WorkflowContinuedAsNew",
             Self::SignalQueued { .. } => "SignalQueued",
             Self::SignalReceived { .. } => "SignalReceived",
-            Self::StepScheduled { .. } => "StepScheduled",
-            Self::StepCompleted { .. } => "StepCompleted",
-            Self::StepFailed { .. } => "StepFailed",
             Self::TimerScheduled { .. } => "TimerScheduled",
             Self::TimerFired { .. } => "TimerFired",
             Self::WorkflowCompleted { .. } => "WorkflowCompleted",

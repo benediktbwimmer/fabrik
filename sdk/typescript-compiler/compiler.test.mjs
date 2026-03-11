@@ -72,24 +72,23 @@ test("compiler lowers ctx.sideEffect expressions", async () => {
   assert.match(serialized, /"marker_id":"marker_/);
 });
 
-test("compiler lowers awaited ctx.sideEffect calls into effect states", async () => {
-  const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/effect-workflow.ts");
+test("compiler lowers awaited ctx.activity calls into activity states", async () => {
+  const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/activity-workflow.ts");
   const { stdout } = await runCompiler([
     "--entry",
     fixture,
     "--export",
-    "effectWorkflow",
+    "activityWorkflow",
     "--definition-id",
-    "effect-workflow",
+    "activity-workflow",
     "--version",
     "1",
   ]);
   const artifact = JSON.parse(stdout);
   const serialized = JSON.stringify(artifact.workflow.states);
 
-  assert.match(serialized, /"type":"effect"/);
-  assert.match(serialized, /"connector":"core\.echo"/);
-  assert.match(serialized, /"timeout":"30s"/);
+  assert.match(serialized, /"type":"step"/);
+  assert.match(serialized, /"handler":"core\.echo"/);
   assert.match(serialized, /"output_var":"echoed"/);
 });
 
