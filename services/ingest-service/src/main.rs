@@ -317,9 +317,7 @@ async fn trigger_workflow(
         ),
         payload,
     );
-    envelope
-        .metadata
-        .insert("workflow_task_queue".to_owned(), workflow_task_queue.clone());
+    envelope.metadata.insert("workflow_task_queue".to_owned(), workflow_task_queue.clone());
 
     state.publisher.publish(&envelope, &envelope.partition_key).await.map_err(internal_error)?;
     state
@@ -605,9 +603,7 @@ async fn continue_as_new(
     );
     trigger.causation_id = Some(continued.event_id);
     trigger.correlation_id = continued.correlation_id;
-    trigger
-        .metadata
-        .insert("workflow_task_queue".to_owned(), workflow_task_queue.clone());
+    trigger.metadata.insert("workflow_task_queue".to_owned(), workflow_task_queue.clone());
 
     state.publisher.publish(&trigger, &trigger.partition_key).await.map_err(internal_error)?;
     state

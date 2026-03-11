@@ -337,8 +337,7 @@ pub fn workflow_turn_routing(payload: &WorkflowEvent) -> WorkflowTurnRouting {
 #[cfg(test)]
 mod tests {
     use super::{
-        EventEnvelope, WorkflowEvent, WorkflowIdentity, WorkflowTurnRouting,
-        workflow_turn_routing,
+        EventEnvelope, WorkflowEvent, WorkflowIdentity, WorkflowTurnRouting, workflow_turn_routing,
     };
     use serde_json::json;
 

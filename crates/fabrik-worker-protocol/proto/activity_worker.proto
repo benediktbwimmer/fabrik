@@ -54,11 +54,12 @@ message WorkflowTask {
   int32 partition_id = 8;
   string task_queue = 9;
   string preferred_build_id = 10;
-  string source_event_id = 11;
-  string source_event_type = 12;
-  string source_event_json = 13;
-  uint32 attempt_count = 14;
-  int64 created_at_unix_ms = 15;
+  uint64 mailbox_consumed_seq = 11;
+  uint64 resume_consumed_seq = 12;
+  uint64 mailbox_backlog = 13;
+  uint64 resume_backlog = 14;
+  uint32 attempt_count = 15;
+  int64 created_at_unix_ms = 16;
 }
 
 message PollWorkflowTaskResponse {
@@ -127,6 +128,39 @@ message ReportActivityTaskCancelledRequest {
   string metadata_json = 9;
 }
 
+message ActivityTaskCompletedResult {
+  string output_json = 1;
+}
+
+message ActivityTaskFailedResult {
+  string error = 1;
+}
+
+message ActivityTaskCancelledResult {
+  string reason = 1;
+  string metadata_json = 2;
+}
+
+message ActivityTaskResult {
+  string tenant_id = 1;
+  string instance_id = 2;
+  string run_id = 3;
+  string activity_id = 4;
+  uint32 attempt = 5;
+  string worker_id = 6;
+  string worker_build_id = 7;
+
+  oneof result {
+    ActivityTaskCompletedResult completed = 8;
+    ActivityTaskFailedResult failed = 9;
+    ActivityTaskCancelledResult cancelled = 10;
+  }
+}
+
+message ReportActivityTaskResultsRequest {
+  repeated ActivityTaskResult results = 1;
+}
+
 message Ack {}
 
 service ActivityWorkerApi {
@@ -135,6 +169,7 @@ service ActivityWorkerApi {
   rpc FailActivityTask(FailActivityTaskRequest) returns (Ack);
   rpc RecordActivityHeartbeat(RecordActivityHeartbeatRequest) returns (RecordActivityHeartbeatResponse);
   rpc ReportActivityTaskCancelled(ReportActivityTaskCancelledRequest) returns (Ack);
+  rpc ReportActivityTaskResults(ReportActivityTaskResultsRequest) returns (Ack);
 }
 
 service WorkflowWorkerApi {

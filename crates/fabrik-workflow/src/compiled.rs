@@ -90,6 +90,26 @@ pub enum CompiledStateNode {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         on_error: Option<ErrorTransition>,
     },
+    FanOut {
+        activity_type: String,
+        items: Expression,
+        next: String,
+        handle_var: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_queue: Option<Expression>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry: Option<RetryPolicy>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config: Option<StepConfig>,
+    },
+    WaitForAllActivities {
+        fanout_ref_var: String,
+        next: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_var: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on_error: Option<ErrorTransition>,
+    },
     StartChild {
         child_definition_id: String,
         input: Expression,
@@ -258,6 +278,16 @@ pub struct ActiveUpdateState {
     pub return_state: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct FanOutExecutionState {
+    pub origin_state: String,
+    pub wait_state: String,
+    pub task_queue: String,
+    pub inputs: Vec<Value>,
+    pub pending_activity_ids: Vec<String>,
+    pub results: Vec<Option<Value>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ParentClosePolicy {
@@ -323,7 +353,9 @@ impl CompiledWorkflowArtifact {
             .ok_or_else(|| CompiledWorkflowError::UnknownState(state_id.to_owned()))?;
         Ok(matches!(
             state,
-            CompiledStateNode::WaitForEvent { .. } | CompiledStateNode::WaitForTimer { .. }
+            CompiledStateNode::WaitForEvent { .. }
+                | CompiledStateNode::WaitForTimer { .. }
+                | CompiledStateNode::WaitForAllActivities { .. }
         ))
     }
 
@@ -733,6 +765,54 @@ impl CompiledWorkflowArtifact {
                 })?;
                 self.execute_from_state_in_graph(states, next, execution_state, false)
             }
+            CompiledStateNode::WaitForAllActivities {
+                fanout_ref_var, next, output_var, ..
+            } => {
+                let mut fanout =
+                    self.fanout_binding(step_state, fanout_ref_var, &execution_state)?;
+                let Some((origin_state, fanout_index)) = parse_fanout_activity_id(step_id) else {
+                    return Err(CompiledWorkflowError::InvalidFanOutActivityId(step_id.to_owned()));
+                };
+                if fanout.origin_state != origin_state
+                    || fanout_index >= fanout.results.len()
+                    || !fanout.pending_activity_ids.iter().any(|activity_id| activity_id == step_id)
+                {
+                    return Err(CompiledWorkflowError::UnexpectedFanOutActivity {
+                        state: step_state.to_owned(),
+                        activity_id: step_id.to_owned(),
+                    });
+                }
+                fanout.pending_activity_ids.retain(|activity_id| activity_id != step_id);
+                fanout.results[fanout_index] = Some(output.clone());
+                if fanout.pending_activity_ids.is_empty() {
+                    let ordered_results = Value::Array(
+                        fanout
+                            .results
+                            .iter()
+                            .cloned()
+                            .map(|value| value.unwrap_or(Value::Null))
+                            .collect(),
+                    );
+                    execution_state.bindings.remove(fanout_ref_var);
+                    if let Some(output_var) = output_var {
+                        execution_state.bindings.insert(output_var.clone(), ordered_results);
+                    }
+                    self.execute_from_state_in_graph(states, next, execution_state, false)
+                } else {
+                    execution_state.bindings.insert(
+                        fanout_ref_var.clone(),
+                        serde_json::to_value(&fanout).expect("fanout state serializes"),
+                    );
+                    Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: step_state.to_owned(),
+                        emissions: Vec::new(),
+                        execution_state,
+                        context: Some(output.clone()),
+                        output: None,
+                    })
+                }
+            }
             CompiledStateNode::Step { .. } => Err(CompiledWorkflowError::UnexpectedStep {
                 expected: step_state.to_owned(),
                 received: step_id.to_owned(),
@@ -812,6 +892,64 @@ impl CompiledWorkflowArtifact {
                     output: Some(Value::String(error.to_owned())),
                 })
             }
+            CompiledStateNode::WaitForAllActivities { fanout_ref_var, on_error, .. } => {
+                let fanout = self.fanout_binding(step_state, fanout_ref_var, &execution_state)?;
+                let Some((origin_state, fanout_index)) = parse_fanout_activity_id(step_id) else {
+                    return Err(CompiledWorkflowError::InvalidFanOutActivityId(step_id.to_owned()));
+                };
+                if fanout.origin_state != origin_state
+                    || fanout_index >= fanout.results.len()
+                    || !fanout.pending_activity_ids.iter().any(|activity_id| activity_id == step_id)
+                {
+                    return Err(CompiledWorkflowError::UnexpectedFanOutActivity {
+                        state: step_state.to_owned(),
+                        activity_id: step_id.to_owned(),
+                    });
+                }
+                execution_state.bindings.remove(fanout_ref_var);
+                if let Some(on_error) = on_error {
+                    if let Some(error_var) = &on_error.error_var {
+                        execution_state
+                            .bindings
+                            .insert(error_var.clone(), Value::String(error.to_owned()));
+                    }
+                    return self.execute_from_state_in_graph(
+                        states,
+                        &on_error.next,
+                        execution_state,
+                        false,
+                    );
+                }
+                if let Some(active_update) = execution_state.active_update.take() {
+                    let return_state = active_update.return_state;
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: return_state.clone(),
+                        emissions: vec![ExecutionEmission {
+                            event: WorkflowEvent::WorkflowUpdateRejected {
+                                update_id: active_update.update_id,
+                                update_name: active_update.update_name,
+                                error: error.to_owned(),
+                            },
+                            state: Some(return_state),
+                        }],
+                        execution_state,
+                        context: Some(Value::String(error.to_owned())),
+                        output: Some(Value::String(error.to_owned())),
+                    });
+                }
+                Ok(CompiledExecutionPlan {
+                    workflow_version: self.definition_version,
+                    final_state: step_state.to_owned(),
+                    emissions: vec![ExecutionEmission {
+                        event: WorkflowEvent::WorkflowFailed { reason: error.to_owned() },
+                        state: Some(step_state.to_owned()),
+                    }],
+                    execution_state,
+                    context: Some(Value::String(error.to_owned())),
+                    output: Some(Value::String(error.to_owned())),
+                })
+            }
             CompiledStateNode::Step { .. } => Err(CompiledWorkflowError::UnexpectedStep {
                 expected: step_state.to_owned(),
                 received: step_id.to_owned(),
@@ -823,12 +961,20 @@ impl CompiledWorkflowArtifact {
     pub fn step_retry(
         &self,
         step_state: &str,
+        execution_state: &ArtifactExecutionState,
     ) -> Result<Option<&RetryPolicy>, CompiledWorkflowError> {
         let state = self
             .state_by_id(step_state)
             .ok_or_else(|| CompiledWorkflowError::UnknownState(step_state.to_owned()))?;
         match state {
             CompiledStateNode::Step { retry, .. } => Ok(retry.as_ref()),
+            CompiledStateNode::WaitForAllActivities { fanout_ref_var, .. } => {
+                let fanout = self.fanout_binding(step_state, fanout_ref_var, execution_state)?;
+                match self.state_by_id(&fanout.origin_state) {
+                    Some(CompiledStateNode::FanOut { retry, .. }) => Ok(retry.as_ref()),
+                    _ => Err(CompiledWorkflowError::NotWaitingOnFanOut(step_state.to_owned())),
+                }
+            }
             _ => Err(CompiledWorkflowError::NotWaitingOnStep(step_state.to_owned())),
         }
     }
@@ -840,12 +986,34 @@ impl CompiledWorkflowArtifact {
     ) -> Result<(String, Option<StepConfig>, Value), CompiledWorkflowError> {
         let state = self
             .state_by_id(step_state)
+            .or_else(|| {
+                parse_fanout_activity_id(step_state)
+                    .and_then(|(state_id, _)| self.state_by_id(&state_id))
+            })
             .ok_or_else(|| CompiledWorkflowError::UnknownState(step_state.to_owned()))?;
         match state {
             CompiledStateNode::Step { handler, input, config, .. } => {
                 let mut execution_state = execution_state.clone();
                 let input = evaluate_expression(input, &mut execution_state, &self.helpers)?;
                 Ok((handler.clone(), config.clone(), input))
+            }
+            CompiledStateNode::FanOut { activity_type, config, .. } => {
+                let Some((origin_state, index)) = parse_fanout_activity_id(step_state) else {
+                    return Err(CompiledWorkflowError::InvalidFanOutActivityId(
+                        step_state.to_owned(),
+                    ));
+                };
+                let (_, fanout) = self
+                    .find_fanout_member(execution_state, &origin_state, index)
+                    .ok_or_else(|| CompiledWorkflowError::UnexpectedFanOutActivity {
+                        state: origin_state.clone(),
+                        activity_id: step_state.to_owned(),
+                    })?;
+                Ok((
+                    activity_type.clone(),
+                    config.clone(),
+                    fanout.inputs.get(index).cloned().unwrap_or(Value::Null),
+                ))
             }
             _ => Err(CompiledWorkflowError::NotWaitingOnStep(step_state.to_owned())),
         }
@@ -857,13 +1025,57 @@ impl CompiledWorkflowArtifact {
     ) -> Result<(String, Option<StepConfig>), CompiledWorkflowError> {
         let state = self
             .state_by_id(step_state)
+            .or_else(|| {
+                parse_fanout_activity_id(step_state)
+                    .and_then(|(state_id, _)| self.state_by_id(&state_id))
+            })
             .ok_or_else(|| CompiledWorkflowError::UnknownState(step_state.to_owned()))?;
         match state {
             CompiledStateNode::Step { handler, config, .. } => {
                 Ok((handler.clone(), config.clone()))
             }
+            CompiledStateNode::FanOut { activity_type, config, .. } => {
+                Ok((activity_type.clone(), config.clone()))
+            }
             _ => Err(CompiledWorkflowError::NotWaitingOnStep(step_state.to_owned())),
         }
+    }
+
+    fn fanout_binding(
+        &self,
+        state_id: &str,
+        binding: &str,
+        execution_state: &ArtifactExecutionState,
+    ) -> Result<FanOutExecutionState, CompiledWorkflowError> {
+        execution_state.bindings.get(binding).and_then(decode_fanout_state).ok_or_else(|| {
+            CompiledWorkflowError::MissingFanOutBinding {
+                state: state_id.to_owned(),
+                binding: binding.to_owned(),
+            }
+        })
+    }
+
+    fn find_fanout_member(
+        &self,
+        execution_state: &ArtifactExecutionState,
+        origin_state: &str,
+        index: usize,
+    ) -> Option<(String, FanOutExecutionState)> {
+        execution_state.bindings.iter().find_map(|(binding, value)| {
+            let fanout = decode_fanout_state(value)?;
+            (fanout.origin_state == origin_state && index < fanout.inputs.len())
+                .then_some((binding.clone(), fanout))
+        })
+    }
+
+    pub fn reschedule_state_for_activity(
+        &self,
+        activity_id: &str,
+        execution_state: &ArtifactExecutionState,
+    ) -> Option<String> {
+        let (origin_state, index) = parse_fanout_activity_id(activity_id)?;
+        self.find_fanout_member(execution_state, &origin_state, index)
+            .map(|(_, fanout)| fanout.wait_state)
     }
 
     fn execute_from_state(
@@ -950,6 +1162,109 @@ impl CompiledWorkflowArtifact {
                         },
                         state: Some(current_state.clone()),
                     });
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: current_state,
+                        emissions,
+                        execution_state,
+                        context,
+                        output,
+                    });
+                }
+                CompiledStateNode::FanOut {
+                    activity_type,
+                    items,
+                    next,
+                    handle_var,
+                    task_queue,
+                    config,
+                    ..
+                } => {
+                    let items = evaluate_expression(items, &mut execution_state, &self.helpers)?;
+                    let Value::Array(items) = items else {
+                        return Err(CompiledWorkflowError::InvalidFanOutItems {
+                            state: current_state.clone(),
+                        });
+                    };
+                    let task_queue = task_queue
+                        .as_ref()
+                        .map(|expr| evaluate_expression(expr, &mut execution_state, &self.helpers))
+                        .transpose()?
+                        .and_then(|value| stringify_value(&value))
+                        .unwrap_or_else(|| "default".to_owned());
+                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+
+                    if items.is_empty() {
+                        let wait_state = states
+                            .get(next)
+                            .ok_or_else(|| CompiledWorkflowError::UnknownState(next.clone()))?;
+                        if let CompiledStateNode::WaitForAllActivities {
+                            fanout_ref_var,
+                            next: after_wait,
+                            output_var,
+                            ..
+                        } = wait_state
+                        {
+                            execution_state.bindings.remove(fanout_ref_var);
+                            if let Some(output_var) = output_var {
+                                execution_state
+                                    .bindings
+                                    .insert(output_var.clone(), Value::Array(Vec::new()));
+                            }
+                            current_state = after_wait.clone();
+                            continue;
+                        }
+                        return Err(CompiledWorkflowError::NotWaitingOnFanOut(next.clone()));
+                    }
+
+                    let mut pending_activity_ids = Vec::with_capacity(items.len());
+                    let mut results = Vec::with_capacity(items.len());
+                    for (index, item) in items.iter().enumerate() {
+                        let activity_id = build_fanout_activity_id(&current_state, index);
+                        pending_activity_ids.push(activity_id.clone());
+                        results.push(None);
+                        emissions.push(ExecutionEmission {
+                            event: WorkflowEvent::ActivityTaskScheduled {
+                                activity_id,
+                                activity_type: activity_type.clone(),
+                                task_queue: task_queue.clone(),
+                                attempt: 1,
+                                input: item.clone(),
+                                config: config.as_ref().map(|config| {
+                                    serde_json::to_value(config)
+                                        .expect("fanout activity config serializes")
+                                }),
+                                state: Some(next.clone()),
+                                schedule_to_start_timeout_ms: None,
+                                start_to_close_timeout_ms: None,
+                                heartbeat_timeout_ms: None,
+                            },
+                            state: Some(next.clone()),
+                        });
+                    }
+                    execution_state.bindings.insert(
+                        handle_var.clone(),
+                        serde_json::to_value(FanOutExecutionState {
+                            origin_state: current_state.clone(),
+                            wait_state: next.clone(),
+                            task_queue,
+                            inputs: items.clone(),
+                            pending_activity_ids,
+                            results,
+                        })
+                        .expect("fanout execution state serializes"),
+                    );
+                    context = Some(Value::Array(items));
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: next.clone(),
+                        emissions,
+                        execution_state,
+                        context,
+                        output,
+                    });
+                }
+                CompiledStateNode::WaitForAllActivities { .. } => {
                     return Ok(CompiledExecutionPlan {
                         workflow_version: self.definition_version,
                         final_state: current_state,
@@ -1177,6 +1492,10 @@ impl CompiledStateNode {
                 .map(String::as_str)
                 .chain(on_error.iter().map(|transition| transition.next.as_str()))
                 .collect(),
+            Self::FanOut { next, .. } => vec![next.as_str()],
+            Self::WaitForAllActivities { next, on_error, .. } => std::iter::once(next.as_str())
+                .chain(on_error.iter().map(|transition| transition.next.as_str()))
+                .collect(),
             Self::StartChild { next, .. }
             | Self::WaitForEvent { next, .. }
             | Self::WaitForTimer { next, .. }
@@ -1198,6 +1517,8 @@ impl ParentClosePolicy {
     }
 }
 
+const FANOUT_ACTIVITY_SEPARATOR: &str = "::";
+
 fn build_child_id(turn_context: &ExecutionTurnContext, state_id: &str) -> String {
     uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_URL,
@@ -1208,6 +1529,19 @@ fn build_child_id(turn_context: &ExecutionTurnContext, state_id: &str) -> String
 
 fn extract_child_id(value: &Value) -> Option<String> {
     value.get("child_id").and_then(Value::as_str).map(str::to_owned)
+}
+
+fn build_fanout_activity_id(state_id: &str, index: usize) -> String {
+    format!("{state_id}{FANOUT_ACTIVITY_SEPARATOR}{index}")
+}
+
+fn parse_fanout_activity_id(activity_id: &str) -> Option<(String, usize)> {
+    let (state_id, index) = activity_id.rsplit_once(FANOUT_ACTIVITY_SEPARATOR)?;
+    Some((state_id.to_owned(), index.parse::<usize>().ok()?))
+}
+
+fn decode_fanout_state(value: &Value) -> Option<FanOutExecutionState> {
+    serde_json::from_value(value.clone()).ok()
 }
 
 pub fn evaluate_expression(
@@ -1479,6 +1813,16 @@ pub enum CompiledWorkflowError {
     NotWaitingOnStep(String),
     #[error("unexpected step completion, expected {expected}, received {received}")]
     UnexpectedStep { expected: String, received: String },
+    #[error("compiled workflow state {0} is not waiting on a fan-out join")]
+    NotWaitingOnFanOut(String),
+    #[error("compiled workflow state {state} evaluated fan-out items to a non-array value")]
+    InvalidFanOutItems { state: String },
+    #[error("compiled workflow state {state} is missing fan-out binding {binding}")]
+    MissingFanOutBinding { state: String, binding: String },
+    #[error("compiled workflow state {state} received unexpected fan-out activity {activity_id}")]
+    UnexpectedFanOutActivity { state: String, activity_id: String },
+    #[error("compiled workflow activity id {0} is not a valid fan-out member id")]
+    InvalidFanOutActivityId(String),
     #[error("compiled workflow state {0} is not waiting on a child")]
     NotWaitingOnChild(String),
     #[error("unexpected child completion, expected {expected}, received {received}")]
@@ -1628,6 +1972,63 @@ mod tests {
             workflow,
         );
         artifact.updates = updates;
+        artifact.artifact_hash = artifact.hash();
+        artifact
+    }
+
+    fn fanout_artifact(enable_retry: bool) -> CompiledWorkflowArtifact {
+        let workflow = CompiledWorkflow {
+            initial_state: "dispatch".to_owned(),
+            states: BTreeMap::from([
+                (
+                    "dispatch".to_owned(),
+                    CompiledStateNode::FanOut {
+                        activity_type: "benchmark.echo".to_owned(),
+                        items: Expression::Member {
+                            object: Box::new(Expression::Identifier { name: "input".to_owned() }),
+                            property: "items".to_owned(),
+                        },
+                        next: "join".to_owned(),
+                        handle_var: "fanout".to_owned(),
+                        task_queue: None,
+                        retry: enable_retry
+                            .then_some(RetryPolicy { max_attempts: 2, delay: "1s".to_owned() }),
+                        config: None,
+                    },
+                ),
+                (
+                    "join".to_owned(),
+                    CompiledStateNode::WaitForAllActivities {
+                        fanout_ref_var: "fanout".to_owned(),
+                        next: "done".to_owned(),
+                        output_var: Some("results".to_owned()),
+                        on_error: Some(ErrorTransition {
+                            next: "fail".to_owned(),
+                            error_var: Some("error".to_owned()),
+                        }),
+                    },
+                ),
+                (
+                    "done".to_owned(),
+                    CompiledStateNode::Succeed {
+                        output: Some(Expression::Identifier { name: "results".to_owned() }),
+                    },
+                ),
+                (
+                    "fail".to_owned(),
+                    CompiledStateNode::Fail {
+                        reason: Some(Expression::Identifier { name: "error".to_owned() }),
+                    },
+                ),
+            ]),
+        };
+        let mut artifact = CompiledWorkflowArtifact::new(
+            "fanout-demo",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            workflow,
+        );
         artifact.artifact_hash = artifact.hash();
         artifact
     }
@@ -1823,5 +2224,147 @@ mod tests {
                 state,
             }) if state.as_deref() == Some("wait_signal")
         ));
+    }
+
+    #[test]
+    fn fanout_join_returns_ordered_results_after_out_of_order_completions() {
+        let artifact = fanout_artifact(false);
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({
+                    "items": [
+                        {"value": 1},
+                        {"value": 2},
+                        {"value": 3}
+                    ]
+                }),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+                        .unwrap(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(plan.final_state, "join");
+        assert_eq!(plan.emissions.len(), 4);
+
+        let plan = artifact
+            .execute_after_step_completion_with_turn(
+                "join",
+                "dispatch::2",
+                &json!({"value": 30}),
+                plan.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_100).unwrap(),
+                },
+            )
+            .unwrap();
+        assert_eq!(plan.final_state, "join");
+        assert!(plan.emissions.is_empty());
+
+        let plan = artifact
+            .execute_after_step_completion_with_turn(
+                "join",
+                "dispatch::0",
+                &json!({"value": 10}),
+                plan.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_200).unwrap(),
+                },
+            )
+            .unwrap();
+        assert_eq!(plan.final_state, "join");
+        assert!(plan.emissions.is_empty());
+
+        let plan = artifact
+            .execute_after_step_completion_with_turn(
+                "join",
+                "dispatch::1",
+                &json!({"value": 20}),
+                plan.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_300).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(plan.final_state, "done");
+        assert!(matches!(
+            plan.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output == &json!([
+                {"value": 10},
+                {"value": 20},
+                {"value": 30}
+            ])
+        ));
+    }
+
+    #[test]
+    fn fanout_failure_uses_join_error_transition() {
+        let artifact = fanout_artifact(false);
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"items": [{"value": 1}, {"value": 2}]}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        let failed = artifact
+            .execute_after_step_failure_with_turn(
+                "join",
+                "dispatch::1",
+                "boom",
+                plan.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_100).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(failed.final_state, "fail");
+        assert!(matches!(
+            failed.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowFailed { reason },
+                ..
+            }) if reason == "boom"
+        ));
+    }
+
+    #[test]
+    fn fanout_wait_state_resolves_retry_and_member_input() {
+        let artifact = fanout_artifact(true);
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"items": [{"value": 1}, {"value": 2}]}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        let retry = artifact.step_retry("join", &plan.execution_state).unwrap().unwrap();
+        assert_eq!(retry.max_attempts, 2);
+
+        let (activity_type, _config, input) =
+            artifact.step_details("dispatch::1", &plan.execution_state).unwrap();
+        assert_eq!(activity_type, "benchmark.echo");
+        assert_eq!(input, json!({"value": 2}));
+        assert_eq!(
+            artifact.reschedule_state_for_activity("dispatch::1", &plan.execution_state).as_deref(),
+            Some("join")
+        );
     }
 }

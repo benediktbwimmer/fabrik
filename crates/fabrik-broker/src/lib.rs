@@ -8,7 +8,11 @@ use std::{
 use anyhow::{Context, Result};
 use chrono::Utc;
 use fabrik_events::{EventEnvelope, WorkflowEvent, workflow_partition_key};
-use futures_util::{StreamExt, stream::BoxStream};
+use futures_util::{
+    StreamExt,
+    future::try_join_all,
+    stream::{BoxStream, FuturesOrdered},
+};
 use rskafka::{
     client::{
         Client, ClientBuilder,
@@ -101,7 +105,7 @@ impl WorkflowPublisher {
             );
 
             let producer = BatchProducerBuilder::new(partition_client)
-                .with_linger(Duration::from_millis(5))
+                .with_linger(Duration::ZERO)
                 .build(RecordAggregator::new(1024 * 1024));
             producers.insert(partition_id, Arc::new(producer));
         }
@@ -128,6 +132,54 @@ impl WorkflowPublisher {
             })
             .await
             .context("failed to publish event")?;
+        Ok(())
+    }
+
+    pub async fn publish_all(&self, envelopes: &[EventEnvelope<WorkflowEvent>]) -> Result<()> {
+        if envelopes.is_empty() {
+            return Ok(());
+        }
+
+        let mut records_by_partition = HashMap::<i32, Vec<Record>>::new();
+        for envelope in envelopes {
+            let payload =
+                serde_json::to_vec(envelope).context("failed to serialize event envelope")?;
+            let partition_id = partition_for_key(&envelope.partition_key, self.partition_count);
+            records_by_partition.entry(partition_id).or_default().push(Record {
+                key: Some(envelope.partition_key.as_bytes().to_vec()),
+                value: Some(payload),
+                headers: BTreeMap::new(),
+                timestamp: Utc::now(),
+            });
+        }
+
+        let mut flushes = Vec::new();
+        for (partition_id, records) in records_by_partition {
+            let producer = self
+                .producers
+                .get(&partition_id)
+                .with_context(|| format!("missing producer for workflow partition {partition_id}"))?
+                .clone();
+            flushes.push(async move {
+                let mut pending = FuturesOrdered::new();
+                for record in records {
+                    let producer = producer.clone();
+                    pending.push_back(async move {
+                        producer
+                            .produce(record)
+                            .await
+                            .map(|_| ())
+                            .context("failed to publish event")
+                    });
+                }
+                while let Some(result) = pending.next().await {
+                    result?;
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+        }
+
+        try_join_all(flushes).await?;
         Ok(())
     }
 

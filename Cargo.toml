@@ -12,6 +12,7 @@ members = [
     "services/executor-service",
     "services/ingest-service",
     "services/matching-service",
+    "services/benchmark-runner",
     "services/query-service",
     "services/replay-tool",
     "services/timer-service",

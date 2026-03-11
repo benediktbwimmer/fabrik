@@ -18,30 +18,42 @@ use fabrik_events::{
     EventEnvelope, WorkflowEvent, WorkflowIdentity, WorkflowTurnRouting, workflow_turn_routing,
 };
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
-use fabrik_store::{PartitionOwnershipRecord, WorkflowStore};
+use fabrik_store::{ConsumedSignalRecord, PartitionOwnershipRecord, WorkflowStore};
 use fabrik_worker_protocol::activity_worker::{
-    CompleteWorkflowTaskRequest, FailWorkflowTaskRequest, PollWorkflowTaskRequest,
+    CompleteWorkflowTaskRequest, FailWorkflowTaskRequest, PollWorkflowTaskRequest, WorkflowTask,
     workflow_worker_api_client::WorkflowWorkerApiClient,
 };
 use fabrik_workflow::{
-    CompiledExecutionPlan, CompiledWorkflowArtifact, ExecutionEmission, ExecutionTurnContext,
+    ArtifactEntrypoint, CompiledExecutionPlan, CompiledStateNode, CompiledWorkflow,
+    CompiledWorkflowArtifact, ExecutionEmission, ExecutionTurnContext, Expression,
     WorkflowInstanceState, replay_compiled_history_trace_from_snapshot,
     replay_history_trace_from_snapshot,
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, HashMap};
 use std::env;
-use std::collections::HashMap;
+use std::net::TcpListener;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration as StdDuration, Instant};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const OWNERSHIP_TRANSITION_HISTORY_LIMIT: usize = 16;
+const SIGNAL_DISPATCH_EVENT_NAMESPACE: Uuid =
+    Uuid::from_u128(0x2f8a_ff40_8508_4b85_9082_55d2_eb0b_9f19);
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let mut args = env::args().skip(1);
+    if matches!(args.next().as_deref(), Some("benchmark-milestone")) {
+        init_tracing("info");
+        return run_milestone_benchmark(args.collect()).await;
+    }
+
     let config = HttpServiceConfig::from_env("EXECUTOR_SERVICE", "executor-service", 3002)?;
     let redpanda = RedpandaConfig::from_env()?;
     let postgres = PostgresConfig::from_env()?;
@@ -76,8 +88,8 @@ async fn main() -> Result<()> {
     let owner_id = format!("executor-service:{}", Uuid::now_v7());
     let matching_endpoint = env::var("MATCHING_SERVICE_ENDPOINT")
         .unwrap_or_else(|_| "http://127.0.0.1:50051".to_owned());
-    let workflow_worker_build_id = env::var("WORKFLOW_WORKER_BUILD_ID")
-        .unwrap_or_else(|_| "dev-workflow-build".to_owned());
+    let workflow_worker_build_id =
+        env::var("WORKFLOW_WORKER_BUILD_ID").unwrap_or_else(|_| "dev-workflow-build".to_owned());
     let lease_ttl = std::time::Duration::from_secs(ownership.lease_ttl_seconds);
     let initial_partitions = ownership.static_partition_ids.clone().unwrap_or_default();
     let initial_ownerships = if initial_partitions.is_empty() {
@@ -149,6 +161,848 @@ async fn main() -> Result<()> {
     .with_state(ExecutorAppState { debug: debug_state, broker, store });
 
     serve(app, config.port).await
+}
+
+struct MilestoneBenchmarkConfig {
+    items_per_run: usize,
+    iterations: usize,
+}
+
+impl MilestoneBenchmarkConfig {
+    fn parse(args: Vec<String>) -> Result<Self> {
+        let mut config = Self { items_per_run: 1000, iterations: 5 };
+        let mut index = 0usize;
+        while index < args.len() {
+            match args[index].as_str() {
+                "--items" => {
+                    let value = args
+                        .get(index + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--items requires a value"))?;
+                    config.items_per_run = value.parse()?;
+                    index += 2;
+                }
+                "--iterations" => {
+                    let value = args
+                        .get(index + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--iterations requires a value"))?;
+                    config.iterations = value.parse()?;
+                    index += 2;
+                }
+                unknown => {
+                    return Err(anyhow::anyhow!(
+                        "unknown benchmark argument {unknown}; supported flags: --items, --iterations"
+                    ));
+                }
+            }
+        }
+        Ok(config)
+    }
+}
+
+struct BenchmarkPostgres {
+    container_name: String,
+    database_url: String,
+}
+
+impl BenchmarkPostgres {
+    fn start() -> Result<Self> {
+        let container_name = format!("fabrik-executor-bench-pg-{}", Uuid::now_v7());
+        let image = env::var("FABRIK_TEST_POSTGRES_IMAGE")
+            .unwrap_or_else(|_| "postgres:16-alpine".to_owned());
+        let output = Command::new("docker")
+            .args([
+                "run",
+                "--detach",
+                "--rm",
+                "--name",
+                &container_name,
+                "--env",
+                "POSTGRES_USER=fabrik",
+                "--env",
+                "POSTGRES_PASSWORD=fabrik",
+                "--env",
+                "POSTGRES_DB=fabrik_bench",
+                "--publish-all",
+                &image,
+            ])
+            .output()?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "failed to start postgres benchmark container: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        let host_port = wait_for_docker_port(&container_name, "5432/tcp")?;
+        let database_url =
+            format!("postgres://fabrik:fabrik@127.0.0.1:{host_port}/fabrik_bench?sslmode=disable");
+        Ok(Self { container_name, database_url })
+    }
+
+    async fn connect_store(&self) -> Result<WorkflowStore> {
+        let deadline = Instant::now() + StdDuration::from_secs(30);
+        loop {
+            match WorkflowStore::connect(&self.database_url).await {
+                Ok(store) => {
+                    store.init().await?;
+                    return Ok(store);
+                }
+                Err(error) if Instant::now() < deadline => {
+                    let _ = error;
+                    tokio::time::sleep(StdDuration::from_millis(250)).await;
+                }
+                Err(error) => {
+                    let logs = docker_logs(&self.container_name).unwrap_or_default();
+                    return Err(anyhow::Error::from(error).context(format!(
+                        "postgres benchmark container {} did not become ready; logs:\n{}",
+                        self.container_name, logs
+                    )));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for BenchmarkPostgres {
+    fn drop(&mut self) {
+        let _ = cleanup_container(&self.container_name);
+    }
+}
+
+struct BenchmarkRedpanda {
+    container_name: String,
+    broker: BrokerConfig,
+}
+
+impl BenchmarkRedpanda {
+    fn start() -> Result<Self> {
+        let kafka_port = choose_free_port()?;
+        let container_name = format!("fabrik-executor-bench-rp-{}", Uuid::now_v7());
+        let image = env::var("FABRIK_TEST_REDPANDA_IMAGE")
+            .unwrap_or_else(|_| "docker.redpanda.com/redpandadata/redpanda:v25.1.2".to_owned());
+        let topic = format!("workflow-events-bench-{}", Uuid::now_v7());
+        let output = Command::new("docker")
+            .args([
+                "run",
+                "--detach",
+                "--rm",
+                "--name",
+                &container_name,
+                "--publish",
+                &format!("{kafka_port}:{kafka_port}"),
+                &image,
+                "redpanda",
+                "start",
+                "--overprovisioned",
+                "--smp",
+                "1",
+                "--memory",
+                "1G",
+                "--reserve-memory",
+                "0M",
+                "--node-id",
+                "0",
+                "--check=false",
+                "--kafka-addr",
+                &format!("PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:{kafka_port}"),
+                "--advertise-kafka-addr",
+                &format!("PLAINTEXT://127.0.0.1:9092,OUTSIDE://127.0.0.1:{kafka_port}"),
+                "--rpc-addr",
+                "0.0.0.0:33145",
+                "--advertise-rpc-addr",
+                "127.0.0.1:33145",
+            ])
+            .output()?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "failed to start redpanda benchmark container: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        Ok(Self {
+            container_name,
+            broker: BrokerConfig::new(format!("127.0.0.1:{kafka_port}"), topic, 1),
+        })
+    }
+
+    async fn connect_publisher(&self) -> Result<WorkflowPublisher> {
+        let deadline = Instant::now() + StdDuration::from_secs(45);
+        loop {
+            match WorkflowPublisher::new(&self.broker, "executor-benchmark").await {
+                Ok(publisher) => return Ok(publisher),
+                Err(error) if Instant::now() < deadline => {
+                    let _ = error;
+                    tokio::time::sleep(StdDuration::from_millis(500)).await;
+                }
+                Err(error) => {
+                    let logs = docker_logs(&self.container_name).unwrap_or_default();
+                    return Err(anyhow::Error::from(error).context(format!(
+                        "redpanda benchmark container {} did not become ready; logs:\n{}",
+                        self.container_name, logs
+                    )));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for BenchmarkRedpanda {
+    fn drop(&mut self) {
+        let _ = cleanup_container(&self.container_name);
+    }
+}
+
+struct BenchmarkHarness {
+    store: WorkflowStore,
+    broker: BrokerConfig,
+    publisher: WorkflowPublisher,
+    debug_state: Arc<Mutex<ExecutorDebugState>>,
+    lease_state: Arc<Mutex<LeaseState>>,
+    partition_id: i32,
+    task_queue: String,
+    worker_id: String,
+    worker_build_id: String,
+}
+
+struct ScenarioMeasurement {
+    enqueue_duration: StdDuration,
+    drain_duration: StdDuration,
+    end_to_end_duration: StdDuration,
+    task_rows: u64,
+    tasks_executed: u64,
+    restores: u64,
+}
+
+struct ScenarioSummary {
+    name: &'static str,
+    workload: &'static str,
+    items_per_run: usize,
+    iterations: usize,
+    measurements: Vec<ScenarioMeasurement>,
+}
+
+#[derive(Debug)]
+struct ConsumedSignal {
+    signal_id: String,
+    consumed_event_id: Uuid,
+    consumed_at: chrono::DateTime<chrono::Utc>,
+}
+
+struct WorkflowPublishBuffer<'a> {
+    publisher: &'a WorkflowPublisher,
+    envelopes: Vec<EventEnvelope<WorkflowEvent>>,
+}
+
+impl<'a> WorkflowPublishBuffer<'a> {
+    fn new(publisher: &'a WorkflowPublisher) -> Self {
+        Self { publisher, envelopes: Vec::new() }
+    }
+
+    fn publish(&mut self, envelope: &EventEnvelope<WorkflowEvent>) {
+        self.envelopes.push(envelope.clone());
+    }
+
+    async fn flush(&mut self) -> Result<()> {
+        if self.envelopes.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.envelopes);
+        self.publisher.publish_all(&pending).await
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct WorkflowLookupKey {
+    tenant_id: String,
+    definition_id: String,
+    definition_version: Option<u32>,
+}
+
+#[derive(Default)]
+struct WorkflowLookupCache {
+    key: Option<WorkflowLookupKey>,
+    artifact: Option<Option<CompiledWorkflowArtifact>>,
+    definition: Option<fabrik_workflow::WorkflowDefinition>,
+}
+
+async fn run_milestone_benchmark(args: Vec<String>) -> Result<()> {
+    let config = MilestoneBenchmarkConfig::parse(args)?;
+    info!(
+        items_per_run = config.items_per_run,
+        iterations = config.iterations,
+        "starting milestone benchmark"
+    );
+
+    let postgres = BenchmarkPostgres::start()?;
+    let redpanda = BenchmarkRedpanda::start()?;
+    let store = postgres.connect_store().await?;
+    let publisher = redpanda.connect_publisher().await?;
+    let partition_id = 0;
+    let ownership = store
+        .claim_partition_ownership(partition_id, "executor-benchmark", StdDuration::from_secs(120))
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("failed to claim benchmark partition ownership"))?;
+    let debug_state =
+        Arc::new(Mutex::new(ExecutorDebugState::new(&[ownership.clone()], 128, 10_000)));
+    let lease_state = Arc::new(Mutex::new(LeaseState::from_record(&ownership)));
+    let harness = BenchmarkHarness {
+        store: store.clone(),
+        broker: redpanda.broker.clone(),
+        publisher,
+        debug_state,
+        lease_state,
+        partition_id,
+        task_queue: "bench".to_owned(),
+        worker_id: "benchmark-worker".to_owned(),
+        worker_build_id: "benchmark-build".to_owned(),
+    };
+
+    let signal_artifact = signal_benchmark_artifact();
+    let activity_artifact = activity_benchmark_artifact();
+    harness.store.put_artifact("tenant-bench", &signal_artifact).await?;
+    harness.store.put_artifact("tenant-bench", &activity_artifact).await?;
+
+    let signal_current = run_signal_benchmark(&harness, &signal_artifact, &config).await?;
+    let activity_current =
+        run_activity_resume_benchmark(&harness, &activity_artifact, &config).await?;
+    print_scenario_summary(&signal_current);
+    print_scenario_summary(&activity_current);
+
+    Ok(())
+}
+
+async fn run_signal_benchmark(
+    harness: &BenchmarkHarness,
+    artifact: &CompiledWorkflowArtifact,
+    config: &MilestoneBenchmarkConfig,
+) -> Result<ScenarioSummary> {
+    let mut measurements = Vec::with_capacity(config.iterations);
+    for iteration in 0..config.iterations {
+        let instance_id = format!("bench-signal-current-{iteration}");
+        let run_id = format!("run-{instance_id}");
+        seed_benchmark_run(harness, artifact, &instance_id, &run_id, "wait_signal").await?;
+
+        let start = Instant::now();
+        let enqueue_duration =
+            enqueue_signal_burst(harness, artifact, &instance_id, &run_id, config.items_per_run)
+                .await?;
+        let task_rows = harness
+            .store
+            .count_workflow_tasks_for_run("tenant-bench", &instance_id, &run_id)
+            .await?;
+        let (drain_duration, tasks_executed, restores) =
+            drain_benchmark_run(harness, config.items_per_run).await?;
+        measurements.push(ScenarioMeasurement {
+            enqueue_duration,
+            drain_duration,
+            end_to_end_duration: start.elapsed(),
+            task_rows,
+            tasks_executed,
+            restores,
+        });
+    }
+
+    Ok(ScenarioSummary {
+        name: "signal_current",
+        workload: "signals",
+        items_per_run: config.items_per_run,
+        iterations: config.iterations,
+        measurements,
+    })
+}
+
+async fn run_activity_resume_benchmark(
+    harness: &BenchmarkHarness,
+    artifact: &CompiledWorkflowArtifact,
+    config: &MilestoneBenchmarkConfig,
+) -> Result<ScenarioSummary> {
+    let mut measurements = Vec::with_capacity(config.iterations);
+    for iteration in 0..config.iterations {
+        let instance_id = format!("bench-activity-current-{iteration}");
+        let run_id = format!("run-{instance_id}");
+        seed_benchmark_run(harness, artifact, &instance_id, &run_id, "step").await?;
+
+        let start = Instant::now();
+        let enqueue_duration = enqueue_activity_resume_burst(
+            harness,
+            artifact,
+            &instance_id,
+            &run_id,
+            config.items_per_run,
+        )
+        .await?;
+        let task_rows = harness
+            .store
+            .count_workflow_tasks_for_run("tenant-bench", &instance_id, &run_id)
+            .await?;
+        let (drain_duration, tasks_executed, restores) =
+            drain_benchmark_run(harness, config.items_per_run).await?;
+        measurements.push(ScenarioMeasurement {
+            enqueue_duration,
+            drain_duration,
+            end_to_end_duration: start.elapsed(),
+            task_rows,
+            tasks_executed,
+            restores,
+        });
+    }
+
+    Ok(ScenarioSummary {
+        name: "activity_resume_current",
+        workload: "activity_resumes",
+        items_per_run: config.items_per_run,
+        iterations: config.iterations,
+        measurements,
+    })
+}
+
+async fn seed_benchmark_run(
+    harness: &BenchmarkHarness,
+    artifact: &CompiledWorkflowArtifact,
+    instance_id: &str,
+    run_id: &str,
+    current_state: &str,
+) -> Result<()> {
+    let started_at = chrono::Utc::now();
+    let trigger_event_id = Uuid::now_v7();
+    harness
+        .store
+        .put_run_start(
+            "tenant-bench",
+            instance_id,
+            run_id,
+            &artifact.definition_id,
+            Some(artifact.definition_version),
+            Some(&artifact.artifact_hash),
+            &harness.task_queue,
+            trigger_event_id,
+            started_at,
+            None,
+            None,
+        )
+        .await?;
+    harness
+        .store
+        .upsert_instance(&WorkflowInstanceState {
+            tenant_id: "tenant-bench".to_owned(),
+            instance_id: instance_id.to_owned(),
+            run_id: run_id.to_owned(),
+            definition_id: artifact.definition_id.clone(),
+            definition_version: Some(artifact.definition_version),
+            artifact_hash: Some(artifact.artifact_hash.clone()),
+            workflow_task_queue: harness.task_queue.clone(),
+            sticky_workflow_build_id: None,
+            sticky_workflow_poller_id: None,
+            current_state: Some(current_state.to_owned()),
+            context: Some(Value::Null),
+            artifact_execution: Some(Default::default()),
+            status: fabrik_workflow::WorkflowStatus::Running,
+            input: Some(Value::Null),
+            output: None,
+            event_count: 1,
+            last_event_id: trigger_event_id,
+            last_event_type: "WorkflowStarted".to_owned(),
+            updated_at: started_at,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn enqueue_signal_burst(
+    harness: &BenchmarkHarness,
+    artifact: &CompiledWorkflowArtifact,
+    instance_id: &str,
+    run_id: &str,
+    items: usize,
+) -> Result<StdDuration> {
+    let start = Instant::now();
+    for sequence in 0..items {
+        let event = benchmark_signal_event(
+            &artifact.definition_id,
+            artifact.definition_version,
+            &artifact.artifact_hash,
+            instance_id,
+            run_id,
+            sequence,
+            &harness.task_queue,
+        );
+        harness
+            .store
+            .queue_signal(
+                "tenant-bench",
+                instance_id,
+                run_id,
+                &format!("sig-{sequence}"),
+                "external.approved",
+                None,
+                &json!({ "sequence": sequence }),
+                event.event_id,
+                event.occurred_at,
+            )
+            .await?;
+        harness
+            .store
+            .enqueue_workflow_mailbox_message(
+                harness.partition_id,
+                &harness.task_queue,
+                None,
+                &event,
+                fabrik_store::WorkflowMailboxKind::Signal,
+                Some(&format!("sig-{sequence}")),
+                Some("external.approved"),
+                Some(&json!({ "sequence": sequence })),
+            )
+            .await?;
+    }
+    Ok(start.elapsed())
+}
+
+async fn enqueue_activity_resume_burst(
+    harness: &BenchmarkHarness,
+    artifact: &CompiledWorkflowArtifact,
+    instance_id: &str,
+    run_id: &str,
+    items: usize,
+) -> Result<StdDuration> {
+    let start = Instant::now();
+    for sequence in 0..items {
+        let event = benchmark_activity_completed_event(
+            &artifact.definition_id,
+            artifact.definition_version,
+            &artifact.artifact_hash,
+            instance_id,
+            run_id,
+            sequence,
+            &harness.task_queue,
+        );
+        harness
+            .store
+            .enqueue_workflow_resume(
+                harness.partition_id,
+                &harness.task_queue,
+                None,
+                &event,
+                fabrik_store::WorkflowResumeKind::ActivityTerminal,
+                &format!("step:{}", sequence + 1),
+                Some("completed"),
+            )
+            .await?;
+    }
+    Ok(start.elapsed())
+}
+
+async fn drain_benchmark_run(
+    harness: &BenchmarkHarness,
+    items_per_run: usize,
+) -> Result<(StdDuration, u64, u64)> {
+    let start = Instant::now();
+    let mut tasks_executed = 0u64;
+    let mut restores = 0u64;
+
+    loop {
+        let Some(task_record) = harness
+            .store
+            .lease_next_workflow_task(
+                harness.partition_id,
+                &harness.worker_id,
+                &harness.worker_build_id,
+                chrono::Duration::seconds(30),
+            )
+            .await?
+        else {
+            break;
+        };
+
+        let mut runtime =
+            ExecutorRuntime::new(64, 10_000, None, None, None, items_per_run, items_per_run);
+        let task = WorkflowTask {
+            task_id: task_record.task_id.to_string(),
+            tenant_id: task_record.tenant_id.clone(),
+            instance_id: task_record.instance_id.clone(),
+            run_id: task_record.run_id.clone(),
+            definition_id: task_record.definition_id.clone(),
+            definition_version: task_record.definition_version.unwrap_or_default(),
+            artifact_hash: task_record.artifact_hash.clone().unwrap_or_default(),
+            partition_id: task_record.partition_id,
+            task_queue: task_record.task_queue.clone(),
+            preferred_build_id: task_record.preferred_build_id.clone().unwrap_or_default(),
+            mailbox_consumed_seq: task_record.mailbox_consumed_seq,
+            resume_consumed_seq: task_record.resume_consumed_seq,
+            mailbox_backlog: task_record.mailbox_backlog,
+            resume_backlog: task_record.resume_backlog,
+            attempt_count: task_record.attempt_count,
+            created_at_unix_ms: task_record.created_at.timestamp_millis(),
+        };
+        let outcome = process_workflow_task(
+            &harness.store,
+            &harness.broker,
+            &harness.publisher,
+            &mut runtime,
+            &harness.debug_state,
+            &harness.lease_state,
+            &task,
+            &harness.worker_id,
+            &harness.worker_build_id,
+        )
+        .await?;
+        if !matches!(outcome, TaskDrainOutcome::Drained) {
+            anyhow::bail!("benchmark run blocked unexpectedly while draining task");
+        }
+        harness
+            .store
+            .complete_workflow_task(
+                task_record.task_id,
+                &harness.worker_id,
+                &harness.worker_build_id,
+                chrono::Utc::now(),
+            )
+            .await?;
+
+        tasks_executed += 1;
+        restores += runtime.restores_from_projection + runtime.restores_from_snapshot_replay;
+    }
+
+    Ok((start.elapsed(), tasks_executed, restores))
+}
+
+fn signal_benchmark_artifact() -> CompiledWorkflowArtifact {
+    CompiledWorkflowArtifact::new(
+        "bench-signal",
+        1,
+        "benchmark",
+        ArtifactEntrypoint { module: "bench.ts".to_owned(), export: "signal".to_owned() },
+        CompiledWorkflow {
+            initial_state: "wait_signal".to_owned(),
+            states: BTreeMap::from([(
+                "wait_signal".to_owned(),
+                CompiledStateNode::WaitForEvent {
+                    event_type: "external.approved".to_owned(),
+                    next: "wait_signal".to_owned(),
+                    output_var: None,
+                },
+            )]),
+        },
+    )
+}
+
+fn activity_benchmark_artifact() -> CompiledWorkflowArtifact {
+    CompiledWorkflowArtifact::new(
+        "bench-activity",
+        1,
+        "benchmark",
+        ArtifactEntrypoint { module: "bench.ts".to_owned(), export: "activity".to_owned() },
+        CompiledWorkflow {
+            initial_state: "step".to_owned(),
+            states: BTreeMap::from([(
+                "step".to_owned(),
+                CompiledStateNode::Step {
+                    handler: "core.echo".to_owned(),
+                    input: Expression::Literal { value: Value::Null },
+                    next: Some("step".to_owned()),
+                    retry: None,
+                    config: None,
+                    output_var: None,
+                    on_error: None,
+                },
+            )]),
+        },
+    )
+}
+
+fn benchmark_signal_event(
+    definition_id: &str,
+    definition_version: u32,
+    artifact_hash: &str,
+    instance_id: &str,
+    run_id: &str,
+    sequence: usize,
+    task_queue: &str,
+) -> EventEnvelope<WorkflowEvent> {
+    let mut event = EventEnvelope::new(
+        WorkflowEvent::SignalQueued {
+            signal_id: format!("sig-{sequence}"),
+            signal_type: "external.approved".to_owned(),
+            payload: json!({ "sequence": sequence }),
+        }
+        .event_type(),
+        WorkflowIdentity::new(
+            "tenant-bench",
+            definition_id,
+            definition_version,
+            artifact_hash,
+            instance_id,
+            run_id,
+            "benchmark",
+        ),
+        WorkflowEvent::SignalQueued {
+            signal_id: format!("sig-{sequence}"),
+            signal_type: "external.approved".to_owned(),
+            payload: json!({ "sequence": sequence }),
+        },
+    );
+    event.metadata.insert("workflow_task_queue".to_owned(), task_queue.to_owned());
+    event.occurred_at += chrono::Duration::milliseconds(sequence as i64);
+    event
+}
+
+fn benchmark_activity_completed_event(
+    definition_id: &str,
+    definition_version: u32,
+    artifact_hash: &str,
+    instance_id: &str,
+    run_id: &str,
+    sequence: usize,
+    task_queue: &str,
+) -> EventEnvelope<WorkflowEvent> {
+    let mut event = EventEnvelope::new(
+        WorkflowEvent::ActivityTaskCompleted {
+            activity_id: "step".to_owned(),
+            attempt: 1,
+            output: json!({ "sequence": sequence }),
+            worker_id: "activity-bench-worker".to_owned(),
+            worker_build_id: "activity-bench-build".to_owned(),
+        }
+        .event_type(),
+        WorkflowIdentity::new(
+            "tenant-bench",
+            definition_id,
+            definition_version,
+            artifact_hash,
+            instance_id,
+            run_id,
+            "benchmark",
+        ),
+        WorkflowEvent::ActivityTaskCompleted {
+            activity_id: "step".to_owned(),
+            attempt: 1,
+            output: json!({ "sequence": sequence }),
+            worker_id: "activity-bench-worker".to_owned(),
+            worker_build_id: "activity-bench-build".to_owned(),
+        },
+    );
+    event.metadata.insert("workflow_task_queue".to_owned(), task_queue.to_owned());
+    event.occurred_at += chrono::Duration::milliseconds(sequence as i64);
+    event
+}
+
+fn print_scenario_summary(summary: &ScenarioSummary) {
+    let enqueue_samples = summary
+        .measurements
+        .iter()
+        .map(|measurement| measurement.enqueue_duration)
+        .collect::<Vec<_>>();
+    let drain_samples = summary
+        .measurements
+        .iter()
+        .map(|measurement| measurement.drain_duration)
+        .collect::<Vec<_>>();
+    let end_to_end_samples = summary
+        .measurements
+        .iter()
+        .map(|measurement| measurement.end_to_end_duration)
+        .collect::<Vec<_>>();
+    let total_events = summary.items_per_run * summary.iterations;
+    let total_tasks_executed =
+        summary.measurements.iter().map(|measurement| measurement.tasks_executed).sum::<u64>();
+    let total_restores =
+        summary.measurements.iter().map(|measurement| measurement.restores).sum::<u64>();
+    let avg_task_rows =
+        summary.measurements.iter().map(|measurement| measurement.task_rows as f64).sum::<f64>()
+            / summary.measurements.len() as f64;
+
+    println!(
+        "benchmark={} workload={} iterations={} items_per_run={} avg_task_rows={avg_task_rows:.2} total_tasks_executed={} total_restores={} enqueue_total_ms={:.2} enqueue_throughput_eps={:.2} enqueue_p50_ms={:.2} enqueue_p95_ms={:.2} drain_total_ms={:.2} drain_throughput_eps={:.2} drain_p50_ms={:.2} drain_p95_ms={:.2} e2e_total_ms={:.2} e2e_throughput_eps={:.2} e2e_p50_ms={:.2} e2e_p95_ms={:.2}",
+        summary.name,
+        summary.workload,
+        summary.iterations,
+        summary.items_per_run,
+        total_tasks_executed,
+        total_restores,
+        total_ms(&enqueue_samples),
+        throughput_events_per_second(total_events, &enqueue_samples),
+        percentile_ms(&enqueue_samples, 50.0),
+        percentile_ms(&enqueue_samples, 95.0),
+        total_ms(&drain_samples),
+        throughput_events_per_second(total_events, &drain_samples),
+        percentile_ms(&drain_samples, 50.0),
+        percentile_ms(&drain_samples, 95.0),
+        total_ms(&end_to_end_samples),
+        throughput_events_per_second(total_events, &end_to_end_samples),
+        percentile_ms(&end_to_end_samples, 50.0),
+        percentile_ms(&end_to_end_samples, 95.0),
+    );
+}
+
+fn total_ms(samples: &[StdDuration]) -> f64 {
+    samples.iter().map(|sample| sample.as_secs_f64() * 1000.0).sum()
+}
+
+fn throughput_events_per_second(total_events: usize, samples: &[StdDuration]) -> f64 {
+    let total_seconds = samples.iter().map(StdDuration::as_secs_f64).sum::<f64>();
+    if total_seconds == 0.0 { 0.0 } else { total_events as f64 / total_seconds }
+}
+
+fn percentile_ms(samples: &[StdDuration], percentile: f64) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut values = samples.iter().map(|sample| sample.as_secs_f64() * 1000.0).collect::<Vec<_>>();
+    values.sort_by(|left, right| left.total_cmp(right));
+    let rank = ((percentile / 100.0) * (values.len().saturating_sub(1) as f64)).round() as usize;
+    values[rank]
+}
+
+fn wait_for_docker_port(container_name: &str, container_port: &str) -> Result<u16> {
+    let deadline = Instant::now() + StdDuration::from_secs(15);
+    loop {
+        let output = Command::new("docker")
+            .args([
+                "inspect",
+                "--format",
+                &format!(
+                    "{{{{(index (index .NetworkSettings.Ports \"{container_port}\") 0).HostPort}}}}"
+                ),
+                container_name,
+            ])
+            .output()?;
+        if output.status.success() {
+            let host_port = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !host_port.is_empty() {
+                return host_port.parse::<u16>().map_err(anyhow::Error::from);
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for port {container_port} on {container_name}");
+        }
+        std::thread::sleep(StdDuration::from_millis(100));
+    }
+}
+
+fn choose_free_port() -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
+fn docker_logs(container_name: &str) -> Result<String> {
+    let output = Command::new("docker").args(["logs", container_name]).output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Ok(format!("{stdout}{stderr}"))
+}
+
+fn cleanup_container(container_name: &str) -> Result<()> {
+    let output = Command::new("docker").args(["rm", "--force", container_name]).output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "docker failed to remove container {container_name}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -331,6 +1185,8 @@ async fn spawn_partition_worker(
         runtime_config.continue_as_new_event_threshold,
         runtime_config.continue_as_new_activity_attempt_threshold,
         runtime_config.continue_as_new_run_age_seconds,
+        runtime_config.max_mailbox_items_per_turn,
+        runtime_config.max_transitions_per_turn,
     )));
     if let Ok(mut debug) = debug_state.lock() {
         debug.update_ownership(&initial_ownership, "owned", "partition worker started");
@@ -368,13 +1224,10 @@ async fn spawn_partition_worker(
         lease_state.clone(),
     ));
 
-    workers
-        .lock()
-        .map_err(|_| anyhow::anyhow!("partition worker map lock poisoned"))?
-        .insert(
-            partition_id,
-            PartitionWorkerHandle { renewal_task, consumer_task, poller_task, lease_state },
-        );
+    workers.lock().map_err(|_| anyhow::anyhow!("partition worker map lock poisoned"))?.insert(
+        partition_id,
+        PartitionWorkerHandle { renewal_task, consumer_task, poller_task, lease_state },
+    );
     Ok(())
 }
 
@@ -450,18 +1303,25 @@ async fn run_executor_loop(
                         state.record_local_executor_event(partition_id);
                     }
                     let mut runtime = runtime.lock().await;
+                    let mut persist_mode = PersistMode::Immediate;
+                    let mut lookup_cache = WorkflowLookupCache::default();
+                    let mut publish_buffer = WorkflowPublishBuffer::new(&publisher);
                     if let Err(error) = process_event(
                         &store,
                         &broker,
-                        &publisher,
+                        &mut publish_buffer,
                         &mut runtime,
                         &debug_state,
                         &lease_state,
                         event,
+                        &mut persist_mode,
+                        &mut lookup_cache,
                     )
                     .await
                     {
                         error!(error = %error, "failed to process workflow event");
+                    } else if let Err(error) = publish_buffer.flush().await {
+                        error!(error = %error, "failed to flush workflow event publishes");
                     }
                 }
                 Err(error) => warn!(error = %error, "skipping invalid workflow event"),
@@ -524,55 +1384,32 @@ async fn run_workflow_poll_loop(
             }
 
             let task_id = task.task_id.clone();
-            let mut event: EventEnvelope<WorkflowEvent> = match serde_json::from_str(&task.source_event_json) {
-                Ok(event) => event,
-                Err(error) => {
-                    error!(
-                        error = %error,
-                        task_id = %task_id,
-                        partition_id,
-                        "failed to decode workflow task event"
-                    );
-                    let _ = client
-                        .fail_workflow_task(FailWorkflowTaskRequest {
-                            task_id,
-                            worker_id: worker_id.clone(),
-                            worker_build_id: worker_build_id.clone(),
-                            error: error.to_string(),
-                        })
-                        .await;
-                    continue;
-                }
-            };
-            event
-                .metadata
-                .insert("workflow_build_id".to_owned(), worker_build_id.clone());
-            event
-                .metadata
-                .insert("workflow_poller_id".to_owned(), worker_id.clone());
-
+            let task_uuid = Uuid::parse_str(&task_id).expect("workflow task id is a uuid");
             let execution_started_at = std::time::Instant::now();
             let queue_latency_ms = chrono::Utc::now()
                 .timestamp_millis()
                 .saturating_sub(task.created_at_unix_ms as i64)
                 .max(0) as u64;
-            let sticky_outcome = classify_sticky_dispatch(&task.preferred_build_id, &worker_build_id);
+            let sticky_outcome =
+                classify_sticky_dispatch(&task.preferred_build_id, &worker_build_id);
             let result = {
                 let mut runtime = runtime.lock().await;
-                process_event(
+                process_workflow_task(
                     &store,
                     &broker,
                     &publisher,
                     &mut runtime,
                     &debug_state,
                     &lease_state,
-                    event.clone(),
+                    &task,
+                    &worker_id,
+                    &worker_build_id,
                 )
                 .await
             };
 
             match result {
-                Ok(()) => {
+                Ok(outcome) => {
                     if let Ok(mut state) = debug_state.lock() {
                         state.record_workflow_task_execution(
                             partition_id,
@@ -583,30 +1420,53 @@ async fn run_workflow_poll_loop(
                     }
                     let _ = store
                         .update_run_workflow_sticky(
-                            &event.tenant_id,
-                            &event.instance_id,
-                            &event.run_id,
+                            &task.tenant_id,
+                            &task.instance_id,
+                            &task.run_id,
                             &task.task_queue,
                             &worker_build_id,
                             &worker_id,
                             chrono::Utc::now(),
                         )
                         .await;
-                    if let Err(error) = client
-                        .complete_workflow_task(CompleteWorkflowTaskRequest {
-                            task_id,
-                            worker_id: worker_id.clone(),
-                            worker_build_id: worker_build_id.clone(),
-                        })
-                        .await
-                    {
-                        error!(
-                            error = %error,
-                            partition_id,
-                            workflow_instance_id = %event.instance_id,
-                            "failed to ack workflow task completion"
-                        );
-                        break;
+                    match outcome {
+                        TaskDrainOutcome::Drained => {
+                            if let Err(error) = client
+                                .complete_workflow_task(CompleteWorkflowTaskRequest {
+                                    task_id,
+                                    worker_id: worker_id.clone(),
+                                    worker_build_id: worker_build_id.clone(),
+                                })
+                                .await
+                            {
+                                error!(
+                                    error = %error,
+                                    partition_id,
+                                    workflow_instance_id = %task.instance_id,
+                                    "failed to ack workflow task completion"
+                                );
+                                break;
+                            }
+                        }
+                        TaskDrainOutcome::Blocked => {
+                            if let Err(error) = store
+                                .park_workflow_task(
+                                    task_uuid,
+                                    &worker_id,
+                                    &worker_build_id,
+                                    chrono::Utc::now(),
+                                )
+                                .await
+                            {
+                                error!(
+                                    error = %error,
+                                    partition_id,
+                                    workflow_instance_id = %task.instance_id,
+                                    "failed to park blocked workflow task"
+                                );
+                                break;
+                            }
+                        }
                     }
                 }
                 Err(error) => {
@@ -621,8 +1481,8 @@ async fn run_workflow_poll_loop(
                     error!(
                         error = %error,
                         partition_id,
-                        workflow_instance_id = %event.instance_id,
-                        run_id = %event.run_id,
+                        workflow_instance_id = %task.instance_id,
+                        run_id = %task.run_id,
                         "failed to process leased workflow task"
                     );
                     if let Err(ack_error) = client
@@ -645,14 +1505,704 @@ async fn run_workflow_poll_loop(
     }
 }
 
-async fn process_event(
+async fn process_workflow_task(
     store: &WorkflowStore,
     broker: &BrokerConfig,
     publisher: &WorkflowPublisher,
     runtime: &mut ExecutorRuntime,
     debug_state: &Arc<Mutex<ExecutorDebugState>>,
     lease_state: &Arc<Mutex<LeaseState>>,
+    task: &WorkflowTask,
+    worker_id: &str,
+    worker_build_id: &str,
+) -> Result<TaskDrainOutcome> {
+    let mut transitions = 0usize;
+    let mut mailbox_items = 0usize;
+    let mut persist_mode = PersistMode::Deferred { dirty: false };
+    let mut lookup_cache = WorkflowLookupCache::default();
+    let mut consumed_signals = Vec::new();
+    let mut publish_buffer = WorkflowPublishBuffer::new(publisher);
+
+    loop {
+        if transitions >= runtime.max_transitions_per_turn
+            || mailbox_items >= runtime.max_mailbox_items_per_turn
+        {
+            return finalize_task_drain(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                task,
+                &persist_mode,
+                &mut publish_buffer,
+                TaskDrainOutcome::Drained,
+            )
+            .await;
+        }
+
+        let resume_batch_limit = runtime.max_transitions_per_turn.saturating_sub(transitions);
+        if resume_batch_limit > 0 {
+            let resume_batch = store
+                .list_next_workflow_resume_items(
+                    &task.tenant_id,
+                    &task.instance_id,
+                    &task.run_id,
+                    resume_batch_limit.min(256),
+                )
+                .await?;
+            if !resume_batch.is_empty() {
+                let mut consumed_resume_count = 0usize;
+                let mut max_consumed_resume_seq = None;
+                for resume in resume_batch {
+                    if transitions >= runtime.max_transitions_per_turn {
+                        break;
+                    }
+                    let mut event = resume.source_event.clone();
+                    annotate_workflow_task_event(&mut event, worker_id, worker_build_id);
+                    if let Err(error) = process_event(
+                        store,
+                        broker,
+                        &mut publish_buffer,
+                        runtime,
+                        debug_state,
+                        lease_state,
+                        event,
+                        &mut persist_mode,
+                        &mut lookup_cache,
+                    )
+                    .await
+                    {
+                        flush_task_side_effects(
+                            store,
+                            runtime,
+                            debug_state,
+                            lease_state,
+                            task,
+                            &persist_mode,
+                            &mut publish_buffer,
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                    consumed_resume_count += 1;
+                    max_consumed_resume_seq = Some(resume.resume_seq);
+                    transitions += 1;
+                }
+                if let Some(max_resume_seq) = max_consumed_resume_seq {
+                    store
+                        .mark_workflow_resume_items_consumed_through(
+                            &task.tenant_id,
+                            &task.instance_id,
+                            &task.run_id,
+                            max_resume_seq,
+                            consumed_resume_count,
+                            chrono::Utc::now(),
+                        )
+                        .await?;
+                }
+                continue;
+            }
+        }
+
+        if mailbox_items >= runtime.max_mailbox_items_per_turn
+            || transitions >= runtime.max_transitions_per_turn
+        {
+            return finalize_task_drain(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                task,
+                &persist_mode,
+                &mut publish_buffer,
+                TaskDrainOutcome::Drained,
+            )
+            .await;
+        }
+
+        let mailbox_batch_limit = runtime.max_mailbox_items_per_turn.saturating_sub(mailbox_items);
+        let mailbox_batch = store
+            .list_next_workflow_mailbox_items(
+                &task.tenant_id,
+                &task.instance_id,
+                &task.run_id,
+                mailbox_batch_limit.min(256),
+            )
+            .await?;
+        if mailbox_batch.is_empty() {
+            return finalize_task_drain(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                task,
+                &persist_mode,
+                &mut publish_buffer,
+                TaskDrainOutcome::Drained,
+            )
+            .await;
+        }
+
+        let mut consumed_mailbox_count = 0usize;
+        let mut max_consumed_mailbox_seq = None;
+        for item in mailbox_batch {
+            if mailbox_items >= runtime.max_mailbox_items_per_turn
+                || transitions >= runtime.max_transitions_per_turn
+            {
+                break;
+            }
+
+            let dispatch_outcome = match dispatch_mailbox_item(
+                store,
+                broker,
+                &mut publish_buffer,
+                runtime,
+                debug_state,
+                lease_state,
+                &item,
+                worker_id,
+                worker_build_id,
+                &mut persist_mode,
+                &mut lookup_cache,
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    flush_task_side_effects(
+                        store,
+                        runtime,
+                        debug_state,
+                        lease_state,
+                        task,
+                        &persist_mode,
+                        &mut publish_buffer,
+                    )
+                    .await?;
+                    return Err(error);
+                }
+            };
+
+            match dispatch_outcome {
+                MailboxDispatchOutcome::Processed { consumed_signal } => {
+                    if let Some(consumed_signal) = consumed_signal {
+                        consumed_signals.push(consumed_signal);
+                    }
+                    consumed_mailbox_count += 1;
+                    max_consumed_mailbox_seq = Some(item.accepted_seq);
+                    mailbox_items += 1;
+                    transitions += 1;
+                }
+                MailboxDispatchOutcome::ConsumedNoop => {
+                    consumed_mailbox_count += 1;
+                    max_consumed_mailbox_seq = Some(item.accepted_seq);
+                    mailbox_items += 1;
+                }
+                MailboxDispatchOutcome::Blocked => {
+                    if !consumed_signals.is_empty() {
+                        store
+                            .mark_signals_consumed(
+                                &task.tenant_id,
+                                &task.instance_id,
+                                &task.run_id,
+                                &consumed_signals
+                                    .iter()
+                                    .map(|signal| ConsumedSignalRecord {
+                                        signal_id: signal.signal_id.clone(),
+                                        consumed_event_id: signal.consumed_event_id,
+                                        consumed_at: signal.consumed_at,
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                            .await?;
+                        consumed_signals.clear();
+                    }
+                    if let Some(max_mailbox_seq) = max_consumed_mailbox_seq {
+                        store
+                            .mark_workflow_mailbox_items_consumed_through(
+                                &task.tenant_id,
+                                &task.instance_id,
+                                &task.run_id,
+                                max_mailbox_seq,
+                                consumed_mailbox_count,
+                                chrono::Utc::now(),
+                            )
+                            .await?;
+                    }
+                    return finalize_task_drain(
+                        store,
+                        runtime,
+                        debug_state,
+                        lease_state,
+                        task,
+                        &persist_mode,
+                        &mut publish_buffer,
+                        TaskDrainOutcome::Blocked,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        if !consumed_signals.is_empty() {
+            store
+                .mark_signals_consumed(
+                    &task.tenant_id,
+                    &task.instance_id,
+                    &task.run_id,
+                    &consumed_signals
+                        .iter()
+                        .map(|signal| ConsumedSignalRecord {
+                            signal_id: signal.signal_id.clone(),
+                            consumed_event_id: signal.consumed_event_id,
+                            consumed_at: signal.consumed_at,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .await?;
+            consumed_signals.clear();
+        }
+        if let Some(max_mailbox_seq) = max_consumed_mailbox_seq {
+            store
+                .mark_workflow_mailbox_items_consumed_through(
+                    &task.tenant_id,
+                    &task.instance_id,
+                    &task.run_id,
+                    max_mailbox_seq,
+                    consumed_mailbox_count,
+                    chrono::Utc::now(),
+                )
+                .await?;
+        }
+    }
+}
+
+#[derive(Debug)]
+enum MailboxDispatchOutcome {
+    Processed { consumed_signal: Option<ConsumedSignal> },
+    ConsumedNoop,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskDrainOutcome {
+    Drained,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistMode {
+    Immediate,
+    Deferred { dirty: bool },
+}
+
+async fn finalize_task_drain(
+    store: &WorkflowStore,
+    runtime: &mut ExecutorRuntime,
+    debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    lease_state: &Arc<Mutex<LeaseState>>,
+    task: &WorkflowTask,
+    persist_mode: &PersistMode,
+    publish_buffer: &mut WorkflowPublishBuffer<'_>,
+    outcome: TaskDrainOutcome,
+) -> Result<TaskDrainOutcome> {
+    flush_task_side_effects(
+        store,
+        runtime,
+        debug_state,
+        lease_state,
+        task,
+        persist_mode,
+        publish_buffer,
+    )
+    .await?;
+    Ok(outcome)
+}
+
+async fn flush_task_side_effects(
+    store: &WorkflowStore,
+    runtime: &mut ExecutorRuntime,
+    debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    lease_state: &Arc<Mutex<LeaseState>>,
+    task: &WorkflowTask,
+    persist_mode: &PersistMode,
+    publish_buffer: &mut WorkflowPublishBuffer<'_>,
+) -> Result<()> {
+    if let Err(error) = publish_buffer.flush().await {
+        if let PersistMode::Deferred { dirty: true } = persist_mode {
+            flush_deferred_state(store, runtime, debug_state, lease_state, task).await?;
+        }
+        return Err(error);
+    }
+    if let PersistMode::Deferred { dirty: true } = persist_mode {
+        flush_deferred_state(store, runtime, debug_state, lease_state, task).await?;
+    }
+    Ok(())
+}
+
+async fn flush_deferred_state(
+    store: &WorkflowStore,
+    runtime: &mut ExecutorRuntime,
+    debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    lease_state: &Arc<Mutex<LeaseState>>,
+    task: &WorkflowTask,
+) -> Result<()> {
+    let Some(mut record) = runtime.peek(&task.tenant_id, &task.instance_id) else {
+        return Ok(());
+    };
+    let state = record.state.clone();
+    let lease_snapshot =
+        ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
+    persist_state_immediate(
+        store,
+        runtime,
+        debug_state,
+        lease_state,
+        lease_snapshot.partition_id,
+        &mut record,
+        &state,
+    )
+    .await
+}
+
+fn annotate_workflow_task_event(
+    event: &mut EventEnvelope<WorkflowEvent>,
+    worker_id: &str,
+    worker_build_id: &str,
+) {
+    event.metadata.insert("workflow_build_id".to_owned(), worker_build_id.to_owned());
+    event.metadata.insert("workflow_poller_id".to_owned(), worker_id.to_owned());
+}
+
+fn signal_dispatch_event_id(source_event_id: Uuid) -> Uuid {
+    Uuid::new_v5(
+        &SIGNAL_DISPATCH_EVENT_NAMESPACE,
+        format!("signal-dispatch:{source_event_id}").as_bytes(),
+    )
+}
+
+async fn current_workflow_state(
+    store: &WorkflowStore,
+    runtime: &ExecutorRuntime,
+    tenant_id: &str,
+    instance_id: &str,
+) -> Result<Option<WorkflowInstanceState>> {
+    if let Some(record) = runtime.peek(tenant_id, instance_id) {
+        return Ok(Some(record.state));
+    }
+    store.get_instance(tenant_id, instance_id).await
+}
+
+async fn dispatch_mailbox_item(
+    store: &WorkflowStore,
+    broker: &BrokerConfig,
+    publisher: &mut WorkflowPublishBuffer<'_>,
+    runtime: &mut ExecutorRuntime,
+    debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    lease_state: &Arc<Mutex<LeaseState>>,
+    item: &fabrik_store::WorkflowMailboxRecord,
+    worker_id: &str,
+    worker_build_id: &str,
+    persist_mode: &mut PersistMode,
+    lookup_cache: &mut WorkflowLookupCache,
+) -> Result<MailboxDispatchOutcome> {
+    match item.kind {
+        fabrik_store::WorkflowMailboxKind::Trigger
+        | fabrik_store::WorkflowMailboxKind::CancelRequest => {
+            let mut event = item.source_event.clone();
+            annotate_workflow_task_event(&mut event, worker_id, worker_build_id);
+            process_event(
+                store,
+                broker,
+                publisher,
+                runtime,
+                debug_state,
+                lease_state,
+                event,
+                persist_mode,
+                lookup_cache,
+            )
+            .await?;
+            Ok(MailboxDispatchOutcome::Processed { consumed_signal: None })
+        }
+        fabrik_store::WorkflowMailboxKind::Signal => {
+            let Some(message_id) = item.message_id.as_deref() else {
+                return Ok(MailboxDispatchOutcome::ConsumedNoop);
+            };
+            let Some(instance) =
+                current_workflow_state(store, runtime, &item.tenant_id, &item.instance_id).await?
+            else {
+                return Ok(MailboxDispatchOutcome::ConsumedNoop);
+            };
+            let Some(wait_state) = instance.current_state.as_deref() else {
+                return Ok(MailboxDispatchOutcome::Blocked);
+            };
+            let expected_signal_type = if let Some(artifact) =
+                load_pinned_artifact(store, &item.source_event, &instance, lookup_cache).await?
+            {
+                artifact.expected_signal_type(wait_state)?.map(str::to_owned)
+            } else {
+                let definition =
+                    load_pinned_definition(store, &item.source_event, &instance, lookup_cache)
+                        .await?;
+                definition.expected_signal_type(wait_state)?.map(str::to_owned)
+            };
+            if expected_signal_type.as_deref() != item.message_name.as_deref() {
+                return Ok(MailboxDispatchOutcome::Blocked);
+            }
+
+            let payload = item.payload.clone().unwrap_or(Value::Null);
+            let mut event = EventEnvelope::new(
+                WorkflowEvent::SignalReceived {
+                    signal_id: message_id.to_owned(),
+                    signal_type: item.message_name.clone().unwrap_or_default(),
+                    payload: payload.clone(),
+                }
+                .event_type(),
+                WorkflowIdentity::new(
+                    item.tenant_id.clone(),
+                    item.source_event.definition_id.clone(),
+                    item.source_event.definition_version,
+                    item.source_event.artifact_hash.clone(),
+                    item.instance_id.clone(),
+                    item.run_id.clone(),
+                    "executor-service",
+                ),
+                WorkflowEvent::SignalReceived {
+                    signal_id: message_id.to_owned(),
+                    signal_type: item.message_name.clone().unwrap_or_default(),
+                    payload,
+                },
+            );
+            event.event_id = signal_dispatch_event_id(item.source_event.event_id);
+            event.occurred_at = chrono::Utc::now();
+            event.causation_id = Some(item.source_event.event_id);
+            event.correlation_id =
+                item.source_event.correlation_id.or(Some(item.source_event.event_id));
+            event.dedupe_key = Some(format!("signal:{message_id}"));
+            annotate_workflow_task_event(&mut event, worker_id, worker_build_id);
+            publisher.publish(&event);
+            let consumed_event_id = event.event_id;
+            let consumed_at = event.occurred_at;
+            process_event(
+                store,
+                broker,
+                publisher,
+                runtime,
+                debug_state,
+                lease_state,
+                event,
+                persist_mode,
+                lookup_cache,
+            )
+            .await?;
+            Ok(MailboxDispatchOutcome::Processed {
+                consumed_signal: Some(ConsumedSignal {
+                    signal_id: message_id.to_owned(),
+                    consumed_event_id,
+                    consumed_at,
+                }),
+            })
+        }
+        fabrik_store::WorkflowMailboxKind::Update => {
+            let Some(message_id) = item.message_id.as_deref() else {
+                return Ok(MailboxDispatchOutcome::ConsumedNoop);
+            };
+            let Some(instance) =
+                current_workflow_state(store, runtime, &item.tenant_id, &item.instance_id).await?
+            else {
+                return Ok(MailboxDispatchOutcome::ConsumedNoop);
+            };
+            if instance.status.is_terminal() {
+                let error =
+                    format!("workflow run {} is already {}", item.run_id, instance.status.as_str());
+                if let Some(update) = store
+                    .get_update(&item.tenant_id, &item.instance_id, &item.run_id, message_id)
+                    .await?
+                {
+                    if store
+                        .complete_update(
+                            &update.tenant_id,
+                            &update.instance_id,
+                            &update.run_id,
+                            &update.update_id,
+                            None,
+                            Some(&error),
+                            item.source_event.event_id,
+                            chrono::Utc::now(),
+                        )
+                        .await?
+                    {
+                        let mut event = EventEnvelope::new(
+                            WorkflowEvent::WorkflowUpdateRejected {
+                                update_id: update.update_id.clone(),
+                                update_name: update.update_name.clone(),
+                                error: error.clone(),
+                            }
+                            .event_type(),
+                            source_identity(&item.source_event, "executor-service"),
+                            WorkflowEvent::WorkflowUpdateRejected {
+                                update_id: update.update_id.clone(),
+                                update_name: update.update_name.clone(),
+                                error,
+                            },
+                        );
+                        event.causation_id = Some(item.source_event.event_id);
+                        event.correlation_id =
+                            item.source_event.correlation_id.or(Some(item.source_event.event_id));
+                        event.dedupe_key = Some(format!("update-rejected:{}", update.update_id));
+                        annotate_workflow_task_event(&mut event, worker_id, worker_build_id);
+                        publisher.publish(&event);
+                        process_event(
+                            store,
+                            broker,
+                            publisher,
+                            runtime,
+                            debug_state,
+                            lease_state,
+                            event,
+                            persist_mode,
+                            lookup_cache,
+                        )
+                        .await?;
+                        return Ok(MailboxDispatchOutcome::Processed { consumed_signal: None });
+                    }
+                }
+                return Ok(MailboxDispatchOutcome::ConsumedNoop);
+            }
+            if instance
+                .artifact_execution
+                .as_ref()
+                .and_then(|execution| execution.active_update.as_ref())
+                .is_some()
+            {
+                return Ok(MailboxDispatchOutcome::Blocked);
+            }
+            let Some(artifact) =
+                load_pinned_artifact(store, &item.source_event, &instance, lookup_cache).await?
+            else {
+                return Ok(MailboxDispatchOutcome::Blocked);
+            };
+            let Some(update) = store
+                .get_update(&item.tenant_id, &item.instance_id, &item.run_id, message_id)
+                .await?
+            else {
+                return Ok(MailboxDispatchOutcome::ConsumedNoop);
+            };
+            if !artifact.has_update(&update.update_name) {
+                if !store
+                    .complete_update(
+                        &update.tenant_id,
+                        &update.instance_id,
+                        &update.run_id,
+                        &update.update_id,
+                        None,
+                        Some(&format!("unknown update handler {}", update.update_name)),
+                        update.source_event_id,
+                        chrono::Utc::now(),
+                    )
+                    .await?
+                {
+                    return Ok(MailboxDispatchOutcome::ConsumedNoop);
+                }
+                let mut event = EventEnvelope::new(
+                    WorkflowEvent::WorkflowUpdateRejected {
+                        update_id: update.update_id.clone(),
+                        update_name: update.update_name.clone(),
+                        error: format!("unknown update handler {}", update.update_name),
+                    }
+                    .event_type(),
+                    source_identity(&item.source_event, "executor-service"),
+                    WorkflowEvent::WorkflowUpdateRejected {
+                        update_id: update.update_id.clone(),
+                        update_name: update.update_name.clone(),
+                        error: format!("unknown update handler {}", update.update_name),
+                    },
+                );
+                event.causation_id = Some(update.source_event_id);
+                event.correlation_id =
+                    item.source_event.correlation_id.or(Some(update.source_event_id));
+                event.dedupe_key = Some(format!("update-rejected:{}", update.update_id));
+                annotate_workflow_task_event(&mut event, worker_id, worker_build_id);
+                publisher.publish(&event);
+                process_event(
+                    store,
+                    broker,
+                    publisher,
+                    runtime,
+                    debug_state,
+                    lease_state,
+                    event,
+                    persist_mode,
+                    lookup_cache,
+                )
+                .await?;
+                return Ok(MailboxDispatchOutcome::Processed { consumed_signal: None });
+            }
+
+            let accepted_event_id = Uuid::now_v7();
+            if !store
+                .accept_update(
+                    &update.tenant_id,
+                    &update.instance_id,
+                    &update.run_id,
+                    &update.update_id,
+                    accepted_event_id,
+                    chrono::Utc::now(),
+                )
+                .await?
+            {
+                return Ok(MailboxDispatchOutcome::ConsumedNoop);
+            }
+            let mut event = EventEnvelope::new(
+                WorkflowEvent::WorkflowUpdateAccepted {
+                    update_id: update.update_id.clone(),
+                    update_name: update.update_name.clone(),
+                    payload: update.payload.clone(),
+                }
+                .event_type(),
+                source_identity(&item.source_event, "executor-service"),
+                WorkflowEvent::WorkflowUpdateAccepted {
+                    update_id: update.update_id.clone(),
+                    update_name: update.update_name.clone(),
+                    payload: update.payload.clone(),
+                },
+            );
+            event.event_id = accepted_event_id;
+            event.occurred_at = chrono::Utc::now();
+            event.causation_id = Some(update.source_event_id);
+            event.correlation_id =
+                item.source_event.correlation_id.or(Some(update.source_event_id));
+            event.dedupe_key = Some(format!("update-accepted:{}", update.update_id));
+            annotate_workflow_task_event(&mut event, worker_id, worker_build_id);
+            publisher.publish(&event);
+            process_event(
+                store,
+                broker,
+                publisher,
+                runtime,
+                debug_state,
+                lease_state,
+                event,
+                persist_mode,
+                lookup_cache,
+            )
+            .await?;
+            Ok(MailboxDispatchOutcome::Processed { consumed_signal: None })
+        }
+    }
+}
+
+async fn process_event(
+    store: &WorkflowStore,
+    broker: &BrokerConfig,
+    publisher: &mut WorkflowPublishBuffer<'_>,
+    runtime: &mut ExecutorRuntime,
+    debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    lease_state: &Arc<Mutex<LeaseState>>,
     event: EventEnvelope<WorkflowEvent>,
+    persist_mode: &mut PersistMode,
+    lookup_cache: &mut WorkflowLookupCache,
 ) -> Result<()> {
     let lease_snapshot =
         ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
@@ -735,7 +2285,7 @@ async fn process_event(
     };
 
     let mut state = record.state.clone();
-    persist_state(
+    persist_state_with_mode(
         store,
         runtime,
         debug_state,
@@ -743,12 +2293,15 @@ async fn process_event(
         lease_snapshot.partition_id,
         &mut record,
         &state,
+        persist_mode,
     )
     .await?;
 
     match &event.payload {
         WorkflowEvent::WorkflowTriggered { .. } => {
-            if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
+            if let Some(artifact) =
+                load_pinned_artifact(store, &event, &state, lookup_cache).await?
+            {
                 publish_artifact_pinned(
                     store,
                     runtime,
@@ -767,7 +2320,7 @@ async fn process_event(
                     },
                 )?;
                 apply_compiled_plan(&mut state, &plan);
-                persist_state(
+                persist_state_with_mode(
                     store,
                     runtime,
                     debug_state,
@@ -775,6 +2328,7 @@ async fn process_event(
                     lease_snapshot.partition_id,
                     &mut record,
                     &state,
+                    persist_mode,
                 )
                 .await?;
                 publish_compiled_plan(
@@ -878,7 +2432,9 @@ async fn process_event(
         WorkflowEvent::TimerFired { timer_id } => {
             store.delete_timer(&event.tenant_id, &event.instance_id, timer_id).await?;
 
-            if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
+            if let Some(artifact) =
+                load_pinned_artifact(store, &event, &state, lookup_cache).await?
+            {
                 if let Some((target_kind, target_id, attempt)) = parse_retry_timer_id(timer_id) {
                     let mut execution_state = state.artifact_execution.clone().unwrap_or_default();
                     execution_state.turn_context = Some(ExecutionTurnContext {
@@ -888,9 +2444,12 @@ async fn process_event(
                     match target_kind {
                         RetryTargetKind::Step => {
                             let input = artifact.step_details(&target_id, &execution_state)?.2;
+                            let reschedule_state = artifact
+                                .reschedule_state_for_activity(&target_id, &execution_state)
+                                .unwrap_or_else(|| target_id.clone());
                             state.context = Some(input);
-                            state.current_state = Some(target_id.clone());
-                            persist_state(
+                            state.current_state = Some(reschedule_state.clone());
+                            persist_state_with_mode(
                                 store,
                                 runtime,
                                 debug_state,
@@ -898,6 +2457,7 @@ async fn process_event(
                                 lease_snapshot.partition_id,
                                 &mut record,
                                 &state,
+                                persist_mode,
                             )
                             .await?;
                             let (activity_type, config) = artifact.step_descriptor(&target_id)?;
@@ -912,12 +2472,12 @@ async fn process_event(
                                         serde_json::to_value(config)
                                             .expect("activity config serializes")
                                     }),
-                                    state: Some(target_id.clone()),
+                                    state: Some(reschedule_state.clone()),
                                     schedule_to_start_timeout_ms: None,
                                     start_to_close_timeout_ms: None,
                                     heartbeat_timeout_ms: None,
                                 },
-                                state: Some(target_id.clone()),
+                                state: Some(reschedule_state.clone()),
                             };
                             publish_plan(
                                 store,
@@ -929,7 +2489,7 @@ async fn process_event(
                                 artifact.definition_version,
                                 fabrik_workflow::WorkflowExecutionPlan {
                                     workflow_version: artifact.definition_version,
-                                    final_state: target_id,
+                                    final_state: reschedule_state,
                                     emissions: vec![emission],
                                 },
                                 state.context.clone().or_else(|| state.input.clone()),
@@ -961,7 +2521,7 @@ async fn process_event(
                     },
                 )?;
                 apply_compiled_plan(&mut state, &plan);
-                persist_state(
+                persist_state_with_mode(
                     store,
                     runtime,
                     debug_state,
@@ -969,6 +2529,7 @@ async fn process_event(
                     lease_snapshot.partition_id,
                     &mut record,
                     &state,
+                    persist_mode,
                 )
                 .await?;
                 publish_compiled_plan(
@@ -988,7 +2549,8 @@ async fn process_event(
 
             if let Some((target_kind, target_id, attempt)) = parse_retry_timer_id(timer_id) {
                 let RetryTargetKind::Step = target_kind;
-                let definition = load_pinned_definition(store, &event, &state).await?;
+                let definition =
+                    load_pinned_definition(store, &event, &state, lookup_cache).await?;
                 let input =
                     state.context.clone().or_else(|| state.input.clone()).unwrap_or(Value::Null);
                 let activity_type = definition.step_handler(&target_id)?.to_owned();
@@ -1041,7 +2603,7 @@ async fn process_event(
                 }
             };
 
-            let definition = load_pinned_definition(store, &event, &state).await?;
+            let definition = load_pinned_definition(store, &event, &state, lookup_cache).await?;
             let input =
                 state.context.clone().or_else(|| state.input.clone()).unwrap_or(Value::Null);
 
@@ -1080,7 +2642,9 @@ async fn process_event(
         WorkflowEvent::ActivityTaskCompleted {
             activity_id: step_id, attempt: _, output, ..
         } => {
-            if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
+            if let Some(artifact) =
+                load_pinned_artifact(store, &event, &state, lookup_cache).await?
+            {
                 let step_state = match state.current_state.clone() {
                     Some(step_state) => step_state,
                     None => {
@@ -1103,7 +2667,7 @@ async fn process_event(
                     },
                 )?;
                 apply_compiled_plan(&mut state, &plan);
-                persist_state(
+                persist_state_with_mode(
                     store,
                     runtime,
                     debug_state,
@@ -1111,6 +2675,7 @@ async fn process_event(
                     lease_snapshot.partition_id,
                     &mut record,
                     &state,
+                    persist_mode,
                 )
                 .await?;
                 publish_compiled_plan(
@@ -1140,7 +2705,7 @@ async fn process_event(
                 }
             };
 
-            let definition = load_pinned_definition(store, &event, &state).await?;
+            let definition = load_pinned_definition(store, &event, &state, lookup_cache).await?;
             let plan = match definition.execute_after_step_completion(&step_state, step_id, output)
             {
                 Ok(plan) => plan,
@@ -1186,7 +2751,9 @@ async fn process_event(
             reason: step_error,
             ..
         } => {
-            if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
+            if let Some(artifact) =
+                load_pinned_artifact(store, &event, &state, lookup_cache).await?
+            {
                 let step_state = match state.current_state.clone() {
                     Some(step_state) => step_state,
                     None => {
@@ -1199,7 +2766,10 @@ async fn process_event(
                     }
                 };
 
-                match artifact.step_retry(&step_state)? {
+                match artifact.step_retry(
+                    &step_state,
+                    &state.artifact_execution.clone().unwrap_or_default(),
+                )? {
                     Some(retry_policy) if *attempt < retry_policy.max_attempts => {
                         let retry = chrono::Utc::now()
                             + fabrik_workflow::parse_timer_ref(&retry_policy.delay)?;
@@ -1241,7 +2811,7 @@ async fn process_event(
                             },
                         )?;
                         apply_compiled_plan(&mut state, &plan);
-                        persist_state(
+                        persist_state_with_mode(
                             store,
                             runtime,
                             debug_state,
@@ -1249,6 +2819,7 @@ async fn process_event(
                             lease_snapshot.partition_id,
                             &mut record,
                             &state,
+                            persist_mode,
                         )
                         .await?;
                         publish_compiled_plan(
@@ -1280,7 +2851,7 @@ async fn process_event(
                 }
             };
 
-            let definition = load_pinned_definition(store, &event, &state).await?;
+            let definition = load_pinned_definition(store, &event, &state, lookup_cache).await?;
             match definition.schedule_retry(&step_state, *attempt) {
                 Ok(Some(retry)) => {
                     let retry_timer_id =
@@ -1341,7 +2912,9 @@ async fn process_event(
         }
         WorkflowEvent::ActivityTaskTimedOut { activity_id, attempt, .. } => {
             let step_error = "activity timed out";
-            if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
+            if let Some(artifact) =
+                load_pinned_artifact(store, &event, &state, lookup_cache).await?
+            {
                 let step_state = match state.current_state.clone() {
                     Some(step_state) => step_state,
                     None => {
@@ -1354,7 +2927,10 @@ async fn process_event(
                     }
                 };
 
-                match artifact.step_retry(&step_state)? {
+                match artifact.step_retry(
+                    &step_state,
+                    &state.artifact_execution.clone().unwrap_or_default(),
+                )? {
                     Some(retry_policy) if *attempt < retry_policy.max_attempts => {
                         let retry = chrono::Utc::now()
                             + fabrik_workflow::parse_timer_ref(&retry_policy.delay)?;
@@ -1396,7 +2972,7 @@ async fn process_event(
                             },
                         )?;
                         apply_compiled_plan(&mut state, &plan);
-                        persist_state(
+                        persist_state_with_mode(
                             store,
                             runtime,
                             debug_state,
@@ -1404,6 +2980,7 @@ async fn process_event(
                             lease_snapshot.partition_id,
                             &mut record,
                             &state,
+                            persist_mode,
                         )
                         .await?;
                         publish_compiled_plan(
@@ -1435,7 +3012,7 @@ async fn process_event(
                 }
             };
 
-            let definition = load_pinned_definition(store, &event, &state).await?;
+            let definition = load_pinned_definition(store, &event, &state, lookup_cache).await?;
             match definition.schedule_retry(&step_state, *attempt) {
                 Ok(Some(retry)) => {
                     let retry_timer_id =
@@ -1494,18 +3071,10 @@ async fn process_event(
                 }
             }
         }
-        WorkflowEvent::SignalReceived { signal_id, signal_type, payload } => {
-            store
-                .mark_signal_consumed(
-                    &event.tenant_id,
-                    &event.instance_id,
-                    &event.run_id,
-                    signal_id,
-                    event.event_id,
-                    event.occurred_at,
-                )
-                .await?;
-            if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
+        WorkflowEvent::SignalReceived { signal_id: _, signal_type, payload } => {
+            if let Some(artifact) =
+                load_pinned_artifact(store, &event, &state, lookup_cache).await?
+            {
                 let wait_state = match state.current_state.clone() {
                     Some(wait_state) => wait_state,
                     None => {
@@ -1528,7 +3097,7 @@ async fn process_event(
                     },
                 )?;
                 apply_compiled_plan(&mut state, &plan);
-                persist_state(
+                persist_state_with_mode(
                     store,
                     runtime,
                     debug_state,
@@ -1536,6 +3105,7 @@ async fn process_event(
                     lease_snapshot.partition_id,
                     &mut record,
                     &state,
+                    persist_mode,
                 )
                 .await?;
                 publish_compiled_plan(
@@ -1565,7 +3135,7 @@ async fn process_event(
                 }
             };
 
-            let definition = load_pinned_definition(store, &event, &state).await?;
+            let definition = load_pinned_definition(store, &event, &state, lookup_cache).await?;
             let plan = match definition.execute_after_signal(&wait_state, signal_type, payload) {
                 Ok(plan) => plan,
                 Err(error) => {
@@ -1612,7 +3182,8 @@ async fn process_event(
                     event.occurred_at,
                 )
                 .await?;
-            let Some(artifact) = load_pinned_artifact(store, &event, &state).await? else {
+            let Some(artifact) = load_pinned_artifact(store, &event, &state, lookup_cache).await?
+            else {
                 return Ok(());
             };
             let wait_state = match state.current_state.clone() {
@@ -1634,7 +3205,7 @@ async fn process_event(
                 ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at },
             )?;
             apply_compiled_plan(&mut state, &plan);
-            persist_state(
+            persist_state_with_mode(
                 store,
                 runtime,
                 debug_state,
@@ -1642,6 +3213,7 @@ async fn process_event(
                 lease_snapshot.partition_id,
                 &mut record,
                 &state,
+                persist_mode,
             )
             .await?;
             publish_compiled_plan(
@@ -1680,7 +3252,8 @@ async fn process_event(
                     event.occurred_at,
                 )
                 .await?;
-            let Some(artifact) = load_pinned_artifact(store, &event, &state).await? else {
+            let Some(artifact) = load_pinned_artifact(store, &event, &state, lookup_cache).await?
+            else {
                 return Ok(());
             };
             let wait_state = match state.current_state.clone() {
@@ -1702,7 +3275,7 @@ async fn process_event(
                 ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at },
             )?;
             apply_compiled_plan(&mut state, &plan);
-            persist_state(
+            persist_state_with_mode(
                 store,
                 runtime,
                 debug_state,
@@ -1710,6 +3283,7 @@ async fn process_event(
                 lease_snapshot.partition_id,
                 &mut record,
                 &state,
+                persist_mode,
             )
             .await?;
             publish_compiled_plan(
@@ -1728,7 +3302,8 @@ async fn process_event(
         }
         WorkflowEvent::WorkflowUpdateRequested { .. } => {}
         WorkflowEvent::WorkflowUpdateAccepted { update_id, update_name, payload } => {
-            let Some(artifact) = load_pinned_artifact(store, &event, &state).await? else {
+            let Some(artifact) = load_pinned_artifact(store, &event, &state, lookup_cache).await?
+            else {
                 publish_failure(
                     store,
                     runtime,
@@ -1756,7 +3331,7 @@ async fn process_event(
                 ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at },
             )?;
             apply_compiled_plan(&mut state, &plan);
-            persist_state(
+            persist_state_with_mode(
                 store,
                 runtime,
                 debug_state,
@@ -1764,6 +3339,7 @@ async fn process_event(
                 lease_snapshot.partition_id,
                 &mut record,
                 &state,
+                persist_mode,
             )
             .await?;
             publish_compiled_plan(
@@ -1856,10 +3432,8 @@ async fn process_event(
                 .insert("parent_instance_id".to_owned(), event.instance_id.clone());
             child_trigger.metadata.insert("parent_run_id".to_owned(), event.run_id.clone());
             child_trigger.metadata.insert("parent_child_id".to_owned(), child_id.clone());
-            child_trigger
-                .metadata
-                .insert("workflow_task_queue".to_owned(), workflow_task_queue);
-            publisher.publish(&child_trigger, &child_trigger.partition_key).await?;
+            child_trigger.metadata.insert("workflow_task_queue".to_owned(), workflow_task_queue);
+            publisher.publish(&child_trigger);
 
             let mut parent_started = EventEnvelope::new(
                 WorkflowEvent::ChildWorkflowStarted {
@@ -1877,7 +3451,7 @@ async fn process_event(
             );
             parent_started.causation_id = Some(event.event_id);
             parent_started.correlation_id = event.correlation_id.or(Some(event.event_id));
-            publisher.publish(&parent_started, &parent_started.partition_key).await?;
+            publisher.publish(&parent_started);
             return Ok(());
         }
         WorkflowEvent::WorkflowContinuedAsNew { .. } => {
@@ -1891,18 +3465,7 @@ async fn process_event(
                 "continued workflow as new run"
             );
         }
-        WorkflowEvent::SignalQueued { .. } => {
-            try_dispatch_next_message(
-                store,
-                runtime,
-                debug_state,
-                lease_state,
-                publisher,
-                &state,
-                &event,
-            )
-            .await?;
-        }
+        WorkflowEvent::SignalQueued { .. } => {}
         WorkflowEvent::WorkflowCancellationRequested { reason } => {
             ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
             let mut cancelled = EventEnvelope::new(
@@ -1912,7 +3475,7 @@ async fn process_event(
             );
             cancelled.causation_id = Some(event.event_id);
             cancelled.correlation_id = event.correlation_id.or(Some(event.event_id));
-            publisher.publish(&cancelled, &cancelled.partition_key).await?;
+            publisher.publish(&cancelled);
             return Ok(());
         }
         WorkflowEvent::WorkflowArtifactPinned
@@ -2073,19 +3636,6 @@ async fn process_event(
         .await?;
     }
 
-    if !event_is_terminal(&event.payload) && !state.status.is_terminal() {
-        try_dispatch_next_message(
-            store,
-            runtime,
-            debug_state,
-            lease_state,
-            publisher,
-            &state,
-            &event,
-        )
-        .await?;
-    }
-
     Ok(())
 }
 
@@ -2129,6 +3679,8 @@ struct ExecutorRuntime {
     continue_as_new_event_threshold: Option<u64>,
     continue_as_new_activity_attempt_threshold: Option<u64>,
     continue_as_new_run_age_seconds: Option<u64>,
+    max_mailbox_items_per_turn: usize,
+    max_transitions_per_turn: usize,
     access_epoch: u64,
     hits: u64,
     misses: u64,
@@ -2231,11 +3783,7 @@ impl DurationStats {
     }
 
     fn average_ms(&self) -> f64 {
-        if self.sample_count == 0 {
-            0.0
-        } else {
-            self.total_ms as f64 / self.sample_count as f64
-        }
+        if self.sample_count == 0 { 0.0 } else { self.total_ms as f64 / self.sample_count as f64 }
     }
 }
 
@@ -2307,6 +3855,8 @@ impl ExecutorRuntime {
         continue_as_new_event_threshold: Option<u64>,
         continue_as_new_activity_attempt_threshold: Option<u64>,
         continue_as_new_run_age_seconds: Option<u64>,
+        max_mailbox_items_per_turn: usize,
+        max_transitions_per_turn: usize,
     ) -> Self {
         Self {
             cache_capacity,
@@ -2314,6 +3864,8 @@ impl ExecutorRuntime {
             continue_as_new_event_threshold,
             continue_as_new_activity_attempt_threshold,
             continue_as_new_run_age_seconds,
+            max_mailbox_items_per_turn,
+            max_transitions_per_turn,
             access_epoch: 0,
             hits: 0,
             misses: 0,
@@ -2373,6 +3925,11 @@ impl ExecutorRuntime {
 
     fn clear(&mut self) {
         self.cache.clear();
+    }
+
+    fn peek(&self, tenant_id: &str, instance_id: &str) -> Option<HotStateRecord> {
+        let key = HotStateKey::new(tenant_id, instance_id);
+        self.cache.get(&key).map(|entry| entry.record.clone())
     }
 }
 
@@ -2498,9 +4055,7 @@ impl ExecutorDebugState {
         sticky_outcome: StickyDispatchOutcome,
     ) {
         let partition = self.partition_mut(partition_id);
-        partition
-            .workflow_task_queue_latency
-            .record_ms(queue_latency_ms);
+        partition.workflow_task_queue_latency.record_ms(queue_latency_ms);
         partition
             .workflow_task_execution_latency
             .record_ms(execution_latency.as_millis().min(u128::from(u64::MAX)) as u64);
@@ -2616,40 +4171,22 @@ impl ExecutorDebugState {
             self.partitions.iter().map(|entry| entry.restores_after_handoff).sum();
         self.hot_instance_count =
             self.partitions.iter().map(|entry| entry.hot_instance_count).sum();
-        self.workflow_turns_routed_via_matching = self
-            .partitions
-            .iter()
-            .map(|entry| entry.workflow_turns_routed_via_matching)
-            .sum();
-        self.workflow_turns_processed_locally = self
-            .partitions
-            .iter()
-            .map(|entry| entry.workflow_turns_processed_locally)
-            .sum();
-        self.sticky_build_hits =
-            self.partitions.iter().map(|entry| entry.sticky_build_hits).sum();
-        self.sticky_build_fallbacks = self
-            .partitions
-            .iter()
-            .map(|entry| entry.sticky_build_fallbacks)
-            .sum();
-        self.workflow_task_poll_hits = self
-            .partitions
-            .iter()
-            .map(|entry| entry.workflow_task_poll_hits)
-            .sum();
-        self.workflow_task_poll_empties = self
-            .partitions
-            .iter()
-            .map(|entry| entry.workflow_task_poll_empties)
-            .sum();
-        self.workflow_task_poll_failures = self
-            .partitions
-            .iter()
-            .map(|entry| entry.workflow_task_poll_failures)
-            .sum();
-        self.workflow_task_queue_latency =
-            DurationStats::combine(self.partitions.iter().map(|entry| entry.workflow_task_queue_latency));
+        self.workflow_turns_routed_via_matching =
+            self.partitions.iter().map(|entry| entry.workflow_turns_routed_via_matching).sum();
+        self.workflow_turns_processed_locally =
+            self.partitions.iter().map(|entry| entry.workflow_turns_processed_locally).sum();
+        self.sticky_build_hits = self.partitions.iter().map(|entry| entry.sticky_build_hits).sum();
+        self.sticky_build_fallbacks =
+            self.partitions.iter().map(|entry| entry.sticky_build_fallbacks).sum();
+        self.workflow_task_poll_hits =
+            self.partitions.iter().map(|entry| entry.workflow_task_poll_hits).sum();
+        self.workflow_task_poll_empties =
+            self.partitions.iter().map(|entry| entry.workflow_task_poll_empties).sum();
+        self.workflow_task_poll_failures =
+            self.partitions.iter().map(|entry| entry.workflow_task_poll_failures).sum();
+        self.workflow_task_queue_latency = DurationStats::combine(
+            self.partitions.iter().map(|entry| entry.workflow_task_queue_latency),
+        );
         self.workflow_task_execution_latency = DurationStats::combine(
             self.partitions.iter().map(|entry| entry.workflow_task_execution_latency),
         );
@@ -2667,8 +4204,14 @@ impl ExecutorDebugState {
             total_workflow_turns,
             matching_routed_turns: self.workflow_turns_routed_via_matching,
             local_executor_turns: self.workflow_turns_processed_locally,
-            matching_routed_ratio: ratio(self.workflow_turns_routed_via_matching, total_workflow_turns),
-            local_executor_ratio: ratio(self.workflow_turns_processed_locally, total_workflow_turns),
+            matching_routed_ratio: ratio(
+                self.workflow_turns_routed_via_matching,
+                total_workflow_turns,
+            ),
+            local_executor_ratio: ratio(
+                self.workflow_turns_processed_locally,
+                total_workflow_turns,
+            ),
             sticky_build_hits: self.sticky_build_hits,
             sticky_build_fallbacks: self.sticky_build_fallbacks,
             sticky_hit_rate: ratio(self.sticky_build_hits, total_sticky_dispatches),
@@ -2681,7 +4224,9 @@ impl ExecutorDebugState {
             poll_failure_rate: ratio(self.workflow_task_poll_failures, total_polls),
             avg_workflow_task_queue_latency_ms: self.workflow_task_queue_latency.average_ms(),
             max_workflow_task_queue_latency_ms: self.workflow_task_queue_latency.max_ms,
-            avg_workflow_task_execution_latency_ms: self.workflow_task_execution_latency.average_ms(),
+            avg_workflow_task_execution_latency_ms: self
+                .workflow_task_execution_latency
+                .average_ms(),
             max_workflow_task_execution_latency_ms: self.workflow_task_execution_latency.max_ms,
             restores_after_handoff: self.restores_after_handoff,
         }
@@ -2689,11 +4234,7 @@ impl ExecutorDebugState {
 }
 
 fn ratio(numerator: u64, denominator: u64) -> f64 {
-    if denominator == 0 {
-        0.0
-    } else {
-        numerator as f64 / denominator as f64
-    }
+    if denominator == 0 { 0.0 } else { numerator as f64 / denominator as f64 }
 }
 
 async fn load_cached_or_snapshot_state(
@@ -2745,7 +4286,40 @@ async fn load_cached_or_snapshot_state(
     }))
 }
 
-async fn persist_state(
+async fn persist_state_with_mode(
+    store: &WorkflowStore,
+    runtime: &mut ExecutorRuntime,
+    debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    lease_state: &Arc<Mutex<LeaseState>>,
+    partition_id: i32,
+    record: &mut HotStateRecord,
+    state: &WorkflowInstanceState,
+    persist_mode: &mut PersistMode,
+) -> Result<()> {
+    match persist_mode {
+        PersistMode::Immediate => {
+            persist_state_immediate(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                partition_id,
+                record,
+                state,
+            )
+            .await
+        }
+        PersistMode::Deferred { dirty } => {
+            record.state = state.clone();
+            runtime.put(record.clone());
+            sync_debug_state(debug_state, partition_id, runtime);
+            *dirty = true;
+            Ok(())
+        }
+    }
+}
+
+async fn persist_state_immediate(
     store: &WorkflowStore,
     runtime: &mut ExecutorRuntime,
     debug_state: &Arc<Mutex<ExecutorDebugState>>,
@@ -2997,14 +4571,12 @@ async fn ensure_active_partition_ownership(
         anyhow::bail!("executor does not currently hold partition ownership");
     }
 
-    if !store
-        .validate_partition_ownership(
-            snapshot.partition_id,
-            &snapshot.owner_id,
-            snapshot.owner_epoch,
-        )
-        .await?
-    {
+    if snapshot.lease_expires_at > chrono::Utc::now() {
+        return Ok(snapshot);
+    }
+
+    let refreshed = store.get_partition_ownership(snapshot.partition_id).await?;
+    let Some(refreshed) = refreshed else {
         runtime.clear();
         sync_debug_state(debug_state, snapshot.partition_id, runtime);
         if let Ok(mut state) = lease_state.lock() {
@@ -3019,9 +4591,33 @@ async fn ensure_active_partition_ownership(
             );
         }
         anyhow::bail!("executor partition ownership is stale");
+    };
+
+    if refreshed.owner_id == snapshot.owner_id
+        && refreshed.owner_epoch == snapshot.owner_epoch
+        && refreshed.lease_expires_at > chrono::Utc::now()
+    {
+        let refreshed_state = LeaseState::from_record(&refreshed);
+        if let Ok(mut state) = lease_state.lock() {
+            *state = refreshed_state.clone();
+        }
+        return Ok(refreshed_state);
     }
 
-    Ok(snapshot)
+    runtime.clear();
+    sync_debug_state(debug_state, snapshot.partition_id, runtime);
+    if let Ok(mut state) = lease_state.lock() {
+        state.active = false;
+    }
+    if let Ok(mut debug) = debug_state.lock() {
+        debug.mark_ownership_lost(
+            snapshot.partition_id,
+            snapshot.owner_epoch,
+            snapshot.lease_expires_at,
+            "ownership validation failed",
+        );
+    }
+    anyhow::bail!("executor partition ownership is stale")
 }
 
 fn should_drop_stale_timer_event(
@@ -3127,37 +4723,73 @@ async fn load_pinned_definition(
     store: &WorkflowStore,
     event: &EventEnvelope<WorkflowEvent>,
     state: &WorkflowInstanceState,
+    lookup_cache: &mut WorkflowLookupCache,
 ) -> Result<fabrik_workflow::WorkflowDefinition> {
+    let key = WorkflowLookupKey {
+        tenant_id: event.tenant_id.clone(),
+        definition_id: state.definition_id.clone(),
+        definition_version: state.definition_version,
+    };
+    if lookup_cache.key.as_ref() != Some(&key) {
+        lookup_cache.key = Some(key);
+        lookup_cache.artifact = None;
+        lookup_cache.definition = None;
+    }
+    if let Some(definition) = lookup_cache.definition.clone() {
+        return Ok(definition);
+    }
     if let Some(version) = state.definition_version {
         if let Some(definition) =
             store.get_definition_version(&event.tenant_id, &state.definition_id, version).await?
         {
+            lookup_cache.definition = Some(definition.clone());
             return Ok(definition);
         }
     }
 
-    store.get_latest_definition(&event.tenant_id, &state.definition_id).await?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "workflow definition {} not found for tenant {}",
-            state.definition_id,
-            event.tenant_id
-        )
-    })
+    let definition = store
+        .get_latest_definition(&event.tenant_id, &state.definition_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "workflow definition {} not found for tenant {}",
+                state.definition_id,
+                event.tenant_id
+            )
+        })?;
+    lookup_cache.definition = Some(definition.clone());
+    Ok(definition)
 }
 
 async fn load_pinned_artifact(
     store: &WorkflowStore,
     event: &EventEnvelope<WorkflowEvent>,
     state: &WorkflowInstanceState,
+    lookup_cache: &mut WorkflowLookupCache,
 ) -> Result<Option<CompiledWorkflowArtifact>> {
+    let key = WorkflowLookupKey {
+        tenant_id: event.tenant_id.clone(),
+        definition_id: state.definition_id.clone(),
+        definition_version: state.definition_version,
+    };
+    if lookup_cache.key.as_ref() != Some(&key) {
+        lookup_cache.key = Some(key);
+        lookup_cache.artifact = None;
+        lookup_cache.definition = None;
+    }
+    if let Some(artifact) = lookup_cache.artifact.clone() {
+        return Ok(artifact);
+    }
     if let Some(version) = state.definition_version {
         if let Some(artifact) =
             store.get_artifact_version(&event.tenant_id, &state.definition_id, version).await?
         {
+            lookup_cache.artifact = Some(Some(artifact.clone()));
             return Ok(Some(artifact));
         }
     }
 
+    lookup_cache.artifact = Some(None);
     Ok(None)
 }
 
@@ -3166,15 +4798,13 @@ async fn publish_plan(
     runtime: &mut ExecutorRuntime,
     debug_state: &Arc<Mutex<ExecutorDebugState>>,
     lease_state: &Arc<Mutex<LeaseState>>,
-    publisher: &WorkflowPublisher,
+    publisher: &mut WorkflowPublishBuffer<'_>,
     event: &EventEnvelope<WorkflowEvent>,
     workflow_version: u32,
     plan: fabrik_workflow::WorkflowExecutionPlan,
     continue_input: Option<Value>,
 ) -> Result<()> {
-    ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
     let final_state = plan.final_state.clone();
-    let key = event.partition_key.clone();
     let correlation_id = event.correlation_id.or(Some(event.event_id));
     let mut previous_causation_id = event.event_id;
 
@@ -3190,7 +4820,7 @@ async fn publish_plan(
             envelope.metadata.insert("final_state".to_owned(), final_state.clone());
         }
         previous_causation_id = envelope.event_id;
-        publisher.publish(&envelope, &key).await?;
+        publisher.publish(&envelope);
     }
 
     let continued = maybe_auto_continue_as_new_legacy(
@@ -3205,37 +4835,22 @@ async fn publish_plan(
         continue_input,
     )
     .await?;
-    if !continued {
-        if let Some(current) = store.get_instance(&event.tenant_id, &event.instance_id).await? {
-            try_dispatch_next_message(
-                store,
-                runtime,
-                debug_state,
-                lease_state,
-                publisher,
-                &current,
-                event,
-            )
-            .await?;
-        }
-    }
+    let _ = continued;
 
     Ok(())
 }
 
 async fn publish_failure(
-    store: &WorkflowStore,
-    runtime: &mut ExecutorRuntime,
-    debug_state: &Arc<Mutex<ExecutorDebugState>>,
-    lease_state: &Arc<Mutex<LeaseState>>,
-    publisher: &WorkflowPublisher,
+    _store: &WorkflowStore,
+    _runtime: &mut ExecutorRuntime,
+    _debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    _lease_state: &Arc<Mutex<LeaseState>>,
+    publisher: &mut WorkflowPublishBuffer<'_>,
     event: &EventEnvelope<WorkflowEvent>,
     _workflow_version: Option<u32>,
     reason: String,
     state: Option<String>,
 ) -> Result<()> {
-    ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
-    let key = event.partition_key.clone();
     let mut failed = EventEnvelope::new(
         WorkflowEvent::WorkflowFailed { reason: reason.clone() }.event_type(),
         source_identity(event, "executor-service"),
@@ -3246,7 +4861,7 @@ async fn publish_failure(
     if let Some(state) = state {
         failed.metadata.insert("state".to_owned(), state);
     }
-    publisher.publish(&failed, &key).await?;
+    publisher.publish(&failed);
     Ok(())
 }
 
@@ -3255,15 +4870,13 @@ async fn publish_compiled_plan(
     runtime: &mut ExecutorRuntime,
     debug_state: &Arc<Mutex<ExecutorDebugState>>,
     lease_state: &Arc<Mutex<LeaseState>>,
-    publisher: &WorkflowPublisher,
+    publisher: &mut WorkflowPublishBuffer<'_>,
     event: &EventEnvelope<WorkflowEvent>,
     artifact: &CompiledWorkflowArtifact,
     plan: CompiledExecutionPlan,
     continue_input: Option<Value>,
 ) -> Result<()> {
-    ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
     let final_state = plan.final_state.clone();
-    let key = event.partition_key.clone();
     let correlation_id = event.correlation_id.or(Some(event.event_id));
     let mut previous_causation_id = event.event_id;
 
@@ -3281,7 +4894,7 @@ async fn publish_compiled_plan(
             if let Some(state) = emission.state.clone() {
                 envelope.metadata.insert("state".to_owned(), state);
             }
-            publisher.publish(&envelope, &key).await?;
+            publisher.publish(&envelope);
 
             let trigger_payload = WorkflowEvent::WorkflowTriggered { input: input.clone() };
             let mut trigger = EventEnvelope::new(
@@ -3299,7 +4912,7 @@ async fn publish_compiled_plan(
             );
             trigger.causation_id = Some(envelope.event_id);
             trigger.correlation_id = correlation_id;
-            publisher.publish(&trigger, &trigger.partition_key).await?;
+            publisher.publish(&trigger);
             previous_causation_id = trigger.event_id;
             continue;
         }
@@ -3311,7 +4924,7 @@ async fn publish_compiled_plan(
             envelope.metadata.insert("state".to_owned(), state);
         }
         previous_causation_id = envelope.event_id;
-        publisher.publish(&envelope, &key).await?;
+        publisher.publish(&envelope);
     }
 
     let continued = maybe_auto_continue_as_new_compiled(
@@ -3326,20 +4939,7 @@ async fn publish_compiled_plan(
         continue_input,
     )
     .await?;
-    if !continued {
-        if let Some(current) = store.get_instance(&event.tenant_id, &event.instance_id).await? {
-            try_dispatch_next_message(
-                store,
-                runtime,
-                debug_state,
-                lease_state,
-                publisher,
-                &current,
-                event,
-            )
-            .await?;
-        }
-    }
+    let _ = continued;
 
     Ok(())
 }
@@ -3389,14 +4989,13 @@ fn build_workflow_envelope(
 }
 
 async fn publish_artifact_pinned(
-    store: &WorkflowStore,
-    runtime: &mut ExecutorRuntime,
-    debug_state: &Arc<Mutex<ExecutorDebugState>>,
-    lease_state: &Arc<Mutex<LeaseState>>,
-    publisher: &WorkflowPublisher,
+    _store: &WorkflowStore,
+    _runtime: &mut ExecutorRuntime,
+    _debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    _lease_state: &Arc<Mutex<LeaseState>>,
+    publisher: &mut WorkflowPublishBuffer<'_>,
     event: &EventEnvelope<WorkflowEvent>,
 ) -> Result<()> {
-    ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
     let mut envelope = EventEnvelope::new(
         WorkflowEvent::WorkflowArtifactPinned.event_type(),
         source_identity(event, "executor-service"),
@@ -3404,7 +5003,7 @@ async fn publish_artifact_pinned(
     );
     envelope.causation_id = Some(event.event_id);
     envelope.correlation_id = event.correlation_id.or(Some(event.event_id));
-    publisher.publish(&envelope, &envelope.partition_key).await?;
+    publisher.publish(&envelope);
     Ok(())
 }
 
@@ -3482,118 +5081,15 @@ async fn execute_internal_query(
     }))
 }
 
-async fn try_dispatch_buffered_update(
-    store: &WorkflowStore,
-    runtime: &mut ExecutorRuntime,
-    debug_state: &Arc<Mutex<ExecutorDebugState>>,
-    lease_state: &Arc<Mutex<LeaseState>>,
-    publisher: &WorkflowPublisher,
-    state: &WorkflowInstanceState,
-    event: &EventEnvelope<WorkflowEvent>,
-) -> Result<()> {
-    if state.status.is_terminal() {
-        return Ok(());
-    }
-    if state
-        .artifact_execution
-        .as_ref()
-        .and_then(|execution| execution.active_update.as_ref())
-        .is_some()
-    {
-        return Ok(());
-    }
-    let Some(artifact) = load_pinned_artifact(store, event, state).await? else {
-        return Ok(());
-    };
-    let oldest_signal = store
-        .get_oldest_pending_signal(&event.tenant_id, &event.instance_id, &event.run_id)
-        .await?;
-    let Some(update) = store
-        .get_oldest_requested_update(&event.tenant_id, &event.instance_id, &event.run_id)
-        .await?
-    else {
-        return Ok(());
-    };
-    if choose_pending_inbound_kind(oldest_signal.as_ref(), Some(&update))
-        != Some(PendingInboundKind::Update)
-    {
-        return Ok(());
-    }
-    if !artifact.has_update(&update.update_name) {
-        store
-            .complete_update(
-                &update.tenant_id,
-                &update.instance_id,
-                &update.run_id,
-                &update.update_id,
-                None,
-                Some(&format!("unknown update handler {}", update.update_name)),
-                update.source_event_id,
-                chrono::Utc::now(),
-            )
-            .await?;
-        ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
-        let payload = WorkflowEvent::WorkflowUpdateRejected {
-            update_id: update.update_id.clone(),
-            update_name: update.update_name.clone(),
-            error: format!("unknown update handler {}", update.update_name),
-        };
-        let mut envelope = EventEnvelope::new(
-            payload.event_type(),
-            source_identity(event, "executor-service"),
-            payload,
-        );
-        envelope.causation_id = Some(update.source_event_id);
-        envelope.correlation_id = event.correlation_id.or(Some(update.source_event_id));
-        envelope.dedupe_key = Some(format!("update-rejected:{}", update.update_id));
-        publisher.publish(&envelope, &envelope.partition_key).await?;
-        return Ok(());
-    }
-    let accepted_event_id = Uuid::now_v7();
-    if !store
-        .accept_update(
-            &update.tenant_id,
-            &update.instance_id,
-            &update.run_id,
-            &update.update_id,
-            accepted_event_id,
-            chrono::Utc::now(),
-        )
-        .await?
-    {
-        return Ok(());
-    }
-
-    ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
-    let payload = WorkflowEvent::WorkflowUpdateAccepted {
-        update_id: update.update_id.clone(),
-        update_name: update.update_name.clone(),
-        payload: update.payload.clone(),
-    };
-    let mut envelope = EventEnvelope::new(
-        payload.event_type(),
-        source_identity(event, "executor-service"),
-        payload,
-    );
-    envelope.event_id = accepted_event_id;
-    envelope.occurred_at = chrono::Utc::now();
-    envelope.causation_id = Some(update.source_event_id);
-    envelope.correlation_id = event.correlation_id.or(Some(update.source_event_id));
-    envelope.dedupe_key = Some(format!("update-accepted:{}", update.update_id));
-    publisher.publish(&envelope, &envelope.partition_key).await?;
-    Ok(())
-}
-
 async fn publish_child_terminal_reflection(
     store: &WorkflowStore,
-    runtime: &mut ExecutorRuntime,
-    debug_state: &Arc<Mutex<ExecutorDebugState>>,
-    lease_state: &Arc<Mutex<LeaseState>>,
-    publisher: &WorkflowPublisher,
+    _runtime: &mut ExecutorRuntime,
+    _debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    _lease_state: &Arc<Mutex<LeaseState>>,
+    publisher: &mut WorkflowPublishBuffer<'_>,
     event: &EventEnvelope<WorkflowEvent>,
     parent_child: &fabrik_store::WorkflowChildRecord,
 ) -> Result<()> {
-    ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
     let parent_instance = store.get_instance(&event.tenant_id, &parent_child.instance_id).await?;
     let Some(parent_instance) = parent_instance else {
         return Ok(());
@@ -3636,10 +5132,11 @@ async fn publish_child_terminal_reflection(
     );
     envelope.causation_id = Some(event.event_id);
     envelope.correlation_id = event.correlation_id.or(Some(event.event_id));
-    publisher.publish(&envelope, &envelope.partition_key).await?;
+    publisher.publish(&envelope);
     Ok(())
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingInboundKind {
     Signal,
@@ -3653,6 +5150,7 @@ enum ParentCloseAction {
     Abandon,
 }
 
+#[cfg(test)]
 fn choose_pending_inbound_kind(
     signal: Option<&fabrik_store::WorkflowSignalRecord>,
     update: Option<&fabrik_store::WorkflowUpdateRecord>,
@@ -3675,67 +5173,12 @@ fn choose_pending_inbound_kind(
     }
 }
 
-async fn try_dispatch_next_message(
-    store: &WorkflowStore,
-    runtime: &mut ExecutorRuntime,
-    debug_state: &Arc<Mutex<ExecutorDebugState>>,
-    lease_state: &Arc<Mutex<LeaseState>>,
-    publisher: &WorkflowPublisher,
-    state: &WorkflowInstanceState,
-    event: &EventEnvelope<WorkflowEvent>,
-) -> Result<()> {
-    if state.status.is_terminal() {
-        return Ok(());
-    }
-    if state
-        .artifact_execution
-        .as_ref()
-        .and_then(|execution| execution.active_update.as_ref())
-        .is_some()
-    {
-        return Ok(());
-    }
-    let oldest_signal = store
-        .get_oldest_pending_signal(&event.tenant_id, &event.instance_id, &event.run_id)
-        .await?;
-    let oldest_update = store
-        .get_oldest_requested_update(&event.tenant_id, &event.instance_id, &event.run_id)
-        .await?;
-    match choose_pending_inbound_kind(oldest_signal.as_ref(), oldest_update.as_ref()) {
-        Some(PendingInboundKind::Signal) => {
-            try_dispatch_buffered_signal(
-                store,
-                runtime,
-                debug_state,
-                lease_state,
-                publisher,
-                state,
-                event,
-            )
-            .await
-        }
-        Some(PendingInboundKind::Update) => {
-            try_dispatch_buffered_update(
-                store,
-                runtime,
-                debug_state,
-                lease_state,
-                publisher,
-                state,
-                event,
-            )
-            .await
-        }
-        None => Ok(()),
-    }
-}
-
 async fn enforce_parent_close_policies(
     store: &WorkflowStore,
     runtime: &mut ExecutorRuntime,
     debug_state: &Arc<Mutex<ExecutorDebugState>>,
     lease_state: &Arc<Mutex<LeaseState>>,
-    publisher: &WorkflowPublisher,
+    publisher: &mut WorkflowPublishBuffer<'_>,
     event: &EventEnvelope<WorkflowEvent>,
 ) -> Result<()> {
     let children = store
@@ -3829,16 +5272,15 @@ fn parse_parent_close_action(value: &str) -> ParentCloseAction {
 
 async fn emit_parent_close_child_event(
     store: &WorkflowStore,
-    runtime: &mut ExecutorRuntime,
-    debug_state: &Arc<Mutex<ExecutorDebugState>>,
-    lease_state: &Arc<Mutex<LeaseState>>,
-    publisher: &WorkflowPublisher,
+    _runtime: &mut ExecutorRuntime,
+    _debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    _lease_state: &Arc<Mutex<LeaseState>>,
+    publisher: &mut WorkflowPublishBuffer<'_>,
     parent_event: &EventEnvelope<WorkflowEvent>,
     child: &fabrik_store::WorkflowChildRecord,
     child_run_id: &str,
     payload: WorkflowEvent,
 ) -> Result<()> {
-    ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
     let definition =
         store.get_latest_artifact(&child.tenant_id, &child.child_definition_id).await?;
     let (definition_version, artifact_hash) = if let Some(artifact) = definition {
@@ -3867,99 +5309,7 @@ async fn emit_parent_close_child_event(
     );
     envelope.causation_id = Some(parent_event.event_id);
     envelope.correlation_id = parent_event.correlation_id.or(Some(parent_event.event_id));
-    publisher.publish(&envelope, &envelope.partition_key).await?;
-    Ok(())
-}
-
-async fn try_dispatch_buffered_signal(
-    store: &WorkflowStore,
-    runtime: &mut ExecutorRuntime,
-    debug_state: &Arc<Mutex<ExecutorDebugState>>,
-    lease_state: &Arc<Mutex<LeaseState>>,
-    publisher: &WorkflowPublisher,
-    state: &WorkflowInstanceState,
-    event: &EventEnvelope<WorkflowEvent>,
-) -> Result<()> {
-    if state.status.is_terminal() {
-        return Ok(());
-    }
-    let Some(wait_state) = state.current_state.as_deref() else {
-        return Ok(());
-    };
-    let expected_signal_type =
-        if let Some(artifact) = load_pinned_artifact(store, event, state).await? {
-            artifact.expected_signal_type(wait_state)?.map(str::to_owned)
-        } else {
-            let definition = load_pinned_definition(store, event, state).await?;
-            definition.expected_signal_type(wait_state)?.map(str::to_owned)
-        };
-    let Some(expected_signal_type) = expected_signal_type else {
-        return Ok(());
-    };
-
-    let Some(oldest_signal) = store
-        .get_oldest_pending_signal(&event.tenant_id, &event.instance_id, &event.run_id)
-        .await?
-    else {
-        return Ok(());
-    };
-    let oldest_update = store
-        .get_oldest_requested_update(&event.tenant_id, &event.instance_id, &event.run_id)
-        .await?;
-    if choose_pending_inbound_kind(Some(&oldest_signal), oldest_update.as_ref())
-        != Some(PendingInboundKind::Signal)
-    {
-        return Ok(());
-    }
-    if oldest_signal.signal_type != expected_signal_type {
-        return Ok(());
-    }
-
-    let Some((signal, newly_claimed)) = store
-        .claim_signal_for_dispatch(
-            &event.tenant_id,
-            &event.instance_id,
-            &event.run_id,
-            &oldest_signal.signal_id,
-        )
-        .await?
-    else {
-        return Ok(());
-    };
-    if !newly_claimed {
-        return Ok(());
-    }
-    let dispatch_event_id = signal.dispatch_event_id.ok_or_else(|| {
-        anyhow::anyhow!("workflow signal {} missing dispatch_event_id", signal.signal_id)
-    })?;
-
-    ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
-    let payload = WorkflowEvent::SignalReceived {
-        signal_id: signal.signal_id.clone(),
-        signal_type: signal.signal_type.clone(),
-        payload: signal.payload.clone(),
-    };
-    let mut envelope = EventEnvelope::new(
-        payload.event_type(),
-        WorkflowIdentity::new(
-            event.tenant_id.clone(),
-            event.definition_id.clone(),
-            event.definition_version,
-            event.artifact_hash.clone(),
-            event.instance_id.clone(),
-            event.run_id.clone(),
-            "executor-service",
-        ),
-        payload,
-    );
-    envelope.event_id = dispatch_event_id;
-    envelope.occurred_at = chrono::Utc::now();
-    envelope.causation_id = Some(signal.source_event_id);
-    envelope.correlation_id = event.correlation_id.or(Some(signal.source_event_id));
-    envelope.dedupe_key = Some(format!("signal:{}", signal.signal_id));
-    envelope.metadata.insert("mailbox_delivery".to_owned(), "true".to_owned());
-
-    publisher.publish(&envelope, &envelope.partition_key).await?;
+    publisher.publish(&envelope);
     Ok(())
 }
 
@@ -3968,7 +5318,7 @@ async fn maybe_auto_continue_as_new_legacy(
     runtime: &mut ExecutorRuntime,
     debug_state: &Arc<Mutex<ExecutorDebugState>>,
     lease_state: &Arc<Mutex<LeaseState>>,
-    publisher: &WorkflowPublisher,
+    publisher: &mut WorkflowPublishBuffer<'_>,
     event: &EventEnvelope<WorkflowEvent>,
     workflow_version: u32,
     final_state: &str,
@@ -4010,10 +5360,10 @@ async fn maybe_auto_continue_as_new_legacy(
 
 async fn reject_outstanding_updates_for_closed_run(
     store: &WorkflowStore,
-    runtime: &mut ExecutorRuntime,
-    debug_state: &Arc<Mutex<ExecutorDebugState>>,
-    lease_state: &Arc<Mutex<LeaseState>>,
-    publisher: &WorkflowPublisher,
+    _runtime: &mut ExecutorRuntime,
+    _debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    _lease_state: &Arc<Mutex<LeaseState>>,
+    publisher: &mut WorkflowPublishBuffer<'_>,
     event: &EventEnvelope<WorkflowEvent>,
 ) -> Result<()> {
     let error = format!(
@@ -4046,7 +5396,6 @@ async fn reject_outstanding_updates_for_closed_run(
         {
             continue;
         }
-        ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
         let payload = WorkflowEvent::WorkflowUpdateRejected {
             update_id: update.update_id.clone(),
             update_name: update.update_name.clone(),
@@ -4060,7 +5409,7 @@ async fn reject_outstanding_updates_for_closed_run(
         envelope.causation_id = Some(event.event_id);
         envelope.correlation_id = event.correlation_id.or(Some(event.event_id));
         envelope.dedupe_key = Some(format!("update-rejected:{}", update.update_id));
-        publisher.publish(&envelope, &envelope.partition_key).await?;
+        publisher.publish(&envelope);
     }
     Ok(())
 }
@@ -4075,17 +5424,10 @@ fn terminal_status_label(payload: &WorkflowEvent) -> &'static str {
     }
 }
 
-fn event_is_terminal(payload: &WorkflowEvent) -> bool {
-    matches!(
-        payload,
-        WorkflowEvent::WorkflowCompleted { .. }
-            | WorkflowEvent::WorkflowFailed { .. }
-            | WorkflowEvent::WorkflowCancelled { .. }
-            | WorkflowEvent::WorkflowTerminated { .. }
-    )
-}
-
-fn classify_sticky_dispatch(preferred_build_id: &str, actual_build_id: &str) -> StickyDispatchOutcome {
+fn classify_sticky_dispatch(
+    preferred_build_id: &str,
+    actual_build_id: &str,
+) -> StickyDispatchOutcome {
     if preferred_build_id.trim().is_empty() {
         StickyDispatchOutcome::None
     } else if preferred_build_id == actual_build_id {
@@ -4100,7 +5442,7 @@ async fn maybe_auto_continue_as_new_compiled(
     runtime: &mut ExecutorRuntime,
     debug_state: &Arc<Mutex<ExecutorDebugState>>,
     lease_state: &Arc<Mutex<LeaseState>>,
-    publisher: &WorkflowPublisher,
+    publisher: &mut WorkflowPublishBuffer<'_>,
     event: &EventEnvelope<WorkflowEvent>,
     artifact: &CompiledWorkflowArtifact,
     final_state: &str,
@@ -4176,17 +5518,16 @@ async fn rollover_reason(
 
 async fn emit_continue_as_new(
     store: &WorkflowStore,
-    runtime: &mut ExecutorRuntime,
-    debug_state: &Arc<Mutex<ExecutorDebugState>>,
-    lease_state: &Arc<Mutex<LeaseState>>,
-    publisher: &WorkflowPublisher,
+    _runtime: &mut ExecutorRuntime,
+    _debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    _lease_state: &Arc<Mutex<LeaseState>>,
+    publisher: &mut WorkflowPublishBuffer<'_>,
     event: &EventEnvelope<WorkflowEvent>,
     definition_version: u32,
     artifact_hash: &str,
     input: Value,
     reason: &str,
 ) -> Result<()> {
-    ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
     let workflow_task_queue = store
         .get_run_record(&event.tenant_id, &event.instance_id, &event.run_id)
         .await?
@@ -4213,7 +5554,7 @@ async fn emit_continue_as_new(
     continued.causation_id = Some(event.event_id);
     continued.correlation_id = event.correlation_id.or(Some(event.event_id));
     continued.metadata.insert("continue_reason".to_owned(), reason.to_owned());
-    publisher.publish(&continued, &continued.partition_key).await?;
+    publisher.publish(&continued);
 
     let trigger_payload = WorkflowEvent::WorkflowTriggered { input };
     let mut trigger = EventEnvelope::new(
@@ -4232,10 +5573,8 @@ async fn emit_continue_as_new(
     trigger.causation_id = Some(continued.event_id);
     trigger.correlation_id = continued.correlation_id;
     trigger.metadata.insert("continue_reason".to_owned(), reason.to_owned());
-    trigger
-        .metadata
-        .insert("workflow_task_queue".to_owned(), workflow_task_queue.clone());
-    publisher.publish(&trigger, &trigger.partition_key).await?;
+    trigger.metadata.insert("workflow_task_queue".to_owned(), workflow_task_queue.clone());
+    publisher.publish(&trigger);
 
     store
         .put_run_start(
@@ -4327,7 +5666,10 @@ mod tests {
         sync::{Arc, Mutex},
         time::{Duration as StdDuration, Instant},
     };
-    use tokio::{sync::{Notify, oneshot}, time::sleep};
+    use tokio::{
+        sync::{Notify, oneshot},
+        time::sleep,
+    };
     use tonic::{Request, Response, Status, transport::Server};
 
     fn demo_state(instance_id: &str) -> WorkflowInstanceState {
@@ -4408,8 +5750,8 @@ mod tests {
             }
 
             let container_name = format!("fabrik-executor-test-pg-{}", Uuid::now_v7());
-            let image =
-                std::env::var("FABRIK_TEST_POSTGRES_IMAGE").unwrap_or_else(|_| "postgres:16-alpine".to_owned());
+            let image = std::env::var("FABRIK_TEST_POSTGRES_IMAGE")
+                .unwrap_or_else(|_| "postgres:16-alpine".to_owned());
             let output = Command::new("docker")
                 .args([
                     "run",
@@ -4442,8 +5784,9 @@ mod tests {
                     return Err(error);
                 }
             };
-            let database_url =
-                format!("postgres://fabrik:fabrik@127.0.0.1:{host_port}/fabrik_test?sslmode=disable");
+            let database_url = format!(
+                "postgres://fabrik:fabrik@127.0.0.1:{host_port}/fabrik_test?sslmode=disable"
+            );
             Ok(Some(Self { container_name, database_url }))
         }
 
@@ -4609,12 +5952,8 @@ mod tests {
     }
 
     fn choose_free_port() -> Result<u16> {
-        let listener =
-            TcpListener::bind("127.0.0.1:0").context("failed to bind ephemeral port")?;
-        let port = listener
-            .local_addr()
-            .context("failed to read ephemeral socket address")?
-            .port();
+        let listener = TcpListener::bind("127.0.0.1:0").context("failed to bind ephemeral port")?;
+        let port = listener.local_addr().context("failed to read ephemeral socket address")?.port();
         drop(listener);
         Ok(port)
     }
@@ -4644,7 +5983,10 @@ mod tests {
         }
     }
 
-    fn test_event(identity: &WorkflowIdentity, payload: WorkflowEvent) -> EventEnvelope<WorkflowEvent> {
+    fn test_event(
+        identity: &WorkflowIdentity,
+        payload: WorkflowEvent,
+    ) -> EventEnvelope<WorkflowEvent> {
         let mut event = EventEnvelope::new(payload.event_type(), identity.clone(), payload);
         event.metadata.insert("workflow_task_queue".to_owned(), "default".to_owned());
         event
@@ -4671,10 +6013,10 @@ mod tests {
                 partition_id: record.partition_id,
                 task_queue: record.task_queue.clone(),
                 preferred_build_id: record.preferred_build_id.clone().unwrap_or_default(),
-                source_event_id: record.source_event_id.to_string(),
-                source_event_type: record.source_event_type.clone(),
-                source_event_json: serde_json::to_string(&record.source_event)
-                    .expect("workflow task event serializes"),
+                mailbox_consumed_seq: record.mailbox_consumed_seq,
+                resume_consumed_seq: record.resume_consumed_seq,
+                mailbox_backlog: record.mailbox_backlog,
+                resume_backlog: record.resume_backlog,
                 attempt_count: record.attempt_count,
                 created_at_unix_ms: record.created_at.timestamp_millis(),
             }
@@ -4747,7 +6089,12 @@ mod tests {
             let task_id = Uuid::parse_str(&request.task_id)
                 .map_err(|error| Status::invalid_argument(error.to_string()))?;
             self.store
-                .complete_workflow_task(task_id, &request.worker_id, &request.worker_build_id, Utc::now())
+                .complete_workflow_task(
+                    task_id,
+                    &request.worker_id,
+                    &request.worker_build_id,
+                    Utc::now(),
+                )
                 .await
                 .map_err(|error| Status::internal(error.to_string()))?;
             Ok(Response::new(Ack {}))
@@ -4849,7 +6196,7 @@ mod tests {
 
     #[test]
     fn hot_state_cache_returns_cached_entries() {
-        let mut runtime = ExecutorRuntime::new(2, 10, None, None, None);
+        let mut runtime = ExecutorRuntime::new(2, 10, None, None, None, 64, 10_000);
         let state = demo_state("instance-1");
         runtime.put(HotStateRecord {
             state: state.clone(),
@@ -4866,7 +6213,7 @@ mod tests {
 
     #[test]
     fn hot_state_cache_evicts_least_recent_entry() {
-        let mut runtime = ExecutorRuntime::new(2, 10, None, None, None);
+        let mut runtime = ExecutorRuntime::new(2, 10, None, None, None, 64, 10_000);
         runtime.put(HotStateRecord {
             state: demo_state("instance-1"),
             last_snapshot_event_count: Some(1),
@@ -4953,10 +6300,7 @@ mod tests {
     fn sticky_dispatch_classifies_hit_and_fallback() {
         assert_eq!(classify_sticky_dispatch("", "build-a"), StickyDispatchOutcome::None);
         assert_eq!(classify_sticky_dispatch("build-a", "build-a"), StickyDispatchOutcome::Hit);
-        assert_eq!(
-            classify_sticky_dispatch("build-a", "build-b"),
-            StickyDispatchOutcome::Fallback
-        );
+        assert_eq!(classify_sticky_dispatch("build-a", "build-b"), StickyDispatchOutcome::Fallback);
     }
 
     #[test]
@@ -5054,6 +6398,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_persist_keeps_intermediate_state_out_of_store_until_flush() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let owner = store
+            .claim_partition_ownership(2, "executor-a", StdDuration::from_secs(30))
+            .await?
+            .context("partition owner should claim benchmark partition")?;
+        let debug = Arc::new(Mutex::new(ExecutorDebugState::new(&[owner.clone()], 8, 100)));
+        let lease = Arc::new(Mutex::new(LeaseState::from_record(&owner)));
+        let mut runtime = ExecutorRuntime::new(8, 100, None, None, None, 64, 10_000);
+        let mut record = HotStateRecord {
+            state: demo_state("instance-deferred"),
+            last_snapshot_event_count: None,
+            restore_source: RestoreSource::Initialized,
+        };
+        store.upsert_instance(&record.state).await?;
+        runtime.put(record.clone());
+        sync_debug_state(&debug, owner.partition_id, &runtime);
+
+        let mut persist_mode = PersistMode::Deferred { dirty: false };
+        let mut staged_state = record.state.clone();
+        staged_state.event_count = 2;
+        staged_state.last_event_type = "SignalQueued".to_owned();
+        persist_state_with_mode(
+            &store,
+            &mut runtime,
+            &debug,
+            &lease,
+            owner.partition_id,
+            &mut record,
+            &staged_state,
+            &mut persist_mode,
+        )
+        .await?;
+
+        let cached_before_flush = runtime
+            .peek(&record.state.tenant_id, &record.state.instance_id)
+            .context("deferred state should remain cached")?;
+        assert_eq!(cached_before_flush.state.event_count, 2);
+        let persisted_before_flush = store
+            .get_instance(&record.state.tenant_id, &record.state.instance_id)
+            .await?
+            .context("projected workflow state should exist")?;
+        assert_eq!(persisted_before_flush.event_count, 1);
+
+        staged_state.event_count = 3;
+        staged_state.last_event_type = "MarkerRecorded".to_owned();
+        persist_state_with_mode(
+            &store,
+            &mut runtime,
+            &debug,
+            &lease,
+            owner.partition_id,
+            &mut record,
+            &staged_state,
+            &mut persist_mode,
+        )
+        .await?;
+
+        let task = WorkflowTask {
+            task_id: Uuid::nil().to_string(),
+            tenant_id: record.state.tenant_id.clone(),
+            instance_id: record.state.instance_id.clone(),
+            run_id: record.state.run_id.clone(),
+            definition_id: record.state.definition_id.clone(),
+            definition_version: record.state.definition_version.unwrap_or_default(),
+            artifact_hash: record.state.artifact_hash.clone().unwrap_or_default(),
+            partition_id: owner.partition_id,
+            task_queue: record.state.workflow_task_queue.clone(),
+            preferred_build_id: String::new(),
+            mailbox_consumed_seq: 0,
+            resume_consumed_seq: 0,
+            mailbox_backlog: 0,
+            resume_backlog: 0,
+            attempt_count: 0,
+            created_at_unix_ms: Utc::now().timestamp_millis(),
+        };
+        flush_deferred_state(&store, &mut runtime, &debug, &lease, &task).await?;
+
+        let persisted_after_flush = store
+            .get_instance(&record.state.tenant_id, &record.state.instance_id)
+            .await?
+            .context("projected workflow state should still exist")?;
+        assert_eq!(persisted_after_flush.event_count, 3);
+        assert_eq!(persisted_after_flush.last_event_type, "MarkerRecorded");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn ownership_handoff_replays_broker_tail_from_snapshot() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
@@ -5076,7 +6512,8 @@ mod tests {
         );
         let partition_id = publisher.partition_for_key(&identity.partition_key);
 
-        let trigger = test_event(&identity, WorkflowEvent::WorkflowTriggered { input: json!({"ok": true}) });
+        let trigger =
+            test_event(&identity, WorkflowEvent::WorkflowTriggered { input: json!({"ok": true}) });
         let started = test_event(&identity, WorkflowEvent::WorkflowStarted);
         let signal_queued = test_event(
             &identity,
@@ -5124,17 +6561,23 @@ mod tests {
             .context("owner a should claim partition")?;
         let debug_a = Arc::new(Mutex::new(ExecutorDebugState::new(&[owner_a.clone()], 8, 100)));
         let lease_a = Arc::new(Mutex::new(LeaseState::from_record(&owner_a)));
-        let mut runtime_a = ExecutorRuntime::new(8, 100, None, None, None);
+        let mut runtime_a = ExecutorRuntime::new(8, 100, None, None, None, 64, 10_000);
+        let mut persist_mode_a = PersistMode::Immediate;
+        let mut lookup_cache_a = WorkflowLookupCache::default();
+        let mut publish_buffer_a = WorkflowPublishBuffer::new(&publisher);
         process_event(
             &store,
             &broker,
-            &publisher,
+            &mut publish_buffer_a,
             &mut runtime_a,
             &debug_a,
             &lease_a,
             signal_queued.clone(),
+            &mut persist_mode_a,
+            &mut lookup_cache_a,
         )
         .await?;
+        publish_buffer_a.flush().await?;
         let state_after_owner_a = store
             .get_instance(&identity.tenant_id, &identity.instance_id)
             .await?
@@ -5155,19 +6598,25 @@ mod tests {
             .context("owner b should claim expired partition")?;
         let debug_b = Arc::new(Mutex::new(ExecutorDebugState::new(&[owner_b.clone()], 8, 100)));
         let lease_b = Arc::new(Mutex::new(LeaseState::from_record(&owner_b)));
-        let mut runtime_b = ExecutorRuntime::new(8, 100, None, None, None);
+        let mut runtime_b = ExecutorRuntime::new(8, 100, None, None, None, 64, 10_000);
+        let mut persist_mode_b = PersistMode::Immediate;
+        let mut lookup_cache_b = WorkflowLookupCache::default();
 
         publisher.publish(&marker, &marker.partition_key).await?;
+        let mut publish_buffer_b = WorkflowPublishBuffer::new(&publisher);
         process_event(
             &store,
             &broker,
-            &publisher,
+            &mut publish_buffer_b,
             &mut runtime_b,
             &debug_b,
             &lease_b,
             marker.clone(),
+            &mut persist_mode_b,
+            &mut lookup_cache_b,
         )
         .await?;
+        publish_buffer_b.flush().await?;
 
         assert_eq!(runtime_b.restores_from_snapshot_replay, 1);
         assert_eq!(runtime_b.restores_after_handoff, 1);
@@ -5248,7 +6697,8 @@ mod tests {
             )
             .await?;
 
-        let trigger = test_event(&identity, WorkflowEvent::WorkflowTriggered { input: json!({"ok": true}) });
+        let trigger =
+            test_event(&identity, WorkflowEvent::WorkflowTriggered { input: json!({"ok": true}) });
         let started = test_event(&identity, WorkflowEvent::WorkflowStarted);
         let cancel_requested = test_event(
             &identity,
@@ -5281,7 +6731,9 @@ mod tests {
             .await?
             .context("workflow task should be created")?;
 
-        let runtime_a = Arc::new(tokio::sync::Mutex::new(ExecutorRuntime::new(8, 100, None, None, None)));
+        let runtime_a = Arc::new(tokio::sync::Mutex::new(ExecutorRuntime::new(
+            8, 100, None, None, None, 64, 10_000,
+        )));
         let debug_a = Arc::new(Mutex::new(ExecutorDebugState::new(&[], 8, 100)));
         let lease_a = Arc::new(Mutex::new(LeaseState {
             partition_id,
@@ -5310,7 +6762,10 @@ mod tests {
             StdDuration::from_secs(15),
         )
         .await?;
-        assert_eq!(failed_task.last_error.as_deref(), Some("executor does not currently hold partition ownership"));
+        assert_eq!(
+            failed_task.last_error.as_deref(),
+            Some("executor does not currently hold partition ownership")
+        );
         poller_a.abort();
         let _ = poller_a.await;
 
@@ -5318,7 +6773,9 @@ mod tests {
             .claim_partition_ownership(partition_id, "executor-b", StdDuration::from_secs(10))
             .await?
             .context("owner b should claim partition")?;
-        let runtime_b = Arc::new(tokio::sync::Mutex::new(ExecutorRuntime::new(8, 100, None, None, None)));
+        let runtime_b = Arc::new(tokio::sync::Mutex::new(ExecutorRuntime::new(
+            8, 100, None, None, None, 64, 10_000,
+        )));
         let debug_b = Arc::new(Mutex::new(ExecutorDebugState::new(&[owner_b.clone()], 8, 100)));
         let lease_b = Arc::new(Mutex::new(LeaseState::from_record(&owner_b)));
         let poller_b = tokio::spawn(run_workflow_poll_loop(
@@ -5347,7 +6804,11 @@ mod tests {
         let history = read_workflow_history(
             &broker,
             "executor-poll-failover-test",
-            &WorkflowHistoryFilter::new(&identity.tenant_id, &identity.instance_id, &identity.run_id),
+            &WorkflowHistoryFilter::new(
+                &identity.tenant_id,
+                &identity.instance_id,
+                &identity.run_id,
+            ),
             StdDuration::from_millis(500),
             StdDuration::from_secs(10),
         )
@@ -5356,10 +6817,11 @@ mod tests {
             event.payload,
             WorkflowEvent::WorkflowCancellationRequested { .. }
         )));
-        assert!(history.iter().any(|event| matches!(
-            event.payload,
-            WorkflowEvent::WorkflowCancelled { .. }
-        )));
+        assert!(
+            history
+                .iter()
+                .any(|event| matches!(event.payload, WorkflowEvent::WorkflowCancelled { .. }))
+        );
 
         let run = store
             .get_run_record(&identity.tenant_id, &identity.instance_id, &identity.run_id)

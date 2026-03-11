@@ -241,6 +241,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "benchmark-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "fabrik-config",
+ "fabrik-workflow",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1369,6 +1385,7 @@ name = "matching-service"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum 0.8.8",
  "chrono",
  "fabrik-broker",
  "fabrik-config",
@@ -1378,6 +1395,7 @@ dependencies = [
  "fabrik-worker-protocol",
  "futures-util",
  "prost",
+ "serde",
  "serde_json",
  "tokio",
  "tonic",

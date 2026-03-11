@@ -1,0 +1,646 @@
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
+use fabrik_config::PostgresConfig;
+use fabrik_workflow::{
+    ArtifactEntrypoint, CompiledStateNode, CompiledWorkflow, CompiledWorkflowArtifact,
+    ErrorTransition, Expression, RetryPolicy,
+};
+use reqwest::Client;
+use serde::Serialize;
+use serde_json::{Value, json};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+const DEFAULT_POLL_INTERVAL_MS: u64 = 250;
+const DEFAULT_TIMEOUT_SECS: u64 = 300;
+
+#[derive(Debug, Clone)]
+struct BenchmarkProfile {
+    workflow_count: usize,
+    activities_per_workflow: usize,
+}
+
+#[derive(Debug)]
+struct Args {
+    profile_name: String,
+    profile: BenchmarkProfile,
+    output_path: PathBuf,
+    worker_count: usize,
+    payload_size: usize,
+    retry_rate: f64,
+    cancel_rate: f64,
+    tenant_id: String,
+    task_queue: String,
+    timeout: Duration,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkReport {
+    profile: String,
+    started_at: DateTime<Utc>,
+    completed_at: DateTime<Utc>,
+    duration_ms: u128,
+    workflow_count: usize,
+    activities_per_workflow: usize,
+    total_activities: usize,
+    worker_count: usize,
+    payload_size: usize,
+    retry_rate: f64,
+    cancel_rate: f64,
+    definition_id: String,
+    task_queue: String,
+    instance_prefix: String,
+    workflow_outcomes: WorkflowOutcomeMetrics,
+    activity_metrics: ActivityMetrics,
+    coalescing_metrics: CoalescingMetrics,
+    backlog_metrics: BacklogMetrics,
+    executor_debug: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowOutcomeMetrics {
+    completed: u64,
+    failed: u64,
+    cancelled: u64,
+    running: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ActivityMetrics {
+    completed: u64,
+    failed: u64,
+    cancelled: u64,
+    timed_out: u64,
+    avg_schedule_to_start_latency_ms: f64,
+    max_schedule_to_start_latency_ms: u64,
+    avg_start_to_close_latency_ms: f64,
+    max_start_to_close_latency_ms: u64,
+    throughput_activities_per_second: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct CoalescingMetrics {
+    workflow_task_rows: u64,
+    resume_rows: u64,
+    resume_events_per_task_row: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct BacklogMetrics {
+    final_workflow_backlog: u64,
+    final_activity_backlog: u64,
+    max_workflow_backlog: u64,
+    max_activity_backlog: u64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct WorkflowOutcomeRow {
+    completed: i64,
+    failed: i64,
+    cancelled: i64,
+    running: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ActivityMetricRow {
+    completed: i64,
+    failed: i64,
+    cancelled: i64,
+    timed_out: i64,
+    avg_schedule_to_start_latency_ms: Option<f64>,
+    max_schedule_to_start_latency_ms: Option<f64>,
+    avg_start_to_close_latency_ms: Option<f64>,
+    max_start_to_close_latency_ms: Option<f64>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct CoalescingRow {
+    workflow_task_rows: i64,
+    resume_rows: i64,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = parse_args()?;
+    let postgres = PostgresConfig::from_env()?;
+    let pool = PgPool::connect(&postgres.url).await.context("failed to connect to postgres")?;
+    let client = Client::new();
+
+    let ingest_base =
+        env::var("INGEST_SERVICE_URL").unwrap_or_else(|_| "http://127.0.0.1:3001".to_owned());
+    let executor_base =
+        env::var("EXECUTOR_SERVICE_URL").unwrap_or_else(|_| "http://127.0.0.1:3002".to_owned());
+
+    let definition_id = format!("fanout-benchmark-{}", args.profile_name);
+    let instance_prefix = format!("fanout-{}-{}", args.profile_name, Uuid::now_v7());
+    let started_at = Utc::now();
+    let started = Instant::now();
+
+    publish_artifact(
+        &client,
+        &ingest_base,
+        &args.tenant_id,
+        &benchmark_artifact(&definition_id, &args.task_queue, args.retry_rate > 0.0),
+    )
+    .await?;
+
+    for workflow_index in 0..args.profile.workflow_count {
+        let instance_id = format!("{instance_prefix}-{workflow_index:04}");
+        let input = benchmark_input(
+            args.profile.activities_per_workflow,
+            args.payload_size,
+            args.retry_rate,
+            args.cancel_rate,
+        );
+        trigger_workflow(
+            &client,
+            &ingest_base,
+            &definition_id,
+            &args.tenant_id,
+            &instance_id,
+            &args.task_queue,
+            input,
+        )
+        .await?;
+    }
+
+    let mut max_workflow_backlog = 0_u64;
+    let mut max_activity_backlog = 0_u64;
+    loop {
+        let outcomes = workflow_outcomes(&pool, &args.tenant_id, &instance_prefix).await?;
+        let (workflow_backlog, activity_backlog) =
+            backlog_snapshot(&pool, &args.tenant_id, &instance_prefix).await?;
+        max_workflow_backlog = max_workflow_backlog.max(workflow_backlog);
+        max_activity_backlog = max_activity_backlog.max(activity_backlog);
+
+        if outcomes.completed + outcomes.failed + outcomes.cancelled
+            == args.profile.workflow_count as u64
+        {
+            break;
+        }
+        if started.elapsed() >= args.timeout {
+            bail!(
+                "timed out waiting for benchmark completion: completed={} failed={} cancelled={} expected={}",
+                outcomes.completed,
+                outcomes.failed,
+                outcomes.cancelled,
+                args.profile.workflow_count
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(DEFAULT_POLL_INTERVAL_MS)).await;
+    }
+
+    let completed_at = Utc::now();
+    let duration_ms = started.elapsed().as_millis();
+    let workflow_outcomes = workflow_outcomes(&pool, &args.tenant_id, &instance_prefix).await?;
+    let activity_metrics = activity_metrics(
+        &pool,
+        &args.tenant_id,
+        &instance_prefix,
+        duration_ms,
+        args.profile.workflow_count * args.profile.activities_per_workflow,
+    )
+    .await?;
+    let coalescing_metrics = coalescing_metrics(&pool, &args.tenant_id, &instance_prefix).await?;
+    let (final_workflow_backlog, final_activity_backlog) =
+        backlog_snapshot(&pool, &args.tenant_id, &instance_prefix).await?;
+    let executor_debug = client
+        .get(format!("{executor_base}/debug/hybrid-routing"))
+        .send()
+        .await
+        .context("failed to fetch executor debug summary")?
+        .error_for_status()
+        .context("executor debug endpoint returned error")?
+        .json::<Value>()
+        .await
+        .context("failed to decode executor debug summary")?;
+
+    let report = BenchmarkReport {
+        profile: args.profile_name.clone(),
+        started_at,
+        completed_at,
+        duration_ms,
+        workflow_count: args.profile.workflow_count,
+        activities_per_workflow: args.profile.activities_per_workflow,
+        total_activities: args.profile.workflow_count * args.profile.activities_per_workflow,
+        worker_count: args.worker_count,
+        payload_size: args.payload_size,
+        retry_rate: args.retry_rate,
+        cancel_rate: args.cancel_rate,
+        definition_id,
+        task_queue: args.task_queue.clone(),
+        instance_prefix,
+        workflow_outcomes,
+        activity_metrics,
+        coalescing_metrics,
+        backlog_metrics: BacklogMetrics {
+            final_workflow_backlog,
+            final_activity_backlog,
+            max_workflow_backlog,
+            max_activity_backlog,
+        },
+        executor_debug,
+    };
+
+    write_report(&args.output_path, &report)?;
+    println!("{}", summary_text(&report));
+    println!("report_path={}", args.output_path.display());
+    Ok(())
+}
+
+fn parse_args() -> Result<Args> {
+    let mut profile_name = "smoke".to_owned();
+    let mut output_path = None;
+    let mut worker_count = 1_usize;
+    let mut payload_size = 128_usize;
+    let mut retry_rate = 0.0_f64;
+    let mut cancel_rate = 0.0_f64;
+    let mut tenant_id = "benchmark".to_owned();
+    let mut task_queue = "default".to_owned();
+    let mut timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
+    let mut workflow_count = None;
+    let mut activities_per_workflow = None;
+
+    let mut args = env::args().skip(1);
+    while let Some(flag) = args.next() {
+        let value = args.next().with_context(|| format!("missing value for argument {flag}"))?;
+        match flag.as_str() {
+            "--profile" => profile_name = value,
+            "--output" => output_path = Some(PathBuf::from(value)),
+            "--worker-count" => worker_count = value.parse().context("invalid --worker-count")?,
+            "--payload-size" => payload_size = value.parse().context("invalid --payload-size")?,
+            "--retry-rate" => retry_rate = value.parse().context("invalid --retry-rate")?,
+            "--cancel-rate" => cancel_rate = value.parse().context("invalid --cancel-rate")?,
+            "--tenant-id" => tenant_id = value,
+            "--task-queue" => task_queue = value,
+            "--timeout-secs" => {
+                timeout = Duration::from_secs(value.parse().context("invalid --timeout-secs")?)
+            }
+            "--workflow-count" => {
+                workflow_count = Some(value.parse().context("invalid --workflow-count")?)
+            }
+            "--activities-per-workflow" => {
+                activities_per_workflow =
+                    Some(value.parse().context("invalid --activities-per-workflow")?)
+            }
+            other => bail!("unknown argument {other}"),
+        }
+    }
+
+    let default_profile = match profile_name.as_str() {
+        "smoke" => BenchmarkProfile { workflow_count: 10, activities_per_workflow: 100 },
+        "target" => BenchmarkProfile { workflow_count: 100, activities_per_workflow: 1_000 },
+        "stress" => BenchmarkProfile { workflow_count: 250, activities_per_workflow: 1_000 },
+        other => bail!("unknown profile {other}; expected smoke, target, or stress"),
+    };
+
+    let profile = BenchmarkProfile {
+        workflow_count: workflow_count.unwrap_or(default_profile.workflow_count),
+        activities_per_workflow: activities_per_workflow
+            .unwrap_or(default_profile.activities_per_workflow),
+    };
+    let output_path = output_path.unwrap_or_else(|| {
+        PathBuf::from(format!("target/benchmark-reports/{}.json", profile_name))
+    });
+
+    Ok(Args {
+        profile_name,
+        profile,
+        output_path,
+        worker_count,
+        payload_size,
+        retry_rate,
+        cancel_rate,
+        tenant_id,
+        task_queue,
+        timeout,
+    })
+}
+
+fn benchmark_artifact(
+    definition_id: &str,
+    task_queue: &str,
+    enable_retry: bool,
+) -> CompiledWorkflowArtifact {
+    let mut states = BTreeMap::new();
+    states.insert(
+        "dispatch".to_owned(),
+        CompiledStateNode::FanOut {
+            activity_type: "benchmark.echo".to_owned(),
+            items: Expression::Member {
+                object: Box::new(Expression::Identifier { name: "input".to_owned() }),
+                property: "items".to_owned(),
+            },
+            next: "join".to_owned(),
+            handle_var: "fanout".to_owned(),
+            task_queue: Some(Expression::Literal { value: Value::String(task_queue.to_owned()) }),
+            retry: enable_retry.then_some(RetryPolicy { max_attempts: 2, delay: "1s".to_owned() }),
+            config: None,
+        },
+    );
+    states.insert(
+        "join".to_owned(),
+        CompiledStateNode::WaitForAllActivities {
+            fanout_ref_var: "fanout".to_owned(),
+            next: "done".to_owned(),
+            output_var: Some("results".to_owned()),
+            on_error: Some(ErrorTransition {
+                next: "fail".to_owned(),
+                error_var: Some("error".to_owned()),
+            }),
+        },
+    );
+    states.insert(
+        "done".to_owned(),
+        CompiledStateNode::Succeed {
+            output: Some(Expression::Identifier { name: "results".to_owned() }),
+        },
+    );
+    states.insert(
+        "fail".to_owned(),
+        CompiledStateNode::Fail {
+            reason: Some(Expression::Identifier { name: "error".to_owned() }),
+        },
+    );
+
+    CompiledWorkflowArtifact::new(
+        definition_id,
+        1,
+        "benchmark-runner",
+        ArtifactEntrypoint { module: "benchmark.ts".to_owned(), export: "workflow".to_owned() },
+        CompiledWorkflow { initial_state: "dispatch".to_owned(), states },
+    )
+}
+
+fn benchmark_input(
+    activities_per_workflow: usize,
+    payload_size: usize,
+    retry_rate: f64,
+    cancel_rate: f64,
+) -> Value {
+    let retry_count = ((activities_per_workflow as f64) * retry_rate).round() as usize;
+    let cancel_count = ((activities_per_workflow as f64) * cancel_rate).round() as usize;
+    let payload = "x".repeat(payload_size);
+    Value::Object(
+        [(
+            "items".to_owned(),
+            Value::Array(
+                (0..activities_per_workflow)
+                    .map(|index| {
+                        json!({
+                            "index": index,
+                            "payload": payload,
+                            "fail_until_attempt": if index < retry_count { 1 } else { 0 },
+                            "cancel": index >= retry_count && index < retry_count + cancel_count,
+                        })
+                    })
+                    .collect(),
+            ),
+        )]
+        .into_iter()
+        .collect(),
+    )
+}
+
+async fn publish_artifact(
+    client: &Client,
+    ingest_base: &str,
+    tenant_id: &str,
+    artifact: &CompiledWorkflowArtifact,
+) -> Result<()> {
+    client
+        .post(format!("{ingest_base}/tenants/{tenant_id}/workflow-artifacts"))
+        .json(artifact)
+        .send()
+        .await
+        .context("failed to publish benchmark artifact")?
+        .error_for_status()
+        .context("benchmark artifact publish returned error")?;
+    Ok(())
+}
+
+async fn trigger_workflow(
+    client: &Client,
+    ingest_base: &str,
+    definition_id: &str,
+    tenant_id: &str,
+    instance_id: &str,
+    task_queue: &str,
+    input: Value,
+) -> Result<()> {
+    client
+        .post(format!("{ingest_base}/workflows/{definition_id}/trigger"))
+        .json(&json!({
+            "tenant_id": tenant_id,
+            "instance_id": instance_id,
+            "workflow_task_queue": task_queue,
+            "input": input,
+            "request_id": instance_id,
+        }))
+        .send()
+        .await
+        .with_context(|| format!("failed to trigger benchmark workflow {instance_id}"))?
+        .error_for_status()
+        .with_context(|| format!("benchmark workflow trigger failed for {instance_id}"))?;
+    Ok(())
+}
+
+async fn workflow_outcomes(
+    pool: &PgPool,
+    tenant_id: &str,
+    instance_prefix: &str,
+) -> Result<WorkflowOutcomeMetrics> {
+    let row = sqlx::query_as::<_, WorkflowOutcomeRow>(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE state->>'status' = 'completed') AS completed,
+            COUNT(*) FILTER (WHERE state->>'status' = 'failed') AS failed,
+            COUNT(*) FILTER (WHERE state->>'status' = 'cancelled') AS cancelled,
+            COUNT(*) FILTER (WHERE state->>'status' NOT IN ('completed', 'failed', 'cancelled', 'terminated')) AS running
+        FROM workflow_instances
+        WHERE tenant_id = $1 AND workflow_instance_id LIKE $2
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(format!("{instance_prefix}%"))
+    .fetch_one(pool)
+    .await
+    .context("failed to query workflow outcomes")?;
+
+    Ok(WorkflowOutcomeMetrics {
+        completed: row.completed as u64,
+        failed: row.failed as u64,
+        cancelled: row.cancelled as u64,
+        running: row.running as u64,
+    })
+}
+
+async fn activity_metrics(
+    pool: &PgPool,
+    tenant_id: &str,
+    instance_prefix: &str,
+    duration_ms: u128,
+    total_activities: usize,
+) -> Result<ActivityMetrics> {
+    let row = sqlx::query_as::<_, ActivityMetricRow>(
+        r#"
+        SELECT
+            COUNT(*) FILTER (WHERE status = 'completed') AS completed,
+            COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+            COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled,
+            COUNT(*) FILTER (WHERE status = 'timed_out') AS timed_out,
+            AVG((EXTRACT(EPOCH FROM (started_at - scheduled_at)) * 1000)::double precision)
+                FILTER (WHERE started_at IS NOT NULL) AS avg_schedule_to_start_latency_ms,
+            MAX((EXTRACT(EPOCH FROM (started_at - scheduled_at)) * 1000)::double precision)
+                FILTER (WHERE started_at IS NOT NULL) AS max_schedule_to_start_latency_ms,
+            AVG((EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)::double precision)
+                FILTER (WHERE completed_at IS NOT NULL AND started_at IS NOT NULL) AS avg_start_to_close_latency_ms,
+            MAX((EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)::double precision)
+                FILTER (WHERE completed_at IS NOT NULL AND started_at IS NOT NULL) AS max_start_to_close_latency_ms
+        FROM workflow_activities
+        WHERE tenant_id = $1 AND workflow_instance_id LIKE $2
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(format!("{instance_prefix}%"))
+    .fetch_one(pool)
+    .await
+    .context("failed to query activity metrics")?;
+
+    let throughput = if duration_ms == 0 {
+        0.0
+    } else {
+        total_activities as f64 / (duration_ms as f64 / 1_000.0)
+    };
+    Ok(ActivityMetrics {
+        completed: row.completed as u64,
+        failed: row.failed as u64,
+        cancelled: row.cancelled as u64,
+        timed_out: row.timed_out as u64,
+        avg_schedule_to_start_latency_ms: row.avg_schedule_to_start_latency_ms.unwrap_or(0.0),
+        max_schedule_to_start_latency_ms: row.max_schedule_to_start_latency_ms.unwrap_or(0.0)
+            as u64,
+        avg_start_to_close_latency_ms: row.avg_start_to_close_latency_ms.unwrap_or(0.0),
+        max_start_to_close_latency_ms: row.max_start_to_close_latency_ms.unwrap_or(0.0) as u64,
+        throughput_activities_per_second: throughput,
+    })
+}
+
+async fn coalescing_metrics(
+    pool: &PgPool,
+    tenant_id: &str,
+    instance_prefix: &str,
+) -> Result<CoalescingMetrics> {
+    let row = sqlx::query_as::<_, CoalescingRow>(
+        r#"
+        SELECT
+            (SELECT COUNT(*)
+             FROM workflow_tasks
+             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2) AS workflow_task_rows,
+            (SELECT COUNT(*)
+             FROM workflow_resumes
+             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2) AS resume_rows
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(format!("{instance_prefix}%"))
+    .fetch_one(pool)
+    .await
+    .context("failed to query coalescing metrics")?;
+
+    let workflow_task_rows = row.workflow_task_rows as u64;
+    let resume_rows = row.resume_rows as u64;
+    Ok(CoalescingMetrics {
+        workflow_task_rows,
+        resume_rows,
+        resume_events_per_task_row: if workflow_task_rows == 0 {
+            0.0
+        } else {
+            resume_rows as f64 / workflow_task_rows as f64
+        },
+    })
+}
+
+async fn backlog_snapshot(
+    pool: &PgPool,
+    tenant_id: &str,
+    instance_prefix: &str,
+) -> Result<(u64, u64)> {
+    let workflow_backlog = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM workflow_tasks
+        WHERE tenant_id = $1
+          AND workflow_instance_id LIKE $2
+          AND status = 'pending'
+          AND (mailbox_backlog > 0 OR resume_backlog > 0)
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(format!("{instance_prefix}%"))
+    .fetch_one(pool)
+    .await
+    .context("failed to query workflow backlog")?;
+    let activity_backlog = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM workflow_activities
+        WHERE tenant_id = $1
+          AND workflow_instance_id LIKE $2
+          AND status = 'scheduled'
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(format!("{instance_prefix}%"))
+    .fetch_one(pool)
+    .await
+    .context("failed to query activity backlog")?;
+    Ok((workflow_backlog as u64, activity_backlog as u64))
+}
+
+fn write_report(output_path: &Path, report: &BenchmarkReport) -> Result<()> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(
+        output_path,
+        serde_json::to_vec_pretty(report).context("failed to serialize benchmark report")?,
+    )
+    .with_context(|| format!("failed to write {}", output_path.display()))?;
+
+    let summary_path = output_path.with_extension("txt");
+    fs::write(&summary_path, summary_text(report))
+        .with_context(|| format!("failed to write {}", summary_path.display()))?;
+    Ok(())
+}
+
+fn summary_text(report: &BenchmarkReport) -> String {
+    format!(
+        "profile={profile}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n",
+        profile = report.profile,
+        workflows = report.workflow_count,
+        activities_per_workflow = report.activities_per_workflow,
+        total_activities = report.total_activities,
+        duration_ms = report.duration_ms,
+        throughput = report.activity_metrics.throughput_activities_per_second,
+        completed_workflows = report.workflow_outcomes.completed,
+        failed_workflows = report.workflow_outcomes.failed,
+        workflow_task_rows = report.coalescing_metrics.workflow_task_rows,
+        resume_rows = report.coalescing_metrics.resume_rows,
+        resume_ratio = report.coalescing_metrics.resume_events_per_task_row,
+        max_workflow_backlog = report.backlog_metrics.max_workflow_backlog,
+        max_activity_backlog = report.backlog_metrics.max_activity_backlog,
+        final_workflow_backlog = report.backlog_metrics.final_workflow_backlog,
+        final_activity_backlog = report.backlog_metrics.final_activity_backlog,
+        avg_schedule = report.activity_metrics.avg_schedule_to_start_latency_ms,
+        avg_close = report.activity_metrics.avg_start_to_close_latency_ms,
+    )
+}

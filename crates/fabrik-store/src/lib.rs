@@ -23,6 +23,13 @@ pub struct ScheduledTimer {
     pub correlation_id: Option<Uuid>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ConsumedSignalRecord {
+    pub signal_id: String,
+    pub consumed_event_id: Uuid,
+    pub consumed_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PartitionOwnershipRecord {
     pub partition_id: i32,
@@ -116,6 +123,36 @@ pub struct WorkflowActivityRecord {
 pub struct ActivityHeartbeatResult {
     pub updated: bool,
     pub cancellation_requested: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ActivityTerminalPayload {
+    Completed { output: Value },
+    Failed { error: String },
+    Cancelled { reason: String, metadata: Option<Value> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActivityTerminalUpdate {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub activity_id: String,
+    pub attempt: u32,
+    pub worker_id: String,
+    pub worker_build_id: String,
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub occurred_at: DateTime<Utc>,
+    pub payload: ActivityTerminalPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AppliedActivityTerminalUpdate {
+    pub record: WorkflowActivityRecord,
+    pub event_id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub payload: ActivityTerminalPayload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -223,6 +260,154 @@ impl WorkflowTaskStatus {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowMailboxStatus {
+    Queued,
+    Claimed,
+    Consumed,
+}
+
+impl WorkflowMailboxStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Claimed => "claimed",
+            Self::Consumed => "consumed",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "claimed" => Ok(Self::Claimed),
+            "consumed" => Ok(Self::Consumed),
+            other => anyhow::bail!("unknown workflow mailbox status {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowMailboxKind {
+    Trigger,
+    Signal,
+    Update,
+    CancelRequest,
+}
+
+impl WorkflowMailboxKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Trigger => "trigger",
+            Self::Signal => "signal",
+            Self::Update => "update",
+            Self::CancelRequest => "cancel_request",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "trigger" => Ok(Self::Trigger),
+            "signal" => Ok(Self::Signal),
+            "update" => Ok(Self::Update),
+            "cancel_request" => Ok(Self::CancelRequest),
+            other => anyhow::bail!("unknown workflow mailbox kind {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowMailboxRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub accepted_seq: u64,
+    pub kind: WorkflowMailboxKind,
+    pub message_id: Option<String>,
+    pub message_name: Option<String>,
+    pub payload: Option<Value>,
+    pub source_event_id: Uuid,
+    pub source_event_type: String,
+    pub source_event: EventEnvelope<WorkflowEvent>,
+    pub status: WorkflowMailboxStatus,
+    pub consumed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowResumeStatus {
+    Queued,
+    Claimed,
+    Consumed,
+}
+
+impl WorkflowResumeStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Claimed => "claimed",
+            Self::Consumed => "consumed",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "claimed" => Ok(Self::Claimed),
+            "consumed" => Ok(Self::Consumed),
+            other => anyhow::bail!("unknown workflow resume status {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowResumeKind {
+    TimerFired,
+    ActivityTerminal,
+    ChildTerminal,
+}
+
+impl WorkflowResumeKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::TimerFired => "timer_fired",
+            Self::ActivityTerminal => "activity_terminal",
+            Self::ChildTerminal => "child_terminal",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "timer_fired" => Ok(Self::TimerFired),
+            "activity_terminal" => Ok(Self::ActivityTerminal),
+            "child_terminal" => Ok(Self::ChildTerminal),
+            other => anyhow::bail!("unknown workflow resume kind {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowResumeRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub resume_seq: u64,
+    pub kind: WorkflowResumeKind,
+    pub ref_id: String,
+    pub status_label: Option<String>,
+    pub source_event_id: Uuid,
+    pub source_event_type: String,
+    pub source_event: EventEnvelope<WorkflowEvent>,
+    pub status: WorkflowResumeStatus,
+    pub consumed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkflowTaskRecord {
     pub task_id: Uuid,
@@ -239,6 +424,12 @@ pub struct WorkflowTaskRecord {
     pub source_event_id: Uuid,
     pub source_event_type: String,
     pub source_event: EventEnvelope<WorkflowEvent>,
+    pub mailbox_consumed_seq: u64,
+    pub resume_consumed_seq: u64,
+    pub mailbox_high_watermark: u64,
+    pub resume_high_watermark: u64,
+    pub mailbox_backlog: u64,
+    pub resume_backlog: u64,
     pub lease_poller_id: Option<String>,
     pub lease_build_id: Option<String>,
     pub lease_expires_at: Option<DateTime<Utc>>,
@@ -265,11 +456,33 @@ pub struct TaskQueueInspection {
     pub backlog: u64,
     pub oldest_backlog_at: Option<DateTime<Utc>>,
     pub sticky_effectiveness: Option<StickyQueueEffectiveness>,
+    pub resume_coalescing: Option<ResumeCoalescingMetrics>,
+    pub activity_completion_metrics: Option<ActivityCompletionMetrics>,
     pub default_set_id: Option<String>,
     pub compatible_build_ids: Vec<String>,
     pub registered_builds: Vec<TaskQueueBuildRecord>,
     pub compatibility_sets: Vec<CompatibilitySetRecord>,
     pub pollers: Vec<QueuePollerRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResumeCoalescingMetrics {
+    pub workflow_task_rows: u64,
+    pub queued_resume_rows: u64,
+    pub total_resume_rows: u64,
+    pub resume_rows_per_task_row: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActivityCompletionMetrics {
+    pub completed: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+    pub timed_out: u64,
+    pub avg_schedule_to_start_latency_ms: f64,
+    pub max_schedule_to_start_latency_ms: u64,
+    pub avg_start_to_close_latency_ms: f64,
+    pub max_start_to_close_latency_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -463,10 +676,15 @@ impl WorkflowStore {
 
     pub async fn init(&self) -> Result<()> {
         const INIT_LOCK_KEY: i64 = 0x4641_4252_494b;
+        let mut lock_conn = self
+            .pool
+            .acquire()
+            .await
+            .context("failed to acquire workflow store init connection")?;
 
         sqlx::query("SELECT pg_advisory_lock($1)")
             .bind(INIT_LOCK_KEY)
-            .execute(&self.pool)
+            .execute(&mut *lock_conn)
             .await
             .context("failed to acquire workflow store init lock")?;
 
@@ -839,6 +1057,12 @@ impl WorkflowStore {
                 source_event_id UUID NOT NULL,
                 source_event_type TEXT NOT NULL,
                 source_event JSONB NOT NULL,
+                mailbox_consumed_seq BIGINT NOT NULL DEFAULT 0,
+                resume_consumed_seq BIGINT NOT NULL DEFAULT 0,
+                mailbox_high_watermark BIGINT NOT NULL DEFAULT 0,
+                resume_high_watermark BIGINT NOT NULL DEFAULT 0,
+                mailbox_backlog BIGINT NOT NULL DEFAULT 0,
+                resume_backlog BIGINT NOT NULL DEFAULT 0,
                 lease_poller_id TEXT,
                 lease_build_id TEXT,
                 lease_expires_at TIMESTAMPTZ,
@@ -854,6 +1078,43 @@ impl WorkflowStore {
         .context("failed to initialize workflow_tasks table")?;
 
         sqlx::query(
+            "ALTER TABLE workflow_tasks ADD COLUMN IF NOT EXISTS mailbox_consumed_seq BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add workflow_tasks.mailbox_consumed_seq")?;
+        sqlx::query(
+            "ALTER TABLE workflow_tasks ADD COLUMN IF NOT EXISTS resume_consumed_seq BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add workflow_tasks.resume_consumed_seq")?;
+        sqlx::query(
+            "ALTER TABLE workflow_tasks ADD COLUMN IF NOT EXISTS mailbox_high_watermark BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add workflow_tasks.mailbox_high_watermark")?;
+        sqlx::query(
+            "ALTER TABLE workflow_tasks ADD COLUMN IF NOT EXISTS resume_high_watermark BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add workflow_tasks.resume_high_watermark")?;
+        sqlx::query(
+            "ALTER TABLE workflow_tasks ADD COLUMN IF NOT EXISTS mailbox_backlog BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add workflow_tasks.mailbox_backlog")?;
+        sqlx::query(
+            "ALTER TABLE workflow_tasks ADD COLUMN IF NOT EXISTS resume_backlog BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add workflow_tasks.resume_backlog")?;
+
+        sqlx::query(
             r#"
             CREATE UNIQUE INDEX IF NOT EXISTS workflow_tasks_source_event_idx
             ON workflow_tasks (source_event_id)
@@ -866,12 +1127,121 @@ impl WorkflowStore {
         sqlx::query(
             r#"
             CREATE INDEX IF NOT EXISTS workflow_tasks_partition_status_idx
-            ON workflow_tasks (partition_id, status, task_queue, preferred_build_id, updated_at)
+            ON workflow_tasks (
+                partition_id,
+                status,
+                task_queue,
+                preferred_build_id,
+                updated_at,
+                mailbox_backlog,
+                resume_backlog
+            )
             "#,
         )
         .execute(&self.pool)
         .await
         .context("failed to initialize workflow_tasks partition status index")?;
+
+        sqlx::query(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS workflow_tasks_run_idx
+            ON workflow_tasks (tenant_id, workflow_instance_id, run_id)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_tasks run index")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS workflow_mailbox (
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                accepted_seq BIGINT NOT NULL,
+                kind TEXT NOT NULL,
+                message_id TEXT,
+                message_name TEXT,
+                payload JSONB,
+                source_event_id UUID NOT NULL,
+                source_event_type TEXT NOT NULL,
+                source_event JSONB NOT NULL,
+                status TEXT NOT NULL,
+                consumed_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, workflow_instance_id, run_id, accepted_seq)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_mailbox table")?;
+
+        sqlx::query(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS workflow_mailbox_source_event_idx
+            ON workflow_mailbox (source_event_id)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_mailbox source event index")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS workflow_mailbox_run_status_idx
+            ON workflow_mailbox (tenant_id, workflow_instance_id, run_id, status, accepted_seq)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_mailbox run status index")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS workflow_resumes (
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                resume_seq BIGINT NOT NULL,
+                kind TEXT NOT NULL,
+                ref_id TEXT NOT NULL,
+                status_label TEXT,
+                source_event_id UUID NOT NULL,
+                source_event_type TEXT NOT NULL,
+                source_event JSONB NOT NULL,
+                status TEXT NOT NULL,
+                consumed_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, workflow_instance_id, run_id, resume_seq)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_resumes table")?;
+
+        sqlx::query(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS workflow_resumes_source_event_idx
+            ON workflow_resumes (source_event_id)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_resumes source event index")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS workflow_resumes_run_status_idx
+            ON workflow_resumes (tenant_id, workflow_instance_id, run_id, status, resume_seq)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_resumes run status index")?;
 
         sqlx::query(
             r#"
@@ -1069,7 +1439,7 @@ impl WorkflowStore {
 
         sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(INIT_LOCK_KEY)
-            .execute(&self.pool)
+            .execute(&mut *lock_conn)
             .await
             .context("failed to release workflow store init lock")?;
 
@@ -2300,9 +2670,7 @@ impl WorkflowStore {
                 .context("failed to rollback missing default-set promotion transaction")?;
             anyhow::bail!("compatibility set {set_id} was not found for task queue {task_queue}");
         }
-        tx.commit()
-            .await
-            .context("failed to commit default-set promotion transaction")?;
+        tx.commit().await.context("failed to commit default-set promotion transaction")?;
 
         Ok(())
     }
@@ -2335,7 +2703,12 @@ impl WorkflowStore {
         match row {
             Some(row) => {
                 let build_ids = self
-                    .list_compatibility_set_build_ids(tenant_id, queue_kind.clone(), task_queue, set_id)
+                    .list_compatibility_set_build_ids(
+                        tenant_id,
+                        queue_kind.clone(),
+                        task_queue,
+                        set_id,
+                    )
                     .await?;
                 Ok(Some(Self::decode_compatibility_set_row(row, build_ids)?))
             }
@@ -2366,11 +2739,15 @@ impl WorkflowStore {
 
         let mut sets = Vec::with_capacity(rows.len());
         for row in rows {
-            let set_id: String = row
-                .try_get("set_id")
-                .context("compatibility set set_id missing")?;
+            let set_id: String =
+                row.try_get("set_id").context("compatibility set set_id missing")?;
             let build_ids = self
-                .list_compatibility_set_build_ids(tenant_id, queue_kind.clone(), task_queue, &set_id)
+                .list_compatibility_set_build_ids(
+                    tenant_id,
+                    queue_kind.clone(),
+                    task_queue,
+                    &set_id,
+                )
                 .await?;
             sets.push(Self::decode_compatibility_set_row(row, build_ids)?);
         }
@@ -2420,13 +2797,13 @@ impl WorkflowStore {
         task_queue: &str,
         build_id: &str,
     ) -> Result<bool> {
-        let registered_builds = self.list_task_queue_builds(tenant_id, queue_kind.clone(), task_queue).await?;
+        let registered_builds =
+            self.list_task_queue_builds(tenant_id, queue_kind.clone(), task_queue).await?;
         if registered_builds.is_empty() {
             return Ok(true);
         }
-        let compatible = self
-            .list_default_compatible_build_ids(tenant_id, queue_kind, task_queue)
-            .await?;
+        let compatible =
+            self.list_default_compatible_build_ids(tenant_id, queue_kind, task_queue).await?;
         Ok(compatible.is_empty() || compatible.iter().any(|candidate| candidate == build_id))
     }
 
@@ -2561,6 +2938,108 @@ impl WorkflowStore {
         rows.into_iter().map(Self::decode_queue_poller_row).collect()
     }
 
+    pub async fn enqueue_workflow_mailbox_message(
+        &self,
+        partition_id: i32,
+        task_queue: &str,
+        preferred_build_id: Option<&str>,
+        event: &EventEnvelope<WorkflowEvent>,
+        kind: WorkflowMailboxKind,
+        message_id: Option<&str>,
+        message_name: Option<&str>,
+        payload: Option<&Value>,
+    ) -> Result<Option<WorkflowMailboxRecord>> {
+        let now = event.occurred_at;
+        let accepted_seq = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO workflow_mailbox (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                accepted_seq,
+                kind,
+                message_id,
+                message_name,
+                payload,
+                source_event_id,
+                source_event_type,
+                source_event,
+                status,
+                consumed_at,
+                created_at,
+                updated_at
+            )
+            SELECT
+                $1,
+                $2,
+                $3,
+                COALESCE(MAX(accepted_seq), 0) + 1,
+                $4,
+                $5,
+                $6,
+                $7,
+                $8,
+                $9,
+                $10,
+                $11,
+                NULL,
+                $12,
+                $12
+            FROM workflow_mailbox
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
+            ON CONFLICT (source_event_id) DO NOTHING
+            RETURNING accepted_seq
+            "#,
+        )
+        .bind(&event.tenant_id)
+        .bind(&event.instance_id)
+        .bind(&event.run_id)
+        .bind(kind.as_str())
+        .bind(message_id)
+        .bind(message_name)
+        .bind(payload.cloned().map(Json))
+        .bind(event.event_id)
+        .bind(&event.event_type)
+        .bind(Json(event.clone()))
+        .bind(WorkflowMailboxStatus::Queued.as_str())
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to enqueue workflow mailbox message")?;
+        let Some(accepted_seq) = accepted_seq else {
+            return Ok(None);
+        };
+        let accepted_seq = accepted_seq as u64;
+
+        self.ensure_runnable_workflow_task(
+            partition_id,
+            task_queue,
+            preferred_build_id,
+            event,
+            Some(accepted_seq),
+            None,
+        )
+        .await?;
+
+        Ok(Some(WorkflowMailboxRecord {
+            tenant_id: event.tenant_id.clone(),
+            instance_id: event.instance_id.clone(),
+            run_id: event.run_id.clone(),
+            accepted_seq,
+            kind,
+            message_id: message_id.map(str::to_owned),
+            message_name: message_name.map(str::to_owned),
+            payload: payload.cloned(),
+            source_event_id: event.event_id,
+            source_event_type: event.event_type.clone(),
+            source_event: event.clone(),
+            status: WorkflowMailboxStatus::Queued,
+            consumed_at: None,
+            created_at: now,
+            updated_at: now,
+        }))
+    }
+
     pub async fn enqueue_workflow_task(
         &self,
         partition_id: i32,
@@ -2568,63 +3047,551 @@ impl WorkflowStore {
         preferred_build_id: Option<&str>,
         event: &EventEnvelope<WorkflowEvent>,
     ) -> Result<Option<WorkflowTaskRecord>> {
-        let task_id = Uuid::now_v7();
-        let occurred_at = event.occurred_at;
-        let inserted = sqlx::query(
+        match &event.payload {
+            WorkflowEvent::WorkflowTriggered { input } => {
+                self.enqueue_workflow_mailbox_message(
+                    partition_id,
+                    task_queue,
+                    preferred_build_id,
+                    event,
+                    WorkflowMailboxKind::Trigger,
+                    None,
+                    None,
+                    Some(input),
+                )
+                .await?;
+            }
+            WorkflowEvent::SignalQueued { signal_id, signal_type, payload } => {
+                self.enqueue_workflow_mailbox_message(
+                    partition_id,
+                    task_queue,
+                    preferred_build_id,
+                    event,
+                    WorkflowMailboxKind::Signal,
+                    Some(signal_id),
+                    Some(signal_type),
+                    Some(payload),
+                )
+                .await?;
+            }
+            WorkflowEvent::WorkflowUpdateRequested { update_id, update_name, payload } => {
+                self.enqueue_workflow_mailbox_message(
+                    partition_id,
+                    task_queue,
+                    preferred_build_id,
+                    event,
+                    WorkflowMailboxKind::Update,
+                    Some(update_id),
+                    Some(update_name),
+                    Some(payload),
+                )
+                .await?;
+            }
+            WorkflowEvent::WorkflowCancellationRequested { reason } => {
+                self.enqueue_workflow_mailbox_message(
+                    partition_id,
+                    task_queue,
+                    preferred_build_id,
+                    event,
+                    WorkflowMailboxKind::CancelRequest,
+                    None,
+                    Some(reason),
+                    None,
+                )
+                .await?;
+            }
+            WorkflowEvent::TimerFired { timer_id } => {
+                self.enqueue_workflow_resume(
+                    partition_id,
+                    task_queue,
+                    preferred_build_id,
+                    event,
+                    WorkflowResumeKind::TimerFired,
+                    timer_id,
+                    None,
+                )
+                .await?;
+            }
+            WorkflowEvent::ActivityTaskCompleted { activity_id, .. } => {
+                self.enqueue_workflow_resume(
+                    partition_id,
+                    task_queue,
+                    preferred_build_id,
+                    event,
+                    WorkflowResumeKind::ActivityTerminal,
+                    activity_id,
+                    Some("completed"),
+                )
+                .await?;
+            }
+            WorkflowEvent::ActivityTaskFailed { activity_id, .. } => {
+                self.enqueue_workflow_resume(
+                    partition_id,
+                    task_queue,
+                    preferred_build_id,
+                    event,
+                    WorkflowResumeKind::ActivityTerminal,
+                    activity_id,
+                    Some("failed"),
+                )
+                .await?;
+            }
+            WorkflowEvent::ActivityTaskTimedOut { activity_id, .. } => {
+                self.enqueue_workflow_resume(
+                    partition_id,
+                    task_queue,
+                    preferred_build_id,
+                    event,
+                    WorkflowResumeKind::ActivityTerminal,
+                    activity_id,
+                    Some("timed_out"),
+                )
+                .await?;
+            }
+            WorkflowEvent::ActivityTaskCancelled { activity_id, .. } => {
+                self.enqueue_workflow_resume(
+                    partition_id,
+                    task_queue,
+                    preferred_build_id,
+                    event,
+                    WorkflowResumeKind::ActivityTerminal,
+                    activity_id,
+                    Some("cancelled"),
+                )
+                .await?;
+            }
+            WorkflowEvent::ChildWorkflowCompleted { child_id, .. } => {
+                self.enqueue_workflow_resume(
+                    partition_id,
+                    task_queue,
+                    preferred_build_id,
+                    event,
+                    WorkflowResumeKind::ChildTerminal,
+                    child_id,
+                    Some("completed"),
+                )
+                .await?;
+            }
+            WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
+                self.enqueue_workflow_resume(
+                    partition_id,
+                    task_queue,
+                    preferred_build_id,
+                    event,
+                    WorkflowResumeKind::ChildTerminal,
+                    child_id,
+                    Some("failed"),
+                )
+                .await?;
+            }
+            WorkflowEvent::ChildWorkflowCancelled { child_id, .. } => {
+                self.enqueue_workflow_resume(
+                    partition_id,
+                    task_queue,
+                    preferred_build_id,
+                    event,
+                    WorkflowResumeKind::ChildTerminal,
+                    child_id,
+                    Some("cancelled"),
+                )
+                .await?;
+            }
+            WorkflowEvent::ChildWorkflowTerminated { child_id, .. } => {
+                self.enqueue_workflow_resume(
+                    partition_id,
+                    task_queue,
+                    preferred_build_id,
+                    event,
+                    WorkflowResumeKind::ChildTerminal,
+                    child_id,
+                    Some("terminated"),
+                )
+                .await?;
+            }
+            _ => return Ok(None),
+        }
+
+        let task_id = sqlx::query(
             r#"
-            INSERT INTO workflow_tasks (
-                task_id,
-                tenant_id,
-                workflow_instance_id,
-                run_id,
-                workflow_id,
-                definition_version,
-                artifact_hash,
-                partition_id,
-                task_queue,
-                preferred_build_id,
-                status,
-                source_event_id,
-                source_event_type,
-                source_event,
-                lease_poller_id,
-                lease_build_id,
-                lease_expires_at,
-                attempt_count,
-                last_error,
-                created_at,
-                updated_at
-            )
-            VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending', $11, $12, $13, NULL, NULL, NULL, 0, NULL, $14, $14
-            )
-            ON CONFLICT (source_event_id) DO NOTHING
+            SELECT task_id
+            FROM workflow_tasks
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
+            LIMIT 1
             "#,
         )
-        .bind(task_id)
         .bind(&event.tenant_id)
         .bind(&event.instance_id)
         .bind(&event.run_id)
-        .bind(&event.definition_id)
-        .bind(i32::try_from(event.definition_version).context("workflow task definition version exceeds i32")?)
-        .bind(&event.artifact_hash)
-        .bind(partition_id)
-        .bind(task_queue)
-        .bind(preferred_build_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load workflow task after enqueue")?
+        .map(|row| row.try_get("task_id").expect("task_id selected"));
+
+        match task_id {
+            Some(task_id) => self.get_workflow_task(task_id).await,
+            None => Ok(None),
+        }
+    }
+
+    pub async fn enqueue_workflow_resume(
+        &self,
+        partition_id: i32,
+        task_queue: &str,
+        preferred_build_id: Option<&str>,
+        event: &EventEnvelope<WorkflowEvent>,
+        kind: WorkflowResumeKind,
+        ref_id: &str,
+        status_label: Option<&str>,
+    ) -> Result<Option<WorkflowResumeRecord>> {
+        let now = event.occurred_at;
+        let resume_seq = sqlx::query_scalar::<_, i64>(
+            r#"
+            INSERT INTO workflow_resumes (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                resume_seq,
+                kind,
+                ref_id,
+                status_label,
+                source_event_id,
+                source_event_type,
+                source_event,
+                status,
+                consumed_at,
+                created_at,
+                updated_at
+            )
+            SELECT
+                $1,
+                $2,
+                $3,
+                COALESCE(MAX(resume_seq), 0) + 1,
+                $4,
+                $5,
+                $6,
+                $7,
+                $8,
+                $9,
+                $10,
+                NULL,
+                $11,
+                $11
+            FROM workflow_resumes
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
+            ON CONFLICT (source_event_id) DO NOTHING
+            RETURNING resume_seq
+            "#,
+        )
+        .bind(&event.tenant_id)
+        .bind(&event.instance_id)
+        .bind(&event.run_id)
+        .bind(kind.as_str())
+        .bind(ref_id)
+        .bind(status_label)
         .bind(event.event_id)
         .bind(&event.event_type)
         .bind(Json(event.clone()))
-        .bind(occurred_at)
+        .bind(WorkflowResumeStatus::Queued.as_str())
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to enqueue workflow resume")?;
+        let Some(resume_seq) = resume_seq else {
+            return Ok(None);
+        };
+        let resume_seq = resume_seq as u64;
+
+        self.ensure_runnable_workflow_task(
+            partition_id,
+            task_queue,
+            preferred_build_id,
+            event,
+            None,
+            Some(resume_seq),
+        )
+        .await?;
+
+        Ok(Some(WorkflowResumeRecord {
+            tenant_id: event.tenant_id.clone(),
+            instance_id: event.instance_id.clone(),
+            run_id: event.run_id.clone(),
+            resume_seq,
+            kind,
+            ref_id: ref_id.to_owned(),
+            status_label: status_label.map(str::to_owned),
+            source_event_id: event.event_id,
+            source_event_type: event.event_type.clone(),
+            source_event: event.clone(),
+            status: WorkflowResumeStatus::Queued,
+            consumed_at: None,
+            created_at: now,
+            updated_at: now,
+        }))
+    }
+
+    pub async fn get_next_workflow_mailbox_item(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+    ) -> Result<Option<WorkflowMailboxRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT tenant_id, workflow_instance_id, run_id, accepted_seq, kind, message_id,
+                   message_name, payload, source_event_id, source_event_type, source_event,
+                   status, consumed_at, created_at, updated_at
+            FROM workflow_mailbox
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND status = 'queued'
+            ORDER BY accepted_seq ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load next workflow mailbox item")?;
+
+        row.map(Self::decode_workflow_mailbox_row).transpose()
+    }
+
+    pub async fn list_next_workflow_mailbox_items(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkflowMailboxRecord>> {
+        let limit =
+            i64::try_from(limit.max(1)).context("workflow mailbox batch limit exceeds i64")?;
+        let rows = sqlx::query(
+            r#"
+            SELECT tenant_id, workflow_instance_id, run_id, accepted_seq, kind, message_id,
+                   message_name, payload, source_event_id, source_event_type, source_event,
+                   status, consumed_at, created_at, updated_at
+            FROM workflow_mailbox
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND status = 'queued'
+            ORDER BY accepted_seq ASC
+            LIMIT $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load workflow mailbox batch")?;
+
+        rows.into_iter().map(Self::decode_workflow_mailbox_row).collect()
+    }
+
+    pub async fn get_next_workflow_resume_item(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+    ) -> Result<Option<WorkflowResumeRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT tenant_id, workflow_instance_id, run_id, resume_seq, kind, ref_id,
+                   status_label, source_event_id, source_event_type, source_event,
+                   status, consumed_at, created_at, updated_at
+            FROM workflow_resumes
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND status = 'queued'
+            ORDER BY resume_seq ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load next workflow resume item")?;
+
+        row.map(Self::decode_workflow_resume_row).transpose()
+    }
+
+    pub async fn list_next_workflow_resume_items(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkflowResumeRecord>> {
+        let limit =
+            i64::try_from(limit.max(1)).context("workflow resume batch limit exceeds i64")?;
+        let rows = sqlx::query(
+            r#"
+            SELECT tenant_id, workflow_instance_id, run_id, resume_seq, kind, ref_id,
+                   status_label, source_event_id, source_event_type, source_event,
+                   status, consumed_at, created_at, updated_at
+            FROM workflow_resumes
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND status = 'queued'
+            ORDER BY resume_seq ASC
+            LIMIT $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load workflow resume batch")?;
+
+        rows.into_iter().map(Self::decode_workflow_resume_row).collect()
+    }
+
+    pub async fn mark_workflow_mailbox_item_consumed(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        accepted_seq: u64,
+        consumed_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.mark_workflow_mailbox_items_consumed_through(
+            tenant_id,
+            instance_id,
+            run_id,
+            accepted_seq,
+            1,
+            consumed_at,
+        )
+        .await
+    }
+
+    pub async fn mark_workflow_mailbox_items_consumed_through(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        max_accepted_seq: u64,
+        consumed_count: usize,
+        consumed_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let consumed_count =
+            i64::try_from(consumed_count).context("workflow mailbox consumed count exceeds i64")?;
+        let updated = sqlx::query(
+            r#"
+            WITH consumed AS (
+                UPDATE workflow_mailbox
+                SET status = 'consumed',
+                    consumed_at = $5,
+                    updated_at = $5
+                WHERE tenant_id = $1
+                  AND workflow_instance_id = $2
+                  AND run_id = $3
+                  AND accepted_seq <= $4
+                  AND status = 'queued'
+                RETURNING accepted_seq
+            )
+            UPDATE workflow_tasks
+            SET mailbox_consumed_seq = GREATEST(mailbox_consumed_seq, $4),
+                mailbox_backlog = GREATEST(mailbox_backlog - $6, 0),
+                updated_at = $5
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND EXISTS (SELECT 1 FROM consumed)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(i64::try_from(max_accepted_seq).context("workflow mailbox sequence exceeds i64")?)
+        .bind(consumed_at)
+        .bind(consumed_count)
         .execute(&self.pool)
         .await
-        .context("failed to enqueue workflow task")?
+        .context("failed to mark workflow mailbox item consumed")?
         .rows_affected();
 
-        if inserted == 0 {
-            return Ok(None);
-        }
+        Ok(updated > 0)
+    }
 
-        self.get_workflow_task(task_id).await
+    pub async fn mark_workflow_resume_item_consumed(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        resume_seq: u64,
+        consumed_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.mark_workflow_resume_items_consumed_through(
+            tenant_id,
+            instance_id,
+            run_id,
+            resume_seq,
+            1,
+            consumed_at,
+        )
+        .await
+    }
+
+    pub async fn mark_workflow_resume_items_consumed_through(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        max_resume_seq: u64,
+        consumed_count: usize,
+        consumed_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let consumed_count =
+            i64::try_from(consumed_count).context("workflow resume consumed count exceeds i64")?;
+        let updated = sqlx::query(
+            r#"
+            WITH consumed AS (
+                UPDATE workflow_resumes
+                SET status = 'consumed',
+                    consumed_at = $5,
+                    updated_at = $5
+                WHERE tenant_id = $1
+                  AND workflow_instance_id = $2
+                  AND run_id = $3
+                  AND resume_seq <= $4
+                  AND status = 'queued'
+                RETURNING resume_seq
+            )
+            UPDATE workflow_tasks
+            SET resume_consumed_seq = GREATEST(resume_consumed_seq, $4),
+                resume_backlog = GREATEST(resume_backlog - $6, 0),
+                updated_at = $5
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND EXISTS (SELECT 1 FROM consumed)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(i64::try_from(max_resume_seq).context("workflow resume sequence exceeds i64")?)
+        .bind(consumed_at)
+        .bind(consumed_count)
+        .execute(&self.pool)
+        .await
+        .context("failed to mark workflow resume item consumed")?
+        .rows_affected();
+
+        Ok(updated > 0)
     }
 
     pub async fn get_workflow_task(&self, task_id: Uuid) -> Result<Option<WorkflowTaskRecord>> {
@@ -2645,6 +3612,12 @@ impl WorkflowStore {
                 source_event_id,
                 source_event_type,
                 source_event,
+                mailbox_consumed_seq,
+                resume_consumed_seq,
+                mailbox_high_watermark,
+                resume_high_watermark,
+                mailbox_backlog,
+                resume_backlog,
                 lease_poller_id,
                 lease_build_id,
                 lease_expires_at,
@@ -2662,6 +3635,29 @@ impl WorkflowStore {
         .context("failed to load workflow task")?;
 
         row.map(Self::decode_workflow_task_row).transpose()
+    }
+
+    pub async fn count_workflow_tasks_for_run(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+    ) -> Result<u64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM workflow_tasks
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to count workflow tasks for run")?;
+
+        Ok(count as u64)
     }
 
     pub async fn lease_next_workflow_task(
@@ -2689,6 +3685,12 @@ impl WorkflowStore {
                 source_event_id,
                 source_event_type,
                 source_event,
+                mailbox_consumed_seq,
+                resume_consumed_seq,
+                mailbox_high_watermark,
+                resume_high_watermark,
+                mailbox_backlog,
+                resume_backlog,
                 lease_poller_id,
                 lease_build_id,
                 lease_expires_at,
@@ -2698,6 +3700,7 @@ impl WorkflowStore {
                 updated_at
             FROM workflow_tasks
             WHERE partition_id = $1
+              AND (mailbox_backlog > 0 OR resume_backlog > 0)
               AND (status = 'pending' OR (status = 'leased' AND lease_expires_at <= $2))
             ORDER BY
                 CASE WHEN preferred_build_id = $3 THEN 0 ELSE 1 END,
@@ -2747,6 +3750,7 @@ impl WorkflowStore {
                     lease_expires_at = $4,
                     updated_at = $5
                 WHERE task_id = $1
+                  AND (mailbox_backlog > 0 OR resume_backlog > 0)
                   AND (status = 'pending' OR (status = 'leased' AND lease_expires_at <= $5))
                 "#,
             )
@@ -2779,13 +3783,24 @@ impl WorkflowStore {
         let updated = sqlx::query(
             r#"
             UPDATE workflow_tasks
-            SET status = 'completed',
-                lease_poller_id = $2,
-                lease_build_id = $3,
+            SET status = CASE
+                    WHEN mailbox_backlog > 0 OR resume_backlog > 0 THEN 'pending'
+                    ELSE 'completed'
+                END,
+                lease_poller_id = CASE
+                    WHEN mailbox_backlog > 0 OR resume_backlog > 0 THEN NULL
+                    ELSE $2
+                END,
+                lease_build_id = CASE
+                    WHEN mailbox_backlog > 0 OR resume_backlog > 0 THEN NULL
+                    ELSE $3
+                END,
                 lease_expires_at = NULL,
                 updated_at = $4
             WHERE task_id = $1
               AND status = 'leased'
+              AND lease_poller_id = $2
+              AND lease_build_id = $3
             "#,
         )
         .bind(task_id)
@@ -2811,7 +3826,10 @@ impl WorkflowStore {
         let updated = sqlx::query(
             r#"
             UPDATE workflow_tasks
-            SET status = 'pending',
+            SET status = CASE
+                    WHEN mailbox_backlog > 0 OR resume_backlog > 0 THEN 'pending'
+                    ELSE 'completed'
+                END,
                 lease_poller_id = NULL,
                 lease_build_id = NULL,
                 lease_expires_at = NULL,
@@ -2837,6 +3855,151 @@ impl WorkflowStore {
         Ok(updated > 0)
     }
 
+    pub async fn park_workflow_task(
+        &self,
+        task_id: Uuid,
+        poller_id: &str,
+        build_id: &str,
+        parked_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE workflow_tasks
+            SET status = 'completed',
+                lease_poller_id = NULL,
+                lease_build_id = NULL,
+                lease_expires_at = NULL,
+                updated_at = $4
+            WHERE task_id = $1
+              AND status = 'leased'
+              AND lease_poller_id = $2
+              AND lease_build_id = $3
+            "#,
+        )
+        .bind(task_id)
+        .bind(poller_id)
+        .bind(build_id)
+        .bind(parked_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to park workflow task")?
+        .rows_affected();
+
+        Ok(updated > 0)
+    }
+
+    async fn ensure_runnable_workflow_task(
+        &self,
+        partition_id: i32,
+        task_queue: &str,
+        preferred_build_id: Option<&str>,
+        event: &EventEnvelope<WorkflowEvent>,
+        mailbox_high_watermark: Option<u64>,
+        resume_high_watermark: Option<u64>,
+    ) -> Result<()> {
+        let task_id = Uuid::now_v7();
+        let occurred_at = event.occurred_at;
+        let mailbox_increment = if mailbox_high_watermark.is_some() { 1_i64 } else { 0_i64 };
+        let resume_increment = if resume_high_watermark.is_some() { 1_i64 } else { 0_i64 };
+        let mailbox_high_watermark = mailbox_high_watermark
+            .map(i64::try_from)
+            .transpose()
+            .context("workflow mailbox high watermark exceeds i64")?;
+        let resume_high_watermark = resume_high_watermark
+            .map(i64::try_from)
+            .transpose()
+            .context("workflow resume high watermark exceeds i64")?;
+        let definition_version = i32::try_from(event.definition_version)
+            .context("workflow task definition version exceeds i32")?;
+        sqlx::query(
+            r#"
+            INSERT INTO workflow_tasks (
+                task_id,
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                workflow_id,
+                definition_version,
+                artifact_hash,
+                partition_id,
+                task_queue,
+                preferred_build_id,
+                status,
+                source_event_id,
+                source_event_type,
+                source_event,
+                mailbox_consumed_seq,
+                resume_consumed_seq,
+                mailbox_high_watermark,
+                resume_high_watermark,
+                mailbox_backlog,
+                resume_backlog,
+                lease_poller_id,
+                lease_build_id,
+                lease_expires_at,
+                attempt_count,
+                last_error,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                'pending', $11, $12, $13,
+                0, 0, COALESCE($14, 0), COALESCE($15, 0), $16, $17,
+                NULL, NULL, NULL, 0, NULL, $18, $18
+            )
+            ON CONFLICT (tenant_id, workflow_instance_id, run_id)
+            DO UPDATE SET
+                workflow_id = EXCLUDED.workflow_id,
+                definition_version = EXCLUDED.definition_version,
+                artifact_hash = EXCLUDED.artifact_hash,
+                partition_id = EXCLUDED.partition_id,
+                task_queue = EXCLUDED.task_queue,
+                preferred_build_id = EXCLUDED.preferred_build_id,
+                source_event_id = EXCLUDED.source_event_id,
+                source_event_type = EXCLUDED.source_event_type,
+                source_event = EXCLUDED.source_event,
+                mailbox_high_watermark = GREATEST(
+                    workflow_tasks.mailbox_high_watermark,
+                    COALESCE(EXCLUDED.mailbox_high_watermark, workflow_tasks.mailbox_high_watermark)
+                ),
+                resume_high_watermark = GREATEST(
+                    workflow_tasks.resume_high_watermark,
+                    COALESCE(EXCLUDED.resume_high_watermark, workflow_tasks.resume_high_watermark)
+                ),
+                mailbox_backlog = workflow_tasks.mailbox_backlog + $16,
+                resume_backlog = workflow_tasks.resume_backlog + $17,
+                status = CASE
+                    WHEN workflow_tasks.status = 'leased' THEN workflow_tasks.status
+                    ELSE 'pending'
+                END,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(task_id)
+        .bind(&event.tenant_id)
+        .bind(&event.instance_id)
+        .bind(&event.run_id)
+        .bind(&event.definition_id)
+        .bind(definition_version)
+        .bind(&event.artifact_hash)
+        .bind(partition_id)
+        .bind(task_queue)
+        .bind(preferred_build_id)
+        .bind(event.event_id)
+        .bind(&event.event_type)
+        .bind(Json(event.clone()))
+        .bind(mailbox_high_watermark)
+        .bind(resume_high_watermark)
+        .bind(mailbox_increment)
+        .bind(resume_increment)
+        .bind(occurred_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to ensure runnable workflow task")?;
+        Ok(())
+    }
+
     pub async fn inspect_task_queue(
         &self,
         tenant_id: &str,
@@ -2850,17 +4013,22 @@ impl WorkflowStore {
             .iter()
             .find(|record| record.is_default)
             .map(|record| record.set_id.clone());
-        let compatible_build_ids =
-            self.list_default_compatible_build_ids(tenant_id, queue_kind.clone(), task_queue).await?;
+        let compatible_build_ids = self
+            .list_default_compatible_build_ids(tenant_id, queue_kind.clone(), task_queue)
+            .await?;
         let registered_builds =
             self.list_task_queue_builds(tenant_id, queue_kind.clone(), task_queue).await?;
-        let pollers = self
-            .list_queue_pollers(tenant_id, queue_kind.clone(), task_queue, active_at)
-            .await?;
+        let pollers =
+            self.list_queue_pollers(tenant_id, queue_kind.clone(), task_queue, active_at).await?;
         let (backlog, oldest_backlog_at) =
             self.task_queue_backlog(tenant_id, queue_kind.clone(), task_queue).await?;
         let sticky_effectiveness =
             self.task_queue_sticky_effectiveness(tenant_id, queue_kind.clone(), task_queue).await?;
+        let resume_coalescing =
+            self.task_queue_resume_coalescing(tenant_id, queue_kind.clone(), task_queue).await?;
+        let activity_completion_metrics = self
+            .task_queue_activity_completion_metrics(tenant_id, queue_kind.clone(), task_queue)
+            .await?;
 
         Ok(TaskQueueInspection {
             tenant_id: tenant_id.to_owned(),
@@ -2869,6 +4037,8 @@ impl WorkflowStore {
             backlog,
             oldest_backlog_at,
             sticky_effectiveness,
+            resume_coalescing,
+            activity_completion_metrics,
             default_set_id,
             compatible_build_ids,
             registered_builds,
@@ -2918,7 +4088,10 @@ impl WorkflowStore {
                     r#"
                     SELECT COUNT(*) AS backlog, MIN(created_at) AS oldest_backlog_at
                     FROM workflow_tasks
-                    WHERE tenant_id = $1 AND task_queue = $2 AND status = 'pending'
+                    WHERE tenant_id = $1
+                      AND task_queue = $2
+                      AND status = 'pending'
+                      AND (mailbox_backlog > 0 OR resume_backlog > 0)
                     "#,
                 )
                 .bind(tenant_id)
@@ -2927,8 +4100,7 @@ impl WorkflowStore {
                 .await
                 .context("failed to inspect workflow queue backlog")?;
                 Ok((
-                    row.try_get::<i64, _>("backlog")
-                        .context("workflow backlog missing")? as u64,
+                    row.try_get::<i64, _>("backlog").context("workflow backlog missing")? as u64,
                     row.try_get("oldest_backlog_at")
                         .context("workflow oldest backlog timestamp missing")?,
                 ))
@@ -2947,8 +4119,7 @@ impl WorkflowStore {
                 .await
                 .context("failed to inspect activity queue backlog")?;
                 Ok((
-                    row.try_get::<i64, _>("backlog")
-                        .context("activity backlog missing")? as u64,
+                    row.try_get::<i64, _>("backlog").context("activity backlog missing")? as u64,
                     row.try_get("oldest_backlog_at")
                         .context("activity oldest backlog timestamp missing")?,
                 ))
@@ -2999,15 +4170,15 @@ impl WorkflowStore {
         .await
         .context("failed to inspect workflow queue sticky effectiveness")?;
 
-        let sticky_dispatch_count = row
-            .try_get::<i64, _>("sticky_dispatch_count")
-            .context("workflow sticky_dispatch_count missing")? as u64;
-        let sticky_hit_count =
-            row.try_get::<i64, _>("sticky_hit_count").context("workflow sticky_hit_count missing")?
-                as u64;
-        let sticky_fallback_count = row
-            .try_get::<i64, _>("sticky_fallback_count")
-            .context("workflow sticky_fallback_count missing")? as u64;
+        let sticky_dispatch_count =
+            row.try_get::<i64, _>("sticky_dispatch_count")
+                .context("workflow sticky_dispatch_count missing")? as u64;
+        let sticky_hit_count = row
+            .try_get::<i64, _>("sticky_hit_count")
+            .context("workflow sticky_hit_count missing")? as u64;
+        let sticky_fallback_count =
+            row.try_get::<i64, _>("sticky_fallback_count")
+                .context("workflow sticky_fallback_count missing")? as u64;
         let sticky_hit_rate = if sticky_dispatch_count == 0 {
             0.0
         } else {
@@ -3025,6 +4196,138 @@ impl WorkflowStore {
             sticky_fallback_count,
             sticky_hit_rate,
             sticky_fallback_rate,
+        }))
+    }
+
+    async fn task_queue_resume_coalescing(
+        &self,
+        tenant_id: &str,
+        queue_kind: TaskQueueKind,
+        task_queue: &str,
+    ) -> Result<Option<ResumeCoalescingMetrics>> {
+        if queue_kind != TaskQueueKind::Workflow {
+            return Ok(None);
+        }
+
+        let row = sqlx::query(
+            r#"
+            SELECT
+                (SELECT COUNT(*)
+                 FROM workflow_tasks
+                 WHERE tenant_id = $1 AND task_queue = $2) AS workflow_task_rows,
+                (SELECT COUNT(*)
+                 FROM workflow_resumes resumes
+                 WHERE resumes.tenant_id = $1
+                   AND resumes.status = 'queued'
+                   AND EXISTS (
+                     SELECT 1
+                     FROM workflow_tasks tasks
+                     WHERE tasks.tenant_id = resumes.tenant_id
+                       AND tasks.task_queue = $2
+                       AND tasks.workflow_instance_id = resumes.workflow_instance_id
+                       AND tasks.run_id = resumes.run_id
+                   )) AS queued_resume_rows,
+                (SELECT COUNT(*)
+                 FROM workflow_resumes resumes
+                 WHERE resumes.tenant_id = $1
+                   AND EXISTS (
+                     SELECT 1
+                     FROM workflow_tasks tasks
+                     WHERE tasks.tenant_id = resumes.tenant_id
+                       AND tasks.task_queue = $2
+                       AND tasks.workflow_instance_id = resumes.workflow_instance_id
+                       AND tasks.run_id = resumes.run_id
+                   )) AS total_resume_rows
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(task_queue)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to inspect workflow queue resume coalescing")?;
+
+        let workflow_task_rows = row
+            .try_get::<i64, _>("workflow_task_rows")
+            .context("workflow task rows missing")? as u64;
+        let queued_resume_rows = row
+            .try_get::<i64, _>("queued_resume_rows")
+            .context("queued resume rows missing")? as u64;
+        let total_resume_rows =
+            row.try_get::<i64, _>("total_resume_rows").context("total resume rows missing")? as u64;
+
+        Ok(Some(ResumeCoalescingMetrics {
+            workflow_task_rows,
+            queued_resume_rows,
+            total_resume_rows,
+            resume_rows_per_task_row: if workflow_task_rows == 0 {
+                0.0
+            } else {
+                total_resume_rows as f64 / workflow_task_rows as f64
+            },
+        }))
+    }
+
+    async fn task_queue_activity_completion_metrics(
+        &self,
+        tenant_id: &str,
+        queue_kind: TaskQueueKind,
+        task_queue: &str,
+    ) -> Result<Option<ActivityCompletionMetrics>> {
+        if queue_kind != TaskQueueKind::Activity {
+            return Ok(None);
+        }
+
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) FILTER (WHERE status = 'completed') AS completed,
+                COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+                COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled,
+                COUNT(*) FILTER (WHERE status = 'timed_out') AS timed_out,
+                AVG(EXTRACT(EPOCH FROM (started_at - scheduled_at)) * 1000)
+                    FILTER (WHERE started_at IS NOT NULL) AS avg_schedule_to_start_latency_ms,
+                MAX(EXTRACT(EPOCH FROM (started_at - scheduled_at)) * 1000)
+                    FILTER (WHERE started_at IS NOT NULL) AS max_schedule_to_start_latency_ms,
+                AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)
+                    FILTER (WHERE completed_at IS NOT NULL AND started_at IS NOT NULL)
+                    AS avg_start_to_close_latency_ms,
+                MAX(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)
+                    FILTER (WHERE completed_at IS NOT NULL AND started_at IS NOT NULL)
+                    AS max_start_to_close_latency_ms
+            FROM workflow_activities
+            WHERE tenant_id = $1 AND task_queue = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(task_queue)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to inspect activity queue completion metrics")?;
+
+        Ok(Some(ActivityCompletionMetrics {
+            completed: row.try_get::<i64, _>("completed").context("completed count missing")?
+                as u64,
+            failed: row.try_get::<i64, _>("failed").context("failed count missing")? as u64,
+            cancelled: row.try_get::<i64, _>("cancelled").context("cancelled count missing")?
+                as u64,
+            timed_out: row.try_get::<i64, _>("timed_out").context("timed_out count missing")?
+                as u64,
+            avg_schedule_to_start_latency_ms: row
+                .try_get::<Option<f64>, _>("avg_schedule_to_start_latency_ms")
+                .context("avg schedule-to-start latency missing")?
+                .unwrap_or(0.0),
+            max_schedule_to_start_latency_ms: row
+                .try_get::<Option<f64>, _>("max_schedule_to_start_latency_ms")
+                .context("max schedule-to-start latency missing")?
+                .unwrap_or(0.0) as u64,
+            avg_start_to_close_latency_ms: row
+                .try_get::<Option<f64>, _>("avg_start_to_close_latency_ms")
+                .context("avg start-to-close latency missing")?
+                .unwrap_or(0.0),
+            max_start_to_close_latency_ms: row
+                .try_get::<Option<f64>, _>("max_start_to_close_latency_ms")
+                .context("max start-to-close latency missing")?
+                .unwrap_or(0.0) as u64,
         }))
     }
 
@@ -3326,6 +4629,49 @@ impl WorkflowStore {
         row.map(Self::decode_signal_row).transpose()
     }
 
+    pub async fn get_signal(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        signal_id: &str,
+    ) -> Result<Option<WorkflowSignalRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                signal_id,
+                signal_type,
+                dedupe_key,
+                payload,
+                status,
+                source_event_id,
+                dispatch_event_id,
+                consumed_event_id,
+                enqueued_at,
+                consumed_at,
+                updated_at
+            FROM workflow_signals
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND signal_id = $4
+              AND status != 'consumed'
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(signal_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load workflow signal")?;
+
+        row.map(Self::decode_signal_row).transpose()
+    }
+
     pub async fn claim_signal_for_dispatch(
         &self,
         tenant_id: &str,
@@ -3451,6 +4797,57 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to mark workflow signal consumed")?;
+
+        Ok(())
+    }
+
+    pub async fn mark_signals_consumed(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        consumed_signals: &[ConsumedSignalRecord],
+    ) -> Result<()> {
+        if consumed_signals.is_empty() {
+            return Ok(());
+        }
+
+        let signal_ids =
+            consumed_signals.iter().map(|signal| signal.signal_id.as_str()).collect::<Vec<_>>();
+        let consumed_event_ids =
+            consumed_signals.iter().map(|signal| signal.consumed_event_id).collect::<Vec<_>>();
+        let consumed_ats =
+            consumed_signals.iter().map(|signal| signal.consumed_at).collect::<Vec<_>>();
+
+        sqlx::query(
+            r#"
+            WITH consumed(signal_id, consumed_event_id, consumed_at) AS (
+                SELECT *
+                FROM UNNEST($4::text[], $5::uuid[], $6::timestamptz[])
+            )
+            UPDATE workflow_signals signals
+            SET status = $7,
+                consumed_event_id = consumed.consumed_event_id,
+                consumed_at = consumed.consumed_at,
+                updated_at = consumed.consumed_at
+            FROM consumed
+            WHERE signals.tenant_id = $1
+              AND signals.workflow_instance_id = $2
+              AND signals.run_id = $3
+              AND signals.signal_id = consumed.signal_id
+              AND signals.status != $7
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(&signal_ids)
+        .bind(&consumed_event_ids)
+        .bind(&consumed_ats)
+        .bind(WorkflowSignalStatus::Consumed.as_str())
+        .execute(&self.pool)
+        .await
+        .context("failed to mark workflow signals consumed")?;
 
         Ok(())
     }
@@ -4547,6 +5944,7 @@ impl WorkflowStore {
               AND activity_id = $4
               AND attempt = $5
               AND status = 'scheduled'
+              AND cancellation_requested = FALSE
             "#,
         )
         .bind(tenant_id)
@@ -4699,6 +6097,134 @@ impl WorkflowStore {
             occurred_at,
         )
         .await
+    }
+
+    pub async fn apply_activity_terminal_batch(
+        &self,
+        updates: &[ActivityTerminalUpdate],
+    ) -> Result<Vec<AppliedActivityTerminalUpdate>> {
+        if updates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin activity terminal batch transaction")?;
+        let mut applied = Vec::new();
+
+        for update in updates {
+            let (status, output, error, cancellation_reason, cancellation_metadata) =
+                match &update.payload {
+                    ActivityTerminalPayload::Completed { output } => {
+                        (WorkflowActivityStatus::Completed.as_str(), Some(output), None, None, None)
+                    }
+                    ActivityTerminalPayload::Failed { error } => (
+                        WorkflowActivityStatus::Failed.as_str(),
+                        None,
+                        Some(error.as_str()),
+                        None,
+                        None,
+                    ),
+                    ActivityTerminalPayload::Cancelled { reason, metadata } => (
+                        WorkflowActivityStatus::Cancelled.as_str(),
+                        None,
+                        Some(reason.as_str()),
+                        Some(reason.as_str()),
+                        metadata.as_ref(),
+                    ),
+                };
+
+            let row = sqlx::query(
+                r#"
+                UPDATE workflow_activities
+                SET status = $6,
+                    output = $7,
+                    error = $8,
+                    cancellation_reason = $9,
+                    cancellation_metadata = $10,
+                    worker_id = $11,
+                    worker_build_id = $12,
+                    completed_at = $13,
+                    lease_expires_at = NULL,
+                    last_event_id = $14,
+                    last_event_type = $15,
+                    updated_at = $16
+                WHERE tenant_id = $1
+                  AND workflow_instance_id = $2
+                  AND run_id = $3
+                  AND activity_id = $4
+                  AND attempt = $5
+                  AND status IN ('scheduled', 'started')
+                RETURNING
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    workflow_id,
+                    workflow_version,
+                    artifact_hash,
+                    activity_id,
+                    attempt,
+                    activity_type,
+                    task_queue,
+                    state,
+                    status,
+                    input,
+                    config,
+                    output,
+                    error,
+                    cancellation_requested,
+                    cancellation_reason,
+                    cancellation_metadata,
+                    worker_id,
+                    worker_build_id,
+                    scheduled_at,
+                    started_at,
+                    last_heartbeat_at,
+                    lease_expires_at,
+                    completed_at,
+                    schedule_to_start_timeout_ms,
+                    start_to_close_timeout_ms,
+                    heartbeat_timeout_ms,
+                    last_event_id,
+                    last_event_type,
+                    updated_at
+                "#,
+            )
+            .bind(&update.tenant_id)
+            .bind(&update.instance_id)
+            .bind(&update.run_id)
+            .bind(&update.activity_id)
+            .bind(i32::try_from(update.attempt).context("activity attempt exceeds i32")?)
+            .bind(status)
+            .bind(output.map(Json))
+            .bind(error)
+            .bind(cancellation_reason)
+            .bind(cancellation_metadata.map(Json))
+            .bind(&update.worker_id)
+            .bind(&update.worker_build_id)
+            .bind(update.occurred_at)
+            .bind(update.event_id)
+            .bind(&update.event_type)
+            .bind(update.occurred_at)
+            .fetch_optional(&mut *tx)
+            .await
+            .context("failed to update workflow activity terminal status in batch")?;
+
+            if let Some(row) = row {
+                applied.push(AppliedActivityTerminalUpdate {
+                    record: Self::decode_activity_row(row)?,
+                    event_id: update.event_id,
+                    occurred_at: update.occurred_at,
+                    payload: update.payload.clone(),
+                });
+            }
+        }
+
+        tx.commit().await.context("failed to commit activity terminal batch transaction")?;
+
+        Ok(applied)
     }
 
     pub async fn fail_activity(
@@ -5287,12 +6813,8 @@ impl WorkflowStore {
                 .try_get::<Option<Json<Value>>, _>("metadata")
                 .context("task queue build metadata missing")?
                 .map(|value| value.0),
-            created_at: row
-                .try_get("created_at")
-                .context("task queue build created_at missing")?,
-            updated_at: row
-                .try_get("updated_at")
-                .context("task queue build updated_at missing")?,
+            created_at: row.try_get("created_at").context("task queue build created_at missing")?,
+            updated_at: row.try_get("updated_at").context("task queue build updated_at missing")?,
         })
     }
 
@@ -5301,9 +6823,7 @@ impl WorkflowStore {
         build_ids: Vec<String>,
     ) -> Result<CompatibilitySetRecord> {
         Ok(CompatibilitySetRecord {
-            tenant_id: row
-                .try_get("tenant_id")
-                .context("compatibility set tenant_id missing")?,
+            tenant_id: row.try_get("tenant_id").context("compatibility set tenant_id missing")?,
             queue_kind: TaskQueueKind::from_db(
                 &row.try_get::<String, _>("queue_kind")
                     .context("compatibility set queue_kind missing")?,
@@ -5345,15 +6865,9 @@ impl WorkflowStore {
             last_seen_at: row
                 .try_get("last_seen_at")
                 .context("queue poller last_seen_at missing")?,
-            expires_at: row
-                .try_get("expires_at")
-                .context("queue poller expires_at missing")?,
-            created_at: row
-                .try_get("created_at")
-                .context("queue poller created_at missing")?,
-            updated_at: row
-                .try_get("updated_at")
-                .context("queue poller updated_at missing")?,
+            expires_at: row.try_get("expires_at").context("queue poller expires_at missing")?,
+            created_at: row.try_get("created_at").context("queue poller created_at missing")?,
+            updated_at: row.try_get("updated_at").context("queue poller updated_at missing")?,
         })
     }
 
@@ -5378,15 +6892,12 @@ impl WorkflowStore {
             partition_id: row
                 .try_get("partition_id")
                 .context("workflow task partition_id missing")?,
-            task_queue: row
-                .try_get("task_queue")
-                .context("workflow task task_queue missing")?,
+            task_queue: row.try_get("task_queue").context("workflow task task_queue missing")?,
             preferred_build_id: row
                 .try_get("preferred_build_id")
                 .context("workflow task preferred_build_id missing")?,
             status: WorkflowTaskStatus::from_db(
-                &row.try_get::<String, _>("status")
-                    .context("workflow task status missing")?,
+                &row.try_get::<String, _>("status").context("workflow task status missing")?,
             )?,
             source_event_id: row
                 .try_get("source_event_id")
@@ -5398,6 +6909,30 @@ impl WorkflowStore {
                 .try_get::<Json<EventEnvelope<WorkflowEvent>>, _>("source_event")
                 .context("workflow task source_event missing")?
                 .0,
+            mailbox_consumed_seq: row
+                .try_get::<i64, _>("mailbox_consumed_seq")
+                .context("workflow task mailbox_consumed_seq missing")?
+                as u64,
+            resume_consumed_seq: row
+                .try_get::<i64, _>("resume_consumed_seq")
+                .context("workflow task resume_consumed_seq missing")?
+                as u64,
+            mailbox_high_watermark: row
+                .try_get::<i64, _>("mailbox_high_watermark")
+                .context("workflow task mailbox_high_watermark missing")?
+                as u64,
+            resume_high_watermark: row
+                .try_get::<i64, _>("resume_high_watermark")
+                .context("workflow task resume_high_watermark missing")?
+                as u64,
+            mailbox_backlog: row
+                .try_get::<i64, _>("mailbox_backlog")
+                .context("workflow task mailbox_backlog missing")?
+                as u64,
+            resume_backlog: row
+                .try_get::<i64, _>("resume_backlog")
+                .context("workflow task resume_backlog missing")?
+                as u64,
             lease_poller_id: row
                 .try_get("lease_poller_id")
                 .context("workflow task lease_poller_id missing")?,
@@ -5409,17 +6944,90 @@ impl WorkflowStore {
                 .context("workflow task lease_expires_at missing")?,
             attempt_count: row
                 .try_get::<i32, _>("attempt_count")
-                .context("workflow task attempt_count missing")?
-                as u32,
-            last_error: row
-                .try_get("last_error")
-                .context("workflow task last_error missing")?,
-            created_at: row
-                .try_get("created_at")
-                .context("workflow task created_at missing")?,
-            updated_at: row
-                .try_get("updated_at")
-                .context("workflow task updated_at missing")?,
+                .context("workflow task attempt_count missing")? as u32,
+            last_error: row.try_get("last_error").context("workflow task last_error missing")?,
+            created_at: row.try_get("created_at").context("workflow task created_at missing")?,
+            updated_at: row.try_get("updated_at").context("workflow task updated_at missing")?,
+        })
+    }
+
+    fn decode_workflow_mailbox_row(row: sqlx::postgres::PgRow) -> Result<WorkflowMailboxRecord> {
+        Ok(WorkflowMailboxRecord {
+            tenant_id: row.try_get("tenant_id").context("workflow mailbox tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("workflow mailbox workflow_instance_id missing")?,
+            run_id: row.try_get("run_id").context("workflow mailbox run_id missing")?,
+            accepted_seq: row
+                .try_get::<i64, _>("accepted_seq")
+                .context("workflow mailbox accepted_seq missing")? as u64,
+            kind: WorkflowMailboxKind::from_db(
+                &row.try_get::<String, _>("kind").context("workflow mailbox kind missing")?,
+            )?,
+            message_id: row.try_get("message_id").context("workflow mailbox message_id missing")?,
+            message_name: row
+                .try_get("message_name")
+                .context("workflow mailbox message_name missing")?,
+            payload: row
+                .try_get::<Option<Json<Value>>, _>("payload")
+                .context("workflow mailbox payload missing")?
+                .map(|value| value.0),
+            source_event_id: row
+                .try_get("source_event_id")
+                .context("workflow mailbox source_event_id missing")?,
+            source_event_type: row
+                .try_get("source_event_type")
+                .context("workflow mailbox source_event_type missing")?,
+            source_event: row
+                .try_get::<Json<EventEnvelope<WorkflowEvent>>, _>("source_event")
+                .context("workflow mailbox source_event missing")?
+                .0,
+            status: WorkflowMailboxStatus::from_db(
+                &row.try_get::<String, _>("status").context("workflow mailbox status missing")?,
+            )?,
+            consumed_at: row
+                .try_get("consumed_at")
+                .context("workflow mailbox consumed_at missing")?,
+            created_at: row.try_get("created_at").context("workflow mailbox created_at missing")?,
+            updated_at: row.try_get("updated_at").context("workflow mailbox updated_at missing")?,
+        })
+    }
+
+    fn decode_workflow_resume_row(row: sqlx::postgres::PgRow) -> Result<WorkflowResumeRecord> {
+        Ok(WorkflowResumeRecord {
+            tenant_id: row.try_get("tenant_id").context("workflow resume tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("workflow resume workflow_instance_id missing")?,
+            run_id: row.try_get("run_id").context("workflow resume run_id missing")?,
+            resume_seq: row
+                .try_get::<i64, _>("resume_seq")
+                .context("workflow resume resume_seq missing")? as u64,
+            kind: WorkflowResumeKind::from_db(
+                &row.try_get::<String, _>("kind").context("workflow resume kind missing")?,
+            )?,
+            ref_id: row.try_get("ref_id").context("workflow resume ref_id missing")?,
+            status_label: row
+                .try_get("status_label")
+                .context("workflow resume status_label missing")?,
+            source_event_id: row
+                .try_get("source_event_id")
+                .context("workflow resume source_event_id missing")?,
+            source_event_type: row
+                .try_get("source_event_type")
+                .context("workflow resume source_event_type missing")?,
+            source_event: row
+                .try_get::<Json<EventEnvelope<WorkflowEvent>>, _>("source_event")
+                .context("workflow resume source_event missing")?
+                .0,
+            status: WorkflowResumeStatus::from_db(
+                &row.try_get::<String, _>("status").context("workflow resume status missing")?,
+            )?,
+            consumed_at: row
+                .try_get("consumed_at")
+                .context("workflow resume consumed_at missing")?,
+            created_at: row.try_get("created_at").context("workflow resume created_at missing")?,
+            updated_at: row.try_get("updated_at").context("workflow resume updated_at missing")?,
         })
     }
 
@@ -5696,8 +7304,8 @@ mod tests {
             }
 
             let container_name = format!("fabrik-store-test-{}", Uuid::now_v7());
-            let image =
-                std::env::var("FABRIK_TEST_POSTGRES_IMAGE").unwrap_or_else(|_| "postgres:16-alpine".to_owned());
+            let image = std::env::var("FABRIK_TEST_POSTGRES_IMAGE")
+                .unwrap_or_else(|_| "postgres:16-alpine".to_owned());
             let output = Command::new("docker")
                 .args([
                     "run",
@@ -5730,8 +7338,9 @@ mod tests {
                     return Err(error);
                 }
             };
-            let database_url =
-                format!("postgres://fabrik:fabrik@127.0.0.1:{host_port}/fabrik_test?sslmode=disable");
+            let database_url = format!(
+                "postgres://fabrik:fabrik@127.0.0.1:{host_port}/fabrik_test?sslmode=disable"
+            );
             Ok(Some(Self { container_name, database_url }))
         }
 
@@ -5841,6 +7450,72 @@ mod tests {
             ),
             WorkflowEvent::WorkflowTriggered { input: json!({"ok": true}) },
         )
+    }
+
+    fn signal_event(
+        instance_id: &str,
+        run_id: &str,
+        sequence: usize,
+    ) -> EventEnvelope<WorkflowEvent> {
+        let mut event = EventEnvelope::new(
+            WorkflowEvent::SignalQueued {
+                signal_id: format!("sig-{sequence}"),
+                signal_type: "external.approved".to_owned(),
+                payload: json!({ "sequence": sequence }),
+            }
+            .event_type(),
+            WorkflowIdentity::new(
+                "tenant-a".to_owned(),
+                "demo".to_owned(),
+                1,
+                "artifact-a".to_owned(),
+                instance_id.to_owned(),
+                run_id.to_owned(),
+                "test",
+            ),
+            WorkflowEvent::SignalQueued {
+                signal_id: format!("sig-{sequence}"),
+                signal_type: "external.approved".to_owned(),
+                payload: json!({ "sequence": sequence }),
+            },
+        );
+        event.occurred_at += chrono::Duration::milliseconds(sequence as i64);
+        event
+    }
+
+    fn activity_completed_event(
+        instance_id: &str,
+        run_id: &str,
+        sequence: usize,
+    ) -> EventEnvelope<WorkflowEvent> {
+        let mut event = EventEnvelope::new(
+            WorkflowEvent::ActivityTaskCompleted {
+                activity_id: format!("activity-{sequence}"),
+                attempt: 1,
+                output: json!({ "sequence": sequence }),
+                worker_id: "worker-a".to_owned(),
+                worker_build_id: "build-a".to_owned(),
+            }
+            .event_type(),
+            WorkflowIdentity::new(
+                "tenant-a".to_owned(),
+                "demo".to_owned(),
+                1,
+                "artifact-a".to_owned(),
+                instance_id.to_owned(),
+                run_id.to_owned(),
+                "test",
+            ),
+            WorkflowEvent::ActivityTaskCompleted {
+                activity_id: format!("activity-{sequence}"),
+                attempt: 1,
+                output: json!({ "sequence": sequence }),
+                worker_id: "worker-a".to_owned(),
+                worker_build_id: "build-a".to_owned(),
+            },
+        );
+        event.occurred_at += chrono::Duration::milliseconds(sequence as i64);
+        event
     }
 
     #[tokio::test]
@@ -5972,9 +7647,8 @@ mod tests {
         assert_eq!(initial.owner_epoch, 1);
         assert!(store.validate_partition_ownership(7, "executor-a", 1).await?);
 
-        let busy = store
-            .claim_partition_ownership(7, "executor-b", StdDuration::from_secs(1))
-            .await?;
+        let busy =
+            store.claim_partition_ownership(7, "executor-b", StdDuration::from_secs(1)).await?;
         assert!(busy.is_none());
 
         sleep(StdDuration::from_millis(250)).await;
@@ -5993,6 +7667,143 @@ mod tests {
                 .await?
                 .is_none()
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "perf harness; run with cargo test -p fabrik-store mailbox_task_coalescing_benchmark -- --ignored --nocapture"]
+    async fn mailbox_task_coalescing_benchmark() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let instance_id = "wf-mailbox-bench";
+        let run_id = "run-mailbox-bench";
+        let accepted_messages = 1000_i64;
+        let started_at = Instant::now();
+
+        for sequence in 0..accepted_messages as usize {
+            let event = signal_event(instance_id, run_id, sequence);
+            store
+                .enqueue_workflow_mailbox_message(
+                    2,
+                    "payments",
+                    Some("build-a"),
+                    &event,
+                    WorkflowMailboxKind::Signal,
+                    Some(&format!("sig-{sequence}")),
+                    Some("external.approved"),
+                    Some(&json!({ "sequence": sequence })),
+                )
+                .await?;
+        }
+
+        let elapsed = started_at.elapsed();
+        let task_rows: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM workflow_tasks
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
+            "#,
+        )
+        .bind("tenant-a")
+        .bind(instance_id)
+        .bind(run_id)
+        .fetch_one(&store.pool)
+        .await?;
+        let mailbox_backlog: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(mailbox_backlog, 0)
+            FROM workflow_tasks
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
+            LIMIT 1
+            "#,
+        )
+        .bind("tenant-a")
+        .bind(instance_id)
+        .bind(run_id)
+        .fetch_one(&store.pool)
+        .await?;
+        let legacy_task_rows = accepted_messages;
+        let reduction_pct = 100.0 * (1.0 - task_rows as f64 / legacy_task_rows as f64);
+
+        println!(
+            "mailbox_task_coalescing_benchmark accepted_messages={accepted_messages} task_rows={task_rows} legacy_task_rows={legacy_task_rows} reduction_pct={reduction_pct:.2} mailbox_backlog={mailbox_backlog} elapsed_ms={}",
+            elapsed.as_millis()
+        );
+
+        assert_eq!(task_rows, 1);
+        assert_eq!(mailbox_backlog, accepted_messages);
+        assert!(reduction_pct >= 99.0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "perf harness; run with cargo test -p fabrik-store resume_task_coalescing_benchmark -- --ignored --nocapture"]
+    async fn resume_task_coalescing_benchmark() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let instance_id = "wf-resume-bench";
+        let run_id = "run-resume-bench";
+        let resume_events = 1000_i64;
+        let started_at = Instant::now();
+
+        for sequence in 0..resume_events as usize {
+            let event = activity_completed_event(instance_id, run_id, sequence);
+            store
+                .enqueue_workflow_resume(
+                    2,
+                    "payments",
+                    Some("build-a"),
+                    &event,
+                    WorkflowResumeKind::ActivityTerminal,
+                    &format!("activity-{sequence}:1"),
+                    Some("completed"),
+                )
+                .await?;
+        }
+
+        let elapsed = started_at.elapsed();
+        let task_rows: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM workflow_tasks
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
+            "#,
+        )
+        .bind("tenant-a")
+        .bind(instance_id)
+        .bind(run_id)
+        .fetch_one(&store.pool)
+        .await?;
+        let resume_backlog: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(resume_backlog, 0)
+            FROM workflow_tasks
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
+            LIMIT 1
+            "#,
+        )
+        .bind("tenant-a")
+        .bind(instance_id)
+        .bind(run_id)
+        .fetch_one(&store.pool)
+        .await?;
+        let legacy_task_rows = resume_events;
+        let reduction_pct = 100.0 * (1.0 - task_rows as f64 / legacy_task_rows as f64);
+
+        println!(
+            "resume_task_coalescing_benchmark resume_events={resume_events} task_rows={task_rows} legacy_task_rows={legacy_task_rows} reduction_pct={reduction_pct:.2} resume_backlog={resume_backlog} elapsed_ms={}",
+            elapsed.as_millis()
+        );
+
+        assert_eq!(task_rows, 1);
+        assert_eq!(resume_backlog, resume_events);
+        assert!(reduction_pct >= 99.0);
 
         Ok(())
     }

@@ -23,6 +23,7 @@ struct AppState {
     ingest_base: String,
     query_base: String,
     executor_base: String,
+    matching_base: String,
     store: WorkflowStore,
 }
 
@@ -79,6 +80,8 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|_| "http://127.0.0.1:3005".to_owned()),
         executor_base: env::var("EXECUTOR_SERVICE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:3002".to_owned()),
+        matching_base: env::var("MATCHING_DEBUG_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:3004".to_owned()),
         store,
     };
 
@@ -176,6 +179,7 @@ fn build_app(state: AppState, service_name: String) -> Router {
         get(get_task_queue_inspection),
     )
     .route("/admin/debug/executor/hybrid-routing", get(proxy_to_executor_get))
+    .route("/admin/debug/matching/activity-results", get(proxy_to_matching_get))
     .with_state(state)
 }
 
@@ -206,12 +210,15 @@ async fn proxy_to_executor_get(
     State(state): State<AppState>,
     _uri: OriginalUri,
 ) -> Result<(StatusCode, Bytes), (StatusCode, String)> {
-    proxy_get_path(
-        state.client.clone(),
-        state.executor_base.clone(),
-        "/debug/hybrid-routing",
-    )
-    .await
+    proxy_get_path(state.client.clone(), state.executor_base.clone(), "/debug/hybrid-routing").await
+}
+
+async fn proxy_to_matching_get(
+    State(state): State<AppState>,
+    _uri: OriginalUri,
+) -> Result<(StatusCode, Bytes), (StatusCode, String)> {
+    proxy_get_path(state.client.clone(), state.matching_base.clone(), "/debug/activity-results")
+        .await
 }
 
 async fn register_build(
@@ -233,8 +240,10 @@ async fn register_build(
         .await
         .map_err(internal_error)?;
     if request.promote_default {
-        let set_id =
-            request.compatibility_set_id.clone().unwrap_or_else(|| format!("default-{}", request.build_id));
+        let set_id = request
+            .compatibility_set_id
+            .clone()
+            .unwrap_or_else(|| format!("default-{}", request.build_id));
         state
             .store
             .upsert_compatibility_set(
@@ -348,17 +357,11 @@ async fn proxy_request(
     uri: OriginalUri,
     body: Option<Bytes>,
 ) -> Result<(StatusCode, Bytes), (StatusCode, String)> {
-    let path_and_query = uri
-        .0
-        .path_and_query()
-        .map(|value| value.as_str())
-        .unwrap_or_else(|| uri.0.path());
+    let path_and_query =
+        uri.0.path_and_query().map(|value| value.as_str()).unwrap_or_else(|| uri.0.path());
     let url = format!("{base_url}{path_and_query}");
-    let request = if let Some(body) = body {
-        client.post(&url).body(body)
-    } else {
-        client.get(&url)
-    };
+    let request =
+        if let Some(body) = body { client.post(&url).body(body) } else { client.get(&url) };
     let response = request
         .send()
         .await
@@ -366,10 +369,8 @@ async fn proxy_request(
         .map_err(internal_error)?;
     let status = StatusCode::from_u16(response.status().as_u16())
         .map_err(|error| internal_error(anyhow::anyhow!(error.to_string())))?;
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| internal_error(anyhow::Error::from(error)))?;
+    let bytes =
+        response.bytes().await.map_err(|error| internal_error(anyhow::Error::from(error)))?;
     Ok((status, bytes))
 }
 
@@ -387,10 +388,8 @@ async fn proxy_get_path(
         .map_err(internal_error)?;
     let status = StatusCode::from_u16(response.status().as_u16())
         .map_err(|error| internal_error(anyhow::anyhow!(error.to_string())))?;
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| internal_error(anyhow::Error::from(error)))?;
+    let bytes =
+        response.bytes().await.map_err(|error| internal_error(anyhow::Error::from(error)))?;
     Ok((status, bytes))
 }
 
@@ -438,8 +437,8 @@ mod tests {
             }
 
             let container_name = format!("fabrik-gateway-test-pg-{}", uuid::Uuid::now_v7());
-            let image =
-                std::env::var("FABRIK_TEST_POSTGRES_IMAGE").unwrap_or_else(|_| "postgres:16-alpine".to_owned());
+            let image = std::env::var("FABRIK_TEST_POSTGRES_IMAGE")
+                .unwrap_or_else(|_| "postgres:16-alpine".to_owned());
             let output = Command::new("docker")
                 .args([
                     "run",
@@ -472,8 +471,9 @@ mod tests {
                     return Err(error);
                 }
             };
-            let database_url =
-                format!("postgres://fabrik:fabrik@127.0.0.1:{host_port}/fabrik_test?sslmode=disable");
+            let database_url = format!(
+                "postgres://fabrik:fabrik@127.0.0.1:{host_port}/fabrik_test?sslmode=disable"
+            );
             Ok(Some(Self { container_name, database_url }))
         }
 
@@ -612,26 +612,29 @@ mod tests {
         };
         let store = postgres.connect_store().await?;
 
-        let ingest = TestHttpServer::start(
-            Router::new().route(
-                "/workflows/demo/trigger",
-                post(|| async { (StatusCode::ACCEPTED, Json(json!({"service": "ingest"}))).into_response() }),
-            ),
-        )
+        let ingest = TestHttpServer::start(Router::new().route(
+            "/workflows/demo/trigger",
+            post(|| async {
+                (StatusCode::ACCEPTED, Json(json!({"service": "ingest"}))).into_response()
+            }),
+        ))
         .await?;
-        let query = TestHttpServer::start(
-            Router::new().route(
-                "/tenants/tenant-a/workflows/instance-1",
-                get(|| async { Json(json!({"service": "query"})).into_response() }),
-            ),
-        )
+        let query = TestHttpServer::start(Router::new().route(
+            "/tenants/tenant-a/workflows/instance-1",
+            get(|| async { Json(json!({"service": "query"})).into_response() }),
+        ))
         .await?;
-        let executor = TestHttpServer::start(
-            Router::new().route(
-                "/debug/hybrid-routing",
-                get(|| async { Json(json!({"matching_routed_turns": 4})).into_response() }),
-            ),
-        )
+        let executor = TestHttpServer::start(Router::new().route(
+            "/debug/hybrid-routing",
+            get(|| async { Json(json!({"matching_routed_turns": 4})).into_response() }),
+        ))
+        .await?;
+        let matching = TestHttpServer::start(Router::new().route(
+            "/debug/activity-results",
+            get(|| async {
+                Json(json!({"applied_batches": 2, "applied_results": 8})).into_response()
+            }),
+        ))
         .await?;
 
         let app = build_app(
@@ -640,6 +643,7 @@ mod tests {
                 ingest_base: ingest.base_url.clone(),
                 query_base: query.base_url.clone(),
                 executor_base: executor.base_url.clone(),
+                matching_base: matching.base_url.clone(),
                 store,
             },
             "api-gateway-test".to_owned(),
@@ -671,6 +675,7 @@ mod tests {
         assert_eq!(serde_json::from_slice::<Value>(&query_body)?["service"], "query");
 
         let debug_response = app
+            .clone()
             .oneshot(
                 Request::get("/admin/debug/executor/hybrid-routing")
                     .body(Body::empty())
@@ -679,14 +684,23 @@ mod tests {
             .await?;
         assert_eq!(debug_response.status(), StatusCode::OK);
         let debug_body = to_bytes(debug_response.into_body(), usize::MAX).await?;
-        assert_eq!(
-            serde_json::from_slice::<Value>(&debug_body)?["matching_routed_turns"],
-            4
-        );
+        assert_eq!(serde_json::from_slice::<Value>(&debug_body)?["matching_routed_turns"], 4);
+
+        let matching_debug_response = app
+            .oneshot(
+                Request::get("/admin/debug/matching/activity-results")
+                    .body(Body::empty())
+                    .expect("matching debug request"),
+            )
+            .await?;
+        assert_eq!(matching_debug_response.status(), StatusCode::OK);
+        let matching_debug_body = to_bytes(matching_debug_response.into_body(), usize::MAX).await?;
+        assert_eq!(serde_json::from_slice::<Value>(&matching_debug_body)?["applied_results"], 8);
 
         ingest.stop().await;
         query.stop().await;
         executor.stop().await;
+        matching.stop().await;
         Ok(())
     }
 
@@ -702,6 +716,7 @@ mod tests {
                 ingest_base: "http://127.0.0.1:1".to_owned(),
                 query_base: "http://127.0.0.1:1".to_owned(),
                 executor_base: "http://127.0.0.1:1".to_owned(),
+                matching_base: "http://127.0.0.1:1".to_owned(),
                 store: store.clone(),
             },
             "api-gateway-test".to_owned(),
@@ -779,9 +794,7 @@ mod tests {
             ),
             WorkflowEvent::WorkflowTriggered { input: json!({"ok": true}) },
         );
-        event
-            .metadata
-            .insert("workflow_task_queue".to_owned(), "payments".to_owned());
+        event.metadata.insert("workflow_task_queue".to_owned(), "payments".to_owned());
         let task = store
             .enqueue_workflow_task(3, "payments", Some("build-a"), &event)
             .await?

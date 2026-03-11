@@ -116,6 +116,10 @@ pub struct MatchingRuntimeConfig {
     pub heartbeat_publish_interval_ms: u64,
     pub sweep_interval_ms: u64,
     pub max_rebuild_tasks: i64,
+    pub activity_result_apply_batch_max_items: usize,
+    pub activity_result_apply_batch_max_bytes: usize,
+    pub activity_result_apply_flush_interval_ms: u64,
+    pub result_apply_per_run_coalescing_cap: usize,
 }
 
 impl MatchingRuntimeConfig {
@@ -128,6 +132,22 @@ impl MatchingRuntimeConfig {
             )?,
             sweep_interval_ms: read_u64_with_default("MATCHING_SWEEP_INTERVAL_MS", 500)?,
             max_rebuild_tasks: read_i64_with_default("MATCHING_MAX_REBUILD_TASKS", 10_000)?,
+            activity_result_apply_batch_max_items: read_usize_with_default(
+                "MATCHING_ACTIVITY_RESULT_BATCH_MAX_ITEMS",
+                256,
+            )?,
+            activity_result_apply_batch_max_bytes: read_usize_with_default(
+                "MATCHING_ACTIVITY_RESULT_BATCH_MAX_BYTES",
+                1_048_576,
+            )?,
+            activity_result_apply_flush_interval_ms: read_u64_with_default(
+                "MATCHING_ACTIVITY_RESULT_BATCH_FLUSH_INTERVAL_MS",
+                5,
+            )?,
+            result_apply_per_run_coalescing_cap: read_usize_with_default(
+                "MATCHING_RESULT_APPLY_PER_RUN_COALESCING_CAP",
+                256,
+            )?,
         })
     }
 }
@@ -157,6 +177,8 @@ pub struct ExecutorRuntimeConfig {
     pub continue_as_new_event_threshold: Option<u64>,
     pub continue_as_new_activity_attempt_threshold: Option<u64>,
     pub continue_as_new_run_age_seconds: Option<u64>,
+    pub max_mailbox_items_per_turn: usize,
+    pub max_transitions_per_turn: usize,
 }
 
 impl ExecutorRuntimeConfig {
@@ -175,6 +197,14 @@ impl ExecutorRuntimeConfig {
             )?,
             continue_as_new_run_age_seconds: read_optional_u64(
                 "EXECUTOR_CONTINUE_AS_NEW_RUN_AGE_SECONDS",
+            )?,
+            max_mailbox_items_per_turn: read_usize_with_default(
+                "EXECUTOR_MAX_MAILBOX_ITEMS_PER_TURN",
+                64,
+            )?,
+            max_transitions_per_turn: read_usize_with_default(
+                "EXECUTOR_MAX_TRANSITIONS_PER_TURN",
+                10_000,
             )?,
         })
     }
