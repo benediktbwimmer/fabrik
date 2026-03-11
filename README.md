@@ -157,6 +157,7 @@ Run all checks:
 ```bash
 cargo check
 cargo test
+npm install
 ```
 
 Run a service:
@@ -171,6 +172,17 @@ Replay one workflow run from the durable log:
 cargo run -p replay-tool -- <tenant_id> <instance_id> [run_id]
 ```
 
+Compile a TypeScript workflow artifact:
+
+```bash
+node sdk/typescript-compiler/compiler.mjs \
+  --entry examples/typescript-workflows/order-workflow.ts \
+  --export orderWorkflow \
+  --definition-id order-workflow \
+  --version 1 \
+  --out /tmp/order-workflow-artifact.json
+```
+
 Useful local endpoints:
 
 - Redpanda broker: `localhost:29092`
@@ -179,10 +191,14 @@ Useful local endpoints:
 - API gateway health: `http://localhost:3000/healthz`
 - Ingest trigger API: `POST http://localhost:3001/workflows/{definition_id}/trigger`
 - Ingest definition publish API: `POST http://localhost:3001/tenants/{tenant_id}/workflow-definitions`
+- Ingest artifact publish API: `POST http://localhost:3001/tenants/{tenant_id}/workflow-artifacts`
 - Ingest signal API: `POST http://localhost:3001/tenants/{tenant_id}/workflows/{instance_id}/signals/{signal_type}`
 - Ingest continue-as-new API: `POST http://localhost:3001/tenants/{tenant_id}/workflows/{instance_id}/continue-as-new`
 - Query definition API: `GET http://localhost:3005/tenants/{tenant_id}/workflow-definitions/{definition_id}/latest`
+- Query artifact API: `GET http://localhost:3005/tenants/{tenant_id}/workflow-artifacts/{definition_id}/versions/{version}`
 - Query instance API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}`
+
+Example TypeScript workflows live in [examples/typescript-workflows/order-workflow.ts](/Users/bene/code/fabrik/examples/typescript-workflows/order-workflow.ts) and [examples/typescript-workflows/helpers.ts](/Users/bene/code/fabrik/examples/typescript-workflows/helpers.ts).
 
 ## Documents
 

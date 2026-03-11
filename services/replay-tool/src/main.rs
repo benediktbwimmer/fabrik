@@ -3,8 +3,10 @@ use std::{env, time::Duration};
 use anyhow::{Context, Result, bail};
 use fabrik_broker::{BrokerConfig, WorkflowHistoryFilter, read_workflow_history};
 use fabrik_config::{PostgresConfig, RedpandaConfig};
+use fabrik_events::WorkflowEvent;
 use fabrik_store::WorkflowStore;
-use fabrik_workflow::{WorkflowInstanceState, artifact_hash};
+use fabrik_workflow::WorkflowInstanceState;
+use fabrik_workflow::artifact_hash;
 use serde::Serialize;
 
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 1_000;
@@ -67,30 +69,51 @@ async fn main() -> Result<()> {
         );
     }
 
-    let replayed_state = replay_history(&history)?;
-    let definition_version = replayed_state
-        .definition_version
-        .context("replayed state is missing definition_version")?;
+    let pinned_artifact = if let Some(version) = current_instance.definition_version {
+        store.get_artifact_version(&args.tenant_id, &current_instance.definition_id, version).await?
+    } else {
+        None
+    };
+
+    let replayed_state = if let Some(artifact) = pinned_artifact {
+        replay_compiled_history(&history, &artifact)?
+    } else {
+        replay_history(&history)?
+    };
+    let definition_version =
+        replayed_state.definition_version.context("replayed state is missing definition_version")?;
     let pinned_artifact_hash =
         replayed_state.artifact_hash.clone().context("replayed state is missing artifact_hash")?;
-    let definition = store
-        .get_definition_version(&args.tenant_id, &replayed_state.definition_id, definition_version)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "workflow definition {} version {} not found for tenant {}",
-                replayed_state.definition_id,
-                definition_version,
-                args.tenant_id
-            )
-        })?;
-    let computed_artifact_hash = artifact_hash(&definition);
-    if computed_artifact_hash != pinned_artifact_hash {
-        bail!(
-            "artifact hash mismatch for replayed run: history={}, definition={}",
-            pinned_artifact_hash,
-            computed_artifact_hash
-        );
+    if let Some(artifact) =
+        store.get_artifact_version(&args.tenant_id, &replayed_state.definition_id, definition_version).await?
+    {
+        if artifact.artifact_hash != pinned_artifact_hash {
+            bail!(
+                "artifact hash mismatch for replayed run: history={}, artifact={}",
+                pinned_artifact_hash,
+                artifact.artifact_hash
+            );
+        }
+    } else {
+        let definition = store
+            .get_definition_version(&args.tenant_id, &replayed_state.definition_id, definition_version)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "workflow definition {} version {} not found for tenant {}",
+                    replayed_state.definition_id,
+                    definition_version,
+                    args.tenant_id
+                )
+            })?;
+        let computed_artifact_hash = artifact_hash(&definition);
+        if computed_artifact_hash != pinned_artifact_hash {
+            bail!(
+                "artifact hash mismatch for replayed run: history={}, definition={}",
+                pinned_artifact_hash,
+                computed_artifact_hash
+            );
+        }
     }
 
     let projection_matches_store = (current_instance.run_id == replayed_state.run_id)
@@ -147,6 +170,68 @@ fn replay_history(
     }
 
     state.context("workflow history did not produce a replayable state")
+}
+
+fn replay_compiled_history(
+    history: &[fabrik_events::EventEnvelope<fabrik_events::WorkflowEvent>],
+    artifact: &fabrik_workflow::CompiledWorkflowArtifact,
+) -> Result<WorkflowInstanceState> {
+    let trigger = history
+        .iter()
+        .find_map(|event| match &event.payload {
+            WorkflowEvent::WorkflowTriggered { input } => Some((event, input.clone())),
+            _ => None,
+        })
+        .context("compiled workflow history is missing WorkflowTriggered")?;
+    let mut replayed = WorkflowInstanceState::try_from(trigger.0)?;
+    let mut execution = artifact.execute_trigger(&trigger.1)?;
+    replayed.current_state = Some(execution.final_state.clone());
+    replayed.context = execution.context.clone();
+    replayed.output = execution.output.clone();
+    replayed.artifact_execution = Some(execution.execution_state.clone());
+    for event in history.iter().skip(1) {
+        replayed.apply_event(event);
+        match &event.payload {
+            WorkflowEvent::SignalReceived { signal_type, payload } => {
+                execution = artifact.execute_after_signal(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    signal_type,
+                    payload,
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                )?;
+            }
+            WorkflowEvent::TimerFired { timer_id } => {
+                execution = artifact.execute_after_timer(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    timer_id,
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                )?;
+            }
+            WorkflowEvent::StepCompleted { step_id, output, .. } => {
+                execution = artifact.execute_after_step_completion(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    step_id,
+                    output,
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                )?;
+            }
+            WorkflowEvent::StepFailed { step_id, error, .. } => {
+                execution = artifact.execute_after_step_failure(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    step_id,
+                    error,
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                )?;
+            }
+            _ => continue,
+        }
+        replayed.current_state = Some(execution.final_state.clone());
+        replayed.context = execution.context.clone();
+        replayed.output = execution.output.clone();
+        replayed.artifact_execution = Some(execution.execution_state.clone());
+    }
+
+    Ok(replayed)
 }
 
 fn same_projection(left: &WorkflowInstanceState, right: &WorkflowInstanceState) -> bool {

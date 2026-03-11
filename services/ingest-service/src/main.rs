@@ -10,7 +10,7 @@ use fabrik_config::{HttpServiceConfig, PostgresConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::WorkflowStore;
-use fabrik_workflow::{WorkflowDefinition, WorkflowStatus, artifact_hash};
+use fabrik_workflow::{CompiledWorkflowArtifact, WorkflowDefinition, WorkflowStatus, artifact_hash};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::info;
@@ -83,6 +83,15 @@ struct PublishWorkflowDefinitionResponse {
     status: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+struct PublishWorkflowArtifactResponse {
+    tenant_id: String,
+    definition_id: String,
+    version: u32,
+    artifact_hash: String,
+    status: &'static str,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = HttpServiceConfig::from_env("INGEST_SERVICE", "ingest-service", 3001)?;
@@ -100,6 +109,7 @@ async fn main() -> Result<()> {
         env!("CARGO_PKG_VERSION"),
     ))
     .route("/tenants/{tenant_id}/workflow-definitions", post(publish_workflow_definition))
+    .route("/tenants/{tenant_id}/workflow-artifacts", post(publish_workflow_artifact))
     .route("/workflows/{workflow_id}/trigger", post(trigger_workflow))
     .route(
         "/tenants/{tenant_id}/workflows/{workflow_instance_id}/signals/{signal_type}",
@@ -115,6 +125,27 @@ async fn main() -> Result<()> {
     });
 
     serve(app, config.port).await
+}
+
+async fn publish_workflow_artifact(
+    Path(tenant_id): Path<String>,
+    State(state): State<AppState>,
+    Json(artifact): Json<CompiledWorkflowArtifact>,
+) -> Result<(StatusCode, Json<PublishWorkflowArtifactResponse>), (StatusCode, String)> {
+    artifact.validate().map_err(validation_error)?;
+
+    state.store.put_artifact(&tenant_id, &artifact).await.map_err(internal_error)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(PublishWorkflowArtifactResponse {
+            tenant_id,
+            definition_id: artifact.definition_id.clone(),
+            version: artifact.definition_version,
+            artifact_hash: artifact.artifact_hash.clone(),
+            status: "stored",
+        }),
+    ))
 }
 
 async fn publish_workflow_definition(
@@ -143,31 +174,40 @@ async fn trigger_workflow(
     State(state): State<AppState>,
     Json(request): Json<TriggerWorkflowRequest>,
 ) -> Result<(StatusCode, Json<TriggerWorkflowResponse>), (StatusCode, String)> {
-    let definition = state
+    let (resolved_definition_id, definition_version, artifact_hash) = if let Some(artifact) = state
         .store
-        .get_latest_definition(&request.tenant_id, &definition_id)
+        .get_latest_artifact(&request.tenant_id, &definition_id)
         .await
         .map_err(internal_error)?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                format!(
-                    "workflow definition {definition_id} not found for tenant {}",
-                    request.tenant_id
-                ),
-            )
-        })?;
+    {
+        (artifact.definition_id, artifact.definition_version, artifact.artifact_hash)
+    } else {
+        let definition = state
+            .store
+            .get_latest_definition(&request.tenant_id, &definition_id)
+            .await
+            .map_err(internal_error)?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "workflow definition {definition_id} not found for tenant {}",
+                        request.tenant_id
+                    ),
+                )
+            })?;
+        (definition.id.clone(), definition.version, artifact_hash(&definition))
+    };
 
     let instance_id = request.instance_id.unwrap_or_else(|| format!("wf-{}", Uuid::now_v7()));
     let run_id = format!("run-{}", Uuid::now_v7());
-    let artifact_hash = artifact_hash(&definition);
     let payload = WorkflowEvent::WorkflowTriggered { input: request.input };
     let envelope = EventEnvelope::new(
         payload.event_type(),
         WorkflowIdentity::new(
             request.tenant_id,
-            definition.id.clone(),
-            definition.version,
+            resolved_definition_id.clone(),
+            definition_version,
             artifact_hash.clone(),
             instance_id.clone(),
             run_id.clone(),
@@ -181,8 +221,8 @@ async fn trigger_workflow(
     Ok((
         StatusCode::ACCEPTED,
         Json(TriggerWorkflowResponse {
-            definition_id,
-            definition_version: definition.version,
+            definition_id: resolved_definition_id,
+            definition_version,
             artifact_hash,
             instance_id,
             run_id,
@@ -297,15 +337,21 @@ async fn continue_as_new(
 
     let definition_exists = state
         .store
-        .get_definition_version(&tenant_id, &instance.definition_id, definition_version)
+        .get_artifact_version(&tenant_id, &instance.definition_id, definition_version)
         .await
         .map_err(internal_error)?
-        .is_some();
+        .is_some()
+        || state
+            .store
+            .get_definition_version(&tenant_id, &instance.definition_id, definition_version)
+            .await
+            .map_err(internal_error)?
+            .is_some();
     if !definition_exists {
         return Err((
             StatusCode::CONFLICT,
             format!(
-                "workflow definition {} version {} is no longer available for tenant {tenant_id}",
+                "workflow definition or artifact {} version {} is no longer available for tenant {tenant_id}",
                 instance.definition_id, definition_version
             ),
         ));

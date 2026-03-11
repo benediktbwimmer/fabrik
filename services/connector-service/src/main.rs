@@ -6,7 +6,7 @@ use fabrik_config::{HttpServiceConfig, PostgresConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::WorkflowStore;
-use fabrik_workflow::{StepConfig, WorkflowDefinition, execute_handler};
+use fabrik_workflow::{CompiledWorkflowArtifact, StepConfig, WorkflowDefinition, execute_handler};
 use futures_util::StreamExt;
 use reqwest::{Client, Method, Response};
 use serde_json::Value;
@@ -84,28 +84,46 @@ async fn process_event(
         }
     };
 
-    let definition =
-        load_pinned_definition(store, &event, &instance.definition_id, instance.definition_version)
-            .await?;
-    let handler = match definition.step_handler(step_id) {
-        Ok(handler) => handler,
-        Err(error) => {
-            publish_step_failure(publisher, &event, step_id, *attempt, error.to_string()).await?;
-            return Ok(());
+    let (handler, config, input) = if let Some(artifact) =
+        load_pinned_artifact(store, &event, &instance.definition_id, instance.definition_version).await?
+    {
+        let default_execution = fabrik_workflow::ArtifactExecutionState::default();
+        let execution = instance.artifact_execution.as_ref().unwrap_or(&default_execution);
+        match artifact.step_details(
+            step_id,
+            execution,
+        ) {
+            Ok((handler, config, input)) => (handler, config, input),
+            Err(error) => {
+                publish_step_failure(publisher, &event, step_id, *attempt, error.to_string()).await?;
+                return Ok(());
+            }
         }
-    };
+    } else {
+        let definition =
+            load_pinned_definition(store, &event, &instance.definition_id, instance.definition_version)
+                .await?;
+        let handler = match definition.step_handler(step_id) {
+            Ok(handler) => handler.to_owned(),
+            Err(error) => {
+                publish_step_failure(publisher, &event, step_id, *attempt, error.to_string()).await?;
+                return Ok(());
+            }
+        };
 
-    let input = instance.context.clone().or_else(|| instance.input.clone()).unwrap_or(Value::Null);
-    let config = match definition.step_config(step_id) {
-        Ok(config) => config,
-        Err(error) => {
-            publish_step_failure(publisher, &event, step_id, *attempt, error.to_string()).await?;
-            return Ok(());
-        }
+        let input = instance.context.clone().or_else(|| instance.input.clone()).unwrap_or(Value::Null);
+        let config = match definition.step_config(step_id) {
+            Ok(config) => config.cloned(),
+            Err(error) => {
+                publish_step_failure(publisher, &event, step_id, *attempt, error.to_string()).await?;
+                return Ok(());
+            }
+        };
+        (handler, config, input)
     };
     let idempotency_key = build_idempotency_key(&event, step_id, *attempt);
 
-    match execute_step(client, handler, config, &input, &idempotency_key).await {
+    match execute_step(client, &handler, config.as_ref(), &input, &idempotency_key).await {
         Ok(output) => {
             let payload = WorkflowEvent::StepCompleted {
                 step_id: step_id.clone(),
@@ -282,6 +300,19 @@ async fn load_pinned_definition(
             event.tenant_id
         )
     })
+}
+
+async fn load_pinned_artifact(
+    store: &WorkflowStore,
+    event: &EventEnvelope<WorkflowEvent>,
+    definition_id: &str,
+    definition_version: Option<u32>,
+) -> Result<Option<CompiledWorkflowArtifact>> {
+    if let Some(version) = definition_version.or(Some(event.definition_version)) {
+        return store.get_artifact_version(&event.tenant_id, definition_id, version).await;
+    }
+
+    Ok(None)
 }
 
 fn source_identity(event: &EventEnvelope<WorkflowEvent>, producer: &str) -> WorkflowIdentity {

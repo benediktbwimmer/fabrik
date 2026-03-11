@@ -1,0 +1,11 @@
+{
+  "name": "fabrik",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "compile:workflow": "node sdk/typescript-compiler/compiler.mjs"
+  },
+  "dependencies": {
+    "typescript": "^5.8.3"
+  }
+}

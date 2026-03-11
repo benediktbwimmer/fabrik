@@ -416,6 +416,7 @@ name = "executor-service"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "fabrik-broker",
  "fabrik-config",
  "fabrik-events",

@@ -6,7 +6,10 @@ use fabrik_config::{HttpServiceConfig, PostgresConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::WorkflowStore;
-use fabrik_workflow::{ExecutionEmission, WorkflowInstanceState};
+use fabrik_workflow::{
+    ArtifactExecutionState, CompiledExecutionPlan, CompiledWorkflowArtifact, ExecutionEmission,
+    WorkflowInstanceState,
+};
 use futures_util::StreamExt;
 use serde_json::Value;
 use tracing::{error, info, warn};
@@ -65,7 +68,7 @@ async fn process_event(
         return Ok(());
     }
 
-    let state = match store.get_instance(&event.tenant_id, &event.instance_id).await? {
+    let mut state = match store.get_instance(&event.tenant_id, &event.instance_id).await? {
         Some(state) if state.run_id != event.run_id => {
             if matches!(event.payload, WorkflowEvent::WorkflowContinuedAsNew { .. }) {
                 let deleted = store
@@ -114,6 +117,16 @@ async fn process_event(
 
     match &event.payload {
         WorkflowEvent::WorkflowTriggered { .. } => {
+            if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
+                publish_artifact_pinned(publisher, &event).await?;
+                let input = state.context.clone().unwrap_or(Value::Null);
+                let plan = artifact.execute_trigger(&input)?;
+                apply_compiled_plan(&mut state, &plan);
+                store.upsert_instance(&state).await?;
+                publish_compiled_plan(publisher, &event, &artifact, plan).await?;
+                return Ok(());
+            }
+
             let definition = match store
                 .get_definition_version(
                     &event.tenant_id,
@@ -179,6 +192,60 @@ async fn process_event(
         WorkflowEvent::TimerFired { timer_id } => {
             store.delete_timer(&event.tenant_id, &event.instance_id, timer_id).await?;
 
+            if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
+                if let Some((step_id, attempt)) = parse_retry_timer_id(timer_id) {
+                    let input = artifact
+                        .step_details(
+                            &step_id,
+                            state
+                                .artifact_execution
+                                .as_ref()
+                                .unwrap_or(&ArtifactExecutionState::default()),
+                        )?
+                        .2;
+                    state.context = Some(input);
+                    state.current_state = Some(step_id.clone());
+                    store.upsert_instance(&state).await?;
+                    let emission = ExecutionEmission {
+                        event: WorkflowEvent::StepScheduled { step_id: step_id.clone(), attempt },
+                        state: Some(step_id.clone()),
+                    };
+                    publish_plan(
+                        publisher,
+                        &event,
+                        artifact.definition_version,
+                        fabrik_workflow::WorkflowExecutionPlan {
+                            workflow_version: artifact.definition_version,
+                            final_state: step_id.clone(),
+                            emissions: vec![emission],
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+
+                let wait_state = match state.current_state.clone() {
+                    Some(wait_state) => wait_state,
+                    None => {
+                        warn!(
+                            workflow_instance_id = %event.instance_id,
+                            timer_id = %timer_id,
+                            "timer fired without current_state"
+                        );
+                        return Ok(());
+                    }
+                };
+                let plan = artifact.execute_after_timer(
+                    &wait_state,
+                    timer_id,
+                    state.artifact_execution.clone().unwrap_or_default(),
+                )?;
+                apply_compiled_plan(&mut state, &plan);
+                store.upsert_instance(&state).await?;
+                publish_compiled_plan(publisher, &event, &artifact, plan).await?;
+                return Ok(());
+            }
+
             if let Some((step_id, attempt)) = parse_retry_timer_id(timer_id) {
                 let definition = load_pinned_definition(store, &event, &state).await?;
                 let emission = ExecutionEmission {
@@ -233,6 +300,30 @@ async fn process_event(
             publish_plan(publisher, &event, definition.version, plan).await?;
         }
         WorkflowEvent::StepCompleted { step_id, attempt: _, output } => {
+            if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
+                let step_state = match state.current_state.clone() {
+                    Some(step_state) => step_state,
+                    None => {
+                        warn!(
+                            workflow_instance_id = %event.instance_id,
+                            step_id = %step_id,
+                            "step completed without current_state"
+                        );
+                        return Ok(());
+                    }
+                };
+                let plan = artifact.execute_after_step_completion(
+                    &step_state,
+                    step_id,
+                    output,
+                    state.artifact_execution.clone().unwrap_or_default(),
+                )?;
+                apply_compiled_plan(&mut state, &plan);
+                store.upsert_instance(&state).await?;
+                publish_compiled_plan(publisher, &event, &artifact, plan).await?;
+                return Ok(());
+            }
+
             let step_state = match state.current_state.clone() {
                 Some(step_state) => step_state,
                 None => {
@@ -265,6 +356,58 @@ async fn process_event(
             publish_plan(publisher, &event, definition.version, plan).await?;
         }
         WorkflowEvent::StepFailed { step_id, attempt, error: step_error } => {
+            if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
+                let step_state = match state.current_state.clone() {
+                    Some(step_state) => step_state,
+                    None => {
+                        warn!(
+                            workflow_instance_id = %event.instance_id,
+                            step_id = %step_id,
+                            "step failed without current_state"
+                        );
+                        return Ok(());
+                    }
+                };
+
+                match artifact.step_retry(&step_state)? {
+                    Some(retry_policy) if *attempt < retry_policy.max_attempts => {
+                        let retry =
+                            chrono::Utc::now() + fabrik_workflow::parse_timer_ref(&retry_policy.delay)?;
+                        let retry_timer_id = build_retry_timer_id(step_id, attempt + 1);
+                        let emission = ExecutionEmission {
+                            event: WorkflowEvent::TimerScheduled {
+                                timer_id: retry_timer_id,
+                                fire_at: retry,
+                            },
+                            state: Some(step_state.clone()),
+                        };
+                        publish_plan(
+                            publisher,
+                            &event,
+                            artifact.definition_version,
+                            fabrik_workflow::WorkflowExecutionPlan {
+                                workflow_version: artifact.definition_version,
+                                final_state: step_state,
+                                emissions: vec![emission],
+                            },
+                        )
+                        .await?;
+                    }
+                    _ => {
+                        let plan = artifact.execute_after_step_failure(
+                            &step_state,
+                            step_id,
+                            step_error,
+                            state.artifact_execution.clone().unwrap_or_default(),
+                        )?;
+                        apply_compiled_plan(&mut state, &plan);
+                        store.upsert_instance(&state).await?;
+                        publish_compiled_plan(publisher, &event, &artifact, plan).await?;
+                    }
+                }
+                return Ok(());
+            }
+
             let step_state = match state.current_state.clone() {
                 Some(step_state) => step_state,
                 None => {
@@ -323,6 +466,30 @@ async fn process_event(
             }
         }
         WorkflowEvent::SignalReceived { signal_type, payload } => {
+            if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
+                let wait_state = match state.current_state.clone() {
+                    Some(wait_state) => wait_state,
+                    None => {
+                        warn!(
+                            workflow_instance_id = %event.instance_id,
+                            signal_type = %signal_type,
+                            "signal received without current_state"
+                        );
+                        return Ok(());
+                    }
+                };
+                let plan = artifact.execute_after_signal(
+                    &wait_state,
+                    signal_type,
+                    payload,
+                    state.artifact_execution.clone().unwrap_or_default(),
+                )?;
+                apply_compiled_plan(&mut state, &plan);
+                store.upsert_instance(&state).await?;
+                publish_compiled_plan(publisher, &event, &artifact, plan).await?;
+                return Ok(());
+            }
+
             let wait_state = match state.current_state.clone() {
                 Some(wait_state) => wait_state,
                 None => {
@@ -393,6 +560,22 @@ async fn load_pinned_definition(
     })
 }
 
+async fn load_pinned_artifact(
+    store: &WorkflowStore,
+    event: &EventEnvelope<WorkflowEvent>,
+    state: &WorkflowInstanceState,
+) -> Result<Option<CompiledWorkflowArtifact>> {
+    if let Some(version) = state.definition_version {
+        if let Some(artifact) =
+            store.get_artifact_version(&event.tenant_id, &state.definition_id, version).await?
+        {
+            return Ok(Some(artifact));
+        }
+    }
+
+    Ok(None)
+}
+
 async fn publish_plan(
     publisher: &WorkflowPublisher,
     event: &EventEnvelope<WorkflowEvent>,
@@ -440,6 +623,65 @@ async fn publish_failure(
         failed.metadata.insert("state".to_owned(), state);
     }
     publisher.publish(&failed, &key).await?;
+    Ok(())
+}
+
+async fn publish_compiled_plan(
+    publisher: &WorkflowPublisher,
+    event: &EventEnvelope<WorkflowEvent>,
+    artifact: &CompiledWorkflowArtifact,
+    plan: CompiledExecutionPlan,
+) -> Result<()> {
+    let key = event.partition_key.clone();
+    let correlation_id = event.correlation_id.or(Some(event.event_id));
+    let mut previous_causation_id = event.event_id;
+
+    for emission in plan.emissions {
+        let mut identity = source_identity(event, "executor-service");
+        identity.definition_version = artifact.definition_version;
+        identity.artifact_hash = artifact.artifact_hash.clone();
+        let event_payload = emission.event.clone();
+        if let WorkflowEvent::WorkflowContinuedAsNew { new_run_id, input } = &event_payload.clone() {
+            let mut envelope =
+                EventEnvelope::new(event_payload.event_type(), identity.clone(), event_payload);
+            envelope.causation_id = Some(previous_causation_id);
+            envelope.correlation_id = correlation_id;
+            if let Some(state) = emission.state.clone() {
+                envelope.metadata.insert("state".to_owned(), state);
+            }
+            publisher.publish(&envelope, &key).await?;
+
+            let trigger_payload = WorkflowEvent::WorkflowTriggered { input: input.clone() };
+            let mut trigger = EventEnvelope::new(
+                trigger_payload.event_type(),
+                WorkflowIdentity::new(
+                    event.tenant_id.clone(),
+                    event.definition_id.clone(),
+                    artifact.definition_version,
+                    artifact.artifact_hash.clone(),
+                    event.instance_id.clone(),
+                    new_run_id.clone(),
+                    "executor-service",
+                ),
+                trigger_payload,
+            );
+            trigger.causation_id = Some(envelope.event_id);
+            trigger.correlation_id = correlation_id;
+            publisher.publish(&trigger, &trigger.partition_key).await?;
+            previous_causation_id = trigger.event_id;
+            continue;
+        }
+
+        let mut envelope = EventEnvelope::new(event_payload.event_type(), identity, event_payload);
+        envelope.causation_id = Some(previous_causation_id);
+        envelope.correlation_id = correlation_id;
+        if let Some(state) = emission.state {
+            envelope.metadata.insert("state".to_owned(), state);
+        }
+        previous_causation_id = envelope.event_id;
+        publisher.publish(&envelope, &key).await?;
+    }
+
     Ok(())
 }
 
@@ -499,6 +741,13 @@ fn source_identity(event: &EventEnvelope<WorkflowEvent>, producer: &str) -> Work
         event.run_id.clone(),
         producer.to_owned(),
     )
+}
+
+fn apply_compiled_plan(state: &mut WorkflowInstanceState, plan: &CompiledExecutionPlan) {
+    state.current_state = Some(plan.final_state.clone());
+    state.context = plan.context.clone();
+    state.output = plan.output.clone();
+    state.artifact_execution = Some(plan.execution_state.clone());
 }
 
 fn is_run_initialization_event(event: &WorkflowEvent) -> bool {

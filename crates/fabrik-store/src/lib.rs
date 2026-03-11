@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
-use fabrik_workflow::{WorkflowDefinition, WorkflowInstanceState};
+use fabrik_workflow::{CompiledWorkflowArtifact, WorkflowDefinition, WorkflowInstanceState};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions, types::Json};
 use uuid::Uuid;
 
@@ -123,6 +123,23 @@ impl WorkflowStore {
 
         sqlx::query(
             r#"
+            CREATE TABLE IF NOT EXISTS workflow_artifacts (
+                tenant_id TEXT NOT NULL,
+                workflow_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                artifact JSONB NOT NULL,
+                PRIMARY KEY (tenant_id, workflow_id, version)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_artifacts table")?;
+
+        sqlx::query(
+            r#"
             CREATE TABLE IF NOT EXISTS workflow_timers (
                 tenant_id TEXT NOT NULL,
                 workflow_instance_id TEXT NOT NULL,
@@ -238,6 +255,93 @@ impl WorkflowStore {
             row.try_get::<Json<WorkflowDefinition>, _>("definition")
                 .map(|value| value.0)
                 .context("failed to decode workflow definition")
+        })
+        .transpose()
+    }
+
+    pub async fn put_artifact(
+        &self,
+        tenant_id: &str,
+        artifact: &CompiledWorkflowArtifact,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO workflow_artifacts (
+                tenant_id,
+                workflow_id,
+                version,
+                artifact
+            )
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (tenant_id, workflow_id, version)
+            DO UPDATE SET
+                is_active = TRUE,
+                artifact = EXCLUDED.artifact
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(&artifact.definition_id)
+        .bind(i32::try_from(artifact.definition_version).context("artifact version exceeds i32")?)
+        .bind(Json(artifact))
+        .execute(&self.pool)
+        .await
+        .context("failed to store workflow artifact")?;
+
+        Ok(())
+    }
+
+    pub async fn get_latest_artifact(
+        &self,
+        tenant_id: &str,
+        workflow_id: &str,
+    ) -> Result<Option<CompiledWorkflowArtifact>> {
+        let row = sqlx::query(
+            r#"
+            SELECT artifact
+            FROM workflow_artifacts
+            WHERE tenant_id = $1 AND workflow_id = $2 AND is_active = TRUE
+            ORDER BY version DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(workflow_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load latest workflow artifact")?;
+
+        row.map(|row| {
+            row.try_get::<Json<CompiledWorkflowArtifact>, _>("artifact")
+                .map(|value| value.0)
+                .context("failed to decode workflow artifact")
+        })
+        .transpose()
+    }
+
+    pub async fn get_artifact_version(
+        &self,
+        tenant_id: &str,
+        workflow_id: &str,
+        version: u32,
+    ) -> Result<Option<CompiledWorkflowArtifact>> {
+        let row = sqlx::query(
+            r#"
+            SELECT artifact
+            FROM workflow_artifacts
+            WHERE tenant_id = $1 AND workflow_id = $2 AND version = $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(workflow_id)
+        .bind(i32::try_from(version).context("artifact version exceeds i32")?)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load workflow artifact version")?;
+
+        row.map(|row| {
+            row.try_get::<Json<CompiledWorkflowArtifact>, _>("artifact")
+                .map(|value| value.0)
+                .context("failed to decode workflow artifact")
         })
         .transpose()
     }

@@ -1,3 +1,5 @@
+mod compiled;
+
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
@@ -7,6 +9,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
+
+pub use compiled::{
+    ArtifactEntrypoint, ArtifactExecutionState, CompiledExecutionPlan, CompiledStateNode,
+    CompiledWorkflow, CompiledWorkflowArtifact, CompiledWorkflowError, ErrorTransition, Expression,
+    HelperFunction, SourceLocation,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowDefinition {
@@ -480,7 +488,7 @@ fn validate_step_config(
     }
 }
 
-fn parse_timer_ref(timer_ref: &str) -> Result<chrono::TimeDelta, TimerParseError> {
+pub fn parse_timer_ref(timer_ref: &str) -> Result<chrono::TimeDelta, TimerParseError> {
     if timer_ref.is_empty() {
         return Err(TimerParseError::Empty);
     }
@@ -507,6 +515,8 @@ pub struct WorkflowInstanceState {
     pub artifact_hash: Option<String>,
     pub current_state: Option<String>,
     pub context: Option<Value>,
+    #[serde(default)]
+    pub artifact_execution: Option<ArtifactExecutionState>,
     pub status: WorkflowStatus,
     pub input: Option<Value>,
     pub output: Option<Value>,
@@ -592,6 +602,7 @@ impl TryFrom<&EventEnvelope<WorkflowEvent>> for WorkflowInstanceState {
             artifact_hash: None,
             current_state: None,
             context: None,
+            artifact_execution: None,
             status: WorkflowStatus::Triggered,
             input: None,
             output: None,

@@ -8,7 +8,7 @@ use axum::{
 use fabrik_config::{HttpServiceConfig, PostgresConfig};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::WorkflowStore;
-use fabrik_workflow::{WorkflowDefinition, WorkflowInstanceState};
+use fabrik_workflow::{CompiledWorkflowArtifact, WorkflowDefinition, WorkflowInstanceState};
 use serde::Serialize;
 use tracing::info;
 
@@ -44,6 +44,14 @@ async fn main() -> Result<()> {
     .route(
         "/tenants/{tenant_id}/workflow-definitions/{definition_id}/versions/{version}",
         get(get_workflow_definition_version),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflow-artifacts/{definition_id}/latest",
+        get(get_latest_workflow_artifact),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflow-artifacts/{definition_id}/versions/{version}",
+        get(get_workflow_artifact_version),
     )
     .route("/tenants/{tenant_id}/workflows/{instance_id}", get(get_workflow_instance))
     .with_state(AppState { store });
@@ -110,6 +118,50 @@ async fn get_workflow_definition_version(
             Json(ErrorResponse {
                 message: format!(
                     "workflow definition {definition_id} version {version} not found for tenant {tenant_id}"
+                ),
+            }),
+        )),
+    }
+}
+
+async fn get_latest_workflow_artifact(
+    Path((tenant_id, definition_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<CompiledWorkflowArtifact>, (StatusCode, Json<ErrorResponse>)> {
+    match state
+        .store
+        .get_latest_artifact(&tenant_id, &definition_id)
+        .await
+        .map_err(internal_error)?
+    {
+        Some(artifact) => Ok(Json(artifact)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                message: format!(
+                    "workflow artifact {definition_id} not found for tenant {tenant_id}"
+                ),
+            }),
+        )),
+    }
+}
+
+async fn get_workflow_artifact_version(
+    Path((tenant_id, definition_id, version)): Path<(String, String, u32)>,
+    State(state): State<AppState>,
+) -> Result<Json<CompiledWorkflowArtifact>, (StatusCode, Json<ErrorResponse>)> {
+    match state
+        .store
+        .get_artifact_version(&tenant_id, &definition_id, version)
+        .await
+        .map_err(internal_error)?
+    {
+        Some(artifact) => Ok(Json(artifact)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                message: format!(
+                    "workflow artifact {definition_id} version {version} not found for tenant {tenant_id}"
                 ),
             }),
         )),
