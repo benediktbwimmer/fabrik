@@ -3817,7 +3817,6 @@ impl WorkflowStore {
             instance_id,
             run_id,
             accepted_seq,
-            1,
             consumed_at,
         )
         .await
@@ -3829,11 +3828,8 @@ impl WorkflowStore {
         instance_id: &str,
         run_id: &str,
         max_accepted_seq: u64,
-        consumed_count: usize,
         consumed_at: DateTime<Utc>,
     ) -> Result<bool> {
-        let consumed_count =
-            i64::try_from(consumed_count).context("workflow mailbox consumed count exceeds i64")?;
         let updated = sqlx::query(
             r#"
             WITH consumed AS (
@@ -3850,7 +3846,10 @@ impl WorkflowStore {
             )
             UPDATE workflow_tasks
             SET mailbox_consumed_seq = GREATEST(mailbox_consumed_seq, $4),
-                mailbox_backlog = GREATEST(mailbox_backlog - $6, 0),
+                mailbox_backlog = GREATEST(
+                    mailbox_backlog - COALESCE((SELECT COUNT(*) FROM consumed), 0),
+                    0
+                ),
                 updated_at = $5
             WHERE tenant_id = $1
               AND workflow_instance_id = $2
@@ -3863,7 +3862,6 @@ impl WorkflowStore {
         .bind(run_id)
         .bind(i64::try_from(max_accepted_seq).context("workflow mailbox sequence exceeds i64")?)
         .bind(consumed_at)
-        .bind(consumed_count)
         .execute(&self.pool)
         .await
         .context("failed to mark workflow mailbox item consumed")?
@@ -3885,7 +3883,6 @@ impl WorkflowStore {
             instance_id,
             run_id,
             resume_seq,
-            1,
             consumed_at,
         )
         .await
@@ -3897,11 +3894,8 @@ impl WorkflowStore {
         instance_id: &str,
         run_id: &str,
         max_resume_seq: u64,
-        consumed_count: usize,
         consumed_at: DateTime<Utc>,
     ) -> Result<bool> {
-        let consumed_count =
-            i64::try_from(consumed_count).context("workflow resume consumed count exceeds i64")?;
         let updated = sqlx::query(
             r#"
             WITH consumed AS (
@@ -3918,7 +3912,10 @@ impl WorkflowStore {
             )
             UPDATE workflow_tasks
             SET resume_consumed_seq = GREATEST(resume_consumed_seq, $4),
-                resume_backlog = GREATEST(resume_backlog - $6, 0),
+                resume_backlog = GREATEST(
+                    resume_backlog - COALESCE((SELECT COUNT(*) FROM consumed), 0),
+                    0
+                ),
                 updated_at = $5
             WHERE tenant_id = $1
               AND workflow_instance_id = $2
@@ -3931,7 +3928,6 @@ impl WorkflowStore {
         .bind(run_id)
         .bind(i64::try_from(max_resume_seq).context("workflow resume sequence exceeds i64")?)
         .bind(consumed_at)
-        .bind(consumed_count)
         .execute(&self.pool)
         .await
         .context("failed to mark workflow resume item consumed")?
@@ -4129,16 +4125,21 @@ impl WorkflowStore {
         let updated = sqlx::query(
             r#"
             UPDATE workflow_tasks
-            SET status = CASE
-                    WHEN mailbox_backlog > 0 OR resume_backlog > 0 THEN 'pending'
+            SET mailbox_backlog = GREATEST(mailbox_high_watermark - mailbox_consumed_seq, 0),
+                resume_backlog = GREATEST(resume_high_watermark - resume_consumed_seq, 0),
+                status = CASE
+                    WHEN mailbox_high_watermark > mailbox_consumed_seq
+                      OR resume_high_watermark > resume_consumed_seq THEN 'pending'
                     ELSE 'completed'
                 END,
                 lease_poller_id = CASE
-                    WHEN mailbox_backlog > 0 OR resume_backlog > 0 THEN NULL
+                    WHEN mailbox_high_watermark > mailbox_consumed_seq
+                      OR resume_high_watermark > resume_consumed_seq THEN NULL
                     ELSE $2
                 END,
                 lease_build_id = CASE
-                    WHEN mailbox_backlog > 0 OR resume_backlog > 0 THEN NULL
+                    WHEN mailbox_high_watermark > mailbox_consumed_seq
+                      OR resume_high_watermark > resume_consumed_seq THEN NULL
                     ELSE $3
                 END,
                 lease_expires_at = NULL,
@@ -4172,8 +4173,11 @@ impl WorkflowStore {
         let updated = sqlx::query(
             r#"
             UPDATE workflow_tasks
-            SET status = CASE
-                    WHEN mailbox_backlog > 0 OR resume_backlog > 0 THEN 'pending'
+            SET mailbox_backlog = GREATEST(mailbox_high_watermark - mailbox_consumed_seq, 0),
+                resume_backlog = GREATEST(resume_high_watermark - resume_consumed_seq, 0),
+                status = CASE
+                    WHEN mailbox_high_watermark > mailbox_consumed_seq
+                      OR resume_high_watermark > resume_consumed_seq THEN 'pending'
                     ELSE 'completed'
                 END,
                 lease_poller_id = NULL,
@@ -9146,6 +9150,97 @@ mod tests {
             .lease_next_workflow_task(2, "poller-b", "build-b", chrono::Duration::seconds(30))
             .await?;
         assert!(incompatible.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn complete_workflow_task_reconciles_stale_resume_backlog() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+
+        store
+            .register_task_queue_build(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "payments",
+                "build-a",
+                &["artifact-a".to_owned()],
+                None,
+            )
+            .await?;
+        store
+            .upsert_compatibility_set(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "payments",
+                "stable",
+                &["build-a".to_owned()],
+                true,
+            )
+            .await?;
+
+        let event = activity_completed_event("wf-stale", "run-stale", 0);
+        let resume = store
+            .enqueue_workflow_resume(
+                2,
+                "payments",
+                Some("build-a"),
+                &event,
+                WorkflowResumeKind::ActivityTerminal,
+                "activity-0",
+                Some("completed"),
+            )
+            .await?
+            .context("workflow resume should be created")?;
+        let task = store
+            .lease_next_workflow_task(2, "poller-a", "build-a", chrono::Duration::seconds(30))
+            .await?
+            .context("workflow task should be leased")?;
+
+        store
+            .mark_workflow_resume_item_consumed(
+                "tenant-a",
+                "wf-stale",
+                "run-stale",
+                resume.resume_seq,
+                chrono::Utc::now(),
+            )
+            .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE workflow_tasks
+            SET resume_backlog = 1
+            WHERE task_id = $1
+            "#,
+        )
+        .bind(task.task_id)
+        .execute(&store.pool)
+        .await?;
+
+        assert!(
+            store
+                .complete_workflow_task(
+                    task.task_id,
+                    "poller-a",
+                    "build-a",
+                    chrono::Utc::now(),
+                )
+                .await?
+        );
+
+        let updated = store
+            .get_workflow_task(task.task_id)
+            .await?
+            .context("workflow task should still exist")?;
+        assert_eq!(updated.resume_backlog, 0);
+        assert_eq!(updated.resume_consumed_seq, updated.resume_high_watermark);
+        assert_eq!(updated.status, WorkflowTaskStatus::Completed);
+        assert_eq!(updated.lease_poller_id.as_deref(), Some("poller-a"));
+        assert_eq!(updated.lease_build_id.as_deref(), Some("build-a"));
 
         Ok(())
     }

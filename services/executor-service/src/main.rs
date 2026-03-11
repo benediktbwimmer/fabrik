@@ -1549,9 +1549,8 @@ async fn process_workflow_task(
                     &task.run_id,
                     resume_batch_limit.min(256),
                 )
-                .await?;
+            .await?;
             if !resume_batch.is_empty() {
-                let mut consumed_resume_count = 0usize;
                 let mut max_consumed_resume_seq = None;
                 for resume in resume_batch {
                     if transitions >= runtime.max_transitions_per_turn {
@@ -1584,7 +1583,6 @@ async fn process_workflow_task(
                         .await?;
                         return Err(error);
                     }
-                    consumed_resume_count += 1;
                     max_consumed_resume_seq = Some(resume.resume_seq);
                     transitions += 1;
                 }
@@ -1595,7 +1593,6 @@ async fn process_workflow_task(
                             &task.instance_id,
                             &task.run_id,
                             max_resume_seq,
-                            consumed_resume_count,
                             chrono::Utc::now(),
                         )
                         .await?;
@@ -1643,7 +1640,6 @@ async fn process_workflow_task(
             .await;
         }
 
-        let mut consumed_mailbox_count = 0usize;
         let mut max_consumed_mailbox_seq = None;
         for item in mailbox_batch {
             if mailbox_items >= runtime.max_mailbox_items_per_turn
@@ -1688,13 +1684,11 @@ async fn process_workflow_task(
                     if let Some(consumed_signal) = consumed_signal {
                         consumed_signals.push(consumed_signal);
                     }
-                    consumed_mailbox_count += 1;
                     max_consumed_mailbox_seq = Some(item.accepted_seq);
                     mailbox_items += 1;
                     transitions += 1;
                 }
                 MailboxDispatchOutcome::ConsumedNoop => {
-                    consumed_mailbox_count += 1;
                     max_consumed_mailbox_seq = Some(item.accepted_seq);
                     mailbox_items += 1;
                 }
@@ -1724,7 +1718,6 @@ async fn process_workflow_task(
                                 &task.instance_id,
                                 &task.run_id,
                                 max_mailbox_seq,
-                                consumed_mailbox_count,
                                 chrono::Utc::now(),
                             )
                             .await?;
@@ -1769,7 +1762,6 @@ async fn process_workflow_task(
                     &task.instance_id,
                     &task.run_id,
                     max_mailbox_seq,
-                    consumed_mailbox_count,
                     chrono::Utc::now(),
                 )
                 .await?;
