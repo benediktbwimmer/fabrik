@@ -44,7 +44,6 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const ACTIVITY_POLL_PREFETCH_SIZE: usize = 8;
-
 #[derive(Clone)]
 struct AppState {
     store: WorkflowStore,
@@ -564,7 +563,8 @@ impl ActivityWorkerApi for ActivityApi {
             )
             .await
             .map_err(internal_status)?;
-            if let Some((first, remaining)) = leased.split_first() {
+            if !leased.is_empty() {
+                let (first, remaining) = leased.split_first().expect("leased batch is non-empty");
                 if !remaining.is_empty() {
                     self.state
                         .activity_prefetch

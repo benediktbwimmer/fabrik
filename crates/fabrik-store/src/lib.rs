@@ -4,7 +4,11 @@ use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_workflow::{CompiledWorkflowArtifact, WorkflowDefinition, WorkflowInstanceState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{PgPool, Row, postgres::PgPoolOptions, types::Json};
+use sqlx::{
+    PgPool, QueryBuilder, Row,
+    postgres::{PgPoolOptions, Postgres},
+    types::Json,
+};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -6106,123 +6110,154 @@ impl WorkflowStore {
         if updates.is_empty() {
             return Ok(Vec::new());
         }
+        let mut query = QueryBuilder::<Postgres>::new(
+            r#"
+            WITH updates (
+                batch_index,
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                activity_id,
+                attempt,
+                status,
+                output,
+                error,
+                cancellation_reason,
+                cancellation_metadata,
+                worker_id,
+                worker_build_id,
+                event_id,
+                event_type,
+                occurred_at
+            ) AS (
+            "#,
+        );
 
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .context("failed to begin activity terminal batch transaction")?;
-        let mut applied = Vec::new();
+        query.push_values(updates.iter().enumerate(), |mut builder, (batch_index, update)| {
+            let (status, output, error, cancellation_reason, cancellation_metadata) = match &update
+                .payload
+            {
+                ActivityTerminalPayload::Completed { output } => (
+                    WorkflowActivityStatus::Completed.as_str(),
+                    Some(output.clone()),
+                    None,
+                    None,
+                    None,
+                ),
+                ActivityTerminalPayload::Failed { error } => {
+                    (WorkflowActivityStatus::Failed.as_str(), None, Some(error.clone()), None, None)
+                }
+                ActivityTerminalPayload::Cancelled { reason, metadata } => (
+                    WorkflowActivityStatus::Cancelled.as_str(),
+                    None,
+                    Some(reason.clone()),
+                    Some(reason.clone()),
+                    metadata.clone(),
+                ),
+            };
+            builder
+                .push_bind(batch_index as i64)
+                .push_bind(&update.tenant_id)
+                .push_bind(&update.instance_id)
+                .push_bind(&update.run_id)
+                .push_bind(&update.activity_id)
+                .push_bind(update.attempt as i32)
+                .push_bind(status)
+                .push_bind(output.map(Json))
+                .push_bind(error)
+                .push_bind(cancellation_reason)
+                .push_bind(cancellation_metadata.map(Json))
+                .push_bind(&update.worker_id)
+                .push_bind(&update.worker_build_id)
+                .push_bind(update.event_id)
+                .push_bind(&update.event_type)
+                .push_bind(update.occurred_at);
+        });
 
-        for update in updates {
-            let (status, output, error, cancellation_reason, cancellation_metadata) =
-                match &update.payload {
-                    ActivityTerminalPayload::Completed { output } => {
-                        (WorkflowActivityStatus::Completed.as_str(), Some(output), None, None, None)
-                    }
-                    ActivityTerminalPayload::Failed { error } => (
-                        WorkflowActivityStatus::Failed.as_str(),
-                        None,
-                        Some(error.as_str()),
-                        None,
-                        None,
-                    ),
-                    ActivityTerminalPayload::Cancelled { reason, metadata } => (
-                        WorkflowActivityStatus::Cancelled.as_str(),
-                        None,
-                        Some(reason.as_str()),
-                        Some(reason.as_str()),
-                        metadata.as_ref(),
-                    ),
-                };
-
-            let row = sqlx::query(
-                r#"
-                UPDATE workflow_activities
-                SET status = $6,
-                    output = $7,
-                    error = $8,
-                    cancellation_reason = $9,
-                    cancellation_metadata = $10,
-                    worker_id = $11,
-                    worker_build_id = $12,
-                    completed_at = $13,
+        query.push(
+            r#"
+            ),
+            applied AS (
+                UPDATE workflow_activities AS activity
+                SET status = updates.status,
+                    output = updates.output,
+                    error = updates.error,
+                    cancellation_reason = updates.cancellation_reason,
+                    cancellation_metadata = updates.cancellation_metadata,
+                    worker_id = updates.worker_id,
+                    worker_build_id = updates.worker_build_id,
+                    completed_at = updates.occurred_at,
                     lease_expires_at = NULL,
-                    last_event_id = $14,
-                    last_event_type = $15,
-                    updated_at = $16
-                WHERE tenant_id = $1
-                  AND workflow_instance_id = $2
-                  AND run_id = $3
-                  AND activity_id = $4
-                  AND attempt = $5
-                  AND status IN ('scheduled', 'started')
+                    last_event_id = updates.event_id,
+                    last_event_type = updates.event_type,
+                    updated_at = updates.occurred_at
+                FROM updates
+                WHERE activity.tenant_id = updates.tenant_id
+                  AND activity.workflow_instance_id = updates.workflow_instance_id
+                  AND activity.run_id = updates.run_id
+                  AND activity.activity_id = updates.activity_id
+                  AND activity.attempt = updates.attempt
+                  AND activity.status IN ('scheduled', 'started')
                 RETURNING
-                    tenant_id,
-                    workflow_instance_id,
-                    run_id,
-                    workflow_id,
-                    workflow_version,
-                    artifact_hash,
-                    activity_id,
-                    attempt,
-                    activity_type,
-                    task_queue,
-                    state,
-                    status,
-                    input,
-                    config,
-                    output,
-                    error,
-                    cancellation_requested,
-                    cancellation_reason,
-                    cancellation_metadata,
-                    worker_id,
-                    worker_build_id,
-                    scheduled_at,
-                    started_at,
-                    last_heartbeat_at,
-                    lease_expires_at,
-                    completed_at,
-                    schedule_to_start_timeout_ms,
-                    start_to_close_timeout_ms,
-                    heartbeat_timeout_ms,
-                    last_event_id,
-                    last_event_type,
-                    updated_at
-                "#,
+                    updates.batch_index,
+                    activity.tenant_id,
+                    activity.workflow_instance_id,
+                    activity.run_id,
+                    activity.workflow_id,
+                    activity.workflow_version,
+                    activity.artifact_hash,
+                    activity.activity_id,
+                    activity.attempt,
+                    activity.activity_type,
+                    activity.task_queue,
+                    activity.state,
+                    activity.status,
+                    activity.input,
+                    activity.config,
+                    activity.output,
+                    activity.error,
+                    activity.cancellation_requested,
+                    activity.cancellation_reason,
+                    activity.cancellation_metadata,
+                    activity.worker_id,
+                    activity.worker_build_id,
+                    activity.scheduled_at,
+                    activity.started_at,
+                    activity.last_heartbeat_at,
+                    activity.lease_expires_at,
+                    activity.completed_at,
+                    activity.schedule_to_start_timeout_ms,
+                    activity.start_to_close_timeout_ms,
+                    activity.heartbeat_timeout_ms,
+                    activity.last_event_id,
+                    activity.last_event_type,
+                    activity.updated_at
             )
-            .bind(&update.tenant_id)
-            .bind(&update.instance_id)
-            .bind(&update.run_id)
-            .bind(&update.activity_id)
-            .bind(i32::try_from(update.attempt).context("activity attempt exceeds i32")?)
-            .bind(status)
-            .bind(output.map(Json))
-            .bind(error)
-            .bind(cancellation_reason)
-            .bind(cancellation_metadata.map(Json))
-            .bind(&update.worker_id)
-            .bind(&update.worker_build_id)
-            .bind(update.occurred_at)
-            .bind(update.event_id)
-            .bind(&update.event_type)
-            .bind(update.occurred_at)
-            .fetch_optional(&mut *tx)
+            SELECT *
+            FROM applied
+            ORDER BY batch_index
+            "#,
+        );
+
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
             .await
             .context("failed to update workflow activity terminal status in batch")?;
 
-            if let Some(row) = row {
-                applied.push(AppliedActivityTerminalUpdate {
-                    record: Self::decode_activity_row(row)?,
-                    event_id: update.event_id,
-                    occurred_at: update.occurred_at,
-                    payload: update.payload.clone(),
-                });
-            }
+        let mut applied = Vec::with_capacity(rows.len());
+        for row in rows {
+            let batch_index = row
+                .try_get::<i64, _>("batch_index")
+                .context("activity batch_index missing")? as usize;
+            let update = &updates[batch_index];
+            applied.push(AppliedActivityTerminalUpdate {
+                record: Self::decode_activity_row(row)?,
+                event_id: update.event_id,
+                occurred_at: update.occurred_at,
+                payload: update.payload.clone(),
+            });
         }
-
-        tx.commit().await.context("failed to commit activity terminal batch transaction")?;
 
         Ok(applied)
     }
