@@ -14,9 +14,15 @@ use fabrik_broker::{
 use fabrik_config::{
     ExecutorRuntimeConfig, HttpServiceConfig, OwnershipConfig, PostgresConfig, RedpandaConfig,
 };
-use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
+use fabrik_events::{
+    EventEnvelope, WorkflowEvent, WorkflowIdentity, WorkflowTurnRouting, workflow_turn_routing,
+};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{PartitionOwnershipRecord, WorkflowStore};
+use fabrik_worker_protocol::activity_worker::{
+    CompleteWorkflowTaskRequest, FailWorkflowTaskRequest, PollWorkflowTaskRequest,
+    workflow_worker_api_client::WorkflowWorkerApiClient,
+};
 use fabrik_workflow::{
     CompiledExecutionPlan, CompiledWorkflowArtifact, ExecutionEmission, ExecutionTurnContext,
     WorkflowInstanceState, replay_compiled_history_trace_from_snapshot,
@@ -25,6 +31,7 @@ use fabrik_workflow::{
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::env;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
@@ -67,6 +74,10 @@ async fn main() -> Result<()> {
     let store = WorkflowStore::connect(&postgres.url).await?;
     store.init().await?;
     let owner_id = format!("executor-service:{}", Uuid::now_v7());
+    let matching_endpoint = env::var("MATCHING_SERVICE_ENDPOINT")
+        .unwrap_or_else(|_| "http://127.0.0.1:50051".to_owned());
+    let workflow_worker_build_id = env::var("WORKFLOW_WORKER_BUILD_ID")
+        .unwrap_or_else(|_| "dev-workflow-build".to_owned());
     let lease_ttl = std::time::Duration::from_secs(ownership.lease_ttl_seconds);
     let initial_partitions = ownership.static_partition_ids.clone().unwrap_or_default();
     let initial_ownerships = if initial_partitions.is_empty() {
@@ -97,6 +108,8 @@ async fn main() -> Result<()> {
             debug_state.clone(),
             workers.clone(),
             owner_id.clone(),
+            matching_endpoint.clone(),
+            workflow_worker_build_id.clone(),
             lease_ttl,
         ));
     } else {
@@ -109,6 +122,8 @@ async fn main() -> Result<()> {
                 &debug_state,
                 &workers,
                 owner_id.clone(),
+                matching_endpoint.clone(),
+                workflow_worker_build_id.clone(),
                 record,
                 std::time::Duration::from_secs(ownership.renew_interval_seconds),
                 lease_ttl,
@@ -123,6 +138,7 @@ async fn main() -> Result<()> {
         env!("CARGO_PKG_VERSION"),
     ))
     .route("/debug/runtime", get(get_runtime_debug))
+    .route("/debug/hybrid-routing", get(get_hybrid_routing_debug))
     .route("/debug/ownership", get(get_ownership_debug))
     .route("/debug/broker", get(get_broker_debug))
     .route("/debug/hot-state/{tenant_id}/{instance_id}", get(get_hot_state_debug))
@@ -145,6 +161,7 @@ struct ExecutorAppState {
 struct PartitionWorkerHandle {
     renewal_task: JoinHandle<()>,
     consumer_task: JoinHandle<()>,
+    poller_task: JoinHandle<()>,
     lease_state: Arc<Mutex<LeaseState>>,
 }
 
@@ -157,6 +174,8 @@ async fn run_assignment_supervisor(
     debug_state: Arc<Mutex<ExecutorDebugState>>,
     workers: Arc<Mutex<HashMap<i32, PartitionWorkerHandle>>>,
     owner_id: String,
+    matching_endpoint: String,
+    workflow_worker_build_id: String,
     lease_ttl: std::time::Duration,
 ) {
     let heartbeat_ttl =
@@ -214,6 +233,8 @@ async fn run_assignment_supervisor(
                     &debug_state,
                     &workers,
                     &owner_id,
+                    &matching_endpoint,
+                    &workflow_worker_build_id,
                     desired,
                     renew_interval,
                     lease_ttl,
@@ -238,6 +259,8 @@ async fn reconcile_partition_workers(
     debug_state: &Arc<Mutex<ExecutorDebugState>>,
     workers: &Arc<Mutex<HashMap<i32, PartitionWorkerHandle>>>,
     owner_id: &str,
+    matching_endpoint: &str,
+    workflow_worker_build_id: &str,
     desired_partitions: Vec<i32>,
     renew_interval: std::time::Duration,
     lease_ttl: std::time::Duration,
@@ -274,6 +297,8 @@ async fn reconcile_partition_workers(
             debug_state,
             workers,
             owner_id.to_owned(),
+            matching_endpoint.to_owned(),
+            workflow_worker_build_id.to_owned(),
             record,
             renew_interval,
             lease_ttl,
@@ -292,12 +317,21 @@ async fn spawn_partition_worker(
     debug_state: &Arc<Mutex<ExecutorDebugState>>,
     workers: &Arc<Mutex<HashMap<i32, PartitionWorkerHandle>>>,
     owner_id: String,
+    matching_endpoint: String,
+    workflow_worker_build_id: String,
     initial_ownership: PartitionOwnershipRecord,
     renew_interval: std::time::Duration,
     lease_ttl: std::time::Duration,
 ) -> Result<()> {
     let partition_id = initial_ownership.partition_id;
     let lease_state = Arc::new(Mutex::new(LeaseState::from_record(&initial_ownership)));
+    let runtime = Arc::new(tokio::sync::Mutex::new(ExecutorRuntime::new(
+        runtime_config.cache_capacity,
+        runtime_config.snapshot_interval_events,
+        runtime_config.continue_as_new_event_threshold,
+        runtime_config.continue_as_new_activity_attempt_threshold,
+        runtime_config.continue_as_new_run_age_seconds,
+    )));
     if let Ok(mut debug) = debug_state.lock() {
         debug.update_ownership(&initial_ownership, "owned", "partition worker started");
     }
@@ -312,11 +346,24 @@ async fn spawn_partition_worker(
     let consumer =
         build_workflow_partition_consumer(broker, "executor-service", partition_id).await?;
     let consumer_task = tokio::spawn(run_executor_loop(
+        partition_id,
         consumer,
         publisher.clone(),
         store.clone(),
         broker.clone(),
-        runtime_config.clone(),
+        runtime.clone(),
+        debug_state.clone(),
+        lease_state.clone(),
+    ));
+    let poller_task = tokio::spawn(run_workflow_poll_loop(
+        matching_endpoint,
+        partition_id,
+        format!("{owner_id}:partition-{partition_id}"),
+        workflow_worker_build_id,
+        publisher.clone(),
+        store.clone(),
+        broker.clone(),
+        runtime.clone(),
         debug_state.clone(),
         lease_state.clone(),
     ));
@@ -324,8 +371,10 @@ async fn spawn_partition_worker(
     workers
         .lock()
         .map_err(|_| anyhow::anyhow!("partition worker map lock poisoned"))?
-        .insert(partition_id, PartitionWorkerHandle { renewal_task, consumer_task, lease_state });
-    let _ = owner_id;
+        .insert(
+            partition_id,
+            PartitionWorkerHandle { renewal_task, consumer_task, poller_task, lease_state },
+        );
     Ok(())
 }
 
@@ -341,6 +390,7 @@ fn stop_partition_worker(
     if let Some(handle) = handle {
         let lease_snapshot = handle.lease_state.lock().ok().map(|state| state.clone());
         handle.consumer_task.abort();
+        handle.poller_task.abort();
         handle.renewal_task.abort();
         if let Some(lease_snapshot) = lease_snapshot {
             if let Ok(mut debug) = debug_state.lock() {
@@ -358,6 +408,15 @@ fn stop_partition_worker(
                 partition.restores_from_projection = 0;
                 partition.restores_from_snapshot_replay = 0;
                 partition.restores_after_handoff = 0;
+                partition.workflow_turns_routed_via_matching = 0;
+                partition.workflow_turns_processed_locally = 0;
+                partition.sticky_build_hits = 0;
+                partition.sticky_build_fallbacks = 0;
+                partition.workflow_task_poll_hits = 0;
+                partition.workflow_task_poll_empties = 0;
+                partition.workflow_task_poll_failures = 0;
+                partition.workflow_task_queue_latency = DurationStats::default();
+                partition.workflow_task_execution_latency = DurationStats::default();
                 debug.recompute_totals();
             }
         }
@@ -366,27 +425,31 @@ fn stop_partition_worker(
 }
 
 async fn run_executor_loop(
+    partition_id: i32,
     consumer: rskafka::client::consumer::StreamConsumer,
     publisher: WorkflowPublisher,
     store: WorkflowStore,
     broker: BrokerConfig,
-    runtime_config: ExecutorRuntimeConfig,
+    runtime: Arc<tokio::sync::Mutex<ExecutorRuntime>>,
     debug_state: Arc<Mutex<ExecutorDebugState>>,
     lease_state: Arc<Mutex<LeaseState>>,
 ) {
     let mut stream = consumer;
-    let mut runtime = ExecutorRuntime::new(
-        runtime_config.cache_capacity,
-        runtime_config.snapshot_interval_events,
-        runtime_config.continue_as_new_event_threshold,
-        runtime_config.continue_as_new_activity_attempt_threshold,
-        runtime_config.continue_as_new_run_age_seconds,
-    );
 
     while let Some(message) = stream.next().await {
         match message {
             Ok((record, _high_watermark)) => match decode_workflow_event(&record) {
                 Ok(event) => {
+                    if matches!(
+                        workflow_turn_routing(&event.payload),
+                        WorkflowTurnRouting::MatchingPoller
+                    ) {
+                        continue;
+                    }
+                    if let Ok(mut state) = debug_state.lock() {
+                        state.record_local_executor_event(partition_id);
+                    }
+                    let mut runtime = runtime.lock().await;
                     if let Err(error) = process_event(
                         &store,
                         &broker,
@@ -405,6 +468,180 @@ async fn run_executor_loop(
             },
             Err(error) => error!(error = %error, "executor consumer error"),
         }
+    }
+}
+
+async fn run_workflow_poll_loop(
+    matching_endpoint: String,
+    partition_id: i32,
+    worker_id: String,
+    worker_build_id: String,
+    publisher: WorkflowPublisher,
+    store: WorkflowStore,
+    broker: BrokerConfig,
+    runtime: Arc<tokio::sync::Mutex<ExecutorRuntime>>,
+    debug_state: Arc<Mutex<ExecutorDebugState>>,
+    lease_state: Arc<Mutex<LeaseState>>,
+) {
+    loop {
+        let mut client = match WorkflowWorkerApiClient::connect(matching_endpoint.clone()).await {
+            Ok(client) => client,
+            Err(error) => {
+                error!(error = %error, partition_id, "failed to connect to matching-service workflow api");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+
+        loop {
+            let poll_started_at = std::time::Instant::now();
+            let response = client
+                .poll_workflow_task(PollWorkflowTaskRequest {
+                    partition_id,
+                    worker_id: worker_id.clone(),
+                    worker_build_id: worker_build_id.clone(),
+                    poll_timeout_ms: 30_000,
+                })
+                .await;
+            let Some(task) = (match response {
+                Ok(response) => response.into_inner().task,
+                Err(error) => {
+                    if let Ok(mut state) = debug_state.lock() {
+                        state.record_workflow_poll_failure(partition_id);
+                    }
+                    error!(error = %error, partition_id, "failed to poll workflow task");
+                    break;
+                }
+            }) else {
+                if let Ok(mut state) = debug_state.lock() {
+                    state.record_workflow_poll_empty(partition_id);
+                }
+                continue;
+            };
+            if let Ok(mut state) = debug_state.lock() {
+                state.record_workflow_poll_hit(partition_id, poll_started_at.elapsed());
+                state.record_matching_routed_event(partition_id);
+            }
+
+            let task_id = task.task_id.clone();
+            let mut event: EventEnvelope<WorkflowEvent> = match serde_json::from_str(&task.source_event_json) {
+                Ok(event) => event,
+                Err(error) => {
+                    error!(
+                        error = %error,
+                        task_id = %task_id,
+                        partition_id,
+                        "failed to decode workflow task event"
+                    );
+                    let _ = client
+                        .fail_workflow_task(FailWorkflowTaskRequest {
+                            task_id,
+                            worker_id: worker_id.clone(),
+                            worker_build_id: worker_build_id.clone(),
+                            error: error.to_string(),
+                        })
+                        .await;
+                    continue;
+                }
+            };
+            event
+                .metadata
+                .insert("workflow_build_id".to_owned(), worker_build_id.clone());
+            event
+                .metadata
+                .insert("workflow_poller_id".to_owned(), worker_id.clone());
+
+            let execution_started_at = std::time::Instant::now();
+            let queue_latency_ms = chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_sub(task.created_at_unix_ms as i64)
+                .max(0) as u64;
+            let sticky_outcome = classify_sticky_dispatch(&task.preferred_build_id, &worker_build_id);
+            let result = {
+                let mut runtime = runtime.lock().await;
+                process_event(
+                    &store,
+                    &broker,
+                    &publisher,
+                    &mut runtime,
+                    &debug_state,
+                    &lease_state,
+                    event.clone(),
+                )
+                .await
+            };
+
+            match result {
+                Ok(()) => {
+                    if let Ok(mut state) = debug_state.lock() {
+                        state.record_workflow_task_execution(
+                            partition_id,
+                            queue_latency_ms,
+                            execution_started_at.elapsed(),
+                            sticky_outcome,
+                        );
+                    }
+                    let _ = store
+                        .update_run_workflow_sticky(
+                            &event.tenant_id,
+                            &event.instance_id,
+                            &event.run_id,
+                            &task.task_queue,
+                            &worker_build_id,
+                            &worker_id,
+                            chrono::Utc::now(),
+                        )
+                        .await;
+                    if let Err(error) = client
+                        .complete_workflow_task(CompleteWorkflowTaskRequest {
+                            task_id,
+                            worker_id: worker_id.clone(),
+                            worker_build_id: worker_build_id.clone(),
+                        })
+                        .await
+                    {
+                        error!(
+                            error = %error,
+                            partition_id,
+                            workflow_instance_id = %event.instance_id,
+                            "failed to ack workflow task completion"
+                        );
+                        break;
+                    }
+                }
+                Err(error) => {
+                    if let Ok(mut state) = debug_state.lock() {
+                        state.record_workflow_task_execution(
+                            partition_id,
+                            queue_latency_ms,
+                            execution_started_at.elapsed(),
+                            sticky_outcome,
+                        );
+                    }
+                    error!(
+                        error = %error,
+                        partition_id,
+                        workflow_instance_id = %event.instance_id,
+                        run_id = %event.run_id,
+                        "failed to process leased workflow task"
+                    );
+                    if let Err(ack_error) = client
+                        .fail_workflow_task(FailWorkflowTaskRequest {
+                            task_id,
+                            worker_id: worker_id.clone(),
+                            worker_build_id: worker_build_id.clone(),
+                            error: error.to_string(),
+                        })
+                        .await
+                    {
+                        error!(error = %ack_error, partition_id, "failed to nack workflow task");
+                        break;
+                    }
+                }
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
 
@@ -1548,7 +1785,7 @@ async fn process_event(
             child_workflow_id,
             child_definition_id,
             input,
-            task_queue: _,
+            task_queue,
             parent_close_policy,
         } => {
             store
@@ -1580,6 +1817,8 @@ async fn process_event(
                 (definition.version, fabrik_workflow::artifact_hash(&definition))
             };
             let child_run_id = format!("run-{}", Uuid::now_v7());
+            let workflow_task_queue =
+                task_queue.clone().unwrap_or_else(|| state.workflow_task_queue.clone());
             store
                 .put_run_start(
                     &event.tenant_id,
@@ -1588,6 +1827,7 @@ async fn process_event(
                     child_definition_id,
                     Some(definition_version),
                     Some(&artifact_hash),
+                    &workflow_task_queue,
                     event.event_id,
                     event.occurred_at,
                     None,
@@ -1616,6 +1856,9 @@ async fn process_event(
                 .insert("parent_instance_id".to_owned(), event.instance_id.clone());
             child_trigger.metadata.insert("parent_run_id".to_owned(), event.run_id.clone());
             child_trigger.metadata.insert("parent_child_id".to_owned(), child_id.clone());
+            child_trigger
+                .metadata
+                .insert("workflow_task_queue".to_owned(), workflow_task_queue);
             publisher.publish(&child_trigger, &child_trigger.partition_key).await?;
 
             let mut parent_started = EventEnvelope::new(
@@ -1865,7 +2108,7 @@ struct HotStateRecord {
     restore_source: RestoreSource,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum RestoreSource {
     Initialized,
@@ -1905,6 +2148,15 @@ struct ExecutorDebugState {
     restores_from_snapshot_replay: u64,
     restores_after_handoff: u64,
     hot_instance_count: usize,
+    workflow_turns_routed_via_matching: u64,
+    workflow_turns_processed_locally: u64,
+    sticky_build_hits: u64,
+    sticky_build_fallbacks: u64,
+    workflow_task_poll_hits: u64,
+    workflow_task_poll_empties: u64,
+    workflow_task_poll_failures: u64,
+    workflow_task_queue_latency: DurationStats,
+    workflow_task_execution_latency: DurationStats,
     partitions: Vec<PartitionRuntimeDebug>,
     ownership_transitions: Vec<OwnershipTransitionDebug>,
 }
@@ -1919,7 +2171,79 @@ struct PartitionRuntimeDebug {
     restores_from_snapshot_replay: u64,
     restores_after_handoff: u64,
     hot_instance_count: usize,
+    workflow_turns_routed_via_matching: u64,
+    workflow_turns_processed_locally: u64,
+    sticky_build_hits: u64,
+    sticky_build_fallbacks: u64,
+    workflow_task_poll_hits: u64,
+    workflow_task_poll_empties: u64,
+    workflow_task_poll_failures: u64,
+    workflow_task_queue_latency: DurationStats,
+    workflow_task_execution_latency: DurationStats,
     hot_instances: Vec<HotInstanceDebug>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct HybridRoutingDebugSummary {
+    total_workflow_turns: u64,
+    matching_routed_turns: u64,
+    local_executor_turns: u64,
+    matching_routed_ratio: f64,
+    local_executor_ratio: f64,
+    sticky_build_hits: u64,
+    sticky_build_fallbacks: u64,
+    sticky_hit_rate: f64,
+    sticky_fallback_rate: f64,
+    workflow_task_poll_hits: u64,
+    workflow_task_poll_empties: u64,
+    workflow_task_poll_failures: u64,
+    poll_hit_rate: f64,
+    poll_empty_rate: f64,
+    poll_failure_rate: f64,
+    avg_workflow_task_queue_latency_ms: f64,
+    max_workflow_task_queue_latency_ms: u64,
+    avg_workflow_task_execution_latency_ms: f64,
+    max_workflow_task_execution_latency_ms: u64,
+    restores_after_handoff: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+struct DurationStats {
+    sample_count: u64,
+    total_ms: u64,
+    max_ms: u64,
+}
+
+impl DurationStats {
+    fn record_ms(&mut self, value_ms: u64) {
+        self.sample_count += 1;
+        self.total_ms = self.total_ms.saturating_add(value_ms);
+        self.max_ms = self.max_ms.max(value_ms);
+    }
+
+    fn combine(values: impl Iterator<Item = Self>) -> Self {
+        values.fold(Self::default(), |mut combined, value| {
+            combined.sample_count = combined.sample_count.saturating_add(value.sample_count);
+            combined.total_ms = combined.total_ms.saturating_add(value.total_ms);
+            combined.max_ms = combined.max_ms.max(value.max_ms);
+            combined
+        })
+    }
+
+    fn average_ms(&self) -> f64 {
+        if self.sample_count == 0 {
+            0.0
+        } else {
+            self.total_ms as f64 / self.sample_count as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StickyDispatchOutcome {
+    None,
+    Hit,
+    Fallback,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2067,6 +2391,15 @@ impl ExecutorDebugState {
             restores_from_snapshot_replay: 0,
             restores_after_handoff: 0,
             hot_instance_count: 0,
+            workflow_turns_routed_via_matching: 0,
+            workflow_turns_processed_locally: 0,
+            sticky_build_hits: 0,
+            sticky_build_fallbacks: 0,
+            workflow_task_poll_hits: 0,
+            workflow_task_poll_empties: 0,
+            workflow_task_poll_failures: 0,
+            workflow_task_queue_latency: DurationStats::default(),
+            workflow_task_execution_latency: DurationStats::default(),
             partitions: ownerships
                 .iter()
                 .map(|ownership| PartitionRuntimeDebug {
@@ -2078,6 +2411,15 @@ impl ExecutorDebugState {
                     restores_from_snapshot_replay: 0,
                     restores_after_handoff: 0,
                     hot_instance_count: 0,
+                    workflow_turns_routed_via_matching: 0,
+                    workflow_turns_processed_locally: 0,
+                    sticky_build_hits: 0,
+                    sticky_build_fallbacks: 0,
+                    workflow_task_poll_hits: 0,
+                    workflow_task_poll_empties: 0,
+                    workflow_task_poll_failures: 0,
+                    workflow_task_queue_latency: DurationStats::default(),
+                    workflow_task_execution_latency: DurationStats::default(),
                     hot_instances: Vec::new(),
                 })
                 .collect(),
@@ -2120,6 +2462,53 @@ impl ExecutorDebugState {
         partition.hot_instances.sort_by(|left, right| {
             left.tenant_id.cmp(&right.tenant_id).then(left.instance_id.cmp(&right.instance_id))
         });
+        self.recompute_totals();
+    }
+
+    fn record_matching_routed_event(&mut self, partition_id: i32) {
+        self.partition_mut(partition_id).workflow_turns_routed_via_matching += 1;
+        self.recompute_totals();
+    }
+
+    fn record_local_executor_event(&mut self, partition_id: i32) {
+        self.partition_mut(partition_id).workflow_turns_processed_locally += 1;
+        self.recompute_totals();
+    }
+
+    fn record_workflow_poll_hit(&mut self, partition_id: i32, _latency: std::time::Duration) {
+        self.partition_mut(partition_id).workflow_task_poll_hits += 1;
+        self.recompute_totals();
+    }
+
+    fn record_workflow_poll_empty(&mut self, partition_id: i32) {
+        self.partition_mut(partition_id).workflow_task_poll_empties += 1;
+        self.recompute_totals();
+    }
+
+    fn record_workflow_poll_failure(&mut self, partition_id: i32) {
+        self.partition_mut(partition_id).workflow_task_poll_failures += 1;
+        self.recompute_totals();
+    }
+
+    fn record_workflow_task_execution(
+        &mut self,
+        partition_id: i32,
+        queue_latency_ms: u64,
+        execution_latency: std::time::Duration,
+        sticky_outcome: StickyDispatchOutcome,
+    ) {
+        let partition = self.partition_mut(partition_id);
+        partition
+            .workflow_task_queue_latency
+            .record_ms(queue_latency_ms);
+        partition
+            .workflow_task_execution_latency
+            .record_ms(execution_latency.as_millis().min(u128::from(u64::MAX)) as u64);
+        match sticky_outcome {
+            StickyDispatchOutcome::Hit => partition.sticky_build_hits += 1,
+            StickyDispatchOutcome::Fallback => partition.sticky_build_fallbacks += 1,
+            StickyDispatchOutcome::None => {}
+        }
         self.recompute_totals();
     }
 
@@ -2201,6 +2590,15 @@ impl ExecutorDebugState {
             restores_from_snapshot_replay: 0,
             restores_after_handoff: 0,
             hot_instance_count: 0,
+            workflow_turns_routed_via_matching: 0,
+            workflow_turns_processed_locally: 0,
+            sticky_build_hits: 0,
+            sticky_build_fallbacks: 0,
+            workflow_task_poll_hits: 0,
+            workflow_task_poll_empties: 0,
+            workflow_task_poll_failures: 0,
+            workflow_task_queue_latency: DurationStats::default(),
+            workflow_task_execution_latency: DurationStats::default(),
             hot_instances: Vec::new(),
         });
         self.partitions.last_mut().expect("partition debug inserted")
@@ -2218,6 +2616,83 @@ impl ExecutorDebugState {
             self.partitions.iter().map(|entry| entry.restores_after_handoff).sum();
         self.hot_instance_count =
             self.partitions.iter().map(|entry| entry.hot_instance_count).sum();
+        self.workflow_turns_routed_via_matching = self
+            .partitions
+            .iter()
+            .map(|entry| entry.workflow_turns_routed_via_matching)
+            .sum();
+        self.workflow_turns_processed_locally = self
+            .partitions
+            .iter()
+            .map(|entry| entry.workflow_turns_processed_locally)
+            .sum();
+        self.sticky_build_hits =
+            self.partitions.iter().map(|entry| entry.sticky_build_hits).sum();
+        self.sticky_build_fallbacks = self
+            .partitions
+            .iter()
+            .map(|entry| entry.sticky_build_fallbacks)
+            .sum();
+        self.workflow_task_poll_hits = self
+            .partitions
+            .iter()
+            .map(|entry| entry.workflow_task_poll_hits)
+            .sum();
+        self.workflow_task_poll_empties = self
+            .partitions
+            .iter()
+            .map(|entry| entry.workflow_task_poll_empties)
+            .sum();
+        self.workflow_task_poll_failures = self
+            .partitions
+            .iter()
+            .map(|entry| entry.workflow_task_poll_failures)
+            .sum();
+        self.workflow_task_queue_latency =
+            DurationStats::combine(self.partitions.iter().map(|entry| entry.workflow_task_queue_latency));
+        self.workflow_task_execution_latency = DurationStats::combine(
+            self.partitions.iter().map(|entry| entry.workflow_task_execution_latency),
+        );
+    }
+
+    fn hybrid_routing_summary(&self) -> HybridRoutingDebugSummary {
+        let total_workflow_turns =
+            self.workflow_turns_routed_via_matching + self.workflow_turns_processed_locally;
+        let total_sticky_dispatches = self.sticky_build_hits + self.sticky_build_fallbacks;
+        let total_polls = self.workflow_task_poll_hits
+            + self.workflow_task_poll_empties
+            + self.workflow_task_poll_failures;
+
+        HybridRoutingDebugSummary {
+            total_workflow_turns,
+            matching_routed_turns: self.workflow_turns_routed_via_matching,
+            local_executor_turns: self.workflow_turns_processed_locally,
+            matching_routed_ratio: ratio(self.workflow_turns_routed_via_matching, total_workflow_turns),
+            local_executor_ratio: ratio(self.workflow_turns_processed_locally, total_workflow_turns),
+            sticky_build_hits: self.sticky_build_hits,
+            sticky_build_fallbacks: self.sticky_build_fallbacks,
+            sticky_hit_rate: ratio(self.sticky_build_hits, total_sticky_dispatches),
+            sticky_fallback_rate: ratio(self.sticky_build_fallbacks, total_sticky_dispatches),
+            workflow_task_poll_hits: self.workflow_task_poll_hits,
+            workflow_task_poll_empties: self.workflow_task_poll_empties,
+            workflow_task_poll_failures: self.workflow_task_poll_failures,
+            poll_hit_rate: ratio(self.workflow_task_poll_hits, total_polls),
+            poll_empty_rate: ratio(self.workflow_task_poll_empties, total_polls),
+            poll_failure_rate: ratio(self.workflow_task_poll_failures, total_polls),
+            avg_workflow_task_queue_latency_ms: self.workflow_task_queue_latency.average_ms(),
+            max_workflow_task_queue_latency_ms: self.workflow_task_queue_latency.max_ms,
+            avg_workflow_task_execution_latency_ms: self.workflow_task_execution_latency.average_ms(),
+            max_workflow_task_execution_latency_ms: self.workflow_task_execution_latency.max_ms,
+            restores_after_handoff: self.restores_after_handoff,
+        }
+    }
+}
+
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
     }
 }
 
@@ -2573,6 +3048,19 @@ async fn get_runtime_debug(
             .lock()
             .map_err(|_| internal_executor_error("executor debug state lock poisoned"))?;
         state.clone()
+    };
+    Ok(Json(snapshot))
+}
+
+async fn get_hybrid_routing_debug(
+    AxumState(state): AxumState<ExecutorAppState>,
+) -> Result<Json<HybridRoutingDebugSummary>, (StatusCode, Json<ExecutorErrorResponse>)> {
+    let snapshot = {
+        let state = state
+            .debug
+            .lock()
+            .map_err(|_| internal_executor_error("executor debug state lock poisoned"))?;
+        state.hybrid_routing_summary()
     };
     Ok(Json(snapshot))
 }
@@ -3597,6 +4085,16 @@ fn event_is_terminal(payload: &WorkflowEvent) -> bool {
     )
 }
 
+fn classify_sticky_dispatch(preferred_build_id: &str, actual_build_id: &str) -> StickyDispatchOutcome {
+    if preferred_build_id.trim().is_empty() {
+        StickyDispatchOutcome::None
+    } else if preferred_build_id == actual_build_id {
+        StickyDispatchOutcome::Hit
+    } else {
+        StickyDispatchOutcome::Fallback
+    }
+}
+
 async fn maybe_auto_continue_as_new_compiled(
     store: &WorkflowStore,
     runtime: &mut ExecutorRuntime,
@@ -3689,6 +4187,11 @@ async fn emit_continue_as_new(
     reason: &str,
 ) -> Result<()> {
     ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
+    let workflow_task_queue = store
+        .get_run_record(&event.tenant_id, &event.instance_id, &event.run_id)
+        .await?
+        .map(|run| run.workflow_task_queue)
+        .unwrap_or_else(|| "default".to_owned());
     let new_run_id = format!("run-{}", Uuid::now_v7());
     let continue_payload = WorkflowEvent::WorkflowContinuedAsNew {
         new_run_id: new_run_id.clone(),
@@ -3729,6 +4232,9 @@ async fn emit_continue_as_new(
     trigger.causation_id = Some(continued.event_id);
     trigger.correlation_id = continued.correlation_id;
     trigger.metadata.insert("continue_reason".to_owned(), reason.to_owned());
+    trigger
+        .metadata
+        .insert("workflow_task_queue".to_owned(), workflow_task_queue.clone());
     publisher.publish(&trigger, &trigger.partition_key).await?;
 
     store
@@ -3739,6 +4245,7 @@ async fn emit_continue_as_new(
             &trigger.definition_id,
             Some(trigger.definition_version),
             Some(&trigger.artifact_hash),
+            &workflow_task_queue,
             trigger.event_id,
             trigger.occurred_at,
             Some(&event.run_id),
@@ -3798,12 +4305,30 @@ fn is_run_initialization_event(event: &WorkflowEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use chrono::Utc;
+    use fabrik_broker::{WorkflowHistoryFilter, read_workflow_history};
+    use fabrik_events::WorkflowIdentity;
     use fabrik_store::{
-        WorkflowSignalRecord, WorkflowSignalStatus, WorkflowUpdateRecord, WorkflowUpdateStatus,
+        TaskQueueKind, WorkflowSignalRecord, WorkflowSignalStatus, WorkflowTaskRecord,
+        WorkflowTaskStatus, WorkflowUpdateRecord, WorkflowUpdateStatus,
+    };
+    use fabrik_worker_protocol::activity_worker::{
+        Ack, CompleteWorkflowTaskRequest, FailWorkflowTaskRequest, PollWorkflowTaskRequest,
+        PollWorkflowTaskResponse, WorkflowTask,
+        workflow_worker_api_server::{WorkflowWorkerApi, WorkflowWorkerApiServer},
     };
     use fabrik_workflow::WorkflowStatus;
     use serde_json::json;
+    use std::{
+        collections::HashSet,
+        net::TcpListener,
+        process::Command,
+        sync::{Arc, Mutex},
+        time::{Duration as StdDuration, Instant},
+    };
+    use tokio::{sync::{Notify, oneshot}, time::sleep};
+    use tonic::{Request, Response, Status, transport::Server};
 
     fn demo_state(instance_id: &str) -> WorkflowInstanceState {
         WorkflowInstanceState {
@@ -3813,6 +4338,9 @@ mod tests {
             definition_id: "demo".to_owned(),
             definition_version: Some(1),
             artifact_hash: Some("artifact".to_owned()),
+            workflow_task_queue: "default".to_owned(),
+            sticky_workflow_build_id: None,
+            sticky_workflow_poller_id: None,
             current_state: Some("wait".to_owned()),
             context: Some(Value::Null),
             artifact_execution: None,
@@ -3864,6 +4392,458 @@ mod tests {
             accepted_at: None,
             completed_at: None,
             updated_at: requested_at,
+        }
+    }
+
+    struct TestPostgres {
+        container_name: String,
+        database_url: String,
+    }
+
+    impl TestPostgres {
+        fn start() -> Result<Option<Self>> {
+            if !docker_available() {
+                eprintln!("skipping executor integration test because docker is unavailable");
+                return Ok(None);
+            }
+
+            let container_name = format!("fabrik-executor-test-pg-{}", Uuid::now_v7());
+            let image =
+                std::env::var("FABRIK_TEST_POSTGRES_IMAGE").unwrap_or_else(|_| "postgres:16-alpine".to_owned());
+            let output = Command::new("docker")
+                .args([
+                    "run",
+                    "--detach",
+                    "--rm",
+                    "--name",
+                    &container_name,
+                    "--env",
+                    "POSTGRES_USER=fabrik",
+                    "--env",
+                    "POSTGRES_PASSWORD=fabrik",
+                    "--env",
+                    "POSTGRES_DB=fabrik_test",
+                    "--publish-all",
+                    &image,
+                ])
+                .output()
+                .with_context(|| format!("failed to start docker container {container_name}"))?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "docker failed to start postgres test container: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+
+            let host_port = match wait_for_docker_port(&container_name, "5432/tcp") {
+                Ok(port) => port,
+                Err(error) => {
+                    let _ = cleanup_container(&container_name);
+                    return Err(error);
+                }
+            };
+            let database_url =
+                format!("postgres://fabrik:fabrik@127.0.0.1:{host_port}/fabrik_test?sslmode=disable");
+            Ok(Some(Self { container_name, database_url }))
+        }
+
+        async fn connect_store(&self) -> Result<WorkflowStore> {
+            let deadline = Instant::now() + StdDuration::from_secs(30);
+            loop {
+                match WorkflowStore::connect(&self.database_url).await {
+                    Ok(store) => {
+                        store.init().await?;
+                        return Ok(store);
+                    }
+                    Err(error) if Instant::now() < deadline => {
+                        let _ = error;
+                        sleep(StdDuration::from_millis(250)).await;
+                    }
+                    Err(error) => {
+                        let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        return Err(error).with_context(|| {
+                            format!(
+                                "postgres test container {} did not become ready; logs:\n{}",
+                                self.container_name, logs
+                            )
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for TestPostgres {
+        fn drop(&mut self) {
+            let _ = cleanup_container(&self.container_name);
+        }
+    }
+
+    struct TestRedpanda {
+        container_name: String,
+        broker: BrokerConfig,
+    }
+
+    impl TestRedpanda {
+        fn start() -> Result<Option<Self>> {
+            if !docker_available() {
+                eprintln!("skipping executor integration test because docker is unavailable");
+                return Ok(None);
+            }
+
+            let kafka_port = choose_free_port().context("failed to allocate kafka host port")?;
+            let container_name = format!("fabrik-executor-test-rp-{}", Uuid::now_v7());
+            let image = std::env::var("FABRIK_TEST_REDPANDA_IMAGE")
+                .unwrap_or_else(|_| "docker.redpanda.com/redpandadata/redpanda:v25.1.2".to_owned());
+            let topic = format!("workflow-events-test-{}", Uuid::now_v7());
+            let output = Command::new("docker")
+                .args([
+                    "run",
+                    "--detach",
+                    "--rm",
+                    "--name",
+                    &container_name,
+                    "--publish",
+                    &format!("{kafka_port}:{kafka_port}"),
+                    &image,
+                    "redpanda",
+                    "start",
+                    "--overprovisioned",
+                    "--smp",
+                    "1",
+                    "--memory",
+                    "1G",
+                    "--reserve-memory",
+                    "0M",
+                    "--node-id",
+                    "0",
+                    "--check=false",
+                    "--kafka-addr",
+                    &format!("PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:{kafka_port}"),
+                    "--advertise-kafka-addr",
+                    &format!("PLAINTEXT://127.0.0.1:9092,OUTSIDE://127.0.0.1:{kafka_port}"),
+                    "--rpc-addr",
+                    "0.0.0.0:33145",
+                    "--advertise-rpc-addr",
+                    "127.0.0.1:33145",
+                ])
+                .output()
+                .with_context(|| format!("failed to start docker container {container_name}"))?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "docker failed to start redpanda test container: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+
+            Ok(Some(Self {
+                container_name,
+                broker: BrokerConfig::new(format!("127.0.0.1:{kafka_port}"), topic, 1),
+            }))
+        }
+
+        async fn connect_publisher(&self) -> Result<WorkflowPublisher> {
+            let deadline = Instant::now() + StdDuration::from_secs(45);
+            loop {
+                match WorkflowPublisher::new(&self.broker, "executor-service-test").await {
+                    Ok(publisher) => return Ok(publisher),
+                    Err(error) if Instant::now() < deadline => {
+                        let _ = error;
+                        sleep(StdDuration::from_millis(500)).await;
+                    }
+                    Err(error) => {
+                        let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        return Err(error).with_context(|| {
+                            format!(
+                                "redpanda test container {} did not become ready; logs:\n{}",
+                                self.container_name, logs
+                            )
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for TestRedpanda {
+        fn drop(&mut self) {
+            let _ = cleanup_container(&self.container_name);
+        }
+    }
+
+    fn docker_available() -> bool {
+        Command::new("docker")
+            .args(["info", "--format", "{{.ServerVersion}}"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    fn wait_for_docker_port(container_name: &str, container_port: &str) -> Result<u16> {
+        let deadline = Instant::now() + StdDuration::from_secs(15);
+        loop {
+            let output = Command::new("docker")
+                .args([
+                    "inspect",
+                    "--format",
+                    &format!(
+                        "{{{{(index (index .NetworkSettings.Ports \"{container_port}\") 0).HostPort}}}}"
+                    ),
+                    container_name,
+                ])
+                .output()
+                .with_context(|| format!("failed to inspect docker container {container_name}"))?;
+            if output.status.success() {
+                let host_port = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                if !host_port.is_empty() {
+                    return host_port
+                        .parse::<u16>()
+                        .with_context(|| format!("invalid mapped port {host_port}"));
+                }
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("timed out waiting for port {container_port} on {container_name}");
+            }
+            std::thread::sleep(StdDuration::from_millis(100));
+        }
+    }
+
+    fn choose_free_port() -> Result<u16> {
+        let listener =
+            TcpListener::bind("127.0.0.1:0").context("failed to bind ephemeral port")?;
+        let port = listener
+            .local_addr()
+            .context("failed to read ephemeral socket address")?
+            .port();
+        drop(listener);
+        Ok(port)
+    }
+
+    fn docker_logs(container_name: &str) -> Result<String> {
+        let output = Command::new("docker")
+            .args(["logs", container_name])
+            .output()
+            .with_context(|| format!("failed to read docker logs for {container_name}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Ok(format!("{stdout}{stderr}"))
+    }
+
+    fn cleanup_container(container_name: &str) -> Result<()> {
+        let output = Command::new("docker")
+            .args(["rm", "--force", container_name])
+            .output()
+            .with_context(|| format!("failed to remove docker container {container_name}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "docker failed to remove container {container_name}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        }
+    }
+
+    fn test_event(identity: &WorkflowIdentity, payload: WorkflowEvent) -> EventEnvelope<WorkflowEvent> {
+        let mut event = EventEnvelope::new(payload.event_type(), identity.clone(), payload);
+        event.metadata.insert("workflow_task_queue".to_owned(), "default".to_owned());
+        event
+    }
+
+    #[derive(Clone)]
+    struct TestWorkflowApi {
+        store: WorkflowStore,
+        notify: Arc<Notify>,
+        blocked_workers: Arc<Mutex<HashSet<String>>>,
+        lease_ttl: chrono::Duration,
+    }
+
+    impl TestWorkflowApi {
+        fn workflow_task_to_proto(record: &WorkflowTaskRecord) -> WorkflowTask {
+            WorkflowTask {
+                task_id: record.task_id.to_string(),
+                tenant_id: record.tenant_id.clone(),
+                instance_id: record.instance_id.clone(),
+                run_id: record.run_id.clone(),
+                definition_id: record.definition_id.clone(),
+                definition_version: record.definition_version.unwrap_or_default(),
+                artifact_hash: record.artifact_hash.clone().unwrap_or_default(),
+                partition_id: record.partition_id,
+                task_queue: record.task_queue.clone(),
+                preferred_build_id: record.preferred_build_id.clone().unwrap_or_default(),
+                source_event_id: record.source_event_id.to_string(),
+                source_event_type: record.source_event_type.clone(),
+                source_event_json: serde_json::to_string(&record.source_event)
+                    .expect("workflow task event serializes"),
+                attempt_count: record.attempt_count,
+                created_at_unix_ms: record.created_at.timestamp_millis(),
+            }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl WorkflowWorkerApi for TestWorkflowApi {
+        async fn poll_workflow_task(
+            &self,
+            request: Request<PollWorkflowTaskRequest>,
+        ) -> Result<Response<PollWorkflowTaskResponse>, Status> {
+            let request = request.into_inner();
+            let deadline = tokio::time::Instant::now()
+                + StdDuration::from_millis(request.poll_timeout_ms.max(1));
+
+            loop {
+                let blocked = self
+                    .blocked_workers
+                    .lock()
+                    .expect("blocked workers lock")
+                    .contains(&request.worker_id);
+                if !blocked {
+                    if let Some(record) = self
+                        .store
+                        .lease_next_workflow_task(
+                            request.partition_id,
+                            &request.worker_id,
+                            &request.worker_build_id,
+                            self.lease_ttl,
+                        )
+                        .await
+                        .map_err(|error| Status::internal(error.to_string()))?
+                    {
+                        self.store
+                            .upsert_queue_poller(
+                                &record.tenant_id,
+                                TaskQueueKind::Workflow,
+                                &record.task_queue,
+                                &request.worker_id,
+                                &request.worker_build_id,
+                                Some(request.partition_id),
+                                None,
+                                self.lease_ttl,
+                            )
+                            .await
+                            .map_err(|error| Status::internal(error.to_string()))?;
+                        return Ok(Response::new(PollWorkflowTaskResponse {
+                            task: Some(Self::workflow_task_to_proto(&record)),
+                        }));
+                    }
+                }
+
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    return Ok(Response::new(PollWorkflowTaskResponse { task: None }));
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                if tokio::time::timeout(remaining, self.notify.notified()).await.is_err() {
+                    return Ok(Response::new(PollWorkflowTaskResponse { task: None }));
+                }
+            }
+        }
+
+        async fn complete_workflow_task(
+            &self,
+            request: Request<CompleteWorkflowTaskRequest>,
+        ) -> Result<Response<Ack>, Status> {
+            let request = request.into_inner();
+            let task_id = Uuid::parse_str(&request.task_id)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            self.store
+                .complete_workflow_task(task_id, &request.worker_id, &request.worker_build_id, Utc::now())
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?;
+            Ok(Response::new(Ack {}))
+        }
+
+        async fn fail_workflow_task(
+            &self,
+            request: Request<FailWorkflowTaskRequest>,
+        ) -> Result<Response<Ack>, Status> {
+            let request = request.into_inner();
+            let task_id = Uuid::parse_str(&request.task_id)
+                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            if self
+                .store
+                .fail_workflow_task(
+                    task_id,
+                    &request.worker_id,
+                    &request.worker_build_id,
+                    &request.error,
+                    Utc::now(),
+                )
+                .await
+                .map_err(|error| Status::internal(error.to_string()))?
+            {
+                self.blocked_workers
+                    .lock()
+                    .expect("blocked workers lock")
+                    .insert(request.worker_id);
+                self.notify.notify_waiters();
+            }
+            Ok(Response::new(Ack {}))
+        }
+    }
+
+    struct TestWorkflowApiServerHandle {
+        endpoint: String,
+        shutdown: Option<oneshot::Sender<()>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestWorkflowApiServerHandle {
+        async fn start(store: WorkflowStore) -> Result<Self> {
+            let port = choose_free_port().context("failed to allocate workflow api port")?;
+            let addr = format!("127.0.0.1:{port}")
+                .parse()
+                .context("failed to parse workflow api address")?;
+            let endpoint = format!("http://127.0.0.1:{port}");
+            let notify = Arc::new(Notify::new());
+            let blocked_workers = Arc::new(Mutex::new(HashSet::new()));
+            let api = TestWorkflowApi {
+                store,
+                notify,
+                blocked_workers,
+                lease_ttl: chrono::Duration::seconds(30),
+            };
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _ = Server::builder()
+                    .add_service(WorkflowWorkerApiServer::new(api))
+                    .serve_with_shutdown(addr, async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await;
+            });
+
+            Ok(Self { endpoint, shutdown: Some(shutdown_tx), task })
+        }
+
+        async fn stop(mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            let _ = self.task.await;
+        }
+    }
+
+    async fn wait_for_workflow_task<F>(
+        store: &WorkflowStore,
+        task_id: Uuid,
+        predicate: F,
+        timeout: StdDuration,
+    ) -> Result<WorkflowTaskRecord>
+    where
+        F: Fn(&WorkflowTaskRecord) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(record) = store.get_workflow_task(task_id).await? {
+                if predicate(&record) {
+                    return Ok(record);
+                }
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("timed out waiting for workflow task {task_id}");
+            }
+            sleep(StdDuration::from_millis(50)).await;
         }
     }
 
@@ -3967,5 +4947,435 @@ mod tests {
         );
 
         assert_eq!(state.status, WorkflowStatus::Completed);
+    }
+
+    #[test]
+    fn sticky_dispatch_classifies_hit_and_fallback() {
+        assert_eq!(classify_sticky_dispatch("", "build-a"), StickyDispatchOutcome::None);
+        assert_eq!(classify_sticky_dispatch("build-a", "build-a"), StickyDispatchOutcome::Hit);
+        assert_eq!(
+            classify_sticky_dispatch("build-a", "build-b"),
+            StickyDispatchOutcome::Fallback
+        );
+    }
+
+    #[test]
+    fn debug_state_tracks_workflow_routing_metrics() {
+        let ownership = PartitionOwnershipRecord {
+            partition_id: 2,
+            owner_id: "executor-1".to_owned(),
+            owner_epoch: 1,
+            lease_expires_at: Utc::now(),
+            acquired_at: Utc::now(),
+            last_transition_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let mut debug = ExecutorDebugState::new(&[ownership], 10, 5);
+        debug.record_matching_routed_event(2);
+        debug.record_local_executor_event(2);
+        debug.record_workflow_poll_hit(2, std::time::Duration::from_millis(3));
+        debug.record_workflow_poll_empty(2);
+        debug.record_workflow_poll_failure(2);
+        debug.record_workflow_task_execution(
+            2,
+            11,
+            std::time::Duration::from_millis(7),
+            StickyDispatchOutcome::Fallback,
+        );
+
+        assert_eq!(debug.workflow_turns_routed_via_matching, 1);
+        assert_eq!(debug.workflow_turns_processed_locally, 1);
+        assert_eq!(debug.workflow_task_poll_hits, 1);
+        assert_eq!(debug.workflow_task_poll_empties, 1);
+        assert_eq!(debug.workflow_task_poll_failures, 1);
+        assert_eq!(debug.sticky_build_fallbacks, 1);
+        assert_eq!(debug.workflow_task_queue_latency.sample_count, 1);
+        assert_eq!(debug.workflow_task_queue_latency.total_ms, 11);
+        assert_eq!(debug.workflow_task_execution_latency.max_ms, 7);
+    }
+
+    #[test]
+    fn hybrid_routing_summary_derives_ratios_and_averages() {
+        let ownership = PartitionOwnershipRecord {
+            partition_id: 2,
+            owner_id: "executor-1".to_owned(),
+            owner_epoch: 1,
+            lease_expires_at: Utc::now(),
+            acquired_at: Utc::now(),
+            last_transition_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let mut debug = ExecutorDebugState::new(&[ownership], 10, 5);
+        debug.record_matching_routed_event(2);
+        debug.record_matching_routed_event(2);
+        debug.record_local_executor_event(2);
+        debug.record_workflow_poll_hit(2, std::time::Duration::from_millis(3));
+        debug.record_workflow_poll_empty(2);
+        debug.record_workflow_poll_failure(2);
+        debug.record_workflow_task_execution(
+            2,
+            9,
+            std::time::Duration::from_millis(6),
+            StickyDispatchOutcome::Hit,
+        );
+        debug.record_workflow_task_execution(
+            2,
+            15,
+            std::time::Duration::from_millis(12),
+            StickyDispatchOutcome::Fallback,
+        );
+        debug.restores_after_handoff = 4;
+
+        assert_eq!(
+            debug.hybrid_routing_summary(),
+            HybridRoutingDebugSummary {
+                total_workflow_turns: 3,
+                matching_routed_turns: 2,
+                local_executor_turns: 1,
+                matching_routed_ratio: 2.0 / 3.0,
+                local_executor_ratio: 1.0 / 3.0,
+                sticky_build_hits: 1,
+                sticky_build_fallbacks: 1,
+                sticky_hit_rate: 0.5,
+                sticky_fallback_rate: 0.5,
+                workflow_task_poll_hits: 1,
+                workflow_task_poll_empties: 1,
+                workflow_task_poll_failures: 1,
+                poll_hit_rate: 1.0 / 3.0,
+                poll_empty_rate: 1.0 / 3.0,
+                poll_failure_rate: 1.0 / 3.0,
+                avg_workflow_task_queue_latency_ms: 12.0,
+                max_workflow_task_queue_latency_ms: 15,
+                avg_workflow_task_execution_latency_ms: 9.0,
+                max_workflow_task_execution_latency_ms: 12,
+                restores_after_handoff: 4,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn ownership_handoff_replays_broker_tail_from_snapshot() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let broker = redpanda.broker.clone();
+
+        let identity = WorkflowIdentity::new(
+            "tenant-a",
+            "demo",
+            1,
+            "artifact-1",
+            "instance-handoff",
+            "run-handoff",
+            "test",
+        );
+        let partition_id = publisher.partition_for_key(&identity.partition_key);
+
+        let trigger = test_event(&identity, WorkflowEvent::WorkflowTriggered { input: json!({"ok": true}) });
+        let started = test_event(&identity, WorkflowEvent::WorkflowStarted);
+        let signal_queued = test_event(
+            &identity,
+            WorkflowEvent::SignalQueued {
+                signal_id: "sig-1".to_owned(),
+                signal_type: "external.approved".to_owned(),
+                payload: json!({"approved": true}),
+            },
+        );
+        let marker = test_event(
+            &identity,
+            WorkflowEvent::MarkerRecorded {
+                marker_id: "handoff".to_owned(),
+                value: json!({"owner": "executor-b"}),
+            },
+        );
+
+        publisher.publish(&trigger, &trigger.partition_key).await?;
+        publisher.publish(&started, &started.partition_key).await?;
+        publisher.publish(&signal_queued, &signal_queued.partition_key).await?;
+
+        let mut snapshot_state = WorkflowInstanceState::try_from(&trigger)?;
+        snapshot_state.apply_event(&started);
+        store
+            .put_run_start(
+                &trigger.tenant_id,
+                &trigger.instance_id,
+                &trigger.run_id,
+                &trigger.definition_id,
+                Some(trigger.definition_version),
+                Some(&trigger.artifact_hash),
+                "default",
+                trigger.event_id,
+                trigger.occurred_at,
+                None,
+                None,
+            )
+            .await?;
+        store.upsert_instance(&snapshot_state).await?;
+        store.put_snapshot(&snapshot_state).await?;
+
+        let owner_a = store
+            .claim_partition_ownership(partition_id, "executor-a", StdDuration::from_secs(2))
+            .await?
+            .context("owner a should claim partition")?;
+        let debug_a = Arc::new(Mutex::new(ExecutorDebugState::new(&[owner_a.clone()], 8, 100)));
+        let lease_a = Arc::new(Mutex::new(LeaseState::from_record(&owner_a)));
+        let mut runtime_a = ExecutorRuntime::new(8, 100, None, None, None);
+        process_event(
+            &store,
+            &broker,
+            &publisher,
+            &mut runtime_a,
+            &debug_a,
+            &lease_a,
+            signal_queued.clone(),
+        )
+        .await?;
+        let state_after_owner_a = store
+            .get_instance(&identity.tenant_id, &identity.instance_id)
+            .await?
+            .context("state after owner a should exist")?;
+        assert_eq!(state_after_owner_a.event_count, 3);
+        assert_eq!(state_after_owner_a.last_event_type, "SignalQueued");
+        let snapshot_after_owner_a = store
+            .get_snapshot_for_run(&identity.tenant_id, &identity.instance_id, &identity.run_id)
+            .await?
+            .context("snapshot should still exist")?;
+        assert_eq!(snapshot_after_owner_a.event_count, 2);
+
+        sleep(StdDuration::from_millis(2_200)).await;
+
+        let owner_b = store
+            .claim_partition_ownership(partition_id, "executor-b", StdDuration::from_secs(5))
+            .await?
+            .context("owner b should claim expired partition")?;
+        let debug_b = Arc::new(Mutex::new(ExecutorDebugState::new(&[owner_b.clone()], 8, 100)));
+        let lease_b = Arc::new(Mutex::new(LeaseState::from_record(&owner_b)));
+        let mut runtime_b = ExecutorRuntime::new(8, 100, None, None, None);
+
+        publisher.publish(&marker, &marker.partition_key).await?;
+        process_event(
+            &store,
+            &broker,
+            &publisher,
+            &mut runtime_b,
+            &debug_b,
+            &lease_b,
+            marker.clone(),
+        )
+        .await?;
+
+        assert_eq!(runtime_b.restores_from_snapshot_replay, 1);
+        assert_eq!(runtime_b.restores_after_handoff, 1);
+        let cache_entry = runtime_b
+            .cache
+            .get(&HotStateKey::new(&identity.tenant_id, &identity.instance_id))
+            .context("handoff restore should populate executor cache")?;
+        assert_eq!(cache_entry.record.restore_source, RestoreSource::SnapshotReplay);
+        assert_eq!(cache_entry.record.state.event_count, 4);
+        assert_eq!(cache_entry.record.state.last_event_type, "MarkerRecorded");
+
+        let final_state = store
+            .get_instance(&identity.tenant_id, &identity.instance_id)
+            .await?
+            .context("final workflow state should exist")?;
+        assert_eq!(final_state.event_count, 4);
+        assert_eq!(final_state.last_event_type, "MarkerRecorded");
+        assert_eq!(final_state.status, WorkflowStatus::Running);
+
+        let debug_snapshot = debug_b.lock().expect("executor debug state lock").clone();
+        assert_eq!(debug_snapshot.restores_after_handoff, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn matching_grpc_and_executor_poll_loop_fail_over_to_second_worker() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let broker = redpanda.broker.clone();
+        let workflow_api = TestWorkflowApiServerHandle::start(store.clone()).await?;
+
+        let identity = WorkflowIdentity::new(
+            "tenant-a",
+            "demo",
+            1,
+            "artifact-1",
+            "instance-poll-failover",
+            "run-poll-failover",
+            "test",
+        );
+        let partition_id = publisher.partition_for_key(&identity.partition_key);
+
+        store
+            .register_task_queue_build(
+                &identity.tenant_id,
+                TaskQueueKind::Workflow,
+                "default",
+                "build-a",
+                &[identity.artifact_hash.clone()],
+                None,
+            )
+            .await?;
+        store
+            .register_task_queue_build(
+                &identity.tenant_id,
+                TaskQueueKind::Workflow,
+                "default",
+                "build-b",
+                &[identity.artifact_hash.clone()],
+                None,
+            )
+            .await?;
+        store
+            .upsert_compatibility_set(
+                &identity.tenant_id,
+                TaskQueueKind::Workflow,
+                "default",
+                "stable",
+                &["build-a".to_owned(), "build-b".to_owned()],
+                true,
+            )
+            .await?;
+
+        let trigger = test_event(&identity, WorkflowEvent::WorkflowTriggered { input: json!({"ok": true}) });
+        let started = test_event(&identity, WorkflowEvent::WorkflowStarted);
+        let cancel_requested = test_event(
+            &identity,
+            WorkflowEvent::WorkflowCancellationRequested {
+                reason: "operator requested stop".to_owned(),
+            },
+        );
+        publisher.publish(&cancel_requested, &cancel_requested.partition_key).await?;
+
+        let mut state = WorkflowInstanceState::try_from(&trigger)?;
+        state.apply_event(&started);
+        store
+            .put_run_start(
+                &identity.tenant_id,
+                &identity.instance_id,
+                &identity.run_id,
+                &identity.definition_id,
+                Some(identity.definition_version),
+                Some(&identity.artifact_hash),
+                "default",
+                trigger.event_id,
+                trigger.occurred_at,
+                None,
+                None,
+            )
+            .await?;
+        store.upsert_instance(&state).await?;
+        let task = store
+            .enqueue_workflow_task(partition_id, "default", Some("build-a"), &cancel_requested)
+            .await?
+            .context("workflow task should be created")?;
+
+        let runtime_a = Arc::new(tokio::sync::Mutex::new(ExecutorRuntime::new(8, 100, None, None, None)));
+        let debug_a = Arc::new(Mutex::new(ExecutorDebugState::new(&[], 8, 100)));
+        let lease_a = Arc::new(Mutex::new(LeaseState {
+            partition_id,
+            owner_id: "executor-a".to_owned(),
+            owner_epoch: 1,
+            lease_expires_at: Utc::now(),
+            active: false,
+        }));
+        let poller_a = tokio::spawn(run_workflow_poll_loop(
+            workflow_api.endpoint.clone(),
+            partition_id,
+            "worker-a".to_owned(),
+            "build-a".to_owned(),
+            publisher.clone(),
+            store.clone(),
+            broker.clone(),
+            runtime_a.clone(),
+            debug_a.clone(),
+            lease_a.clone(),
+        ));
+
+        let failed_task = wait_for_workflow_task(
+            &store,
+            task.task_id,
+            |record| record.status == WorkflowTaskStatus::Pending && record.attempt_count >= 1,
+            StdDuration::from_secs(15),
+        )
+        .await?;
+        assert_eq!(failed_task.last_error.as_deref(), Some("executor does not currently hold partition ownership"));
+        poller_a.abort();
+        let _ = poller_a.await;
+
+        let owner_b = store
+            .claim_partition_ownership(partition_id, "executor-b", StdDuration::from_secs(10))
+            .await?
+            .context("owner b should claim partition")?;
+        let runtime_b = Arc::new(tokio::sync::Mutex::new(ExecutorRuntime::new(8, 100, None, None, None)));
+        let debug_b = Arc::new(Mutex::new(ExecutorDebugState::new(&[owner_b.clone()], 8, 100)));
+        let lease_b = Arc::new(Mutex::new(LeaseState::from_record(&owner_b)));
+        let poller_b = tokio::spawn(run_workflow_poll_loop(
+            workflow_api.endpoint.clone(),
+            partition_id,
+            "worker-b".to_owned(),
+            "build-b".to_owned(),
+            publisher.clone(),
+            store.clone(),
+            broker.clone(),
+            runtime_b.clone(),
+            debug_b.clone(),
+            lease_b.clone(),
+        ));
+
+        let completed_task = wait_for_workflow_task(
+            &store,
+            task.task_id,
+            |record| record.status == WorkflowTaskStatus::Completed,
+            StdDuration::from_secs(20),
+        )
+        .await?;
+        assert_eq!(completed_task.lease_build_id.as_deref(), Some("build-b"));
+        assert_eq!(completed_task.attempt_count, 1);
+
+        let history = read_workflow_history(
+            &broker,
+            "executor-poll-failover-test",
+            &WorkflowHistoryFilter::new(&identity.tenant_id, &identity.instance_id, &identity.run_id),
+            StdDuration::from_millis(500),
+            StdDuration::from_secs(10),
+        )
+        .await?;
+        assert!(history.iter().any(|event| matches!(
+            event.payload,
+            WorkflowEvent::WorkflowCancellationRequested { .. }
+        )));
+        assert!(history.iter().any(|event| matches!(
+            event.payload,
+            WorkflowEvent::WorkflowCancelled { .. }
+        )));
+
+        let run = store
+            .get_run_record(&identity.tenant_id, &identity.instance_id, &identity.run_id)
+            .await?
+            .context("workflow run should exist")?;
+        assert_eq!(run.sticky_workflow_build_id.as_deref(), Some("build-b"));
+        assert_eq!(run.sticky_workflow_poller_id.as_deref(), Some("worker-b"));
+
+        let debug_snapshot = debug_b.lock().expect("executor debug state lock").clone();
+        assert_eq!(debug_snapshot.workflow_task_poll_hits, 1);
+        assert_eq!(debug_snapshot.workflow_turns_routed_via_matching, 1);
+        assert_eq!(debug_snapshot.sticky_build_fallbacks, 1);
+
+        poller_b.abort();
+        let _ = poller_b.await;
+        workflow_api.stop().await;
+        Ok(())
     }
 }

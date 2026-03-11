@@ -611,6 +611,12 @@ pub struct WorkflowInstanceState {
     pub definition_id: String,
     pub definition_version: Option<u32>,
     pub artifact_hash: Option<String>,
+    #[serde(default = "default_workflow_task_queue")]
+    pub workflow_task_queue: String,
+    #[serde(default)]
+    pub sticky_workflow_build_id: Option<String>,
+    #[serde(default)]
+    pub sticky_workflow_poller_id: Option<String>,
     pub current_state: Option<String>,
     pub context: Option<Value>,
     #[serde(default)]
@@ -635,6 +641,15 @@ impl WorkflowInstanceState {
         self.run_id = event.run_id.clone();
         self.definition_version = Some(event.definition_version);
         self.artifact_hash = Some(event.artifact_hash.clone());
+        if let Some(task_queue) = event.metadata.get("workflow_task_queue") {
+            self.workflow_task_queue = task_queue.clone();
+        }
+        if let Some(build_id) = event.metadata.get("workflow_build_id") {
+            self.sticky_workflow_build_id = Some(build_id.clone());
+        }
+        if let Some(poller_id) = event.metadata.get("workflow_poller_id") {
+            self.sticky_workflow_poller_id = Some(poller_id.clone());
+        }
         if !was_terminal {
             self.current_state =
                 event.metadata.get("state").cloned().or_else(|| self.current_state.clone());
@@ -759,6 +774,13 @@ impl TryFrom<&EventEnvelope<WorkflowEvent>> for WorkflowInstanceState {
             definition_id: event.definition_id.clone(),
             definition_version: None,
             artifact_hash: None,
+            workflow_task_queue: event
+                .metadata
+                .get("workflow_task_queue")
+                .cloned()
+                .unwrap_or_else(default_workflow_task_queue),
+            sticky_workflow_build_id: event.metadata.get("workflow_build_id").cloned(),
+            sticky_workflow_poller_id: event.metadata.get("workflow_poller_id").cloned(),
             current_state: None,
             context: None,
             artifact_execution: None,
@@ -773,6 +795,10 @@ impl TryFrom<&EventEnvelope<WorkflowEvent>> for WorkflowInstanceState {
         state.apply_event(event);
         Ok(state)
     }
+}
+
+fn default_workflow_task_queue() -> String {
+    "default".to_owned()
 }
 
 pub fn replay_history(history: &[EventEnvelope<WorkflowEvent>]) -> Result<WorkflowInstanceState> {

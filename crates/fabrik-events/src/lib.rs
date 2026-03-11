@@ -308,9 +308,39 @@ impl WorkflowEvent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowTurnRouting {
+    MatchingPoller,
+    LocalExecutor,
+}
+
+pub fn workflow_turn_routing(payload: &WorkflowEvent) -> WorkflowTurnRouting {
+    match payload {
+        WorkflowEvent::WorkflowTriggered { .. }
+        | WorkflowEvent::SignalQueued { .. }
+        | WorkflowEvent::WorkflowUpdateRequested { .. }
+        | WorkflowEvent::WorkflowCancellationRequested { .. }
+        | WorkflowEvent::TimerFired { .. }
+        | WorkflowEvent::ActivityTaskCompleted { .. }
+        | WorkflowEvent::ActivityTaskFailed { .. }
+        | WorkflowEvent::ActivityTaskTimedOut { .. }
+        | WorkflowEvent::ActivityTaskCancelled { .. }
+        | WorkflowEvent::ChildWorkflowCompleted { .. }
+        | WorkflowEvent::ChildWorkflowFailed { .. }
+        | WorkflowEvent::ChildWorkflowCancelled { .. }
+        | WorkflowEvent::ChildWorkflowTerminated { .. } => WorkflowTurnRouting::MatchingPoller,
+        _ => WorkflowTurnRouting::LocalExecutor,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
+    use super::{
+        EventEnvelope, WorkflowEvent, WorkflowIdentity, WorkflowTurnRouting,
+        workflow_turn_routing,
+    };
+    use serde_json::json;
 
     #[test]
     fn serializes_workflow_events_inside_envelope() {
@@ -332,5 +362,42 @@ mod tests {
         let json = serde_json::to_value(&envelope).unwrap();
         assert_eq!(json["event_type"], "WorkflowStarted");
         assert_eq!(json["payload"]["kind"], "workflow_started");
+    }
+
+    #[test]
+    fn classifies_workflow_turn_routing_policy() {
+        assert_eq!(
+            workflow_turn_routing(&WorkflowEvent::WorkflowTriggered { input: json!({"ok": true}) }),
+            WorkflowTurnRouting::MatchingPoller
+        );
+        assert_eq!(
+            workflow_turn_routing(&WorkflowEvent::ActivityTaskCompleted {
+                activity_id: "a1".to_owned(),
+                attempt: 1,
+                output: json!(true),
+                worker_id: "worker".to_owned(),
+                worker_build_id: "build".to_owned(),
+            }),
+            WorkflowTurnRouting::MatchingPoller
+        );
+        assert_eq!(
+            workflow_turn_routing(&WorkflowEvent::WorkflowStarted),
+            WorkflowTurnRouting::LocalExecutor
+        );
+        assert_eq!(
+            workflow_turn_routing(&WorkflowEvent::ActivityTaskScheduled {
+                activity_id: "a1".to_owned(),
+                activity_type: "demo".to_owned(),
+                task_queue: "default".to_owned(),
+                attempt: 1,
+                input: json!(null),
+                config: None,
+                state: None,
+                schedule_to_start_timeout_ms: None,
+                start_to_close_timeout_ms: None,
+                heartbeat_timeout_ms: None,
+            }),
+            WorkflowTurnRouting::LocalExecutor
+        );
     }
 }

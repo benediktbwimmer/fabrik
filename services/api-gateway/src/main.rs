@@ -1,17 +1,815 @@
-use anyhow::Result;
-use fabrik_config::HttpServiceConfig;
-use fabrik_service::{ServiceInfo, init_tracing, run_http_service};
+use std::env;
+
+use anyhow::{Context, Result};
+use axum::{
+    Json, Router,
+    body::Bytes,
+    extract::{OriginalUri, Path, State},
+    http::StatusCode,
+    routing::{get, post, put},
+};
+use chrono::Utc;
+use fabrik_config::{HttpServiceConfig, PostgresConfig};
+use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
+use fabrik_store::{TaskQueueKind, WorkflowStore};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::info;
+
+#[derive(Clone)]
+struct AppState {
+    client: Client,
+    ingest_base: String,
+    query_base: String,
+    executor_base: String,
+    store: WorkflowStore,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterBuildRequest {
+    build_id: String,
+    #[serde(default)]
+    artifact_hashes: Vec<String>,
+    #[serde(default)]
+    metadata: Option<Value>,
+    #[serde(default)]
+    compatibility_set_id: Option<String>,
+    #[serde(default)]
+    promote_default: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompatibilitySetRequest {
+    build_ids: Vec<String>,
+    #[serde(default)]
+    is_default: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DefaultSetRequest {
+    set_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowRoutingResponse {
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    workflow_task_queue: String,
+    sticky_workflow_build_id: Option<String>,
+    sticky_workflow_poller_id: Option<String>,
+    sticky_updated_at: Option<chrono::DateTime<Utc>>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = HttpServiceConfig::from_env("API_GATEWAY", "api-gateway", 3000)?;
+    let postgres = PostgresConfig::from_env()?;
     init_tracing(&config.log_filter);
     info!(port = config.port, "starting api gateway");
 
-    run_http_service(
-        ServiceInfo::new(config.name, "edge-api", env!("CARGO_PKG_VERSION")),
-        config.port,
+    let store = WorkflowStore::connect(&postgres.url).await?;
+    store.init().await?;
+    let state = AppState {
+        client: Client::new(),
+        ingest_base: env::var("INGEST_SERVICE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:3001".to_owned()),
+        query_base: env::var("QUERY_SERVICE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:3005".to_owned()),
+        executor_base: env::var("EXECUTOR_SERVICE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:3002".to_owned()),
+        store,
+    };
+
+    let app = build_app(state, config.name);
+    serve(app, config.port).await
+}
+
+fn build_app(state: AppState, service_name: String) -> Router {
+    default_router::<AppState>(ServiceInfo::new(
+        service_name,
+        "edge-api",
+        env!("CARGO_PKG_VERSION"),
+    ))
+    .route("/workflows/{workflow_id}/trigger", post(proxy_to_ingest))
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/signals/{signal_type}",
+        post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/updates/{update_name}",
+        post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/terminate",
+        post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/continue-as-new",
+        post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/activities/{activity_id}/cancel",
+        post(proxy_to_ingest),
+    )
+    .route("/tenants/{tenant_id}/workflows/{workflow_instance_id}", get(proxy_to_query_get))
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/queries/{query_name}",
+        post(proxy_to_query_post),
+    )
+    .route("/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs", get(proxy_to_query_get))
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/snapshot",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/activities",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/signals",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs/{run_id}/activities",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs/{run_id}/signals",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/history",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs/{run_id}/history",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/replay",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs/{run_id}/replay",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/routing",
+        get(get_workflow_routing),
+    )
+    .route(
+        "/admin/tenants/{tenant_id}/task-queues/{queue_kind}/{task_queue}/builds",
+        post(register_build),
+    )
+    .route(
+        "/admin/tenants/{tenant_id}/task-queues/{queue_kind}/{task_queue}/compatibility-sets/{set_id}",
+        put(upsert_compatibility_set),
+    )
+    .route(
+        "/admin/tenants/{tenant_id}/task-queues/{queue_kind}/{task_queue}/default-set",
+        post(set_default_set),
+    )
+    .route(
+        "/admin/tenants/{tenant_id}/task-queues/{queue_kind}/{task_queue}",
+        get(get_task_queue_inspection),
+    )
+    .route("/admin/debug/executor/hybrid-routing", get(proxy_to_executor_get))
+    .with_state(state)
+}
+
+async fn proxy_to_ingest(
+    State(state): State<AppState>,
+    uri: OriginalUri,
+    body: Bytes,
+) -> Result<(StatusCode, Bytes), (StatusCode, String)> {
+    proxy_request(state.client.clone(), state.ingest_base.clone(), uri, Some(body)).await
+}
+
+async fn proxy_to_query_get(
+    State(state): State<AppState>,
+    uri: OriginalUri,
+) -> Result<(StatusCode, Bytes), (StatusCode, String)> {
+    proxy_request(state.client.clone(), state.query_base.clone(), uri, None).await
+}
+
+async fn proxy_to_query_post(
+    State(state): State<AppState>,
+    uri: OriginalUri,
+    body: Bytes,
+) -> Result<(StatusCode, Bytes), (StatusCode, String)> {
+    proxy_request(state.client.clone(), state.query_base.clone(), uri, Some(body)).await
+}
+
+async fn proxy_to_executor_get(
+    State(state): State<AppState>,
+    _uri: OriginalUri,
+) -> Result<(StatusCode, Bytes), (StatusCode, String)> {
+    proxy_get_path(
+        state.client.clone(),
+        state.executor_base.clone(),
+        "/debug/hybrid-routing",
     )
     .await
+}
+
+async fn register_build(
+    Path((tenant_id, queue_kind, task_queue)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<RegisterBuildRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let queue_kind = parse_queue_kind(&queue_kind)?;
+    let record = state
+        .store
+        .register_task_queue_build(
+            &tenant_id,
+            queue_kind.clone(),
+            &task_queue,
+            &request.build_id,
+            &request.artifact_hashes,
+            request.metadata.as_ref(),
+        )
+        .await
+        .map_err(internal_error)?;
+    if request.promote_default {
+        let set_id =
+            request.compatibility_set_id.clone().unwrap_or_else(|| format!("default-{}", request.build_id));
+        state
+            .store
+            .upsert_compatibility_set(
+                &tenant_id,
+                queue_kind,
+                &task_queue,
+                &set_id,
+                &[request.build_id.clone()],
+                true,
+            )
+            .await
+            .map_err(internal_error)?;
+    }
+    Ok(Json(serde_json::to_value(record).expect("build record serializes")))
+}
+
+async fn upsert_compatibility_set(
+    Path((tenant_id, queue_kind, task_queue, set_id)): Path<(String, String, String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<CompatibilitySetRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let queue_kind = parse_queue_kind(&queue_kind)?;
+    let record = state
+        .store
+        .upsert_compatibility_set(
+            &tenant_id,
+            queue_kind,
+            &task_queue,
+            &set_id,
+            &request.build_ids,
+            request.is_default,
+        )
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(serde_json::to_value(record).expect("compatibility set serializes")))
+}
+
+async fn set_default_set(
+    Path((tenant_id, queue_kind, task_queue)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<DefaultSetRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let queue_kind = parse_queue_kind(&queue_kind)?;
+    state
+        .store
+        .set_default_compatibility_set(&tenant_id, queue_kind, &task_queue, &request.set_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(serde_json::json!({
+        "tenant_id": tenant_id,
+        "task_queue": task_queue,
+        "default_set_id": request.set_id,
+        "status": "updated"
+    })))
+}
+
+async fn get_task_queue_inspection(
+    Path((tenant_id, queue_kind, task_queue)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let queue_kind = parse_queue_kind(&queue_kind)?;
+    let inspection = state
+        .store
+        .inspect_task_queue(&tenant_id, queue_kind, &task_queue, Utc::now())
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(serde_json::to_value(inspection).expect("inspection serializes")))
+}
+
+async fn get_workflow_routing(
+    Path((tenant_id, instance_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowRoutingResponse>, (StatusCode, String)> {
+    let instance = state
+        .store
+        .get_instance(&tenant_id, &instance_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("workflow instance {instance_id} not found for tenant {tenant_id}"),
+            )
+        })?;
+    let run = state
+        .store
+        .get_run_record(&tenant_id, &instance_id, &instance.run_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("workflow run {} not found for tenant {tenant_id}", instance.run_id),
+            )
+        })?;
+
+    Ok(Json(WorkflowRoutingResponse {
+        tenant_id,
+        instance_id,
+        run_id: run.run_id,
+        workflow_task_queue: run.workflow_task_queue,
+        sticky_workflow_build_id: run.sticky_workflow_build_id,
+        sticky_workflow_poller_id: run.sticky_workflow_poller_id,
+        sticky_updated_at: run.sticky_updated_at,
+    }))
+}
+
+async fn proxy_request(
+    client: Client,
+    base_url: String,
+    uri: OriginalUri,
+    body: Option<Bytes>,
+) -> Result<(StatusCode, Bytes), (StatusCode, String)> {
+    let path_and_query = uri
+        .0
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or_else(|| uri.0.path());
+    let url = format!("{base_url}{path_and_query}");
+    let request = if let Some(body) = body {
+        client.post(&url).body(body)
+    } else {
+        client.get(&url)
+    };
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("failed to proxy request to {url}"))
+        .map_err(internal_error)?;
+    let status = StatusCode::from_u16(response.status().as_u16())
+        .map_err(|error| internal_error(anyhow::anyhow!(error.to_string())))?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| internal_error(anyhow::Error::from(error)))?;
+    Ok((status, bytes))
+}
+
+async fn proxy_get_path(
+    client: Client,
+    base_url: String,
+    path: &str,
+) -> Result<(StatusCode, Bytes), (StatusCode, String)> {
+    let url = format!("{base_url}{path}");
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("failed to proxy request to {url}"))
+        .map_err(internal_error)?;
+    let status = StatusCode::from_u16(response.status().as_u16())
+        .map_err(|error| internal_error(anyhow::anyhow!(error.to_string())))?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| internal_error(anyhow::Error::from(error)))?;
+    Ok((status, bytes))
+}
+
+fn parse_queue_kind(raw: &str) -> Result<TaskQueueKind, (StatusCode, String)> {
+    match raw {
+        "workflow" => Ok(TaskQueueKind::Workflow),
+        "activity" => Ok(TaskQueueKind::Activity),
+        _ => Err((StatusCode::BAD_REQUEST, format!("unknown queue kind {raw}"))),
+    }
+}
+
+fn internal_error(error: anyhow::Error) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+        response::IntoResponse,
+        routing::{get, post},
+    };
+    use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
+    use serde_json::json;
+    use std::{
+        process::Command,
+        time::{Duration as StdDuration, Instant},
+    };
+    use tokio::time::sleep;
+    use tower::ServiceExt;
+
+    struct TestPostgres {
+        container_name: String,
+        database_url: String,
+    }
+
+    impl TestPostgres {
+        fn start() -> Result<Option<Self>> {
+            if !docker_available() {
+                eprintln!("skipping api-gateway integration tests because docker is unavailable");
+                return Ok(None);
+            }
+
+            let container_name = format!("fabrik-gateway-test-pg-{}", uuid::Uuid::now_v7());
+            let image =
+                std::env::var("FABRIK_TEST_POSTGRES_IMAGE").unwrap_or_else(|_| "postgres:16-alpine".to_owned());
+            let output = Command::new("docker")
+                .args([
+                    "run",
+                    "--detach",
+                    "--rm",
+                    "--name",
+                    &container_name,
+                    "--env",
+                    "POSTGRES_USER=fabrik",
+                    "--env",
+                    "POSTGRES_PASSWORD=fabrik",
+                    "--env",
+                    "POSTGRES_DB=fabrik_test",
+                    "--publish-all",
+                    &image,
+                ])
+                .output()
+                .with_context(|| format!("failed to start docker container {container_name}"))?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "docker failed to start postgres test container: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+
+            let host_port = match wait_for_docker_port(&container_name, "5432/tcp") {
+                Ok(port) => port,
+                Err(error) => {
+                    let _ = cleanup_container(&container_name);
+                    return Err(error);
+                }
+            };
+            let database_url =
+                format!("postgres://fabrik:fabrik@127.0.0.1:{host_port}/fabrik_test?sslmode=disable");
+            Ok(Some(Self { container_name, database_url }))
+        }
+
+        async fn connect_store(&self) -> Result<WorkflowStore> {
+            let deadline = Instant::now() + StdDuration::from_secs(30);
+            loop {
+                match WorkflowStore::connect(&self.database_url).await {
+                    Ok(store) => {
+                        store.init().await?;
+                        return Ok(store);
+                    }
+                    Err(error) if Instant::now() < deadline => {
+                        let _ = error;
+                        sleep(StdDuration::from_millis(250)).await;
+                    }
+                    Err(error) => {
+                        let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        return Err(error).with_context(|| {
+                            format!(
+                                "postgres test container {} did not become ready; logs:\n{}",
+                                self.container_name, logs
+                            )
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for TestPostgres {
+        fn drop(&mut self) {
+            let _ = cleanup_container(&self.container_name);
+        }
+    }
+
+    struct TestHttpServer {
+        base_url: String,
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl TestHttpServer {
+        async fn start(app: Router) -> Result<Self> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .context("failed to bind test http listener")?;
+            let addr = listener.local_addr().context("failed to read listener address")?;
+            let base_url = format!("http://{}", addr);
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await;
+            });
+            Ok(Self { base_url, shutdown: Some(shutdown_tx), task })
+        }
+
+        async fn stop(mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+            let _ = self.task.await;
+        }
+    }
+
+    fn docker_available() -> bool {
+        Command::new("docker")
+            .args(["info", "--format", "{{.ServerVersion}}"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    fn wait_for_docker_port(container_name: &str, container_port: &str) -> Result<u16> {
+        let deadline = Instant::now() + StdDuration::from_secs(15);
+        loop {
+            let output = Command::new("docker")
+                .args([
+                    "inspect",
+                    "--format",
+                    &format!(
+                        "{{{{(index (index .NetworkSettings.Ports \"{container_port}\") 0).HostPort}}}}"
+                    ),
+                    container_name,
+                ])
+                .output()
+                .with_context(|| format!("failed to inspect docker container {container_name}"))?;
+            if output.status.success() {
+                let host_port = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                if !host_port.is_empty() {
+                    return host_port
+                        .parse::<u16>()
+                        .with_context(|| format!("invalid mapped port {host_port}"));
+                }
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("timed out waiting for port {container_port} on {container_name}");
+            }
+            std::thread::sleep(StdDuration::from_millis(100));
+        }
+    }
+
+    fn docker_logs(container_name: &str) -> Result<String> {
+        let output = Command::new("docker")
+            .args(["logs", container_name])
+            .output()
+            .with_context(|| format!("failed to read docker logs for {container_name}"))?;
+        Ok(format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+
+    fn cleanup_container(container_name: &str) -> Result<()> {
+        let output = Command::new("docker")
+            .args(["rm", "--force", container_name])
+            .output()
+            .with_context(|| format!("failed to remove docker container {container_name}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "docker failed to remove container {container_name}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_proxies_workflow_and_executor_front_doors() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+
+        let ingest = TestHttpServer::start(
+            Router::new().route(
+                "/workflows/demo/trigger",
+                post(|| async { (StatusCode::ACCEPTED, Json(json!({"service": "ingest"}))).into_response() }),
+            ),
+        )
+        .await?;
+        let query = TestHttpServer::start(
+            Router::new().route(
+                "/tenants/tenant-a/workflows/instance-1",
+                get(|| async { Json(json!({"service": "query"})).into_response() }),
+            ),
+        )
+        .await?;
+        let executor = TestHttpServer::start(
+            Router::new().route(
+                "/debug/hybrid-routing",
+                get(|| async { Json(json!({"matching_routed_turns": 4})).into_response() }),
+            ),
+        )
+        .await?;
+
+        let app = build_app(
+            AppState {
+                client: Client::new(),
+                ingest_base: ingest.base_url.clone(),
+                query_base: query.base_url.clone(),
+                executor_base: executor.base_url.clone(),
+                store,
+            },
+            "api-gateway-test".to_owned(),
+        );
+
+        let trigger = app
+            .clone()
+            .oneshot(
+                Request::post("/workflows/demo/trigger")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"tenant_id":"tenant-a"}"#))
+                    .expect("trigger request"),
+            )
+            .await?;
+        assert_eq!(trigger.status(), StatusCode::ACCEPTED);
+        let trigger_body = to_bytes(trigger.into_body(), usize::MAX).await?;
+        assert_eq!(serde_json::from_slice::<Value>(&trigger_body)?["service"], "ingest");
+
+        let query_response = app
+            .clone()
+            .oneshot(
+                Request::get("/tenants/tenant-a/workflows/instance-1")
+                    .body(Body::empty())
+                    .expect("query request"),
+            )
+            .await?;
+        assert_eq!(query_response.status(), StatusCode::OK);
+        let query_body = to_bytes(query_response.into_body(), usize::MAX).await?;
+        assert_eq!(serde_json::from_slice::<Value>(&query_body)?["service"], "query");
+
+        let debug_response = app
+            .oneshot(
+                Request::get("/admin/debug/executor/hybrid-routing")
+                    .body(Body::empty())
+                    .expect("debug request"),
+            )
+            .await?;
+        assert_eq!(debug_response.status(), StatusCode::OK);
+        let debug_body = to_bytes(debug_response.into_body(), usize::MAX).await?;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&debug_body)?["matching_routed_turns"],
+            4
+        );
+
+        ingest.stop().await;
+        query.stop().await;
+        executor.stop().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gateway_admin_endpoints_manage_and_inspect_task_queues() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let app = build_app(
+            AppState {
+                client: Client::new(),
+                ingest_base: "http://127.0.0.1:1".to_owned(),
+                query_base: "http://127.0.0.1:1".to_owned(),
+                executor_base: "http://127.0.0.1:1".to_owned(),
+                store: store.clone(),
+            },
+            "api-gateway-test".to_owned(),
+        );
+
+        let register_response = app
+            .clone()
+            .oneshot(
+                Request::post("/admin/tenants/tenant-a/task-queues/workflow/payments/builds")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"build_id":"build-a","artifact_hashes":["artifact-a"],"promote_default":true}"#,
+                    ))
+                    .expect("register request"),
+            )
+            .await?;
+        assert_eq!(register_response.status(), StatusCode::OK);
+
+        let upsert_response = app
+            .clone()
+            .oneshot(
+                Request::put(
+                    "/admin/tenants/tenant-a/task-queues/workflow/payments/compatibility-sets/canary",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"build_ids":["build-a"],"is_default":false}"#))
+                .expect("compatibility request"),
+            )
+            .await?;
+        assert_eq!(upsert_response.status(), StatusCode::OK);
+
+        let promote_response = app
+            .clone()
+            .oneshot(
+                Request::post("/admin/tenants/tenant-a/task-queues/workflow/payments/default-set")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"set_id":"canary"}"#))
+                    .expect("promote request"),
+            )
+            .await?;
+        assert_eq!(promote_response.status(), StatusCode::OK);
+
+        store
+            .upsert_queue_poller(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "payments",
+                "poller-a",
+                "build-a",
+                Some(3),
+                None,
+                chrono::Duration::seconds(30),
+            )
+            .await?;
+        store
+            .register_task_queue_build(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "payments",
+                "build-a",
+                &["artifact-a".to_owned()],
+                None,
+            )
+            .await?;
+        let mut event = EventEnvelope::new(
+            WorkflowEvent::WorkflowTriggered { input: json!({"ok": true}) }.event_type(),
+            WorkflowIdentity::new(
+                "tenant-a",
+                "demo",
+                1,
+                "artifact-a",
+                "instance-1",
+                "run-1",
+                "test",
+            ),
+            WorkflowEvent::WorkflowTriggered { input: json!({"ok": true}) },
+        );
+        event
+            .metadata
+            .insert("workflow_task_queue".to_owned(), "payments".to_owned());
+        let task = store
+            .enqueue_workflow_task(3, "payments", Some("build-a"), &event)
+            .await?
+            .context("workflow task should be enqueued")?;
+        let leased = store
+            .lease_next_workflow_task(3, "poller-a", "build-a", chrono::Duration::seconds(30))
+            .await?
+            .context("workflow task should be leased")?;
+        assert_eq!(leased.task_id, task.task_id);
+
+        let inspection_response = app
+            .oneshot(
+                Request::get("/admin/tenants/tenant-a/task-queues/workflow/payments")
+                    .body(Body::empty())
+                    .expect("inspection request"),
+            )
+            .await?;
+        assert_eq!(inspection_response.status(), StatusCode::OK);
+        let inspection_body = to_bytes(inspection_response.into_body(), usize::MAX).await?;
+        let inspection: Value = serde_json::from_slice(&inspection_body)?;
+        assert_eq!(inspection["task_queue"], "payments");
+        assert_eq!(inspection["default_set_id"], "canary");
+        assert_eq!(inspection["registered_builds"][0]["build_id"], "build-a");
+        assert_eq!(inspection["pollers"][0]["poller_id"], "poller-a");
+        assert_eq!(inspection["sticky_effectiveness"]["sticky_dispatch_count"], 1);
+        assert_eq!(inspection["sticky_effectiveness"]["sticky_hit_count"], 1);
+        assert_eq!(inspection["sticky_effectiveness"]["sticky_fallback_count"], 0);
+
+        Ok(())
+    }
 }

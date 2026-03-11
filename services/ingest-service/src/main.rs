@@ -30,6 +30,8 @@ struct TriggerWorkflowRequest {
     tenant_id: String,
     #[serde(default, alias = "workflow_instance_id")]
     instance_id: Option<String>,
+    #[serde(default)]
+    workflow_task_queue: Option<String>,
     input: Value,
     #[serde(default)]
     request_id: Option<String>,
@@ -299,8 +301,10 @@ async fn trigger_workflow(
     let instance_id =
         request.instance_id.clone().unwrap_or_else(|| format!("wf-{}", Uuid::now_v7()));
     let run_id = format!("run-{}", Uuid::now_v7());
+    let workflow_task_queue =
+        request.workflow_task_queue.clone().unwrap_or_else(|| "default".to_owned());
     let payload = WorkflowEvent::WorkflowTriggered { input: request.input.clone() };
-    let envelope = EventEnvelope::new(
+    let mut envelope = EventEnvelope::new(
         payload.event_type(),
         WorkflowIdentity::new(
             request.tenant_id.clone(),
@@ -313,6 +317,9 @@ async fn trigger_workflow(
         ),
         payload,
     );
+    envelope
+        .metadata
+        .insert("workflow_task_queue".to_owned(), workflow_task_queue.clone());
 
     state.publisher.publish(&envelope, &envelope.partition_key).await.map_err(internal_error)?;
     state
@@ -324,6 +331,7 @@ async fn trigger_workflow(
             &envelope.definition_id,
             Some(envelope.definition_version),
             Some(&envelope.artifact_hash),
+            &workflow_task_queue,
             envelope.event_id,
             envelope.occurred_at,
             None,
@@ -551,6 +559,13 @@ async fn continue_as_new(
         .or_else(|| instance.output.clone())
         .or_else(|| instance.input.clone())
         .unwrap_or(Value::Null);
+    let workflow_task_queue = state
+        .store
+        .get_run_record(&tenant_id, &instance_id, &instance.run_id)
+        .await
+        .map_err(internal_error)?
+        .map(|run| run.workflow_task_queue)
+        .unwrap_or_else(|| instance.workflow_task_queue.clone());
     let new_run_id = format!("run-{}", Uuid::now_v7());
 
     let continue_payload = WorkflowEvent::WorkflowContinuedAsNew {
@@ -590,6 +605,9 @@ async fn continue_as_new(
     );
     trigger.causation_id = Some(continued.event_id);
     trigger.correlation_id = continued.correlation_id;
+    trigger
+        .metadata
+        .insert("workflow_task_queue".to_owned(), workflow_task_queue.clone());
 
     state.publisher.publish(&trigger, &trigger.partition_key).await.map_err(internal_error)?;
     state
@@ -601,6 +619,7 @@ async fn continue_as_new(
             &trigger.definition_id,
             Some(trigger.definition_version),
             Some(&trigger.artifact_hash),
+            &workflow_task_queue,
             trigger.event_id,
             trigger.occurred_at,
             Some(&instance.run_id),

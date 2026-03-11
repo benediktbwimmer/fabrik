@@ -60,10 +60,19 @@ name = "api-gateway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum 0.8.8",
+ "chrono",
  "fabrik-config",
+ "fabrik-events",
  "fabrik-service",
+ "fabrik-store",
+ "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
+ "tower 0.5.3",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -501,12 +510,14 @@ dependencies = [
  "fabrik-events",
  "fabrik-service",
  "fabrik-store",
+ "fabrik-worker-protocol",
  "fabrik-workflow",
  "futures-util",
  "rskafka",
  "serde",
  "serde_json",
  "tokio",
+ "tonic",
  "tracing",
  "uuid",
 ]
@@ -565,6 +576,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tokio",
  "uuid",
 ]
 
