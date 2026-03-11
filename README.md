@@ -193,6 +193,7 @@ Current TypeScript compiler constraints:
 - `ctx.sideEffect(expr)` records `MarkerRecorded` events for compiled expression values
 - `await ctx.sideEffect("connector", input, { timeout })` emits host-backed `EffectRequested` / `EffectCompleted` / `EffectFailed` events and can schedule workflow-owned timeouts
 - arbitrary guest callbacks inside `ctx.sideEffect()` are still not supported
+- workflow history and replay responses include persisted effect attempt timelines alongside the raw event stream
 
 Useful local endpoints:
 

@@ -39,6 +39,8 @@ pub struct WorkflowEffectRecord {
     pub input: Value,
     pub output: Option<Value>,
     pub error: Option<String>,
+    pub cancellation_reason: Option<String>,
+    pub cancellation_metadata: Option<Value>,
     pub requested_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub last_event_id: Uuid,
@@ -246,6 +248,8 @@ impl WorkflowStore {
                 input JSONB NOT NULL,
                 output JSONB,
                 error TEXT,
+                cancellation_reason TEXT,
+                cancellation_metadata JSONB,
                 requested_at TIMESTAMPTZ NOT NULL,
                 completed_at TIMESTAMPTZ,
                 last_event_id UUID NOT NULL,
@@ -258,6 +262,20 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize workflow_effects table")?;
+
+        sqlx::query(
+            "ALTER TABLE workflow_effects ADD COLUMN IF NOT EXISTS cancellation_reason TEXT",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add workflow_effects.cancellation_reason")?;
+
+        sqlx::query(
+            "ALTER TABLE workflow_effects ADD COLUMN IF NOT EXISTS cancellation_metadata JSONB",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add workflow_effects.cancellation_metadata")?;
 
         Ok(())
     }
@@ -816,13 +834,18 @@ impl WorkflowStore {
                 input,
                 output,
                 error,
+                cancellation_reason,
+                cancellation_metadata,
                 requested_at,
                 completed_at,
                 last_event_id,
                 last_event_type,
                 updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NULL, NULL, $14, NULL, $15, $16, $17)
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                NULL, NULL, NULL, NULL, $14, NULL, $15, $16, $17
+            )
             ON CONFLICT (tenant_id, workflow_instance_id, run_id, effect_id, attempt)
             DO UPDATE SET
                 workflow_id = EXCLUDED.workflow_id,
@@ -835,6 +858,8 @@ impl WorkflowStore {
                 input = EXCLUDED.input,
                 output = NULL,
                 error = NULL,
+                cancellation_reason = NULL,
+                cancellation_metadata = NULL,
                 requested_at = EXCLUDED.requested_at,
                 completed_at = NULL,
                 last_event_id = EXCLUDED.last_event_id,
@@ -887,6 +912,8 @@ impl WorkflowStore {
             WorkflowEffectStatus::Completed,
             Some(output),
             None,
+            None,
+            None,
             event_id,
             event_type,
             occurred_at,
@@ -903,10 +930,12 @@ impl WorkflowStore {
         attempt: u32,
         status: WorkflowEffectStatus,
         error: &str,
+        cancellation_metadata: Option<&Value>,
         event_id: Uuid,
         event_type: &str,
         occurred_at: DateTime<Utc>,
     ) -> Result<()> {
+        let cancellation_reason = matches!(status, WorkflowEffectStatus::Cancelled).then_some(error);
         self.update_effect_terminal(
             tenant_id,
             instance_id,
@@ -916,6 +945,8 @@ impl WorkflowStore {
             status,
             None,
             Some(error),
+            cancellation_reason,
+            cancellation_metadata,
             event_id,
             event_type,
             occurred_at,
@@ -933,6 +964,8 @@ impl WorkflowStore {
         status: WorkflowEffectStatus,
         output: Option<&Value>,
         error: Option<&str>,
+        cancellation_reason: Option<&str>,
+        cancellation_metadata: Option<&Value>,
         event_id: Uuid,
         event_type: &str,
         occurred_at: DateTime<Utc>,
@@ -943,10 +976,12 @@ impl WorkflowStore {
             SET status = $6,
                 output = $7,
                 error = $8,
-                completed_at = $9,
-                last_event_id = $10,
-                last_event_type = $11,
-                updated_at = $12
+                cancellation_reason = $9,
+                cancellation_metadata = $10,
+                completed_at = $11,
+                last_event_id = $12,
+                last_event_type = $13,
+                updated_at = $14
             WHERE tenant_id = $1
               AND workflow_instance_id = $2
               AND run_id = $3
@@ -962,6 +997,8 @@ impl WorkflowStore {
         .bind(status.as_str())
         .bind(output.map(Json))
         .bind(error)
+        .bind(cancellation_reason)
+        .bind(cancellation_metadata.map(Json))
         .bind(occurred_at)
         .bind(event_id)
         .bind(event_type)
@@ -997,6 +1034,8 @@ impl WorkflowStore {
                 input,
                 output,
                 error,
+                cancellation_reason,
+                cancellation_metadata,
                 requested_at,
                 completed_at,
                 last_event_id,
@@ -1043,6 +1082,8 @@ impl WorkflowStore {
                 input,
                 output,
                 error,
+                cancellation_reason,
+                cancellation_metadata,
                 requested_at,
                 completed_at,
                 last_event_id,
@@ -1093,6 +1134,8 @@ impl WorkflowStore {
                 input,
                 output,
                 error,
+                cancellation_reason,
+                cancellation_metadata,
                 requested_at,
                 completed_at,
                 last_event_id,
@@ -1149,6 +1192,13 @@ impl WorkflowStore {
                 .map(|value: Option<Json<Value>>| value.map(|json| json.0))
                 .context("effect output missing")?,
             error: row.try_get("error").context("effect error missing")?,
+            cancellation_reason: row
+                .try_get("cancellation_reason")
+                .context("effect cancellation_reason missing")?,
+            cancellation_metadata: row
+                .try_get::<Option<Json<Value>>, _>("cancellation_metadata")
+                .map(|value: Option<Json<Value>>| value.map(|json| json.0))
+                .context("effect cancellation_metadata missing")?,
             requested_at: row.try_get("requested_at").context("effect requested_at missing")?,
             completed_at: row.try_get("completed_at").context("effect completed_at missing")?,
             last_event_id: row.try_get("last_event_id").context("effect last_event_id missing")?,

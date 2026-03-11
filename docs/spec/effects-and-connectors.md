@@ -42,12 +42,14 @@ Every effect result must carry:
 - request causation id
 - terminal status
 - structured result or failure payload
+- cancellation reason and optional metadata when terminal status is `cancelled`
 
 ## Ownership Rules
 
 - executor decides when an effect is requested
 - connector workers decide how to execute the effect
 - workflow state changes only when result events are accepted by the executor
+- connector workers should suppress terminal result publication when persisted effect status is already `timed_out` or `cancelled`
 
 ## Retry Rules
 

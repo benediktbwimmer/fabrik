@@ -5,12 +5,15 @@ use fabrik_broker::{
 use fabrik_config::{HttpServiceConfig, PostgresConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
-use fabrik_store::WorkflowStore;
+use fabrik_store::{WorkflowEffectStatus, WorkflowStore};
 use fabrik_workflow::{CompiledWorkflowArtifact, StepConfig, WorkflowDefinition, execute_handler};
 use futures_util::StreamExt;
 use reqwest::{Client, Method, Response};
 use serde_json::Value;
+use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
+
+const EFFECT_CANCELLATION_POLL_MS: u64 = 250;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -140,8 +143,26 @@ async fn process_event(
     };
     let idempotency_key = build_idempotency_key(&event, &target.id, target.attempt);
 
-    match execute_step(client, &handler, config.as_ref(), &target.input, &idempotency_key).await {
-        Ok(output) => {
+    let execution_result = match target.kind {
+        ConnectorTargetKind::Step => {
+            Some(execute_step(client, &handler, config.as_ref(), &target.input, &idempotency_key).await)
+        }
+        ConnectorTargetKind::Effect => {
+            execute_effect_with_cooperative_cancellation(
+                store,
+                client,
+                &handler,
+                config.clone(),
+                &target,
+                &event,
+                &idempotency_key,
+            )
+            .await?
+        }
+    };
+
+    match execution_result {
+        Some(Ok(output)) => {
             let payload = match target.kind {
                 ConnectorTargetKind::Step => WorkflowEvent::StepCompleted {
                     step_id: target.id.clone(),
@@ -165,8 +186,16 @@ async fn process_event(
             envelope.metadata.insert("attempt".to_owned(), target.attempt.to_string());
             publisher.publish(&envelope, &envelope.partition_key).await?;
         }
-        Err(error) => {
+        Some(Err(error)) => {
             publish_connector_failure(publisher, &event, &target, error.to_string()).await?;
+        }
+        None => {
+            info!(
+                workflow_instance_id = %event.instance_id,
+                effect_id = %target.id,
+                attempt = target.attempt,
+                "suppressed terminal publish for cancelled or timed out effect"
+            );
         }
     }
 
@@ -185,6 +214,86 @@ struct ConnectorTarget {
 enum ConnectorTargetKind {
     Step,
     Effect,
+}
+
+async fn execute_effect_with_cooperative_cancellation(
+    store: &WorkflowStore,
+    client: &Client,
+    handler: &str,
+    config: Option<StepConfig>,
+    target: &ConnectorTarget,
+    event: &EventEnvelope<WorkflowEvent>,
+    idempotency_key: &str,
+) -> Result<Option<Result<Value>>> {
+    let execution = execute_step(client, handler, config.as_ref(), &target.input, idempotency_key);
+    tokio::pin!(execution);
+
+    let cancellation = wait_for_effect_termination(store, event, target);
+    tokio::pin!(cancellation);
+
+    let outcome = tokio::select! {
+        result = &mut execution => Some(result),
+        _ = &mut cancellation => None,
+    };
+
+    if outcome.is_none() {
+        return Ok(None);
+    }
+
+    if !effect_attempt_is_publishable(store, event, target).await? {
+        return Ok(None);
+    }
+
+    Ok(outcome)
+}
+
+async fn wait_for_effect_termination(
+    store: &WorkflowStore,
+    event: &EventEnvelope<WorkflowEvent>,
+    target: &ConnectorTarget,
+) {
+    loop {
+        match store
+            .get_effect_attempt(
+                &event.tenant_id,
+                &event.instance_id,
+                &event.run_id,
+                &target.id,
+                target.attempt,
+            )
+            .await
+        {
+            Ok(Some(record))
+                if matches!(
+                    record.status,
+                    WorkflowEffectStatus::TimedOut | WorkflowEffectStatus::Cancelled
+                ) =>
+            {
+                return;
+            }
+            Ok(Some(_)) | Ok(None) | Err(_) => {}
+        }
+        sleep(Duration::from_millis(EFFECT_CANCELLATION_POLL_MS)).await;
+    }
+}
+
+async fn effect_attempt_is_publishable(
+    store: &WorkflowStore,
+    event: &EventEnvelope<WorkflowEvent>,
+    target: &ConnectorTarget,
+) -> Result<bool> {
+    Ok(matches!(
+        store
+            .get_effect_attempt(
+                &event.tenant_id,
+                &event.instance_id,
+                &event.run_id,
+                &target.id,
+                target.attempt,
+            )
+            .await?,
+        Some(record) if record.status == WorkflowEffectStatus::Requested
+    ))
 }
 
 async fn execute_step(

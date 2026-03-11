@@ -58,6 +58,8 @@ struct ContinueAsNewRequest {
 struct CancelEffectRequest {
     #[serde(default = "default_cancel_reason")]
     reason: String,
+    #[serde(default)]
+    metadata: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -495,6 +497,7 @@ async fn cancel_effect(
         effect_id: effect_id.clone(),
         attempt: active_effect.attempt,
         reason: request.reason,
+        metadata: request.metadata,
     };
     let envelope = EventEnvelope::new(
         payload.event_type(),

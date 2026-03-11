@@ -41,6 +41,8 @@ struct WorkflowHistoryResponse {
     definition_version: u32,
     artifact_hash: String,
     event_count: usize,
+    effect_attempt_count: usize,
+    effect_attempts: Vec<WorkflowEffectRecord>,
     events: Vec<EventEnvelope<WorkflowEvent>>,
 }
 
@@ -54,6 +56,8 @@ struct WorkflowReplayResponse {
     artifact_hash: String,
     event_count: usize,
     last_event_type: String,
+    effect_attempt_count: usize,
+    effect_attempts: Vec<WorkflowEffectRecord>,
     projection_matches_store: Option<bool>,
     replayed_state: WorkflowInstanceState,
 }
@@ -279,6 +283,7 @@ async fn load_workflow_history(
             "no workflow history found for tenant={tenant_id}, instance_id={instance_id}, run_id={run_id}"
         )
     })?;
+    let effect_attempts = state.store.list_effects_for_run(tenant_id, instance_id, run_id).await?;
 
     Ok(WorkflowHistoryResponse {
         tenant_id: tenant_id.to_owned(),
@@ -288,6 +293,8 @@ async fn load_workflow_history(
         definition_version: first_event.definition_version,
         artifact_hash: first_event.artifact_hash.clone(),
         event_count: history.len(),
+        effect_attempt_count: effect_attempts.len(),
+        effect_attempts,
         events: history,
     })
 }
@@ -400,6 +407,10 @@ async fn replay_workflow_run(
         .last()
         .map(|event| event.event_type.clone())
         .ok_or_else(|| anyhow::anyhow!("workflow history unexpectedly empty after replay"))?;
+    let effect_attempts = state
+        .store
+        .list_effects_for_run(&current_instance.tenant_id, &current_instance.instance_id, run_id)
+        .await?;
 
     Ok(WorkflowReplayResponse {
         tenant_id: current_instance.tenant_id.clone(),
@@ -410,6 +421,8 @@ async fn replay_workflow_run(
         artifact_hash: pinned_artifact_hash,
         event_count: history.len(),
         last_event_type,
+        effect_attempt_count: effect_attempts.len(),
+        effect_attempts,
         projection_matches_store: (current_instance.run_id == replayed_state.run_id)
             .then(|| same_projection(current_instance, &replayed_state)),
         replayed_state,

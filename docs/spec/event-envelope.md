@@ -62,6 +62,8 @@ Every workflow event must carry:
 - `EffectFailed`
 - `EffectTimedOut`
 - `EffectCancelled`
+
+`EffectCancelled` may include operator-supplied reason and metadata for audit/query use.
 - `WorkflowContinuedAsNew`
 - `WorkflowCompleted`
 - `WorkflowFailed`

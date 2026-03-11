@@ -673,6 +673,7 @@ async fn process_event(
                     *attempt,
                     fabrik_store::WorkflowEffectStatus::Failed,
                     effect_error,
+                    None,
                     event.event_id,
                     &event.event_type,
                     event.occurred_at,
@@ -744,6 +745,7 @@ async fn process_event(
                     *attempt,
                     fabrik_store::WorkflowEffectStatus::TimedOut,
                     "effect timed out",
+                    None,
                     event.event_id,
                     &event.event_type,
                     event.occurred_at,
@@ -805,7 +807,12 @@ async fn process_event(
                 }
             }
         }
-        WorkflowEvent::EffectCancelled { effect_id, attempt, reason } => {
+        WorkflowEvent::EffectCancelled {
+            effect_id,
+            attempt,
+            reason,
+            metadata,
+        } => {
             let _ = store
                 .delete_timer(
                     &event.tenant_id,
@@ -822,6 +829,7 @@ async fn process_event(
                     *attempt,
                     fabrik_store::WorkflowEffectStatus::Cancelled,
                     reason,
+                    metadata.as_ref(),
                     event.event_id,
                     &event.event_type,
                     event.occurred_at,

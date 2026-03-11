@@ -105,7 +105,13 @@ pub enum WorkflowEvent {
     EffectCompleted { effect_id: String, attempt: u32, output: Value },
     EffectFailed { effect_id: String, attempt: u32, error: String },
     EffectTimedOut { effect_id: String, attempt: u32 },
-    EffectCancelled { effect_id: String, attempt: u32, reason: String },
+    EffectCancelled {
+        effect_id: String,
+        attempt: u32,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<Value>,
+    },
     WorkflowContinuedAsNew { new_run_id: String, input: Value },
     SignalReceived { signal_type: String, payload: Value },
     StepScheduled { step_id: String, attempt: u32, input: Value },
