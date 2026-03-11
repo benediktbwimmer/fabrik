@@ -1,0 +1,13 @@
+[package]
+name = "fabrik-store"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+fabrik-events = { path = "../fabrik-events" }
+fabrik-workflow = { path = "../fabrik-workflow" }
+sqlx.workspace = true
+uuid.workspace = true

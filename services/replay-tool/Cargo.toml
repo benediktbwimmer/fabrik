@@ -1,0 +1,16 @@
+[package]
+name = "replay-tool"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+fabrik-broker = { path = "../../crates/fabrik-broker" }
+fabrik-config = { path = "../../crates/fabrik-config" }
+fabrik-events = { path = "../../crates/fabrik-events" }
+fabrik-store = { path = "../../crates/fabrik-store" }
+fabrik-workflow = { path = "../../crates/fabrik-workflow" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

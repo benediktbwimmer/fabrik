@@ -1,0 +1,16 @@
+[package]
+name = "timer-service"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+fabrik-broker = { path = "../../crates/fabrik-broker" }
+fabrik-config = { path = "../../crates/fabrik-config" }
+fabrik-events = { path = "../../crates/fabrik-events" }
+fabrik-service = { path = "../../crates/fabrik-service" }
+fabrik-store = { path = "../../crates/fabrik-store" }
+tracing.workspace = true
+tokio.workspace = true

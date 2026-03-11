@@ -1,0 +1,13 @@
+[package]
+name = "api-gateway"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+fabrik-config = { path = "../../crates/fabrik-config" }
+fabrik-service = { path = "../../crates/fabrik-service" }
+tracing.workspace = true
+tokio.workspace = true
+

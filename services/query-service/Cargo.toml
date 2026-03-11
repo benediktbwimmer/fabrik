@@ -1,0 +1,16 @@
+[package]
+name = "query-service"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+fabrik-config = { path = "../../crates/fabrik-config" }
+fabrik-service = { path = "../../crates/fabrik-service" }
+fabrik-store = { path = "../../crates/fabrik-store" }
+fabrik-workflow = { path = "../../crates/fabrik-workflow" }
+serde.workspace = true
+tracing.workspace = true
+tokio.workspace = true

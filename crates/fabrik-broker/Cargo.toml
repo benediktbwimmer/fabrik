@@ -1,0 +1,14 @@
+[package]
+name = "fabrik-broker"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+fabrik-events = { path = "../fabrik-events" }
+futures-util.workspace = true
+rskafka.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

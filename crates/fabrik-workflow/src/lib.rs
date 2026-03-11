@@ -1,0 +1,1063 @@
+use std::collections::BTreeMap;
+
+use chrono::{DateTime, Utc};
+use fabrik_events::{EventEnvelope, WorkflowEvent};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use thiserror::Error;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkflowDefinition {
+    pub id: String,
+    pub version: u32,
+    pub initial_state: String,
+    pub states: BTreeMap<String, StateNode>,
+}
+
+pub fn artifact_hash(definition: &WorkflowDefinition) -> String {
+    let encoded = serde_json::to_vec(definition).expect("workflow definition serialization failed");
+    let digest = Sha256::digest(encoded);
+    format!("{digest:x}")
+}
+
+impl WorkflowDefinition {
+    pub fn validate(&self) -> Result<(), WorkflowValidationError> {
+        if !self.states.contains_key(&self.initial_state) {
+            return Err(WorkflowValidationError::MissingState(self.initial_state.clone()));
+        }
+
+        for state in self.states.values() {
+            for target in state.next_states() {
+                if !self.states.contains_key(target) {
+                    return Err(WorkflowValidationError::MissingState(target.to_owned()));
+                }
+            }
+
+            if let StateNode::Step { handler, retry, config, .. } = state {
+                if let Some(retry) = retry {
+                    if retry.max_attempts == 0 {
+                        return Err(WorkflowValidationError::InvalidRetryAttempts);
+                    }
+
+                    parse_timer_ref(&retry.delay)
+                        .map_err(WorkflowValidationError::InvalidRetryDelay)?;
+                }
+
+                validate_step_config(handler, config.as_ref())?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn execute_trigger(
+        &self,
+        input: &Value,
+    ) -> Result<WorkflowExecutionPlan, WorkflowExecutionError> {
+        self.execute_from_state(&self.initial_state, input, true)
+    }
+
+    pub fn execute_after_timer(
+        &self,
+        wait_state: &str,
+        timer_id: &str,
+        input: &Value,
+    ) -> Result<WorkflowExecutionPlan, WorkflowExecutionError> {
+        self.validate().map_err(WorkflowExecutionError::InvalidDefinition)?;
+
+        let state = self
+            .states
+            .get(wait_state)
+            .ok_or_else(|| WorkflowExecutionError::UnknownState(wait_state.to_owned()))?;
+
+        match state {
+            StateNode::WaitForTimer { next, .. } if wait_state == timer_id => {
+                self.execute_from_state(next, input, false)
+            }
+            StateNode::WaitForTimer { .. } => Err(WorkflowExecutionError::UnexpectedTimer {
+                expected: wait_state.to_owned(),
+                received: timer_id.to_owned(),
+            }),
+            _ => Err(WorkflowExecutionError::NotWaitingOnTimer(wait_state.to_owned())),
+        }
+    }
+
+    pub fn execute_after_signal(
+        &self,
+        wait_state: &str,
+        signal_type: &str,
+        input: &Value,
+    ) -> Result<WorkflowExecutionPlan, WorkflowExecutionError> {
+        self.validate().map_err(WorkflowExecutionError::InvalidDefinition)?;
+
+        let state = self
+            .states
+            .get(wait_state)
+            .ok_or_else(|| WorkflowExecutionError::UnknownState(wait_state.to_owned()))?;
+
+        match state {
+            StateNode::WaitForEvent { event_type, next } if event_type == signal_type => {
+                self.execute_from_state(next, input, false)
+            }
+            StateNode::WaitForEvent { event_type, .. } => {
+                Err(WorkflowExecutionError::UnexpectedSignal {
+                    expected: event_type.clone(),
+                    received: signal_type.to_owned(),
+                })
+            }
+            _ => Err(WorkflowExecutionError::NotWaitingOnSignal(wait_state.to_owned())),
+        }
+    }
+
+    pub fn execute_after_step_completion(
+        &self,
+        step_state: &str,
+        step_id: &str,
+        output: &Value,
+    ) -> Result<WorkflowExecutionPlan, WorkflowExecutionError> {
+        self.validate().map_err(WorkflowExecutionError::InvalidDefinition)?;
+
+        let state = self
+            .states
+            .get(step_state)
+            .ok_or_else(|| WorkflowExecutionError::UnknownState(step_state.to_owned()))?;
+
+        match state {
+            StateNode::Step { next, .. } if step_state == step_id => match next {
+                Some(next_state) => self.execute_from_state(next_state, output, false),
+                None => Ok(WorkflowExecutionPlan {
+                    workflow_version: self.version,
+                    final_state: step_state.to_owned(),
+                    emissions: vec![ExecutionEmission {
+                        event: WorkflowEvent::WorkflowCompleted { output: output.clone() },
+                        state: Some(step_state.to_owned()),
+                    }],
+                }),
+            },
+            StateNode::Step { .. } => Err(WorkflowExecutionError::UnexpectedStep {
+                expected: step_state.to_owned(),
+                received: step_id.to_owned(),
+            }),
+            _ => Err(WorkflowExecutionError::NotWaitingOnStep(step_state.to_owned())),
+        }
+    }
+
+    pub fn schedule_retry(
+        &self,
+        step_state: &str,
+        last_attempt: u32,
+    ) -> Result<Option<RetrySchedule>, WorkflowExecutionError> {
+        self.validate().map_err(WorkflowExecutionError::InvalidDefinition)?;
+
+        let state = self
+            .states
+            .get(step_state)
+            .ok_or_else(|| WorkflowExecutionError::UnknownState(step_state.to_owned()))?;
+
+        let retry = match state {
+            StateNode::Step { retry, .. } => retry,
+            _ => return Err(WorkflowExecutionError::NotWaitingOnStep(step_state.to_owned())),
+        };
+
+        let Some(retry) = retry else {
+            return Ok(None);
+        };
+
+        if last_attempt >= retry.max_attempts {
+            return Ok(None);
+        }
+
+        let fire_at = Utc::now()
+            + parse_timer_ref(&retry.delay).map_err(|source| {
+                WorkflowExecutionError::InvalidRetry { state: step_state.to_owned(), source }
+            })?;
+
+        Ok(Some(RetrySchedule { attempt: last_attempt + 1, fire_at }))
+    }
+
+    pub fn step_handler(&self, step_id: &str) -> Result<&str, WorkflowExecutionError> {
+        let state = self
+            .states
+            .get(step_id)
+            .ok_or_else(|| WorkflowExecutionError::UnknownState(step_id.to_owned()))?;
+
+        match state {
+            StateNode::Step { handler, .. } => Ok(handler),
+            _ => Err(WorkflowExecutionError::NotWaitingOnStep(step_id.to_owned())),
+        }
+    }
+
+    pub fn step_config(
+        &self,
+        step_id: &str,
+    ) -> Result<Option<&StepConfig>, WorkflowExecutionError> {
+        let state = self
+            .states
+            .get(step_id)
+            .ok_or_else(|| WorkflowExecutionError::UnknownState(step_id.to_owned()))?;
+
+        match state {
+            StateNode::Step { config, .. } => Ok(config.as_ref()),
+            _ => Err(WorkflowExecutionError::NotWaitingOnStep(step_id.to_owned())),
+        }
+    }
+
+    fn execute_from_state(
+        &self,
+        start_state: &str,
+        input: &Value,
+        emit_started: bool,
+    ) -> Result<WorkflowExecutionPlan, WorkflowExecutionError> {
+        self.validate().map_err(WorkflowExecutionError::InvalidDefinition)?;
+
+        let current_state = start_state.to_owned();
+        let mut emissions = Vec::new();
+        let last_output = input.clone();
+        let mut visited = 0usize;
+
+        if emit_started {
+            emissions.push(ExecutionEmission {
+                event: WorkflowEvent::WorkflowStarted,
+                state: Some(current_state.clone()),
+            });
+        }
+
+        loop {
+            visited += 1;
+            if visited > self.states.len() * 4 {
+                return Err(WorkflowExecutionError::LoopDetected(current_state));
+            }
+
+            let state = self
+                .states
+                .get(&current_state)
+                .ok_or_else(|| WorkflowExecutionError::UnknownState(current_state.clone()))?;
+
+            match state {
+                StateNode::Step { .. } => {
+                    emissions.push(ExecutionEmission {
+                        event: WorkflowEvent::StepScheduled {
+                            step_id: current_state.clone(),
+                            attempt: 1,
+                        },
+                        state: Some(current_state.clone()),
+                    });
+                    return Ok(WorkflowExecutionPlan {
+                        workflow_version: self.version,
+                        final_state: current_state,
+                        emissions,
+                    });
+                }
+                StateNode::Succeed => {
+                    emissions.push(ExecutionEmission {
+                        event: WorkflowEvent::WorkflowCompleted { output: last_output.clone() },
+                        state: Some(current_state.clone()),
+                    });
+                    return Ok(WorkflowExecutionPlan {
+                        workflow_version: self.version,
+                        final_state: current_state,
+                        emissions,
+                    });
+                }
+                StateNode::Fail => {
+                    emissions.push(ExecutionEmission {
+                        event: WorkflowEvent::WorkflowFailed {
+                            reason: format!("workflow entered fail state {current_state}"),
+                        },
+                        state: Some(current_state.clone()),
+                    });
+                    return Ok(WorkflowExecutionPlan {
+                        workflow_version: self.version,
+                        final_state: current_state,
+                        emissions,
+                    });
+                }
+                StateNode::WaitForEvent { .. } => {
+                    return Ok(WorkflowExecutionPlan {
+                        workflow_version: self.version,
+                        final_state: current_state,
+                        emissions,
+                    });
+                }
+                StateNode::WaitForTimer { timer_ref, .. } => {
+                    let fire_at = Utc::now()
+                        + parse_timer_ref(timer_ref).map_err(|source| {
+                            WorkflowExecutionError::InvalidTimer {
+                                state: current_state.clone(),
+                                source,
+                            }
+                        })?;
+                    emissions.push(ExecutionEmission {
+                        event: WorkflowEvent::TimerScheduled {
+                            timer_id: current_state.clone(),
+                            fire_at,
+                        },
+                        state: Some(current_state.clone()),
+                    });
+                    return Ok(WorkflowExecutionPlan {
+                        workflow_version: self.version,
+                        final_state: current_state,
+                        emissions,
+                    });
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StateNode {
+    Step {
+        handler: String,
+        next: Option<String>,
+        #[serde(default)]
+        retry: Option<RetryPolicy>,
+        #[serde(default)]
+        config: Option<StepConfig>,
+    },
+    WaitForEvent {
+        event_type: String,
+        next: String,
+    },
+    WaitForTimer {
+        timer_ref: String,
+        next: String,
+    },
+    Succeed,
+    Fail,
+}
+
+impl StateNode {
+    fn next_states(&self) -> impl Iterator<Item = &str> {
+        let next = match self {
+            Self::Step { next, .. } => next.as_deref(),
+            Self::WaitForEvent { next, .. } => Some(next.as_str()),
+            Self::WaitForTimer { next, .. } => Some(next.as_str()),
+            Self::Succeed | Self::Fail => None,
+        };
+
+        next.into_iter()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetryPolicy {
+    pub max_attempts: u32,
+    pub delay: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StepConfig {
+    HttpRequest(HttpRequestConfig),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpRequestConfig {
+    pub method: String,
+    pub url: String,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default)]
+    pub body: Option<Value>,
+    #[serde(default)]
+    pub body_from_input: bool,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum WorkflowValidationError {
+    #[error("workflow references unknown state {0}")]
+    MissingState(String),
+    #[error("step retry policy max_attempts must be at least 1")]
+    InvalidRetryAttempts,
+    #[error("step retry policy delay is invalid: {0}")]
+    InvalidRetryDelay(TimerParseError),
+    #[error("http.request steps require http_request config")]
+    MissingHttpRequestConfig,
+    #[error("http.request steps require a non-empty method")]
+    InvalidHttpRequestMethod,
+    #[error("http.request steps require a non-empty url")]
+    InvalidHttpRequestUrl,
+    #[error("non-http steps do not accept http_request config")]
+    UnexpectedHttpRequestConfig,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkflowExecutionPlan {
+    pub workflow_version: u32,
+    pub final_state: String,
+    pub emissions: Vec<ExecutionEmission>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecutionEmission {
+    pub event: WorkflowEvent,
+    pub state: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrySchedule {
+    pub attempt: u32,
+    pub fire_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum WorkflowExecutionError {
+    #[error("workflow definition is invalid: {0}")]
+    InvalidDefinition(#[from] WorkflowValidationError),
+    #[error("workflow references unknown runtime state {0}")]
+    UnknownState(String),
+    #[error("workflow loop detected while executing state {0}")]
+    LoopDetected(String),
+    #[error("timer state {state} has invalid timer_ref: {source}")]
+    InvalidTimer { state: String, source: TimerParseError },
+    #[error("retry policy for step state {state} is invalid: {source}")]
+    InvalidRetry { state: String, source: TimerParseError },
+    #[error("workflow state {0} is not waiting on a timer")]
+    NotWaitingOnTimer(String),
+    #[error("unexpected timer fired, expected {expected}, received {received}")]
+    UnexpectedTimer { expected: String, received: String },
+    #[error("workflow state {0} is not waiting on a signal")]
+    NotWaitingOnSignal(String),
+    #[error("unexpected signal received, expected {expected}, received {received}")]
+    UnexpectedSignal { expected: String, received: String },
+    #[error("workflow state {0} is not waiting on a step")]
+    NotWaitingOnStep(String),
+    #[error("unexpected step completion, expected {expected}, received {received}")]
+    UnexpectedStep { expected: String, received: String },
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum StepExecutionError {
+    #[error("unsupported handler {0}")]
+    UnsupportedHandler(String),
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum TimerParseError {
+    #[error("timer_ref must not be empty")]
+    Empty,
+    #[error("timer_ref must end with s, m, or h, got {0}")]
+    InvalidUnit(String),
+    #[error("timer_ref amount is invalid: {0}")]
+    InvalidAmount(String),
+}
+
+pub fn execute_handler(handler: &str, input: &Value) -> Result<Value, StepExecutionError> {
+    match handler {
+        "core.echo" => Ok(input.clone()),
+        "core.accept" => Ok(serde_json::json!({
+            "accepted": true,
+            "input": input,
+        })),
+        "core.noop" => Ok(Value::Null),
+        other => Err(StepExecutionError::UnsupportedHandler(other.to_owned())),
+    }
+}
+
+fn validate_step_config(
+    handler: &str,
+    config: Option<&StepConfig>,
+) -> Result<(), WorkflowValidationError> {
+    match (handler, config) {
+        ("http.request", Some(StepConfig::HttpRequest(config))) => {
+            if config.method.trim().is_empty() {
+                return Err(WorkflowValidationError::InvalidHttpRequestMethod);
+            }
+            if config.url.trim().is_empty() {
+                return Err(WorkflowValidationError::InvalidHttpRequestUrl);
+            }
+            Ok(())
+        }
+        ("http.request", None) => Err(WorkflowValidationError::MissingHttpRequestConfig),
+        (_, Some(StepConfig::HttpRequest(_))) => {
+            Err(WorkflowValidationError::UnexpectedHttpRequestConfig)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn parse_timer_ref(timer_ref: &str) -> Result<chrono::TimeDelta, TimerParseError> {
+    if timer_ref.is_empty() {
+        return Err(TimerParseError::Empty);
+    }
+
+    let (amount, unit) = timer_ref.split_at(timer_ref.len() - 1);
+    let amount =
+        amount.parse::<i64>().map_err(|_| TimerParseError::InvalidAmount(timer_ref.to_owned()))?;
+
+    match unit {
+        "s" => Ok(chrono::TimeDelta::seconds(amount)),
+        "m" => Ok(chrono::TimeDelta::minutes(amount)),
+        "h" => Ok(chrono::TimeDelta::hours(amount)),
+        _ => Err(TimerParseError::InvalidUnit(timer_ref.to_owned())),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowInstanceState {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub definition_id: String,
+    pub definition_version: Option<u32>,
+    pub artifact_hash: Option<String>,
+    pub current_state: Option<String>,
+    pub context: Option<Value>,
+    pub status: WorkflowStatus,
+    pub input: Option<Value>,
+    pub output: Option<Value>,
+    pub event_count: i64,
+    pub last_event_id: Uuid,
+    pub last_event_type: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl WorkflowInstanceState {
+    pub fn apply_event(&mut self, event: &EventEnvelope<WorkflowEvent>) {
+        self.event_count += 1;
+        self.last_event_id = event.event_id;
+        self.last_event_type = event.event_type.clone();
+        self.updated_at = event.occurred_at;
+        self.definition_id = event.definition_id.clone();
+        self.run_id = event.run_id.clone();
+        self.definition_version = Some(event.definition_version);
+        self.artifact_hash = Some(event.artifact_hash.clone());
+        self.current_state =
+            event.metadata.get("state").cloned().or_else(|| self.current_state.clone());
+
+        match &event.payload {
+            WorkflowEvent::WorkflowTriggered { input } => {
+                self.status = WorkflowStatus::Triggered;
+                self.input = Some(input.clone());
+                self.context = Some(input.clone());
+            }
+            WorkflowEvent::WorkflowStarted | WorkflowEvent::WorkflowArtifactPinned => {
+                self.status = WorkflowStatus::Running;
+            }
+            WorkflowEvent::WorkflowContinuedAsNew { input, .. } => {
+                self.status = WorkflowStatus::Running;
+                self.current_state = None;
+                self.output = None;
+                self.context = Some(input.clone());
+            }
+            WorkflowEvent::SignalReceived { payload, .. } => {
+                self.status = WorkflowStatus::Running;
+                self.context = Some(payload.clone());
+            }
+            WorkflowEvent::StepScheduled { .. }
+            | WorkflowEvent::TimerScheduled { .. }
+            | WorkflowEvent::TimerFired { .. } => {
+                self.status = WorkflowStatus::Running;
+            }
+            WorkflowEvent::StepCompleted { output, .. } => {
+                self.status = WorkflowStatus::Running;
+                self.context = Some(output.clone());
+            }
+            WorkflowEvent::StepFailed { error, .. }
+            | WorkflowEvent::WorkflowFailed { reason: error } => {
+                self.status = WorkflowStatus::Failed;
+                self.output = Some(Value::String(error.clone()));
+                self.context = Some(Value::String(error.clone()));
+            }
+            WorkflowEvent::WorkflowCompleted { output } => {
+                self.status = WorkflowStatus::Completed;
+                self.output = Some(output.clone());
+                self.context = Some(output.clone());
+            }
+        }
+    }
+}
+
+impl TryFrom<&EventEnvelope<WorkflowEvent>> for WorkflowInstanceState {
+    type Error = WorkflowProjectionError;
+
+    fn try_from(event: &EventEnvelope<WorkflowEvent>) -> Result<Self, Self::Error> {
+        match &event.payload {
+            WorkflowEvent::WorkflowTriggered { .. }
+            | WorkflowEvent::WorkflowStarted
+            | WorkflowEvent::WorkflowArtifactPinned => {}
+            _ => return Err(WorkflowProjectionError::MissingWorkflowId(event.event_type.clone())),
+        }
+
+        let mut state = Self {
+            tenant_id: event.tenant_id.clone(),
+            instance_id: event.instance_id.clone(),
+            run_id: event.run_id.clone(),
+            definition_id: event.definition_id.clone(),
+            definition_version: None,
+            artifact_hash: None,
+            current_state: None,
+            context: None,
+            status: WorkflowStatus::Triggered,
+            input: None,
+            output: None,
+            event_count: 0,
+            last_event_id: event.event_id,
+            last_event_type: event.event_type.clone(),
+            updated_at: event.occurred_at,
+        };
+        state.apply_event(event);
+        Ok(state)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowStatus {
+    Triggered,
+    Running,
+    Completed,
+    Failed,
+}
+
+impl WorkflowStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Triggered => "triggered",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum WorkflowProjectionError {
+    #[error("event {0} cannot initialize workflow state without a workflow id")]
+    MissingWorkflowId(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use chrono::Utc;
+    use fabrik_events::{EventEnvelope, WorkflowEvent};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::{
+        ExecutionEmission, HttpRequestConfig, RetryPolicy, StateNode, StepConfig,
+        WorkflowDefinition, WorkflowInstanceState, WorkflowProjectionError, WorkflowStatus,
+        WorkflowValidationError,
+    };
+
+    #[test]
+    fn validation_rejects_unknown_next_state() {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "start".to_owned(),
+            StateNode::WaitForEvent {
+                event_type: "trigger.received".to_owned(),
+                next: "missing".to_owned(),
+            },
+        );
+
+        let workflow = WorkflowDefinition {
+            id: "demo".to_owned(),
+            version: 1,
+            initial_state: "start".to_owned(),
+            states,
+        };
+
+        assert_eq!(
+            workflow.validate(),
+            Err(WorkflowValidationError::MissingState("missing".to_owned()))
+        );
+    }
+
+    #[test]
+    fn projection_initializes_from_trigger_event() {
+        let event = EventEnvelope {
+            schema_version: 1,
+            event_id: Uuid::now_v7(),
+            event_type: "WorkflowTriggered".to_owned(),
+            occurred_at: Utc::now(),
+            tenant_id: "tenant-a".to_owned(),
+            definition_id: "demo".to_owned(),
+            definition_version: 1,
+            artifact_hash: "artifact-1".to_owned(),
+            instance_id: "instance-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            partition_key: "tenant-a:instance-1:run-1".to_owned(),
+            producer: "test".to_owned(),
+            causation_id: None,
+            correlation_id: None,
+            dedupe_key: None,
+            metadata: BTreeMap::new(),
+            payload: WorkflowEvent::WorkflowTriggered { input: json!({"hello": "world"}) },
+        };
+
+        let state = WorkflowInstanceState::try_from(&event).unwrap();
+        assert_eq!(state.definition_id, "demo");
+        assert_eq!(state.instance_id, "instance-1");
+        assert_eq!(state.run_id, "run-1");
+        assert_eq!(state.status, WorkflowStatus::Triggered);
+        assert_eq!(state.event_count, 1);
+    }
+
+    #[test]
+    fn projection_rejects_non_initial_events_without_initial_identity() {
+        let event = EventEnvelope {
+            schema_version: 1,
+            event_id: Uuid::now_v7(),
+            event_type: "WorkflowCompleted".to_owned(),
+            occurred_at: Utc::now(),
+            tenant_id: "tenant-a".to_owned(),
+            definition_id: "demo".to_owned(),
+            definition_version: 1,
+            artifact_hash: "artifact-1".to_owned(),
+            instance_id: "instance-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            partition_key: "tenant-a:instance-1:run-1".to_owned(),
+            producer: "test".to_owned(),
+            causation_id: None,
+            correlation_id: None,
+            dedupe_key: None,
+            metadata: BTreeMap::new(),
+            payload: WorkflowEvent::WorkflowCompleted { output: json!({"ok": true}) },
+        };
+
+        assert_eq!(
+            WorkflowInstanceState::try_from(&event),
+            Err(WorkflowProjectionError::MissingWorkflowId("WorkflowCompleted".to_owned()))
+        );
+    }
+
+    #[test]
+    fn projection_applies_continue_as_new_marker() {
+        let triggered = EventEnvelope {
+            schema_version: 1,
+            event_id: Uuid::now_v7(),
+            event_type: "WorkflowTriggered".to_owned(),
+            occurred_at: Utc::now(),
+            tenant_id: "tenant-a".to_owned(),
+            definition_id: "demo".to_owned(),
+            definition_version: 1,
+            artifact_hash: "artifact-1".to_owned(),
+            instance_id: "instance-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            partition_key: "tenant-a:instance-1:run-1".to_owned(),
+            producer: "test".to_owned(),
+            causation_id: None,
+            correlation_id: None,
+            dedupe_key: None,
+            metadata: BTreeMap::new(),
+            payload: WorkflowEvent::WorkflowTriggered { input: json!({"hello": "world"}) },
+        };
+
+        let mut state = WorkflowInstanceState::try_from(&triggered).unwrap();
+        let continued = EventEnvelope {
+            schema_version: 1,
+            event_id: Uuid::now_v7(),
+            event_type: "WorkflowContinuedAsNew".to_owned(),
+            occurred_at: Utc::now(),
+            tenant_id: "tenant-a".to_owned(),
+            definition_id: "demo".to_owned(),
+            definition_version: 1,
+            artifact_hash: "artifact-1".to_owned(),
+            instance_id: "instance-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            partition_key: "tenant-a:instance-1:run-1".to_owned(),
+            producer: "test".to_owned(),
+            causation_id: Some(triggered.event_id),
+            correlation_id: Some(triggered.event_id),
+            dedupe_key: None,
+            metadata: BTreeMap::new(),
+            payload: WorkflowEvent::WorkflowContinuedAsNew {
+                new_run_id: "run-2".to_owned(),
+                input: json!({"carried": true}),
+            },
+        };
+
+        state.apply_event(&continued);
+        assert_eq!(state.run_id, "run-1");
+        assert_eq!(state.current_state, None);
+        assert_eq!(state.context, Some(json!({"carried": true})));
+        assert_eq!(state.status, WorkflowStatus::Running);
+    }
+
+    #[test]
+    fn executes_sync_step_workflow() {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "first".to_owned(),
+            StateNode::Step {
+                handler: "core.echo".to_owned(),
+                next: Some("done".to_owned()),
+                retry: None,
+                config: None,
+            },
+        );
+        states.insert("done".to_owned(), StateNode::Succeed);
+
+        let workflow = WorkflowDefinition {
+            id: "demo".to_owned(),
+            version: 3,
+            initial_state: "first".to_owned(),
+            states,
+        };
+
+        let plan = workflow.execute_trigger(&json!({"message": "hi"})).unwrap();
+        assert_eq!(plan.workflow_version, 3);
+        assert_eq!(plan.final_state, "first");
+        assert!(matches!(
+            plan.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::StepScheduled { step_id, attempt },
+                ..
+            }) if step_id == "first" && *attempt == 1
+        ));
+    }
+
+    #[test]
+    fn execute_trigger_stops_on_wait_state() {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "wait".to_owned(),
+            StateNode::WaitForEvent {
+                event_type: "external.signal".to_owned(),
+                next: "done".to_owned(),
+            },
+        );
+        states.insert("done".to_owned(), StateNode::Succeed);
+
+        let workflow = WorkflowDefinition {
+            id: "demo".to_owned(),
+            version: 1,
+            initial_state: "wait".to_owned(),
+            states,
+        };
+
+        let plan = workflow.execute_trigger(&json!({})).unwrap();
+        assert_eq!(plan.final_state, "wait");
+        assert_eq!(plan.emissions.len(), 1);
+        assert!(matches!(&plan.emissions[0].event, WorkflowEvent::WorkflowStarted));
+    }
+
+    #[test]
+    fn execute_trigger_schedules_timer() {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "wait".to_owned(),
+            StateNode::WaitForTimer { timer_ref: "5s".to_owned(), next: "done".to_owned() },
+        );
+        states.insert("done".to_owned(), StateNode::Succeed);
+
+        let workflow = WorkflowDefinition {
+            id: "timer-demo".to_owned(),
+            version: 1,
+            initial_state: "wait".to_owned(),
+            states,
+        };
+
+        let plan = workflow.execute_trigger(&json!({"message": "hi"})).unwrap();
+        assert_eq!(plan.final_state, "wait");
+        assert!(matches!(
+            plan.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::TimerScheduled { timer_id, .. },
+                ..
+            }) if timer_id == "wait"
+        ));
+    }
+
+    #[test]
+    fn execute_after_timer_resumes_next_state() {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "wait".to_owned(),
+            StateNode::WaitForTimer { timer_ref: "1s".to_owned(), next: "done".to_owned() },
+        );
+        states.insert("done".to_owned(), StateNode::Succeed);
+
+        let workflow = WorkflowDefinition {
+            id: "timer-demo".to_owned(),
+            version: 1,
+            initial_state: "wait".to_owned(),
+            states,
+        };
+
+        let plan =
+            workflow.execute_after_timer("wait", "wait", &json!({"message": "resume"})).unwrap();
+        assert_eq!(plan.final_state, "done");
+        assert!(matches!(
+            plan.emissions.last(),
+            Some(ExecutionEmission { event: WorkflowEvent::WorkflowCompleted { .. }, .. })
+        ));
+    }
+
+    #[test]
+    fn execute_after_signal_resumes_next_state() {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "wait".to_owned(),
+            StateNode::WaitForEvent {
+                event_type: "external.approved".to_owned(),
+                next: "done".to_owned(),
+            },
+        );
+        states.insert("done".to_owned(), StateNode::Succeed);
+
+        let workflow = WorkflowDefinition {
+            id: "signal-demo".to_owned(),
+            version: 2,
+            initial_state: "wait".to_owned(),
+            states,
+        };
+
+        let plan = workflow
+            .execute_after_signal("wait", "external.approved", &json!({"approved": true}))
+            .unwrap();
+        assert_eq!(plan.final_state, "done");
+        assert!(matches!(
+            plan.emissions.last(),
+            Some(ExecutionEmission { event: WorkflowEvent::WorkflowCompleted { .. }, .. })
+        ));
+    }
+
+    #[test]
+    fn execute_after_step_completion_advances_workflow() {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "echo".to_owned(),
+            StateNode::Step {
+                handler: "core.echo".to_owned(),
+                next: Some("done".to_owned()),
+                retry: None,
+                config: None,
+            },
+        );
+        states.insert("done".to_owned(), StateNode::Succeed);
+
+        let workflow = WorkflowDefinition {
+            id: "step-demo".to_owned(),
+            version: 1,
+            initial_state: "echo".to_owned(),
+            states,
+        };
+
+        let plan = workflow
+            .execute_after_step_completion("echo", "echo", &json!({"message": "ok"}))
+            .unwrap();
+        assert_eq!(plan.final_state, "done");
+        assert!(matches!(
+            plan.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output == &json!({"message": "ok"})
+        ));
+    }
+
+    #[test]
+    fn schedule_retry_returns_next_attempt() {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "effect".to_owned(),
+            StateNode::Step {
+                handler: "core.echo".to_owned(),
+                next: Some("done".to_owned()),
+                retry: Some(RetryPolicy { max_attempts: 3, delay: "5s".to_owned() }),
+                config: None,
+            },
+        );
+        states.insert("done".to_owned(), StateNode::Succeed);
+
+        let workflow = WorkflowDefinition {
+            id: "retry-demo".to_owned(),
+            version: 1,
+            initial_state: "effect".to_owned(),
+            states,
+        };
+
+        let retry = workflow.schedule_retry("effect", 1).unwrap().unwrap();
+        assert_eq!(retry.attempt, 2);
+    }
+
+    #[test]
+    fn validates_retry_policy() {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "effect".to_owned(),
+            StateNode::Step {
+                handler: "core.echo".to_owned(),
+                next: Some("done".to_owned()),
+                retry: Some(RetryPolicy { max_attempts: 0, delay: "5s".to_owned() }),
+                config: None,
+            },
+        );
+        states.insert("done".to_owned(), StateNode::Succeed);
+
+        let workflow = WorkflowDefinition {
+            id: "retry-demo".to_owned(),
+            version: 1,
+            initial_state: "effect".to_owned(),
+            states,
+        };
+
+        assert_eq!(workflow.validate(), Err(WorkflowValidationError::InvalidRetryAttempts));
+    }
+
+    #[test]
+    fn validates_http_step_config() {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "request".to_owned(),
+            StateNode::Step {
+                handler: "http.request".to_owned(),
+                next: Some("done".to_owned()),
+                retry: None,
+                config: Some(StepConfig::HttpRequest(HttpRequestConfig {
+                    method: "POST".to_owned(),
+                    url: "http://localhost:9999/echo".to_owned(),
+                    headers: BTreeMap::new(),
+                    body: None,
+                    body_from_input: true,
+                })),
+            },
+        );
+        states.insert("done".to_owned(), StateNode::Succeed);
+
+        let workflow = WorkflowDefinition {
+            id: "http-demo".to_owned(),
+            version: 1,
+            initial_state: "request".to_owned(),
+            states,
+        };
+
+        assert_eq!(workflow.validate(), Ok(()));
+        assert!(matches!(
+            workflow.step_config("request").unwrap(),
+            Some(StepConfig::HttpRequest(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_http_step_config() {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "request".to_owned(),
+            StateNode::Step {
+                handler: "http.request".to_owned(),
+                next: Some("done".to_owned()),
+                retry: None,
+                config: None,
+            },
+        );
+        states.insert("done".to_owned(), StateNode::Succeed);
+
+        let workflow = WorkflowDefinition {
+            id: "http-demo".to_owned(),
+            version: 1,
+            initial_state: "request".to_owned(),
+            states,
+        };
+
+        assert_eq!(workflow.validate(), Err(WorkflowValidationError::MissingHttpRequestConfig));
+    }
+}
