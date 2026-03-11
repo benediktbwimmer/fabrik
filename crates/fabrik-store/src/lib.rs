@@ -86,6 +86,11 @@ pub struct WorkflowStateSnapshot {
 }
 
 const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+const MAX_BULK_ITEMS_PER_BATCH: usize = 100_000;
+const MAX_BULK_ITEM_BYTES: usize = 256 * 1024;
+const MAX_BULK_TOTAL_INPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BULK_CHUNK_SIZE: usize = 1024;
+const MAX_BULK_CHUNK_INPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkflowActivityRecord {
@@ -157,6 +162,185 @@ pub struct AppliedActivityTerminalUpdate {
     pub event_id: Uuid,
     pub occurred_at: DateTime<Utc>,
     pub payload: ActivityTerminalPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowBulkBatchStatus {
+    Scheduled,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl WorkflowBulkBatchStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Scheduled => "scheduled",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "scheduled" => Ok(Self::Scheduled),
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            other => anyhow::bail!("unknown workflow bulk batch status {other}"),
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowBulkChunkStatus {
+    Scheduled,
+    Started,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl WorkflowBulkChunkStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Scheduled => "scheduled",
+            Self::Started => "started",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "scheduled" => Ok(Self::Scheduled),
+            "started" => Ok(Self::Started),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            other => anyhow::bail!("unknown workflow bulk chunk status {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowBulkBatchRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub definition_id: String,
+    pub definition_version: Option<u32>,
+    pub artifact_hash: Option<String>,
+    pub batch_id: String,
+    pub activity_type: String,
+    pub task_queue: String,
+    pub state: Option<String>,
+    pub status: WorkflowBulkBatchStatus,
+    pub total_items: u32,
+    pub chunk_size: u32,
+    pub chunk_count: u32,
+    pub succeeded_items: u32,
+    pub failed_items: u32,
+    pub cancelled_items: u32,
+    pub max_attempts: u32,
+    pub retry_delay_ms: u64,
+    pub error: Option<String>,
+    pub scheduled_at: DateTime<Utc>,
+    pub terminal_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowBulkChunkRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub definition_id: String,
+    pub definition_version: Option<u32>,
+    pub artifact_hash: Option<String>,
+    pub batch_id: String,
+    pub chunk_id: String,
+    pub chunk_index: u32,
+    pub activity_type: String,
+    pub task_queue: String,
+    pub state: Option<String>,
+    pub status: WorkflowBulkChunkStatus,
+    pub attempt: u32,
+    pub max_attempts: u32,
+    pub retry_delay_ms: u64,
+    pub items: Vec<Value>,
+    pub output: Option<Vec<Value>>,
+    pub error: Option<String>,
+    pub cancellation_requested: bool,
+    pub cancellation_reason: Option<String>,
+    pub cancellation_metadata: Option<Value>,
+    pub worker_id: Option<String>,
+    pub worker_build_id: Option<String>,
+    pub lease_token: Option<Uuid>,
+    pub scheduled_at: DateTime<Utc>,
+    pub available_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum BulkChunkTerminalPayload {
+    Completed { output: Vec<Value> },
+    Failed { error: String },
+    Cancelled { reason: String, metadata: Option<Value> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BulkChunkTerminalUpdate {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub batch_id: String,
+    pub chunk_id: String,
+    pub chunk_index: u32,
+    pub attempt: u32,
+    pub lease_token: Uuid,
+    pub worker_id: String,
+    pub worker_build_id: String,
+    pub occurred_at: DateTime<Utc>,
+    pub payload: BulkChunkTerminalPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AppliedBulkChunkTerminalUpdate {
+    pub chunk: WorkflowBulkChunkRecord,
+    pub batch: WorkflowBulkBatchRecord,
+    pub terminal_event: Option<EventEnvelope<WorkflowEvent>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowEventOutboxRecord {
+    pub outbox_id: Uuid,
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub event_type: String,
+    pub partition_key: String,
+    pub event: EventEnvelope<WorkflowEvent>,
+    pub available_at: DateTime<Utc>,
+    pub leased_by: Option<String>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub published_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -882,6 +1066,7 @@ impl WorkflowStore {
                 cancellation_metadata JSONB,
                 worker_id TEXT,
                 worker_build_id TEXT,
+                lease_token UUID,
                 scheduled_at TIMESTAMPTZ NOT NULL,
                 started_at TIMESTAMPTZ,
                 last_heartbeat_at TIMESTAMPTZ,
@@ -900,6 +1085,163 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize workflow_activities table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS workflow_bulk_batches (
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                workflow_id TEXT NOT NULL,
+                workflow_version INTEGER,
+                artifact_hash TEXT,
+                batch_id TEXT NOT NULL,
+                activity_type TEXT NOT NULL,
+                task_queue TEXT NOT NULL,
+                state TEXT,
+                status TEXT NOT NULL,
+                total_items INTEGER NOT NULL,
+                chunk_size INTEGER NOT NULL,
+                chunk_count INTEGER NOT NULL,
+                succeeded_items INTEGER NOT NULL DEFAULT 0,
+                failed_items INTEGER NOT NULL DEFAULT 0,
+                cancelled_items INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL,
+                retry_delay_ms BIGINT NOT NULL DEFAULT 0,
+                error TEXT,
+                scheduled_at TIMESTAMPTZ NOT NULL,
+                terminal_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, workflow_instance_id, run_id, batch_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_bulk_batches table")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS workflow_bulk_batches_run_idx
+            ON workflow_bulk_batches (tenant_id, workflow_instance_id, run_id, scheduled_at, batch_id)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_bulk_batches run index")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS workflow_bulk_chunks (
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                workflow_id TEXT NOT NULL,
+                workflow_version INTEGER,
+                artifact_hash TEXT,
+                batch_id TEXT NOT NULL,
+                chunk_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                activity_type TEXT NOT NULL,
+                task_queue TEXT NOT NULL,
+                state TEXT,
+                status TEXT NOT NULL,
+                attempt INTEGER NOT NULL,
+                max_attempts INTEGER NOT NULL,
+                retry_delay_ms BIGINT NOT NULL DEFAULT 0,
+                items JSONB NOT NULL,
+                output JSONB,
+                error TEXT,
+                cancellation_requested BOOLEAN NOT NULL DEFAULT FALSE,
+                cancellation_reason TEXT,
+                cancellation_metadata JSONB,
+                worker_id TEXT,
+                worker_build_id TEXT,
+                lease_token UUID,
+                scheduled_at TIMESTAMPTZ NOT NULL,
+                available_at TIMESTAMPTZ NOT NULL,
+                started_at TIMESTAMPTZ,
+                lease_expires_at TIMESTAMPTZ,
+                completed_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, workflow_instance_id, run_id, batch_id, chunk_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_bulk_chunks table")?;
+
+        sqlx::query(
+            r#"
+            ALTER TABLE workflow_bulk_chunks
+            ADD COLUMN IF NOT EXISTS lease_token UUID
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to ensure workflow_bulk_chunks lease_token column")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS workflow_bulk_chunks_queue_idx
+            ON workflow_bulk_chunks (
+                tenant_id,
+                task_queue,
+                status,
+                available_at,
+                scheduled_at,
+                chunk_index
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_bulk_chunks queue index")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS workflow_bulk_chunks_batch_idx
+            ON workflow_bulk_chunks (tenant_id, workflow_instance_id, run_id, batch_id, chunk_index)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_bulk_chunks batch index")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS workflow_event_outbox (
+                outbox_id UUID PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                partition_key TEXT NOT NULL,
+                event JSONB NOT NULL,
+                available_at TIMESTAMPTZ NOT NULL,
+                leased_by TEXT,
+                lease_expires_at TIMESTAMPTZ,
+                published_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_event_outbox table")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS workflow_event_outbox_pending_idx
+            ON workflow_event_outbox (available_at, created_at)
+            WHERE published_at IS NULL
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_event_outbox pending index")?;
 
         sqlx::query(
             r#"
@@ -6262,6 +6604,847 @@ impl WorkflowStore {
         Ok(applied)
     }
 
+    pub async fn upsert_bulk_batch(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        definition_id: &str,
+        definition_version: Option<u32>,
+        artifact_hash: Option<&str>,
+        batch_id: &str,
+        activity_type: &str,
+        task_queue: &str,
+        state: Option<&str>,
+        items: &[Value],
+        chunk_size: u32,
+        max_attempts: u32,
+        retry_delay_ms: u64,
+        scheduled_at: DateTime<Utc>,
+    ) -> Result<(WorkflowBulkBatchRecord, Vec<WorkflowBulkChunkRecord>)> {
+        if items.len() > MAX_BULK_ITEMS_PER_BATCH {
+            anyhow::bail!(
+                "bulk batch item count {} exceeds limit {}",
+                items.len(),
+                MAX_BULK_ITEMS_PER_BATCH
+            );
+        }
+        let chunk_size_usize = usize::try_from(chunk_size.max(1)).unwrap_or(1);
+        if chunk_size_usize > MAX_BULK_CHUNK_SIZE {
+            anyhow::bail!(
+                "bulk chunk size {} exceeds limit {}",
+                chunk_size_usize,
+                MAX_BULK_CHUNK_SIZE
+            );
+        }
+        let mut total_input_bytes = 0usize;
+        for (chunk_index, chunk_items) in items.chunks(chunk_size_usize).enumerate() {
+            let mut chunk_bytes = 0usize;
+            for item in chunk_items {
+                let item_bytes = serde_json::to_vec(item)
+                    .map(|bytes| bytes.len())
+                    .context("failed to serialize bulk batch item")?;
+                if item_bytes > MAX_BULK_ITEM_BYTES {
+                    anyhow::bail!(
+                        "bulk batch item exceeds per-item byte limit {}",
+                        MAX_BULK_ITEM_BYTES
+                    );
+                }
+                total_input_bytes = total_input_bytes.saturating_add(item_bytes);
+                chunk_bytes = chunk_bytes.saturating_add(item_bytes);
+            }
+            if chunk_bytes > MAX_BULK_CHUNK_INPUT_BYTES {
+                anyhow::bail!(
+                    "bulk chunk {} serialized to {} bytes, over limit {}",
+                    chunk_index,
+                    chunk_bytes,
+                    MAX_BULK_CHUNK_INPUT_BYTES
+                );
+            }
+        }
+        if total_input_bytes > MAX_BULK_TOTAL_INPUT_BYTES {
+            anyhow::bail!(
+                "bulk batch input serialized to {} bytes, over limit {}",
+                total_input_bytes,
+                MAX_BULK_TOTAL_INPUT_BYTES
+            );
+        }
+
+        let mut tx = self.pool.begin().await.context("failed to begin bulk batch transaction")?;
+        let total_items =
+            i32::try_from(items.len()).context("bulk batch item count exceeds i32")?;
+        let chunk_size_i32 =
+            i32::try_from(chunk_size).context("bulk batch chunk_size exceeds i32")?;
+        let chunk_count = if items.is_empty() {
+            0
+        } else {
+            ((items.len() + chunk_size_usize - 1) / chunk_size_usize) as i32
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO workflow_bulk_batches (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                workflow_id,
+                workflow_version,
+                artifact_hash,
+                batch_id,
+                activity_type,
+                task_queue,
+                state,
+                status,
+                total_items,
+                chunk_size,
+                chunk_count,
+                max_attempts,
+                retry_delay_ms,
+                scheduled_at,
+                updated_at
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'scheduled', $11, $12, $13, $14, $15,
+                $16, $16
+            )
+            ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id) DO NOTHING
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(definition_id)
+        .bind(definition_version.map(|value| value as i32))
+        .bind(artifact_hash)
+        .bind(batch_id)
+        .bind(activity_type)
+        .bind(task_queue)
+        .bind(state)
+        .bind(total_items)
+        .bind(chunk_size_i32)
+        .bind(chunk_count)
+        .bind(i32::try_from(max_attempts).context("bulk batch max_attempts exceeds i32")?)
+        .bind(i64::try_from(retry_delay_ms).context("bulk batch retry_delay_ms exceeds i64")?)
+        .bind(scheduled_at)
+        .execute(tx.as_mut())
+        .await
+        .context("failed to upsert workflow bulk batch")?;
+
+        for (chunk_index, chunk_items) in items.chunks(chunk_size_usize).enumerate() {
+            let chunk_id = format!("{batch_id}::{chunk_index}");
+            sqlx::query(
+                r#"
+                INSERT INTO workflow_bulk_chunks (
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    workflow_id,
+                    workflow_version,
+                    artifact_hash,
+                    batch_id,
+                    chunk_id,
+                    chunk_index,
+                    activity_type,
+                    task_queue,
+                    state,
+                    status,
+                    attempt,
+                    max_attempts,
+                    retry_delay_ms,
+                    items,
+                    scheduled_at,
+                    available_at,
+                    updated_at
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'scheduled', 1, $13, $14,
+                    $15, $16, $16, $16
+                )
+                ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id, chunk_id)
+                DO NOTHING
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(instance_id)
+            .bind(run_id)
+            .bind(definition_id)
+            .bind(definition_version.map(|value| value as i32))
+            .bind(artifact_hash)
+            .bind(batch_id)
+            .bind(&chunk_id)
+            .bind(i32::try_from(chunk_index).context("bulk chunk index exceeds i32")?)
+            .bind(activity_type)
+            .bind(task_queue)
+            .bind(state)
+            .bind(i32::try_from(max_attempts).context("bulk chunk max_attempts exceeds i32")?)
+            .bind(i64::try_from(retry_delay_ms).context("bulk chunk retry_delay_ms exceeds i64")?)
+            .bind(Json(chunk_items.to_vec()))
+            .bind(scheduled_at)
+            .execute(tx.as_mut())
+            .await
+            .context("failed to upsert workflow bulk chunk")?;
+        }
+
+        tx.commit().await.context("failed to commit workflow bulk batch transaction")?;
+        let batch = self
+            .get_bulk_batch(tenant_id, instance_id, run_id, batch_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("bulk batch not found after upsert"))?;
+        let chunks = self
+            .list_bulk_chunks_for_batch_page(tenant_id, instance_id, run_id, batch_id, i64::MAX, 0)
+            .await?;
+        Ok((batch, chunks))
+    }
+
+    pub async fn lease_next_bulk_chunks(
+        &self,
+        tenant_id: &str,
+        task_queue: &str,
+        worker_id: &str,
+        worker_build_id: &str,
+        lease_ttl: chrono::Duration,
+        limit: usize,
+    ) -> Result<Vec<WorkflowBulkChunkRecord>> {
+        let now = Utc::now();
+        let lease_expires_at = now + lease_ttl;
+        let rows = sqlx::query(
+            r#"
+            WITH next_chunks AS (
+                SELECT chunk.tenant_id, chunk.workflow_instance_id, chunk.run_id, chunk.batch_id, chunk.chunk_id
+                FROM workflow_bulk_chunks chunk
+                JOIN workflow_bulk_batches batch
+                  ON batch.tenant_id = chunk.tenant_id
+                 AND batch.workflow_instance_id = chunk.workflow_instance_id
+                 AND batch.run_id = chunk.run_id
+                 AND batch.batch_id = chunk.batch_id
+                WHERE chunk.tenant_id = $1
+                  AND chunk.task_queue = $2
+                  AND chunk.status = 'scheduled'
+                  AND chunk.available_at <= $3
+                  AND batch.status IN ('scheduled', 'running')
+                ORDER BY chunk.available_at ASC, chunk.scheduled_at ASC, chunk.chunk_index ASC
+                LIMIT $4
+                FOR UPDATE OF chunk SKIP LOCKED
+            ),
+            updated_chunks AS (
+                UPDATE workflow_bulk_chunks chunk
+                SET status = 'started',
+                    worker_id = $5,
+                    worker_build_id = $6,
+                    lease_token = md5(random()::text || clock_timestamp()::text || chunk.chunk_id)::uuid,
+                    started_at = COALESCE(chunk.started_at, $3),
+                    lease_expires_at = $7,
+                    updated_at = $3
+                FROM next_chunks
+                WHERE chunk.tenant_id = next_chunks.tenant_id
+                  AND chunk.workflow_instance_id = next_chunks.workflow_instance_id
+                  AND chunk.run_id = next_chunks.run_id
+                  AND chunk.batch_id = next_chunks.batch_id
+                  AND chunk.chunk_id = next_chunks.chunk_id
+                RETURNING chunk.*
+            )
+            SELECT * FROM updated_chunks
+            ORDER BY chunk_index ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(task_queue)
+        .bind(now)
+        .bind(i64::try_from(limit.max(1)).context("bulk chunk lease limit exceeds i64")?)
+        .bind(worker_id)
+        .bind(worker_build_id)
+        .bind(lease_expires_at)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to lease workflow bulk chunks")?;
+
+        if !rows.is_empty() {
+            let batch_ids = rows
+                .iter()
+                .map(|row| row.try_get::<String, _>("batch_id"))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("bulk chunk batch_id missing")?;
+            sqlx::query(
+                r#"
+                UPDATE workflow_bulk_batches
+                SET status = CASE WHEN status = 'scheduled' THEN 'running' ELSE status END,
+                    updated_at = $2
+                WHERE tenant_id = $1
+                  AND batch_id = ANY($3)
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(now)
+            .bind(&batch_ids)
+            .execute(&self.pool)
+            .await
+            .context("failed to mark workflow bulk batches running")?;
+        }
+
+        rows.into_iter().map(Self::decode_bulk_chunk_row).collect()
+    }
+
+    pub async fn list_started_bulk_chunks(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<WorkflowBulkChunkRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM workflow_bulk_chunks
+            WHERE status = 'started'
+            ORDER BY lease_expires_at ASC NULLS LAST, scheduled_at ASC, chunk_index ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(i64::try_from(limit).context("bulk chunk list limit exceeds i64")?)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list started workflow bulk chunks")?;
+        rows.into_iter().map(Self::decode_bulk_chunk_row).collect()
+    }
+
+    pub async fn requeue_bulk_chunk(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+        chunk_id: &str,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE workflow_bulk_chunks
+            SET status = 'scheduled',
+                worker_id = NULL,
+                worker_build_id = NULL,
+                lease_token = NULL,
+                lease_expires_at = NULL,
+                available_at = $6,
+                updated_at = $6
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND batch_id = $4
+              AND chunk_id = $5
+              AND status = 'started'
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .bind(chunk_id)
+        .bind(occurred_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to requeue workflow bulk chunk")?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn apply_bulk_chunk_terminal_update(
+        &self,
+        update: &BulkChunkTerminalUpdate,
+    ) -> Result<AppliedBulkChunkTerminalUpdate> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin workflow bulk chunk update transaction")?;
+
+        let batch_row = sqlx::query(
+            r#"
+            SELECT *
+            FROM workflow_bulk_batches
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND batch_id = $4
+            FOR UPDATE
+            "#,
+        )
+        .bind(&update.tenant_id)
+        .bind(&update.instance_id)
+        .bind(&update.run_id)
+        .bind(&update.batch_id)
+        .fetch_optional(tx.as_mut())
+        .await
+        .context("failed to load workflow bulk batch for terminal update")?
+        .ok_or_else(|| anyhow::anyhow!("workflow bulk batch {} not found", update.batch_id))?;
+        let mut batch = Self::decode_bulk_batch_row(batch_row)?;
+
+        let chunk_row = sqlx::query(
+            r#"
+            SELECT *
+            FROM workflow_bulk_chunks
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND batch_id = $4
+              AND chunk_id = $5
+            FOR UPDATE
+            "#,
+        )
+        .bind(&update.tenant_id)
+        .bind(&update.instance_id)
+        .bind(&update.run_id)
+        .bind(&update.batch_id)
+        .bind(&update.chunk_id)
+        .fetch_optional(tx.as_mut())
+        .await
+        .context("failed to load workflow bulk chunk for terminal update")?
+        .ok_or_else(|| anyhow::anyhow!("workflow bulk chunk {} not found", update.chunk_id))?;
+        let mut chunk = Self::decode_bulk_chunk_row(chunk_row)?;
+
+        let mut terminal_event = None;
+        if !batch.status.is_terminal()
+            && chunk.status == WorkflowBulkChunkStatus::Started
+            && chunk.attempt == update.attempt
+            && chunk.lease_token == Some(update.lease_token)
+        {
+            match &update.payload {
+                BulkChunkTerminalPayload::Completed { output } => {
+                    sqlx::query(
+                        r#"
+                        UPDATE workflow_bulk_chunks
+                        SET status = 'completed',
+                            output = $6,
+                            error = NULL,
+                            completed_at = $7,
+                            lease_token = NULL,
+                            lease_expires_at = NULL,
+                            updated_at = $7
+                        WHERE tenant_id = $1
+                          AND workflow_instance_id = $2
+                          AND run_id = $3
+                          AND batch_id = $4
+                          AND chunk_id = $5
+                        "#,
+                    )
+                    .bind(&update.tenant_id)
+                    .bind(&update.instance_id)
+                    .bind(&update.run_id)
+                    .bind(&update.batch_id)
+                    .bind(&update.chunk_id)
+                    .bind(Json(output))
+                    .bind(update.occurred_at)
+                    .execute(tx.as_mut())
+                    .await
+                    .context("failed to mark workflow bulk chunk completed")?;
+                    let succeeded = u32::try_from(chunk.items.len())
+                        .context("workflow bulk chunk item count exceeds u32")?;
+                    batch.succeeded_items = batch.succeeded_items.saturating_add(succeeded);
+                    if batch.succeeded_items >= batch.total_items {
+                        batch.status = WorkflowBulkBatchStatus::Completed;
+                        batch.terminal_at = Some(update.occurred_at);
+                        terminal_event = Some(Self::bulk_terminal_event(
+                            &batch,
+                            WorkflowEvent::BulkActivityBatchCompleted {
+                                batch_id: batch.batch_id.clone(),
+                                total_items: batch.total_items,
+                                succeeded_items: batch.succeeded_items,
+                                failed_items: batch.failed_items,
+                                cancelled_items: batch.cancelled_items,
+                                chunk_count: batch.chunk_count,
+                            },
+                        ));
+                    } else if batch.status == WorkflowBulkBatchStatus::Scheduled {
+                        batch.status = WorkflowBulkBatchStatus::Running;
+                    }
+                }
+                BulkChunkTerminalPayload::Failed { error } => {
+                    if chunk.attempt < chunk.max_attempts {
+                        let retry_at = update.occurred_at
+                            + chrono::Duration::milliseconds(chunk.retry_delay_ms as i64);
+                        sqlx::query(
+                            r#"
+                            UPDATE workflow_bulk_chunks
+                            SET status = 'scheduled',
+                                attempt = attempt + 1,
+                                error = $6,
+                                worker_id = NULL,
+                                worker_build_id = NULL,
+                                lease_token = NULL,
+                                lease_expires_at = NULL,
+                                available_at = $7,
+                                updated_at = $7
+                            WHERE tenant_id = $1
+                              AND workflow_instance_id = $2
+                              AND run_id = $3
+                              AND batch_id = $4
+                              AND chunk_id = $5
+                            "#,
+                        )
+                        .bind(&update.tenant_id)
+                        .bind(&update.instance_id)
+                        .bind(&update.run_id)
+                        .bind(&update.batch_id)
+                        .bind(&update.chunk_id)
+                        .bind(error)
+                        .bind(retry_at)
+                        .execute(tx.as_mut())
+                        .await
+                        .context("failed to reschedule workflow bulk chunk retry")?;
+                    } else {
+                        sqlx::query(
+                            r#"
+                            UPDATE workflow_bulk_chunks
+                            SET status = 'failed',
+                                error = $6,
+                                completed_at = $7,
+                                lease_token = NULL,
+                                lease_expires_at = NULL,
+                                updated_at = $7
+                            WHERE tenant_id = $1
+                              AND workflow_instance_id = $2
+                              AND run_id = $3
+                              AND batch_id = $4
+                              AND chunk_id = $5
+                            "#,
+                        )
+                        .bind(&update.tenant_id)
+                        .bind(&update.instance_id)
+                        .bind(&update.run_id)
+                        .bind(&update.batch_id)
+                        .bind(&update.chunk_id)
+                        .bind(error)
+                        .bind(update.occurred_at)
+                        .execute(tx.as_mut())
+                        .await
+                        .context("failed to mark workflow bulk chunk failed")?;
+                        batch.failed_items = batch.failed_items.saturating_add(
+                            u32::try_from(chunk.items.len())
+                                .context("workflow bulk chunk item count exceeds u32")?,
+                        );
+                        batch.status = WorkflowBulkBatchStatus::Failed;
+                        batch.error = Some(error.clone());
+                        batch.terminal_at = Some(update.occurred_at);
+                        terminal_event = Some(Self::bulk_terminal_event(
+                            &batch,
+                            WorkflowEvent::BulkActivityBatchFailed {
+                                batch_id: batch.batch_id.clone(),
+                                total_items: batch.total_items,
+                                succeeded_items: batch.succeeded_items,
+                                failed_items: batch.failed_items,
+                                cancelled_items: batch.cancelled_items,
+                                chunk_count: batch.chunk_count,
+                                message: error.clone(),
+                            },
+                        ));
+                    }
+                }
+                BulkChunkTerminalPayload::Cancelled { reason, .. } => {
+                    sqlx::query(
+                        r#"
+                        UPDATE workflow_bulk_chunks
+                        SET status = 'cancelled',
+                            error = $6,
+                            completed_at = $7,
+                            lease_token = NULL,
+                            lease_expires_at = NULL,
+                            updated_at = $7
+                        WHERE tenant_id = $1
+                          AND workflow_instance_id = $2
+                          AND run_id = $3
+                          AND batch_id = $4
+                          AND chunk_id = $5
+                        "#,
+                    )
+                    .bind(&update.tenant_id)
+                    .bind(&update.instance_id)
+                    .bind(&update.run_id)
+                    .bind(&update.batch_id)
+                    .bind(&update.chunk_id)
+                    .bind(reason)
+                    .bind(update.occurred_at)
+                    .execute(tx.as_mut())
+                    .await
+                    .context("failed to mark workflow bulk chunk cancelled")?;
+                    batch.cancelled_items = batch.cancelled_items.saturating_add(
+                        u32::try_from(chunk.items.len())
+                            .context("workflow bulk chunk item count exceeds u32")?,
+                    );
+                    batch.status = WorkflowBulkBatchStatus::Cancelled;
+                    batch.error = Some(reason.clone());
+                    batch.terminal_at = Some(update.occurred_at);
+                    terminal_event = Some(Self::bulk_terminal_event(
+                        &batch,
+                        WorkflowEvent::BulkActivityBatchCancelled {
+                            batch_id: batch.batch_id.clone(),
+                            total_items: batch.total_items,
+                            succeeded_items: batch.succeeded_items,
+                            failed_items: batch.failed_items,
+                            cancelled_items: batch.cancelled_items,
+                            chunk_count: batch.chunk_count,
+                            message: reason.clone(),
+                        },
+                    ));
+                }
+            }
+
+            sqlx::query(
+                r#"
+                UPDATE workflow_bulk_batches
+                SET status = $5,
+                    succeeded_items = $6,
+                    failed_items = $7,
+                    cancelled_items = $8,
+                    error = $9,
+                    terminal_at = $10,
+                    updated_at = $11
+                WHERE tenant_id = $1
+                  AND workflow_instance_id = $2
+                  AND run_id = $3
+                  AND batch_id = $4
+                "#,
+            )
+            .bind(&batch.tenant_id)
+            .bind(&batch.instance_id)
+            .bind(&batch.run_id)
+            .bind(&batch.batch_id)
+            .bind(batch.status.as_str())
+            .bind(i32::try_from(batch.succeeded_items).context("bulk batch succeeded_items exceeds i32")?)
+            .bind(i32::try_from(batch.failed_items).context("bulk batch failed_items exceeds i32")?)
+            .bind(i32::try_from(batch.cancelled_items).context("bulk batch cancelled_items exceeds i32")?)
+            .bind(&batch.error)
+            .bind(batch.terminal_at)
+            .bind(update.occurred_at)
+            .execute(tx.as_mut())
+            .await
+            .context("failed to update workflow bulk batch counters")?;
+
+            if let Some(event) = terminal_event.as_ref() {
+                self.enqueue_workflow_event_outbox(tx.as_mut(), event, update.occurred_at).await?;
+            }
+
+            batch = self
+                .get_bulk_batch_with_executor(tx.as_mut(), &update.tenant_id, &update.instance_id, &update.run_id, &update.batch_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("workflow bulk batch missing after update"))?;
+            chunk = self
+                .get_bulk_chunk_with_executor(
+                    tx.as_mut(),
+                    &update.tenant_id,
+                    &update.instance_id,
+                    &update.run_id,
+                    &update.batch_id,
+                    &update.chunk_id,
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("workflow bulk chunk missing after update"))?;
+        }
+
+        tx.commit().await.context("failed to commit workflow bulk chunk update transaction")?;
+        Ok(AppliedBulkChunkTerminalUpdate { chunk, batch, terminal_event })
+    }
+
+    pub async fn lease_workflow_event_outbox(
+        &self,
+        publisher_id: &str,
+        lease_ttl: chrono::Duration,
+        limit: usize,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<WorkflowEventOutboxRecord>> {
+        let lease_expires_at = now + lease_ttl;
+        let rows = sqlx::query(
+            r#"
+            WITH candidates AS (
+                SELECT outbox_id
+                FROM workflow_event_outbox
+                WHERE published_at IS NULL
+                  AND available_at <= $1
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= $1)
+                ORDER BY created_at, outbox_id
+                LIMIT $4
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE workflow_event_outbox outbox
+            SET leased_by = $2,
+                lease_expires_at = $3,
+                updated_at = $1
+            FROM candidates
+            WHERE outbox.outbox_id = candidates.outbox_id
+            RETURNING outbox.*
+            "#,
+        )
+        .bind(now)
+        .bind(publisher_id)
+        .bind(lease_expires_at)
+        .bind(i64::try_from(limit.max(1)).context("workflow event outbox lease limit exceeds i64")?)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to lease workflow event outbox rows")?;
+        rows.into_iter().map(Self::decode_workflow_event_outbox_row).collect()
+    }
+
+    pub async fn mark_workflow_event_outbox_published(
+        &self,
+        outbox_id: Uuid,
+        publisher_id: &str,
+        published_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE workflow_event_outbox
+            SET published_at = $3,
+                leased_by = NULL,
+                lease_expires_at = NULL,
+                updated_at = $3
+            WHERE outbox_id = $1
+              AND leased_by = $2
+              AND published_at IS NULL
+            "#,
+        )
+        .bind(outbox_id)
+        .bind(publisher_id)
+        .bind(published_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to mark workflow event outbox row published")?;
+        Ok(updated.rows_affected() > 0)
+    }
+
+    pub async fn release_workflow_event_outbox_lease(
+        &self,
+        outbox_id: Uuid,
+        publisher_id: &str,
+        available_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE workflow_event_outbox
+            SET leased_by = NULL,
+                lease_expires_at = NULL,
+                available_at = $3,
+                updated_at = $3
+            WHERE outbox_id = $1
+              AND leased_by = $2
+              AND published_at IS NULL
+            "#,
+        )
+        .bind(outbox_id)
+        .bind(publisher_id)
+        .bind(available_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to release workflow event outbox lease")?;
+        Ok(updated.rows_affected() > 0)
+    }
+
+    pub async fn count_bulk_batches_for_run(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+    ) -> Result<u64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM workflow_bulk_batches
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to count workflow bulk batches for run")?;
+        Ok(count as u64)
+    }
+
+    pub async fn list_bulk_batches_for_run_page(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<WorkflowBulkBatchRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM workflow_bulk_batches
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
+            ORDER BY scheduled_at ASC, batch_id ASC
+            LIMIT $4 OFFSET $5
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list workflow bulk batches for run")?;
+        rows.into_iter().map(Self::decode_bulk_batch_row).collect()
+    }
+
+    pub async fn get_bulk_batch(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+    ) -> Result<Option<WorkflowBulkBatchRecord>> {
+        self.get_bulk_batch_with_executor(&self.pool, tenant_id, instance_id, run_id, batch_id).await
+    }
+
+    pub async fn count_bulk_chunks_for_batch(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+    ) -> Result<u64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM workflow_bulk_chunks
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3 AND batch_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to count workflow bulk chunks for batch")?;
+        Ok(count as u64)
+    }
+
+    pub async fn list_bulk_chunks_for_batch_page(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<WorkflowBulkChunkRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM workflow_bulk_chunks
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3 AND batch_id = $4
+            ORDER BY chunk_index ASC
+            LIMIT $5 OFFSET $6
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list workflow bulk chunks for batch")?;
+        rows.into_iter().map(Self::decode_bulk_chunk_row).collect()
+    }
+
     pub async fn fail_activity(
         &self,
         tenant_id: &str,
@@ -7197,6 +8380,306 @@ impl WorkflowStore {
         })
     }
 
+    async fn get_bulk_batch_with_executor<'e, E>(
+        &self,
+        executor: E,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+    ) -> Result<Option<WorkflowBulkBatchRecord>>
+    where
+        E: sqlx::Executor<'e, Database = Postgres>,
+    {
+        let row = sqlx::query(
+            r#"
+            SELECT *
+            FROM workflow_bulk_batches
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND batch_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .fetch_optional(executor)
+        .await
+        .context("failed to load workflow bulk batch")?;
+        row.map(Self::decode_bulk_batch_row).transpose()
+    }
+
+    async fn get_bulk_chunk_with_executor<'e, E>(
+        &self,
+        executor: E,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+        chunk_id: &str,
+    ) -> Result<Option<WorkflowBulkChunkRecord>>
+    where
+        E: sqlx::Executor<'e, Database = Postgres>,
+    {
+        let row = sqlx::query(
+            r#"
+            SELECT *
+            FROM workflow_bulk_chunks
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND batch_id = $4
+              AND chunk_id = $5
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .bind(chunk_id)
+        .fetch_optional(executor)
+        .await
+        .context("failed to load workflow bulk chunk")?;
+        row.map(Self::decode_bulk_chunk_row).transpose()
+    }
+
+    async fn enqueue_workflow_event_outbox<'e, E>(
+        &self,
+        executor: E,
+        event: &EventEnvelope<WorkflowEvent>,
+        available_at: DateTime<Utc>,
+    ) -> Result<()>
+    where
+        E: sqlx::Executor<'e, Database = Postgres>,
+    {
+        sqlx::query(
+            r#"
+            INSERT INTO workflow_event_outbox (
+                outbox_id,
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                event_type,
+                partition_key,
+                event,
+                available_at,
+                created_at,
+                updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, $8)
+            ON CONFLICT (outbox_id) DO NOTHING
+            "#,
+        )
+        .bind(event.event_id)
+        .bind(&event.tenant_id)
+        .bind(&event.instance_id)
+        .bind(&event.run_id)
+        .bind(&event.event_type)
+        .bind(&event.partition_key)
+        .bind(Json(event))
+        .bind(available_at)
+        .execute(executor)
+        .await
+        .context("failed to insert workflow event outbox row")?;
+        Ok(())
+    }
+
+    fn bulk_terminal_event(
+        batch: &WorkflowBulkBatchRecord,
+        payload: WorkflowEvent,
+    ) -> EventEnvelope<WorkflowEvent> {
+        let mut envelope = EventEnvelope::new(
+            payload.event_type(),
+            fabrik_events::WorkflowIdentity::new(
+                batch.tenant_id.clone(),
+                batch.definition_id.clone(),
+                batch.definition_version.unwrap_or_default(),
+                batch.artifact_hash.clone().unwrap_or_default(),
+                batch.instance_id.clone(),
+                batch.run_id.clone(),
+                "matching-service",
+            ),
+            payload,
+        );
+        if let Some(state) = &batch.state {
+            envelope.metadata.insert("state".to_owned(), state.clone());
+        }
+        envelope
+    }
+
+    fn decode_bulk_batch_row(row: sqlx::postgres::PgRow) -> Result<WorkflowBulkBatchRecord> {
+        Ok(WorkflowBulkBatchRecord {
+            tenant_id: row.try_get("tenant_id").context("bulk batch tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("bulk batch workflow_instance_id missing")?,
+            run_id: row.try_get("run_id").context("bulk batch run_id missing")?,
+            definition_id: row.try_get("workflow_id").context("bulk batch workflow_id missing")?,
+            definition_version: row
+                .try_get::<Option<i32>, _>("workflow_version")
+                .context("bulk batch workflow_version missing")?
+                .map(|value| value as u32),
+            artifact_hash: row
+                .try_get("artifact_hash")
+                .context("bulk batch artifact_hash missing")?,
+            batch_id: row.try_get("batch_id").context("bulk batch batch_id missing")?,
+            activity_type: row
+                .try_get("activity_type")
+                .context("bulk batch activity_type missing")?,
+            task_queue: row.try_get("task_queue").context("bulk batch task_queue missing")?,
+            state: row.try_get("state").context("bulk batch state missing")?,
+            status: WorkflowBulkBatchStatus::from_db(
+                &row.try_get::<String, _>("status").context("bulk batch status missing")?,
+            )?,
+            total_items: row
+                .try_get::<i32, _>("total_items")
+                .context("bulk batch total_items missing")? as u32,
+            chunk_size: row
+                .try_get::<i32, _>("chunk_size")
+                .context("bulk batch chunk_size missing")? as u32,
+            chunk_count: row
+                .try_get::<i32, _>("chunk_count")
+                .context("bulk batch chunk_count missing")? as u32,
+            succeeded_items: row
+                .try_get::<i32, _>("succeeded_items")
+                .context("bulk batch succeeded_items missing")? as u32,
+            failed_items: row
+                .try_get::<i32, _>("failed_items")
+                .context("bulk batch failed_items missing")? as u32,
+            cancelled_items: row
+                .try_get::<i32, _>("cancelled_items")
+                .context("bulk batch cancelled_items missing")? as u32,
+            max_attempts: row
+                .try_get::<i32, _>("max_attempts")
+                .context("bulk batch max_attempts missing")? as u32,
+            retry_delay_ms: row
+                .try_get::<i64, _>("retry_delay_ms")
+                .context("bulk batch retry_delay_ms missing")? as u64,
+            error: row.try_get("error").context("bulk batch error missing")?,
+            scheduled_at: row
+                .try_get("scheduled_at")
+                .context("bulk batch scheduled_at missing")?,
+            terminal_at: row
+                .try_get("terminal_at")
+                .context("bulk batch terminal_at missing")?,
+            updated_at: row.try_get("updated_at").context("bulk batch updated_at missing")?,
+        })
+    }
+
+    fn decode_bulk_chunk_row(row: sqlx::postgres::PgRow) -> Result<WorkflowBulkChunkRecord> {
+        Ok(WorkflowBulkChunkRecord {
+            tenant_id: row.try_get("tenant_id").context("bulk chunk tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("bulk chunk workflow_instance_id missing")?,
+            run_id: row.try_get("run_id").context("bulk chunk run_id missing")?,
+            definition_id: row.try_get("workflow_id").context("bulk chunk workflow_id missing")?,
+            definition_version: row
+                .try_get::<Option<i32>, _>("workflow_version")
+                .context("bulk chunk workflow_version missing")?
+                .map(|value| value as u32),
+            artifact_hash: row
+                .try_get("artifact_hash")
+                .context("bulk chunk artifact_hash missing")?,
+            batch_id: row.try_get("batch_id").context("bulk chunk batch_id missing")?,
+            chunk_id: row.try_get("chunk_id").context("bulk chunk chunk_id missing")?,
+            chunk_index: row
+                .try_get::<i32, _>("chunk_index")
+                .context("bulk chunk chunk_index missing")? as u32,
+            activity_type: row
+                .try_get("activity_type")
+                .context("bulk chunk activity_type missing")?,
+            task_queue: row.try_get("task_queue").context("bulk chunk task_queue missing")?,
+            state: row.try_get("state").context("bulk chunk state missing")?,
+            status: WorkflowBulkChunkStatus::from_db(
+                &row.try_get::<String, _>("status").context("bulk chunk status missing")?,
+            )?,
+            attempt: row
+                .try_get::<i32, _>("attempt")
+                .context("bulk chunk attempt missing")? as u32,
+            max_attempts: row
+                .try_get::<i32, _>("max_attempts")
+                .context("bulk chunk max_attempts missing")? as u32,
+            retry_delay_ms: row
+                .try_get::<i64, _>("retry_delay_ms")
+                .context("bulk chunk retry_delay_ms missing")? as u64,
+            items: row
+                .try_get::<Json<Vec<Value>>, _>("items")
+                .map(|value| value.0)
+                .context("bulk chunk items missing")?,
+            output: row
+                .try_get::<Option<Json<Vec<Value>>>, _>("output")
+                .map(|value: Option<Json<Vec<Value>>>| value.map(|json| json.0))
+                .context("bulk chunk output missing")?,
+            error: row.try_get("error").context("bulk chunk error missing")?,
+            cancellation_requested: row
+                .try_get("cancellation_requested")
+                .context("bulk chunk cancellation_requested missing")?,
+            cancellation_reason: row
+                .try_get("cancellation_reason")
+                .context("bulk chunk cancellation_reason missing")?,
+            cancellation_metadata: row
+                .try_get::<Option<Json<Value>>, _>("cancellation_metadata")
+                .map(|value: Option<Json<Value>>| value.map(|json| json.0))
+                .context("bulk chunk cancellation_metadata missing")?,
+            worker_id: row.try_get("worker_id").context("bulk chunk worker_id missing")?,
+            worker_build_id: row
+                .try_get("worker_build_id")
+                .context("bulk chunk worker_build_id missing")?,
+            lease_token: row
+                .try_get("lease_token")
+                .context("bulk chunk lease_token missing")?,
+            scheduled_at: row
+                .try_get("scheduled_at")
+                .context("bulk chunk scheduled_at missing")?,
+            available_at: row
+                .try_get("available_at")
+                .context("bulk chunk available_at missing")?,
+            started_at: row.try_get("started_at").context("bulk chunk started_at missing")?,
+            lease_expires_at: row
+                .try_get("lease_expires_at")
+                .context("bulk chunk lease_expires_at missing")?,
+            completed_at: row
+                .try_get("completed_at")
+                .context("bulk chunk completed_at missing")?,
+            updated_at: row.try_get("updated_at").context("bulk chunk updated_at missing")?,
+        })
+    }
+
+    fn decode_workflow_event_outbox_row(
+        row: sqlx::postgres::PgRow,
+    ) -> Result<WorkflowEventOutboxRecord> {
+        Ok(WorkflowEventOutboxRecord {
+            outbox_id: row.try_get("outbox_id").context("workflow event outbox_id missing")?,
+            tenant_id: row.try_get("tenant_id").context("workflow event tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("workflow event workflow_instance_id missing")?,
+            run_id: row.try_get("run_id").context("workflow event run_id missing")?,
+            event_type: row.try_get("event_type").context("workflow event event_type missing")?,
+            partition_key: row
+                .try_get("partition_key")
+                .context("workflow event partition_key missing")?,
+            event: row
+                .try_get::<Json<EventEnvelope<WorkflowEvent>>, _>("event")
+                .context("workflow event payload missing")?
+                .0,
+            available_at: row
+                .try_get("available_at")
+                .context("workflow event available_at missing")?,
+            leased_by: row.try_get("leased_by").context("workflow event leased_by missing")?,
+            lease_expires_at: row
+                .try_get("lease_expires_at")
+                .context("workflow event lease_expires_at missing")?,
+            published_at: row
+                .try_get("published_at")
+                .context("workflow event published_at missing")?,
+            created_at: row.try_get("created_at").context("workflow event created_at missing")?,
+            updated_at: row.try_get("updated_at").context("workflow event updated_at missing")?,
+        })
+    }
+
     fn decode_activity_row(row: sqlx::postgres::PgRow) -> Result<WorkflowActivityRecord> {
         Ok(WorkflowActivityRecord {
             tenant_id: row.try_get("tenant_id").context("activity tenant_id missing")?,
@@ -7839,6 +9322,102 @@ mod tests {
         assert_eq!(task_rows, 1);
         assert_eq!(resume_backlog, resume_events);
         assert!(reduction_pct >= 99.0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bulk_chunk_completion_enqueues_outbox_event() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+
+        let (batch, chunks) = store
+            .upsert_bulk_batch(
+                "tenant-a",
+                "wf-bulk-1",
+                "run-bulk-1",
+                "demo",
+                Some(1),
+                Some("artifact-1"),
+                "batch-1",
+                "benchmark.echo",
+                "default",
+                Some("join"),
+                &[json!({"value": 1}), json!({"value": 2})],
+                2,
+                1,
+                0,
+                Utc::now(),
+            )
+            .await?;
+        assert_eq!(batch.chunk_count, 1);
+        assert_eq!(chunks.len(), 1);
+
+        let leased = store
+            .lease_next_bulk_chunks(
+                "tenant-a",
+                "default",
+                "worker-a",
+                "build-a",
+                chrono::Duration::seconds(30),
+                1,
+            )
+            .await?;
+        assert_eq!(leased.len(), 1);
+        let leased_chunk = &leased[0];
+
+        let applied = store
+            .apply_bulk_chunk_terminal_update(&BulkChunkTerminalUpdate {
+                tenant_id: leased_chunk.tenant_id.clone(),
+                instance_id: leased_chunk.instance_id.clone(),
+                run_id: leased_chunk.run_id.clone(),
+                batch_id: leased_chunk.batch_id.clone(),
+                chunk_id: leased_chunk.chunk_id.clone(),
+                chunk_index: leased_chunk.chunk_index,
+                attempt: leased_chunk.attempt,
+                lease_token: leased_chunk.lease_token.context("leased chunk missing lease token")?,
+                worker_id: "worker-a".to_owned(),
+                worker_build_id: "build-a".to_owned(),
+                occurred_at: Utc::now(),
+                payload: BulkChunkTerminalPayload::Completed {
+                    output: vec![json!({"value": 1}), json!({"value": 2})],
+                },
+            })
+            .await?;
+        assert!(applied.terminal_event.is_some());
+
+        let outbox = store
+            .lease_workflow_event_outbox(
+                "publisher-a",
+                chrono::Duration::seconds(30),
+                10,
+                Utc::now(),
+            )
+            .await?;
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(
+            outbox[0].event.event_type,
+            WorkflowEvent::BulkActivityBatchCompleted {
+                batch_id: "batch-1".to_owned(),
+                total_items: 2,
+                succeeded_items: 2,
+                failed_items: 0,
+                cancelled_items: 0,
+                chunk_count: 1,
+            }
+            .event_type()
+        );
+        assert!(
+            store
+                .mark_workflow_event_outbox_published(
+                    outbox[0].outbox_id,
+                    "publisher-a",
+                    Utc::now(),
+                )
+                .await?
+        );
 
         Ok(())
     }

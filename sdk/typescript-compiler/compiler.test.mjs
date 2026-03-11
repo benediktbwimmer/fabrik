@@ -92,6 +92,49 @@ test("compiler lowers awaited ctx.activity calls into activity states", async ()
   assert.match(serialized, /"output_var":"echoed"/);
 });
 
+test("compiler lowers bulk activity handles and waits", async () => {
+  const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/bulk-workflow.ts");
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "bulkWorkflow",
+    "--definition-id",
+    "bulk-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"start_bulk_activity"/);
+  assert.match(serialized, /"activity_type":"benchmark\.echo"/);
+  assert.match(serialized, /"chunk_size":128/);
+  assert.match(serialized, /"type":"wait_for_bulk_activity"/);
+  assert.match(serialized, /"output_var":"summary"/);
+});
+
+test("compiler rejects non-static bulk options", async () => {
+  const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/invalid-bulk-workflow.ts");
+  await assert.rejects(
+    runCompiler([
+      "--entry",
+      fixture,
+      "--export",
+      "invalidBulkWorkflow",
+      "--definition-id",
+      "invalid-bulk",
+      "--version",
+      "1",
+    ]),
+    (error) => {
+      const output = `${error.stdout ?? ""}${error.stderr ?? ""}`;
+      assert.match(output, /chunkSize must be a numeric literal/);
+      return true;
+    },
+  );
+});
+
 test("compiler lowers query, update, and child workflow handlers", async () => {
   const fixture = path.join(
     root,

@@ -4,7 +4,10 @@ use anyhow::Result;
 use fabrik_config::GrpcServiceConfig;
 use fabrik_worker_protocol::activity_worker::{
     ActivityTaskCancelledResult, ActivityTaskCompletedResult, ActivityTaskFailedResult,
-    ActivityTaskResult, PollActivityTaskRequest, ReportActivityTaskResultsRequest,
+    ActivityTaskResult, BulkActivityTaskCancelledResult, BulkActivityTaskCompletedResult,
+    BulkActivityTaskFailedResult, BulkActivityTaskResult, PollActivityTaskRequest,
+    PollBulkActivityTaskRequest, ReportActivityTaskResultsRequest,
+    ReportBulkActivityTaskResultsRequest,
     activity_task_result, activity_worker_api_client::ActivityWorkerApiClient,
 };
 use fabrik_workflow::{StepConfig, execute_handler};
@@ -20,6 +23,8 @@ const RESULT_BATCH_MAX_BYTES: usize = 1_048_576;
 const RESULT_BATCH_FLUSH_INTERVAL_MS: u64 = 5;
 const DEFAULT_ACTIVITY_WORKER_CONCURRENCY: usize = 8;
 const DEFAULT_RESULT_FLUSHER_CONCURRENCY: usize = 1;
+const MAX_BULK_CHUNK_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_BULK_CHUNK_OUTPUT_BYTES: usize = 1024 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -62,6 +67,7 @@ async fn main() -> Result<()> {
 
     let mut workers = JoinSet::new();
     let mut result_txs = Vec::with_capacity(result_flusher_concurrency);
+    let mut bulk_result_txs = Vec::with_capacity(result_flusher_concurrency);
     for flusher_index in 0..result_flusher_concurrency {
         let (result_tx, result_rx) = unbounded_channel();
         workers.spawn(run_result_flusher(
@@ -70,6 +76,13 @@ async fn main() -> Result<()> {
             result_rx,
         ));
         result_txs.push(result_tx);
+        let (bulk_result_tx, bulk_result_rx) = unbounded_channel();
+        workers.spawn(run_bulk_result_flusher(
+            endpoint.clone(),
+            format!("bulk-result-flusher-{flusher_index}"),
+            bulk_result_rx,
+        ));
+        bulk_result_txs.push(bulk_result_tx);
     }
 
     for lane in 0..concurrency {
@@ -82,8 +95,18 @@ async fn main() -> Result<()> {
             client.clone(),
             result_txs[lane % result_txs.len()].clone(),
         ));
+        workers.spawn(run_bulk_activity_lane(
+            endpoint.clone(),
+            tenant_id.clone(),
+            task_queue.clone(),
+            lane_worker_id(&worker_id, lane, concurrency),
+            worker_build_id.clone(),
+            client.clone(),
+            bulk_result_txs[lane % bulk_result_txs.len()].clone(),
+        ));
     }
     drop(result_txs);
+    drop(bulk_result_txs);
 
     while let Some(result) = workers.join_next().await {
         match result {
@@ -128,6 +151,32 @@ fn estimate_result_size(result: &ActivityTaskResult) -> usize {
     size
 }
 
+fn estimate_bulk_result_size(result: &BulkActivityTaskResult) -> usize {
+    let mut size = result.tenant_id.len()
+        + result.instance_id.len()
+        + result.run_id.len()
+        + result.batch_id.len()
+        + result.chunk_id.len()
+        + result.worker_id.len()
+        + result.worker_build_id.len()
+        + std::mem::size_of::<u32>() * 2;
+    size += match result.result.as_ref() {
+        Some(fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
+            completed,
+        )) => completed.output_json.len(),
+        Some(fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Failed(
+            failed,
+        )) => failed.error.len(),
+        Some(
+            fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Cancelled(
+                cancelled,
+            ),
+        ) => cancelled.reason.len() + cancelled.metadata_json.len(),
+        None => 0,
+    };
+    size
+}
+
 async fn flush_results(
     worker: &mut ActivityWorkerApiClient<tonic::transport::Channel>,
     pending_results: &mut Vec<ActivityTaskResult>,
@@ -139,6 +188,25 @@ async fn flush_results(
     }
     worker
         .report_activity_task_results(ReportActivityTaskResultsRequest {
+            results: std::mem::take(pending_results),
+        })
+        .await?;
+    *pending_result_bytes = 0;
+    *first_pending_at = None;
+    Ok(())
+}
+
+async fn flush_bulk_results(
+    worker: &mut ActivityWorkerApiClient<tonic::transport::Channel>,
+    pending_results: &mut Vec<BulkActivityTaskResult>,
+    pending_result_bytes: &mut usize,
+    first_pending_at: &mut Option<std::time::Instant>,
+) -> Result<()> {
+    if pending_results.is_empty() {
+        return Ok(());
+    }
+    worker
+        .report_bulk_activity_task_results(ReportBulkActivityTaskResultsRequest {
             results: std::mem::take(pending_results),
         })
         .await?;
@@ -215,6 +283,80 @@ async fn run_result_flusher(
     }
 }
 
+async fn run_bulk_result_flusher(
+    endpoint: String,
+    flusher_id: String,
+    mut result_rx: UnboundedReceiver<BulkActivityTaskResult>,
+) -> Result<()> {
+    let mut worker = connect_activity_worker_with_retry(&endpoint, &flusher_id).await;
+    let mut pending_results = Vec::<BulkActivityTaskResult>::new();
+    let mut pending_result_bytes = 0usize;
+    let mut first_pending_at = None;
+
+    loop {
+        if pending_results.is_empty() {
+            let Some(result) = result_rx.recv().await else {
+                return Ok(());
+            };
+            pending_result_bytes =
+                pending_result_bytes.saturating_add(estimate_bulk_result_size(&result));
+            pending_results.push(result);
+            first_pending_at.get_or_insert_with(std::time::Instant::now);
+        }
+
+        if !pending_results.is_empty()
+            && (pending_results.len() >= RESULT_BATCH_MAX_ITEMS
+                || pending_result_bytes >= RESULT_BATCH_MAX_BYTES
+                || first_pending_at.is_some_and(|started| {
+                    started.elapsed() >= Duration::from_millis(RESULT_BATCH_FLUSH_INTERVAL_MS)
+                }))
+        {
+            flush_bulk_results(
+                &mut worker,
+                &mut pending_results,
+                &mut pending_result_bytes,
+                &mut first_pending_at,
+            )
+            .await?;
+            continue;
+        }
+
+        let wait = first_pending_at
+            .map(|started| {
+                Duration::from_millis(RESULT_BATCH_FLUSH_INTERVAL_MS)
+                    .saturating_sub(started.elapsed())
+            })
+            .unwrap_or_else(|| Duration::from_millis(RESULT_BATCH_FLUSH_INTERVAL_MS));
+
+        match tokio::time::timeout(wait, result_rx.recv()).await {
+            Ok(Some(result)) => {
+                pending_result_bytes =
+                    pending_result_bytes.saturating_add(estimate_bulk_result_size(&result));
+                pending_results.push(result);
+            }
+            Ok(None) => {
+                flush_bulk_results(
+                    &mut worker,
+                    &mut pending_results,
+                    &mut pending_result_bytes,
+                    &mut first_pending_at,
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(_) => {
+                flush_bulk_results(
+                    &mut worker,
+                    &mut pending_results,
+                    &mut pending_result_bytes,
+                    &mut first_pending_at,
+                )
+                .await?;
+            }
+        }
+    }
+}
+
 async fn run_activity_lane(
     endpoint: String,
     tenant_id: String,
@@ -257,6 +399,52 @@ async fn run_activity_lane(
         .await?;
         if result_tx.send(activity_result).is_err() {
             anyhow::bail!("activity result flusher channel closed");
+        }
+    }
+}
+
+async fn run_bulk_activity_lane(
+    endpoint: String,
+    tenant_id: String,
+    task_queue: String,
+    worker_id: String,
+    worker_build_id: String,
+    client: Arc<Client>,
+    result_tx: UnboundedSender<BulkActivityTaskResult>,
+) -> Result<()> {
+    let mut worker = connect_activity_worker_with_retry(&endpoint, &worker_id).await;
+
+    loop {
+        let response = worker
+            .poll_bulk_activity_task(PollBulkActivityTaskRequest {
+                tenant_id: tenant_id.clone(),
+                task_queue: task_queue.clone(),
+                worker_id: worker_id.clone(),
+                worker_build_id: worker_build_id.clone(),
+                poll_timeout_ms: 30_000,
+            })
+            .await;
+
+        let Some(task) = (match response {
+            Ok(response) => response.into_inner().task,
+            Err(error) => {
+                error!(error = %error, worker_id = %worker_id, "failed to poll matching-service for bulk task");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        }) else {
+            continue;
+        };
+
+        let activity_result = execute_bulk_activity_task(
+            client.as_ref(),
+            task,
+            worker_id.clone(),
+            worker_build_id.clone(),
+        )
+        .await?;
+        if result_tx.send(activity_result).is_err() {
+            anyhow::bail!("bulk activity result flusher channel closed");
         }
     }
 }
@@ -339,6 +527,134 @@ async fn execute_activity_task(
                 error: error.to_string(),
             })),
         },
+    })
+}
+
+async fn execute_bulk_activity_task(
+    client: &Client,
+    task: fabrik_worker_protocol::activity_worker::BulkActivityTask,
+    worker_id: String,
+    worker_build_id: String,
+) -> Result<BulkActivityTaskResult> {
+    if task.items_json.len() > MAX_BULK_CHUNK_INPUT_BYTES {
+        return Ok(BulkActivityTaskResult {
+            tenant_id: task.tenant_id,
+            instance_id: task.instance_id,
+            run_id: task.run_id,
+            batch_id: task.batch_id,
+            chunk_id: task.chunk_id,
+            chunk_index: task.chunk_index,
+            attempt: task.attempt,
+            worker_id,
+            worker_build_id,
+            lease_token: task.lease_token,
+            result: Some(
+                fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Failed(
+                    BulkActivityTaskFailedResult {
+                        error: format!(
+                            "bulk chunk input exceeded {} bytes",
+                            MAX_BULK_CHUNK_INPUT_BYTES
+                        ),
+                    },
+                ),
+            ),
+        });
+    }
+    let items = serde_json::from_str::<Vec<Value>>(&task.items_json)?;
+    let mut outputs = Vec::with_capacity(items.len());
+    for item in items {
+        match execute_activity(client, &task.activity_type, task.attempt, None, &item).await {
+            Ok(output) => outputs.push(output),
+            Err(error) if error.to_string() == "activity cancelled" => {
+                return Ok(BulkActivityTaskResult {
+                    tenant_id: task.tenant_id,
+                    instance_id: task.instance_id,
+                    run_id: task.run_id,
+                    batch_id: task.batch_id,
+                    chunk_id: task.chunk_id,
+                    chunk_index: task.chunk_index,
+                    attempt: task.attempt,
+                    worker_id,
+                    worker_build_id,
+                    lease_token: task.lease_token,
+                    result: Some(
+                        fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Cancelled(
+                            BulkActivityTaskCancelledResult {
+                                reason: error.to_string(),
+                                metadata_json: String::new(),
+                            },
+                        ),
+                    ),
+                });
+            }
+            Err(error) => {
+                return Ok(BulkActivityTaskResult {
+                    tenant_id: task.tenant_id,
+                    instance_id: task.instance_id,
+                    run_id: task.run_id,
+                    batch_id: task.batch_id,
+                    chunk_id: task.chunk_id,
+                    chunk_index: task.chunk_index,
+                    attempt: task.attempt,
+                    worker_id,
+                    worker_build_id,
+                    lease_token: task.lease_token,
+                    result: Some(
+                        fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Failed(
+                            BulkActivityTaskFailedResult {
+                                error: error.to_string(),
+                            },
+                        ),
+                    ),
+                });
+            }
+        }
+    }
+
+    let output_json = serde_json::to_string(&outputs)?;
+    if output_json.len() > MAX_BULK_CHUNK_OUTPUT_BYTES {
+        return Ok(BulkActivityTaskResult {
+            tenant_id: task.tenant_id,
+            instance_id: task.instance_id,
+            run_id: task.run_id,
+            batch_id: task.batch_id,
+            chunk_id: task.chunk_id,
+            chunk_index: task.chunk_index,
+            attempt: task.attempt,
+            worker_id,
+            worker_build_id,
+            lease_token: task.lease_token,
+            result: Some(
+                fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Failed(
+                    BulkActivityTaskFailedResult {
+                        error: format!(
+                            "bulk chunk output exceeded {} bytes",
+                            MAX_BULK_CHUNK_OUTPUT_BYTES
+                        ),
+                    },
+                ),
+            ),
+        });
+    }
+
+    Ok(BulkActivityTaskResult {
+        tenant_id: task.tenant_id,
+        instance_id: task.instance_id,
+        run_id: task.run_id,
+        batch_id: task.batch_id,
+        chunk_id: task.chunk_id,
+        chunk_index: task.chunk_index,
+        attempt: task.attempt,
+        worker_id,
+        worker_build_id,
+        lease_token: task.lease_token,
+        result: Some(
+            fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
+                BulkActivityTaskCompletedResult {
+                    output_json,
+                },
+            ),
+        ),
     })
 }
 

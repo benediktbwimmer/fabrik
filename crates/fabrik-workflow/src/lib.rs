@@ -699,6 +699,7 @@ impl WorkflowInstanceState {
             | WorkflowEvent::ActivityTaskStarted { .. }
             | WorkflowEvent::ActivityTaskHeartbeatRecorded { .. }
             | WorkflowEvent::ActivityTaskCancellationRequested { .. }
+            | WorkflowEvent::BulkActivityBatchScheduled { .. }
             | WorkflowEvent::TimerScheduled { .. }
             | WorkflowEvent::TimerFired { .. } => {
                 self.status = WorkflowStatus::Running;
@@ -706,6 +707,26 @@ impl WorkflowInstanceState {
             WorkflowEvent::ActivityTaskCompleted { output, .. } => {
                 self.status = WorkflowStatus::Running;
                 self.context = Some(output.clone());
+            }
+            WorkflowEvent::BulkActivityBatchCompleted {
+                batch_id,
+                total_items,
+                succeeded_items,
+                failed_items,
+                cancelled_items,
+                chunk_count,
+            } => {
+                self.status = WorkflowStatus::Running;
+                self.context = Some(serde_json::json!({
+                    "batchId": batch_id,
+                    "status": "completed",
+                    "totalItems": total_items,
+                    "succeededItems": succeeded_items,
+                    "failedItems": failed_items,
+                    "cancelledItems": cancelled_items,
+                    "chunkCount": chunk_count,
+                    "resultHandle": { "batchId": batch_id },
+                }));
             }
             WorkflowEvent::WorkflowUpdateCompleted { output, .. }
             | WorkflowEvent::ChildWorkflowCompleted { output, .. } => {
@@ -724,6 +745,44 @@ impl WorkflowInstanceState {
                 self.status = WorkflowStatus::Failed;
                 self.output = Some(Value::String(error.clone()));
                 self.context = Some(Value::String(error.clone()));
+            }
+            WorkflowEvent::BulkActivityBatchFailed {
+                batch_id,
+                total_items,
+                succeeded_items,
+                failed_items,
+                cancelled_items,
+                chunk_count,
+                message,
+            }
+            | WorkflowEvent::BulkActivityBatchCancelled {
+                batch_id,
+                total_items,
+                succeeded_items,
+                failed_items,
+                cancelled_items,
+                chunk_count,
+                message,
+            } => {
+                let status =
+                    if matches!(&event.payload, WorkflowEvent::BulkActivityBatchFailed { .. }) {
+                        WorkflowStatus::Failed
+                    } else {
+                        WorkflowStatus::Cancelled
+                    };
+                let error = serde_json::json!({
+                    "batchId": batch_id,
+                    "status": if status == WorkflowStatus::Failed { "failed" } else { "cancelled" },
+                    "message": message,
+                    "totalItems": total_items,
+                    "succeededItems": succeeded_items,
+                    "failedItems": failed_items,
+                    "cancelledItems": cancelled_items,
+                    "chunkCount": chunk_count,
+                });
+                self.status = status;
+                self.output = Some(error.clone());
+                self.context = Some(error);
             }
             WorkflowEvent::ActivityTaskTimedOut { .. } => {
                 self.status = WorkflowStatus::Failed;
@@ -1005,6 +1064,78 @@ pub fn replay_compiled_history_trace(
                     )?;
                     advanced = true;
                 }
+                WorkflowEvent::BulkActivityBatchCompleted {
+                    batch_id,
+                    total_items,
+                    succeeded_items,
+                    failed_items,
+                    cancelled_items,
+                    chunk_count,
+                } => {
+                    execution = artifact.execute_after_bulk_completion_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        batch_id,
+                        &serde_json::json!({
+                            "batchId": batch_id,
+                            "status": "completed",
+                            "totalItems": total_items,
+                            "succeededItems": succeeded_items,
+                            "failedItems": failed_items,
+                            "cancelledItems": cancelled_items,
+                            "chunkCount": chunk_count,
+                            "resultHandle": { "batchId": batch_id },
+                        }),
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    advanced = true;
+                }
+                WorkflowEvent::BulkActivityBatchFailed {
+                    batch_id,
+                    total_items,
+                    succeeded_items,
+                    failed_items,
+                    cancelled_items,
+                    chunk_count,
+                    message,
+                }
+                | WorkflowEvent::BulkActivityBatchCancelled {
+                    batch_id,
+                    total_items,
+                    succeeded_items,
+                    failed_items,
+                    cancelled_items,
+                    chunk_count,
+                    message,
+                } => {
+                    execution = artifact.execute_after_bulk_failure_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        batch_id,
+                        &serde_json::json!({
+                            "batchId": batch_id,
+                            "status": if matches!(&event.payload, WorkflowEvent::BulkActivityBatchFailed { .. }) {
+                                "failed"
+                            } else {
+                                "cancelled"
+                            },
+                            "message": message,
+                            "totalItems": total_items,
+                            "succeededItems": succeeded_items,
+                            "failedItems": failed_items,
+                            "cancelledItems": cancelled_items,
+                            "chunkCount": chunk_count,
+                        }),
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    advanced = true;
+                }
                 WorkflowEvent::ChildWorkflowCompleted { child_id, output, .. } => {
                     execution = artifact.execute_after_child_completion_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
@@ -1164,6 +1295,78 @@ pub fn replay_compiled_history_trace_from_snapshot(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         activity_id,
                         reason,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    apply_compiled_execution(&mut replayed, &execution);
+                }
+                WorkflowEvent::BulkActivityBatchCompleted {
+                    batch_id,
+                    total_items,
+                    succeeded_items,
+                    failed_items,
+                    cancelled_items,
+                    chunk_count,
+                } => {
+                    let execution = artifact.execute_after_bulk_completion_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        batch_id,
+                        &serde_json::json!({
+                            "batchId": batch_id,
+                            "status": "completed",
+                            "totalItems": total_items,
+                            "succeededItems": succeeded_items,
+                            "failedItems": failed_items,
+                            "cancelledItems": cancelled_items,
+                            "chunkCount": chunk_count,
+                            "resultHandle": { "batchId": batch_id },
+                        }),
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    apply_compiled_execution(&mut replayed, &execution);
+                }
+                WorkflowEvent::BulkActivityBatchFailed {
+                    batch_id,
+                    total_items,
+                    succeeded_items,
+                    failed_items,
+                    cancelled_items,
+                    chunk_count,
+                    message,
+                }
+                | WorkflowEvent::BulkActivityBatchCancelled {
+                    batch_id,
+                    total_items,
+                    succeeded_items,
+                    failed_items,
+                    cancelled_items,
+                    chunk_count,
+                    message,
+                } => {
+                    let execution = artifact.execute_after_bulk_failure_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        batch_id,
+                        &serde_json::json!({
+                            "batchId": batch_id,
+                            "status": if matches!(&event.payload, WorkflowEvent::BulkActivityBatchFailed { .. }) {
+                                "failed"
+                            } else {
+                                "cancelled"
+                            },
+                            "message": message,
+                            "totalItems": total_items,
+                            "succeededItems": succeeded_items,
+                            "failedItems": failed_items,
+                            "cancelledItems": cancelled_items,
+                            "chunkCount": chunk_count,
+                        }),
                         replayed.artifact_execution.clone().unwrap_or_default(),
                         ExecutionTurnContext {
                             event_id: event.event_id,

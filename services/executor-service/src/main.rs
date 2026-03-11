@@ -2639,6 +2639,156 @@ async fn process_event(
             )
             .await?;
         }
+        WorkflowEvent::BulkActivityBatchCompleted {
+            batch_id,
+            total_items,
+            succeeded_items,
+            failed_items,
+            cancelled_items,
+            chunk_count,
+        } => {
+            let Some(artifact) = load_pinned_artifact(store, &event, &state, lookup_cache).await?
+            else {
+                return Ok(());
+            };
+            let wait_state = match state.current_state.clone() {
+                Some(wait_state) => wait_state,
+                None => {
+                    warn!(
+                        workflow_instance_id = %event.instance_id,
+                        batch_id = %batch_id,
+                        "bulk batch completed without current_state"
+                    );
+                    return Ok(());
+                }
+            };
+            let summary = serde_json::json!({
+                "batchId": batch_id,
+                "status": "completed",
+                "totalItems": total_items,
+                "succeededItems": succeeded_items,
+                "failedItems": failed_items,
+                "cancelledItems": cancelled_items,
+                "chunkCount": chunk_count,
+                "resultHandle": { "batchId": batch_id },
+            });
+            let plan = artifact.execute_after_bulk_completion_with_turn(
+                &wait_state,
+                batch_id,
+                &summary,
+                state.artifact_execution.clone().unwrap_or_default(),
+                ExecutionTurnContext {
+                    event_id: event.event_id,
+                    occurred_at: event.occurred_at,
+                },
+            )?;
+            apply_compiled_plan(&mut state, &plan);
+            persist_state_with_mode(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                lease_snapshot.partition_id,
+                &mut record,
+                &state,
+                persist_mode,
+            )
+            .await?;
+            publish_compiled_plan(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                publisher,
+                &event,
+                &artifact,
+                plan,
+                state.context.clone().or_else(|| state.input.clone()),
+            )
+            .await?;
+        }
+        WorkflowEvent::BulkActivityBatchFailed {
+            batch_id,
+            total_items,
+            succeeded_items,
+            failed_items,
+            cancelled_items,
+            chunk_count,
+            message,
+        }
+        | WorkflowEvent::BulkActivityBatchCancelled {
+            batch_id,
+            total_items,
+            succeeded_items,
+            failed_items,
+            cancelled_items,
+            chunk_count,
+            message,
+        } => {
+            let Some(artifact) = load_pinned_artifact(store, &event, &state, lookup_cache).await?
+            else {
+                return Ok(());
+            };
+            let wait_state = match state.current_state.clone() {
+                Some(wait_state) => wait_state,
+                None => {
+                    warn!(
+                        workflow_instance_id = %event.instance_id,
+                        batch_id = %batch_id,
+                        "bulk batch failed without current_state"
+                    );
+                    return Ok(());
+                }
+            };
+            let error = serde_json::json!({
+                "batchId": batch_id,
+                "status": if matches!(&event.payload, WorkflowEvent::BulkActivityBatchFailed { .. }) {
+                    "failed"
+                } else {
+                    "cancelled"
+                },
+                "message": message,
+                "totalItems": total_items,
+                "succeededItems": succeeded_items,
+                "failedItems": failed_items,
+                "cancelledItems": cancelled_items,
+                "chunkCount": chunk_count,
+            });
+            let plan = artifact.execute_after_bulk_failure_with_turn(
+                &wait_state,
+                batch_id,
+                &error,
+                state.artifact_execution.clone().unwrap_or_default(),
+                ExecutionTurnContext {
+                    event_id: event.event_id,
+                    occurred_at: event.occurred_at,
+                },
+            )?;
+            apply_compiled_plan(&mut state, &plan);
+            persist_state_with_mode(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                lease_snapshot.partition_id,
+                &mut record,
+                &state,
+                persist_mode,
+            )
+            .await?;
+            publish_compiled_plan(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                publisher,
+                &event,
+                &artifact,
+                plan,
+                state.context.clone().or_else(|| state.input.clone()),
+            )
+            .await?;
+        }
         WorkflowEvent::ActivityTaskCompleted {
             activity_id: step_id, attempt: _, output, ..
         } => {

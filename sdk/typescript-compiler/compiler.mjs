@@ -4,6 +4,8 @@ import path from "node:path";
 import process from "node:process";
 import ts from "typescript";
 
+const MAX_BULK_CHUNK_SIZE = 1024;
+
 function usage() {
   console.error(
     "usage: node sdk/typescript-compiler/compiler.mjs --entry <file> --export <name> --definition-id <id> --version <n> [--out <file>]",
@@ -466,6 +468,29 @@ class WorkflowLowerer {
     this.syntheticCounts = new Map();
     this.queries = {};
     this.updates = {};
+    this.childHandleVars = new Set();
+    this.bulkHandleVars = new Set();
+    this.discoverHandleDeclarations(workflowDeclaration.body);
+  }
+
+  discoverHandleDeclarations(node) {
+    const visit = (current) => {
+      if (
+        ts.isVariableDeclaration(current) &&
+        ts.isIdentifier(current.name) &&
+        current.initializer &&
+        ts.isAwaitExpression(current.initializer) &&
+        ts.isCallExpression(current.initializer.expression) &&
+        ts.isPropertyAccessExpression(current.initializer.expression.expression) &&
+        current.initializer.expression.expression.expression.getText() === "ctx"
+      ) {
+        const method = current.initializer.expression.expression.name.text;
+        if (method === "startChild") this.childHandleVars.add(current.name.text);
+        if (method === "bulkActivity") this.bulkHandleVars.add(current.name.text);
+      }
+      ts.forEachChild(current, visit);
+    };
+    visit(node);
   }
 
   nextId(prefix, node = null) {
@@ -893,12 +918,25 @@ class WorkflowLowerer {
       call.expression.name.text === "result" &&
       ts.isIdentifier(call.expression.expression)
     ) {
-      return this.addState("wait_child", {
-        type: "wait_for_child",
-        child_ref_var: call.expression.expression.text,
-        next: nextState,
-        output_var: targetVar ?? undefined,
-      }, awaitExpression);
+      const handleName = call.expression.expression.text;
+      if (this.childHandleVars.has(handleName)) {
+        return this.addState("wait_child", {
+          type: "wait_for_child",
+          child_ref_var: handleName,
+          next: nextState,
+          output_var: targetVar ?? undefined,
+        }, awaitExpression);
+      }
+      if (this.bulkHandleVars.has(handleName)) {
+        return this.addState("wait_bulk", {
+          type: "wait_for_bulk_activity",
+          bulk_ref_var: handleName,
+          next: nextState,
+          output_var: targetVar ?? undefined,
+          on_error: errorTarget ?? undefined,
+        }, awaitExpression);
+      }
+      throw compilerError(`unknown handle ${handleName}.result()`, awaitExpression);
     }
     if (!ts.isPropertyAccessExpression(call.expression) || call.expression.expression.getText() !== "ctx") {
       throw compilerError(
@@ -934,6 +972,7 @@ class WorkflowLowerer {
     }
     if (method === "startChild") {
       const options = call.arguments[2] ? compileChildOptions(call.arguments[2]) : {};
+      if (targetVar) this.childHandleVars.add(targetVar);
       return this.addState("start_child", {
         type: "start_child",
         child_definition_id: literalString(call.arguments[0], "ctx.startChild workflow name"),
@@ -943,6 +982,23 @@ class WorkflowLowerer {
         workflow_id: options.workflow_id,
         task_queue: options.task_queue,
         parent_close_policy: options.parent_close_policy ?? "TERMINATE",
+      }, awaitExpression);
+    }
+    if (method === "bulkActivity") {
+      const options = call.arguments[2] ? compileBulkOptions(call.arguments[2]) : {};
+      if (!targetVar) {
+        throw compilerError(`await ctx.bulkActivity(...) must be assigned to a handle variable`, awaitExpression);
+      }
+      this.bulkHandleVars.add(targetVar);
+      return this.addState("start_bulk", {
+        type: "start_bulk_activity",
+        activity_type: literalString(call.arguments[0], "ctx.bulkActivity handler"),
+        items: call.arguments[1] ? compileExpression(call.arguments[1]) : { kind: "literal", value: [] },
+        next: nextState,
+        handle_var: targetVar,
+        task_queue: options.task_queue,
+        chunk_size: options.chunk_size,
+        retry: options.retry,
       }, awaitExpression);
     }
     if (method === "sideEffect") {
@@ -1127,6 +1183,75 @@ function compileChildOptions(expression) {
   return options;
 }
 
+function compileBulkOptions(expression) {
+  if (!ts.isObjectLiteralExpression(expression)) {
+    throw compilerError(`ctx.bulkActivity options must be a static object`, expression);
+  }
+  const options = {};
+  for (const property of expression.properties) {
+    if (!ts.isPropertyAssignment(property)) {
+      throw compilerError(`unsupported bulkActivity option ${property.getText()}`, property);
+    }
+    const key = property.name.getText().replaceAll(/^["']|["']$/g, "");
+    if (key === "taskQueue") {
+      options.task_queue = compileExpression(property.initializer);
+      continue;
+    }
+    if (key === "chunkSize") {
+      if (!ts.isNumericLiteral(property.initializer)) {
+        throw compilerError(
+          `ctx.bulkActivity chunkSize must be a numeric literal`,
+          property.initializer,
+        );
+      }
+      const chunkSize = Number(property.initializer.text);
+      if (!Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > MAX_BULK_CHUNK_SIZE) {
+        throw compilerError(
+          `ctx.bulkActivity chunkSize must be between 1 and ${MAX_BULK_CHUNK_SIZE}`,
+          property.initializer,
+        );
+      }
+      options.chunk_size = chunkSize;
+      continue;
+    }
+    if (key === "retry") {
+      if (!ts.isObjectLiteralExpression(property.initializer)) {
+        throw compilerError(`ctx.bulkActivity retry must be a static object`, property.initializer);
+      }
+      const retry = {};
+      for (const retryProperty of property.initializer.properties) {
+        if (!ts.isPropertyAssignment(retryProperty)) {
+          throw compilerError(
+            `unsupported bulkActivity retry option ${retryProperty.getText()}`,
+            retryProperty,
+          );
+        }
+        const retryKey = retryProperty.name.getText().replaceAll(/^["']|["']$/g, "");
+        if (retryKey === "maxAttempts") {
+          if (!ts.isNumericLiteral(retryProperty.initializer)) {
+            throw compilerError(
+              `ctx.bulkActivity retry.maxAttempts must be a numeric literal`,
+              retryProperty.initializer,
+            );
+          }
+          retry.max_attempts = Number(retryProperty.initializer.text);
+        } else if (retryKey === "delay") {
+          retry.delay = literalString(
+            retryProperty.initializer,
+            "ctx.bulkActivity retry.delay",
+          );
+        } else {
+          throw compilerError(`unsupported bulkActivity retry option ${retryKey}`, retryProperty);
+        }
+      }
+      options.retry = retry;
+      continue;
+    }
+    throw compilerError(`unsupported bulkActivity option ${key}`, property);
+  }
+  return options;
+}
+
 function hashArtifact(artifact) {
   const clone = { ...artifact, artifact_hash: "" };
   return crypto
@@ -1227,6 +1352,10 @@ function validateCompiledState(state, validateExpression) {
     case "start_child":
       validateExpression(state.input);
       if (state.workflow_id) validateExpression(state.workflow_id);
+      if (state.task_queue) validateExpression(state.task_queue);
+      break;
+    case "start_bulk_activity":
+      validateExpression(state.items);
       if (state.task_queue) validateExpression(state.task_queue);
       break;
     case "succeed":

@@ -7,7 +7,7 @@ use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{ExecutionEmission, RetryPolicy, StepConfig};
+use crate::{ExecutionEmission, RetryPolicy, StepConfig, parse_timer_ref};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompiledWorkflowArtifact {
@@ -101,6 +101,26 @@ pub enum CompiledStateNode {
         retry: Option<RetryPolicy>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         config: Option<StepConfig>,
+    },
+    StartBulkActivity {
+        activity_type: String,
+        items: Expression,
+        next: String,
+        handle_var: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_queue: Option<Expression>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_size: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry: Option<RetryPolicy>,
+    },
+    WaitForBulkActivity {
+        bulk_ref_var: String,
+        next: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_var: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on_error: Option<ErrorTransition>,
     },
     WaitForAllActivities {
         fanout_ref_var: String,
@@ -286,6 +306,19 @@ struct FanOutExecutionState {
     pub inputs: Vec<Value>,
     pub pending_activity_ids: Vec<String>,
     pub results: Vec<Option<Value>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct BulkActivityExecutionState {
+    pub batch_id: String,
+    pub origin_state: String,
+    pub wait_state: String,
+    pub activity_type: String,
+    pub task_queue: String,
+    pub total_items: u32,
+    pub chunk_size: u32,
+    pub max_attempts: u32,
+    pub retry_delay_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -724,6 +757,115 @@ impl CompiledWorkflowArtifact {
         }
     }
 
+    pub fn execute_after_bulk_completion_with_turn(
+        &self,
+        wait_state: &str,
+        batch_id: &str,
+        summary: &Value,
+        mut execution_state: ArtifactExecutionState,
+        turn_context: ExecutionTurnContext,
+    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
+        execution_state.turn_context = Some(turn_context);
+        let states = self
+            .states_for(wait_state, &execution_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
+        let state = states
+            .get(wait_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
+        match state {
+            CompiledStateNode::WaitForBulkActivity { bulk_ref_var, next, output_var, .. } => {
+                let bulk = self.bulk_binding(wait_state, bulk_ref_var, &execution_state)?;
+                if bulk.batch_id != batch_id {
+                    return Err(CompiledWorkflowError::UnexpectedBulkBatch {
+                        expected: bulk.batch_id,
+                        received: batch_id.to_owned(),
+                    });
+                }
+                execution_state.bindings.remove(bulk_ref_var);
+                if let Some(output_var) = output_var {
+                    execution_state.bindings.insert(output_var.clone(), summary.clone());
+                }
+                self.execute_from_state_in_graph(states, next, execution_state, false)
+            }
+            _ => Err(CompiledWorkflowError::NotWaitingOnBulk(wait_state.to_owned())),
+        }
+    }
+
+    pub fn execute_after_bulk_failure_with_turn(
+        &self,
+        wait_state: &str,
+        batch_id: &str,
+        error: &Value,
+        mut execution_state: ArtifactExecutionState,
+        turn_context: ExecutionTurnContext,
+    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
+        execution_state.turn_context = Some(turn_context);
+        let states = self
+            .states_for(wait_state, &execution_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
+        let state = states
+            .get(wait_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
+        match state {
+            CompiledStateNode::WaitForBulkActivity { bulk_ref_var, on_error, .. } => {
+                let bulk = self.bulk_binding(wait_state, bulk_ref_var, &execution_state)?;
+                if bulk.batch_id != batch_id {
+                    return Err(CompiledWorkflowError::UnexpectedBulkBatch {
+                        expected: bulk.batch_id,
+                        received: batch_id.to_owned(),
+                    });
+                }
+                execution_state.bindings.remove(bulk_ref_var);
+                if let Some(on_error) = on_error {
+                    if let Some(error_var) = &on_error.error_var {
+                        execution_state.bindings.insert(error_var.clone(), error.clone());
+                    }
+                    return self.execute_from_state_in_graph(
+                        states,
+                        &on_error.next,
+                        execution_state,
+                        false,
+                    );
+                }
+                let reason = match error {
+                    Value::String(reason) => reason.clone(),
+                    other => serde_json::to_string(other)
+                        .unwrap_or_else(|_| "bulk batch failed".to_owned()),
+                };
+                if let Some(active_update) = execution_state.active_update.take() {
+                    let return_state = active_update.return_state;
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: return_state.clone(),
+                        emissions: vec![ExecutionEmission {
+                            event: WorkflowEvent::WorkflowUpdateRejected {
+                                update_id: active_update.update_id,
+                                update_name: active_update.update_name,
+                                error: reason.clone(),
+                            },
+                            state: Some(return_state),
+                        }],
+                        execution_state,
+                        context: Some(error.clone()),
+                        output: Some(error.clone()),
+                    });
+                }
+                Ok(CompiledExecutionPlan {
+                    workflow_version: self.definition_version,
+                    final_state: wait_state.to_owned(),
+                    emissions: vec![ExecutionEmission {
+                        event: WorkflowEvent::WorkflowFailed { reason },
+                        state: Some(wait_state.to_owned()),
+                    }],
+                    execution_state,
+                    context: Some(error.clone()),
+                    output: Some(error.clone()),
+                })
+            }
+            _ => Err(CompiledWorkflowError::NotWaitingOnBulk(wait_state.to_owned())),
+        }
+    }
+
     pub fn execute_after_step_completion(
         &self,
         step_state: &str,
@@ -1055,6 +1197,20 @@ impl CompiledWorkflowArtifact {
         })
     }
 
+    fn bulk_binding(
+        &self,
+        state_id: &str,
+        binding: &str,
+        execution_state: &ArtifactExecutionState,
+    ) -> Result<BulkActivityExecutionState, CompiledWorkflowError> {
+        execution_state.bindings.get(binding).and_then(decode_bulk_state).ok_or_else(|| {
+            CompiledWorkflowError::MissingBulkBinding {
+                state: state_id.to_owned(),
+                binding: binding.to_owned(),
+            }
+        })
+    }
+
     fn find_fanout_member(
         &self,
         execution_state: &ArtifactExecutionState,
@@ -1258,6 +1414,123 @@ impl CompiledWorkflowArtifact {
                     return Ok(CompiledExecutionPlan {
                         workflow_version: self.definition_version,
                         final_state: next.clone(),
+                        emissions,
+                        execution_state,
+                        context,
+                        output,
+                    });
+                }
+                CompiledStateNode::StartBulkActivity {
+                    activity_type,
+                    items,
+                    next,
+                    handle_var,
+                    task_queue,
+                    chunk_size,
+                    retry,
+                } => {
+                    let items = evaluate_expression(items, &mut execution_state, &self.helpers)?;
+                    let Value::Array(items) = items else {
+                        return Err(CompiledWorkflowError::InvalidBulkItems {
+                            state: current_state.clone(),
+                        });
+                    };
+                    let task_queue = task_queue
+                        .as_ref()
+                        .map(|expr| evaluate_expression(expr, &mut execution_state, &self.helpers))
+                        .transpose()?
+                        .and_then(|value| stringify_value(&value))
+                        .unwrap_or_else(|| "default".to_owned());
+                    let chunk_size = chunk_size.unwrap_or(256).clamp(1, MAX_BULK_CHUNK_SIZE);
+                    let max_attempts = retry.as_ref().map(|policy| policy.max_attempts).unwrap_or(1);
+                    let retry_delay_ms = retry
+                        .as_ref()
+                        .map(|policy| {
+                            parse_timer_ref(&policy.delay)
+                                .map(|duration| duration.num_milliseconds().max(0) as u64)
+                        })
+                        .transpose()
+                        .map_err(|error| CompiledWorkflowError::InvalidBulkRetryDelay {
+                            state: current_state.clone(),
+                            details: error.to_string(),
+                        })?
+                        .unwrap_or_default();
+                    let batch_id = build_bulk_batch_id(
+                        execution_state.turn_context.as_ref().ok_or_else(|| {
+                            CompiledWorkflowError::MissingTurnContext(
+                                "ctx.bulkActivity()".to_owned(),
+                            )
+                        })?,
+                        &current_state,
+                    );
+                    validate_bulk_items(&current_state, &items, chunk_size as usize)?;
+                    if items.is_empty() {
+                        let wait_state = states
+                            .get(next)
+                            .ok_or_else(|| CompiledWorkflowError::UnknownState(next.clone()))?;
+                        if let CompiledStateNode::WaitForBulkActivity {
+                            bulk_ref_var,
+                            next: after_wait,
+                            output_var,
+                            ..
+                        } = wait_state
+                        {
+                            execution_state.bindings.remove(bulk_ref_var);
+                            if let Some(output_var) = output_var {
+                                execution_state.bindings.insert(
+                                    output_var.clone(),
+                                    bulk_success_summary(&batch_id, 0, 0, 0, 0, 0),
+                                );
+                            }
+                            current_state = after_wait.clone();
+                            continue;
+                        }
+                        return Err(CompiledWorkflowError::NotWaitingOnBulk(next.clone()));
+                    }
+                    let total_items = items_len_to_u32(items.len())?;
+                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+                    emissions.push(ExecutionEmission {
+                        event: WorkflowEvent::BulkActivityBatchScheduled {
+                            batch_id: batch_id.clone(),
+                            activity_type: activity_type.clone(),
+                            task_queue: task_queue.clone(),
+                            items: items.clone(),
+                            chunk_size,
+                            max_attempts,
+                            retry_delay_ms,
+                            state: Some(next.clone()),
+                        },
+                        state: Some(next.clone()),
+                    });
+                    execution_state.bindings.insert(
+                        handle_var.clone(),
+                        serde_json::to_value(BulkActivityExecutionState {
+                            batch_id,
+                            origin_state: current_state.clone(),
+                            wait_state: next.clone(),
+                            activity_type: activity_type.clone(),
+                            task_queue,
+                            total_items,
+                            chunk_size,
+                            max_attempts,
+                            retry_delay_ms,
+                        })
+                        .expect("bulk execution state serializes"),
+                    );
+                    context = Some(Value::Array(items));
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: next.clone(),
+                        emissions,
+                        execution_state,
+                        context,
+                        output,
+                    });
+                }
+                CompiledStateNode::WaitForBulkActivity { .. } => {
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: current_state,
                         emissions,
                         execution_state,
                         context,
@@ -1493,6 +1766,10 @@ impl CompiledStateNode {
                 .chain(on_error.iter().map(|transition| transition.next.as_str()))
                 .collect(),
             Self::FanOut { next, .. } => vec![next.as_str()],
+            Self::StartBulkActivity { next, .. } => vec![next.as_str()],
+            Self::WaitForBulkActivity { next, on_error, .. } => std::iter::once(next.as_str())
+                .chain(on_error.iter().map(|transition| transition.next.as_str()))
+                .collect(),
             Self::WaitForAllActivities { next, on_error, .. } => std::iter::once(next.as_str())
                 .chain(on_error.iter().map(|transition| transition.next.as_str()))
                 .collect(),
@@ -1518,6 +1795,11 @@ impl ParentClosePolicy {
 }
 
 const FANOUT_ACTIVITY_SEPARATOR: &str = "::";
+const MAX_BULK_ITEMS_PER_BATCH: usize = 100_000;
+const MAX_BULK_ITEM_BYTES: usize = 256 * 1024;
+const MAX_BULK_TOTAL_INPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BULK_CHUNK_SIZE: u32 = 1024;
+const MAX_BULK_CHUNK_INPUT_BYTES: usize = 1024 * 1024;
 
 fn build_child_id(turn_context: &ExecutionTurnContext, state_id: &str) -> String {
     uuid::Uuid::new_v5(
@@ -1531,6 +1813,85 @@ fn extract_child_id(value: &Value) -> Option<String> {
     value.get("child_id").and_then(Value::as_str).map(str::to_owned)
 }
 
+fn build_bulk_batch_id(turn_context: &ExecutionTurnContext, state_id: &str) -> String {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("{}:{state_id}:bulk", turn_context.event_id).as_bytes(),
+    )
+    .to_string()
+}
+
+fn bulk_success_summary(
+    batch_id: &str,
+    total_items: u32,
+    succeeded_items: u32,
+    failed_items: u32,
+    cancelled_items: u32,
+    chunk_count: u32,
+) -> Value {
+    serde_json::json!({
+        "batchId": batch_id,
+        "status": "completed",
+        "totalItems": total_items,
+        "succeededItems": succeeded_items,
+        "failedItems": failed_items,
+        "cancelledItems": cancelled_items,
+        "chunkCount": chunk_count,
+        "resultHandle": { "batchId": batch_id },
+    })
+}
+
+fn validate_bulk_items(
+    state: &str,
+    items: &[Value],
+    chunk_size: usize,
+) -> Result<(), CompiledWorkflowError> {
+    if items.len() > MAX_BULK_ITEMS_PER_BATCH {
+        return Err(CompiledWorkflowError::BulkItemLimitExceeded {
+            state: state.to_owned(),
+            count: items.len(),
+            max: MAX_BULK_ITEMS_PER_BATCH,
+        });
+    }
+
+    let mut total_bytes = 0usize;
+    let mut current_chunk_bytes = 0usize;
+    for (index, item) in items.iter().enumerate() {
+        let item_bytes = serde_json::to_vec(item).map(|bytes| bytes.len()).unwrap_or_default();
+        if item_bytes > MAX_BULK_ITEM_BYTES {
+            return Err(CompiledWorkflowError::BulkItemTooLarge {
+                state: state.to_owned(),
+                index,
+                bytes: item_bytes,
+                max: MAX_BULK_ITEM_BYTES,
+            });
+        }
+        total_bytes = total_bytes.saturating_add(item_bytes);
+        if total_bytes > MAX_BULK_TOTAL_INPUT_BYTES {
+            return Err(CompiledWorkflowError::BulkInputTooLarge {
+                state: state.to_owned(),
+                bytes: total_bytes,
+                max: MAX_BULK_TOTAL_INPUT_BYTES,
+            });
+        }
+
+        if index % chunk_size == 0 {
+            current_chunk_bytes = 0;
+        }
+        current_chunk_bytes = current_chunk_bytes.saturating_add(item_bytes);
+        if current_chunk_bytes > MAX_BULK_CHUNK_INPUT_BYTES {
+            return Err(CompiledWorkflowError::BulkChunkTooLarge {
+                state: state.to_owned(),
+                chunk_index: index / chunk_size,
+                bytes: current_chunk_bytes,
+                max: MAX_BULK_CHUNK_INPUT_BYTES,
+            });
+        }
+    }
+
+    Ok(())
+}
+
 fn build_fanout_activity_id(state_id: &str, index: usize) -> String {
     format!("{state_id}{FANOUT_ACTIVITY_SEPARATOR}{index}")
 }
@@ -1542,6 +1903,14 @@ fn parse_fanout_activity_id(activity_id: &str) -> Option<(String, usize)> {
 
 fn decode_fanout_state(value: &Value) -> Option<FanOutExecutionState> {
     serde_json::from_value(value.clone()).ok()
+}
+
+fn decode_bulk_state(value: &Value) -> Option<BulkActivityExecutionState> {
+    serde_json::from_value(value.clone()).ok()
+}
+
+fn items_len_to_u32(len: usize) -> Result<u32, CompiledWorkflowError> {
+    u32::try_from(len).map_err(|_| CompiledWorkflowError::BulkItemsTooLarge { count: len })
 }
 
 pub fn evaluate_expression(
@@ -1823,6 +2192,26 @@ pub enum CompiledWorkflowError {
     UnexpectedFanOutActivity { state: String, activity_id: String },
     #[error("compiled workflow activity id {0} is not a valid fan-out member id")]
     InvalidFanOutActivityId(String),
+    #[error("compiled workflow state {0} is not waiting on a bulk activity")]
+    NotWaitingOnBulk(String),
+    #[error("compiled workflow state {state} evaluated bulk items to a non-array value")]
+    InvalidBulkItems { state: String },
+    #[error("compiled workflow state {state} is missing bulk binding {binding}")]
+    MissingBulkBinding { state: String, binding: String },
+    #[error("unexpected bulk batch completion, expected {expected}, received {received}")]
+    UnexpectedBulkBatch { expected: String, received: String },
+    #[error("compiled workflow state {state} has invalid bulk retry delay: {details}")]
+    InvalidBulkRetryDelay { state: String, details: String },
+    #[error("compiled workflow bulk activity item count {count} exceeds u32")]
+    BulkItemsTooLarge { count: usize },
+    #[error("compiled workflow state {state} exceeded bulk item count limit {max} with {count} items")]
+    BulkItemLimitExceeded { state: String, count: usize, max: usize },
+    #[error("compiled workflow state {state} bulk item {index} serialized to {bytes} bytes, over limit {max}")]
+    BulkItemTooLarge { state: String, index: usize, bytes: usize, max: usize },
+    #[error("compiled workflow state {state} bulk input serialized to {bytes} bytes, over limit {max}")]
+    BulkInputTooLarge { state: String, bytes: usize, max: usize },
+    #[error("compiled workflow state {state} bulk chunk {chunk_index} serialized to {bytes} bytes, over limit {max}")]
+    BulkChunkTooLarge { state: String, chunk_index: usize, bytes: usize, max: usize },
     #[error("compiled workflow state {0} is not waiting on a child")]
     NotWaitingOnChild(String),
     #[error("unexpected child completion, expected {expected}, received {received}")]
@@ -2024,6 +2413,65 @@ mod tests {
         };
         let mut artifact = CompiledWorkflowArtifact::new(
             "fanout-demo",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            workflow,
+        );
+        artifact.artifact_hash = artifact.hash();
+        artifact
+    }
+
+    fn bulk_artifact() -> CompiledWorkflowArtifact {
+        let workflow = CompiledWorkflow {
+            initial_state: "dispatch".to_owned(),
+            states: BTreeMap::from([
+                (
+                    "dispatch".to_owned(),
+                    CompiledStateNode::StartBulkActivity {
+                        activity_type: "benchmark.echo".to_owned(),
+                        items: Expression::Member {
+                            object: Box::new(Expression::Identifier { name: "input".to_owned() }),
+                            property: "items".to_owned(),
+                        },
+                        next: "join".to_owned(),
+                        handle_var: "bulk".to_owned(),
+                        task_queue: None,
+                        chunk_size: Some(2),
+                        retry: Some(RetryPolicy {
+                            max_attempts: 2,
+                            delay: "1s".to_owned(),
+                        }),
+                    },
+                ),
+                (
+                    "join".to_owned(),
+                    CompiledStateNode::WaitForBulkActivity {
+                        bulk_ref_var: "bulk".to_owned(),
+                        next: "done".to_owned(),
+                        output_var: Some("summary".to_owned()),
+                        on_error: Some(ErrorTransition {
+                            next: "fail".to_owned(),
+                            error_var: Some("error".to_owned()),
+                        }),
+                    },
+                ),
+                (
+                    "done".to_owned(),
+                    CompiledStateNode::Succeed {
+                        output: Some(Expression::Identifier { name: "summary".to_owned() }),
+                    },
+                ),
+                (
+                    "fail".to_owned(),
+                    CompiledStateNode::Fail {
+                        reason: Some(Expression::Identifier { name: "error".to_owned() }),
+                    },
+                ),
+            ]),
+        };
+        let mut artifact = CompiledWorkflowArtifact::new(
+            "bulk-demo",
             1,
             "test",
             ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
@@ -2366,5 +2814,148 @@ mod tests {
             artifact.reschedule_state_for_activity("dispatch::1", &plan.execution_state).as_deref(),
             Some("join")
         );
+    }
+
+    #[test]
+    fn bulk_empty_input_short_circuits_without_emitting_schedule_event() {
+        let artifact = bulk_artifact();
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"items": []}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(plan.final_state, "done");
+        assert_eq!(plan.emissions.len(), 2);
+        let output = match &plan.emissions[1].event {
+            WorkflowEvent::WorkflowCompleted { output } => output,
+            other => panic!("expected workflow completion, got {other:?}"),
+        };
+        let batch_id = output["batchId"].as_str().unwrap();
+        assert_eq!(
+            output,
+            &serde_json::json!({
+                "batchId": batch_id,
+                "status": "completed",
+                "totalItems": 0,
+                "succeededItems": 0,
+                "failedItems": 0,
+                "cancelledItems": 0,
+                "chunkCount": 0,
+                "resultHandle": { "batchId": batch_id },
+            })
+        );
+    }
+
+    #[test]
+    fn bulk_wait_state_resumes_with_summary() {
+        let artifact = bulk_artifact();
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"items": [{"value": 1}, {"value": 2}, {"value": 3}]}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+                        .unwrap(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        let batch_id = plan
+            .emissions
+            .iter()
+            .find_map(|emission| match &emission.event {
+                WorkflowEvent::BulkActivityBatchScheduled { batch_id, .. } => Some(batch_id.clone()),
+                _ => None,
+            })
+            .expect("expected bulk schedule event");
+        let resumed = artifact
+            .execute_after_bulk_completion_with_turn(
+                "join",
+                &batch_id,
+                &serde_json::json!({
+                    "batchId": batch_id,
+                    "status": "completed",
+                    "totalItems": 3,
+                    "succeededItems": 3,
+                    "failedItems": 0,
+                    "cancelledItems": 0,
+                    "chunkCount": 2,
+                    "resultHandle": { "batchId": batch_id },
+                }),
+                plan.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_100).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(resumed.final_state, "done");
+        assert!(matches!(
+            resumed.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output["succeededItems"] == json!(3)
+        ));
+    }
+
+    #[test]
+    fn bulk_failure_uses_error_transition() {
+        let artifact = bulk_artifact();
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"items": [{"value": 1}, {"value": 2}]}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::parse_str("bbbbbbbb-cccc-dddd-eeee-ffffffffffff")
+                        .unwrap(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        let batch_id = plan
+            .emissions
+            .iter()
+            .find_map(|emission| match &emission.event {
+                WorkflowEvent::BulkActivityBatchScheduled { batch_id, .. } => Some(batch_id.clone()),
+                _ => None,
+            })
+            .expect("expected bulk schedule event");
+        let failed = artifact
+            .execute_after_bulk_failure_with_turn(
+                "join",
+                &batch_id,
+                &json!({
+                    "batchId": batch_id,
+                    "status": "failed",
+                    "message": "boom",
+                    "totalItems": 2,
+                    "succeededItems": 0,
+                    "failedItems": 2,
+                    "cancelledItems": 0,
+                    "chunkCount": 1,
+                }),
+                plan.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_100).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(failed.final_state, "fail");
+        assert!(matches!(
+            failed.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowFailed { reason },
+                ..
+            }) if reason.contains("boom")
+        ));
     }
 }

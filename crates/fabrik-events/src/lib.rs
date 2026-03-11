@@ -177,6 +177,43 @@ pub enum WorkflowEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<Value>,
     },
+    BulkActivityBatchScheduled {
+        batch_id: String,
+        activity_type: String,
+        task_queue: String,
+        items: Vec<Value>,
+        chunk_size: u32,
+        max_attempts: u32,
+        retry_delay_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<String>,
+    },
+    BulkActivityBatchCompleted {
+        batch_id: String,
+        total_items: u32,
+        succeeded_items: u32,
+        failed_items: u32,
+        cancelled_items: u32,
+        chunk_count: u32,
+    },
+    BulkActivityBatchFailed {
+        batch_id: String,
+        total_items: u32,
+        succeeded_items: u32,
+        failed_items: u32,
+        cancelled_items: u32,
+        chunk_count: u32,
+        message: String,
+    },
+    BulkActivityBatchCancelled {
+        batch_id: String,
+        total_items: u32,
+        succeeded_items: u32,
+        failed_items: u32,
+        cancelled_items: u32,
+        chunk_count: u32,
+        message: String,
+    },
     WorkflowContinuedAsNew {
         new_run_id: String,
         input: Value,
@@ -284,6 +321,10 @@ impl WorkflowEvent {
             Self::ActivityTaskFailed { .. } => "ActivityTaskFailed",
             Self::ActivityTaskTimedOut { .. } => "ActivityTaskTimedOut",
             Self::ActivityTaskCancelled { .. } => "ActivityTaskCancelled",
+            Self::BulkActivityBatchScheduled { .. } => "BulkActivityBatchScheduled",
+            Self::BulkActivityBatchCompleted { .. } => "BulkActivityBatchCompleted",
+            Self::BulkActivityBatchFailed { .. } => "BulkActivityBatchFailed",
+            Self::BulkActivityBatchCancelled { .. } => "BulkActivityBatchCancelled",
             Self::WorkflowContinuedAsNew { .. } => "WorkflowContinuedAsNew",
             Self::SignalQueued { .. } => "SignalQueued",
             Self::SignalReceived { .. } => "SignalReceived",
@@ -326,6 +367,9 @@ pub fn workflow_turn_routing(payload: &WorkflowEvent) -> WorkflowTurnRouting {
         | WorkflowEvent::ActivityTaskFailed { .. }
         | WorkflowEvent::ActivityTaskTimedOut { .. }
         | WorkflowEvent::ActivityTaskCancelled { .. }
+        | WorkflowEvent::BulkActivityBatchCompleted { .. }
+        | WorkflowEvent::BulkActivityBatchFailed { .. }
+        | WorkflowEvent::BulkActivityBatchCancelled { .. }
         | WorkflowEvent::ChildWorkflowCompleted { .. }
         | WorkflowEvent::ChildWorkflowFailed { .. }
         | WorkflowEvent::ChildWorkflowCancelled { .. }

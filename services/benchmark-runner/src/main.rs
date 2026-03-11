@@ -27,6 +27,13 @@ struct BenchmarkProfile {
     activities_per_workflow: usize,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ExecutionMode {
+    Durable,
+    Throughput,
+}
+
 #[derive(Debug)]
 struct Args {
     profile_name: String,
@@ -38,6 +45,7 @@ struct Args {
     cancel_rate: f64,
     tenant_id: String,
     task_queue: String,
+    execution_mode: ExecutionMode,
     timeout: Duration,
 }
 
@@ -56,11 +64,14 @@ struct BenchmarkReport {
     cancel_rate: f64,
     definition_id: String,
     task_queue: String,
+    execution_mode: ExecutionMode,
     instance_prefix: String,
     workflow_outcomes: WorkflowOutcomeMetrics,
     activity_metrics: ActivityMetrics,
     coalescing_metrics: CoalescingMetrics,
     backlog_metrics: BacklogMetrics,
+    bulk_batch_rows: u64,
+    bulk_chunk_rows: u64,
     executor_debug: Value,
 }
 
@@ -147,7 +158,12 @@ async fn main() -> Result<()> {
         &client,
         &ingest_base,
         &args.tenant_id,
-        &benchmark_artifact(&definition_id, &args.task_queue, args.retry_rate > 0.0),
+        &benchmark_artifact(
+            &definition_id,
+            &args.task_queue,
+            args.retry_rate > 0.0,
+            args.execution_mode,
+        ),
     )
     .await?;
 
@@ -206,9 +222,12 @@ async fn main() -> Result<()> {
         &instance_prefix,
         duration_ms,
         args.profile.workflow_count * args.profile.activities_per_workflow,
+        args.execution_mode,
     )
     .await?;
     let coalescing_metrics = coalescing_metrics(&pool, &args.tenant_id, &instance_prefix).await?;
+    let (bulk_batch_rows, bulk_chunk_rows) =
+        bulk_metrics(&pool, &args.tenant_id, &instance_prefix).await?;
     let (final_workflow_backlog, final_activity_backlog) =
         backlog_snapshot(&pool, &args.tenant_id, &instance_prefix).await?;
     let executor_debug = client
@@ -236,6 +255,7 @@ async fn main() -> Result<()> {
         cancel_rate: args.cancel_rate,
         definition_id,
         task_queue: args.task_queue.clone(),
+        execution_mode: args.execution_mode,
         instance_prefix,
         workflow_outcomes,
         activity_metrics,
@@ -246,6 +266,8 @@ async fn main() -> Result<()> {
             max_workflow_backlog,
             max_activity_backlog,
         },
+        bulk_batch_rows,
+        bulk_chunk_rows,
         executor_debug,
     };
 
@@ -264,6 +286,7 @@ fn parse_args() -> Result<Args> {
     let mut cancel_rate = 0.0_f64;
     let mut tenant_id = "benchmark".to_owned();
     let mut task_queue = "default".to_owned();
+    let mut execution_mode = ExecutionMode::Durable;
     let mut timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
     let mut workflow_count = None;
     let mut activities_per_workflow = None;
@@ -280,6 +303,13 @@ fn parse_args() -> Result<Args> {
             "--cancel-rate" => cancel_rate = value.parse().context("invalid --cancel-rate")?,
             "--tenant-id" => tenant_id = value,
             "--task-queue" => task_queue = value,
+            "--execution-mode" => {
+                execution_mode = match value.as_str() {
+                    "durable" => ExecutionMode::Durable,
+                    "throughput" => ExecutionMode::Throughput,
+                    other => bail!("unknown --execution-mode {other}; expected durable or throughput"),
+                }
+            }
             "--timeout-secs" => {
                 timeout = Duration::from_secs(value.parse().context("invalid --timeout-secs")?)
             }
@@ -320,6 +350,7 @@ fn parse_args() -> Result<Args> {
         cancel_rate,
         tenant_id,
         task_queue,
+        execution_mode,
         timeout,
     })
 }
@@ -328,35 +359,79 @@ fn benchmark_artifact(
     definition_id: &str,
     task_queue: &str,
     enable_retry: bool,
+    execution_mode: ExecutionMode,
 ) -> CompiledWorkflowArtifact {
     let mut states = BTreeMap::new();
-    states.insert(
-        "dispatch".to_owned(),
-        CompiledStateNode::FanOut {
-            activity_type: "benchmark.echo".to_owned(),
-            items: Expression::Member {
-                object: Box::new(Expression::Identifier { name: "input".to_owned() }),
-                property: "items".to_owned(),
-            },
-            next: "join".to_owned(),
-            handle_var: "fanout".to_owned(),
-            task_queue: Some(Expression::Literal { value: Value::String(task_queue.to_owned()) }),
-            retry: enable_retry.then_some(RetryPolicy { max_attempts: 2, delay: "1s".to_owned() }),
-            config: None,
-        },
-    );
-    states.insert(
-        "join".to_owned(),
-        CompiledStateNode::WaitForAllActivities {
-            fanout_ref_var: "fanout".to_owned(),
-            next: "done".to_owned(),
-            output_var: Some("results".to_owned()),
-            on_error: Some(ErrorTransition {
-                next: "fail".to_owned(),
-                error_var: Some("error".to_owned()),
-            }),
-        },
-    );
+    match execution_mode {
+        ExecutionMode::Durable => {
+            states.insert(
+                "dispatch".to_owned(),
+                CompiledStateNode::FanOut {
+                    activity_type: "benchmark.echo".to_owned(),
+                    items: Expression::Member {
+                        object: Box::new(Expression::Identifier { name: "input".to_owned() }),
+                        property: "items".to_owned(),
+                    },
+                    next: "join".to_owned(),
+                    handle_var: "fanout".to_owned(),
+                    task_queue: Some(Expression::Literal {
+                        value: Value::String(task_queue.to_owned()),
+                    }),
+                    retry: enable_retry.then_some(RetryPolicy {
+                        max_attempts: 2,
+                        delay: "1s".to_owned(),
+                    }),
+                    config: None,
+                },
+            );
+            states.insert(
+                "join".to_owned(),
+                CompiledStateNode::WaitForAllActivities {
+                    fanout_ref_var: "fanout".to_owned(),
+                    next: "done".to_owned(),
+                    output_var: Some("results".to_owned()),
+                    on_error: Some(ErrorTransition {
+                        next: "fail".to_owned(),
+                        error_var: Some("error".to_owned()),
+                    }),
+                },
+            );
+        }
+        ExecutionMode::Throughput => {
+            states.insert(
+                "dispatch".to_owned(),
+                CompiledStateNode::StartBulkActivity {
+                    activity_type: "benchmark.echo".to_owned(),
+                    items: Expression::Member {
+                        object: Box::new(Expression::Identifier { name: "input".to_owned() }),
+                        property: "items".to_owned(),
+                    },
+                    next: "join".to_owned(),
+                    handle_var: "fanout".to_owned(),
+                    task_queue: Some(Expression::Literal {
+                        value: Value::String(task_queue.to_owned()),
+                    }),
+                    chunk_size: Some(256),
+                    retry: enable_retry.then_some(RetryPolicy {
+                        max_attempts: 2,
+                        delay: "1s".to_owned(),
+                    }),
+                },
+            );
+            states.insert(
+                "join".to_owned(),
+                CompiledStateNode::WaitForBulkActivity {
+                    bulk_ref_var: "fanout".to_owned(),
+                    next: "done".to_owned(),
+                    output_var: Some("results".to_owned()),
+                    on_error: Some(ErrorTransition {
+                        next: "fail".to_owned(),
+                        error_var: Some("error".to_owned()),
+                    }),
+                },
+            );
+        }
+    }
     states.insert(
         "done".to_owned(),
         CompiledStateNode::Succeed {
@@ -488,7 +563,42 @@ async fn activity_metrics(
     instance_prefix: &str,
     duration_ms: u128,
     total_activities: usize,
+    execution_mode: ExecutionMode,
 ) -> Result<ActivityMetrics> {
+    if execution_mode == ExecutionMode::Throughput {
+        let row = sqlx::query_as::<_, (i64, i64, i64)>(
+            r#"
+            SELECT
+                COALESCE(SUM(succeeded_items), 0) AS completed,
+                COALESCE(SUM(failed_items), 0) AS failed,
+                COALESCE(SUM(cancelled_items), 0) AS cancelled
+            FROM workflow_bulk_batches
+            WHERE tenant_id = $1 AND workflow_instance_id LIKE $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(format!("{instance_prefix}%"))
+        .fetch_one(pool)
+        .await
+        .context("failed to query bulk activity metrics")?;
+        let throughput = if duration_ms == 0 {
+            0.0
+        } else {
+            total_activities as f64 / (duration_ms as f64 / 1_000.0)
+        };
+        return Ok(ActivityMetrics {
+            completed: row.0 as u64,
+            failed: row.1 as u64,
+            cancelled: row.2 as u64,
+            timed_out: 0,
+            avg_schedule_to_start_latency_ms: 0.0,
+            max_schedule_to_start_latency_ms: 0,
+            avg_start_to_close_latency_ms: 0.0,
+            max_start_to_close_latency_ms: 0,
+            throughput_activities_per_second: throughput,
+        });
+    }
+
     let row = sqlx::query_as::<_, ActivityMetricRow>(
         r#"
         SELECT
@@ -531,6 +641,26 @@ async fn activity_metrics(
         max_start_to_close_latency_ms: row.max_start_to_close_latency_ms.unwrap_or(0.0) as u64,
         throughput_activities_per_second: throughput,
     })
+}
+
+async fn bulk_metrics(pool: &PgPool, tenant_id: &str, instance_prefix: &str) -> Result<(u64, u64)> {
+    let row = sqlx::query_as::<_, (i64, i64)>(
+        r#"
+        SELECT
+            (SELECT COUNT(*)
+             FROM workflow_bulk_batches
+             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2) AS batch_rows,
+            (SELECT COUNT(*)
+             FROM workflow_bulk_chunks
+             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2) AS chunk_rows
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(format!("{instance_prefix}%"))
+    .fetch_one(pool)
+    .await
+    .context("failed to query bulk benchmark metrics")?;
+    Ok((row.0 as u64, row.1 as u64))
 }
 
 async fn coalescing_metrics(
@@ -590,11 +720,24 @@ async fn backlog_snapshot(
     .context("failed to query workflow backlog")?;
     let activity_backlog = sqlx::query_scalar::<_, i64>(
         r#"
-        SELECT COUNT(*)
-        FROM workflow_activities
-        WHERE tenant_id = $1
-          AND workflow_instance_id LIKE $2
-          AND status = 'scheduled'
+        SELECT
+            (SELECT COUNT(*)
+             FROM workflow_activities
+             WHERE tenant_id = $1
+               AND workflow_instance_id LIKE $2
+               AND status = 'scheduled')
+            +
+            (SELECT COUNT(*)
+             FROM workflow_bulk_chunks chunks
+             JOIN workflow_bulk_batches batches
+               ON batches.tenant_id = chunks.tenant_id
+              AND batches.workflow_instance_id = chunks.workflow_instance_id
+              AND batches.run_id = chunks.run_id
+              AND batches.batch_id = chunks.batch_id
+             WHERE chunks.tenant_id = $1
+               AND chunks.workflow_instance_id LIKE $2
+               AND chunks.status = 'scheduled'
+               AND batches.status IN ('scheduled', 'running'))
         "#,
     )
     .bind(tenant_id)
@@ -624,8 +767,12 @@ fn write_report(output_path: &Path, report: &BenchmarkReport) -> Result<()> {
 
 fn summary_text(report: &BenchmarkReport) -> String {
     format!(
-        "profile={profile}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n",
+        "profile={profile}\nexecution_mode={execution_mode}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n",
         profile = report.profile,
+        execution_mode = match report.execution_mode {
+            ExecutionMode::Durable => "durable",
+            ExecutionMode::Throughput => "throughput",
+        },
         workflows = report.workflow_count,
         activities_per_workflow = report.activities_per_workflow,
         total_activities = report.total_activities,
@@ -636,6 +783,8 @@ fn summary_text(report: &BenchmarkReport) -> String {
         workflow_task_rows = report.coalescing_metrics.workflow_task_rows,
         resume_rows = report.coalescing_metrics.resume_rows,
         resume_ratio = report.coalescing_metrics.resume_events_per_task_row,
+        bulk_batch_rows = report.bulk_batch_rows,
+        bulk_chunk_rows = report.bulk_chunk_rows,
         max_workflow_backlog = report.backlog_metrics.max_workflow_backlog,
         max_activity_backlog = report.backlog_metrics.max_activity_backlog,
         final_workflow_backlog = report.backlog_metrics.final_workflow_backlog,

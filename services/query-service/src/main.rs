@@ -14,8 +14,9 @@ use fabrik_config::{HttpServiceConfig, PostgresConfig, QueryRuntimeConfig, Redpa
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
-    QueryRetentionCutoffs, QueryRetentionPruneResult, WorkflowActivityRecord, WorkflowRunRecord,
-    WorkflowSignalRecord, WorkflowStateSnapshot, WorkflowStore,
+    QueryRetentionCutoffs, QueryRetentionPruneResult, WorkflowActivityRecord,
+    WorkflowBulkBatchRecord, WorkflowBulkChunkRecord, WorkflowRunRecord, WorkflowSignalRecord,
+    WorkflowStateSnapshot, WorkflowStore,
 };
 use fabrik_workflow::{
     CompiledWorkflowArtifact, ReplayDivergence, ReplayDivergenceKind, ReplayFieldMismatch,
@@ -110,6 +111,46 @@ struct WorkflowActivitiesResponse {
     page: PageInfo,
     activity_count: usize,
     activities: Vec<WorkflowActivityRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowBulkBatchesResponse {
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    page: PageInfo,
+    batch_count: usize,
+    batches: Vec<WorkflowBulkBatchRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowBulkBatchResponse {
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    batch: WorkflowBulkBatchRecord,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowBulkChunksResponse {
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    batch_id: String,
+    page: PageInfo,
+    chunk_count: usize,
+    chunks: Vec<WorkflowBulkChunkRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowBulkResultsResponse {
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    batch_id: String,
+    page: PageInfo,
+    chunk_count: usize,
+    chunks: Vec<WorkflowBulkChunkRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -272,6 +313,22 @@ async fn main() -> Result<()> {
     .route(
         "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/signals",
         get(get_workflow_signals_for_run),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/bulk-batches",
+        get(get_workflow_bulk_batches_for_run),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/bulk-batches/{batch_id}",
+        get(get_workflow_bulk_batch_for_run),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/bulk-batches/{batch_id}/chunks",
+        get(get_workflow_bulk_chunks_for_run),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/bulk-batches/{batch_id}/results",
+        get(get_workflow_bulk_results_for_run),
     )
     .route(
         "/tenants/{tenant_id}/workflows/{instance_id}/history",
@@ -538,6 +595,67 @@ async fn get_workflow_activities_for_run(
     Ok(Json(response))
 }
 
+async fn get_workflow_bulk_batches_for_run(
+    Path((tenant_id, instance_id, run_id)): Path<(String, String, String)>,
+    Query(pagination): Query<PaginationQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowBulkBatchesResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let response =
+        load_workflow_bulk_batches(&state, &tenant_id, &instance_id, &run_id, pagination)
+            .await
+            .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+async fn get_workflow_bulk_batch_for_run(
+    Path((tenant_id, instance_id, run_id, batch_id)): Path<(String, String, String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowBulkBatchResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let batch = state
+        .store
+        .get_bulk_batch(&tenant_id, &instance_id, &run_id, &batch_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| not_found(format!("bulk batch {batch_id} not found")))?;
+    Ok(Json(WorkflowBulkBatchResponse { tenant_id, instance_id, run_id, batch }))
+}
+
+async fn get_workflow_bulk_chunks_for_run(
+    Path((tenant_id, instance_id, run_id, batch_id)): Path<(String, String, String, String)>,
+    Query(pagination): Query<PaginationQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowBulkChunksResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let response = load_workflow_bulk_chunks(
+        &state,
+        &tenant_id,
+        &instance_id,
+        &run_id,
+        &batch_id,
+        pagination,
+    )
+    .await
+    .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+async fn get_workflow_bulk_results_for_run(
+    Path((tenant_id, instance_id, run_id, batch_id)): Path<(String, String, String, String)>,
+    Query(pagination): Query<PaginationQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowBulkResultsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let response = load_workflow_bulk_results(
+        &state,
+        &tenant_id,
+        &instance_id,
+        &run_id,
+        &batch_id,
+        pagination,
+    )
+    .await
+    .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
 async fn get_workflow_signals_for_run(
     Path((tenant_id, instance_id, run_id)): Path<(String, String, String)>,
     Query(pagination): Query<PaginationQuery>,
@@ -720,6 +838,109 @@ async fn load_workflow_activities(
         page: build_page_info(&page, total, activities.len()),
         activity_count: total,
         activities,
+    })
+}
+
+async fn load_workflow_bulk_batches(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    pagination: PaginationQuery,
+) -> Result<WorkflowBulkBatchesResponse> {
+    let page = resolve_page(&state.query, &pagination);
+    let total = state.store.count_bulk_batches_for_run(tenant_id, instance_id, run_id).await?
+        as usize;
+    let batches = state
+        .store
+        .list_bulk_batches_for_run_page(
+            tenant_id,
+            instance_id,
+            run_id,
+            i64::try_from(page.limit).context("bulk batch page limit exceeds i64")?,
+            i64::try_from(page.offset).context("bulk batch page offset exceeds i64")?,
+        )
+        .await?;
+    Ok(WorkflowBulkBatchesResponse {
+        tenant_id: tenant_id.to_owned(),
+        instance_id: instance_id.to_owned(),
+        run_id: run_id.to_owned(),
+        page: build_page_info(&page, total, batches.len()),
+        batch_count: total,
+        batches,
+    })
+}
+
+async fn load_workflow_bulk_chunks(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    batch_id: &str,
+    pagination: PaginationQuery,
+) -> Result<WorkflowBulkChunksResponse> {
+    let page = resolve_page(&state.query, &pagination);
+    let total = state
+        .store
+        .count_bulk_chunks_for_batch(tenant_id, instance_id, run_id, batch_id)
+        .await? as usize;
+    let chunks = state
+        .store
+        .list_bulk_chunks_for_batch_page(
+            tenant_id,
+            instance_id,
+            run_id,
+            batch_id,
+            i64::try_from(page.limit).context("bulk chunk page limit exceeds i64")?,
+            i64::try_from(page.offset).context("bulk chunk page offset exceeds i64")?,
+        )
+        .await?;
+    Ok(WorkflowBulkChunksResponse {
+        tenant_id: tenant_id.to_owned(),
+        instance_id: instance_id.to_owned(),
+        run_id: run_id.to_owned(),
+        batch_id: batch_id.to_owned(),
+        page: build_page_info(&page, total, chunks.len()),
+        chunk_count: total,
+        chunks,
+    })
+}
+
+async fn load_workflow_bulk_results(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    batch_id: &str,
+    pagination: PaginationQuery,
+) -> Result<WorkflowBulkResultsResponse> {
+    let page = resolve_page(&state.query, &pagination);
+    let total = state
+        .store
+        .count_bulk_chunks_for_batch(tenant_id, instance_id, run_id, batch_id)
+        .await? as usize;
+    let chunks = state
+        .store
+        .list_bulk_chunks_for_batch_page(
+            tenant_id,
+            instance_id,
+            run_id,
+            batch_id,
+            i64::try_from(page.limit).context("bulk result page limit exceeds i64")?,
+            i64::try_from(page.offset).context("bulk result page offset exceeds i64")?,
+        )
+        .await?
+        .into_iter()
+        .filter(|chunk| chunk.output.is_some())
+        .collect::<Vec<_>>();
+    Ok(WorkflowBulkResultsResponse {
+        tenant_id: tenant_id.to_owned(),
+        instance_id: instance_id.to_owned(),
+        run_id: run_id.to_owned(),
+        batch_id: batch_id.to_owned(),
+        page: build_page_info(&page, total, chunks.len()),
+        chunk_count: total,
+        chunks,
     })
 }
 

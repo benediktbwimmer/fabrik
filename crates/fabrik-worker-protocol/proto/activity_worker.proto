@@ -36,6 +36,38 @@ message PollActivityTaskResponse {
   ActivityTask task = 1;
 }
 
+message PollBulkActivityTaskRequest {
+  string tenant_id = 1;
+  string task_queue = 2;
+  string worker_id = 3;
+  string worker_build_id = 4;
+  uint64 poll_timeout_ms = 5;
+}
+
+message BulkActivityTask {
+  string tenant_id = 1;
+  string definition_id = 2;
+  uint32 definition_version = 3;
+  string artifact_hash = 4;
+  string instance_id = 5;
+  string run_id = 6;
+  string batch_id = 7;
+  string chunk_id = 8;
+  uint32 chunk_index = 9;
+  string activity_type = 10;
+  string task_queue = 11;
+  uint32 attempt = 12;
+  string items_json = 13;
+  int64 scheduled_at_unix_ms = 14;
+  int64 lease_expires_at_unix_ms = 15;
+  bool cancellation_requested = 16;
+  string lease_token = 17;
+}
+
+message PollBulkActivityTaskResponse {
+  BulkActivityTask task = 1;
+}
+
 message PollWorkflowTaskRequest {
   int32 partition_id = 1;
   string worker_id = 2;
@@ -161,15 +193,53 @@ message ReportActivityTaskResultsRequest {
   repeated ActivityTaskResult results = 1;
 }
 
+message BulkActivityTaskCompletedResult {
+  string output_json = 1;
+}
+
+message BulkActivityTaskFailedResult {
+  string error = 1;
+}
+
+message BulkActivityTaskCancelledResult {
+  string reason = 1;
+  string metadata_json = 2;
+}
+
+message BulkActivityTaskResult {
+  string tenant_id = 1;
+  string instance_id = 2;
+  string run_id = 3;
+  string batch_id = 4;
+  string chunk_id = 5;
+  uint32 chunk_index = 6;
+  uint32 attempt = 7;
+  string worker_id = 8;
+  string worker_build_id = 9;
+  string lease_token = 13;
+
+  oneof result {
+    BulkActivityTaskCompletedResult completed = 10;
+    BulkActivityTaskFailedResult failed = 11;
+    BulkActivityTaskCancelledResult cancelled = 12;
+  }
+}
+
+message ReportBulkActivityTaskResultsRequest {
+  repeated BulkActivityTaskResult results = 1;
+}
+
 message Ack {}
 
 service ActivityWorkerApi {
   rpc PollActivityTask(PollActivityTaskRequest) returns (PollActivityTaskResponse);
+  rpc PollBulkActivityTask(PollBulkActivityTaskRequest) returns (PollBulkActivityTaskResponse);
   rpc CompleteActivityTask(CompleteActivityTaskRequest) returns (Ack);
   rpc FailActivityTask(FailActivityTaskRequest) returns (Ack);
   rpc RecordActivityHeartbeat(RecordActivityHeartbeatRequest) returns (RecordActivityHeartbeatResponse);
   rpc ReportActivityTaskCancelled(ReportActivityTaskCancelledRequest) returns (Ack);
   rpc ReportActivityTaskResults(ReportActivityTaskResultsRequest) returns (Ack);
+  rpc ReportBulkActivityTaskResults(ReportBulkActivityTaskResultsRequest) returns (Ack);
 }
 
 service WorkflowWorkerApi {
