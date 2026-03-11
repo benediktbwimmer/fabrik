@@ -22,6 +22,10 @@ pub struct CompiledWorkflowArtifact {
     pub source_map: BTreeMap<String, SourceLocation>,
     #[serde(default)]
     pub helpers: BTreeMap<String, HelperFunction>,
+    #[serde(default)]
+    pub queries: BTreeMap<String, CompiledQueryHandler>,
+    #[serde(default)]
+    pub updates: BTreeMap<String, CompiledUpdateHandler>,
     pub workflow: CompiledWorkflow,
     pub artifact_hash: String,
 }
@@ -41,6 +45,21 @@ pub struct SourceLocation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompiledWorkflow {
+    pub initial_state: String,
+    pub states: BTreeMap<String, CompiledStateNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompiledQueryHandler {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_name: Option<String>,
+    pub expr: Expression,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompiledUpdateHandler {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_name: Option<String>,
     pub initial_state: String,
     pub states: BTreeMap<String, CompiledStateNode>,
 }
@@ -70,6 +89,24 @@ pub enum CompiledStateNode {
         output_var: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         on_error: Option<ErrorTransition>,
+    },
+    StartChild {
+        child_definition_id: String,
+        input: Expression,
+        next: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handle_var: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workflow_id: Option<Expression>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_queue: Option<Expression>,
+        parent_close_policy: ParentClosePolicy,
+    },
+    WaitForChild {
+        child_ref_var: String,
+        next: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_var: Option<String>,
     },
     WaitForEvent {
         event_type: String,
@@ -206,10 +243,27 @@ pub struct ArtifactExecutionState {
     pub bindings: BTreeMap<String, Value>,
     #[serde(default)]
     pub markers: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub active_update: Option<ActiveUpdateState>,
     #[serde(skip)]
     pub turn_context: Option<ExecutionTurnContext>,
     #[serde(skip)]
     pub pending_markers: Vec<(String, Value)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveUpdateState {
+    pub update_id: String,
+    pub update_name: String,
+    pub return_state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ParentClosePolicy {
+    Terminate,
+    RequestCancel,
+    Abandon,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +306,8 @@ impl CompiledWorkflowArtifact {
             source_files: Vec::new(),
             source_map: BTreeMap::new(),
             helpers: BTreeMap::new(),
+            queries: BTreeMap::new(),
+            updates: BTreeMap::new(),
             workflow,
             artifact_hash: String::new(),
         };
@@ -286,6 +342,32 @@ impl CompiledWorkflowArtifact {
         })
     }
 
+    pub fn has_query(&self, query_name: &str) -> bool {
+        self.queries.contains_key(query_name)
+    }
+
+    pub fn has_update(&self, update_name: &str) -> bool {
+        self.updates.contains_key(update_name)
+    }
+
+    pub fn evaluate_query(
+        &self,
+        query_name: &str,
+        args: &Value,
+        mut execution_state: ArtifactExecutionState,
+    ) -> Result<Value, CompiledWorkflowError> {
+        let handler = self
+            .queries
+            .get(query_name)
+            .ok_or_else(|| CompiledWorkflowError::UnknownQuery(query_name.to_owned()))?;
+        if let Some(arg_name) = &handler.arg_name {
+            execution_state.bindings.insert(arg_name.clone(), args.clone());
+        } else {
+            execution_state.bindings.insert("args".to_owned(), args.clone());
+        }
+        evaluate_expression(&handler.expr, &mut execution_state, &self.helpers)
+    }
+
     pub fn hash(&self) -> String {
         let mut clone = self.clone();
         clone.artifact_hash.clear();
@@ -294,6 +376,34 @@ impl CompiledWorkflowArtifact {
             .expect("compiled artifact serialization failed");
         let digest = Sha256::digest(encoded);
         format!("{digest:x}")
+    }
+
+    fn state_by_id(&self, state_id: &str) -> Option<&CompiledStateNode> {
+        self.workflow
+            .states
+            .get(state_id)
+            .or_else(|| self.updates.values().find_map(|handler| handler.states.get(state_id)))
+    }
+
+    fn states_for<'a>(
+        &'a self,
+        state_id: &str,
+        execution_state: &ArtifactExecutionState,
+    ) -> Option<&'a BTreeMap<String, CompiledStateNode>> {
+        if let Some(active_update) = &execution_state.active_update {
+            if let Some(handler) = self.updates.get(&active_update.update_name) {
+                if handler.states.contains_key(state_id) {
+                    return Some(&handler.states);
+                }
+            }
+        }
+        if self.workflow.states.contains_key(state_id) {
+            return Some(&self.workflow.states);
+        }
+        self.updates
+            .values()
+            .find(|handler| handler.states.contains_key(state_id))
+            .map(|handler| &handler.states)
     }
 
     pub fn validate(&self) -> Result<(), CompiledWorkflowError> {
@@ -310,6 +420,22 @@ impl CompiledWorkflowArtifact {
                         state: name.clone(),
                         next: next.to_owned(),
                     });
+                }
+            }
+        }
+        for (name, handler) in &self.updates {
+            if !handler.states.contains_key(&handler.initial_state) {
+                return Err(CompiledWorkflowError::UnknownUpdateInitialState(name.clone()));
+            }
+            for (state_name, state) in &handler.states {
+                for next in state.next_states() {
+                    if !handler.states.contains_key(next) {
+                        return Err(CompiledWorkflowError::UnknownUpdateTransition {
+                            update: name.clone(),
+                            state: state_name.clone(),
+                            next: next.to_owned(),
+                        });
+                    }
                 }
             }
         }
@@ -362,9 +488,10 @@ impl CompiledWorkflowArtifact {
         turn_context: ExecutionTurnContext,
     ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
         execution_state.turn_context = Some(turn_context);
-        let state = self
-            .workflow
-            .states
+        let states = self
+            .states_for(wait_state, &execution_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
+        let state = states
             .get(wait_state)
             .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
         match state {
@@ -374,7 +501,7 @@ impl CompiledWorkflowArtifact {
                 if let Some(output_var) = output_var {
                     execution_state.bindings.insert(output_var.clone(), payload.clone());
                 }
-                self.execute_from_state(next, execution_state, false)
+                self.execute_from_state_in_graph(states, next, execution_state, false)
             }
             CompiledStateNode::WaitForEvent { event_type, .. } => {
                 Err(CompiledWorkflowError::UnexpectedSignal {
@@ -384,6 +511,42 @@ impl CompiledWorkflowArtifact {
             }
             _ => Err(CompiledWorkflowError::NotWaitingOnSignal(wait_state.to_owned())),
         }
+    }
+
+    pub fn execute_update_with_turn(
+        &self,
+        current_state: &str,
+        update_id: &str,
+        update_name: &str,
+        payload: &Value,
+        mut execution_state: ArtifactExecutionState,
+        turn_context: ExecutionTurnContext,
+    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
+        let handler = self
+            .updates
+            .get(update_name)
+            .ok_or_else(|| CompiledWorkflowError::UnknownUpdate(update_name.to_owned()))?;
+        if execution_state.active_update.is_some() {
+            return Err(CompiledWorkflowError::UpdateAlreadyActive(update_name.to_owned()));
+        }
+        execution_state.turn_context = Some(turn_context);
+        execution_state.active_update = Some(ActiveUpdateState {
+            update_id: update_id.to_owned(),
+            update_name: update_name.to_owned(),
+            return_state: current_state.to_owned(),
+        });
+        if let Some(arg_name) = &handler.arg_name {
+            execution_state.bindings.insert(arg_name.clone(), payload.clone());
+        } else {
+            execution_state.bindings.insert("args".to_owned(), payload.clone());
+        }
+        let plan = self.execute_from_state_in_graph(
+            &handler.states,
+            &handler.initial_state,
+            execution_state,
+            false,
+        )?;
+        Ok(plan)
     }
 
     pub fn execute_after_timer(
@@ -408,20 +571,124 @@ impl CompiledWorkflowArtifact {
         turn_context: ExecutionTurnContext,
     ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
         execution_state.turn_context = Some(turn_context);
-        let state = self
-            .workflow
-            .states
+        let states = self
+            .states_for(wait_state, &execution_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
+        let state = states
             .get(wait_state)
             .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
         match state {
             CompiledStateNode::WaitForTimer { next, .. } if wait_state == timer_id => {
-                self.execute_from_state(next, execution_state, false)
+                self.execute_from_state_in_graph(states, next, execution_state, false)
             }
             CompiledStateNode::WaitForTimer { .. } => Err(CompiledWorkflowError::UnexpectedTimer {
                 expected: wait_state.to_owned(),
                 received: timer_id.to_owned(),
             }),
             _ => Err(CompiledWorkflowError::NotWaitingOnTimer(wait_state.to_owned())),
+        }
+    }
+
+    pub fn execute_after_child_completion_with_turn(
+        &self,
+        wait_state: &str,
+        child_id: &str,
+        output: &Value,
+        mut execution_state: ArtifactExecutionState,
+        turn_context: ExecutionTurnContext,
+    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
+        execution_state.turn_context = Some(turn_context);
+        let states = self
+            .states_for(wait_state, &execution_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
+        let state = states
+            .get(wait_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
+        match state {
+            CompiledStateNode::WaitForChild { child_ref_var, next, output_var } => {
+                let bound_child_id = execution_state
+                    .bindings
+                    .get(child_ref_var)
+                    .and_then(extract_child_id)
+                    .ok_or_else(|| {
+                        CompiledWorkflowError::UnknownChildReference(child_ref_var.clone())
+                    })?;
+                if bound_child_id != child_id {
+                    return Err(CompiledWorkflowError::UnexpectedChild {
+                        expected: bound_child_id,
+                        received: child_id.to_owned(),
+                    });
+                }
+                if let Some(output_var) = output_var {
+                    execution_state.bindings.insert(output_var.clone(), output.clone());
+                }
+                self.execute_from_state_in_graph(states, next, execution_state, false)
+            }
+            _ => Err(CompiledWorkflowError::NotWaitingOnChild(wait_state.to_owned())),
+        }
+    }
+
+    pub fn execute_after_child_failure_with_turn(
+        &self,
+        wait_state: &str,
+        child_id: &str,
+        error: &str,
+        mut execution_state: ArtifactExecutionState,
+        turn_context: ExecutionTurnContext,
+    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
+        execution_state.turn_context = Some(turn_context);
+        let state = self
+            .state_by_id(wait_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
+        match state {
+            CompiledStateNode::WaitForChild { child_ref_var, .. } => {
+                let bound_child_id = execution_state
+                    .bindings
+                    .get(child_ref_var)
+                    .and_then(extract_child_id)
+                    .ok_or_else(|| {
+                        CompiledWorkflowError::UnknownChildReference(child_ref_var.clone())
+                    })?;
+                if bound_child_id != child_id {
+                    return Err(CompiledWorkflowError::UnexpectedChild {
+                        expected: bound_child_id,
+                        received: child_id.to_owned(),
+                    });
+                }
+                if let Some(active_update) = &execution_state.active_update {
+                    let return_state = active_update.return_state.clone();
+                    let update_id = active_update.update_id.clone();
+                    let update_name = active_update.update_name.clone();
+                    execution_state.active_update = None;
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: return_state.clone(),
+                        emissions: vec![ExecutionEmission {
+                            event: WorkflowEvent::WorkflowUpdateRejected {
+                                update_id,
+                                update_name,
+                                error: error.to_owned(),
+                            },
+                            state: Some(return_state.clone()),
+                        }],
+                        execution_state,
+                        context: Some(Value::String(error.to_owned())),
+                        output: Some(Value::String(error.to_owned())),
+                    });
+                }
+                Ok(CompiledExecutionPlan {
+                    workflow_version: self.definition_version,
+                    final_state: wait_state.to_owned(),
+                    emissions: vec![ExecutionEmission {
+                        event: WorkflowEvent::WorkflowFailed { reason: error.to_owned() },
+                        state: Some(wait_state.to_owned()),
+                    }],
+                    execution_state,
+                    context: Some(Value::String(error.to_owned())),
+                    output: Some(Value::String(error.to_owned())),
+                })
+            }
+            _ => Err(CompiledWorkflowError::NotWaitingOnChild(wait_state.to_owned())),
         }
     }
 
@@ -450,9 +717,10 @@ impl CompiledWorkflowArtifact {
         turn_context: ExecutionTurnContext,
     ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
         execution_state.turn_context = Some(turn_context);
-        let state = self
-            .workflow
-            .states
+        let states = self
+            .states_for(step_state, &execution_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(step_state.to_owned()))?;
+        let state = states
             .get(step_state)
             .ok_or_else(|| CompiledWorkflowError::UnknownState(step_state.to_owned()))?;
         match state {
@@ -463,7 +731,7 @@ impl CompiledWorkflowArtifact {
                 let next = next.as_ref().ok_or_else(|| {
                     CompiledWorkflowError::MissingContinuation(step_state.to_owned())
                 })?;
-                self.execute_from_state(next, execution_state, false)
+                self.execute_from_state_in_graph(states, next, execution_state, false)
             }
             CompiledStateNode::Step { .. } => Err(CompiledWorkflowError::UnexpectedStep {
                 expected: step_state.to_owned(),
@@ -498,9 +766,10 @@ impl CompiledWorkflowArtifact {
         turn_context: ExecutionTurnContext,
     ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
         execution_state.turn_context = Some(turn_context);
-        let state = self
-            .workflow
-            .states
+        let states = self
+            .states_for(step_state, &execution_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(step_state.to_owned()))?;
+        let state = states
             .get(step_state)
             .ok_or_else(|| CompiledWorkflowError::UnknownState(step_state.to_owned()))?;
         match state {
@@ -510,9 +779,27 @@ impl CompiledWorkflowArtifact {
                         .bindings
                         .insert(error_var.clone(), Value::String(error.to_owned()));
                 }
-                self.execute_from_state(&on_error.next, execution_state, false)
+                self.execute_from_state_in_graph(states, &on_error.next, execution_state, false)
             }
             CompiledStateNode::Step { on_error: None, .. } if step_state == step_id => {
+                if let Some(active_update) = execution_state.active_update.take() {
+                    let return_state = active_update.return_state;
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: return_state.clone(),
+                        emissions: vec![ExecutionEmission {
+                            event: WorkflowEvent::WorkflowUpdateRejected {
+                                update_id: active_update.update_id,
+                                update_name: active_update.update_name,
+                                error: error.to_owned(),
+                            },
+                            state: Some(return_state),
+                        }],
+                        execution_state,
+                        context: Some(Value::String(error.to_owned())),
+                        output: Some(Value::String(error.to_owned())),
+                    });
+                }
                 Ok(CompiledExecutionPlan {
                     workflow_version: self.definition_version,
                     final_state: step_state.to_owned(),
@@ -538,9 +825,7 @@ impl CompiledWorkflowArtifact {
         step_state: &str,
     ) -> Result<Option<&RetryPolicy>, CompiledWorkflowError> {
         let state = self
-            .workflow
-            .states
-            .get(step_state)
+            .state_by_id(step_state)
             .ok_or_else(|| CompiledWorkflowError::UnknownState(step_state.to_owned()))?;
         match state {
             CompiledStateNode::Step { retry, .. } => Ok(retry.as_ref()),
@@ -554,9 +839,7 @@ impl CompiledWorkflowArtifact {
         execution_state: &ArtifactExecutionState,
     ) -> Result<(String, Option<StepConfig>, Value), CompiledWorkflowError> {
         let state = self
-            .workflow
-            .states
-            .get(step_state)
+            .state_by_id(step_state)
             .ok_or_else(|| CompiledWorkflowError::UnknownState(step_state.to_owned()))?;
         match state {
             CompiledStateNode::Step { handler, input, config, .. } => {
@@ -573,9 +856,7 @@ impl CompiledWorkflowArtifact {
         step_state: &str,
     ) -> Result<(String, Option<StepConfig>), CompiledWorkflowError> {
         let state = self
-            .workflow
-            .states
-            .get(step_state)
+            .state_by_id(step_state)
             .ok_or_else(|| CompiledWorkflowError::UnknownState(step_state.to_owned()))?;
         match state {
             CompiledStateNode::Step { handler, config, .. } => {
@@ -587,6 +868,21 @@ impl CompiledWorkflowArtifact {
 
     fn execute_from_state(
         &self,
+        start_state: &str,
+        execution_state: ArtifactExecutionState,
+        emit_started: bool,
+    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
+        self.execute_from_state_in_graph(
+            &self.workflow.states,
+            start_state,
+            execution_state,
+            emit_started,
+        )
+    }
+
+    fn execute_from_state_in_graph(
+        &self,
+        states: &BTreeMap<String, CompiledStateNode>,
         start_state: &str,
         mut execution_state: ArtifactExecutionState,
         emit_started: bool,
@@ -610,9 +906,7 @@ impl CompiledWorkflowArtifact {
                 return Err(CompiledWorkflowError::LoopDetected(current_state));
             }
 
-            let state = self
-                .workflow
-                .states
+            let state = states
                 .get(&current_state)
                 .ok_or_else(|| CompiledWorkflowError::UnknownState(current_state.clone()))?;
 
@@ -656,6 +950,68 @@ impl CompiledWorkflowArtifact {
                         },
                         state: Some(current_state.clone()),
                     });
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: current_state,
+                        emissions,
+                        execution_state,
+                        context,
+                        output,
+                    });
+                }
+                CompiledStateNode::StartChild {
+                    child_definition_id,
+                    input: child_input,
+                    next,
+                    handle_var,
+                    workflow_id,
+                    task_queue,
+                    parent_close_policy,
+                } => {
+                    let input =
+                        evaluate_expression(child_input, &mut execution_state, &self.helpers)?;
+                    let child_id = build_child_id(
+                        execution_state.turn_context.as_ref().ok_or_else(|| {
+                            CompiledWorkflowError::MissingTurnContext("ctx.startChild()".to_owned())
+                        })?,
+                        &current_state,
+                    );
+                    let workflow_id = workflow_id
+                        .as_ref()
+                        .map(|expr| evaluate_expression(expr, &mut execution_state, &self.helpers))
+                        .transpose()?
+                        .and_then(|value| stringify_value(&value))
+                        .unwrap_or_else(|| format!("child-{child_id}"));
+                    let task_queue = task_queue
+                        .as_ref()
+                        .map(|expr| evaluate_expression(expr, &mut execution_state, &self.helpers))
+                        .transpose()?
+                        .and_then(|value| stringify_value(&value));
+                    if let Some(handle_var) = handle_var {
+                        execution_state.bindings.insert(
+                            handle_var.clone(),
+                            serde_json::json!({
+                                "child_id": child_id,
+                                "workflow_id": workflow_id,
+                            }),
+                        );
+                    }
+                    context = Some(input.clone());
+                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+                    emissions.push(ExecutionEmission {
+                        event: WorkflowEvent::ChildWorkflowStartRequested {
+                            child_id,
+                            child_workflow_id: workflow_id,
+                            child_definition_id: child_definition_id.clone(),
+                            input,
+                            task_queue,
+                            parent_close_policy: parent_close_policy.as_event_value().to_owned(),
+                        },
+                        state: Some(next.clone()),
+                    });
+                    current_state = next.clone();
+                }
+                CompiledStateNode::WaitForChild { .. } => {
                     return Ok(CompiledExecutionPlan {
                         workflow_version: self.definition_version,
                         final_state: current_state,
@@ -713,10 +1069,23 @@ impl CompiledWorkflowArtifact {
                     emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
                     output = Some(value.clone());
                     context = Some(value.clone());
-                    emissions.push(ExecutionEmission {
-                        event: WorkflowEvent::WorkflowCompleted { output: value },
-                        state: Some(current_state.clone()),
-                    });
+                    if let Some(active_update) = execution_state.active_update.take() {
+                        let return_state = active_update.return_state;
+                        emissions.push(ExecutionEmission {
+                            event: WorkflowEvent::WorkflowUpdateCompleted {
+                                update_id: active_update.update_id,
+                                update_name: active_update.update_name,
+                                output: value.clone(),
+                            },
+                            state: Some(return_state.clone()),
+                        });
+                        current_state = return_state;
+                    } else {
+                        emissions.push(ExecutionEmission {
+                            event: WorkflowEvent::WorkflowCompleted { output: value },
+                            state: Some(current_state.clone()),
+                        });
+                    }
                     return Ok(CompiledExecutionPlan {
                         workflow_version: self.definition_version,
                         final_state: current_state,
@@ -738,10 +1107,23 @@ impl CompiledWorkflowArtifact {
                     emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
                     output = Some(Value::String(reason.clone()));
                     context = Some(Value::String(reason.clone()));
-                    emissions.push(ExecutionEmission {
-                        event: WorkflowEvent::WorkflowFailed { reason },
-                        state: Some(current_state.clone()),
-                    });
+                    if let Some(active_update) = execution_state.active_update.take() {
+                        let return_state = active_update.return_state;
+                        emissions.push(ExecutionEmission {
+                            event: WorkflowEvent::WorkflowUpdateRejected {
+                                update_id: active_update.update_id,
+                                update_name: active_update.update_name,
+                                error: reason.clone(),
+                            },
+                            state: Some(return_state.clone()),
+                        });
+                        current_state = return_state;
+                    } else {
+                        emissions.push(ExecutionEmission {
+                            event: WorkflowEvent::WorkflowFailed { reason },
+                            state: Some(current_state.clone()),
+                        });
+                    }
                     return Ok(CompiledExecutionPlan {
                         workflow_version: self.definition_version,
                         final_state: current_state,
@@ -795,12 +1177,37 @@ impl CompiledStateNode {
                 .map(String::as_str)
                 .chain(on_error.iter().map(|transition| transition.next.as_str()))
                 .collect(),
-            Self::WaitForEvent { next, .. } | Self::WaitForTimer { next, .. } => {
+            Self::StartChild { next, .. }
+            | Self::WaitForEvent { next, .. }
+            | Self::WaitForTimer { next, .. }
+            | Self::WaitForChild { next, .. } => {
                 vec![next.as_str()]
             }
             Self::Succeed { .. } | Self::Fail { .. } | Self::ContinueAsNew { .. } => Vec::new(),
         }
     }
+}
+
+impl ParentClosePolicy {
+    fn as_event_value(&self) -> &'static str {
+        match self {
+            Self::Terminate => "TERMINATE",
+            Self::RequestCancel => "REQUEST_CANCEL",
+            Self::Abandon => "ABANDON",
+        }
+    }
+}
+
+fn build_child_id(turn_context: &ExecutionTurnContext, state_id: &str) -> String {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("{}:{state_id}:child", turn_context.event_id).as_bytes(),
+    )
+    .to_string()
+}
+
+fn extract_child_id(value: &Value) -> Option<String> {
+    value.get("child_id").and_then(Value::as_str).map(str::to_owned)
 }
 
 pub fn evaluate_expression(
@@ -1050,6 +1457,10 @@ pub enum CompiledWorkflowError {
     UnknownState(String),
     #[error("compiled workflow state {state} references missing next state {next}")]
     UnknownTransition { state: String, next: String },
+    #[error("compiled update handler {0} is missing an initial state")]
+    UnknownUpdateInitialState(String),
+    #[error("compiled update handler {update} state {state} references missing next state {next}")]
+    UnknownUpdateTransition { update: String, state: String, next: String },
     #[error("compiled artifact hash does not match its contents")]
     ArtifactHashMismatch,
     #[error("compiled workflow loop detected while executing state {0}")]
@@ -1068,8 +1479,20 @@ pub enum CompiledWorkflowError {
     NotWaitingOnStep(String),
     #[error("unexpected step completion, expected {expected}, received {received}")]
     UnexpectedStep { expected: String, received: String },
+    #[error("compiled workflow state {0} is not waiting on a child")]
+    NotWaitingOnChild(String),
+    #[error("unexpected child completion, expected {expected}, received {received}")]
+    UnexpectedChild { expected: String, received: String },
     #[error("compiled workflow step {0} is missing a continuation")]
     MissingContinuation(String),
+    #[error("unknown query handler {0}")]
+    UnknownQuery(String),
+    #[error("unknown update handler {0}")]
+    UnknownUpdate(String),
+    #[error("update {0} cannot start while another update is active")]
+    UpdateAlreadyActive(String),
+    #[error("unknown child workflow reference binding {0}")]
+    UnknownChildReference(String),
     #[error("unknown helper function {0}")]
     UnknownHelper(String),
     #[error("helper {helper} expected {expected} args, received {received}")]
@@ -1150,6 +1573,65 @@ mod tests {
         artifact
     }
 
+    fn update_child_artifact() -> CompiledWorkflowArtifact {
+        let workflow = CompiledWorkflow {
+            initial_state: "wait_signal".to_owned(),
+            states: BTreeMap::from([(
+                "wait_signal".to_owned(),
+                CompiledStateNode::WaitForEvent {
+                    event_type: "ready".to_owned(),
+                    next: "done".to_owned(),
+                    output_var: None,
+                },
+            )]),
+        };
+        let updates = BTreeMap::from([(
+            "approve".to_owned(),
+            CompiledUpdateHandler {
+                arg_name: Some("args".to_owned()),
+                initial_state: "start_child".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "start_child".to_owned(),
+                        CompiledStateNode::StartChild {
+                            child_definition_id: "childWorkflow".to_owned(),
+                            input: Expression::Identifier { name: "args".to_owned() },
+                            next: "await_child".to_owned(),
+                            handle_var: Some("child".to_owned()),
+                            workflow_id: None,
+                            task_queue: None,
+                            parent_close_policy: ParentClosePolicy::RequestCancel,
+                        },
+                    ),
+                    (
+                        "await_child".to_owned(),
+                        CompiledStateNode::WaitForChild {
+                            child_ref_var: "child".to_owned(),
+                            next: "finish".to_owned(),
+                            output_var: Some("childResult".to_owned()),
+                        },
+                    ),
+                    (
+                        "finish".to_owned(),
+                        CompiledStateNode::Succeed {
+                            output: Some(Expression::Identifier { name: "childResult".to_owned() }),
+                        },
+                    ),
+                ]),
+            },
+        )]);
+        let mut artifact = CompiledWorkflowArtifact::new(
+            "demo-update-child",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            workflow,
+        );
+        artifact.updates = updates;
+        artifact.artifact_hash = artifact.hash();
+        artifact
+    }
+
     #[test]
     fn validates_hash() {
         let artifact = demo_artifact();
@@ -1215,6 +1697,7 @@ mod tests {
         let mut state = ArtifactExecutionState {
             bindings: BTreeMap::new(),
             markers: BTreeMap::new(),
+            active_update: None,
             turn_context: Some(turn_context.clone()),
             pending_markers: Vec::new(),
         };
@@ -1249,6 +1732,7 @@ mod tests {
         let mut state = ArtifactExecutionState {
             bindings: BTreeMap::new(),
             markers: BTreeMap::new(),
+            active_update: None,
             turn_context: Some(turn_context),
             pending_markers: Vec::new(),
         };
@@ -1268,5 +1752,76 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(state.markers.len(), 1);
         assert_eq!(state.pending_markers.len(), 1);
+    }
+
+    #[test]
+    fn update_start_child_waits_on_child_state_without_duplicate_acceptance_event() {
+        let artifact = update_child_artifact();
+        let plan = artifact
+            .execute_update_with_turn(
+                "wait_signal",
+                "upd-1",
+                "approve",
+                &json!({"id": "approval-1"}),
+                ArtifactExecutionState::default(),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(plan.final_state, "await_child");
+        assert_eq!(plan.emissions.len(), 1);
+        assert!(matches!(
+            plan.emissions.first(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::ChildWorkflowStartRequested { .. },
+                state,
+            }) if state.as_deref() == Some("await_child")
+        ));
+    }
+
+    #[test]
+    fn child_completion_finishes_active_update_and_returns_to_caller_state() {
+        let artifact = update_child_artifact();
+        let plan = artifact
+            .execute_update_with_turn(
+                "wait_signal",
+                "upd-1",
+                "approve",
+                &json!({"id": "approval-1"}),
+                ArtifactExecutionState::default(),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+                        .unwrap(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+        let child_id =
+            plan.execution_state.bindings["child"]["child_id"].as_str().unwrap().to_owned();
+
+        let resumed = artifact
+            .execute_after_child_completion_with_turn(
+                "await_child",
+                &child_id,
+                &json!({"ok": true}),
+                plan.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_100).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(resumed.final_state, "wait_signal");
+        assert!(matches!(
+            resumed.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowUpdateCompleted { .. },
+                state,
+            }) if state.as_deref() == Some("wait_signal")
+        ));
     }
 }

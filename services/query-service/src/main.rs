@@ -3,7 +3,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::get,
+    routing::{get, post},
 };
 use chrono::{DateTime, Utc};
 use fabrik_broker::{
@@ -20,7 +20,7 @@ use fabrik_store::{
 use fabrik_workflow::{
     CompiledWorkflowArtifact, ReplayDivergence, ReplayDivergenceKind, ReplayFieldMismatch,
     ReplaySource, ReplayTransitionTraceEntry, WorkflowDefinition, WorkflowInstanceState,
-    artifact_hash, first_transition_divergence, projection_mismatches,
+    artifact_hash, first_transition_divergence, projection_mismatches, replay_compiled_history,
     replay_compiled_history_trace, replay_compiled_history_trace_from_snapshot,
     replay_history_trace, replay_history_trace_from_snapshot, same_projection,
 };
@@ -132,6 +132,23 @@ struct WorkflowRunsResponse {
     runs: Vec<WorkflowRunRecord>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct StrongQueryRequest {
+    #[serde(default)]
+    args: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct StrongQueryResponse {
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    query_name: String,
+    consistency: &'static str,
+    source: &'static str,
+    result: Value,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 struct PaginationQuery {
     limit: Option<usize>,
@@ -231,6 +248,10 @@ async fn main() -> Result<()> {
     .route("/debug/broker", get(get_broker_debug))
     .route("/debug/retention", get(get_retention_debug))
     .route("/tenants/{tenant_id}/workflows/{instance_id}", get(get_workflow_instance))
+    .route(
+        "/tenants/{tenant_id}/workflows/{instance_id}/queries/{query_name}",
+        post(execute_strong_query),
+    )
     .route("/tenants/{tenant_id}/workflows/{instance_id}/runs", get(get_workflow_runs))
     .route(
         "/tenants/{tenant_id}/workflows/{instance_id}/snapshot",
@@ -366,6 +387,72 @@ async fn get_workflow_runs(
         page: build_page_info(&page, total, runs.len()),
         run_count: total,
         runs,
+    }))
+}
+
+async fn execute_strong_query(
+    Path((tenant_id, instance_id, query_name)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<StrongQueryRequest>,
+) -> Result<Json<StrongQueryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let instance = state
+        .store
+        .get_instance(&tenant_id, &instance_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| not_found(format!("workflow instance {instance_id} not found")))?;
+    let version = instance.definition_version.ok_or_else(|| {
+        internal_error(anyhow::anyhow!(
+            "workflow instance {instance_id} is missing definition_version"
+        ))
+    })?;
+    let artifact = state
+        .store
+        .get_artifact_version(&tenant_id, &instance.definition_id, version)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            internal_error(anyhow::anyhow!(
+                "workflow artifact {} version {} not found",
+                instance.definition_id,
+                version
+            ))
+        })?;
+
+    let (query_state, source) =
+        if !instance.status.is_terminal() && instance.artifact_execution.is_some() {
+            (instance.clone(), "hot_owner")
+        } else {
+            let history = read_workflow_history(
+                &state.broker,
+                "query-service-strong-query",
+                &WorkflowHistoryFilter::new(&tenant_id, &instance_id, &instance.run_id),
+                Duration::from_millis(HISTORY_IDLE_TIMEOUT_MS),
+                Duration::from_millis(HISTORY_MAX_SCAN_MS),
+            )
+            .await
+            .map_err(internal_error)?;
+            (replay_compiled_history(&history, &artifact).map_err(internal_error)?, "replay")
+        };
+
+    let result = artifact
+        .evaluate_query(
+            &query_name,
+            &request.args,
+            query_state.artifact_execution.clone().unwrap_or_default(),
+        )
+        .map_err(|error| {
+            (StatusCode::BAD_REQUEST, Json(ErrorResponse { message: error.to_string() }))
+        })?;
+
+    Ok(Json(StrongQueryResponse {
+        tenant_id,
+        instance_id,
+        run_id: query_state.run_id,
+        query_name,
+        consistency: "strong",
+        source,
+        result,
     }))
 }
 
@@ -547,6 +634,10 @@ fn retention_policy_response(config: &QueryRuntimeConfig) -> RetentionPolicyResp
 
 fn internal_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { message: error.to_string() }))
+}
+
+fn not_found(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
+    (StatusCode::NOT_FOUND, Json(ErrorResponse { message: message.into() }))
 }
 
 fn internal_error_from_display(error: impl std::fmt::Display) -> (StatusCode, Json<ErrorResponse>) {

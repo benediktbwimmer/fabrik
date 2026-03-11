@@ -43,6 +43,7 @@ impl PartitionOwnershipRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExecutorMembershipRecord {
     pub executor_id: String,
+    pub query_endpoint: String,
     pub advertised_capacity: usize,
     pub heartbeat_expires_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
@@ -194,6 +195,82 @@ pub struct WorkflowSignalRecord {
     pub consumed_event_id: Option<Uuid>,
     pub enqueued_at: DateTime<Utc>,
     pub consumed_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowUpdateStatus {
+    Requested,
+    Accepted,
+    Completed,
+    Rejected,
+}
+
+impl WorkflowUpdateStatus {
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "requested" => Ok(Self::Requested),
+            "accepted" => Ok(Self::Accepted),
+            "completed" => Ok(Self::Completed),
+            "rejected" => Ok(Self::Rejected),
+            other => anyhow::bail!("unknown workflow update status {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowUpdateRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub update_id: String,
+    pub update_name: String,
+    pub request_id: Option<String>,
+    pub payload: Value,
+    pub status: WorkflowUpdateStatus,
+    pub output: Option<Value>,
+    pub error: Option<String>,
+    pub source_event_id: Uuid,
+    pub accepted_event_id: Option<Uuid>,
+    pub completed_event_id: Option<Uuid>,
+    pub requested_at: DateTime<Utc>,
+    pub accepted_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowChildRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub child_id: String,
+    pub child_workflow_id: String,
+    pub child_definition_id: String,
+    pub child_run_id: Option<String>,
+    pub parent_close_policy: String,
+    pub input: Value,
+    pub status: String,
+    pub output: Option<Value>,
+    pub error: Option<String>,
+    pub source_event_id: Uuid,
+    pub started_event_id: Option<Uuid>,
+    pub terminal_event_id: Option<Uuid>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RequestDedupRecord {
+    pub tenant_id: String,
+    pub instance_id: Option<String>,
+    pub operation: String,
+    pub request_id: String,
+    pub request_hash: String,
+    pub response: Value,
+    pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -556,6 +633,7 @@ impl WorkflowStore {
             r#"
             CREATE TABLE IF NOT EXISTS workflow_executor_membership (
                 executor_id TEXT PRIMARY KEY,
+                query_endpoint TEXT NOT NULL DEFAULT '',
                 advertised_capacity INTEGER NOT NULL,
                 heartbeat_expires_at TIMESTAMPTZ NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL,
@@ -566,6 +644,13 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize workflow_executor_membership table")?;
+
+        sqlx::query(
+            "ALTER TABLE workflow_executor_membership ADD COLUMN IF NOT EXISTS query_endpoint TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add workflow_executor_membership.query_endpoint")?;
 
         sqlx::query(
             r#"
@@ -580,6 +665,93 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize workflow_partition_assignments table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS workflow_updates (
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                update_id TEXT NOT NULL,
+                update_name TEXT NOT NULL,
+                request_id TEXT,
+                payload JSONB NOT NULL,
+                status TEXT NOT NULL,
+                output JSONB,
+                error TEXT,
+                source_event_id UUID NOT NULL,
+                accepted_event_id UUID,
+                completed_event_id UUID,
+                requested_at TIMESTAMPTZ NOT NULL,
+                accepted_at TIMESTAMPTZ,
+                completed_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, workflow_instance_id, run_id, update_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_updates table")?;
+
+        sqlx::query(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS workflow_updates_request_id_idx
+            ON workflow_updates (tenant_id, workflow_instance_id, run_id, update_name, request_id)
+            WHERE request_id IS NOT NULL
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_updates request dedupe index")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS workflow_children (
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                child_id TEXT NOT NULL,
+                child_workflow_id TEXT NOT NULL,
+                child_definition_id TEXT NOT NULL,
+                child_run_id TEXT,
+                parent_close_policy TEXT NOT NULL,
+                input JSONB NOT NULL,
+                status TEXT NOT NULL,
+                output JSONB,
+                error TEXT,
+                source_event_id UUID NOT NULL,
+                started_event_id UUID,
+                terminal_event_id UUID,
+                started_at TIMESTAMPTZ,
+                completed_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, workflow_instance_id, run_id, child_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_children table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS workflow_request_dedup (
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT,
+                operation TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                request_hash TEXT NOT NULL,
+                response JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, workflow_instance_id, operation, request_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_request_dedup table")?;
 
         sqlx::query(
             "ALTER TABLE workflow_timers ADD COLUMN IF NOT EXISTS dispatch_owner_epoch BIGINT",
@@ -819,6 +991,7 @@ impl WorkflowStore {
     pub async fn heartbeat_executor_member(
         &self,
         executor_id: &str,
+        query_endpoint: &str,
         advertised_capacity: usize,
         heartbeat_ttl: std::time::Duration,
     ) -> Result<ExecutorMembershipRecord> {
@@ -829,20 +1002,23 @@ impl WorkflowStore {
             r#"
             INSERT INTO workflow_executor_membership (
                 executor_id,
+                query_endpoint,
                 advertised_capacity,
                 heartbeat_expires_at,
                 created_at,
                 updated_at
             )
-            VALUES ($1, $2, $3, $4, $4)
+            VALUES ($1, $2, $3, $4, $5, $5)
             ON CONFLICT (executor_id)
             DO UPDATE SET
+                query_endpoint = EXCLUDED.query_endpoint,
                 advertised_capacity = EXCLUDED.advertised_capacity,
                 heartbeat_expires_at = EXCLUDED.heartbeat_expires_at,
                 updated_at = EXCLUDED.updated_at
             "#,
         )
         .bind(executor_id)
+        .bind(query_endpoint)
         .bind(i32::try_from(advertised_capacity).context("executor capacity exceeds i32")?)
         .bind(heartbeat_expires_at)
         .bind(now)
@@ -852,6 +1028,7 @@ impl WorkflowStore {
 
         Ok(ExecutorMembershipRecord {
             executor_id: executor_id.to_owned(),
+            query_endpoint: query_endpoint.to_owned(),
             advertised_capacity,
             heartbeat_expires_at,
             created_at: now,
@@ -865,7 +1042,7 @@ impl WorkflowStore {
     ) -> Result<Vec<ExecutorMembershipRecord>> {
         let rows = sqlx::query(
             r#"
-            SELECT executor_id, advertised_capacity, heartbeat_expires_at, created_at, updated_at
+            SELECT executor_id, query_endpoint, advertised_capacity, heartbeat_expires_at, created_at, updated_at
             FROM workflow_executor_membership
             WHERE heartbeat_expires_at > $1
             ORDER BY executor_id ASC
@@ -1462,6 +1639,113 @@ impl WorkflowStore {
         row.map(Self::decode_run_row).transpose()
     }
 
+    pub async fn close_run(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        closed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE workflow_runs
+            SET closed_at = COALESCE(closed_at, $4),
+                updated_at = $4
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(closed_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to close workflow run")?;
+
+        Ok(())
+    }
+
+    pub async fn get_request_dedup(
+        &self,
+        tenant_id: &str,
+        instance_id: Option<&str>,
+        operation: &str,
+        request_id: &str,
+    ) -> Result<Option<RequestDedupRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT tenant_id, workflow_instance_id, operation, request_id, request_hash, response, created_at, updated_at
+            FROM workflow_request_dedup
+            WHERE tenant_id = $1
+              AND workflow_instance_id IS NOT DISTINCT FROM $2
+              AND operation = $3
+              AND request_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(operation)
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load request dedup record")?;
+
+        row.map(Self::decode_request_dedup_row).transpose()
+    }
+
+    pub async fn upsert_request_dedup(
+        &self,
+        tenant_id: &str,
+        instance_id: Option<&str>,
+        operation: &str,
+        request_id: &str,
+        request_hash: &str,
+        response: &Value,
+    ) -> Result<RequestDedupRecord> {
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO workflow_request_dedup (
+                tenant_id,
+                workflow_instance_id,
+                operation,
+                request_id,
+                request_hash,
+                response,
+                created_at,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+            ON CONFLICT (tenant_id, workflow_instance_id, operation, request_id)
+            DO UPDATE SET
+                request_hash = EXCLUDED.request_hash,
+                response = EXCLUDED.response,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(operation)
+        .bind(request_id)
+        .bind(request_hash)
+        .bind(Json(response))
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert request dedup record")?;
+
+        Ok(RequestDedupRecord {
+            tenant_id: tenant_id.to_owned(),
+            instance_id: instance_id.map(str::to_owned),
+            operation: operation.to_owned(),
+            request_id: request_id.to_owned(),
+            request_hash: request_hash.to_owned(),
+            response: response.clone(),
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
     pub async fn count_activity_attempts_for_run(
         &self,
         tenant_id: &str,
@@ -1685,7 +1969,7 @@ impl WorkflowStore {
         instance_id: &str,
         run_id: &str,
         signal_id: &str,
-    ) -> Result<Option<WorkflowSignalRecord>> {
+    ) -> Result<Option<(WorkflowSignalRecord, bool)>> {
         let mut tx =
             self.pool.begin().await.context("failed to begin signal dispatch transaction")?;
         let row = sqlx::query(
@@ -1727,6 +2011,7 @@ impl WorkflowStore {
         };
 
         let mut signal = Self::decode_signal_row(row)?;
+        let mut newly_claimed = false;
         match signal.status {
             WorkflowSignalStatus::Queued => {
                 let dispatch_event_id = Uuid::now_v7();
@@ -1756,6 +2041,7 @@ impl WorkflowStore {
                 signal.status = WorkflowSignalStatus::Dispatching;
                 signal.dispatch_event_id = Some(dispatch_event_id);
                 signal.updated_at = now;
+                newly_claimed = true;
             }
             WorkflowSignalStatus::Dispatching => {}
             WorkflowSignalStatus::Consumed => {
@@ -1767,7 +2053,7 @@ impl WorkflowStore {
         }
 
         tx.commit().await.context("failed to commit signal dispatch transaction")?;
-        Ok(Some(signal))
+        Ok(Some((signal, newly_claimed)))
     }
 
     pub async fn mark_signal_consumed(
@@ -1804,6 +2090,426 @@ impl WorkflowStore {
         .context("failed to mark workflow signal consumed")?;
 
         Ok(())
+    }
+
+    pub async fn queue_update(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        update_id: &str,
+        update_name: &str,
+        request_id: Option<&str>,
+        payload: &Value,
+        source_event_id: Uuid,
+        requested_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO workflow_updates (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                update_id,
+                update_name,
+                request_id,
+                payload,
+                status,
+                output,
+                error,
+                source_event_id,
+                accepted_event_id,
+                completed_event_id,
+                requested_at,
+                accepted_at,
+                completed_at,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'requested', NULL, NULL, $8, NULL, NULL, $9, NULL, NULL, $9)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(update_id)
+        .bind(update_name)
+        .bind(request_id)
+        .bind(Json(payload))
+        .bind(source_event_id)
+        .bind(requested_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to queue workflow update")?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn get_update(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        update_id: &str,
+    ) -> Result<Option<WorkflowUpdateRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT tenant_id, workflow_instance_id, run_id, update_id, update_name, request_id,
+                   payload, status, output, error, source_event_id, accepted_event_id,
+                   completed_event_id, requested_at, accepted_at, completed_at, updated_at
+            FROM workflow_updates
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3 AND update_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(update_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load workflow update")?;
+
+        row.map(Self::decode_update_row).transpose()
+    }
+
+    pub async fn list_updates_for_run(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+    ) -> Result<Vec<WorkflowUpdateRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT tenant_id, workflow_instance_id, run_id, update_id, update_name, request_id,
+                   payload, status, output, error, source_event_id, accepted_event_id,
+                   completed_event_id, requested_at, accepted_at, completed_at, updated_at
+            FROM workflow_updates
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
+            ORDER BY requested_at ASC, update_id ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list workflow updates")?;
+
+        rows.into_iter().map(Self::decode_update_row).collect()
+    }
+
+    pub async fn get_oldest_requested_update(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+    ) -> Result<Option<WorkflowUpdateRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT tenant_id, workflow_instance_id, run_id, update_id, update_name, request_id,
+                   payload, status, output, error, source_event_id, accepted_event_id,
+                   completed_event_id, requested_at, accepted_at, completed_at, updated_at
+            FROM workflow_updates
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
+              AND status = 'requested'
+            ORDER BY requested_at ASC, update_id ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load oldest requested workflow update")?;
+
+        row.map(Self::decode_update_row).transpose()
+    }
+
+    pub async fn accept_update(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        update_id: &str,
+        accepted_event_id: Uuid,
+        accepted_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE workflow_updates
+            SET status = 'accepted',
+                accepted_event_id = $5,
+                accepted_at = $6,
+                updated_at = $6
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND update_id = $4
+              AND status = 'requested'
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(update_id)
+        .bind(accepted_event_id)
+        .bind(accepted_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to accept workflow update")?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn complete_update(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        update_id: &str,
+        output: Option<&Value>,
+        error: Option<&str>,
+        completed_event_id: Uuid,
+        completed_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let status = if error.is_some() { "rejected" } else { "completed" };
+        let result = sqlx::query(
+            r#"
+            UPDATE workflow_updates
+            SET status = $5,
+                output = $6,
+                error = $7,
+                completed_event_id = $8,
+                completed_at = $9,
+                updated_at = $9
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND update_id = $4
+              AND status IN ('requested', 'accepted')
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(update_id)
+        .bind(status)
+        .bind(output.map(Json))
+        .bind(error)
+        .bind(completed_event_id)
+        .bind(completed_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to complete workflow update")?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn upsert_child_start_requested(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        child_id: &str,
+        child_workflow_id: &str,
+        child_definition_id: &str,
+        parent_close_policy: &str,
+        input: &Value,
+        source_event_id: Uuid,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO workflow_children (
+                tenant_id, workflow_instance_id, run_id, child_id, child_workflow_id,
+                child_definition_id, child_run_id, parent_close_policy, input, status, output,
+                error, source_event_id, started_event_id, terminal_event_id, started_at,
+                completed_at, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, NULL, $7, $8, 'start_requested', NULL, NULL, $9, NULL, NULL, NULL, NULL, $10)
+            ON CONFLICT (tenant_id, workflow_instance_id, run_id, child_id)
+            DO UPDATE SET
+                child_workflow_id = EXCLUDED.child_workflow_id,
+                child_definition_id = EXCLUDED.child_definition_id,
+                parent_close_policy = EXCLUDED.parent_close_policy,
+                input = EXCLUDED.input,
+                source_event_id = EXCLUDED.source_event_id,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(child_id)
+        .bind(child_workflow_id)
+        .bind(child_definition_id)
+        .bind(parent_close_policy)
+        .bind(Json(input))
+        .bind(source_event_id)
+        .bind(occurred_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert child start requested")?;
+
+        Ok(())
+    }
+
+    pub async fn mark_child_started(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        child_id: &str,
+        child_run_id: &str,
+        started_event_id: Uuid,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE workflow_children
+            SET child_run_id = $5,
+                status = 'started',
+                started_event_id = $6,
+                started_at = $7,
+                updated_at = $7
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3 AND child_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(child_id)
+        .bind(child_run_id)
+        .bind(started_event_id)
+        .bind(occurred_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to mark child started")?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn complete_child(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        child_id: &str,
+        status: &str,
+        output: Option<&Value>,
+        error: Option<&str>,
+        terminal_event_id: Uuid,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+            UPDATE workflow_children
+            SET status = $5,
+                output = $6,
+                error = $7,
+                terminal_event_id = $8,
+                completed_at = $9,
+                updated_at = $9
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3 AND child_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(child_id)
+        .bind(status)
+        .bind(output.map(Json))
+        .bind(error)
+        .bind(terminal_event_id)
+        .bind(occurred_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to complete child workflow record")?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn list_children_for_run(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+    ) -> Result<Vec<WorkflowChildRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT tenant_id, workflow_instance_id, run_id, child_id, child_workflow_id,
+                   child_definition_id, child_run_id, parent_close_policy, input, status, output,
+                   error, source_event_id, started_event_id, terminal_event_id, started_at,
+                   completed_at, updated_at
+            FROM workflow_children
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
+            ORDER BY updated_at ASC, child_id ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list child workflows")?;
+
+        rows.into_iter().map(Self::decode_child_row).collect()
+    }
+
+    pub async fn list_open_children_for_run(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+    ) -> Result<Vec<WorkflowChildRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT tenant_id, workflow_instance_id, run_id, child_id, child_workflow_id,
+                   child_definition_id, child_run_id, parent_close_policy, input, status, output,
+                   error, source_event_id, started_event_id, terminal_event_id, started_at,
+                   completed_at, updated_at
+            FROM workflow_children
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND status IN ('start_requested', 'started')
+            ORDER BY updated_at ASC, child_id ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list open child workflows")?;
+
+        rows.into_iter().map(Self::decode_child_row).collect()
+    }
+
+    pub async fn find_parent_for_child_run(
+        &self,
+        tenant_id: &str,
+        child_run_id: &str,
+    ) -> Result<Option<WorkflowChildRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT tenant_id, workflow_instance_id, run_id, child_id, child_workflow_id,
+                   child_definition_id, child_run_id, parent_close_policy, input, status, output,
+                   error, source_event_id, started_event_id, terminal_event_id, started_at,
+                   completed_at, updated_at
+            FROM workflow_children
+            WHERE tenant_id = $1 AND child_run_id = $2
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(child_run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to find parent workflow for child run")?;
+
+        row.map(Self::decode_child_row).transpose()
     }
 
     pub async fn put_snapshot(&self, state: &WorkflowInstanceState) -> Result<()> {
@@ -3116,6 +3822,9 @@ impl WorkflowStore {
             executor_id: row
                 .try_get("executor_id")
                 .context("executor membership executor_id missing")?,
+            query_endpoint: row
+                .try_get("query_endpoint")
+                .context("executor membership query_endpoint missing")?,
             advertised_capacity: row
                 .try_get::<i32, _>("advertised_capacity")
                 .context("executor membership advertised_capacity missing")?
@@ -3215,6 +3924,105 @@ impl WorkflowStore {
             enqueued_at: row.try_get("enqueued_at").context("signal enqueued_at missing")?,
             consumed_at: row.try_get("consumed_at").context("signal consumed_at missing")?,
             updated_at: row.try_get("updated_at").context("signal updated_at missing")?,
+        })
+    }
+
+    fn decode_update_row(row: sqlx::postgres::PgRow) -> Result<WorkflowUpdateRecord> {
+        Ok(WorkflowUpdateRecord {
+            tenant_id: row.try_get("tenant_id").context("update tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("update workflow_instance_id missing")?,
+            run_id: row.try_get("run_id").context("update run_id missing")?,
+            update_id: row.try_get("update_id").context("update update_id missing")?,
+            update_name: row.try_get("update_name").context("update update_name missing")?,
+            request_id: row.try_get("request_id").context("update request_id missing")?,
+            payload: row
+                .try_get::<Json<Value>, _>("payload")
+                .map(|value| value.0)
+                .context("update payload missing")?,
+            status: WorkflowUpdateStatus::from_db(
+                &row.try_get::<String, _>("status").context("update status missing")?,
+            )?,
+            output: row
+                .try_get::<Option<Json<Value>>, _>("output")
+                .map(|value: Option<Json<Value>>| value.map(|json| json.0))
+                .context("update output missing")?,
+            error: row.try_get("error").context("update error missing")?,
+            source_event_id: row
+                .try_get("source_event_id")
+                .context("update source_event_id missing")?,
+            accepted_event_id: row
+                .try_get("accepted_event_id")
+                .context("update accepted_event_id missing")?,
+            completed_event_id: row
+                .try_get("completed_event_id")
+                .context("update completed_event_id missing")?,
+            requested_at: row.try_get("requested_at").context("update requested_at missing")?,
+            accepted_at: row.try_get("accepted_at").context("update accepted_at missing")?,
+            completed_at: row.try_get("completed_at").context("update completed_at missing")?,
+            updated_at: row.try_get("updated_at").context("update updated_at missing")?,
+        })
+    }
+
+    fn decode_child_row(row: sqlx::postgres::PgRow) -> Result<WorkflowChildRecord> {
+        Ok(WorkflowChildRecord {
+            tenant_id: row.try_get("tenant_id").context("child tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("child workflow_instance_id missing")?,
+            run_id: row.try_get("run_id").context("child run_id missing")?,
+            child_id: row.try_get("child_id").context("child child_id missing")?,
+            child_workflow_id: row
+                .try_get("child_workflow_id")
+                .context("child child_workflow_id missing")?,
+            child_definition_id: row
+                .try_get("child_definition_id")
+                .context("child child_definition_id missing")?,
+            child_run_id: row.try_get("child_run_id").context("child child_run_id missing")?,
+            parent_close_policy: row
+                .try_get("parent_close_policy")
+                .context("child parent_close_policy missing")?,
+            input: row
+                .try_get::<Json<Value>, _>("input")
+                .map(|value| value.0)
+                .context("child input missing")?,
+            status: row.try_get("status").context("child status missing")?,
+            output: row
+                .try_get::<Option<Json<Value>>, _>("output")
+                .map(|value: Option<Json<Value>>| value.map(|json| json.0))
+                .context("child output missing")?,
+            error: row.try_get("error").context("child error missing")?,
+            source_event_id: row
+                .try_get("source_event_id")
+                .context("child source_event_id missing")?,
+            started_event_id: row
+                .try_get("started_event_id")
+                .context("child started_event_id missing")?,
+            terminal_event_id: row
+                .try_get("terminal_event_id")
+                .context("child terminal_event_id missing")?,
+            started_at: row.try_get("started_at").context("child started_at missing")?,
+            completed_at: row.try_get("completed_at").context("child completed_at missing")?,
+            updated_at: row.try_get("updated_at").context("child updated_at missing")?,
+        })
+    }
+
+    fn decode_request_dedup_row(row: sqlx::postgres::PgRow) -> Result<RequestDedupRecord> {
+        Ok(RequestDedupRecord {
+            tenant_id: row.try_get("tenant_id").context("request tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("request workflow_instance_id missing")?,
+            operation: row.try_get("operation").context("request operation missing")?,
+            request_id: row.try_get("request_id").context("request request_id missing")?,
+            request_hash: row.try_get("request_hash").context("request request_hash missing")?,
+            response: row
+                .try_get::<Json<Value>, _>("response")
+                .map(|value| value.0)
+                .context("request response missing")?,
+            created_at: row.try_get("created_at").context("request created_at missing")?,
+            updated_at: row.try_get("updated_at").context("request updated_at missing")?,
         })
     }
 

@@ -191,6 +191,60 @@ pub enum WorkflowEvent {
         signal_type: String,
         payload: Value,
     },
+    WorkflowUpdateRequested {
+        update_id: String,
+        update_name: String,
+        payload: Value,
+    },
+    WorkflowUpdateAccepted {
+        update_id: String,
+        update_name: String,
+        payload: Value,
+    },
+    WorkflowUpdateCompleted {
+        update_id: String,
+        update_name: String,
+        output: Value,
+    },
+    WorkflowUpdateRejected {
+        update_id: String,
+        update_name: String,
+        error: String,
+    },
+    ChildWorkflowStartRequested {
+        child_id: String,
+        child_workflow_id: String,
+        child_definition_id: String,
+        input: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_queue: Option<String>,
+        parent_close_policy: String,
+    },
+    ChildWorkflowStarted {
+        child_id: String,
+        child_workflow_id: String,
+        child_run_id: String,
+    },
+    ChildWorkflowCompleted {
+        child_id: String,
+        child_run_id: String,
+        output: Value,
+    },
+    ChildWorkflowFailed {
+        child_id: String,
+        child_run_id: String,
+        error: String,
+    },
+    ChildWorkflowCancelled {
+        child_id: String,
+        child_run_id: String,
+        reason: String,
+    },
+    ChildWorkflowTerminated {
+        child_id: String,
+        child_run_id: String,
+        reason: String,
+    },
     TimerScheduled {
         timer_id: String,
         fire_at: DateTime<Utc>,
@@ -202,6 +256,15 @@ pub enum WorkflowEvent {
         output: Value,
     },
     WorkflowFailed {
+        reason: String,
+    },
+    WorkflowCancellationRequested {
+        reason: String,
+    },
+    WorkflowCancelled {
+        reason: String,
+    },
+    WorkflowTerminated {
         reason: String,
     },
 }
@@ -224,10 +287,23 @@ impl WorkflowEvent {
             Self::WorkflowContinuedAsNew { .. } => "WorkflowContinuedAsNew",
             Self::SignalQueued { .. } => "SignalQueued",
             Self::SignalReceived { .. } => "SignalReceived",
+            Self::WorkflowUpdateRequested { .. } => "WorkflowUpdateRequested",
+            Self::WorkflowUpdateAccepted { .. } => "WorkflowUpdateAccepted",
+            Self::WorkflowUpdateCompleted { .. } => "WorkflowUpdateCompleted",
+            Self::WorkflowUpdateRejected { .. } => "WorkflowUpdateRejected",
+            Self::ChildWorkflowStartRequested { .. } => "ChildWorkflowStartRequested",
+            Self::ChildWorkflowStarted { .. } => "ChildWorkflowStarted",
+            Self::ChildWorkflowCompleted { .. } => "ChildWorkflowCompleted",
+            Self::ChildWorkflowFailed { .. } => "ChildWorkflowFailed",
+            Self::ChildWorkflowCancelled { .. } => "ChildWorkflowCancelled",
+            Self::ChildWorkflowTerminated { .. } => "ChildWorkflowTerminated",
             Self::TimerScheduled { .. } => "TimerScheduled",
             Self::TimerFired { .. } => "TimerFired",
             Self::WorkflowCompleted { .. } => "WorkflowCompleted",
             Self::WorkflowFailed { .. } => "WorkflowFailed",
+            Self::WorkflowCancellationRequested { .. } => "WorkflowCancellationRequested",
+            Self::WorkflowCancelled { .. } => "WorkflowCancelled",
+            Self::WorkflowTerminated { .. } => "WorkflowTerminated",
         }
     }
 }

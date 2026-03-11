@@ -12,9 +12,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub use compiled::{
-    ArtifactEntrypoint, ArtifactExecutionState, CompiledExecutionPlan, CompiledStateNode,
-    CompiledWorkflow, CompiledWorkflowArtifact, CompiledWorkflowError, ErrorTransition,
-    ExecutionTurnContext, Expression, HelperFunction, SourceLocation,
+    ActiveUpdateState, ArtifactEntrypoint, ArtifactExecutionState, CompiledExecutionPlan,
+    CompiledQueryHandler, CompiledStateNode, CompiledUpdateHandler, CompiledWorkflow,
+    CompiledWorkflowArtifact, CompiledWorkflowError, ErrorTransition, ExecutionTurnContext,
+    Expression, HelperFunction, ParentClosePolicy, SourceLocation,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -625,6 +626,7 @@ pub struct WorkflowInstanceState {
 
 impl WorkflowInstanceState {
     pub fn apply_event(&mut self, event: &EventEnvelope<WorkflowEvent>) {
+        let was_terminal = self.status.is_terminal();
         self.event_count += 1;
         self.last_event_id = event.event_id;
         self.last_event_type = event.event_type.clone();
@@ -633,8 +635,23 @@ impl WorkflowInstanceState {
         self.run_id = event.run_id.clone();
         self.definition_version = Some(event.definition_version);
         self.artifact_hash = Some(event.artifact_hash.clone());
-        self.current_state =
-            event.metadata.get("state").cloned().or_else(|| self.current_state.clone());
+        if !was_terminal {
+            self.current_state =
+                event.metadata.get("state").cloned().or_else(|| self.current_state.clone());
+        }
+
+        if was_terminal {
+            if matches!(
+                event.payload,
+                WorkflowEvent::WorkflowUpdateCompleted { .. }
+                    | WorkflowEvent::WorkflowUpdateRejected { .. }
+            ) {
+                if let Some(execution) = self.artifact_execution.as_mut() {
+                    execution.active_update = None;
+                }
+            }
+            return;
+        }
 
         match &event.payload {
             WorkflowEvent::WorkflowTriggered { input } => {
@@ -645,7 +662,11 @@ impl WorkflowInstanceState {
             WorkflowEvent::WorkflowStarted
             | WorkflowEvent::WorkflowArtifactPinned
             | WorkflowEvent::MarkerRecorded { .. }
-            | WorkflowEvent::SignalQueued { .. } => {
+            | WorkflowEvent::SignalQueued { .. }
+            | WorkflowEvent::WorkflowUpdateRequested { .. }
+            | WorkflowEvent::WorkflowCancellationRequested { .. }
+            | WorkflowEvent::ChildWorkflowStartRequested { .. }
+            | WorkflowEvent::ChildWorkflowStarted { .. } => {
                 self.status = WorkflowStatus::Running;
             }
             WorkflowEvent::WorkflowContinuedAsNew { input, .. } => {
@@ -654,7 +675,8 @@ impl WorkflowInstanceState {
                 self.output = None;
                 self.context = Some(input.clone());
             }
-            WorkflowEvent::SignalReceived { payload, .. } => {
+            WorkflowEvent::SignalReceived { payload, .. }
+            | WorkflowEvent::WorkflowUpdateAccepted { payload, .. } => {
                 self.status = WorkflowStatus::Running;
                 self.context = Some(payload.clone());
             }
@@ -669,6 +691,18 @@ impl WorkflowInstanceState {
             WorkflowEvent::ActivityTaskCompleted { output, .. } => {
                 self.status = WorkflowStatus::Running;
                 self.context = Some(output.clone());
+            }
+            WorkflowEvent::WorkflowUpdateCompleted { output, .. }
+            | WorkflowEvent::ChildWorkflowCompleted { output, .. } => {
+                self.status = WorkflowStatus::Running;
+                self.context = Some(output.clone());
+            }
+            WorkflowEvent::WorkflowUpdateRejected { error, .. }
+            | WorkflowEvent::ChildWorkflowFailed { error, .. }
+            | WorkflowEvent::ChildWorkflowCancelled { reason: error, .. }
+            | WorkflowEvent::ChildWorkflowTerminated { reason: error, .. } => {
+                self.status = WorkflowStatus::Running;
+                self.context = Some(Value::String(error.clone()));
             }
             WorkflowEvent::ActivityTaskFailed { error, .. }
             | WorkflowEvent::ActivityTaskCancelled { reason: error, .. } => {
@@ -686,10 +720,20 @@ impl WorkflowInstanceState {
                 self.output = Some(Value::String(error.clone()));
                 self.context = Some(Value::String(error.clone()));
             }
+            WorkflowEvent::WorkflowCancelled { reason } => {
+                self.status = WorkflowStatus::Cancelled;
+                self.output = Some(Value::String(reason.clone()));
+                self.context = Some(Value::String(reason.clone()));
+            }
             WorkflowEvent::WorkflowCompleted { output } => {
                 self.status = WorkflowStatus::Completed;
                 self.output = Some(output.clone());
                 self.context = Some(output.clone());
+            }
+            WorkflowEvent::WorkflowTerminated { reason } => {
+                self.status = WorkflowStatus::Terminated;
+                self.output = Some(Value::String(reason.clone()));
+                self.context = Some(Value::String(reason.clone()));
             }
         }
     }
@@ -826,7 +870,18 @@ pub fn replay_compiled_history_trace(
     }];
     for event in history.iter().skip(1) {
         let before = replay_checkpoint(&replayed);
+        let was_terminal = replayed.status.is_terminal();
         replayed.apply_event(event);
+        if was_terminal {
+            transitions.push(ReplayTransitionTraceEntry {
+                event_id: event.event_id,
+                event_type: event.event_type.clone(),
+                occurred_at: event.occurred_at,
+                checkpoint_before: Some(before),
+                checkpoint_after: replay_checkpoint(&replayed),
+            });
+            continue;
+        }
         let skip_semantic = should_skip_replay_event(event, &mut seen_dedupe_keys);
         let mut advanced = false;
         if !skip_semantic {
@@ -835,6 +890,20 @@ pub fn replay_compiled_history_trace(
                     execution = artifact.execute_after_signal_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         signal_type,
+                        payload,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    advanced = true;
+                }
+                WorkflowEvent::WorkflowUpdateAccepted { update_id, update_name, payload } => {
+                    execution = artifact.execute_update_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        update_id,
+                        update_name,
                         payload,
                         replayed.artifact_execution.clone().unwrap_or_default(),
                         ExecutionTurnContext {
@@ -910,6 +979,34 @@ pub fn replay_compiled_history_trace(
                     )?;
                     advanced = true;
                 }
+                WorkflowEvent::ChildWorkflowCompleted { child_id, output, .. } => {
+                    execution = artifact.execute_after_child_completion_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        child_id,
+                        output,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    advanced = true;
+                }
+                WorkflowEvent::ChildWorkflowFailed { child_id, error, .. }
+                | WorkflowEvent::ChildWorkflowCancelled { child_id, reason: error, .. }
+                | WorkflowEvent::ChildWorkflowTerminated { child_id, reason: error, .. } => {
+                    execution = artifact.execute_after_child_failure_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        child_id,
+                        error,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    advanced = true;
+                }
                 _ => {}
             }
         }
@@ -942,13 +1039,38 @@ pub fn replay_compiled_history_trace_from_snapshot(
 
     for event in history_tail {
         let before = replay_checkpoint(&replayed);
+        let was_terminal = replayed.status.is_terminal();
         replayed.apply_event(event);
+        if was_terminal {
+            transitions.push(ReplayTransitionTraceEntry {
+                event_id: event.event_id,
+                event_type: event.event_type.clone(),
+                occurred_at: event.occurred_at,
+                checkpoint_before: Some(before),
+                checkpoint_after: replay_checkpoint(&replayed),
+            });
+            continue;
+        }
         if !should_skip_replay_event(event, &mut seen_dedupe_keys) {
             match &event.payload {
                 WorkflowEvent::SignalReceived { signal_type, payload, .. } => {
                     let execution = artifact.execute_after_signal_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         signal_type,
+                        payload,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    apply_compiled_execution(&mut replayed, &execution);
+                }
+                WorkflowEvent::WorkflowUpdateAccepted { update_id, update_name, payload } => {
+                    let execution = artifact.execute_update_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        update_id,
+                        update_name,
                         payload,
                         replayed.artifact_execution.clone().unwrap_or_default(),
                         ExecutionTurnContext {
@@ -1016,6 +1138,34 @@ pub fn replay_compiled_history_trace_from_snapshot(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         activity_id,
                         reason,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    apply_compiled_execution(&mut replayed, &execution);
+                }
+                WorkflowEvent::ChildWorkflowCompleted { child_id, output, .. } => {
+                    let execution = artifact.execute_after_child_completion_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        child_id,
+                        output,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    apply_compiled_execution(&mut replayed, &execution);
+                }
+                WorkflowEvent::ChildWorkflowFailed { child_id, error, .. }
+                | WorkflowEvent::ChildWorkflowCancelled { child_id, reason: error, .. }
+                | WorkflowEvent::ChildWorkflowTerminated { child_id, reason: error, .. } => {
+                    let execution = artifact.execute_after_child_failure_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        child_id,
+                        error,
                         replayed.artifact_execution.clone().unwrap_or_default(),
                         ExecutionTurnContext {
                             event_id: event.event_id,
@@ -1224,6 +1374,8 @@ pub enum WorkflowStatus {
     Running,
     Completed,
     Failed,
+    Cancelled,
+    Terminated,
 }
 
 impl WorkflowStatus {
@@ -1233,7 +1385,13 @@ impl WorkflowStatus {
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Terminated => "terminated",
         }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled | Self::Terminated)
     }
 }
 
@@ -1249,7 +1407,7 @@ mod tests {
 
     use chrono::Utc;
     use fabrik_events::{EventEnvelope, WorkflowEvent};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use uuid::Uuid;
 
     use crate::compiled::{
@@ -1258,11 +1416,11 @@ mod tests {
     };
 
     use super::{
-        ExecutionEmission, HttpRequestConfig, ReplaySource, RetryPolicy, StateNode, StepConfig,
-        WorkflowDefinition, WorkflowInstanceState, WorkflowProjectionError, WorkflowStatus,
-        WorkflowValidationError, replay_compiled_history_trace,
-        replay_compiled_history_trace_from_snapshot, replay_history_trace,
-        replay_history_trace_from_snapshot,
+        ActiveUpdateState, ArtifactExecutionState, ExecutionEmission, HttpRequestConfig,
+        ReplaySource, RetryPolicy, StateNode, StepConfig, WorkflowDefinition,
+        WorkflowInstanceState, WorkflowProjectionError, WorkflowStatus, WorkflowValidationError,
+        replay_compiled_history_trace, replay_compiled_history_trace_from_snapshot,
+        replay_history_trace, replay_history_trace_from_snapshot,
     };
 
     fn test_event(
@@ -1575,6 +1733,122 @@ mod tests {
         assert_eq!(trace.transitions.len(), 1);
         assert_eq!(trace.final_state.current_state, Some("done".to_owned()));
         assert_eq!(trace.final_state.status, WorkflowStatus::Completed);
+    }
+
+    #[test]
+    fn projection_tracks_cancellation_request_and_terminal_cancel() {
+        let triggered = test_event(
+            "WorkflowTriggered",
+            "run-1",
+            WorkflowEvent::WorkflowTriggered { input: json!({"hello": "world"}) },
+            &[],
+        );
+        let cancellation_requested = test_event(
+            "WorkflowCancellationRequested",
+            "run-1",
+            WorkflowEvent::WorkflowCancellationRequested {
+                reason: "operator requested cancellation".to_owned(),
+            },
+            &[],
+        );
+        let cancelled = test_event(
+            "WorkflowCancelled",
+            "run-1",
+            WorkflowEvent::WorkflowCancelled {
+                reason: "operator requested cancellation".to_owned(),
+            },
+            &[],
+        );
+
+        let mut state = WorkflowInstanceState::try_from(&triggered).unwrap();
+        state.apply_event(&cancellation_requested);
+        assert_eq!(state.status, WorkflowStatus::Running);
+
+        state.apply_event(&cancelled);
+        assert_eq!(state.status, WorkflowStatus::Cancelled);
+        assert_eq!(state.output, Some(Value::String("operator requested cancellation".to_owned())));
+    }
+
+    #[test]
+    fn projection_does_not_reopen_after_terminal_child_reflection() {
+        let triggered = test_event(
+            "WorkflowTriggered",
+            "run-1",
+            WorkflowEvent::WorkflowTriggered { input: json!({"hello": "world"}) },
+            &[],
+        );
+        let terminated = test_event(
+            "WorkflowTerminated",
+            "run-1",
+            WorkflowEvent::WorkflowTerminated { reason: "done".to_owned() },
+            &[],
+        );
+        let child_cancelled = test_event(
+            "ChildWorkflowCancelled",
+            "run-1",
+            WorkflowEvent::ChildWorkflowCancelled {
+                child_id: "child-1".to_owned(),
+                child_run_id: "child-run-1".to_owned(),
+                reason: "parent close".to_owned(),
+            },
+            &[],
+        );
+
+        let mut state = WorkflowInstanceState::try_from(&triggered).unwrap();
+        state.apply_event(&terminated);
+        state.apply_event(&child_cancelled);
+
+        assert_eq!(state.status, WorkflowStatus::Terminated);
+        assert_eq!(state.output, Some(Value::String("done".to_owned())));
+    }
+
+    #[test]
+    fn terminal_projection_clears_active_update_on_post_terminal_rejection() {
+        let triggered = test_event(
+            "WorkflowTriggered",
+            "run-1",
+            WorkflowEvent::WorkflowTriggered { input: json!({"hello": "world"}) },
+            &[],
+        );
+        let terminated = test_event(
+            "WorkflowTerminated",
+            "run-1",
+            WorkflowEvent::WorkflowTerminated { reason: "done".to_owned() },
+            &[],
+        );
+        let update_rejected = test_event(
+            "WorkflowUpdateRejected",
+            "run-1",
+            WorkflowEvent::WorkflowUpdateRejected {
+                update_id: "upd-1".to_owned(),
+                update_name: "approve".to_owned(),
+                error: "closed".to_owned(),
+            },
+            &[],
+        );
+
+        let mut state = WorkflowInstanceState::try_from(&triggered).unwrap();
+        state.artifact_execution = Some(ArtifactExecutionState {
+            active_update: Some(ActiveUpdateState {
+                update_id: "upd-1".to_owned(),
+                update_name: "approve".to_owned(),
+                return_state: "wait".to_owned(),
+            }),
+            ..Default::default()
+        });
+
+        state.apply_event(&terminated);
+        state.apply_event(&update_rejected);
+
+        assert_eq!(state.status, WorkflowStatus::Terminated);
+        assert_eq!(state.last_event_type, "WorkflowUpdateRejected");
+        assert!(
+            state
+                .artifact_execution
+                .as_ref()
+                .and_then(|execution| execution.active_update.as_ref())
+                .is_none()
+        );
     }
 
     #[test]

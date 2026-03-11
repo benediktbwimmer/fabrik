@@ -1,5 +1,11 @@
 use anyhow::Result;
-use axum::{Json, extract::Path, extract::State as AxumState, http::StatusCode, routing::get};
+use axum::{
+    Json,
+    extract::Path,
+    extract::State as AxumState,
+    http::StatusCode,
+    routing::{get, post},
+};
 use fabrik_broker::{
     BrokerConfig, WorkflowHistoryFilter, WorkflowPublisher, WorkflowTopicTopology,
     build_workflow_partition_consumer, decode_workflow_event, describe_workflow_topic,
@@ -17,7 +23,7 @@ use fabrik_workflow::{
     replay_history_trace_from_snapshot,
 };
 use futures_util::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -120,7 +126,11 @@ async fn main() -> Result<()> {
     .route("/debug/ownership", get(get_ownership_debug))
     .route("/debug/broker", get(get_broker_debug))
     .route("/debug/hot-state/{tenant_id}/{instance_id}", get(get_hot_state_debug))
-    .with_state(ExecutorAppState { debug: debug_state, broker });
+    .route(
+        "/internal/workflows/{tenant_id}/{instance_id}/queries/{query_name}",
+        post(execute_internal_query),
+    )
+    .with_state(ExecutorAppState { debug: debug_state, broker, store });
 
     serve(app, config.port).await
 }
@@ -129,6 +139,7 @@ async fn main() -> Result<()> {
 struct ExecutorAppState {
     debug: Arc<Mutex<ExecutorDebugState>>,
     broker: BrokerConfig,
+    store: WorkflowStore,
 }
 
 struct PartitionWorkerHandle {
@@ -156,10 +167,16 @@ async fn run_assignment_supervisor(
         std::time::Duration::from_secs(ownership_config.rebalance_interval_seconds);
     let renew_interval = std::time::Duration::from_secs(ownership_config.renew_interval_seconds);
     let mut last_rebalance_at = std::time::Instant::now() - rebalance_interval;
+    let query_endpoint = "http://127.0.0.1:3002".to_owned();
 
     loop {
         if let Err(error) = store
-            .heartbeat_executor_member(&owner_id, ownership_config.executor_capacity, heartbeat_ttl)
+            .heartbeat_executor_member(
+                &owner_id,
+                &query_endpoint,
+                ownership_config.executor_capacity,
+                heartbeat_ttl,
+            )
             .await
         {
             error!(error = %error, "failed to heartbeat executor membership");
@@ -1240,7 +1257,17 @@ async fn process_event(
                 }
             }
         }
-        WorkflowEvent::SignalReceived { signal_type, payload, .. } => {
+        WorkflowEvent::SignalReceived { signal_id, signal_type, payload } => {
+            store
+                .mark_signal_consumed(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &event.run_id,
+                    signal_id,
+                    event.event_id,
+                    event.occurred_at,
+                )
+                .await?;
             if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
                 let wait_state = match state.current_state.clone() {
                     Some(wait_state) => wait_state,
@@ -1334,6 +1361,282 @@ async fn process_event(
             )
             .await?;
         }
+        WorkflowEvent::ChildWorkflowCompleted { child_id, output, .. } => {
+            store
+                .complete_child(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &event.run_id,
+                    child_id,
+                    "completed",
+                    Some(output),
+                    None,
+                    event.event_id,
+                    event.occurred_at,
+                )
+                .await?;
+            let Some(artifact) = load_pinned_artifact(store, &event, &state).await? else {
+                return Ok(());
+            };
+            let wait_state = match state.current_state.clone() {
+                Some(wait_state) => wait_state,
+                None => {
+                    warn!(
+                        workflow_instance_id = %event.instance_id,
+                        child_id = %child_id,
+                        "child completed without current_state"
+                    );
+                    return Ok(());
+                }
+            };
+            let plan = artifact.execute_after_child_completion_with_turn(
+                &wait_state,
+                child_id,
+                output,
+                state.artifact_execution.clone().unwrap_or_default(),
+                ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at },
+            )?;
+            apply_compiled_plan(&mut state, &plan);
+            persist_state(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                lease_snapshot.partition_id,
+                &mut record,
+                &state,
+            )
+            .await?;
+            publish_compiled_plan(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                publisher,
+                &event,
+                &artifact,
+                plan,
+                state.context.clone().or_else(|| state.input.clone()),
+            )
+            .await?;
+            return Ok(());
+        }
+        WorkflowEvent::ChildWorkflowFailed { child_id, error, .. }
+        | WorkflowEvent::ChildWorkflowCancelled { child_id, reason: error, .. }
+        | WorkflowEvent::ChildWorkflowTerminated { child_id, reason: error, .. } => {
+            let status = match &event.payload {
+                WorkflowEvent::ChildWorkflowFailed { .. } => "failed",
+                WorkflowEvent::ChildWorkflowCancelled { .. } => "cancelled",
+                WorkflowEvent::ChildWorkflowTerminated { .. } => "terminated",
+                _ => unreachable!(),
+            };
+            store
+                .complete_child(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &event.run_id,
+                    child_id,
+                    status,
+                    None,
+                    Some(error),
+                    event.event_id,
+                    event.occurred_at,
+                )
+                .await?;
+            let Some(artifact) = load_pinned_artifact(store, &event, &state).await? else {
+                return Ok(());
+            };
+            let wait_state = match state.current_state.clone() {
+                Some(wait_state) => wait_state,
+                None => {
+                    warn!(
+                        workflow_instance_id = %event.instance_id,
+                        child_id = %child_id,
+                        "child failed without current_state"
+                    );
+                    return Ok(());
+                }
+            };
+            let plan = artifact.execute_after_child_failure_with_turn(
+                &wait_state,
+                child_id,
+                error,
+                state.artifact_execution.clone().unwrap_or_default(),
+                ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at },
+            )?;
+            apply_compiled_plan(&mut state, &plan);
+            persist_state(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                lease_snapshot.partition_id,
+                &mut record,
+                &state,
+            )
+            .await?;
+            publish_compiled_plan(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                publisher,
+                &event,
+                &artifact,
+                plan,
+                state.context.clone().or_else(|| state.input.clone()),
+            )
+            .await?;
+            return Ok(());
+        }
+        WorkflowEvent::WorkflowUpdateRequested { .. } => {}
+        WorkflowEvent::WorkflowUpdateAccepted { update_id, update_name, payload } => {
+            let Some(artifact) = load_pinned_artifact(store, &event, &state).await? else {
+                publish_failure(
+                    store,
+                    runtime,
+                    debug_state,
+                    lease_state,
+                    publisher,
+                    &event,
+                    state.definition_version,
+                    format!("update {update_name} requires a compiled workflow artifact"),
+                    state.current_state.clone(),
+                )
+                .await?;
+                return Ok(());
+            };
+            let wait_state = state
+                .current_state
+                .clone()
+                .unwrap_or_else(|| artifact.workflow.initial_state.clone());
+            let plan = artifact.execute_update_with_turn(
+                &wait_state,
+                update_id,
+                update_name,
+                payload,
+                state.artifact_execution.clone().unwrap_or_default(),
+                ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at },
+            )?;
+            apply_compiled_plan(&mut state, &plan);
+            persist_state(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                lease_snapshot.partition_id,
+                &mut record,
+                &state,
+            )
+            .await?;
+            publish_compiled_plan(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                publisher,
+                &event,
+                &artifact,
+                plan,
+                state.context.clone().or_else(|| state.input.clone()),
+            )
+            .await?;
+            return Ok(());
+        }
+        WorkflowEvent::ChildWorkflowStartRequested {
+            child_id,
+            child_workflow_id,
+            child_definition_id,
+            input,
+            task_queue: _,
+            parent_close_policy,
+        } => {
+            store
+                .upsert_child_start_requested(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &event.run_id,
+                    child_id,
+                    child_workflow_id,
+                    child_definition_id,
+                    parent_close_policy,
+                    input,
+                    event.event_id,
+                    event.occurred_at,
+                )
+                .await?;
+
+            let (definition_version, artifact_hash) = if let Some(artifact) =
+                store.get_latest_artifact(&event.tenant_id, child_definition_id).await?
+            {
+                (artifact.definition_version, artifact.artifact_hash)
+            } else {
+                let definition = store
+                    .get_latest_definition(&event.tenant_id, child_definition_id)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("child workflow definition {child_definition_id} not found")
+                    })?;
+                (definition.version, fabrik_workflow::artifact_hash(&definition))
+            };
+            let child_run_id = format!("run-{}", Uuid::now_v7());
+            store
+                .put_run_start(
+                    &event.tenant_id,
+                    child_workflow_id,
+                    &child_run_id,
+                    child_definition_id,
+                    Some(definition_version),
+                    Some(&artifact_hash),
+                    event.event_id,
+                    event.occurred_at,
+                    None,
+                    Some(&event.run_id),
+                )
+                .await?;
+
+            ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
+            let mut child_trigger = EventEnvelope::new(
+                WorkflowEvent::WorkflowTriggered { input: input.clone() }.event_type(),
+                WorkflowIdentity::new(
+                    event.tenant_id.clone(),
+                    child_definition_id.clone(),
+                    definition_version,
+                    artifact_hash,
+                    child_workflow_id.clone(),
+                    child_run_id.clone(),
+                    "executor-service",
+                ),
+                WorkflowEvent::WorkflowTriggered { input: input.clone() },
+            );
+            child_trigger.causation_id = Some(event.event_id);
+            child_trigger.correlation_id = event.correlation_id.or(Some(event.event_id));
+            child_trigger
+                .metadata
+                .insert("parent_instance_id".to_owned(), event.instance_id.clone());
+            child_trigger.metadata.insert("parent_run_id".to_owned(), event.run_id.clone());
+            child_trigger.metadata.insert("parent_child_id".to_owned(), child_id.clone());
+            publisher.publish(&child_trigger, &child_trigger.partition_key).await?;
+
+            let mut parent_started = EventEnvelope::new(
+                WorkflowEvent::ChildWorkflowStarted {
+                    child_id: child_id.clone(),
+                    child_workflow_id: child_workflow_id.clone(),
+                    child_run_id: child_run_id.clone(),
+                }
+                .event_type(),
+                source_identity(&event, "executor-service"),
+                WorkflowEvent::ChildWorkflowStarted {
+                    child_id: child_id.clone(),
+                    child_workflow_id: child_workflow_id.clone(),
+                    child_run_id,
+                },
+            );
+            parent_started.causation_id = Some(event.event_id);
+            parent_started.correlation_id = event.correlation_id.or(Some(event.event_id));
+            publisher.publish(&parent_started, &parent_started.partition_key).await?;
+            return Ok(());
+        }
         WorkflowEvent::WorkflowContinuedAsNew { .. } => {
             let deleted = store
                 .delete_timers_for_run(&event.tenant_id, &event.instance_id, &event.run_id)
@@ -1346,7 +1649,7 @@ async fn process_event(
             );
         }
         WorkflowEvent::SignalQueued { .. } => {
-            try_dispatch_buffered_signal(
+            try_dispatch_next_message(
                 store,
                 runtime,
                 debug_state,
@@ -1357,10 +1660,187 @@ async fn process_event(
             )
             .await?;
         }
+        WorkflowEvent::WorkflowCancellationRequested { reason } => {
+            ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
+            let mut cancelled = EventEnvelope::new(
+                WorkflowEvent::WorkflowCancelled { reason: reason.clone() }.event_type(),
+                source_identity(&event, "executor-service"),
+                WorkflowEvent::WorkflowCancelled { reason: reason.clone() },
+            );
+            cancelled.causation_id = Some(event.event_id);
+            cancelled.correlation_id = event.correlation_id.or(Some(event.event_id));
+            publisher.publish(&cancelled, &cancelled.partition_key).await?;
+            return Ok(());
+        }
         WorkflowEvent::WorkflowArtifactPinned
         | WorkflowEvent::WorkflowStarted
         | WorkflowEvent::MarkerRecorded { .. } => {}
         _ => {}
+    }
+
+    match &event.payload {
+        WorkflowEvent::WorkflowUpdateCompleted { update_id, output, .. } => {
+            store
+                .complete_update(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &event.run_id,
+                    update_id,
+                    Some(output),
+                    None,
+                    event.event_id,
+                    event.occurred_at,
+                )
+                .await?;
+        }
+        WorkflowEvent::WorkflowUpdateRejected { update_id, error, .. } => {
+            store
+                .complete_update(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &event.run_id,
+                    update_id,
+                    None,
+                    Some(error),
+                    event.event_id,
+                    event.occurred_at,
+                )
+                .await?;
+        }
+        WorkflowEvent::ChildWorkflowStarted { child_id, child_run_id, .. } => {
+            store
+                .mark_child_started(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &event.run_id,
+                    child_id,
+                    child_run_id,
+                    event.event_id,
+                    event.occurred_at,
+                )
+                .await?;
+        }
+        WorkflowEvent::ChildWorkflowCompleted { child_id, output, .. } => {
+            store
+                .complete_child(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &event.run_id,
+                    child_id,
+                    "completed",
+                    Some(output),
+                    None,
+                    event.event_id,
+                    event.occurred_at,
+                )
+                .await?;
+        }
+        WorkflowEvent::ChildWorkflowFailed { child_id, error, .. } => {
+            store
+                .complete_child(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &event.run_id,
+                    child_id,
+                    "failed",
+                    None,
+                    Some(error),
+                    event.event_id,
+                    event.occurred_at,
+                )
+                .await?;
+        }
+        WorkflowEvent::ChildWorkflowCancelled { child_id, reason, .. } => {
+            store
+                .complete_child(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &event.run_id,
+                    child_id,
+                    "cancelled",
+                    None,
+                    Some(reason),
+                    event.event_id,
+                    event.occurred_at,
+                )
+                .await?;
+        }
+        WorkflowEvent::ChildWorkflowTerminated { child_id, reason, .. } => {
+            store
+                .complete_child(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &event.run_id,
+                    child_id,
+                    "terminated",
+                    None,
+                    Some(reason),
+                    event.event_id,
+                    event.occurred_at,
+                )
+                .await?;
+        }
+        WorkflowEvent::WorkflowCompleted { .. }
+        | WorkflowEvent::WorkflowFailed { .. }
+        | WorkflowEvent::WorkflowCancelled { .. }
+        | WorkflowEvent::WorkflowTerminated { .. } => {
+            store
+                .close_run(&event.tenant_id, &event.instance_id, &event.run_id, event.occurred_at)
+                .await?;
+            reject_outstanding_updates_for_closed_run(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                publisher,
+                &event,
+            )
+            .await?;
+            enforce_parent_close_policies(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                publisher,
+                &event,
+            )
+            .await?;
+        }
+        _ => {}
+    }
+
+    if let Some(parent_child) = match &event.payload {
+        WorkflowEvent::WorkflowCompleted { .. }
+        | WorkflowEvent::WorkflowFailed { .. }
+        | WorkflowEvent::WorkflowCancelled { .. }
+        | WorkflowEvent::WorkflowTerminated { .. } => {
+            store.find_parent_for_child_run(&event.tenant_id, &event.run_id).await?
+        }
+        _ => None,
+    } {
+        publish_child_terminal_reflection(
+            store,
+            runtime,
+            debug_state,
+            lease_state,
+            publisher,
+            &event,
+            &parent_child,
+        )
+        .await?;
+    }
+
+    if !event_is_terminal(&event.payload) && !state.status.is_terminal() {
+        try_dispatch_next_message(
+            store,
+            runtime,
+            debug_state,
+            lease_state,
+            publisher,
+            &state,
+            &event,
+        )
+        .await?;
     }
 
     Ok(())
@@ -2239,7 +2719,7 @@ async fn publish_plan(
     .await?;
     if !continued {
         if let Some(current) = store.get_instance(&event.tenant_id, &event.instance_id).await? {
-            try_dispatch_buffered_signal(
+            try_dispatch_next_message(
                 store,
                 runtime,
                 debug_state,
@@ -2360,7 +2840,7 @@ async fn publish_compiled_plan(
     .await?;
     if !continued {
         if let Some(current) = store.get_instance(&event.tenant_id, &event.instance_id).await? {
-            try_dispatch_buffered_signal(
+            try_dispatch_next_message(
                 store,
                 runtime,
                 debug_state,
@@ -2452,6 +2932,457 @@ fn source_identity(event: &EventEnvelope<WorkflowEvent>, producer: &str) -> Work
     )
 }
 
+#[derive(Debug, Deserialize)]
+struct InternalQueryRequest {
+    #[serde(default)]
+    args: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct InternalQueryResponse {
+    result: Value,
+    consistency: &'static str,
+    source: &'static str,
+}
+
+async fn execute_internal_query(
+    Path((tenant_id, instance_id, query_name)): Path<(String, String, String)>,
+    AxumState(state): AxumState<ExecutorAppState>,
+    Json(request): Json<InternalQueryRequest>,
+) -> Result<Json<InternalQueryResponse>, (StatusCode, Json<ExecutorErrorResponse>)> {
+    let instance = state.store.get_instance(&tenant_id, &instance_id).await.map_err(|error| {
+        internal_executor_error(format!("failed to load workflow instance: {error}"))
+    })?;
+    let Some(instance) = instance else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ExecutorErrorResponse {
+                message: format!("workflow instance {instance_id} not found"),
+            }),
+        ));
+    };
+    let Some(version) = instance.definition_version else {
+        return Err(internal_executor_error(
+            "workflow instance is missing a pinned artifact version",
+        ));
+    };
+    let artifact = state
+        .store
+        .get_artifact_version(&tenant_id, &instance.definition_id, version)
+        .await
+        .map_err(|error| {
+            internal_executor_error(format!("failed to load workflow artifact: {error}"))
+        })?
+        .ok_or_else(|| internal_executor_error("workflow artifact not found"))?;
+    let result = artifact
+        .evaluate_query(
+            &query_name,
+            &request.args,
+            instance.artifact_execution.clone().unwrap_or_default(),
+        )
+        .map_err(|error| {
+            (StatusCode::BAD_REQUEST, Json(ExecutorErrorResponse { message: error.to_string() }))
+        })?;
+    Ok(Json(InternalQueryResponse {
+        result,
+        consistency: "strong",
+        source: if instance.status == fabrik_workflow::WorkflowStatus::Running {
+            "hot_owner"
+        } else {
+            "replay"
+        },
+    }))
+}
+
+async fn try_dispatch_buffered_update(
+    store: &WorkflowStore,
+    runtime: &mut ExecutorRuntime,
+    debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    lease_state: &Arc<Mutex<LeaseState>>,
+    publisher: &WorkflowPublisher,
+    state: &WorkflowInstanceState,
+    event: &EventEnvelope<WorkflowEvent>,
+) -> Result<()> {
+    if state.status.is_terminal() {
+        return Ok(());
+    }
+    if state
+        .artifact_execution
+        .as_ref()
+        .and_then(|execution| execution.active_update.as_ref())
+        .is_some()
+    {
+        return Ok(());
+    }
+    let Some(artifact) = load_pinned_artifact(store, event, state).await? else {
+        return Ok(());
+    };
+    let oldest_signal = store
+        .get_oldest_pending_signal(&event.tenant_id, &event.instance_id, &event.run_id)
+        .await?;
+    let Some(update) = store
+        .get_oldest_requested_update(&event.tenant_id, &event.instance_id, &event.run_id)
+        .await?
+    else {
+        return Ok(());
+    };
+    if choose_pending_inbound_kind(oldest_signal.as_ref(), Some(&update))
+        != Some(PendingInboundKind::Update)
+    {
+        return Ok(());
+    }
+    if !artifact.has_update(&update.update_name) {
+        store
+            .complete_update(
+                &update.tenant_id,
+                &update.instance_id,
+                &update.run_id,
+                &update.update_id,
+                None,
+                Some(&format!("unknown update handler {}", update.update_name)),
+                update.source_event_id,
+                chrono::Utc::now(),
+            )
+            .await?;
+        ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
+        let payload = WorkflowEvent::WorkflowUpdateRejected {
+            update_id: update.update_id.clone(),
+            update_name: update.update_name.clone(),
+            error: format!("unknown update handler {}", update.update_name),
+        };
+        let mut envelope = EventEnvelope::new(
+            payload.event_type(),
+            source_identity(event, "executor-service"),
+            payload,
+        );
+        envelope.causation_id = Some(update.source_event_id);
+        envelope.correlation_id = event.correlation_id.or(Some(update.source_event_id));
+        envelope.dedupe_key = Some(format!("update-rejected:{}", update.update_id));
+        publisher.publish(&envelope, &envelope.partition_key).await?;
+        return Ok(());
+    }
+    let accepted_event_id = Uuid::now_v7();
+    if !store
+        .accept_update(
+            &update.tenant_id,
+            &update.instance_id,
+            &update.run_id,
+            &update.update_id,
+            accepted_event_id,
+            chrono::Utc::now(),
+        )
+        .await?
+    {
+        return Ok(());
+    }
+
+    ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
+    let payload = WorkflowEvent::WorkflowUpdateAccepted {
+        update_id: update.update_id.clone(),
+        update_name: update.update_name.clone(),
+        payload: update.payload.clone(),
+    };
+    let mut envelope = EventEnvelope::new(
+        payload.event_type(),
+        source_identity(event, "executor-service"),
+        payload,
+    );
+    envelope.event_id = accepted_event_id;
+    envelope.occurred_at = chrono::Utc::now();
+    envelope.causation_id = Some(update.source_event_id);
+    envelope.correlation_id = event.correlation_id.or(Some(update.source_event_id));
+    envelope.dedupe_key = Some(format!("update-accepted:{}", update.update_id));
+    publisher.publish(&envelope, &envelope.partition_key).await?;
+    Ok(())
+}
+
+async fn publish_child_terminal_reflection(
+    store: &WorkflowStore,
+    runtime: &mut ExecutorRuntime,
+    debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    lease_state: &Arc<Mutex<LeaseState>>,
+    publisher: &WorkflowPublisher,
+    event: &EventEnvelope<WorkflowEvent>,
+    parent_child: &fabrik_store::WorkflowChildRecord,
+) -> Result<()> {
+    ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
+    let parent_instance = store.get_instance(&event.tenant_id, &parent_child.instance_id).await?;
+    let Some(parent_instance) = parent_instance else {
+        return Ok(());
+    };
+    let payload = match &event.payload {
+        WorkflowEvent::WorkflowCompleted { output } => WorkflowEvent::ChildWorkflowCompleted {
+            child_id: parent_child.child_id.clone(),
+            child_run_id: event.run_id.clone(),
+            output: output.clone(),
+        },
+        WorkflowEvent::WorkflowFailed { reason } => WorkflowEvent::ChildWorkflowFailed {
+            child_id: parent_child.child_id.clone(),
+            child_run_id: event.run_id.clone(),
+            error: reason.clone(),
+        },
+        WorkflowEvent::WorkflowCancelled { reason } => WorkflowEvent::ChildWorkflowCancelled {
+            child_id: parent_child.child_id.clone(),
+            child_run_id: event.run_id.clone(),
+            reason: reason.clone(),
+        },
+        WorkflowEvent::WorkflowTerminated { reason } => WorkflowEvent::ChildWorkflowTerminated {
+            child_id: parent_child.child_id.clone(),
+            child_run_id: event.run_id.clone(),
+            reason: reason.clone(),
+        },
+        _ => return Ok(()),
+    };
+    let mut envelope = EventEnvelope::new(
+        payload.event_type(),
+        WorkflowIdentity::new(
+            event.tenant_id.clone(),
+            parent_instance.definition_id.clone(),
+            parent_instance.definition_version.unwrap_or(event.definition_version),
+            parent_instance.artifact_hash.clone().unwrap_or_else(|| event.artifact_hash.clone()),
+            parent_child.instance_id.clone(),
+            parent_child.run_id.clone(),
+            "executor-service",
+        ),
+        payload,
+    );
+    envelope.causation_id = Some(event.event_id);
+    envelope.correlation_id = event.correlation_id.or(Some(event.event_id));
+    publisher.publish(&envelope, &envelope.partition_key).await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingInboundKind {
+    Signal,
+    Update,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentCloseAction {
+    Terminate,
+    RequestCancel,
+    Abandon,
+}
+
+fn choose_pending_inbound_kind(
+    signal: Option<&fabrik_store::WorkflowSignalRecord>,
+    update: Option<&fabrik_store::WorkflowUpdateRecord>,
+) -> Option<PendingInboundKind> {
+    match (signal, update) {
+        (Some(signal), Some(update)) => {
+            if update.requested_at < signal.enqueued_at {
+                Some(PendingInboundKind::Update)
+            } else if signal.enqueued_at < update.requested_at {
+                Some(PendingInboundKind::Signal)
+            } else if update.update_id <= signal.signal_id {
+                Some(PendingInboundKind::Update)
+            } else {
+                Some(PendingInboundKind::Signal)
+            }
+        }
+        (Some(_), None) => Some(PendingInboundKind::Signal),
+        (None, Some(_)) => Some(PendingInboundKind::Update),
+        (None, None) => None,
+    }
+}
+
+async fn try_dispatch_next_message(
+    store: &WorkflowStore,
+    runtime: &mut ExecutorRuntime,
+    debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    lease_state: &Arc<Mutex<LeaseState>>,
+    publisher: &WorkflowPublisher,
+    state: &WorkflowInstanceState,
+    event: &EventEnvelope<WorkflowEvent>,
+) -> Result<()> {
+    if state.status.is_terminal() {
+        return Ok(());
+    }
+    if state
+        .artifact_execution
+        .as_ref()
+        .and_then(|execution| execution.active_update.as_ref())
+        .is_some()
+    {
+        return Ok(());
+    }
+    let oldest_signal = store
+        .get_oldest_pending_signal(&event.tenant_id, &event.instance_id, &event.run_id)
+        .await?;
+    let oldest_update = store
+        .get_oldest_requested_update(&event.tenant_id, &event.instance_id, &event.run_id)
+        .await?;
+    match choose_pending_inbound_kind(oldest_signal.as_ref(), oldest_update.as_ref()) {
+        Some(PendingInboundKind::Signal) => {
+            try_dispatch_buffered_signal(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                publisher,
+                state,
+                event,
+            )
+            .await
+        }
+        Some(PendingInboundKind::Update) => {
+            try_dispatch_buffered_update(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                publisher,
+                state,
+                event,
+            )
+            .await
+        }
+        None => Ok(()),
+    }
+}
+
+async fn enforce_parent_close_policies(
+    store: &WorkflowStore,
+    runtime: &mut ExecutorRuntime,
+    debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    lease_state: &Arc<Mutex<LeaseState>>,
+    publisher: &WorkflowPublisher,
+    event: &EventEnvelope<WorkflowEvent>,
+) -> Result<()> {
+    let children = store
+        .list_open_children_for_run(&event.tenant_id, &event.instance_id, &event.run_id)
+        .await?;
+    for child in children {
+        match parse_parent_close_action(&child.parent_close_policy) {
+            ParentCloseAction::Abandon => {}
+            ParentCloseAction::RequestCancel => {
+                if let Some(child_run_id) = &child.child_run_id {
+                    emit_parent_close_child_event(
+                        store,
+                        runtime,
+                        debug_state,
+                        lease_state,
+                        publisher,
+                        event,
+                        &child,
+                        child_run_id,
+                        WorkflowEvent::WorkflowCancellationRequested {
+                            reason: format!(
+                                "cancel requested by parent close policy for parent run {}",
+                                event.run_id
+                            ),
+                        },
+                    )
+                    .await?;
+                } else {
+                    store
+                        .complete_child(
+                            &child.tenant_id,
+                            &child.instance_id,
+                            &child.run_id,
+                            &child.child_id,
+                            "cancelled",
+                            None,
+                            Some("cancel requested before child start"),
+                            event.event_id,
+                            event.occurred_at,
+                        )
+                        .await?;
+                }
+            }
+            ParentCloseAction::Terminate => {
+                if let Some(child_run_id) = &child.child_run_id {
+                    emit_parent_close_child_event(
+                        store,
+                        runtime,
+                        debug_state,
+                        lease_state,
+                        publisher,
+                        event,
+                        &child,
+                        child_run_id,
+                        WorkflowEvent::WorkflowTerminated {
+                            reason: format!(
+                                "terminated by parent close policy for parent run {}",
+                                event.run_id
+                            ),
+                        },
+                    )
+                    .await?;
+                } else {
+                    store
+                        .complete_child(
+                            &child.tenant_id,
+                            &child.instance_id,
+                            &child.run_id,
+                            &child.child_id,
+                            "terminated",
+                            None,
+                            Some("terminated before child start"),
+                            event.event_id,
+                            event.occurred_at,
+                        )
+                        .await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_parent_close_action(value: &str) -> ParentCloseAction {
+    match value {
+        "ABANDON" => ParentCloseAction::Abandon,
+        "REQUEST_CANCEL" => ParentCloseAction::RequestCancel,
+        _ => ParentCloseAction::Terminate,
+    }
+}
+
+async fn emit_parent_close_child_event(
+    store: &WorkflowStore,
+    runtime: &mut ExecutorRuntime,
+    debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    lease_state: &Arc<Mutex<LeaseState>>,
+    publisher: &WorkflowPublisher,
+    parent_event: &EventEnvelope<WorkflowEvent>,
+    child: &fabrik_store::WorkflowChildRecord,
+    child_run_id: &str,
+    payload: WorkflowEvent,
+) -> Result<()> {
+    ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
+    let definition =
+        store.get_latest_artifact(&child.tenant_id, &child.child_definition_id).await?;
+    let (definition_version, artifact_hash) = if let Some(artifact) = definition {
+        (artifact.definition_version, artifact.artifact_hash)
+    } else {
+        let definition = store
+            .get_latest_definition(&child.tenant_id, &child.child_definition_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("child definition {} not found", child.child_definition_id)
+            })?;
+        (definition.version, fabrik_workflow::artifact_hash(&definition))
+    };
+    let mut envelope = EventEnvelope::new(
+        payload.event_type(),
+        WorkflowIdentity::new(
+            child.tenant_id.clone(),
+            child.child_definition_id.clone(),
+            definition_version,
+            artifact_hash,
+            child.child_workflow_id.clone(),
+            child_run_id.to_owned(),
+            "executor-service",
+        ),
+        payload,
+    );
+    envelope.causation_id = Some(parent_event.event_id);
+    envelope.correlation_id = parent_event.correlation_id.or(Some(parent_event.event_id));
+    publisher.publish(&envelope, &envelope.partition_key).await?;
+    Ok(())
+}
+
 async fn try_dispatch_buffered_signal(
     store: &WorkflowStore,
     runtime: &mut ExecutorRuntime,
@@ -2461,6 +3392,9 @@ async fn try_dispatch_buffered_signal(
     state: &WorkflowInstanceState,
     event: &EventEnvelope<WorkflowEvent>,
 ) -> Result<()> {
+    if state.status.is_terminal() {
+        return Ok(());
+    }
     let Some(wait_state) = state.current_state.as_deref() else {
         return Ok(());
     };
@@ -2481,11 +3415,19 @@ async fn try_dispatch_buffered_signal(
     else {
         return Ok(());
     };
+    let oldest_update = store
+        .get_oldest_requested_update(&event.tenant_id, &event.instance_id, &event.run_id)
+        .await?;
+    if choose_pending_inbound_kind(Some(&oldest_signal), oldest_update.as_ref())
+        != Some(PendingInboundKind::Signal)
+    {
+        return Ok(());
+    }
     if oldest_signal.signal_type != expected_signal_type {
         return Ok(());
     }
 
-    let Some(signal) = store
+    let Some((signal, newly_claimed)) = store
         .claim_signal_for_dispatch(
             &event.tenant_id,
             &event.instance_id,
@@ -2496,6 +3438,9 @@ async fn try_dispatch_buffered_signal(
     else {
         return Ok(());
     };
+    if !newly_claimed {
+        return Ok(());
+    }
     let dispatch_event_id = signal.dispatch_event_id.ok_or_else(|| {
         anyhow::anyhow!("workflow signal {} missing dispatch_event_id", signal.signal_id)
     })?;
@@ -2527,17 +3472,6 @@ async fn try_dispatch_buffered_signal(
     envelope.metadata.insert("mailbox_delivery".to_owned(), "true".to_owned());
 
     publisher.publish(&envelope, &envelope.partition_key).await?;
-    store
-        .mark_signal_consumed(
-            &signal.tenant_id,
-            &signal.instance_id,
-            &signal.run_id,
-            &signal.signal_id,
-            dispatch_event_id,
-            envelope.occurred_at,
-        )
-        .await?;
-
     Ok(())
 }
 
@@ -2584,6 +3518,83 @@ async fn maybe_auto_continue_as_new_legacy(
     )
     .await?;
     Ok(true)
+}
+
+async fn reject_outstanding_updates_for_closed_run(
+    store: &WorkflowStore,
+    runtime: &mut ExecutorRuntime,
+    debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    lease_state: &Arc<Mutex<LeaseState>>,
+    publisher: &WorkflowPublisher,
+    event: &EventEnvelope<WorkflowEvent>,
+) -> Result<()> {
+    let error = format!(
+        "workflow run {} is already {}",
+        event.run_id,
+        terminal_status_label(&event.payload)
+    );
+    for update in
+        store.list_updates_for_run(&event.tenant_id, &event.instance_id, &event.run_id).await?
+    {
+        if !matches!(
+            update.status,
+            fabrik_store::WorkflowUpdateStatus::Requested
+                | fabrik_store::WorkflowUpdateStatus::Accepted
+        ) {
+            continue;
+        }
+        if !store
+            .complete_update(
+                &update.tenant_id,
+                &update.instance_id,
+                &update.run_id,
+                &update.update_id,
+                None,
+                Some(&error),
+                event.event_id,
+                event.occurred_at,
+            )
+            .await?
+        {
+            continue;
+        }
+        ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
+        let payload = WorkflowEvent::WorkflowUpdateRejected {
+            update_id: update.update_id.clone(),
+            update_name: update.update_name.clone(),
+            error: error.clone(),
+        };
+        let mut envelope = EventEnvelope::new(
+            payload.event_type(),
+            source_identity(event, "executor-service"),
+            payload,
+        );
+        envelope.causation_id = Some(event.event_id);
+        envelope.correlation_id = event.correlation_id.or(Some(event.event_id));
+        envelope.dedupe_key = Some(format!("update-rejected:{}", update.update_id));
+        publisher.publish(&envelope, &envelope.partition_key).await?;
+    }
+    Ok(())
+}
+
+fn terminal_status_label(payload: &WorkflowEvent) -> &'static str {
+    match payload {
+        WorkflowEvent::WorkflowCompleted { .. } => "completed",
+        WorkflowEvent::WorkflowFailed { .. } => "failed",
+        WorkflowEvent::WorkflowCancelled { .. } => "cancelled",
+        WorkflowEvent::WorkflowTerminated { .. } => "terminated",
+        _ => "closed",
+    }
+}
+
+fn event_is_terminal(payload: &WorkflowEvent) -> bool {
+    matches!(
+        payload,
+        WorkflowEvent::WorkflowCompleted { .. }
+            | WorkflowEvent::WorkflowFailed { .. }
+            | WorkflowEvent::WorkflowCancelled { .. }
+            | WorkflowEvent::WorkflowTerminated { .. }
+    )
 }
 
 async fn maybe_auto_continue_as_new_compiled(
@@ -2755,6 +3766,23 @@ fn apply_compiled_plan(state: &mut WorkflowInstanceState, plan: &CompiledExecuti
     state.context = plan.context.clone();
     state.output = plan.output.clone();
     state.artifact_execution = Some(plan.execution_state.clone());
+    for emission in &plan.emissions {
+        match emission.event {
+            WorkflowEvent::WorkflowCompleted { .. } => {
+                state.status = fabrik_workflow::WorkflowStatus::Completed;
+            }
+            WorkflowEvent::WorkflowFailed { .. } => {
+                state.status = fabrik_workflow::WorkflowStatus::Failed;
+            }
+            WorkflowEvent::WorkflowCancelled { .. } => {
+                state.status = fabrik_workflow::WorkflowStatus::Cancelled;
+            }
+            WorkflowEvent::WorkflowTerminated { .. } => {
+                state.status = fabrik_workflow::WorkflowStatus::Terminated;
+            }
+            _ => {}
+        }
+    }
 }
 
 fn is_run_initialization_event(event: &WorkflowEvent) -> bool {
@@ -2771,7 +3799,11 @@ fn is_run_initialization_event(event: &WorkflowEvent) -> bool {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use fabrik_store::{
+        WorkflowSignalRecord, WorkflowSignalStatus, WorkflowUpdateRecord, WorkflowUpdateStatus,
+    };
     use fabrik_workflow::WorkflowStatus;
+    use serde_json::json;
 
     fn demo_state(instance_id: &str) -> WorkflowInstanceState {
         WorkflowInstanceState {
@@ -2791,6 +3823,47 @@ mod tests {
             last_event_id: Uuid::now_v7(),
             last_event_type: "WorkflowStarted".to_owned(),
             updated_at: Utc::now(),
+        }
+    }
+
+    fn demo_signal(signal_id: &str, enqueued_at: chrono::DateTime<Utc>) -> WorkflowSignalRecord {
+        WorkflowSignalRecord {
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "instance-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            signal_id: signal_id.to_owned(),
+            signal_type: "external.approved".to_owned(),
+            dedupe_key: None,
+            payload: json!({}),
+            status: WorkflowSignalStatus::Queued,
+            source_event_id: Uuid::now_v7(),
+            dispatch_event_id: None,
+            consumed_event_id: None,
+            enqueued_at,
+            consumed_at: None,
+            updated_at: enqueued_at,
+        }
+    }
+
+    fn demo_update(update_id: &str, requested_at: chrono::DateTime<Utc>) -> WorkflowUpdateRecord {
+        WorkflowUpdateRecord {
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "instance-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            update_id: update_id.to_owned(),
+            update_name: "setValue".to_owned(),
+            request_id: None,
+            payload: json!({}),
+            status: WorkflowUpdateStatus::Requested,
+            output: None,
+            error: None,
+            source_event_id: Uuid::now_v7(),
+            accepted_event_id: None,
+            completed_event_id: None,
+            requested_at,
+            accepted_at: None,
+            completed_at: None,
+            updated_at: requested_at,
         }
     }
 
@@ -2834,5 +3907,65 @@ mod tests {
         assert!(runtime.get("tenant-a", "instance-1").is_some());
         assert!(runtime.get("tenant-a", "instance-3").is_some());
         assert!(runtime.get("tenant-a", "instance-2").is_none());
+    }
+
+    #[test]
+    fn pending_inbound_order_prefers_earliest_timestamp() {
+        let now = Utc::now();
+        let signal = demo_signal("sig-b", now + chrono::Duration::seconds(5));
+        let update = demo_update("upd-a", now);
+
+        assert_eq!(
+            choose_pending_inbound_kind(Some(&signal), Some(&update)),
+            Some(PendingInboundKind::Update)
+        );
+        assert_eq!(
+            choose_pending_inbound_kind(
+                Some(&demo_signal("sig-a", now)),
+                Some(&demo_update("upd-b", now + chrono::Duration::seconds(5)))
+            ),
+            Some(PendingInboundKind::Signal)
+        );
+    }
+
+    #[test]
+    fn pending_inbound_order_uses_stable_id_tiebreaker() {
+        let now = Utc::now();
+        let signal = demo_signal("sig-b", now);
+        let update = demo_update("sig-a", now);
+
+        assert_eq!(
+            choose_pending_inbound_kind(Some(&signal), Some(&update)),
+            Some(PendingInboundKind::Update)
+        );
+    }
+
+    #[test]
+    fn parent_close_action_parser_matches_supported_variants() {
+        assert_eq!(parse_parent_close_action("ABANDON"), ParentCloseAction::Abandon);
+        assert_eq!(parse_parent_close_action("REQUEST_CANCEL"), ParentCloseAction::RequestCancel);
+        assert_eq!(parse_parent_close_action("TERMINATE"), ParentCloseAction::Terminate);
+        assert_eq!(parse_parent_close_action("unknown"), ParentCloseAction::Terminate);
+    }
+
+    #[test]
+    fn apply_compiled_plan_marks_terminal_status_from_emissions() {
+        let mut state = demo_state("instance-terminal");
+        apply_compiled_plan(
+            &mut state,
+            &CompiledExecutionPlan {
+                workflow_version: 1,
+                final_state: "done".to_owned(),
+                emissions: vec![ExecutionEmission {
+                    event: WorkflowEvent::WorkflowCompleted { output: json!({"ok": true}) },
+                    state: Some("done".to_owned()),
+                }],
+                execution_state: fabrik_workflow::ArtifactExecutionState::default(),
+                context: Some(json!({"ok": true})),
+                output: Some(json!({"ok": true})),
+            },
+        );
+
+        assert_eq!(state.status, WorkflowStatus::Completed);
     }
 }

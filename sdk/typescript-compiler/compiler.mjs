@@ -456,26 +456,31 @@ function compileExpression(expression) {
 }
 
 class WorkflowLowerer {
-  constructor(definitionId, version, workflowDeclaration) {
+  constructor(definitionId, version, workflowDeclaration, statePrefix = "") {
     this.definitionId = definitionId;
     this.version = version;
     this.workflowDeclaration = workflowDeclaration;
+    this.statePrefix = statePrefix;
     this.states = {};
     this.sourceMap = {};
     this.syntheticCounts = new Map();
+    this.queries = {};
+    this.updates = {};
   }
 
   nextId(prefix, node = null) {
     if (!node) {
       const count = (this.syntheticCounts.get(prefix) ?? 0) + 1;
       this.syntheticCounts.set(prefix, count);
-      return `${prefix}_${count}`;
+      return `${this.statePrefix}${prefix}_${count}`;
     }
 
-    const nodeKey = `${prefix}:${stableNodeKey(node)}`;
+    const nodeKey = `${this.statePrefix}${prefix}:${stableNodeKey(node)}`;
     const count = (this.syntheticCounts.get(nodeKey) ?? 0) + 1;
     this.syntheticCounts.set(nodeKey, count);
-    return count === 1 ? `${prefix}_${stableNodeKey(node)}` : `${prefix}_${stableNodeKey(node)}_${count}`;
+    return count === 1
+      ? `${this.statePrefix}${prefix}_${stableNodeKey(node)}`
+      : `${this.statePrefix}${prefix}_${stableNodeKey(node)}_${count}`;
   }
 
   lower() {
@@ -490,7 +495,13 @@ class WorkflowLowerer {
       null,
       null,
     );
-    return { initialState, states: this.states, sourceMap: this.sourceMap };
+    return {
+      initialState,
+      states: this.states,
+      sourceMap: this.sourceMap,
+      queries: this.queries,
+      updates: this.updates,
+    };
   }
 
   addState(prefix, state, node = null) {
@@ -517,6 +528,23 @@ class WorkflowLowerer {
   }
 
   lowerStatement(statement, nextState, breakTarget, continueTarget, errorTarget) {
+    if (ts.isExpressionStatement(statement) && ts.isCallExpression(statement.expression)) {
+      if (
+        ts.isPropertyAccessExpression(statement.expression.expression) &&
+        statement.expression.expression.expression.getText() === "ctx"
+      ) {
+        const method = statement.expression.expression.name.text;
+        if (method === "query") {
+          this.registerQueryHandler(statement.expression);
+          return nextState;
+        }
+        if (method === "update") {
+          this.registerUpdateHandler(statement.expression);
+          return nextState;
+        }
+      }
+    }
+
     if (ts.isVariableStatement(statement)) {
       const declarations = statement.declarationList.declarations;
       const awaitDeclaration = declarations.find(
@@ -860,6 +888,18 @@ class WorkflowLowerer {
       );
     }
     const call = awaitExpression.expression;
+    if (
+      ts.isPropertyAccessExpression(call.expression) &&
+      call.expression.name.text === "result" &&
+      ts.isIdentifier(call.expression.expression)
+    ) {
+      return this.addState("wait_child", {
+        type: "wait_for_child",
+        child_ref_var: call.expression.expression.text,
+        next: nextState,
+        output_var: targetVar ?? undefined,
+      }, awaitExpression);
+    }
     if (!ts.isPropertyAccessExpression(call.expression) || call.expression.expression.getText() !== "ctx") {
       throw compilerError(
         `non-deterministic await detected; only await ctx.* calls are allowed in workflows`,
@@ -890,6 +930,19 @@ class WorkflowLowerer {
         next: nextState,
         output_var: targetVar ?? undefined,
         on_error: errorTarget ?? undefined,
+      }, awaitExpression);
+    }
+    if (method === "startChild") {
+      const options = call.arguments[2] ? compileChildOptions(call.arguments[2]) : {};
+      return this.addState("start_child", {
+        type: "start_child",
+        child_definition_id: literalString(call.arguments[0], "ctx.startChild workflow name"),
+        input: call.arguments[1] ? compileExpression(call.arguments[1]) : { kind: "literal", value: null },
+        next: nextState,
+        handle_var: targetVar ?? undefined,
+        workflow_id: options.workflow_id,
+        task_queue: options.task_queue,
+        parent_close_policy: options.parent_close_policy ?? "TERMINATE",
       }, awaitExpression);
     }
     if (method === "sideEffect") {
@@ -942,6 +995,50 @@ class WorkflowLowerer {
     }
     throw compilerError(`unsupported terminal call ctx.${method}`, callExpression.expression.name);
   }
+
+  registerQueryHandler(callExpression) {
+    const queryName = literalString(callExpression.arguments[0], "ctx.query name");
+    const handler = callExpression.arguments[1];
+    if (!handler || (!ts.isArrowFunction(handler) && !ts.isFunctionExpression(handler))) {
+      throw compilerError(`ctx.query requires an inline function handler`, callExpression);
+    }
+    if (handler.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) {
+      throw compilerError(`ctx.query handlers must not be async`, handler);
+    }
+    const body = compilePureHandlerExpression(handler, "ctx.query");
+    this.queries[queryName] = {
+      arg_name: handler.parameters[0] ? handler.parameters[0].name.getText() : undefined,
+      expr: body,
+    };
+  }
+
+  registerUpdateHandler(callExpression) {
+    const updateName = literalString(callExpression.arguments[0], "ctx.update name");
+    const handler = callExpression.arguments[1];
+    if (!handler || (!ts.isArrowFunction(handler) && !ts.isFunctionExpression(handler))) {
+      throw compilerError(`ctx.update requires an inline function handler`, callExpression);
+    }
+    const lowered = new WorkflowLowerer(
+      this.definitionId,
+      this.version,
+      { body: ts.isBlock(handler.body) ? handler.body : ts.factory.createBlock([ts.factory.createReturnStatement(handler.body)], true) },
+      `update_${shortHash(updateName)}_`,
+    );
+    const bodyBlock = ts.isBlock(handler.body)
+      ? handler.body
+      : ts.factory.createBlock([ts.factory.createReturnStatement(handler.body)], true);
+    const terminalFail = lowered.addState("fail_terminal", {
+      type: "fail",
+      reason: { kind: "literal", value: `update ${updateName} terminated without explicit completion` },
+    });
+    const initialState = lowered.lowerBlock(bodyBlock.statements, terminalFail, null, null, null);
+    this.updates[updateName] = {
+      arg_name: handler.parameters[0] ? handler.parameters[0].name.getText() : undefined,
+      initial_state: initialState,
+      states: lowered.states,
+    };
+    Object.assign(this.sourceMap, lowered.sourceMap);
+  }
 }
 
 function literalString(expression, label) {
@@ -991,6 +1088,41 @@ function compileEffectOptions(expression) {
     const key = property.name.getText().replaceAll(/^["']|["']$/g, "");
     if (key === "timeout") options.timeout = literalString(property.initializer, "ctx.sideEffect timeout");
     else throw compilerError(`unsupported sideEffect option ${key}`, property);
+  }
+  return options;
+}
+
+function compilePureHandlerExpression(handler, label) {
+  if (ts.isBlock(handler.body)) {
+    if (
+      handler.body.statements.length !== 1 ||
+      !ts.isReturnStatement(handler.body.statements[0]) ||
+      !handler.body.statements[0].expression
+    ) {
+      throw compilerError(`${label} handlers must be a single return expression`, handler.body);
+    }
+    return compileExpression(handler.body.statements[0].expression);
+  }
+  return compileExpression(handler.body);
+}
+
+function compileChildOptions(expression) {
+  if (!ts.isObjectLiteralExpression(expression)) {
+    throw compilerError(`ctx.startChild options must be a static object`, expression);
+  }
+  const options = {};
+  for (const property of expression.properties) {
+    if (!ts.isPropertyAssignment(property)) {
+      throw compilerError(`unsupported startChild option ${property.getText()}`, property);
+    }
+    const key = property.name.getText().replaceAll(/^["']|["']$/g, "");
+    if (key === "workflowId") options.workflow_id = compileExpression(property.initializer);
+    else if (key === "taskQueue") options.task_queue = compileExpression(property.initializer);
+    else if (key === "parentClosePolicy") {
+      options.parent_close_policy = literalString(property.initializer, "ctx.startChild parentClosePolicy");
+    } else {
+      throw compilerError(`unsupported startChild option ${key}`, property);
+    }
   }
   return options;
 }
@@ -1074,30 +1206,41 @@ function validateArtifactCalls(artifact) {
   };
 
   Object.values(artifact.helpers).forEach((helper) => validateExpression(helper.body));
-  Object.values(artifact.workflow.states).forEach((state) => {
-    switch (state.type) {
-      case "assign":
-        state.actions.forEach((action) => validateExpression(action.expr));
-        break;
-      case "choice":
-        validateExpression(state.condition);
-        break;
-      case "step":
-        validateExpression(state.input);
-        break;
-      case "succeed":
-        if (state.output) validateExpression(state.output);
-        break;
-      case "fail":
-        if (state.reason) validateExpression(state.reason);
-        break;
-      case "continue_as_new":
-        if (state.input) validateExpression(state.input);
-        break;
-      default:
-        break;
-    }
+  Object.values(artifact.workflow.states).forEach((state) => validateCompiledState(state, validateExpression));
+  Object.values(artifact.updates ?? {}).forEach((update) => {
+    Object.values(update.states).forEach((state) => validateCompiledState(state, validateExpression));
   });
+  Object.values(artifact.queries ?? {}).forEach((query) => validateExpression(query.expr));
+}
+
+function validateCompiledState(state, validateExpression) {
+  switch (state.type) {
+    case "assign":
+      state.actions.forEach((action) => validateExpression(action.expr));
+      break;
+    case "choice":
+      validateExpression(state.condition);
+      break;
+    case "step":
+      validateExpression(state.input);
+      break;
+    case "start_child":
+      validateExpression(state.input);
+      if (state.workflow_id) validateExpression(state.workflow_id);
+      if (state.task_queue) validateExpression(state.task_queue);
+      break;
+    case "succeed":
+      if (state.output) validateExpression(state.output);
+      break;
+    case "fail":
+      if (state.reason) validateExpression(state.reason);
+      break;
+    case "continue_as_new":
+      if (state.input) validateExpression(state.input);
+      break;
+    default:
+      break;
+  }
 }
 
 async function main() {
@@ -1106,7 +1249,7 @@ async function main() {
   const workflow = findExportedFunction(program, args.exportName);
   const helpers = buildHelperRegistry(program, workflow);
   const lowerer = new WorkflowLowerer(args.definitionId, args.version, workflow);
-  const { initialState, states, sourceMap } = lowerer.lower();
+  const { initialState, states, sourceMap, queries, updates } = lowerer.lower();
 
   const artifact = {
     definition_id: args.definitionId,
@@ -1122,6 +1265,8 @@ async function main() {
     ),
     source_map: sourceMap,
     helpers,
+    queries,
+    updates,
     workflow: {
       initial_state: initialState,
       states,

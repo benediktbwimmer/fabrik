@@ -13,8 +13,9 @@ use fabrik_store::WorkflowStore;
 use fabrik_workflow::{
     CompiledWorkflowArtifact, WorkflowDefinition, WorkflowStatus, artifact_hash,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use tokio::time::{Duration, Instant};
 use tracing::info;
 use uuid::Uuid;
 
@@ -24,15 +25,17 @@ struct AppState {
     store: WorkflowStore,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct TriggerWorkflowRequest {
     tenant_id: String,
     #[serde(default, alias = "workflow_instance_id")]
     instance_id: Option<String>,
     input: Value,
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct TriggerWorkflowResponse {
     definition_id: String,
     definition_version: u32,
@@ -40,14 +43,36 @@ struct TriggerWorkflowResponse {
     instance_id: String,
     run_id: String,
     event_id: Uuid,
-    status: &'static str,
+    status: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct SignalWorkflowRequest {
     payload: Value,
     #[serde(default)]
     dedupe_key: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct UpdateWorkflowRequest {
+    #[serde(default)]
+    payload: Value,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    wait_for: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct TerminateWorkflowRequest {
+    #[serde(default = "default_terminate_reason")]
+    reason: String,
+    #[serde(default)]
+    request_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,14 +89,33 @@ struct CancelActivityRequest {
     metadata: Option<Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct SignalWorkflowResponse {
     instance_id: String,
     run_id: String,
     signal_id: String,
     signal_type: String,
     event_id: Uuid,
-    status: &'static str,
+    status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct UpdateWorkflowResponse {
+    instance_id: String,
+    run_id: String,
+    update_id: String,
+    status: String,
+    accepted_event_id: Option<Uuid>,
+    result: Option<Value>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TerminateWorkflowResponse {
+    instance_id: String,
+    run_id: String,
+    event_id: Uuid,
+    status: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,6 +187,14 @@ async fn main() -> Result<()> {
         post(signal_workflow),
     )
     .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/updates/{update_name}",
+        post(update_workflow),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/terminate",
+        post(terminate_workflow),
+    )
+    .route(
         "/tenants/{tenant_id}/workflows/{workflow_instance_id}/continue-as-new",
         post(continue_as_new),
     )
@@ -205,6 +257,20 @@ async fn trigger_workflow(
     State(state): State<AppState>,
     Json(request): Json<TriggerWorkflowRequest>,
 ) -> Result<(StatusCode, Json<TriggerWorkflowResponse>), (StatusCode, String)> {
+    if let Some(request_id) = request.request_id.as_deref() {
+        if let Some(response) = load_dedup_response::<TriggerWorkflowResponse, _>(
+            &state.store,
+            &request.tenant_id,
+            request.instance_id.as_deref(),
+            &format!("trigger:{definition_id}"),
+            request_id,
+            &request,
+        )
+        .await?
+        {
+            return Ok((StatusCode::ACCEPTED, Json(response)));
+        }
+    }
     let (resolved_definition_id, definition_version, artifact_hash) = if let Some(artifact) = state
         .store
         .get_latest_artifact(&request.tenant_id, &definition_id)
@@ -230,13 +296,14 @@ async fn trigger_workflow(
         (definition.id.clone(), definition.version, artifact_hash(&definition))
     };
 
-    let instance_id = request.instance_id.unwrap_or_else(|| format!("wf-{}", Uuid::now_v7()));
+    let instance_id =
+        request.instance_id.clone().unwrap_or_else(|| format!("wf-{}", Uuid::now_v7()));
     let run_id = format!("run-{}", Uuid::now_v7());
-    let payload = WorkflowEvent::WorkflowTriggered { input: request.input };
+    let payload = WorkflowEvent::WorkflowTriggered { input: request.input.clone() };
     let envelope = EventEnvelope::new(
         payload.event_type(),
         WorkflowIdentity::new(
-            request.tenant_id,
+            request.tenant_id.clone(),
             resolved_definition_id.clone(),
             definition_version,
             artifact_hash.clone(),
@@ -265,18 +332,28 @@ async fn trigger_workflow(
         .await
         .map_err(internal_error)?;
 
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(TriggerWorkflowResponse {
-            definition_id: resolved_definition_id,
-            definition_version,
-            artifact_hash,
-            instance_id,
-            run_id,
-            event_id: envelope.event_id,
-            status: "accepted",
-        }),
-    ))
+    let response = TriggerWorkflowResponse {
+        definition_id: resolved_definition_id,
+        definition_version,
+        artifact_hash,
+        instance_id,
+        run_id,
+        event_id: envelope.event_id,
+        status: "accepted".to_owned(),
+    };
+    if let Some(request_id) = request.request_id.as_deref() {
+        store_dedup_response(
+            &state.store,
+            &envelope.tenant_id,
+            Some(&envelope.instance_id),
+            &format!("trigger:{definition_id}"),
+            request_id,
+            &request,
+            &response,
+        )
+        .await?;
+    }
+    Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
 async fn signal_workflow(
@@ -284,6 +361,20 @@ async fn signal_workflow(
     State(state): State<AppState>,
     Json(request): Json<SignalWorkflowRequest>,
 ) -> Result<(StatusCode, Json<SignalWorkflowResponse>), (StatusCode, String)> {
+    if let Some(request_id) = request.request_id.as_deref() {
+        if let Some(response) = load_dedup_response::<SignalWorkflowResponse, _>(
+            &state.store,
+            &tenant_id,
+            Some(&instance_id),
+            &format!("signal:{signal_type}"),
+            request_id,
+            &request,
+        )
+        .await?
+        {
+            return Ok((StatusCode::ACCEPTED, Json(response)));
+        }
+    }
     let instance = state
         .store
         .get_instance(&tenant_id, &instance_id)
@@ -296,7 +387,13 @@ async fn signal_workflow(
             )
         })?;
 
-    if matches!(instance.status, WorkflowStatus::Completed | WorkflowStatus::Failed) {
+    if matches!(
+        instance.status,
+        WorkflowStatus::Completed
+            | WorkflowStatus::Failed
+            | WorkflowStatus::Cancelled
+            | WorkflowStatus::Terminated
+    ) {
         return Err((
             StatusCode::CONFLICT,
             format!("workflow instance {instance_id} is already {}", instance.status.as_str()),
@@ -355,17 +452,15 @@ async fn signal_workflow(
         .await
         .map_err(internal_error)?;
     if !queued {
-        return Ok((
-            StatusCode::ACCEPTED,
-            Json(SignalWorkflowResponse {
-                instance_id,
-                run_id: instance.run_id,
-                signal_id,
-                signal_type,
-                event_id: envelope.event_id,
-                status: "duplicate",
-            }),
-        ));
+        let response = SignalWorkflowResponse {
+            instance_id,
+            run_id: instance.run_id,
+            signal_id,
+            signal_type,
+            event_id: envelope.event_id,
+            status: "duplicate".to_owned(),
+        };
+        return Ok((StatusCode::ACCEPTED, Json(response)));
     }
 
     if let Err(error) = state.publisher.publish(&envelope, &envelope.partition_key).await {
@@ -375,18 +470,27 @@ async fn signal_workflow(
             .await;
         return Err(internal_error(error));
     }
-
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(SignalWorkflowResponse {
-            instance_id,
-            run_id: instance.run_id,
-            signal_id,
-            signal_type,
-            event_id: envelope.event_id,
-            status: "accepted",
-        }),
-    ))
+    let response = SignalWorkflowResponse {
+        instance_id,
+        run_id: instance.run_id,
+        signal_id,
+        signal_type,
+        event_id: envelope.event_id,
+        status: "accepted".to_owned(),
+    };
+    if let Some(request_id) = request.request_id.as_deref() {
+        store_dedup_response(
+            &state.store,
+            &envelope.tenant_id,
+            Some(&envelope.instance_id),
+            &format!("signal:{}", response.signal_type),
+            request_id,
+            &request,
+            &response,
+        )
+        .await?;
+    }
+    Ok((StatusCode::ACCEPTED, Json(response)))
 }
 
 async fn continue_as_new(
@@ -535,6 +639,233 @@ async fn continue_as_new(
     ))
 }
 
+async fn update_workflow(
+    Path((tenant_id, instance_id, update_name)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<UpdateWorkflowRequest>,
+) -> Result<(StatusCode, Json<UpdateWorkflowResponse>), (StatusCode, String)> {
+    if let Some(request_id) = request.request_id.as_deref() {
+        if let Some(response) = load_dedup_response::<UpdateWorkflowResponse, _>(
+            &state.store,
+            &tenant_id,
+            Some(&instance_id),
+            &format!("update:{update_name}"),
+            request_id,
+            &request,
+        )
+        .await?
+        {
+            return Ok((StatusCode::ACCEPTED, Json(response)));
+        }
+    }
+
+    let instance = state
+        .store
+        .get_instance(&tenant_id, &instance_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("workflow instance {instance_id} not found for tenant {tenant_id}"),
+            )
+        })?;
+    if matches!(
+        instance.status,
+        WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Terminated
+    ) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("workflow instance {instance_id} is already {}", instance.status.as_str()),
+        ));
+    }
+    let definition_version = instance.definition_version.ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            format!("workflow instance {instance_id} has no pinned definition version"),
+        )
+    })?;
+    let artifact_hash = instance.artifact_hash.clone().ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            format!("workflow instance {instance_id} has no pinned artifact hash"),
+        )
+    })?;
+    let update_id = format!("upd-{}", Uuid::now_v7());
+    let payload = WorkflowEvent::WorkflowUpdateRequested {
+        update_id: update_id.clone(),
+        update_name: update_name.clone(),
+        payload: request.payload.clone(),
+    };
+    let envelope = EventEnvelope::new(
+        payload.event_type(),
+        WorkflowIdentity::new(
+            tenant_id.clone(),
+            instance.definition_id.clone(),
+            definition_version,
+            artifact_hash,
+            instance.instance_id.clone(),
+            instance.run_id.clone(),
+            "ingest-service",
+        ),
+        payload,
+    );
+    state
+        .store
+        .queue_update(
+            &tenant_id,
+            &instance_id,
+            &instance.run_id,
+            &update_id,
+            &update_name,
+            request.request_id.as_deref(),
+            &request.payload,
+            envelope.event_id,
+            envelope.occurred_at,
+        )
+        .await
+        .map_err(internal_error)?;
+    state.publisher.publish(&envelope, &envelope.partition_key).await.map_err(internal_error)?;
+
+    let mut response = UpdateWorkflowResponse {
+        instance_id: instance_id.clone(),
+        run_id: instance.run_id.clone(),
+        update_id: update_id.clone(),
+        status: "requested".to_owned(),
+        accepted_event_id: None,
+        result: None,
+        error: None,
+    };
+
+    if let Some(wait_for) = request.wait_for.as_deref() {
+        let deadline = Instant::now() + Duration::from_millis(request.timeout_ms.unwrap_or(5_000));
+        loop {
+            if let Some(update) = state
+                .store
+                .get_update(&tenant_id, &instance_id, &instance.run_id, &update_id)
+                .await
+                .map_err(internal_error)?
+            {
+                response.status = update_status_label(&update.status).to_owned();
+                response.accepted_event_id = update.accepted_event_id;
+                response.result = update.output.clone();
+                response.error = update.error.clone();
+                if wait_for.eq_ignore_ascii_case("accepted")
+                    && !matches!(update.status, fabrik_store::WorkflowUpdateStatus::Requested)
+                {
+                    break;
+                }
+                if wait_for.eq_ignore_ascii_case("completed")
+                    && matches!(
+                        update.status,
+                        fabrik_store::WorkflowUpdateStatus::Completed
+                            | fabrik_store::WorkflowUpdateStatus::Rejected
+                    )
+                {
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    if let Some(request_id) = request.request_id.as_deref() {
+        store_dedup_response(
+            &state.store,
+            &tenant_id,
+            Some(&instance_id),
+            &format!("update:{update_name}"),
+            request_id,
+            &request,
+            &response,
+        )
+        .await?;
+    }
+
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+async fn terminate_workflow(
+    Path((tenant_id, instance_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<TerminateWorkflowRequest>,
+) -> Result<(StatusCode, Json<TerminateWorkflowResponse>), (StatusCode, String)> {
+    if let Some(request_id) = request.request_id.as_deref() {
+        if let Some(response) = load_dedup_response::<TerminateWorkflowResponse, _>(
+            &state.store,
+            &tenant_id,
+            Some(&instance_id),
+            "terminate",
+            request_id,
+            &request,
+        )
+        .await?
+        {
+            return Ok((StatusCode::ACCEPTED, Json(response)));
+        }
+    }
+    let instance = state
+        .store
+        .get_instance(&tenant_id, &instance_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("workflow instance {instance_id} not found for tenant {tenant_id}"),
+            )
+        })?;
+    let definition_version = instance.definition_version.ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            format!("workflow instance {instance_id} has no pinned definition version"),
+        )
+    })?;
+    let artifact_hash = instance.artifact_hash.clone().ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            format!("workflow instance {instance_id} has no pinned artifact hash"),
+        )
+    })?;
+    let payload = WorkflowEvent::WorkflowTerminated { reason: request.reason.clone() };
+    let envelope = EventEnvelope::new(
+        payload.event_type(),
+        WorkflowIdentity::new(
+            tenant_id.clone(),
+            instance.definition_id.clone(),
+            definition_version,
+            artifact_hash,
+            instance.instance_id.clone(),
+            instance.run_id.clone(),
+            "ingest-service",
+        ),
+        payload,
+    );
+    state.publisher.publish(&envelope, &envelope.partition_key).await.map_err(internal_error)?;
+    let response = TerminateWorkflowResponse {
+        instance_id,
+        run_id: instance.run_id,
+        event_id: envelope.event_id,
+        status: "accepted".to_owned(),
+    };
+    if let Some(request_id) = request.request_id.as_deref() {
+        store_dedup_response(
+            &state.store,
+            &tenant_id,
+            Some(&response.instance_id),
+            "terminate",
+            request_id,
+            &request,
+            &response,
+        )
+        .await?;
+    }
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
 async fn cancel_activity(
     Path((tenant_id, instance_id, activity_id)): Path<(String, String, String)>,
     State(state): State<AppState>,
@@ -552,7 +883,13 @@ async fn cancel_activity(
             )
         })?;
 
-    if matches!(instance.status, WorkflowStatus::Completed | WorkflowStatus::Failed) {
+    if matches!(
+        instance.status,
+        WorkflowStatus::Completed
+            | WorkflowStatus::Failed
+            | WorkflowStatus::Cancelled
+            | WorkflowStatus::Terminated
+    ) {
         return Err((
             StatusCode::CONFLICT,
             format!("workflow instance {instance_id} is already {}", instance.status.as_str()),
@@ -625,6 +962,74 @@ fn validation_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::BAD_REQUEST, error.to_string())
 }
 
+async fn load_dedup_response<T: DeserializeOwned, R: Serialize>(
+    store: &WorkflowStore,
+    tenant_id: &str,
+    instance_id: Option<&str>,
+    operation: &str,
+    request_id: &str,
+    request: &R,
+) -> Result<Option<T>, (StatusCode, String)> {
+    let request_hash =
+        serde_json::to_string(request).map_err(|error| internal_error(error.into()))?;
+    let Some(existing) = store
+        .get_request_dedup(tenant_id, instance_id, operation, request_id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Ok(None);
+    };
+    if existing.request_hash != request_hash {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("request_id {request_id} was already used with a different payload"),
+        ));
+    }
+    serde_json::from_value(existing.response).map(Some).map_err(|error| {
+        internal_error(anyhow::anyhow!("failed to decode dedup response: {error}"))
+    })
+}
+
+async fn store_dedup_response<R: Serialize, T: Serialize>(
+    store: &WorkflowStore,
+    tenant_id: &str,
+    instance_id: Option<&str>,
+    operation: &str,
+    request_id: &str,
+    request: &R,
+    response: &T,
+) -> Result<(), (StatusCode, String)> {
+    let request_hash =
+        serde_json::to_string(request).map_err(|error| internal_error(error.into()))?;
+    let response_value =
+        serde_json::to_value(response).map_err(|error| internal_error(error.into()))?;
+    store
+        .upsert_request_dedup(
+            tenant_id,
+            instance_id,
+            operation,
+            request_id,
+            &request_hash,
+            &response_value,
+        )
+        .await
+        .map_err(internal_error)?;
+    Ok(())
+}
+
 fn default_cancel_reason() -> String {
     "cancelled by operator".to_owned()
+}
+
+fn default_terminate_reason() -> String {
+    "terminated by operator".to_owned()
+}
+
+fn update_status_label(status: &fabrik_store::WorkflowUpdateStatus) -> &'static str {
+    match status {
+        fabrik_store::WorkflowUpdateStatus::Requested => "requested",
+        fabrik_store::WorkflowUpdateStatus::Accepted => "accepted",
+        fabrik_store::WorkflowUpdateStatus::Completed => "completed",
+        fabrik_store::WorkflowUpdateStatus::Rejected => "rejected",
+    }
 }

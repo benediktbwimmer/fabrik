@@ -92,6 +92,31 @@ test("compiler lowers awaited ctx.activity calls into activity states", async ()
   assert.match(serialized, /"output_var":"echoed"/);
 });
 
+test("compiler lowers query, update, and child workflow handlers", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/query-update-child-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "queryUpdateChildWorkflow",
+    "--definition-id",
+    "query-update-child-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  assert.ok(artifact.queries.summary);
+  assert.equal(artifact.queries.summary.arg_name, "args");
+  assert.ok(artifact.updates.approve);
+  const serializedUpdateStates = JSON.stringify(artifact.updates.approve.states);
+  assert.match(serializedUpdateStates, /"type":"start_child"/);
+  assert.match(serializedUpdateStates, /"type":"wait_for_child"/);
+  assert.match(serializedUpdateStates, /"parent_close_policy":"REQUEST_CANCEL"/);
+});
+
 test("compiler rejects forbidden global access with source location", async () => {
   const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/invalid-global.ts");
   await assert.rejects(
@@ -197,6 +222,27 @@ test("compiler explains non-ctx await failures", async () => {
       const output = `${error.stdout ?? ""}${error.stderr ?? ""}`;
       assert.match(output, /non-deterministic await detected/);
       assert.match(output, /ctx\.\* methods/);
+      return true;
+    },
+  );
+});
+
+test("compiler rejects async query handlers", async () => {
+  const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/invalid-query-await.ts");
+  await assert.rejects(
+    runCompiler([
+      "--entry",
+      fixture,
+      "--export",
+      "invalidQueryAwaitWorkflow",
+      "--definition-id",
+      "invalid-query-await",
+      "--version",
+      "1",
+    ]),
+    (error) => {
+      const output = `${error.stdout ?? ""}${error.stderr ?? ""}`;
+      assert.match(output, /ctx\.query handlers must not be async/);
       return true;
     },
   );
