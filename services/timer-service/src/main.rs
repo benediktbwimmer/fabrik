@@ -1,10 +1,10 @@
 use anyhow::Result;
 use chrono::Utc;
 use fabrik_broker::{BrokerConfig, WorkflowPublisher};
-use fabrik_config::{HttpServiceConfig, PostgresConfig, RedpandaConfig};
+use fabrik_config::{HttpServiceConfig, OwnershipConfig, PostgresConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
-use fabrik_store::{ScheduledTimer, WorkflowStore};
+use fabrik_store::{PartitionOwnershipRecord, ScheduledTimer, WorkflowStore};
 use tracing::{error, info};
 
 #[tokio::main]
@@ -12,15 +12,16 @@ async fn main() -> Result<()> {
     let config = HttpServiceConfig::from_env("TIMER_SERVICE", "timer-service", 3003)?;
     let redpanda = RedpandaConfig::from_env()?;
     let postgres = PostgresConfig::from_env()?;
+    let ownership = OwnershipConfig::from_env()?;
     init_tracing(&config.log_filter);
-    info!(port = config.port, "starting timer service");
+    info!(port = config.port, partition_id = ownership.partition_id, "starting timer service");
 
     let broker = BrokerConfig::new(redpanda.brokers, redpanda.workflow_events_topic);
     let publisher = WorkflowPublisher::new(&broker, "timer-service").await?;
     let store = WorkflowStore::connect(&postgres.url).await?;
     store.init().await?;
 
-    tokio::spawn(run_timer_loop(store.clone(), publisher));
+    tokio::spawn(run_timer_loop(store.clone(), publisher, ownership.partition_id));
 
     let app =
         default_router::<()>(ServiceInfo::new(config.name, "timer", env!("CARGO_PKG_VERSION")));
@@ -28,19 +29,37 @@ async fn main() -> Result<()> {
     serve(app, config.port).await
 }
 
-async fn run_timer_loop(store: WorkflowStore, publisher: WorkflowPublisher) {
+async fn run_timer_loop(store: WorkflowStore, publisher: WorkflowPublisher, partition_id: i32) {
     let interval = std::time::Duration::from_millis(250);
 
     loop {
-        match store.claim_due_timers(Utc::now(), 100).await {
-            Ok(timers) => {
-                for timer in timers {
-                    if let Err(error) = dispatch_timer(&store, &publisher, timer).await {
-                        error!(error = %error, "failed to dispatch timer");
+        let now = Utc::now();
+        let ownership = match store.get_partition_ownership(partition_id).await {
+            Ok(Some(ownership)) if ownership.is_active_at(now) => Some(ownership),
+            Ok(Some(_)) => None,
+            Ok(None) => None,
+            Err(error) => {
+                error!(error = %error, partition_id, "failed to load partition ownership");
+                None
+            }
+        };
+
+        match ownership {
+            Some(ownership) => {
+                match store.claim_due_timers(now, 100, ownership.owner_epoch).await {
+                    Ok(timers) => {
+                        for timer in timers {
+                            if let Err(error) =
+                                dispatch_timer(&store, &publisher, timer, &ownership).await
+                            {
+                                error!(error = %error, "failed to dispatch timer");
+                            }
+                        }
                     }
+                    Err(error) => error!(error = %error, "failed to load due timers"),
                 }
             }
-            Err(error) => error!(error = %error, "failed to load due timers"),
+            None => {}
         }
 
         tokio::time::sleep(interval).await;
@@ -51,8 +70,17 @@ async fn dispatch_timer(
     store: &WorkflowStore,
     publisher: &WorkflowPublisher,
     timer: ScheduledTimer,
+    ownership: &PartitionOwnershipRecord,
 ) -> Result<()> {
-    if !store.mark_timer_dispatched(&timer.tenant_id, &timer.instance_id, &timer.timer_id).await? {
+    if !store
+        .mark_timer_dispatched(
+            &timer.tenant_id,
+            &timer.instance_id,
+            &timer.timer_id,
+            ownership.owner_epoch,
+        )
+        .await?
+    {
         return Ok(());
     }
 
@@ -83,6 +111,8 @@ async fn dispatch_timer(
         envelope.metadata.insert("state".to_owned(), state);
     }
     envelope.metadata.insert("fire_at".to_owned(), timer.fire_at.to_rfc3339());
+    envelope.metadata.insert("owner_epoch".to_owned(), ownership.owner_epoch.to_string());
+    envelope.metadata.insert("owner_id".to_owned(), ownership.owner_id.clone());
     envelope.dedupe_key = Some(format!(
         "{}:{}:{}:{}",
         timer.tenant_id, timer.instance_id, timer.run_id, timer.timer_id

@@ -17,6 +17,68 @@ pub use compiled::{
     ExecutionTurnContext, Expression, HelperFunction, SourceLocation,
 };
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplaySource {
+    RunStart,
+    SnapshotTail {
+        snapshot_event_count: i64,
+        snapshot_last_event_id: Uuid,
+        snapshot_last_event_type: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplayCheckpoint {
+    pub run_id: String,
+    pub current_state: Option<String>,
+    pub status: WorkflowStatus,
+    pub context: Option<Value>,
+    pub output: Option<Value>,
+    pub event_count: i64,
+    pub last_event_id: Uuid,
+    pub last_event_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplayTransitionTraceEntry {
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub occurred_at: DateTime<Utc>,
+    pub checkpoint_before: Option<ReplayCheckpoint>,
+    pub checkpoint_after: ReplayCheckpoint,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplayFieldMismatch {
+    pub field: String,
+    pub expected: Value,
+    pub actual: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayDivergenceKind {
+    ProjectionMismatch,
+    SnapshotMismatch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplayDivergence {
+    pub kind: ReplayDivergenceKind,
+    pub event_id: Option<Uuid>,
+    pub event_type: Option<String>,
+    pub message: String,
+    pub fields: Vec<ReplayFieldMismatch>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplayTrace {
+    pub source: ReplaySource,
+    pub final_state: WorkflowInstanceState,
+    pub transitions: Vec<ReplayTransitionTraceEntry>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowDefinition {
     pub id: String,
@@ -211,6 +273,28 @@ impl WorkflowDefinition {
             StateNode::Step { config, .. } => Ok(config.as_ref()),
             _ => Err(WorkflowExecutionError::NotWaitingOnStep(step_id.to_owned())),
         }
+    }
+
+    pub fn is_wait_state(&self, state_id: &str) -> Result<bool, WorkflowExecutionError> {
+        let state = self
+            .states
+            .get(state_id)
+            .ok_or_else(|| WorkflowExecutionError::UnknownState(state_id.to_owned()))?;
+        Ok(matches!(state, StateNode::WaitForEvent { .. } | StateNode::WaitForTimer { .. }))
+    }
+
+    pub fn expected_signal_type(
+        &self,
+        state_id: &str,
+    ) -> Result<Option<&str>, WorkflowExecutionError> {
+        let state = self
+            .states
+            .get(state_id)
+            .ok_or_else(|| WorkflowExecutionError::UnknownState(state_id.to_owned()))?;
+        Ok(match state {
+            StateNode::WaitForEvent { event_type, .. } => Some(event_type.as_str()),
+            _ => None,
+        })
     }
 
     fn execute_from_state(
@@ -549,7 +633,8 @@ impl WorkflowInstanceState {
             }
             WorkflowEvent::WorkflowStarted
             | WorkflowEvent::WorkflowArtifactPinned
-            | WorkflowEvent::MarkerRecorded { .. } => {
+            | WorkflowEvent::MarkerRecorded { .. }
+            | WorkflowEvent::SignalQueued { .. } => {
                 self.status = WorkflowStatus::Running;
             }
             WorkflowEvent::WorkflowContinuedAsNew { input, .. } => {
@@ -606,7 +691,8 @@ impl TryFrom<&EventEnvelope<WorkflowEvent>> for WorkflowInstanceState {
             WorkflowEvent::WorkflowTriggered { .. }
             | WorkflowEvent::WorkflowStarted
             | WorkflowEvent::WorkflowArtifactPinned
-            | WorkflowEvent::MarkerRecorded { .. } => {}
+            | WorkflowEvent::MarkerRecorded { .. }
+            | WorkflowEvent::SignalQueued { .. } => {}
             _ => return Err(WorkflowProjectionError::MissingWorkflowId(event.event_type.clone())),
         }
 
@@ -634,22 +720,74 @@ impl TryFrom<&EventEnvelope<WorkflowEvent>> for WorkflowInstanceState {
 }
 
 pub fn replay_history(history: &[EventEnvelope<WorkflowEvent>]) -> Result<WorkflowInstanceState> {
-    let mut state: Option<WorkflowInstanceState> = None;
+    Ok(replay_history_trace(history)?.final_state)
+}
+
+pub fn replay_history_trace(history: &[EventEnvelope<WorkflowEvent>]) -> Result<ReplayTrace> {
+    replay_history_trace_from_state(history, None, ReplaySource::RunStart)
+}
+
+pub fn replay_history_trace_from_snapshot(
+    history_tail: &[EventEnvelope<WorkflowEvent>],
+    snapshot_state: &WorkflowInstanceState,
+    snapshot_event_count: i64,
+    snapshot_last_event_id: Uuid,
+    snapshot_last_event_type: &str,
+) -> Result<ReplayTrace> {
+    replay_history_trace_from_state(
+        history_tail,
+        Some(snapshot_state.clone()),
+        ReplaySource::SnapshotTail {
+            snapshot_event_count,
+            snapshot_last_event_id,
+            snapshot_last_event_type: snapshot_last_event_type.to_owned(),
+        },
+    )
+}
+
+fn replay_history_trace_from_state(
+    history: &[EventEnvelope<WorkflowEvent>],
+    mut state: Option<WorkflowInstanceState>,
+    source: ReplaySource,
+) -> Result<ReplayTrace> {
+    let mut transitions = Vec::with_capacity(history.len());
 
     for event in history {
+        let before = state.as_ref().map(replay_checkpoint);
         match state.as_mut() {
             Some(current) => current.apply_event(event),
             None => state = Some(WorkflowInstanceState::try_from(event)?),
         }
+        let after = replay_checkpoint(
+            state.as_ref().context("workflow history failed to materialize state")?,
+        );
+        transitions.push(ReplayTransitionTraceEntry {
+            event_id: event.event_id,
+            event_type: event.event_type.clone(),
+            occurred_at: event.occurred_at,
+            checkpoint_before: before,
+            checkpoint_after: after,
+        });
     }
 
-    state.context("workflow history did not produce a replayable state")
+    Ok(ReplayTrace {
+        source,
+        final_state: state.context("workflow history did not produce a replayable state")?,
+        transitions,
+    })
 }
 
 pub fn replay_compiled_history(
     history: &[EventEnvelope<WorkflowEvent>],
     artifact: &CompiledWorkflowArtifact,
 ) -> Result<WorkflowInstanceState> {
+    Ok(replay_compiled_history_trace(history, artifact)?.final_state)
+}
+
+pub fn replay_compiled_history_trace(
+    history: &[EventEnvelope<WorkflowEvent>],
+    artifact: &CompiledWorkflowArtifact,
+) -> Result<ReplayTrace> {
     let trigger = history
         .iter()
         .find_map(|event| match &event.payload {
@@ -666,10 +804,19 @@ pub fn replay_compiled_history(
     replayed.context = execution.context.clone();
     replayed.output = execution.output.clone();
     replayed.artifact_execution = Some(execution.execution_state.clone());
+    let mut transitions = vec![ReplayTransitionTraceEntry {
+        event_id: trigger.0.event_id,
+        event_type: trigger.0.event_type.clone(),
+        occurred_at: trigger.0.occurred_at,
+        checkpoint_before: None,
+        checkpoint_after: replay_checkpoint(&replayed),
+    }];
     for event in history.iter().skip(1) {
+        let before = replay_checkpoint(&replayed);
         replayed.apply_event(event);
+        let mut advanced = false;
         match &event.payload {
-            WorkflowEvent::SignalReceived { signal_type, payload } => {
+            WorkflowEvent::SignalReceived { signal_type, payload, .. } => {
                 execution = artifact.execute_after_signal_with_turn(
                     replayed.current_state.as_deref().unwrap_or_default(),
                     signal_type,
@@ -680,6 +827,7 @@ pub fn replay_compiled_history(
                         occurred_at: event.occurred_at,
                     },
                 )?;
+                advanced = true;
             }
             WorkflowEvent::TimerFired { timer_id } => {
                 execution = artifact.execute_after_timer_with_turn(
@@ -691,6 +839,7 @@ pub fn replay_compiled_history(
                         occurred_at: event.occurred_at,
                     },
                 )?;
+                advanced = true;
             }
             WorkflowEvent::StepCompleted { step_id, output, .. } => {
                 execution = artifact.execute_after_step_completion_with_turn(
@@ -703,6 +852,7 @@ pub fn replay_compiled_history(
                         occurred_at: event.occurred_at,
                     },
                 )?;
+                advanced = true;
             }
             WorkflowEvent::EffectCompleted { effect_id, output, .. } => {
                 execution = artifact.execute_after_effect_completion_with_turn(
@@ -715,6 +865,7 @@ pub fn replay_compiled_history(
                         occurred_at: event.occurred_at,
                     },
                 )?;
+                advanced = true;
             }
             WorkflowEvent::StepFailed { step_id, error, .. } => {
                 execution = artifact.execute_after_step_failure_with_turn(
@@ -727,6 +878,7 @@ pub fn replay_compiled_history(
                         occurred_at: event.occurred_at,
                     },
                 )?;
+                advanced = true;
             }
             WorkflowEvent::EffectFailed { effect_id, error, .. } => {
                 execution = artifact.execute_after_effect_failure_with_turn(
@@ -739,6 +891,7 @@ pub fn replay_compiled_history(
                         occurred_at: event.occurred_at,
                     },
                 )?;
+                advanced = true;
             }
             WorkflowEvent::EffectTimedOut { effect_id, .. } => {
                 execution = artifact.execute_after_effect_failure_with_turn(
@@ -751,6 +904,7 @@ pub fn replay_compiled_history(
                         occurred_at: event.occurred_at,
                     },
                 )?;
+                advanced = true;
             }
             WorkflowEvent::EffectCancelled { effect_id, reason, .. } => {
                 execution = artifact.execute_after_effect_failure_with_turn(
@@ -763,16 +917,305 @@ pub fn replay_compiled_history(
                         occurred_at: event.occurred_at,
                     },
                 )?;
+                advanced = true;
             }
-            _ => continue,
+            _ => {}
         }
-        replayed.current_state = Some(execution.final_state.clone());
-        replayed.context = execution.context.clone();
-        replayed.output = execution.output.clone();
-        replayed.artifact_execution = Some(execution.execution_state.clone());
+        if advanced {
+            apply_compiled_execution(&mut replayed, &execution);
+        }
+        transitions.push(ReplayTransitionTraceEntry {
+            event_id: event.event_id,
+            event_type: event.event_type.clone(),
+            occurred_at: event.occurred_at,
+            checkpoint_before: Some(before),
+            checkpoint_after: replay_checkpoint(&replayed),
+        });
     }
 
-    Ok(replayed)
+    Ok(ReplayTrace { source: ReplaySource::RunStart, final_state: replayed, transitions })
+}
+
+pub fn replay_compiled_history_trace_from_snapshot(
+    history_tail: &[EventEnvelope<WorkflowEvent>],
+    snapshot_state: &WorkflowInstanceState,
+    artifact: &CompiledWorkflowArtifact,
+    snapshot_event_count: i64,
+    snapshot_last_event_id: Uuid,
+    snapshot_last_event_type: &str,
+) -> Result<ReplayTrace> {
+    let mut replayed = snapshot_state.clone();
+    let mut transitions = Vec::with_capacity(history_tail.len());
+
+    for event in history_tail {
+        let before = replay_checkpoint(&replayed);
+        replayed.apply_event(event);
+        match &event.payload {
+            WorkflowEvent::SignalReceived { signal_type, payload, .. } => {
+                let execution = artifact.execute_after_signal_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    signal_type,
+                    payload,
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                apply_compiled_execution(&mut replayed, &execution);
+            }
+            WorkflowEvent::TimerFired { timer_id } => {
+                let execution = artifact.execute_after_timer_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    timer_id,
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                apply_compiled_execution(&mut replayed, &execution);
+            }
+            WorkflowEvent::StepCompleted { step_id, output, .. } => {
+                let execution = artifact.execute_after_step_completion_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    step_id,
+                    output,
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                apply_compiled_execution(&mut replayed, &execution);
+            }
+            WorkflowEvent::EffectCompleted { effect_id, output, .. } => {
+                let execution = artifact.execute_after_effect_completion_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    effect_id,
+                    output,
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                apply_compiled_execution(&mut replayed, &execution);
+            }
+            WorkflowEvent::StepFailed { step_id, error, .. } => {
+                let execution = artifact.execute_after_step_failure_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    step_id,
+                    error,
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                apply_compiled_execution(&mut replayed, &execution);
+            }
+            WorkflowEvent::EffectFailed { effect_id, error, .. } => {
+                let execution = artifact.execute_after_effect_failure_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    effect_id,
+                    error,
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                apply_compiled_execution(&mut replayed, &execution);
+            }
+            WorkflowEvent::EffectTimedOut { effect_id, .. } => {
+                let execution = artifact.execute_after_effect_failure_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    effect_id,
+                    "effect timed out",
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                apply_compiled_execution(&mut replayed, &execution);
+            }
+            WorkflowEvent::EffectCancelled { effect_id, reason, .. } => {
+                let execution = artifact.execute_after_effect_failure_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    effect_id,
+                    reason,
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                apply_compiled_execution(&mut replayed, &execution);
+            }
+            _ => {}
+        }
+        transitions.push(ReplayTransitionTraceEntry {
+            event_id: event.event_id,
+            event_type: event.event_type.clone(),
+            occurred_at: event.occurred_at,
+            checkpoint_before: Some(before),
+            checkpoint_after: replay_checkpoint(&replayed),
+        });
+    }
+
+    Ok(ReplayTrace {
+        source: ReplaySource::SnapshotTail {
+            snapshot_event_count,
+            snapshot_last_event_id,
+            snapshot_last_event_type: snapshot_last_event_type.to_owned(),
+        },
+        final_state: replayed,
+        transitions,
+    })
+}
+
+fn apply_compiled_execution(
+    replayed: &mut WorkflowInstanceState,
+    execution: &CompiledExecutionPlan,
+) {
+    replayed.current_state = Some(execution.final_state.clone());
+    replayed.context = execution.context.clone();
+    replayed.output = execution.output.clone();
+    replayed.artifact_execution = Some(execution.execution_state.clone());
+}
+
+fn replay_checkpoint(state: &WorkflowInstanceState) -> ReplayCheckpoint {
+    ReplayCheckpoint {
+        run_id: state.run_id.clone(),
+        current_state: state.current_state.clone(),
+        status: state.status.clone(),
+        context: state.context.clone(),
+        output: state.output.clone(),
+        event_count: state.event_count,
+        last_event_id: state.last_event_id,
+        last_event_type: state.last_event_type.clone(),
+    }
+}
+
+pub fn projection_mismatches(
+    expected: &WorkflowInstanceState,
+    actual: &WorkflowInstanceState,
+) -> Vec<ReplayFieldMismatch> {
+    let mut mismatches = Vec::new();
+    push_mismatch(&mut mismatches, "tenant_id", &expected.tenant_id, &actual.tenant_id);
+    push_mismatch(&mut mismatches, "instance_id", &expected.instance_id, &actual.instance_id);
+    push_mismatch(&mut mismatches, "run_id", &expected.run_id, &actual.run_id);
+    push_mismatch(&mut mismatches, "definition_id", &expected.definition_id, &actual.definition_id);
+    push_mismatch(
+        &mut mismatches,
+        "definition_version",
+        &expected.definition_version,
+        &actual.definition_version,
+    );
+    push_mismatch(&mut mismatches, "artifact_hash", &expected.artifact_hash, &actual.artifact_hash);
+    push_mismatch(&mut mismatches, "current_state", &expected.current_state, &actual.current_state);
+    push_mismatch(&mut mismatches, "context", &expected.context, &actual.context);
+    push_mismatch(&mut mismatches, "status", &expected.status, &actual.status);
+    push_mismatch(&mut mismatches, "input", &expected.input, &actual.input);
+    push_mismatch(&mut mismatches, "output", &expected.output, &actual.output);
+    push_mismatch(
+        &mut mismatches,
+        "artifact_execution",
+        &expected.artifact_execution,
+        &actual.artifact_execution,
+    );
+    push_mismatch(&mut mismatches, "event_count", &expected.event_count, &actual.event_count);
+    push_mismatch(&mut mismatches, "last_event_id", &expected.last_event_id, &actual.last_event_id);
+    push_mismatch(
+        &mut mismatches,
+        "last_event_type",
+        &expected.last_event_type,
+        &actual.last_event_type,
+    );
+    mismatches
+}
+
+pub fn first_transition_divergence(
+    expected: &[ReplayTransitionTraceEntry],
+    actual: &[ReplayTransitionTraceEntry],
+) -> Option<ReplayDivergence> {
+    for (expected_entry, actual_entry) in expected.iter().zip(actual.iter()) {
+        let fields =
+            checkpoint_mismatches(&expected_entry.checkpoint_after, &actual_entry.checkpoint_after);
+        if !fields.is_empty() {
+            return Some(ReplayDivergence {
+                kind: ReplayDivergenceKind::SnapshotMismatch,
+                event_id: Some(actual_entry.event_id),
+                event_type: Some(actual_entry.event_type.clone()),
+                message: format!(
+                    "snapshot-backed replay diverged after event {} ({})",
+                    actual_entry.event_id, actual_entry.event_type
+                ),
+                fields,
+            });
+        }
+    }
+
+    if expected.len() != actual.len() {
+        let extra = if actual.len() > expected.len() {
+            actual.get(expected.len())
+        } else {
+            expected.get(actual.len())
+        };
+        return Some(ReplayDivergence {
+            kind: ReplayDivergenceKind::SnapshotMismatch,
+            event_id: extra.map(|entry| entry.event_id),
+            event_type: extra.map(|entry| entry.event_type.clone()),
+            message: "snapshot-backed replay produced a different transition count".to_owned(),
+            fields: vec![ReplayFieldMismatch {
+                field: "transition_count".to_owned(),
+                expected: Value::from(expected.len() as u64),
+                actual: Value::from(actual.len() as u64),
+            }],
+        });
+    }
+
+    None
+}
+
+fn checkpoint_mismatches(
+    expected: &ReplayCheckpoint,
+    actual: &ReplayCheckpoint,
+) -> Vec<ReplayFieldMismatch> {
+    let mut mismatches = Vec::new();
+    push_mismatch(&mut mismatches, "run_id", &expected.run_id, &actual.run_id);
+    push_mismatch(&mut mismatches, "current_state", &expected.current_state, &actual.current_state);
+    push_mismatch(&mut mismatches, "status", &expected.status, &actual.status);
+    push_mismatch(&mut mismatches, "context", &expected.context, &actual.context);
+    push_mismatch(&mut mismatches, "output", &expected.output, &actual.output);
+    push_mismatch(&mut mismatches, "event_count", &expected.event_count, &actual.event_count);
+    push_mismatch(&mut mismatches, "last_event_id", &expected.last_event_id, &actual.last_event_id);
+    push_mismatch(
+        &mut mismatches,
+        "last_event_type",
+        &expected.last_event_type,
+        &actual.last_event_type,
+    );
+    mismatches
+}
+
+fn push_mismatch<T>(
+    mismatches: &mut Vec<ReplayFieldMismatch>,
+    field: &str,
+    expected: &T,
+    actual: &T,
+) where
+    T: Serialize + PartialEq,
+{
+    if expected != actual {
+        mismatches.push(ReplayFieldMismatch {
+            field: field.to_owned(),
+            expected: serde_json::to_value(expected).expect("expected value serializes"),
+            actual: serde_json::to_value(actual).expect("actual value serializes"),
+        });
+    }
 }
 
 pub fn same_projection(left: &WorkflowInstanceState, right: &WorkflowInstanceState) -> bool {
@@ -828,10 +1271,42 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        ExecutionEmission, HttpRequestConfig, RetryPolicy, StateNode, StepConfig,
+        ExecutionEmission, HttpRequestConfig, ReplaySource, RetryPolicy, StateNode, StepConfig,
         WorkflowDefinition, WorkflowInstanceState, WorkflowProjectionError, WorkflowStatus,
-        WorkflowValidationError,
+        WorkflowValidationError, replay_history_trace, replay_history_trace_from_snapshot,
     };
+
+    fn test_event(
+        event_type: &str,
+        run_id: &str,
+        payload: WorkflowEvent,
+        metadata: &[(&str, &str)],
+    ) -> EventEnvelope<WorkflowEvent> {
+        let mut event_metadata = BTreeMap::new();
+        for (key, value) in metadata {
+            event_metadata.insert((*key).to_owned(), (*value).to_owned());
+        }
+
+        EventEnvelope {
+            schema_version: 1,
+            event_id: Uuid::now_v7(),
+            event_type: event_type.to_owned(),
+            occurred_at: Utc::now(),
+            tenant_id: "tenant-a".to_owned(),
+            definition_id: "demo".to_owned(),
+            definition_version: 1,
+            artifact_hash: "artifact-1".to_owned(),
+            instance_id: "instance-1".to_owned(),
+            run_id: run_id.to_owned(),
+            partition_key: format!("tenant-a:instance-1:{run_id}"),
+            producer: "test".to_owned(),
+            causation_id: None,
+            correlation_id: None,
+            dedupe_key: None,
+            metadata: event_metadata,
+            payload,
+        }
+    }
 
     #[test]
     fn validation_rejects_unknown_next_state() {
@@ -966,6 +1441,74 @@ mod tests {
         assert_eq!(state.current_state, None);
         assert_eq!(state.context, Some(json!({"carried": true})));
         assert_eq!(state.status, WorkflowStatus::Running);
+    }
+
+    #[test]
+    fn replay_trace_records_all_history_events() {
+        let triggered = test_event(
+            "WorkflowTriggered",
+            "run-1",
+            WorkflowEvent::WorkflowTriggered { input: json!({"hello": "world"}) },
+            &[],
+        );
+        let started = test_event(
+            "WorkflowStarted",
+            "run-1",
+            WorkflowEvent::WorkflowStarted,
+            &[("state", "wait")],
+        );
+        let completed = test_event(
+            "WorkflowCompleted",
+            "run-1",
+            WorkflowEvent::WorkflowCompleted { output: json!({"ok": true}) },
+            &[("state", "done")],
+        );
+
+        let trace = replay_history_trace(&[triggered, started, completed]).unwrap();
+        assert_eq!(trace.source, ReplaySource::RunStart);
+        assert_eq!(trace.transitions.len(), 3);
+        assert_eq!(trace.transitions[0].checkpoint_before, None);
+        assert_eq!(trace.transitions[1].checkpoint_after.current_state, Some("wait".to_owned()));
+        assert_eq!(trace.final_state.current_state, Some("done".to_owned()));
+        assert_eq!(trace.final_state.status, WorkflowStatus::Completed);
+    }
+
+    #[test]
+    fn replay_trace_from_snapshot_replays_only_tail() {
+        let triggered = test_event(
+            "WorkflowTriggered",
+            "run-1",
+            WorkflowEvent::WorkflowTriggered { input: json!({"hello": "world"}) },
+            &[],
+        );
+        let started = test_event(
+            "WorkflowStarted",
+            "run-1",
+            WorkflowEvent::WorkflowStarted,
+            &[("state", "wait")],
+        );
+        let completed = test_event(
+            "WorkflowCompleted",
+            "run-1",
+            WorkflowEvent::WorkflowCompleted { output: json!({"ok": true}) },
+            &[("state", "done")],
+        );
+
+        let full_history = vec![triggered, started, completed.clone()];
+        let snapshot_state = replay_history_trace(&full_history[..2]).unwrap().final_state;
+        let trace = replay_history_trace_from_snapshot(
+            &[completed],
+            &snapshot_state,
+            snapshot_state.event_count,
+            snapshot_state.last_event_id,
+            &snapshot_state.last_event_type,
+        )
+        .unwrap();
+
+        assert!(matches!(trace.source, ReplaySource::SnapshotTail { .. }));
+        assert_eq!(trace.transitions.len(), 1);
+        assert_eq!(trace.final_state.current_state, Some("done".to_owned()));
+        assert_eq!(trace.final_state.status, WorkflowStatus::Completed);
     }
 
     #[test]

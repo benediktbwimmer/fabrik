@@ -28,4 +28,6 @@ This document freezes workflow identity and execution versioning semantics.
 
 ## Current Implementation Note
 
-The current repository still uses simpler field names in code and APIs. This spec defines the target canonical model the runtime should converge toward.
+- the runtime persists run lineage in PostgreSQL keyed by `tenant_id + instance_id + run_id`
+- manual and automatic `ContinueAsNew` both link `previous_run_id -> next_run_id` durably
+- query APIs can now expose run chains for one logical `instance_id`

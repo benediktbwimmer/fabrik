@@ -97,14 +97,35 @@ impl<T> EventEnvelope<T> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkflowEvent {
-    WorkflowTriggered { input: Value },
+    WorkflowTriggered {
+        input: Value,
+    },
     WorkflowStarted,
     WorkflowArtifactPinned,
-    MarkerRecorded { marker_id: String, value: Value },
-    EffectRequested { effect_id: String, connector: String, attempt: u32, input: Value },
-    EffectCompleted { effect_id: String, attempt: u32, output: Value },
-    EffectFailed { effect_id: String, attempt: u32, error: String },
-    EffectTimedOut { effect_id: String, attempt: u32 },
+    MarkerRecorded {
+        marker_id: String,
+        value: Value,
+    },
+    EffectRequested {
+        effect_id: String,
+        connector: String,
+        attempt: u32,
+        input: Value,
+    },
+    EffectCompleted {
+        effect_id: String,
+        attempt: u32,
+        output: Value,
+    },
+    EffectFailed {
+        effect_id: String,
+        attempt: u32,
+        error: String,
+    },
+    EffectTimedOut {
+        effect_id: String,
+        attempt: u32,
+    },
     EffectCancelled {
         effect_id: String,
         attempt: u32,
@@ -112,15 +133,48 @@ pub enum WorkflowEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         metadata: Option<Value>,
     },
-    WorkflowContinuedAsNew { new_run_id: String, input: Value },
-    SignalReceived { signal_type: String, payload: Value },
-    StepScheduled { step_id: String, attempt: u32, input: Value },
-    StepCompleted { step_id: String, attempt: u32, output: Value },
-    StepFailed { step_id: String, attempt: u32, error: String },
-    TimerScheduled { timer_id: String, fire_at: DateTime<Utc> },
-    TimerFired { timer_id: String },
-    WorkflowCompleted { output: Value },
-    WorkflowFailed { reason: String },
+    WorkflowContinuedAsNew {
+        new_run_id: String,
+        input: Value,
+    },
+    SignalQueued {
+        signal_id: String,
+        signal_type: String,
+        payload: Value,
+    },
+    SignalReceived {
+        signal_id: String,
+        signal_type: String,
+        payload: Value,
+    },
+    StepScheduled {
+        step_id: String,
+        attempt: u32,
+        input: Value,
+    },
+    StepCompleted {
+        step_id: String,
+        attempt: u32,
+        output: Value,
+    },
+    StepFailed {
+        step_id: String,
+        attempt: u32,
+        error: String,
+    },
+    TimerScheduled {
+        timer_id: String,
+        fire_at: DateTime<Utc>,
+    },
+    TimerFired {
+        timer_id: String,
+    },
+    WorkflowCompleted {
+        output: Value,
+    },
+    WorkflowFailed {
+        reason: String,
+    },
 }
 
 impl WorkflowEvent {
@@ -136,6 +190,7 @@ impl WorkflowEvent {
             Self::EffectTimedOut { .. } => "EffectTimedOut",
             Self::EffectCancelled { .. } => "EffectCancelled",
             Self::WorkflowContinuedAsNew { .. } => "WorkflowContinuedAsNew",
+            Self::SignalQueued { .. } => "SignalQueued",
             Self::SignalReceived { .. } => "SignalReceived",
             Self::StepScheduled { .. } => "StepScheduled",
             Self::StepCompleted { .. } => "StepCompleted",

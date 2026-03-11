@@ -274,6 +274,33 @@ impl CompiledWorkflowArtifact {
         artifact
     }
 
+    pub fn is_wait_state(&self, state_id: &str) -> Result<bool, CompiledWorkflowError> {
+        let state = self
+            .workflow
+            .states
+            .get(state_id)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(state_id.to_owned()))?;
+        Ok(matches!(
+            state,
+            CompiledStateNode::WaitForEvent { .. } | CompiledStateNode::WaitForTimer { .. }
+        ))
+    }
+
+    pub fn expected_signal_type(
+        &self,
+        state_id: &str,
+    ) -> Result<Option<&str>, CompiledWorkflowError> {
+        let state = self
+            .workflow
+            .states
+            .get(state_id)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(state_id.to_owned()))?;
+        Ok(match state {
+            CompiledStateNode::WaitForEvent { event_type, .. } => Some(event_type.as_str()),
+            _ => None,
+        })
+    }
+
     pub fn hash(&self) -> String {
         let mut clone = self.clone();
         clone.artifact_hash.clear();

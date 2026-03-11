@@ -5,18 +5,27 @@ use axum::{
     http::StatusCode,
     routing::get,
 };
+use chrono::{DateTime, Utc};
 use fabrik_broker::{BrokerConfig, WorkflowHistoryFilter, read_workflow_history};
 use fabrik_config::{HttpServiceConfig, PostgresConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
-use fabrik_store::{WorkflowEffectRecord, WorkflowStore};
+use fabrik_store::{
+    WorkflowEffectRecord, WorkflowRunRecord, WorkflowSignalRecord, WorkflowStateSnapshot,
+    WorkflowStore,
+};
 use fabrik_workflow::{
-    CompiledWorkflowArtifact, WorkflowDefinition, WorkflowInstanceState, artifact_hash,
-    replay_compiled_history, replay_history, same_projection,
+    CompiledWorkflowArtifact, ReplayDivergence, ReplayDivergenceKind, ReplayFieldMismatch,
+    ReplaySource, ReplayTransitionTraceEntry, WorkflowDefinition, WorkflowInstanceState,
+    artifact_hash, first_transition_divergence, projection_mismatches,
+    replay_compiled_history_trace, replay_compiled_history_trace_from_snapshot,
+    replay_history_trace, replay_history_trace_from_snapshot, same_projection,
 };
 use serde::Serialize;
+use serde_json::{Value, to_value};
 use std::time::Duration;
 use tracing::info;
+use uuid::Uuid;
 
 const HISTORY_IDLE_TIMEOUT_MS: u64 = 1_000;
 const HISTORY_MAX_SCAN_MS: u64 = 10_000;
@@ -40,6 +49,9 @@ struct WorkflowHistoryResponse {
     definition_id: String,
     definition_version: u32,
     artifact_hash: String,
+    previous_run_id: Option<String>,
+    next_run_id: Option<String>,
+    continue_reason: Option<String>,
     event_count: usize,
     effect_attempt_count: usize,
     effect_attempts: Vec<WorkflowEffectRecord>,
@@ -54,12 +66,31 @@ struct WorkflowReplayResponse {
     definition_id: String,
     definition_version: u32,
     artifact_hash: String,
+    previous_run_id: Option<String>,
+    next_run_id: Option<String>,
+    continue_reason: Option<String>,
     event_count: usize,
     last_event_type: String,
     effect_attempt_count: usize,
     effect_attempts: Vec<WorkflowEffectRecord>,
     projection_matches_store: Option<bool>,
+    replay_source: ReplaySource,
+    snapshot: Option<ReplaySnapshotSummary>,
+    divergence_count: usize,
+    divergences: Vec<ReplayDivergence>,
+    transition_count: usize,
+    transition_trace: Vec<ReplayTransitionTraceEntry>,
     replayed_state: WorkflowInstanceState,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplaySnapshotSummary {
+    run_id: String,
+    snapshot_schema_version: u32,
+    event_count: i64,
+    last_event_id: Uuid,
+    last_event_type: String,
+    updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +100,24 @@ struct WorkflowEffectsResponse {
     run_id: String,
     effect_count: usize,
     effects: Vec<WorkflowEffectRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowSignalsResponse {
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    signal_count: usize,
+    signals: Vec<WorkflowSignalRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowRunsResponse {
+    tenant_id: String,
+    instance_id: String,
+    current_run_id: Option<String>,
+    run_count: usize,
+    runs: Vec<WorkflowRunRecord>,
 }
 
 #[tokio::main]
@@ -105,13 +154,26 @@ async fn main() -> Result<()> {
         get(get_workflow_artifact_version),
     )
     .route("/tenants/{tenant_id}/workflows/{instance_id}", get(get_workflow_instance))
+    .route("/tenants/{tenant_id}/workflows/{instance_id}/runs", get(get_workflow_runs))
+    .route(
+        "/tenants/{tenant_id}/workflows/{instance_id}/snapshot",
+        get(get_latest_workflow_snapshot),
+    )
     .route(
         "/tenants/{tenant_id}/workflows/{instance_id}/effects",
         get(get_current_workflow_effects),
     )
     .route(
+        "/tenants/{tenant_id}/workflows/{instance_id}/signals",
+        get(get_current_workflow_signals),
+    )
+    .route(
         "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/effects",
         get(get_workflow_effects_for_run),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/signals",
+        get(get_workflow_signals_for_run),
     )
     .route(
         "/tenants/{tenant_id}/workflows/{instance_id}/history",
@@ -173,6 +235,43 @@ async fn get_current_workflow_history(
     Ok(Json(response))
 }
 
+async fn get_workflow_runs(
+    Path((tenant_id, instance_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowRunsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let current_instance =
+        state.store.get_instance(&tenant_id, &instance_id).await.map_err(internal_error)?;
+    let runs = state
+        .store
+        .list_runs_for_instance(&tenant_id, &instance_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(WorkflowRunsResponse {
+        tenant_id,
+        instance_id,
+        current_run_id: current_instance.map(|instance| instance.run_id),
+        run_count: runs.len(),
+        runs,
+    }))
+}
+
+async fn get_latest_workflow_snapshot(
+    Path((tenant_id, instance_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowStateSnapshot>, (StatusCode, Json<ErrorResponse>)> {
+    match state.store.get_latest_snapshot(&tenant_id, &instance_id).await.map_err(internal_error)? {
+        Some(snapshot) => Ok(Json(snapshot)),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                message: format!(
+                    "workflow snapshot for instance {instance_id} not found for tenant {tenant_id}"
+                ),
+            }),
+        )),
+    }
+}
+
 async fn get_current_workflow_effects(
     Path((tenant_id, instance_id)): Path<(String, String)>,
     State(state): State<AppState>,
@@ -198,11 +297,46 @@ async fn get_current_workflow_effects(
     Ok(Json(response))
 }
 
+async fn get_current_workflow_signals(
+    Path((tenant_id, instance_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowSignalsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let instance = state
+        .store
+        .get_instance(&tenant_id, &instance_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    message: format!(
+                        "workflow instance {instance_id} not found for tenant {tenant_id}"
+                    ),
+                }),
+            )
+        })?;
+    let response = load_workflow_signals(&state, &tenant_id, &instance_id, &instance.run_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
 async fn get_workflow_effects_for_run(
     Path((tenant_id, instance_id, run_id)): Path<(String, String, String)>,
     State(state): State<AppState>,
 ) -> Result<Json<WorkflowEffectsResponse>, (StatusCode, Json<ErrorResponse>)> {
     let response = load_workflow_effects(&state, &tenant_id, &instance_id, &run_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+async fn get_workflow_signals_for_run(
+    Path((tenant_id, instance_id, run_id)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowSignalsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let response = load_workflow_signals(&state, &tenant_id, &instance_id, &run_id)
         .await
         .map_err(internal_error)?;
     Ok(Json(response))
@@ -284,6 +418,7 @@ async fn load_workflow_history(
         )
     })?;
     let effect_attempts = state.store.list_effects_for_run(tenant_id, instance_id, run_id).await?;
+    let run = state.store.get_run_record(tenant_id, instance_id, run_id).await?;
 
     Ok(WorkflowHistoryResponse {
         tenant_id: tenant_id.to_owned(),
@@ -292,6 +427,9 @@ async fn load_workflow_history(
         definition_id: first_event.definition_id.clone(),
         definition_version: first_event.definition_version,
         artifact_hash: first_event.artifact_hash.clone(),
+        previous_run_id: run.as_ref().and_then(|run| run.previous_run_id.clone()),
+        next_run_id: run.as_ref().and_then(|run| run.next_run_id.clone()),
+        continue_reason: run.and_then(|run| run.continue_reason),
         event_count: history.len(),
         effect_attempt_count: effect_attempts.len(),
         effect_attempts,
@@ -315,6 +453,22 @@ async fn load_workflow_effects(
     })
 }
 
+async fn load_workflow_signals(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+) -> Result<WorkflowSignalsResponse> {
+    let signals = state.store.list_signals_for_run(tenant_id, instance_id, run_id).await?;
+    Ok(WorkflowSignalsResponse {
+        tenant_id: tenant_id.to_owned(),
+        instance_id: instance_id.to_owned(),
+        run_id: run_id.to_owned(),
+        signal_count: signals.len(),
+        signals,
+    })
+}
+
 async fn replay_workflow_run(
     state: &AppState,
     current_instance: &WorkflowInstanceState,
@@ -334,29 +488,33 @@ async fn replay_workflow_run(
             current_instance.instance_id
         );
     }
+    let first_event = history
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("workflow history unexpectedly empty after read"))?;
+    let run = state
+        .store
+        .get_run_record(&current_instance.tenant_id, &current_instance.instance_id, run_id)
+        .await?;
 
-    let pinned_artifact = if let Some(version) = current_instance.definition_version {
+    let pinned_artifact = {
+        let version = first_event.definition_version;
         state
             .store
-            .get_artifact_version(
-                &current_instance.tenant_id,
-                &current_instance.definition_id,
-                version,
-            )
+            .get_artifact_version(&current_instance.tenant_id, &first_event.definition_id, version)
             .await?
-    } else {
-        None
     };
 
-    let replayed_state = if let Some(artifact) = pinned_artifact {
-        replay_compiled_history(&history, &artifact)?
+    let full_trace = if let Some(artifact) = pinned_artifact.as_ref() {
+        replay_compiled_history_trace(&history, artifact)?
     } else {
-        replay_history(&history)?
+        replay_history_trace(&history)?
     };
-    let definition_version = replayed_state
+    let definition_version = full_trace
+        .final_state
         .definition_version
         .ok_or_else(|| anyhow::anyhow!("replayed state is missing definition_version"))?;
-    let pinned_artifact_hash = replayed_state
+    let pinned_artifact_hash = full_trace
+        .final_state
         .artifact_hash
         .clone()
         .ok_or_else(|| anyhow::anyhow!("replayed state is missing artifact_hash"))?;
@@ -364,7 +522,7 @@ async fn replay_workflow_run(
         .store
         .get_artifact_version(
             &current_instance.tenant_id,
-            &replayed_state.definition_id,
+            &full_trace.final_state.definition_id,
             definition_version,
         )
         .await?
@@ -381,14 +539,14 @@ async fn replay_workflow_run(
             .store
             .get_definition_version(
                 &current_instance.tenant_id,
-                &replayed_state.definition_id,
+                &full_trace.final_state.definition_id,
                 definition_version,
             )
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "workflow definition {} version {} not found for tenant {}",
-                    replayed_state.definition_id,
+                    full_trace.final_state.definition_id,
                     definition_version,
                     current_instance.tenant_id
                 )
@@ -403,6 +561,73 @@ async fn replay_workflow_run(
         }
     }
 
+    let snapshot = state
+        .store
+        .get_snapshot_for_run(&current_instance.tenant_id, &current_instance.instance_id, run_id)
+        .await?;
+    let snapshot_summary = snapshot.as_ref().map(snapshot_summary);
+    let mut divergences = Vec::new();
+
+    let active_trace = if let Some(snapshot) = snapshot {
+        match history.iter().position(|event| event.event_id == snapshot.last_event_id) {
+            Some(index) => {
+                let tail = &history[index + 1..];
+                let trace = if let Some(artifact) = pinned_artifact.as_ref() {
+                    replay_compiled_history_trace_from_snapshot(
+                        tail,
+                        &snapshot.state,
+                        artifact,
+                        snapshot.event_count,
+                        snapshot.last_event_id,
+                        &snapshot.last_event_type,
+                    )?
+                } else {
+                    replay_history_trace_from_snapshot(
+                        tail,
+                        &snapshot.state,
+                        snapshot.event_count,
+                        snapshot.last_event_id,
+                        &snapshot.last_event_type,
+                    )?
+                };
+                let expected_tail =
+                    full_trace.transitions.iter().skip(index + 1).cloned().collect::<Vec<_>>();
+                if let Some(divergence) =
+                    first_transition_divergence(&expected_tail, &trace.transitions)
+                {
+                    divergences.push(divergence);
+                } else if !same_projection(&full_trace.final_state, &trace.final_state) {
+                    divergences.push(ReplayDivergence {
+                        kind: ReplayDivergenceKind::SnapshotMismatch,
+                        event_id: history.last().map(|event| event.event_id),
+                        event_type: history.last().map(|event| event.event_type.clone()),
+                        message: "snapshot-backed replay produced a different final state"
+                            .to_owned(),
+                        fields: projection_mismatches(&full_trace.final_state, &trace.final_state),
+                    });
+                }
+                trace
+            }
+            None => {
+                divergences.push(ReplayDivergence {
+                    kind: ReplayDivergenceKind::SnapshotMismatch,
+                    event_id: Some(snapshot.last_event_id),
+                    event_type: Some(snapshot.last_event_type.clone()),
+                    message: "snapshot boundary event was not found in broker history".to_owned(),
+                    fields: vec![ReplayFieldMismatch {
+                        field: "snapshot_last_event_id".to_owned(),
+                        expected: to_value(snapshot.last_event_id)
+                            .expect("snapshot event id serializes"),
+                        actual: Value::Null,
+                    }],
+                });
+                full_trace.clone()
+            }
+        }
+    } else {
+        full_trace.clone()
+    };
+
     let last_event_type = history
         .last()
         .map(|event| event.event_type.clone())
@@ -411,22 +636,53 @@ async fn replay_workflow_run(
         .store
         .list_effects_for_run(&current_instance.tenant_id, &current_instance.instance_id, run_id)
         .await?;
+    let projection_matches_store = (current_instance.run_id == active_trace.final_state.run_id)
+        .then(|| same_projection(current_instance, &active_trace.final_state));
+    if matches!(projection_matches_store, Some(false)) {
+        divergences.push(ReplayDivergence {
+            kind: ReplayDivergenceKind::ProjectionMismatch,
+            event_id: Some(active_trace.final_state.last_event_id),
+            event_type: Some(active_trace.final_state.last_event_type.clone()),
+            message: "replayed final state does not match the stored workflow projection"
+                .to_owned(),
+            fields: projection_mismatches(current_instance, &active_trace.final_state),
+        });
+    }
 
     Ok(WorkflowReplayResponse {
         tenant_id: current_instance.tenant_id.clone(),
         instance_id: current_instance.instance_id.clone(),
         run_id: run_id.to_owned(),
-        definition_id: replayed_state.definition_id.clone(),
+        definition_id: active_trace.final_state.definition_id.clone(),
         definition_version,
         artifact_hash: pinned_artifact_hash,
+        previous_run_id: run.as_ref().and_then(|run| run.previous_run_id.clone()),
+        next_run_id: run.as_ref().and_then(|run| run.next_run_id.clone()),
+        continue_reason: run.and_then(|run| run.continue_reason),
         event_count: history.len(),
         last_event_type,
         effect_attempt_count: effect_attempts.len(),
         effect_attempts,
-        projection_matches_store: (current_instance.run_id == replayed_state.run_id)
-            .then(|| same_projection(current_instance, &replayed_state)),
-        replayed_state,
+        projection_matches_store,
+        replay_source: active_trace.source.clone(),
+        snapshot: snapshot_summary,
+        divergence_count: divergences.len(),
+        divergences,
+        transition_count: active_trace.transitions.len(),
+        transition_trace: active_trace.transitions,
+        replayed_state: active_trace.final_state,
     })
+}
+
+fn snapshot_summary(snapshot: &WorkflowStateSnapshot) -> ReplaySnapshotSummary {
+    ReplaySnapshotSummary {
+        run_id: snapshot.run_id.clone(),
+        snapshot_schema_version: snapshot.snapshot_schema_version,
+        event_count: snapshot.event_count,
+        last_event_id: snapshot.last_event_id,
+        last_event_type: snapshot.last_event_type.clone(),
+        updated_at: snapshot.updated_at,
+    }
 }
 
 async fn read_history(

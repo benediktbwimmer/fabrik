@@ -46,6 +46,8 @@ struct TriggerWorkflowResponse {
 #[derive(Debug, Deserialize)]
 struct SignalWorkflowRequest {
     payload: Value,
+    #[serde(default)]
+    dedupe_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,6 +68,7 @@ struct CancelEffectRequest {
 struct SignalWorkflowResponse {
     instance_id: String,
     run_id: String,
+    signal_id: String,
     signal_type: String,
     event_id: Uuid,
     status: &'static str,
@@ -241,6 +244,22 @@ async fn trigger_workflow(
     );
 
     state.publisher.publish(&envelope, &envelope.partition_key).await.map_err(internal_error)?;
+    state
+        .store
+        .put_run_start(
+            &envelope.tenant_id,
+            &envelope.instance_id,
+            &envelope.run_id,
+            &envelope.definition_id,
+            Some(envelope.definition_version),
+            Some(&envelope.artifact_hash),
+            envelope.event_id,
+            envelope.occurred_at,
+            None,
+            None,
+        )
+        .await
+        .map_err(internal_error)?;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -297,9 +316,11 @@ async fn signal_workflow(
         )
     })?;
 
-    let payload = WorkflowEvent::SignalReceived {
+    let signal_id = format!("sig-{}", Uuid::now_v7());
+    let payload = WorkflowEvent::SignalQueued {
+        signal_id: signal_id.clone(),
         signal_type: signal_type.clone(),
-        payload: request.payload,
+        payload: request.payload.clone(),
     };
     let envelope = EventEnvelope::new(
         payload.event_type(),
@@ -314,14 +335,49 @@ async fn signal_workflow(
         ),
         payload,
     );
+    let queued = state
+        .store
+        .queue_signal(
+            &envelope.tenant_id,
+            &envelope.instance_id,
+            &envelope.run_id,
+            &signal_id,
+            &signal_type,
+            request.dedupe_key.as_deref(),
+            &request.payload,
+            envelope.event_id,
+            envelope.occurred_at,
+        )
+        .await
+        .map_err(internal_error)?;
+    if !queued {
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(SignalWorkflowResponse {
+                instance_id,
+                run_id: instance.run_id,
+                signal_id,
+                signal_type,
+                event_id: envelope.event_id,
+                status: "duplicate",
+            }),
+        ));
+    }
 
-    state.publisher.publish(&envelope, &envelope.partition_key).await.map_err(internal_error)?;
+    if let Err(error) = state.publisher.publish(&envelope, &envelope.partition_key).await {
+        let _ = state
+            .store
+            .delete_signal(&envelope.tenant_id, &envelope.instance_id, &envelope.run_id, &signal_id)
+            .await;
+        return Err(internal_error(error));
+    }
 
     Ok((
         StatusCode::ACCEPTED,
         Json(SignalWorkflowResponse {
             instance_id,
             run_id: instance.run_id,
+            signal_id,
             signal_type,
             event_id: envelope.event_id,
             status: "accepted",
@@ -428,6 +484,36 @@ async fn continue_as_new(
     trigger.correlation_id = continued.correlation_id;
 
     state.publisher.publish(&trigger, &trigger.partition_key).await.map_err(internal_error)?;
+    state
+        .store
+        .put_run_start(
+            &trigger.tenant_id,
+            &trigger.instance_id,
+            &trigger.run_id,
+            &trigger.definition_id,
+            Some(trigger.definition_version),
+            Some(&trigger.artifact_hash),
+            trigger.event_id,
+            trigger.occurred_at,
+            Some(&instance.run_id),
+            Some(&instance.run_id),
+        )
+        .await
+        .map_err(internal_error)?;
+    state
+        .store
+        .record_run_continuation(
+            &continued.tenant_id,
+            &continued.instance_id,
+            &instance.run_id,
+            &new_run_id,
+            "manual_continue_as_new",
+            continued.event_id,
+            trigger.event_id,
+            trigger.occurred_at,
+        )
+        .await
+        .map_err(internal_error)?;
 
     Ok((
         StatusCode::ACCEPTED,

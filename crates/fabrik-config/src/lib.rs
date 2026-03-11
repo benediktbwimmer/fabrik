@@ -66,10 +66,99 @@ impl PostgresConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutorRuntimeConfig {
+    pub cache_capacity: usize,
+    pub snapshot_interval_events: u64,
+    pub continue_as_new_event_threshold: Option<u64>,
+    pub continue_as_new_effect_attempt_threshold: Option<u64>,
+    pub continue_as_new_run_age_seconds: Option<u64>,
+}
+
+impl ExecutorRuntimeConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Ok(Self {
+            cache_capacity: read_usize_with_default("EXECUTOR_CACHE_CAPACITY", 10_000)?,
+            snapshot_interval_events: read_u64_with_default(
+                "EXECUTOR_SNAPSHOT_INTERVAL_EVENTS",
+                50,
+            )?,
+            continue_as_new_event_threshold: read_optional_u64(
+                "EXECUTOR_CONTINUE_AS_NEW_EVENT_THRESHOLD",
+            )?,
+            continue_as_new_effect_attempt_threshold: read_optional_u64(
+                "EXECUTOR_CONTINUE_AS_NEW_EFFECT_ATTEMPT_THRESHOLD",
+            )?,
+            continue_as_new_run_age_seconds: read_optional_u64(
+                "EXECUTOR_CONTINUE_AS_NEW_RUN_AGE_SECONDS",
+            )?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnershipConfig {
+    pub partition_id: i32,
+    pub lease_ttl_seconds: u64,
+    pub renew_interval_seconds: u64,
+}
+
+impl OwnershipConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Ok(Self {
+            partition_id: read_i32_with_default("WORKFLOW_PARTITION_ID", 0)?,
+            lease_ttl_seconds: read_u64_with_default("OWNERSHIP_LEASE_TTL_SECONDS", 15)?,
+            renew_interval_seconds: read_u64_with_default("OWNERSHIP_RENEW_INTERVAL_SECONDS", 5)?,
+        })
+    }
+}
+
 fn read_string_with_default(key: &str, default: &str) -> Result<String, ConfigError> {
     match env::var(key) {
         Ok(value) => Ok(value),
         Err(env::VarError::NotPresent) => Ok(default.to_owned()),
+        Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
+    }
+}
+
+fn read_usize_with_default(key: &str, default: usize) -> Result<usize, ConfigError> {
+    match env::var(key) {
+        Ok(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| ConfigError::InvalidUsize { key: key.to_owned(), value: raw }),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
+    }
+}
+
+fn read_u64_with_default(key: &str, default: u64) -> Result<u64, ConfigError> {
+    match env::var(key) {
+        Ok(raw) => raw
+            .parse::<u64>()
+            .map_err(|_| ConfigError::InvalidU64 { key: key.to_owned(), value: raw }),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
+    }
+}
+
+fn read_i32_with_default(key: &str, default: i32) -> Result<i32, ConfigError> {
+    match env::var(key) {
+        Ok(raw) => raw
+            .parse::<i32>()
+            .map_err(|_| ConfigError::InvalidI32 { key: key.to_owned(), value: raw }),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
+    }
+}
+
+fn read_optional_u64(key: &str) -> Result<Option<u64>, ConfigError> {
+    match env::var(key) {
+        Ok(raw) if raw.trim().is_empty() => Ok(None),
+        Ok(raw) => raw
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| ConfigError::InvalidU64 { key: key.to_owned(), value: raw }),
+        Err(env::VarError::NotPresent) => Ok(None),
         Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
     }
 }
@@ -80,6 +169,12 @@ pub enum ConfigError {
     UnreadableEnv { key: String, source: env::VarError },
     #[error("environment variable {key} must be a valid u16 port, got {value}")]
     InvalidPort { key: String, value: String },
+    #[error("environment variable {key} must be a valid usize, got {value}")]
+    InvalidUsize { key: String, value: String },
+    #[error("environment variable {key} must be a valid u64, got {value}")]
+    InvalidU64 { key: String, value: String },
+    #[error("environment variable {key} must be a valid i32, got {value}")]
+    InvalidI32 { key: String, value: String },
 }
 
 #[cfg(test)]

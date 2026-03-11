@@ -13,6 +13,15 @@ The platform must support:
 - determinism divergence detection
 - event-by-event replay diagnostics
 
+Current implementation note:
+
+- `GET /tenants/{tenant_id}/workflows/{instance_id}/replay` and `/runs/{run_id}/replay` return:
+  - `replay_source` as either `run_start` or `snapshot_tail`
+  - snapshot boundary metadata when a run-scoped snapshot exists
+  - a compact transition trace with state/status before and after each replayed event
+  - divergence diagnostics for snapshot-boundary mismatches and stored-projection mismatches
+- `cargo run -p replay-tool -- <tenant_id> <instance_id> [run_id]` returns the same diagnostics in CLI form
+
 ## Required Test Classes
 
 - deterministic executor tests

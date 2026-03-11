@@ -31,3 +31,10 @@ Minimum snapshot contents:
 ## Trigger Policy
 
 Snapshot frequency is an optimization policy and may evolve, but it must never alter workflow semantics.
+
+## Current Implementation Note
+
+- the current runtime persists run-scoped snapshots on a configurable event-count interval and always on terminal state changes
+- snapshots carry the replay boundary through `last_event_id` and `event_count`
+- executor cache misses restore from the latest snapshot and replay the run tail after that boundary
+- snapshot restore source is exposed through executor debug endpoints so operators can distinguish cache hits from projection restores and snapshot-backed restores

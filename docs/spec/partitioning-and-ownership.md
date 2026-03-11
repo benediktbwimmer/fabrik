@@ -29,6 +29,18 @@ While an executor owns a partition, it may cache:
 
 It may not treat cached state as authoritative.
 
+Current implementation note:
+
+- the current executor keeps a bounded in-memory cache for active instances keyed by `tenant_id + instance_id`
+- cache misses restore from PostgreSQL snapshots, replay the run tail from the broker, and then repopulate the hot cache
+- the current implementation persists a single logical partition lease in PostgreSQL through `workflow_partition_ownership`
+- executor-service claims and renews that lease with a monotonically increasing `owner_epoch`
+- executor turns validate `(partition_id, owner_id, owner_epoch)` before mutating state or publishing follow-up events
+- ownership loss clears the executor hot cache and forces later turns to restore from snapshot + replay after reacquisition
+- timer-service reads the current ownership record, only dispatches due timers for the active epoch, and stamps `TimerFired` with the observed `owner_epoch`
+- the executor exposes its local ownership record and recent ownership transitions over `/debug/ownership`
+- restore source is surfaced as one of `initialized`, `projection`, `snapshot_replay`, or `cache` in executor debug output
+
 ## Rebalance Contract
 
 On ownership loss:

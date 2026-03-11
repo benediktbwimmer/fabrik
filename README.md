@@ -161,6 +161,30 @@ npm install
 npm run test:compiler
 ```
 
+Tune executor hot-state capacity with:
+
+```bash
+EXECUTOR_CACHE_CAPACITY=10000 cargo run -p executor-service
+```
+
+Tune sparse snapshot cadence with:
+
+```bash
+EXECUTOR_SNAPSHOT_INTERVAL_EVENTS=50 cargo run -p executor-service
+```
+
+Tune ownership lease behavior with:
+
+```bash
+WORKFLOW_PARTITION_ID=0 OWNERSHIP_LEASE_TTL_SECONDS=15 OWNERSHIP_RENEW_INTERVAL_SECONDS=5 cargo run -p executor-service
+```
+
+Enable automatic history rollover with:
+
+```bash
+EXECUTOR_CONTINUE_AS_NEW_EVENT_THRESHOLD=500 EXECUTOR_CONTINUE_AS_NEW_EFFECT_ATTEMPT_THRESHOLD=100 EXECUTOR_CONTINUE_AS_NEW_RUN_AGE_SECONDS=3600 cargo run -p executor-service
+```
+
 Run a service:
 
 ```bash
@@ -194,6 +218,14 @@ Current TypeScript compiler constraints:
 - `await ctx.sideEffect("connector", input, { timeout })` emits host-backed `EffectRequested` / `EffectCompleted` / `EffectFailed` events and can schedule workflow-owned timeouts
 - arbitrary guest callbacks inside `ctx.sideEffect()` are still not supported
 - workflow history and replay responses include persisted effect attempt timelines alongside the raw event stream
+- the executor keeps a bounded hot-state cache for active instances, persists periodic run-scoped PostgreSQL snapshots, and restores cold runs by replaying the event tail after the snapshot boundary
+- the executor persists a single-partition ownership lease with epochs in PostgreSQL, renews it in the background, clears hot cache on ownership loss, and fences stale turns against that lease
+- timer-service stamps `TimerFired` events with the observed executor ownership epoch and the executor drops stale timer fires after handoff
+- executor-service can automatically emit `WorkflowContinuedAsNew` at durable wait boundaries when configured event-count, effect-attempt, or run-age thresholds are exceeded
+- run lineage is persisted in PostgreSQL so current and historical runs for one logical `instance_id` can be inspected as a chain
+- signals now flow through a durable FIFO mailbox per run: `SignalQueued` records arrival, executor consumes only the oldest pending signal at matching wait states, and query APIs expose queued/dispatching/consumed signal records
+- the executor exposes debug surfaces for cache hit/miss counters, restore-source breakdown, ownership transitions, and current single-partition ownership state
+- replay responses and the `replay-tool` are snapshot-aware: they report whether replay started from run start or snapshot tail, include compact transition traces, and surface snapshot/projection divergence diagnostics when determinism or restore boundaries drift
 
 Useful local endpoints:
 
@@ -210,12 +242,19 @@ Useful local endpoints:
 - Query definition API: `GET http://localhost:3005/tenants/{tenant_id}/workflow-definitions/{definition_id}/latest`
 - Query artifact API: `GET http://localhost:3005/tenants/{tenant_id}/workflow-artifacts/{definition_id}/versions/{version}`
 - Query instance API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}`
+- Query run lineage API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/runs`
+- Query latest snapshot API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/snapshot`
 - Query current-run effects API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/effects`
+- Query current-run signals API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/signals`
 - Query run effects API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/effects`
+- Query run signals API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/signals`
 - Query run history API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/history`
 - Query current-run history API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/history`
 - Query run replay API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/replay`
 - Query current-run replay API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/replay`
+- Executor runtime debug API: `GET http://localhost:3002/debug/runtime`
+- Executor ownership debug API: `GET http://localhost:3002/debug/ownership`
+- Executor hot-state debug API: `GET http://localhost:3002/debug/hot-state/{tenant_id}/{instance_id}`
 
 Example TypeScript workflows live in [examples/typescript-workflows/order-workflow.ts](/Users/bene/code/fabrik/examples/typescript-workflows/order-workflow.ts) and [examples/typescript-workflows/helpers.ts](/Users/bene/code/fabrik/examples/typescript-workflows/helpers.ts).
 

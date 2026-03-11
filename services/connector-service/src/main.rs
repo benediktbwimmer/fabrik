@@ -144,9 +144,9 @@ async fn process_event(
     let idempotency_key = build_idempotency_key(&event, &target.id, target.attempt);
 
     let execution_result = match target.kind {
-        ConnectorTargetKind::Step => {
-            Some(execute_step(client, &handler, config.as_ref(), &target.input, &idempotency_key).await)
-        }
+        ConnectorTargetKind::Step => Some(
+            execute_step(client, &handler, config.as_ref(), &target.input, &idempotency_key).await,
+        ),
         ConnectorTargetKind::Effect => {
             execute_effect_with_cooperative_cancellation(
                 store,
