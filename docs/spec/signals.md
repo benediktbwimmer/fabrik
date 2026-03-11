@@ -1,48 +1,43 @@
-# Signals
+# Signals, Queries, and Updates
 
 ## Purpose
 
-This document freezes workflow signal semantics.
+This document freezes inbound workflow interaction semantics.
 
 ## Signal Contract
 
 - signals are durable inbound workflow messages
-- signal delivery is represented in workflow history
-- signal handling behavior follows mailbox rules, not ad hoc callback timing
+- signal acceptance is represented in workflow history
+- signal handling must be deterministic at the workflow boundary
+
+Signals may be observed through explicit waits, registered handlers, or both, but the runtime rules must not depend on ad hoc callback timing.
+
+## Query Contract
+
+- queries do not mutate workflow state
+- queries may require strong routing to the current workflow owner
+- query results may come from hot state, replay, or a consistent snapshot depending on the query model
+- the query consistency contract must be explicit per API
+
+## Update Contract
+
+- updates are durable mutating requests against a workflow
+- update acceptance and update completion are distinct states
+- update handlers must be replay-safe
+- update results and rejections must be visible in workflow history
 
 ## Ordering
 
-- signal ordering is per workflow run
-- ordering is determined by mailbox enqueue order for a run
-- only the oldest pending mailbox signal may be consumed next
-- later matching signals may not bypass an earlier non-matching signal
-- duplicate signals may be rejected by an explicit per-run dedupe key
-
-## Buffering
-
-Before workflow start, buffering behavior must be explicit.
-
-Current rule:
-
-- signals for unknown runs are rejected
-- signals for known runs are persisted in a durable mailbox even if the workflow is not currently waiting
-- mailbox records transition through `queued -> dispatching -> consumed`
+- signals and updates are ordered per workflow run by durable acceptance order
+- the runtime must define how workflow tasks consume accepted messages when multiple message types are pending
+- no later message may bypass an earlier accepted message in ways that violate the documented workflow semantics
 
 ## Interleaving
 
-Initial target rule:
-
-- signals are mailbox-queued
-- signal handling may resume the workflow only at defined suspension points
+- message handling occurs only at deterministic workflow suspension or handler execution points
 - arbitrary interleaving with user code execution is forbidden
-- the current implementation uses strict mailbox serialization at wait states rather than callback-style interleaving
+- the platform must support handler-style semantics without giving up replay safety
 
 ## Visibility
 
-Signals become visible to queries after projection accepts the corresponding signal event.
-
-Current implementation note:
-
-- ingest publishes `SignalQueued` after persisting the mailbox record
-- executor emits `SignalReceived` only when the oldest pending mailbox entry matches the current wait state
-- query APIs expose mailbox contents for the current run and explicit historical runs
+Signals and updates become visible to visibility APIs after their acceptance events are durably recorded. Query invocations may be logged for audit or debugging, but queries are not required to appear in normal user-facing event history unless the product contract chooses to expose them.

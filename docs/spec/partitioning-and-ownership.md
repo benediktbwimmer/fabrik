@@ -2,56 +2,65 @@
 
 ## Purpose
 
-This document freezes how workflow runs are routed and who is allowed to advance them.
+This document freezes how workflows and task queues are routed and owned.
 
-## Partition Key
+## Workflow Partition Key
 
-The routing identity for an active execution is:
+The routing identity for workflow execution is:
 
 - `tenant_id + instance_id`
 
-This combined value becomes the canonical partition key so all `ContinueAsNew` epochs for one logical instance stay on the same shard.
+This value becomes the canonical workflow partition key so all runs for one logical workflow stay on the same workflow shard.
 
-## Ownership Contract
+## Workflow Ownership Contract
 
-- one executor owner advances a partition at a time
-- within a partition owner, one workflow run is advanced by one in-memory task at a time
-- duplicate delivery is tolerated and neutralized through dedupe plus idempotent side-effect protocols
+- one workflow owner advances a workflow run at a time
+- within one workflow owner, one workflow run is advanced by one in-memory task at a time
+- duplicate delivery is tolerated and neutralized through durable dedupe and idempotent completion handling
 
 ## Hot-State Contract
 
-While an executor owns a partition, it may cache:
+While an executor owns a workflow partition, it may cache:
 
 - execution frame
 - pinned artifact metadata
 - pending timer metadata
-- pending join state
+- pending activity metadata
+- pending child workflow metadata
+- sticky-queue assignment metadata
 
 It may not treat cached state as authoritative.
 
-Current implementation note:
+## Sticky Execution Contract
 
-- the current executor keeps a bounded in-memory cache for active instances keyed by `tenant_id + instance_id`
-- cache misses restore from PostgreSQL snapshots, replay the run tail from the broker, and then repopulate the hot cache
-- the current implementation persists one PostgreSQL lease record per broker partition through `workflow_partition_ownership`
-- executor-service can own multiple partitions through `WORKFLOW_PARTITIONS`, or discover them dynamically through `workflow_executor_membership` and `workflow_partition_assignments`
-- dynamic assignment is driven by executor heartbeats plus a PostgreSQL advisory-lock rebalance pass that writes one owner assignment per broker partition
-- executor-service claims and renews each owned lease with a monotonically increasing `owner_epoch`
-- executor turns validate `(partition_id, owner_id, owner_epoch)` before mutating state or publishing follow-up events
-- ownership loss clears the affected partition cache and forces later turns to restore from snapshot + replay after reacquisition
-- timer-service stores timers with `partition_id`, scans all broker partitions, only claims due timers for partitions with an active executor owner, and stamps `TimerFired` with the observed `owner_epoch`
-- the executor exposes its owned partition set and recent ownership transitions over `/debug/ownership`
-- restore source is surfaced as one of `initialized`, `projection`, `snapshot_replay`, or `cache` in executor debug output
+- active workflows should use sticky workflow-task routing whenever possible
+- sticky routing is an optimization only
+- sticky loss must fall back to normal routing plus replay-safe restore
+- sticky execution must not create multiple concurrent workflow owners for one run
+
+## Activity Queue Contract
+
+Activity task queues are separate from workflow partition ownership.
+
+The platform must support:
+
+- independent scaling of activity pollers
+- queue backlog visibility
+- poller liveness tracking
+- capacity-aware routing
+- build-compatibility-aware routing
+
+No activity-queue optimization may violate the workflow-history contract.
 
 ## Rebalance Contract
 
-On ownership loss:
+On workflow ownership loss:
 
-- the old owner stops accepting new work for that partition
-- best-effort snapshot flush may happen
+- the old owner stops accepting new workflow tasks for that partition
 - cached state is discarded after handoff
-- replay on the new owner is the correctness fallback
+- the new owner restores via snapshot plus replay
+- in-flight duplicate workflow tasks are acceptable if completion handling is dedupe-safe
 
 ## Mid-Flight Rule
 
-If ownership changes while a run turn is in progress, duplicate consumption is acceptable. Duplicate effects are neutralized by event-id dedupe and connector idempotency keys.
+If ownership changes while a workflow task is in progress, duplicate workflow-task execution is acceptable. The system must neutralize duplicates through event and task-completion idempotency rather than by assuming impossible exactly-once dispatch.

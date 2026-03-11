@@ -12,39 +12,50 @@ This document freezes the telemetry vocabulary for `fabrik`.
 - `artifact_hash`
 - `instance_id`
 - `run_id`
-- `partition`
-- `connector`
+- `workflow_partition`
+- `workflow_task_queue`
+- `activity_task_queue`
+- `activity_type`
+- `worker_build_id`
 
 ## Required Metrics
 
-- `fabrik_executor_cache_hits_total`
-- `fabrik_executor_cache_misses_total`
-- `fabrik_executor_snapshot_restores_total`
-- `fabrik_executor_projection_restores_total`
-- `fabrik_executor_restores_after_handoff_total`
-- partition lag
-- hot-state cache hit ratio
+- workflow task schedule-to-start latency
+- workflow task execution latency
+- sticky-cache hit ratio
+- snapshot restore count
 - replay duration
 - timer drift
-- effect success and failure rates
+- activity task schedule-to-start latency
+- activity task start-to-close latency
+- activity heartbeat timeout count
+- activity success and failure rates
+- task queue backlog
+- poller counts
 - workflow completion latency
 - continue-as-new frequency
 - replay divergence count
 
-Current implementation note:
+## Required Operational Views
 
-- the executor debug surface at `/debug/runtime` returns aggregate counters plus per-partition cache hit/miss counters, snapshot/projection restore counts, cache capacity, snapshot cadence, and partition-local hot-instance lists
-- `/debug/ownership` returns the current owned partition set, lease expiry, owner epoch, and recent ownership transitions for the local executor process
-- `/debug/hot-state/{tenant_id}/{instance_id}` returns the cached run id, definition id, event count, and latest restore source for one hot instance when present
-- partition ownership and assignment diagnosis now depends on both `workflow_partition_ownership` and `workflow_partition_assignments`; recent ownership transitions include `partition_id`
+Operators must be able to inspect:
+
+- owned workflow partitions
+- hot workflow counts
+- sticky-queue effectiveness
+- task queue backlog and age
+- worker poller presence by task queue
+- workflow and activity throughput by tenant and type
+- version-routing behavior by worker build
 
 ## Trace Rules
 
 Trace and span naming must distinguish:
 
-- ingest
-- executor replay
-- executor turn advancement
+- request acceptance
+- workflow replay
+- workflow task advancement
+- activity task matching
+- activity worker execution
 - timer dispatch
-- connector execution
-- query projection
+- visibility projection

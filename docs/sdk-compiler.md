@@ -2,134 +2,142 @@
 
 ## Goal
 
-`fabrik` should let developers think in code while the runtime thinks in explicit deterministic artifacts.
+`fabrik` should feel like Temporal to the application developer while executing workflow logic more efficiently internally.
 
-The intended model is:
+That requires two different runtime boundaries:
 
-- author workflows in SDK code
-- compile authored workflows to workflow IR / state machine artifacts
-- execute those artifacts on shard-local executors
-- treat event history as the source of truth
+- workflows are authored in SDK code and compiled into deterministic workflow artifacts
+- activities are authored as arbitrary user code and executed by workers through task queues
 
 ## Why This Split Exists
 
-Authoring and execution optimize for different things.
+Workflow execution and activity execution optimize for different things.
 
-Authoring wants:
+Workflow execution wants:
 
-- normal control flow
-- readable branching
-- local composition
-- strong type information
+- determinism
+- replay safety
+- low-latency decisions
+- explicit state transitions
 
-Execution wants:
+Activity execution wants:
 
-- explicit states and transitions
-- deterministic replay
-- low overhead on hot paths
-- precise artifact pinning
+- arbitrary code
+- normal libraries and network access
+- full language runtime support
+- user-controlled process deployment
 
-`fabrik` should not force developers to author raw state graphs, and it should not execute arbitrary guest code as the ground-truth runtime model.
+`fabrik` should not force users to choose one model for both.
 
-## First SDK Shape
+## Workflow SDK Shape
 
-The first SDK should feel like durable orchestration code with constrained primitives:
+The workflow SDK should feel like normal durable orchestration code:
 
 ```ts
 export async function orderWorkflow(ctx, input) {
   const order = await ctx.waitForSignal("order_placed");
-  await ctx.sleep("15m");
+  const reservation = await ctx.activity("reserveInventory", {
+    orderId: order.id,
+  });
 
-  const ok = await ctx.predicate("inventory_check", order);
-  if (!ok) return ctx.fail("out_of_stock");
+  const child = await ctx.startChild("chargeWorkflow", {
+    reservationId: reservation.id,
+  });
 
-  await ctx.activity("reserve_inventory", order);
-  return ctx.complete();
+  await child.result();
+  return ctx.complete({ ok: true });
 }
 ```
 
-The important constraint is that `ctx` owns all non-deterministic behavior.
+Required workflow primitives include:
 
-Initial required primitives:
-
-- `ctx.waitForSignal(name)`
 - `ctx.sleep(duration)`
-- `ctx.activity(name, input)`
+- `ctx.waitForSignal(name)`
+- `ctx.setSignalHandler(name, handler)`
+- `ctx.query(name, handler)`
+- `ctx.update(name, handler)`
+- `ctx.activity(name, input, options?)`
+- `ctx.startChild(name, input, options?)`
+- `ctx.sideEffect(fn)`
+- `ctx.version(changeId, min, max)`
+- `ctx.continueAsNew(input?)`
 - `ctx.complete(output?)`
 - `ctx.fail(reason)`
-- `ctx.continueAsNew(input?)`
 
-Current compiler status:
+## Activity SDK Shape
 
-- implemented in the TypeScript compiler and compiled runtime today: `waitForSignal`, `sleep`, `activity`, `httpRequest`, `complete`, `fail`, `continueAsNew`, `ctx.now()`, `ctx.uuid()`, `ctx.sideEffect()`
-- `ctx.now()` is deterministic per execution turn and resolves from the causation event timestamp
-- `ctx.uuid()` is deterministic per execution turn and per callsite, derived from the causation event id plus compiler-stable scope
-- `ctx.sideEffect(expr)` records a `MarkerRecorded` event the first time a callsite is evaluated in a turn and reuses the persisted marker value on replay
-- `await ctx.sideEffect("connector", input, { timeout })` lowers to an explicit effect state and runs through `EffectRequested` / `EffectCompleted` / `EffectFailed`, with workflow-owned timeout timers when configured
-- arbitrary guest callbacks inside `ctx.sideEffect()` are still not supported
-- non-`ctx` async operations are rejected at compile time with source locations
+Activities are not compiled into workflow IR.
 
-## Compiler Output
+They should look like ordinary user code:
 
-The compiler target should be a deterministic artifact that can be inspected and hashed.
+```ts
+export async function reserveInventory(input) {
+  const response = await inventoryClient.reserve(input.orderId);
+  return { reservationId: response.id };
+}
+```
+
+Activity workers should register activity types, poll queues, and report:
+
+- started
+- heartbeat
+- completed
+- failed
+- cancelled
+
+## Compiler Responsibilities
+
+The compiler target is a deterministic artifact that can be inspected and hashed.
 
 Likely artifact sections:
 
 - workflow metadata
-- IR / state machine graph
-- signal definitions
-- activity / connector references
-- marker definitions
-- source map from IR state id to source location
+- workflow state graph or bytecode
+- signal, query, and update handler metadata
+- activity callsites and retry metadata
+- child workflow callsites
+- side-effect and version markers
+- source map
 - compiler version
 - artifact hash
 
-Possible lowered representation for the example above:
-
-- state `WaitingForOrderPlaced`
-- transition on signal `order_placed`
-- state `TimerPending(15m)`
-- transition on `TimerFired`
-- state `InvokePredicate(inventory_check)`
-- branch on predicate result
-- state `ScheduleActivity(reserve_inventory)`
-- terminal `Completed` or `Failed`
+The compiler must reject workflow code that breaks determinism, while activity code remains unconstrained.
 
 ## Runtime Contract
 
-Executors should operate on the compiled artifact with these rules:
+Workflow executors should operate on the compiled artifact with these rules:
 
 - active executions stay warm on shard owners whenever possible
-- replay from snapshot + event tail is the fallback path
-- every execution epoch is pinned to `definition_version` and `artifact_hash`
-- inbound signals follow explicit mailbox ordering rules
-- side effects are represented through explicit scheduling and result events
+- replay from snapshot plus event tail is the fallback path
+- every run is pinned to an artifact version
+- workflow tasks are short-lived decision turns
+- activity tasks are scheduled durably and completed asynchronously
+- signals, queries, and updates follow documented handler rules
 
 ## Versioning Rules
 
-Workflow deployments must preserve replay safety.
+Temporal parity requires both workflow and worker versioning.
 
 Required rules:
 
-- a running instance never silently switches to a new artifact
+- a running workflow never silently switches artifacts
 - artifact pinning is written into history
-- incompatible code changes require a new artifact and safe rollout policy
-- replay tooling must validate representative histories before deployment
+- activity tasks route according to worker build compatibility
+- replay tooling validates representative histories before deployment
+- version markers allow safe workflow code evolution
 
-## History Rollover
+## Testing Contract
 
-Long-lived or chatty workflows need explicit history rollover.
+The SDK story must include:
 
-`ContinueAsNew`-style behavior should:
+- replay tests against captured histories
+- deterministic workflow unit tests
+- activity integration tests
+- worker compatibility tests
+- upgrade and rollback tests
 
-- end the current execution epoch
-- start a fresh epoch with carried-forward state
-- preserve logical workflow identity
-- keep replay cost bounded
+## Non-Goal
 
-## Open Design Questions
+The compiler is not a mechanism for removing arbitrary activities from the platform.
 
-- which language should host the first SDK
-- how rich the source-level debugging and IR inspection experience should become beyond per-state source maps
-- whether signal handlers may interleave with the main workflow body
-- which marker events are required in the first artifact model
+Its job is to make workflow execution fast and deterministic while preserving the general-purpose activity model users expect from a Temporal replacement.

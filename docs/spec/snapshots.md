@@ -6,17 +6,19 @@ This document freezes snapshot semantics so snapshots do not become a second sou
 
 ## Snapshot Rule
 
-Snapshots are optimization only. The event log remains authoritative.
+Snapshots are optimization only. Durable history remains authoritative.
 
 ## Snapshot Contents
 
-Minimum snapshot contents:
+Minimum workflow snapshot contents:
 
 - execution frame
-- current node id
+- current workflow location
 - local workflow variables
 - pending timer metadata
-- pending join / fork metadata
+- pending activity metadata
+- pending child workflow metadata
+- pending update metadata
 - pinned `definition_version`
 - pinned `artifact_hash`
 - replay start offset
@@ -25,16 +27,15 @@ Minimum snapshot contents:
 ## Compatibility Rules
 
 - snapshots must be versioned
-- snapshot decoding must validate compatibility with the artifact pinned in history
+- snapshot decoding must validate compatibility with the workflow artifact pinned in history
 - on incompatibility, the runtime must fall back to replay rather than invent conversion behavior
 
 ## Trigger Policy
 
 Snapshot frequency is an optimization policy and may evolve, but it must never alter workflow semantics.
 
-## Current Implementation Note
+## Sticky Execution Interaction
 
-- the current runtime persists run-scoped snapshots on a configurable event-count interval and always on terminal state changes
-- snapshots carry the replay boundary through `last_event_id` and `event_count`
-- executor cache misses restore from the latest snapshot and replay the run tail after that boundary
-- snapshot restore source is exposed through executor debug endpoints so operators can distinguish cache hits from projection restores and snapshot-backed restores
+- snapshots complement sticky execution; they do not replace it
+- cache misses or ownership loss may restore from snapshot plus replay
+- sticky routing should reduce restore frequency in the steady state

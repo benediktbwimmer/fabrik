@@ -1,70 +1,77 @@
-# Effects and Connectors
+# Activities, Task Queues, and Connectors
 
 ## Purpose
 
-This document freezes the protocol for external side effects.
+This document freezes the contract for external work.
 
 ## Principle
 
-Connectors never mutate workflow state directly. They emit result events back into the log.
+Activities are the primary external-work abstraction of the platform.
 
-## Canonical Protocol
+Connectors are optional built-in or managed activity implementations. They are not a separate correctness model.
+
+## Canonical Activity Protocol
 
 Target protocol:
 
-- `EffectRequested`
-- optional `EffectStarted`
-- `EffectCompleted`
-- `EffectFailed`
-- `EffectTimedOut`
-- `EffectCancelled`
-
-Current implementation note:
-
-- compiled workflow effects now use `EffectRequested`, `EffectCompleted`, `EffectFailed`, `EffectTimedOut`, and `EffectCancelled`
-- legacy JSON workflow definitions still use `StepScheduled`, `StepCompleted`, and `StepFailed`
-- connector workers must support both during the transition
+- `ActivityTaskScheduled`
+- `ActivityTaskStarted`
+- zero or more `ActivityTaskHeartbeatRecorded`
+- one terminal event:
+  - `ActivityTaskCompleted`
+  - `ActivityTaskFailed`
+  - `ActivityTaskTimedOut`
+  - `ActivityTaskCancelled`
 
 ## Required Fields
 
-Every effect request must carry:
+Every activity task must carry:
 
-- connector type
-- effect id
-- idempotency key
+- activity type
+- task queue
+- activity id
+- workflow and activity attempt counters
+- idempotency or task token identity
 - timeout configuration
-- retry policy reference
+- retry policy
 - request payload
+- worker version routing metadata when applicable
 
-Every effect result must carry:
+Every activity result must carry:
 
-- effect id
+- activity id
 - request causation id
 - terminal status
 - structured result or failure payload
-- cancellation reason and optional metadata when terminal status is `cancelled`
+- worker identity and build metadata when available
 
 ## Ownership Rules
 
-- executor decides when an effect is requested
-- connector workers decide how to execute the effect
-- workflow state changes only when result events are accepted by the executor
-- connector workers should suppress terminal result publication when persisted effect status is already `timed_out` or `cancelled`
+- the workflow executor decides when an activity is scheduled
+- activity workers decide how to execute the activity
+- workflow state changes only when activity result events are durably accepted
+- no activity worker may mutate workflow state directly
 
 ## Retry Rules
 
-- workflow-owned retries are durable and visible in history
-- connector-local retry loops must be bounded and subordinate to workflow policy
-- backoff must be encoded durably, not held only in memory
+- workflow-visible activity retries are durable and represented in history
+- activity retry policy must be explicit
+- connector-local hidden retry loops must remain bounded and subordinate to the durable retry contract
 
-## Timeout and Cancellation
+## Heartbeats, Timeout, and Cancellation
 
-- effect timeout semantics must be explicit
-- cancellation must be representable as an event
-- timed-out or cancelled effects still require a terminal result event
-- timeout timers are workflow-owned and visible in history
-- operator cancellation targets the currently active effect attempt for a run
+- long-running activities may heartbeat progress
+- heartbeat timeout semantics must be explicit and durable
+- schedule-to-start and start-to-close timeout semantics must be explicit and durable
+- cancellation must be representable as an event and deliverable to workers
 
-## Dead-Letter Rule
+## Task Queue Rules
 
-Non-recoverable effect failures may be routed to a dead-letter path, but the workflow history must still record the terminal failure.
+- workers poll task queues
+- task delivery is at-least-once
+- completion handling must be idempotent
+- matching must support backlog visibility, rate limiting, and worker-version-aware routing
+
+## Connector Rule
+
+Managed connectors should be implemented as ordinary activity types or activity-worker libraries so that users do not face a different correctness model depending on whether work is "custom" or "built in."

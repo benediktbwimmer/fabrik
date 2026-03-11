@@ -29,49 +29,61 @@ Every workflow event must carry:
 ## Field Rules
 
 - `event_id` is globally unique
-- `recorded_at` is assigned when the event is committed
-- `logical_time` is optional and reserved for higher-level workflow semantics
+- `recorded_at` is assigned when the event is durably accepted
 - `causation_id` points to the event that directly caused this event
-- `correlation_id` groups the broader logical transaction
-- `dedupe_key` is required for effect-result or timer-fire events that may be redelivered
+- `correlation_id` groups the broader logical operation
+- `dedupe_key` is required for events that may be emitted more than once by retrying infrastructure
+- `partition_key` must route all runs for one logical workflow identity to the same workflow shard
 
 ## Producer Identity
 
 `producer` must identify the emitting runtime component, for example:
 
-- `ingest-service`
+- `api-gateway`
+- `matching-service`
 - `executor-service`
+- `activity-worker`
 - `timer-service`
+- `visibility-projector`
 
-Current implementation note:
+## Canonical Event Families
 
-- `partition_key` is a stable shard-routing key derived from `tenant_id:instance_id`, not `run_id`
-- this keeps all `ContinueAsNew` epochs for one logical workflow instance on the same broker partition and executor shard
-- `connector-service`
-- future SDK compiler or deployment control plane
+The canonical event families include:
 
-## Phase-1 Canonical Event Families
-
-- `WorkflowTriggered`
-- `WorkflowStarted`
-- `WorkflowArtifactPinned`
-- `MarkerRecorded`
-- `SignalReceived`
-- `TimerScheduled`
+- `WorkflowExecutionStarted`
+- `WorkflowTaskScheduled`
+- `WorkflowTaskStarted`
+- `WorkflowTaskCompleted`
+- `WorkflowTaskFailed`
+- `ActivityTaskScheduled`
+- `ActivityTaskStarted`
+- `ActivityTaskHeartbeatRecorded`
+- `ActivityTaskCompleted`
+- `ActivityTaskFailed`
+- `ActivityTaskTimedOut`
+- `ActivityTaskCancelled`
+- `SignalAccepted`
+- `SignalDelivered`
+- `QueryRecorded`
+- `UpdateAccepted`
+- `UpdateCompleted`
+- `UpdateRejected`
+- `TimerStarted`
 - `TimerFired`
-- `StepScheduled`
-- `StepCompleted`
-- `StepFailed`
-- `EffectRequested`
-- `EffectCompleted`
-- `EffectFailed`
-- `EffectTimedOut`
-- `EffectCancelled`
+- `MarkerRecorded`
+- `VersionMarkerRecorded`
+- `ChildWorkflowExecutionStarted`
+- `ChildWorkflowExecutionCompleted`
+- `ChildWorkflowExecutionFailed`
+- `ChildWorkflowExecutionCancelled`
+- `ChildWorkflowExecutionTimedOut`
+- `WorkflowExecutionContinuedAsNew`
+- `WorkflowExecutionCompleted`
+- `WorkflowExecutionFailed`
+- `WorkflowExecutionCancelled`
+- `WorkflowExecutionTerminated`
 
-`EffectCancelled` may include operator-supplied reason and metadata for audit/query use.
-- `WorkflowContinuedAsNew`
-- `WorkflowCompleted`
-- `WorkflowFailed`
+Not every event must be exposed to end users in raw form, but the history model must be rich enough to reconstruct workflow behavior and operator decisions.
 
 ## Compatibility Rule
 

@@ -16,15 +16,23 @@ A timer is identified by:
 
 ## Canonical Events
 
-- `TimerScheduled`
+- `TimerStarted`
 - `TimerFired`
+
+The same substrate may be used for:
+
+- workflow sleeps
+- activity retry backoff
+- activity timeout tracking
+- child workflow timeout tracking
+- workflow run timeout tracking
 
 ## Contract
 
 - timers are durable records, not in-memory sleeps
 - timer firing is at-least-once
 - `TimerFired` must be deduplicated by timer identity plus scheduled event identity
-- only the timer service may emit `TimerFired`
+- only the timer subsystem may emit `TimerFired`
 
 ## Due-Time Semantics
 
@@ -34,7 +42,7 @@ A timer is identified by:
 
 ## Ordering Rule
 
-If a signal and a timer become available at nearly the same real time, workflow behavior follows durable log order, not wall-clock intuition.
+If a signal, update, activity completion, and timer become available at nearly the same wall-clock time, workflow behavior follows durable accepted order, not wall-clock intuition.
 
 ## Recovery Rule
 

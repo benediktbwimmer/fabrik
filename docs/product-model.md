@@ -2,51 +2,61 @@
 
 ## Purpose
 
-This document freezes the top-level product model for `fabrik` so the project does not drift between incompatible identities.
+This document freezes the top-level product identity for `fabrik`.
 
 ## Core Statement
 
-`fabrik` is a log-first, deterministic workflow engine optimized for high aggregate event throughput across many workflow instances.
+`fabrik` is a high-performance Temporal replacement.
 
-## Authoring Model
+The product goal is to match Temporal's durable execution feature set while outperforming it on:
 
-- workflows are authored in code through an SDK
-- authored workflows compile to deterministic workflow IR / state machine artifacts
-- executors run compiled artifacts, not arbitrary user code as the hot path
+- workflow decision latency
+- aggregate workflow and activity throughput
+- scale under extreme fan-out / fan-in
+- replay-safe operation at very high event rates
+
+## User Model
+
+The user-facing programming model is intentionally Temporal-like:
+
+- workflows are long-lived durable programs
+- workflows are authored in SDK code
+- activities are arbitrary user code that may be non-deterministic
+- workflows communicate through signals, queries, updates, timers, retries, and child workflows
 
 ## Execution Model
 
-- the durable event log is authoritative
-- one workflow instance has one ordered history per run
-- one active executor owner advances a workflow instance at a time
-- snapshots are optimization only
-- external side effects only count when confirmed by result events
+The runtime model is intentionally not identical to Temporal's internals:
+
+- workflow code compiles to deterministic workflow execution artifacts
+- workflow turns execute on shard-local executors
+- activities execute in worker processes outside the workflow executor hot path
+- task queues mediate dispatch between the control plane, workflow executors, and workers
+- durable history is authoritative
+- snapshots and caches are optimization only
 
 ## Optimization Target
 
 `fabrik` is optimized for:
 
-- many concurrently active workflow instances
-- high total event throughput
-- low steady-state decision latency through hot-state ownership
-- replay-safe long-running execution
-
-It is not optimized for:
-
-- arbitrary unconstrained user code on the hot path
-- single-workflow giant in-memory compute jobs
-- strongly consistent synchronous read models
+- many concurrently active workflow executions
+- very high total history event throughput
+- large-scale activity fan-out and completion fan-in
+- low workflow-task latency under sticky execution
+- deterministic replay and fast failover
 
 ## Non-Goals
 
 The following are explicit non-goals:
 
-- cross-system exactly-once semantics
-- arbitrary guest-language execution as the ground-truth runtime model
-- strongly consistent query projections
-- using snapshots as a second source of truth
-- making the broker the programmable surface where workflow semantics live
+- inventing a new workflow programming model incompatible with Temporal users
+- limiting activities to built-in connectors or sandboxed mini-handlers
+- using snapshots or projections as a second source of truth
+- sacrificing replay correctness for benchmark-only wins
+- making the broker or connector layer the primary product abstraction
 
 ## Consequence
 
-All lower-level specs, services, SDKs, and deployment rules should be evaluated against this model first.
+All lower-level docs, services, SDKs, and benchmarks should be evaluated against one question first:
+
+Does this move `fabrik` closer to a faster, more scalable Temporal-compatible durable execution platform?

@@ -1,4 +1,4 @@
-# ADR 0002: Author Workflows in Code, Execute Compiled Artifacts
+# ADR 0002: Author Workflows in Code, Execute Compiled Workflow Artifacts, Run Activities in Workers
 
 ## Status
 
@@ -10,54 +10,53 @@ Accepted
 
 ## Context
 
-`fabrik` needs two things that are often in tension:
+`fabrik` needs two things at once:
 
-- workflow authoring must feel like normal application code
-- execution must stay deterministic, replayable, and fast under very large workloads
+- Temporal-like workflow and activity ergonomics
+- lower workflow-decision overhead than systems that directly interpret general-purpose workflow code at runtime
 
-Exposing raw internal state machines as the primary developer surface would make the runtime easier to reason about, but it would produce a weak authoring experience.
+Running arbitrary workflow guest code directly as the execution substrate would improve implementation familiarity, but it would push replay cost, versioning risk, and determinism complexity into the workflow hot path.
 
-Running arbitrary guest workflow code directly as the execution substrate would improve ergonomics, but it would push replay cost, versioning risk, and determinism complexity into the hot path.
+Eliminating arbitrary activity code, on the other hand, would destroy Temporal parity and weaken the product.
 
 ## Decision
 
-We will separate authoring from execution:
+We will separate the workflow runtime from the activity runtime:
 
-- workflows will be authored in code through an SDK
-- SDK code will compile to deterministic workflow IR / state machine artifacts
-- executors will run the compiled artifact, not arbitrary author code as the steady-state runtime path
-- each running instance will be pinned to a `definition_version` and `artifact_hash` recorded in history
+- workflows will be authored in SDK code
+- workflow SDK code will compile to deterministic workflow artifacts
+- executors will run compiled workflow artifacts on the steady-state workflow path
+- activities will remain arbitrary user code executed by workers through activity task queues
+- each running workflow will be pinned to a workflow artifact version recorded in history
 
 ## Rationale
 
-This gives `fabrik` the right combination of properties:
+This gives `fabrik` the required combination of properties:
 
-- code-first ergonomics for developers
-- explicit execution artifacts for inspection and replay
-- lower steady-state replay overhead than direct guest-code re-execution
-- clearer deployment and version-pinning rules for long-running workflows
-- simpler operational debugging because runtime state is representable as explicit transitions
+- code-first ergonomics for workflows
+- arbitrary user activities
+- explicit workflow execution artifacts for inspection and replay
+- lower workflow-task overhead than direct workflow guest-code execution
+- clean version pinning for long-running workflows
 
 ## Consequences
 
 ### Positive
 
-- the public programming model can feel similar to durable workflow systems without inheriting their full replay cost profile
-- replay safety can be enforced at the artifact boundary
-- long-running instances can be pinned cleanly across deployments
-- internal execution remains compatible with shard-local hot-state caching
+- workflow latency can improve without weakening the activity model
+- replay safety is enforced at the workflow artifact boundary
+- activity ecosystems remain broad and practical
+- the product can target Temporal feature parity without Temporal's exact runtime structure
 
 ### Negative
 
-- we must build and maintain an SDK and compiler
-- source-level debugging must map cleanly onto compiled artifacts
-- features that seem simple in author code may require careful IR design
+- the platform must build and maintain both workflow compilers and worker protocols
+- source-level debugging must map cleanly onto compiled workflow artifacts
+- compatibility rules must cover both workflow artifacts and worker builds
 
 ## Required Follow-Up
 
-- define the first SDK surface and deterministic runtime APIs
-- define the workflow IR schema and artifact hashing strategy
-- add marker events for side effects, versioning, and runtime metadata
-- add replay tooling that can validate histories against artifacts in CI
-- define signal mailbox ordering and interleaving rules
-- add `ContinueAsNew`-style history rollover
+- define workflow task and activity task semantics
+- define the workflow IR for activities, child workflows, updates, joins, and version markers
+- add worker versioning and compatibility routing
+- add replay tooling that validates histories against workflow artifacts in CI

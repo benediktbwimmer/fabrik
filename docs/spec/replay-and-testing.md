@@ -8,30 +8,36 @@ This document freezes replay and validation as core platform infrastructure.
 
 The platform must support:
 
-- replaying a captured history against a chosen artifact
-- replaying from snapshot + event tail
+- replaying a captured workflow history against a chosen workflow artifact
+- replaying from snapshot plus event tail
 - determinism divergence detection
 - event-by-event replay diagnostics
+- upgrade compatibility validation across workflow versions
 
-Current implementation note:
-
-- `GET /tenants/{tenant_id}/workflows/{instance_id}/replay` and `/runs/{run_id}/replay` return:
-  - `replay_source` as either `run_start` or `snapshot_tail`
-  - snapshot boundary metadata when a run-scoped snapshot exists
-  - a compact transition trace with state/status before and after each replayed event
-  - divergence diagnostics for snapshot-boundary mismatches and stored-projection mismatches
-- `cargo run -p replay-tool -- <tenant_id> <instance_id> [run_id]` returns the same diagnostics in CLI form
+Activity code is not replayed as workflow code. Replay validates the workflow boundary and the recorded activity outcomes.
 
 ## Required Test Classes
 
-- deterministic executor tests
+- deterministic workflow executor tests
 - golden history replay tests
-- artifact compatibility tests
-- crash / restart recovery tests
+- workflow artifact compatibility tests
+- worker version routing tests
+- crash and restart recovery tests
 - timer recovery tests
 - duplicate-delivery tests
 - snapshot restore tests
+- large fan-out / fan-in stress tests
 
 ## CI Rule
 
 Replay validation for representative histories is a release-gating capability, not optional QA.
+
+## SDK Testing Rule
+
+Every supported SDK should provide:
+
+- deterministic workflow tests
+- captured-history replay tests
+- activity mocking
+- child workflow testing
+- upgrade regression testing

@@ -2,441 +2,266 @@
 
 ## Overview
 
-`fabrik` is a log-first workflow engine. Durable events are the source of truth. Rust services consume those events, apply workflow semantics, and emit new events that describe state transitions, timers, retries, side effects, version markers, and execution rollover.
+`fabrik` is a log-first durable execution platform designed to replace Temporal at high scale.
 
-The architecture is designed for:
+The product keeps Temporal's workflow and activity semantics, but the runtime is organized around:
 
-- very high event throughput
-- ordered processing within workflow instance boundaries
-- deterministic replay
-- code-authored workflow ergonomics
-- safe multi-tenant customization
-- operational recovery through log replay and snapshots
-
-This document is an overview. The canonical semantic contracts live in [docs/spec/README.md](/Users/bene/code/fabrik/docs/spec/README.md) and the execution invariants ADR set.
+- compiled workflow artifacts for deterministic workflow turns
+- task queues for workflow and activity dispatch
+- shard-local workflow ownership with sticky execution
+- durable history as the source of truth
+- worker fleets that run arbitrary user activity code
 
 ## High-Level Topology
 
 ```text
-                         +--------------------+
-                         |  Control Plane API |
-                         +---------+----------+
-                                   |
-                                   v
-+----------------+       +---------+----------+       +------------------+
-| External Inputs| ----> | Ingest / Validation | ---> | Redpanda Topics  |
-+----------------+       +--------------------+       +--------+---------+
-                                                           |
-                                                           v
-                                                 +---------+----------+
-                                                 | Sharded Executors  |
-                                                 +----+----------+----+
-                                                      |          |
-                                                      |          v
-                                                      |   +------+------+
-                                                      |   | Timer Service|
-                                                      |   +------+------+
-                                                      |          |
-                                                      v          |
-                                              +-------+------+   |
-                                              | Snapshot Store|  |
-                                              +-------+------+   |
-                                                      |          |
-                                                      v          v
-                                                +-----+----------+----+
-                                                | Read Models / Query |
-                                                +---------------------+
-
-                                                      |
-                                                      v
-                                                +-----+-----------+
-                                                | Connector Workers|
-                                                +------------------+
+                   +------------------------+
+                   | API / Control Plane    |
+                   | start signal update    |
+                   | query cancel describe  |
+                   +-----------+------------+
+                               |
+                               v
+                    +----------+-----------+
+                    | Durable History Log  |
+                    | + control metadata   |
+                    +----+-------------+---+
+                         |             |
+                         |             v
+                         |    +--------+--------+
+                         |    | Visibility      |
+                         |    | indexing/query  |
+                         |    +-----------------+
+                         |
+                         v
+                +--------+---------+
+                | Workflow         |
+                | Executors        |
+                | compiled turns   |
+                +---+-----------+--+
+                    |           |
+                    |           v
+                    |    +------+------+
+                    |    | Timer /     |
+                    |    | timeout svc |
+                    |    +-------------+
+                    |
+                    v
+             +------+--------+
+             | Matching /    |
+             | Task Queues   |
+             +---+--------+--+
+                 |        |
+                 |        v
+                 |   +----+------------------+
+                 |   | Activity Workers      |
+                 |   | arbitrary user code   |
+                 |   +-----------------------+
+                 |
+                 v
+           +-----+---------------------------+
+           | Sticky queue state / ownership  |
+           +---------------------------------+
 ```
 
 ## Core Components
 
-### 1. Ingest Plane
+### 1. API and Control Plane
 
-The ingest plane accepts:
+The front door accepts and coordinates:
 
-- trigger events
-- workflow definitions
-- external callbacks and signals
-- administrative commands
+- workflow start
+- signal delivery
+- query execution
+- update submission
+- cancellation and termination
+- workflow and worker registration metadata
+- visibility search
 
 Responsibilities:
 
 - authenticate and authorize tenants
-- validate payloads against schemas
-- assign routing keys
-- write canonical events to Redpanda
+- validate requests
+- persist control-plane records
+- append canonical workflow events
+- route strong operations to the correct workflow owner when needed
 
-The ingest plane does not execute workflow logic. It normalizes inputs and commits them to the durable log.
+### 2. Durable History
 
-### 2. Durable Event Backbone
-
-Redpanda is the event substrate.
-
-Responsibilities:
-
-- durable append-only event storage
-- partitioning for shard-local ordering
-- replication and retention
-- replay for recovery and debugging
-
-Partitioning strategy for workflow events:
-
-- primary key: `tenant_id`
-- secondary key: `instance_id`
-- execution epoch key: `run_id`
-- partition hash input: `tenant_id + instance_id + run_id`
-
-This preserves ordering for a given workflow instance while allowing broad horizontal scale.
-
-### 3. Sharded Workflow Executors
-
-Executors are Rust services that own partitions and apply workflow semantics.
+Durable workflow history is the authoritative record of execution.
 
 Responsibilities:
 
-- consume events for assigned partitions
-- keep hot workflow state in memory for active executions
-- reconstruct workflow state from snapshot + event tail on cache miss or reassignment
-- evaluate compiled workflow IR / state machine artifacts
-- emit new workflow events
-- schedule timers
-- coordinate step execution and retries
+- append immutable workflow events
+- preserve per-run event ordering
+- support replay and audit
+- provide a durable source for failover recovery
 
-Each executor is deterministic with respect to the event history it consumes. That property is required for replay and auditability.
+The history substrate may be log-first internally, but product correctness is defined at the workflow-history boundary, not at the broker abstraction boundary.
 
-Hot-state ownership is explicit:
+### 3. Workflow Executors
 
-- shard owners keep active executions warm in memory
-- cache eviction is a deliberate policy surface
-- replay is the recovery path, not the steady-state execution path
-
-### 4. Timer Service
-
-Timers are first-class workflow concepts, not ad hoc sleeps in worker memory.
+Workflow executors own workflow partitions and advance runs.
 
 Responsibilities:
 
-- persist due times as durable records
-- emit `TimerFired` events when deadlines are reached
-- recover cleanly after restarts
+- load pinned workflow artifacts
+- keep hot workflow state warm on owning shards
+- process workflow tasks with low latency
+- evaluate compiled workflow state transitions
+- schedule activities, timers, child workflows, and updates
+- rebuild state by snapshot plus replay on cache miss or failover
 
-Implementation direction:
+Critical rule:
 
-- start with a persistent timer table indexed by due time
-- later evolve to partition-aware timer wheels backed by durable state
+- executors run compiled workflow artifacts, not arbitrary workflow guest code, on the hot path
 
-### 5. Snapshot Store
+That is the main performance bet of `fabrik`.
 
-Snapshots accelerate recovery and reduce replay cost.
+### 4. Matching and Task Queues
 
-Responsibilities:
+Task queues are first-class runtime infrastructure.
 
-- persist compact workflow state snapshots
-- store versioned execution metadata
-- support replay from snapshot boundaries
+The platform must support:
 
-Initial choice:
+- workflow task queues
+- activity task queues
+- sticky workflow task queues
+- rate limiting and backlog visibility
+- poller discovery and capacity-aware routing
+- at-least-once dispatch with idempotent completion handling
 
-- PostgreSQL for snapshots and control-plane metadata
+Matching is responsible for making work available to the right workers quickly without breaking workflow ordering guarantees.
 
-Constraints:
+### 5. Activity Workers
 
-- snapshots are an optimization only
-- the event log remains authoritative
-
-### 6. Connector Workers
-
-Connector workers perform side effects against external systems.
-
-Responsibilities:
-
-- receive effect requests from workflow events
-- apply idempotency keys
-- handle retries and backoff
-- emit success or failure events back into the log
-- preserve connector response metadata in result payloads when available
-
-Rules:
-
-- no connector success is assumed until confirmed by an emitted result event
-- no workflow state is mutated directly by a connector
-- connector result events should carry enough response detail for debugging without reopening the external system
-
-### 7. Query Plane
-
-The query plane exposes current workflow state and execution history.
+Activity workers run arbitrary user-defined activity code.
 
 Responsibilities:
 
-- serve workflow instance state
-- serve workflow execution timelines
-- power debugging and replay tooling
+- poll activity task queues
+- execute activity code in the user's runtime
+- heartbeat long-running activities
+- report completion, failure, and cancellation
+- observe retries and timeout semantics
 
-Read models are projections and may lag slightly behind the event log.
+Activities are the general external-compute and external-I/O surface of the platform. Built-in connectors are only a convenience layer on top of the activity model.
 
-### 8. Wasm Runtime
+### 6. Timer and Timeout Service
 
-Tenant-defined logic runs in Wasmtime.
+Timers are durable and first-class.
 
-Supported use cases:
+The timer subsystem handles:
 
-- event transforms
-- branching predicates
-- lightweight step handlers
-- data mapping and normalization
+- workflow sleeps
+- activity schedule-to-start deadlines
+- activity start-to-close deadlines
+- heartbeat timeout checks
+- workflow run timeouts
+- retry backoff timers
 
-Why Wasm:
+No correctness-critical timeout may live only in worker memory.
 
-- sandboxing
-- resource controls
-- language flexibility via compilation targets
-- versionable executable artifacts
+### 7. Visibility Layer
+
+Visibility is a primary product surface, not an afterthought.
+
+Responsibilities:
+
+- list and filter workflows
+- index search attributes and memo-like metadata
+- expose workflow execution timelines
+- provide operational views over task queues and workers
+- support debugging at fleet scale
+
+The visibility model may be eventually consistent, but the product must also provide direct strong-query paths where workflow semantics require them.
+
+### 8. Worker Versioning
+
+Temporal parity requires safe code rollout.
+
+The platform must support:
+
+- worker build identifiers
+- compatible version sets
+- task queue routing by build compatibility
+- workflow artifact pinning
+- replay-safe upgrade controls
+
+Workflow versioning and activity-worker versioning are separate concerns and both are required.
 
 ## Execution Model
 
-### Workflow Authoring Model
+### Workflow Side
 
-Public authoring and internal execution intentionally use different models.
-
-Public model:
-
-- workflows are authored in SDK code
-- the SDK exposes deterministic workflow primitives instead of raw host APIs
-- external I/O happens through activities or connectors, not direct host calls
-
-Internal model:
-
-- authored workflows compile to deterministic workflow IR / state machine artifacts
-- executors run compiled artifacts, not arbitrary guest code as the hot path
-- the compiled artifact is the replay and inspection boundary
-
-This split is the core architecture choice behind `fabrik`: code-authored workflows for ergonomics, explicit execution artifacts for throughput and determinism.
-
-### Workflow Execution Primitives
-
-The SDK and compiler must lower workflow code into explicit operations such as:
+Workflow SDK code compiles to deterministic artifacts with explicit operations such as:
 
 - wait for signal
-- durable timer sleep
-- invoke activity / connector
-- invoke predicate or transform
-- branch on prior result
-- emit marker
+- wait for update
+- run query handler
+- sleep
+- schedule activity
+- await activity completion
+- start child workflow
+- await child completion
+- record side effect marker
+- branch and join
 - continue as new
-- complete or fail
+- complete, fail, cancel, or terminate
 
-Non-deterministic behavior must go through runtime APIs instead of raw host calls. Examples:
+Workflow determinism remains mandatory.
 
-- `ctx.sleep()` instead of host timers
-- `ctx.now()` instead of wall-clock reads
-- `ctx.uuid()` instead of direct UUID generation
-- `ctx.side_effect()` for controlled one-time non-deterministic evaluation
-- `ctx.signal()` / message handlers for inbound workflow interaction
+### Activity Side
 
-### Workflow Definition Model
+Activities:
 
-Workflows are compiled into explicit state machines, not free-form imperative scripts.
+- may be arbitrary code
+- may use normal libraries and network clients
+- may be non-deterministic
+- are retried according to durable policy
+- are isolated from workflow state mutation
 
-A workflow may contain:
+Activity effects become real only when the corresponding completion event is durably accepted by the runtime.
 
-- event waits
-- timers
-- step invocations
-- retry policies
-- forks and joins
-- compensations
-- external signals
+### Fan-Out / Fan-In
 
-This makes workflow progress durable and inspectable.
+Large fan-out / fan-in is a primary design center.
 
-### Artifact Pinning
+The architecture must therefore optimize for:
 
-Every running workflow instance must be pinned to the exact execution artifact that started it.
+- efficient scheduling of many activity tasks from one workflow
+- compact pending-activity state
+- batched activity completion ingestion
+- low-overhead join bookkeeping
+- bounded replay cost through snapshots and continue-as-new
 
-Persisted history and instance state should record at least:
+### Sticky Execution
 
-- `definition_version`
-- `artifact_hash`
-- optional SDK / compiler version
+Sticky execution is required for competitive latency:
 
-New workflow code must never silently take over a running execution. Artifact rollout rules are part of the correctness model.
+- active runs stay on the same workflow owner whenever possible
+- workflow tasks should avoid full replay in the steady state
+- sticky handoff failure must still remain replay-safe
 
-### Event Types
+### Failure and Recovery
 
-Initial canonical event families:
+Correctness under failure requires:
 
-- `WorkflowDefined`
-- `WorkflowTriggered`
-- `WorkflowStarted`
-- `WorkflowArtifactPinned`
-- `StepScheduled`
-- `StepStarted`
-- `StepCompleted`
-- `StepFailed`
-- `TimerScheduled`
-- `TimerFired`
-- `SignalReceived`
-- `MarkerRecorded`
-- `WorkflowContinuedAsNew`
-- `CompensationTriggered`
-- `WorkflowCompleted`
-- `WorkflowFailed`
+- deterministic replay from history
+- durable timer rediscovery
+- deduplicated task completion handling
+- ownership fencing on shard handoff
+- no direct workflow mutation by workers
 
-All state transitions should be representable by events in this family or approved extensions.
+## Why This Architecture
 
-### State Reconstruction
+`fabrik` is not trying to replace Temporal by removing features.
 
-For each workflow instance:
+It is trying to replace Temporal by preserving the workflow model users want while changing the runtime implementation details that most affect:
 
-1. load the latest snapshot if present
-2. read the event tail after the snapshot offset
-3. replay events deterministically into the state machine
-4. apply the next command generated by the executor
-5. emit resulting events
+- throughput
+- latency
+- operational predictability
+- replay efficiency
 
-In steady state, executors should usually advance workflows from hot in-memory state. Full replay is the fallback for cold start, failover, cache eviction, or explicit validation.
-
-### History Rollover
-
-High-throughput and long-lived workflows must not accumulate unbounded history in one execution epoch.
-
-`fabrik` should support a `ContinueAsNew`-style rollover mechanism that:
-
-- closes the current execution epoch cleanly
-- starts a fresh epoch with carried-forward logical state
-- preserves logical workflow identity while resetting replay cost
-- keeps history segments explicit for audit and debugging
-
-### Signal Semantics
-
-Signal handling is part of the replay contract, not just an SDK convenience.
-
-The runtime must define:
-
-- mailbox ordering guarantees
-- whether signals are strictly serialized or may interleave at suspension points
-- how signal handlers interact with the main workflow body
-- how signal delivery is represented in history
-
-## Correctness Model
-
-`fabrik` is explicitly designed around at-least-once processing.
-
-Correctness mechanisms:
-
-- idempotent connector calls
-- dedupe keys on externally visible effects
-- deterministic executor logic
-- immutable event histories
-- outbox-style side effect requests
-- explicit acknowledgement events
-- version markers and artifact pinning
-- replay validation against real histories
-
-Non-goal:
-
-- distributed exactly-once semantics across third-party APIs
-
-## Replay Tooling
-
-Replay is not only a recovery mechanism. It is also a deployment safety tool.
-
-Required capabilities:
-
-- replay a captured workflow history against a chosen artifact version
-- detect determinism divergence before production rollout
-- explain replay mismatches with event-by-event diagnostics
-- run replay validation in CI for representative histories
-
-## Multi-Tenancy
-
-Multi-tenancy is enforced at several layers:
-
-- tenant-scoped auth in the ingest and query planes
-- tenant-aware partition routing
-- per-tenant quotas for execution and Wasm resources
-- tenant-isolated workflow definitions and secrets
-
-Later enhancements may include dedicated executor pools for noisy-neighbor isolation.
-
-## Scalability Strategy
-
-### Horizontal Scale
-
-The primary scaling unit is the partition.
-
-Scale levers:
-
-- increase Redpanda partitions
-- increase executor replicas
-- rebalance partition ownership
-- separate connector pools by integration type
-- isolate hot tenants into dedicated shards
-
-### Backpressure
-
-Backpressure is mandatory for overload safety.
-
-Mechanisms:
-
-- bounded executor work queues
-- connector concurrency limits
-- ingest throttling by tenant
-- delayed retry scheduling instead of hot-loop retries
-
-## Observability
-
-Required signals from the first implementation:
-
-- per-partition lag
-- hot-state cache hit ratio
-- executor replay time
-- timer drift
-- connector success/failure rates
-- workflow completion latency
-- continue-as-new frequency
-- replay divergence rate in CI
-- Wasm execution duration and memory usage
-
-Tracing should preserve:
-
-- tenant id
-- workflow id
-- workflow instance id
-- partition id
-- event id
-
-## Security Posture
-
-Security assumptions:
-
-- all external inputs are untrusted
-- tenant-defined Wasm modules are untrusted
-- connector credentials are sensitive and isolated
-
-Requirements:
-
-- strict schema validation at ingress
-- resource-limited Wasm execution
-- secret storage outside workflow definitions
-- audit trail for definition and deployment changes
-
-## Suggested Initial Service Split
-
-For the first implementation:
-
-- `api-gateway`
-- `ingest-service`
-- `executor-service`
-- `timer-service`
-- `connector-service`
-- `query-service`
-- shared crates for events, workflow model, storage, and Wasm runtime
-
-This is enough to prove the architecture without premature microservice sprawl.
+That means compiled workflows plus arbitrary activities, not compiled workflows instead of arbitrary activities.

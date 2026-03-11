@@ -1,183 +1,166 @@
 # Roadmap
 
-## Phase 0: Project Foundations
+## Guiding Goal
 
-Goal: establish a repo and technical baseline that supports fast iteration without locking in bad architecture.
+Build `fabrik` into a high-performance Temporal replacement with:
 
-Deliverables:
+- feature parity for core durable execution semantics
+- lower workflow-task latency
+- higher aggregate throughput
+- stronger scale characteristics for heavy fan-out / fan-in workloads
 
-- product model and non-goals
-- Rust workspace layout
-- local development stack
-- lint, format, and test tooling
-- event schema conventions
-- ADR process
-- initial workflow IR direction
-- semantic spec pack under `docs/spec/`
+## Phase 0: Product Realignment
 
-Exit criteria:
-
-- a new contributor can run the workspace locally
-- shared crates compile
-- core architectural choices are documented
-
-## Phase 1: Minimal End-to-End Vertical Slice
-
-Goal: prove the log-first execution model with one simple workflow type.
+Goal: align the product model, docs, and architecture around Temporal parity.
 
 Deliverables:
 
-- ingest API for trigger events
-- Redpanda-backed event publication
-- single executor consuming one workflow topic
-- workflow instance state machine runtime
-- snapshot persistence in PostgreSQL
-- hot-state cache for active executions
-- timer scheduling and firing
-- query API for workflow state and history
-- replay harness for captured histories
-
-Demo scenario:
-
-- receive an event
-- start a workflow
-- wait on a timer
-- invoke a Wasm predicate or transform
-- complete the workflow
+- updated product model
+- updated architecture docs
+- semantic specs for activities, task queues, updates, visibility, and worker versioning
+- explicit rejection of the older connector-first activity model
 
 Exit criteria:
 
-- workflow state recovers correctly after restart
-- replay from log produces the same final state
-- timer events survive process restarts
-- replay validation can run in CI against real histories
+- the repo docs describe one coherent target platform
+- workflow and activity semantics match the intended Temporal-compatible direction
 
-## Phase 2: Workflow SDK and Compiler
+## Phase 1: Workflow Runtime Core
 
-Goal: make workflows feel like code while keeping the runtime deterministic and explicit.
+Goal: make the workflow side of the runtime production-shaped.
 
 Deliverables:
 
-- first workflow SDK
-- deterministic runtime API surface such as `sleep`, `signal`, `now`, `uuid`, and side-effect markers
-- compiler from SDK code to workflow IR / state machine artifacts
-- artifact hashing and pinning model
-- artifact inspection tooling
+- compiled workflow execution artifacts
+- workflow task dispatch
+- sticky execution and shard ownership
+- durable timers
+- snapshots plus replay
+- continue-as-new
+- deterministic side-effect and version markers
 
 Exit criteria:
 
-- developers can author workflows in code instead of raw schema
-- compiled artifacts are deterministic and inspectable
-- running instances are pinned to exact artifact versions
+- hot workflow execution avoids replay in the steady state
+- replay reproduces workflow state exactly
+- failover is replay-safe
 
-## Phase 3: Side Effects and Connector Discipline
+## Phase 2: Activity Runtime and Task Queues
 
-Goal: make external effects safe enough for real automation.
+Goal: add a real Temporal-equivalent activity model.
 
 Deliverables:
 
-- connector worker framework
-- effect request and result events
-- idempotency key model
-- retry and dead-letter handling
-- one reference connector, likely HTTP
-- structured connector result payloads
+- activity task queues
+- worker polling protocol
+- arbitrary user activity execution
+- activity retries and timeout handling
+- heartbeat and cancellation delivery
+- task queue backlog and poller visibility
 
 Exit criteria:
 
-- repeated delivery does not duplicate confirmed external side effects
-- connector failures are visible in workflow history
-- retry policy is configurable and durable
+- activities are no longer limited to built-in handlers or connectors
+- long-running activities heartbeat and cancel correctly
+- high-volume activity scheduling and completion are stable
 
-## Phase 4: Sandboxed Extensibility
+## Phase 3: API Parity
 
-Goal: allow tenant-defined logic without surrendering safety.
+Goal: expose the user-facing workflow control surface expected from a Temporal replacement.
 
 Deliverables:
 
-- Wasmtime integration
-- versioned Wasm artifact registry
-- host capability model for safe bindings
-- tenant quotas for CPU time and memory
-- example custom transform and step module
+- start, signal, query, update, cancel, terminate APIs
+- query consistency rules
+- update acceptance and completion semantics
+- child workflow lifecycle support
+- idempotent request handling
 
 Exit criteria:
 
-- untrusted Wasm modules execute under resource limits
-- module versions are pinned in workflow history
-- replay uses the correct module version semantics
+- a realistic Temporal-style application model can run end to end
 
-## Phase 5: Runtime Semantics and History Control
+## Phase 4: SDK Parity
 
-Goal: harden long-running workflow correctness before scale multiplies the cost of mistakes.
+Goal: make the developer experience competitive.
 
 Deliverables:
 
-- mailbox and signal interleaving rules
-- marker event family for side effects and versioning
-- `ContinueAsNew` / history rollover support
-- safe deployment rules for artifact upgrades
-- replay-diff diagnostics
+- workflow SDK with deterministic workflow primitives
+- activity stubs and configuration APIs
+- child workflow APIs
+- signal, query, and update handlers
+- testing harnesses and replay tests
+- interceptors or middleware hooks
 
 Exit criteria:
 
-- long-lived workflows can roll history without losing logical identity
-- signal behavior is deterministic and documented
-- artifact upgrades are replay-safe
+- developers can port representative Temporal workflow patterns without changing the mental model
 
-## Phase 6: Multi-Tenant Hardening
+## Phase 5: Versioning and Visibility
 
-Goal: make the platform safe and fair under mixed workloads.
+Goal: make production upgrades and operations safe.
 
 Deliverables:
 
-- tenant-aware auth and quotas
-- workload isolation controls
-- partition hot-spot detection
-- backpressure and throttling policies
-- operational dashboards
+- worker build IDs and compatibility routing
+- workflow artifact pinning
+- search attributes and memo
+- list and filter visibility APIs
+- task queue and worker fleet observability
 
 Exit criteria:
 
-- one hot tenant cannot collapse shared execution capacity
-- per-tenant limits are enforced and observable
-- partition lag can be attributed to tenant or workflow class
+- workflow and worker rollouts are replay-safe
+- operators can inspect task queues and workflows at fleet scale
 
-## Phase 7: Scale and Reliability
+## Phase 6: Scale Validation
 
-Goal: validate the architecture under production-shaped load.
+Goal: prove the architecture under production-shaped load.
 
 Deliverables:
 
-- executor shard rebalancing
-- snapshot compaction policy
-- replay acceleration
-- sticky hot-state eviction strategy
-- chaos and failure testing
-- throughput and latency benchmarks
+- large fan-out / fan-in benchmarks
+- high-event-rate history ingestion benchmarks
+- batched completion ingestion
+- sticky-cache eviction and restore tuning
+- shard rebalance and chaos testing
 
 Exit criteria:
 
-- shard movement does not corrupt workflow state
-- recovery objectives are measured and documented
-- high-volume ingestion does not break timer correctness
-- replay remains the fallback path rather than the dominant steady-state cost
+- large activity fan-out does not collapse workflow latency
+- task queue throughput scales horizontally
+- failover preserves correctness under load
+
+## Phase 7: Hosted Platform Hardening
+
+Goal: make the system safe for multi-tenant production use.
+
+Deliverables:
+
+- tenant quotas
+- worker and API auth
+- namespace isolation
+- rate limiting and abuse controls
+- retention and archival policies
+
+Exit criteria:
+
+- one hot tenant cannot take down shared control planes or matching capacity
+- hosted and self-managed worker modes are both well-defined
 
 ## Cross-Cutting Workstreams
 
-These should progress continuously:
-
-- schema evolution strategy
 - replay tooling
-- observability
-- security review
 - benchmark harnesses
-- local developer ergonomics
+- schema evolution
+- SDK ergonomics
+- operator experience
 - documentation
 
 ## Recommended Immediate Next Steps
 
-1. Define the first code-authored workflow SDK surface.
-2. Define workflow IR and artifact pinning metadata.
-3. Build replay tooling that can validate histories against artifacts.
-4. Implement `ContinueAsNew` and marker events before histories grow large in production.
+1. Define workflow task and activity task queue semantics.
+2. Define the arbitrary activity worker protocol.
+3. Expand the workflow IR to cover child workflows, updates, joins, and version markers.
+4. Design worker versioning and visibility before the first broad SDK rollout.

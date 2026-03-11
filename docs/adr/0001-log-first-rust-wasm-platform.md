@@ -1,4 +1,4 @@
-# ADR 0001: Choose a Log-First Rust + Wasm Workflow Architecture
+# ADR 0001: Choose a Log-First Workflow Engine with Compiled Workflows and Activity Workers
 
 ## Status
 
@@ -10,83 +10,79 @@ Accepted
 
 ## Context
 
-`fabrik` is intended to be a high-performance event-driven workflow automation platform optimized for very large workloads.
-
-Two candidate directions were considered:
-
-- a log-first sharded workflow engine on Redpanda
-- a Fluvio + SmartModules-first platform
+`fabrik` is intended to be a high-performance Temporal replacement.
 
 The product needs:
 
-- durable workflow history
-- high event throughput
-- deterministic replay
-- code-authored workflow ergonomics with explicit execution semantics
-- long-lived waits and timers
-- safe multi-tenant extensibility
+- Temporal-compatible workflow semantics
+- arbitrary user-defined activities
+- low-latency workflow task execution
+- very high event throughput
+- safe replay and recovery
+- long-running timers and waits
+- large-scale fan-out / fan-in handling
 - a strong Rust implementation story
+
+The previous documentation direction over-weighted sandboxed handlers and connector-style external effects. That direction would have reduced capability compared to Temporal and is therefore not aligned with the product goal.
 
 ## Decision
 
-We will build `fabrik` as a log-first workflow platform with:
+We will build `fabrik` as a log-first workflow engine with:
 
-- Redpanda as the durable event backbone
-- Rust executor services using Tokio
-- workflow semantics implemented in our own execution layer
-- authored workflows eventually compiling to explicit execution artifacts in our own runtime
-- Wasmtime for sandboxed user-defined logic
-- PostgreSQL as the initial snapshot and control metadata store
+- a durable history substrate
+- Rust workflow executors using Tokio
+- compiled workflow execution artifacts for the workflow hot path
+- workflow and activity task queues
+- arbitrary user activity workers outside the workflow executor hot path
+- PostgreSQL as the initial control, visibility, and snapshot metadata store
 
-We will not make broker-level transformation the center of product semantics.
+Optional sandboxed runtimes such as Wasm may still be useful for managed extensions, but they are not the primary activity model of the product.
 
 ## Rationale
 
-This decision keeps the most valuable behavior under direct product control:
+This decision preserves the parts of the prior architecture that are performance advantages:
 
-- workflow durability
-- replay
-- timer correctness
-- state-machine execution semantics
-- tenant isolation
-- execution debugging
+- replayable durable history
+- shard-local workflow ownership
+- deterministic workflow execution
+- strong control over timer and failover correctness
 
-It also gives a practical path to scale because the architecture is partition-oriented and replayable.
+It also restores the capability surface required for a Temporal replacement:
 
-The design still captures the best idea from the Fluvio direction by adopting a Wasm-first extensibility model for tenant logic, but it avoids making the streaming substrate itself the main programmable surface.
+- arbitrary activity code
+- worker fleets
+- task queue semantics
+- richer workflow APIs
 
 ## Consequences
 
 ### Positive
 
-- clearer workflow correctness model
-- stronger audit and replay story
-- lower ecosystem risk for the broker layer
-- easier integration leverage through the Kafka-compatible ecosystem
-- flexibility to evolve the plugin model independently of the broker
+- the product remains competitive with Temporal's programming model
+- workflow execution can still be optimized aggressively
+- activities keep the flexibility users expect
+- scale work can focus on task dispatch, matching, and workflow decision latency
 
 ### Negative
 
-- more application logic must be built in-house
-- workflow semantics, timers, and replay tooling are our responsibility
-- the first implementation is less novel than a broker-programmable platform
+- the platform must implement more Temporal-like semantics than the earlier connector-first design
+- task queues, worker versioning, and visibility become mandatory infrastructure
+- the system must support both deterministic workflow execution and arbitrary activity execution cleanly
 
 ## Non-Goals
 
 This decision does not commit us to:
 
+- executing workflow code directly as arbitrary guest code on the hot path
 - exactly-once external side effects
-- a specific UI
-- a final persistent store beyond the initial PostgreSQL choice
-- a permanent rejection of Fluvio-inspired inline transforms
+- only one worker-hosting model
 
 ## Follow-Up
 
 Next decisions to formalize:
 
-- event envelope and schema evolution policy
-- workflow definition format
-- workflow SDK and compiler model
-- snapshot storage design
-- connector capability model
-- Wasm host function surface
+- workflow and activity task queue semantics
+- worker protocol and heartbeating
+- worker versioning model
+- visibility and search attribute contracts
+- workflow IR expansion for child workflows, updates, and version markers
