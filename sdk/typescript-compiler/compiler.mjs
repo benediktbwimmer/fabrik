@@ -34,7 +34,56 @@ function parseArgs(argv) {
   };
 }
 
-class CompilerError extends Error {}
+class CompilerError extends Error {
+  constructor(message, node = null) {
+    const location = node ? formatNodeLocation(node) : null;
+    super(location ? `${location.file}:${location.line}:${location.column}: ${message}` : message);
+    this.name = "CompilerError";
+    this.file = location?.file ?? null;
+    this.line = location?.line ?? null;
+    this.column = location?.column ?? null;
+  }
+}
+
+function compilerError(message, node = null) {
+  return new CompilerError(message, node);
+}
+
+function formatNodeLocation(node) {
+  const sourceFile = node.getSourceFile();
+  const { line, character } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+  return {
+    file: path.relative(process.cwd(), sourceFile.fileName),
+    line: line + 1,
+    column: character + 1,
+  };
+}
+
+function sourceLocation(node) {
+  const location = formatNodeLocation(node);
+  return {
+    file: location.file,
+    line: location.line,
+    column: location.column,
+  };
+}
+
+function rootIdentifierName(expression) {
+  if (ts.isIdentifier(expression)) {
+    return expression.text;
+  }
+  if (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) {
+    return rootIdentifierName(expression.expression);
+  }
+  return null;
+}
+
+function assertAllowedRootIdentifier(expression) {
+  const root = rootIdentifierName(expression);
+  if (root && ["Date", "Math", "process", "globalThis", "window", "document"].includes(root)) {
+    throw compilerError(`unsupported global access ${root}`, expression);
+  }
+}
 
 function createProgram(entry) {
   const configPath = ts.findConfigFile(process.cwd(), ts.sys.fileExists, "tsconfig.json");
@@ -66,13 +115,15 @@ function assertNoTopLevelSideEffects(sourceFile) {
       continue;
     }
     if (ts.isVariableStatement(statement)) {
-      throw new CompilerError(
+      throw compilerError(
         `top-level variables are not allowed in workflow modules (${sourceFile.fileName})`,
+        statement,
       );
     }
     if (!ts.isEmptyStatement(statement)) {
-      throw new CompilerError(
+      throw compilerError(
         `top-level side effects are not allowed in workflow modules (${sourceFile.fileName})`,
+        statement,
       );
     }
   }
@@ -102,12 +153,12 @@ function findExportedFunction(program, exportName) {
       ts.isArrowFunction(declaration)
     ) {
       if (!declaration.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) {
-        throw new CompilerError(`workflow export ${exportName} must be async`);
+        throw compilerError(`workflow export ${exportName} must be async`, declaration);
       }
       return declaration;
     }
   }
-  throw new CompilerError(`exported async workflow ${exportName} not found`);
+  throw compilerError(`exported async workflow ${exportName} not found`);
 }
 
 function buildHelperRegistry(program, workflowDeclaration) {
@@ -215,7 +266,7 @@ function findExportedFunctionDeclaration(sourceFile, exportName) {
 
 function compileHelperFunction(name, declaration) {
   if (declaration.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) {
-    throw new CompilerError(`helper ${name} must not be async`);
+    throw compilerError(`helper ${name} must not be async`, declaration);
   }
   const params = declaration.parameters.map((parameter) => parameter.name.getText());
   if (ts.isBlock(declaration.body)) {
@@ -224,7 +275,7 @@ function compileHelperFunction(name, declaration) {
       !ts.isReturnStatement(declaration.body.statements[0]) ||
       !declaration.body.statements[0].expression
     ) {
-      throw new CompilerError(`helper ${name} must be a single return expression`);
+      throw compilerError(`helper ${name} must be a single return expression`, declaration.body);
     }
     return { params, body: compileExpression(declaration.body.statements[0].expression) };
   }
@@ -232,6 +283,7 @@ function compileHelperFunction(name, declaration) {
 }
 
 function compileExpression(expression) {
+  assertAllowedRootIdentifier(expression);
   if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) {
     return { kind: "literal", value: expression.text };
   }
@@ -275,7 +327,7 @@ function compileExpression(expression) {
         continue;
       }
       if (!ts.isPropertyAssignment(property)) {
-        throw new CompilerError(`unsupported object literal property: ${property.getText()}`);
+        throw compilerError(`unsupported object literal property: ${property.getText()}`, property);
       }
       const key = property.name.getText().replaceAll(/^["']|["']$/g, "");
       fields[key] = compileExpression(property.initializer);
@@ -320,7 +372,10 @@ function compileExpression(expression) {
       [ts.SyntaxKind.GreaterThanEqualsToken, "greater_than_or_equal"],
     ]);
     if (!binaryMap.has(expression.operatorToken.kind)) {
-      throw new CompilerError(`unsupported binary operator ${expression.operatorToken.getText()}`);
+      throw compilerError(
+        `unsupported binary operator ${expression.operatorToken.getText()}`,
+        expression.operatorToken,
+      );
     }
     return {
       kind: "binary",
@@ -345,7 +400,7 @@ function compileExpression(expression) {
     };
   }
 
-  throw new CompilerError(`unsupported expression: ${expression.getText()}`);
+  throw compilerError(`unsupported expression: ${expression.getText()}`, expression);
 }
 
 class WorkflowLowerer {
@@ -354,6 +409,7 @@ class WorkflowLowerer {
     this.version = version;
     this.workflowDeclaration = workflowDeclaration;
     this.states = {};
+    this.sourceMap = {};
     this.id = 0;
   }
 
@@ -374,12 +430,15 @@ class WorkflowLowerer {
       null,
       null,
     );
-    return { initialState, states: this.states };
+    return { initialState, states: this.states, sourceMap: this.sourceMap };
   }
 
-  addState(prefix, state) {
+  addState(prefix, state, node = null) {
     const id = this.nextId(prefix);
     this.states[id] = state;
+    if (node) {
+      this.sourceMap[id] = sourceLocation(node);
+    }
     return id;
   }
 
@@ -405,7 +464,10 @@ class WorkflowLowerer {
       );
       if (awaitDeclaration) {
         if (declarations.length !== 1 || !ts.isIdentifier(awaitDeclaration.name)) {
-          throw new CompilerError(`await variable declarations must declare exactly one identifier`);
+          throw compilerError(
+            `await variable declarations must declare exactly one identifier`,
+            statement,
+          );
         }
         return this.lowerAwait(
           awaitDeclaration.initializer,
@@ -416,14 +478,14 @@ class WorkflowLowerer {
       }
       const actions = declarations.map((declaration) => {
         if (!ts.isIdentifier(declaration.name) || !declaration.initializer) {
-          throw new CompilerError(`unsupported declaration: ${statement.getText()}`);
+          throw compilerError(`unsupported declaration: ${statement.getText()}`, declaration);
         }
         return {
           target: declaration.name.text,
           expr: compileExpression(declaration.initializer),
         };
       });
-      return this.addState("assign", { type: "assign", actions, next: nextState });
+      return this.addState("assign", { type: "assign", actions, next: nextState }, statement);
     }
 
     if (ts.isExpressionStatement(statement)) {
@@ -435,7 +497,7 @@ class WorkflowLowerer {
         statement.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken
       ) {
         if (!ts.isIdentifier(statement.expression.left)) {
-          throw new CompilerError(`unsupported assignment target: ${statement.getText()}`);
+          throw compilerError(`unsupported assignment target: ${statement.getText()}`, statement);
         }
         return this.addState("assign", {
           type: "assign",
@@ -446,9 +508,9 @@ class WorkflowLowerer {
             },
           ],
           next: nextState,
-        });
+        }, statement);
       }
-      throw new CompilerError(`unsupported expression statement: ${statement.getText()}`);
+      throw compilerError(`unsupported expression statement: ${statement.getText()}`, statement);
     }
 
     if (ts.isIfStatement(statement)) {
@@ -473,7 +535,7 @@ class WorkflowLowerer {
         condition: compileExpression(statement.expression),
         then_next: thenNext,
         else_next: elseNext,
-      });
+      }, statement.expression);
     }
 
     if (ts.isWhileStatement(statement)) {
@@ -491,6 +553,7 @@ class WorkflowLowerer {
         then_next: bodyStart,
         else_next: nextState,
       };
+      this.sourceMap[choiceState] = sourceLocation(statement.expression);
       return choiceState;
     }
 
@@ -509,6 +572,7 @@ class WorkflowLowerer {
         then_next: bodyStart,
         else_next: nextState,
       };
+      this.sourceMap[choiceState] = sourceLocation(statement.expression);
       return bodyStart;
     }
 
@@ -534,6 +598,7 @@ class WorkflowLowerer {
         then_next: bodyStart,
         else_next: nextState,
       };
+      this.sourceMap[choiceState] = sourceLocation(statement.condition ?? statement);
       return statement.initializer
         ? this.lowerForInitializer(statement.initializer, choiceState)
         : choiceState;
@@ -541,11 +606,11 @@ class WorkflowLowerer {
 
     if (ts.isForOfStatement(statement)) {
       if (!ts.isVariableDeclarationList(statement.initializer)) {
-        throw new CompilerError(`unsupported for-of initializer: ${statement.getText()}`);
+        throw compilerError(`unsupported for-of initializer: ${statement.getText()}`, statement);
       }
       const loopVar = statement.initializer.declarations[0];
       if (!ts.isIdentifier(loopVar.name)) {
-        throw new CompilerError(`unsupported for-of binding: ${statement.getText()}`);
+        throw compilerError(`unsupported for-of binding: ${statement.getText()}`, loopVar.name);
       }
       const arrayVar = this.nextId("__items");
       const indexVar = this.nextId("__index");
@@ -562,7 +627,7 @@ class WorkflowLowerer {
           },
         ],
         next: "",
-      });
+      }, statement);
       const updateIndex = this.addState("assign", {
         type: "assign",
         actions: [
@@ -577,7 +642,7 @@ class WorkflowLowerer {
           },
         ],
         next: "",
-      });
+      }, statement);
       const choiceState = this.nextId("for_of_choice");
       const bodyStart = this.lowerStatementOrBlock(
         statement.statement,
@@ -603,6 +668,7 @@ class WorkflowLowerer {
         then_next: assignLoopVar,
         else_next: nextState,
       };
+      this.sourceMap[choiceState] = sourceLocation(statement.expression);
       return this.addState("assign", {
         type: "assign",
         actions: [
@@ -610,22 +676,22 @@ class WorkflowLowerer {
           { target: indexVar, expr: { kind: "literal", value: 0 } },
         ],
         next: choiceState,
-      });
+      }, statement);
     }
 
     if (ts.isBreakStatement(statement)) {
-      if (!breakTarget) throw new CompilerError(`break used outside loop`);
+      if (!breakTarget) throw compilerError(`break used outside loop`, statement);
       return breakTarget;
     }
 
     if (ts.isContinueStatement(statement)) {
-      if (!continueTarget) throw new CompilerError(`continue used outside loop`);
+      if (!continueTarget) throw compilerError(`continue used outside loop`, statement);
       return continueTarget;
     }
 
     if (ts.isReturnStatement(statement)) {
       if (!statement.expression || !ts.isCallExpression(statement.expression)) {
-        throw new CompilerError(`return statements must be ctx terminal calls`);
+        throw compilerError(`return statements must be ctx terminal calls`, statement);
       }
       return this.lowerTerminalCall(statement.expression);
     }
@@ -636,12 +702,12 @@ class WorkflowLowerer {
         if (errorTarget.error_var && statement.expression) {
           actions.push({ target: errorTarget.error_var, expr: compileExpression(statement.expression) });
         }
-        return this.addState("assign", { type: "assign", actions, next: errorTarget.next });
+        return this.addState("assign", { type: "assign", actions, next: errorTarget.next }, statement);
       }
       return this.addState("fail", {
         type: "fail",
         reason: statement.expression ? compileExpression(statement.expression) : undefined,
-      });
+      }, statement);
     }
 
     if (ts.isTryStatement(statement)) {
@@ -673,7 +739,7 @@ class WorkflowLowerer {
       return this.lowerBlock(statement.statements, nextState, breakTarget, continueTarget, errorTarget);
     }
 
-    throw new CompilerError(`unsupported statement: ${statement.getText()}`);
+    throw compilerError(`unsupported statement: ${statement.getText()}`, statement);
   }
 
   lowerStatementOrBlock(statement, nextState, breakTarget, continueTarget, errorTarget) {
@@ -688,7 +754,7 @@ class WorkflowLowerer {
         target: declaration.name.getText(),
         expr: declaration.initializer ? compileExpression(declaration.initializer) : { kind: "literal", value: null },
       }));
-      return this.addState("assign", { type: "assign", actions, next: nextState });
+      return this.addState("assign", { type: "assign", actions, next: nextState }, initializer);
     }
     return this.lowerSyntheticExpression(initializer, nextState);
   }
@@ -703,7 +769,7 @@ class WorkflowLowerer {
         type: "assign",
         actions: [{ target: expression.left.text, expr: compileExpression(expression.right) }],
         next: nextState,
-      });
+      }, expression);
     }
     if (ts.isPostfixUnaryExpression(expression) && ts.isIdentifier(expression.operand)) {
       const op = expression.operator === ts.SyntaxKind.PlusPlusToken ? "add" : "subtract";
@@ -721,18 +787,18 @@ class WorkflowLowerer {
           },
         ],
         next: nextState,
-      });
+      }, expression);
     }
-    throw new CompilerError(`unsupported for-loop update expression: ${expression.getText()}`);
+    throw compilerError(`unsupported for-loop update expression: ${expression.getText()}`, expression);
   }
 
   lowerAwait(awaitExpression, targetVar, nextState, errorTarget) {
     if (!ts.isCallExpression(awaitExpression.expression)) {
-      throw new CompilerError(`await must target ctx.* call`);
+      throw compilerError(`await must target ctx.* call`, awaitExpression);
     }
     const call = awaitExpression.expression;
     if (!ts.isPropertyAccessExpression(call.expression) || call.expression.expression.getText() !== "ctx") {
-      throw new CompilerError(`only await ctx.* calls are allowed`);
+      throw compilerError(`only await ctx.* calls are allowed`, call.expression);
     }
     const method = call.expression.name.text;
     if (method === "waitForSignal") {
@@ -741,14 +807,14 @@ class WorkflowLowerer {
         event_type: literalString(call.arguments[0], "ctx.waitForSignal signal name"),
         next: nextState,
         output_var: targetVar ?? undefined,
-      });
+      }, awaitExpression);
     }
     if (method === "sleep") {
       return this.addState("wait_timer", {
         type: "wait_for_timer",
         timer_ref: literalString(call.arguments[0], "ctx.sleep duration"),
         next: nextState,
-      });
+      }, awaitExpression);
     }
     if (method === "activity") {
       return this.addState("step", {
@@ -758,12 +824,12 @@ class WorkflowLowerer {
         next: nextState,
         output_var: targetVar ?? undefined,
         on_error: errorTarget ?? undefined,
-      });
+      }, awaitExpression);
     }
     if (method === "httpRequest") {
       const requestArg = call.arguments[0];
       if (!requestArg || !ts.isObjectLiteralExpression(requestArg)) {
-        throw new CompilerError(`ctx.httpRequest requires a static request object`);
+        throw compilerError(`ctx.httpRequest requires a static request object`, call);
       }
       const config = compileHttpConfig(requestArg);
       return this.addState("http_step", {
@@ -774,41 +840,41 @@ class WorkflowLowerer {
         output_var: targetVar ?? undefined,
         config,
         on_error: errorTarget ?? undefined,
-      });
+      }, awaitExpression);
     }
-    throw new CompilerError(`unsupported ctx method ctx.${method}`);
+    throw compilerError(`unsupported ctx method ctx.${method}`, call.expression.name);
   }
 
   lowerTerminalCall(callExpression) {
     if (!ts.isPropertyAccessExpression(callExpression.expression) || callExpression.expression.expression.getText() !== "ctx") {
-      throw new CompilerError(`terminal return must be ctx.complete/fail/continueAsNew`);
+      throw compilerError(`terminal return must be ctx.complete/fail/continueAsNew`, callExpression);
     }
     const method = callExpression.expression.name.text;
     if (method === "complete") {
       return this.addState("complete", {
         type: "succeed",
         output: callExpression.arguments[0] ? compileExpression(callExpression.arguments[0]) : undefined,
-      });
+      }, callExpression);
     }
     if (method === "fail") {
       return this.addState("fail", {
         type: "fail",
         reason: callExpression.arguments[0] ? compileExpression(callExpression.arguments[0]) : undefined,
-      });
+      }, callExpression);
     }
     if (method === "continueAsNew") {
       return this.addState("continue_as_new", {
         type: "continue_as_new",
         input: callExpression.arguments[0] ? compileExpression(callExpression.arguments[0]) : undefined,
-      });
+      }, callExpression);
     }
-    throw new CompilerError(`unsupported terminal call ctx.${method}`);
+    throw compilerError(`unsupported terminal call ctx.${method}`, callExpression.expression.name);
   }
 }
 
 function literalString(expression, label) {
   if (!expression || (!ts.isStringLiteral(expression) && !ts.isNoSubstitutionTemplateLiteral(expression))) {
-    throw new CompilerError(`${label} must be a string literal`);
+    throw compilerError(`${label} must be a string literal`, expression);
   }
   return expression.text;
 }
@@ -817,7 +883,7 @@ function compileHttpConfig(objectLiteral) {
   const config = { kind: "http_request", method: "GET", url: "", headers: {}, body_from_input: true };
   for (const property of objectLiteral.properties) {
     if (!ts.isPropertyAssignment(property)) {
-      throw new CompilerError(`unsupported httpRequest property ${property.getText()}`);
+      throw compilerError(`unsupported httpRequest property ${property.getText()}`, property);
     }
     const key = property.name.getText().replaceAll(/^["']|["']$/g, "");
     if (key === "method") config.method = literalString(property.initializer, "httpRequest.method");
@@ -825,11 +891,11 @@ function compileHttpConfig(objectLiteral) {
     else if (key === "bodyFromInput") config.body_from_input = property.initializer.kind === ts.SyntaxKind.TrueKeyword;
     else if (key === "headers") {
       if (!ts.isObjectLiteralExpression(property.initializer)) {
-        throw new CompilerError(`httpRequest.headers must be a static object`);
+        throw compilerError(`httpRequest.headers must be a static object`, property.initializer);
       }
       for (const header of property.initializer.properties) {
         if (!ts.isPropertyAssignment(header)) {
-          throw new CompilerError(`unsupported header config ${header.getText()}`);
+          throw compilerError(`unsupported header config ${header.getText()}`, header);
         }
         config.headers[header.name.getText().replaceAll(/^["']|["']$/g, "")] = literalString(
           header.initializer,
@@ -864,13 +930,92 @@ function canonicalize(value) {
   return value;
 }
 
+function walkExpression(expression, visitor) {
+  if (!expression || typeof expression !== "object") {
+    return;
+  }
+  visitor(expression);
+  switch (expression.kind) {
+    case "member":
+      walkExpression(expression.object, visitor);
+      break;
+    case "index":
+      walkExpression(expression.object, visitor);
+      walkExpression(expression.index, visitor);
+      break;
+    case "binary":
+    case "logical":
+      walkExpression(expression.left, visitor);
+      walkExpression(expression.right, visitor);
+      break;
+    case "unary":
+      walkExpression(expression.expr, visitor);
+      break;
+    case "conditional":
+      walkExpression(expression.condition, visitor);
+      walkExpression(expression.then_expr, visitor);
+      walkExpression(expression.else_expr, visitor);
+      break;
+    case "array":
+      expression.items.forEach((item) => walkExpression(item, visitor));
+      break;
+    case "object":
+      Object.values(expression.fields).forEach((field) => walkExpression(field, visitor));
+      break;
+    case "call":
+      expression.args.forEach((arg) => walkExpression(arg, visitor));
+      break;
+    default:
+      break;
+  }
+}
+
+function validateArtifactCalls(artifact) {
+  const helperNames = new Set(Object.keys(artifact.helpers));
+  const validateExpression = (expression) => {
+    walkExpression(expression, (node) => {
+      if (node.kind === "call" && !helperNames.has(node.callee)) {
+        throw compilerError(
+          `unsupported function call ${node.callee}; only imported or local pure helpers are allowed`,
+        );
+      }
+    });
+  };
+
+  Object.values(artifact.helpers).forEach((helper) => validateExpression(helper.body));
+  Object.values(artifact.workflow.states).forEach((state) => {
+    switch (state.type) {
+      case "assign":
+        state.actions.forEach((action) => validateExpression(action.expr));
+        break;
+      case "choice":
+        validateExpression(state.condition);
+        break;
+      case "step":
+        validateExpression(state.input);
+        break;
+      case "succeed":
+        if (state.output) validateExpression(state.output);
+        break;
+      case "fail":
+        if (state.reason) validateExpression(state.reason);
+        break;
+      case "continue_as_new":
+        if (state.input) validateExpression(state.input);
+        break;
+      default:
+        break;
+    }
+  });
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const program = createProgram(args.entry);
   const workflow = findExportedFunction(program, args.exportName);
   const helpers = buildHelperRegistry(program, workflow);
   const lowerer = new WorkflowLowerer(args.definitionId, args.version, workflow);
-  const { initialState, states } = lowerer.lower();
+  const { initialState, states, sourceMap } = lowerer.lower();
 
   const artifact = {
     definition_id: args.definitionId,
@@ -884,7 +1029,7 @@ async function main() {
     source_files: getResolvedSources(program).map((sourceFile) =>
       path.relative(process.cwd(), sourceFile.fileName),
     ),
-    source_map: {},
+    source_map: sourceMap,
     helpers,
     workflow: {
       initial_state: initialState,
@@ -892,6 +1037,7 @@ async function main() {
     },
     artifact_hash: "",
   };
+  validateArtifactCalls(artifact);
   artifact.artifact_hash = hashArtifact(artifact);
 
   const encoded = JSON.stringify(artifact, null, 2);

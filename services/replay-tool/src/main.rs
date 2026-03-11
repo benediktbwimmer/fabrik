@@ -3,10 +3,10 @@ use std::{env, time::Duration};
 use anyhow::{Context, Result, bail};
 use fabrik_broker::{BrokerConfig, WorkflowHistoryFilter, read_workflow_history};
 use fabrik_config::{PostgresConfig, RedpandaConfig};
-use fabrik_events::WorkflowEvent;
 use fabrik_store::WorkflowStore;
-use fabrik_workflow::WorkflowInstanceState;
-use fabrik_workflow::artifact_hash;
+use fabrik_workflow::{
+    WorkflowInstanceState, artifact_hash, replay_compiled_history, replay_history, same_projection,
+};
 use serde::Serialize;
 
 const DEFAULT_IDLE_TIMEOUT_MS: u64 = 1_000;
@@ -70,7 +70,9 @@ async fn main() -> Result<()> {
     }
 
     let pinned_artifact = if let Some(version) = current_instance.definition_version {
-        store.get_artifact_version(&args.tenant_id, &current_instance.definition_id, version).await?
+        store
+            .get_artifact_version(&args.tenant_id, &current_instance.definition_id, version)
+            .await?
     } else {
         None
     };
@@ -80,12 +82,14 @@ async fn main() -> Result<()> {
     } else {
         replay_history(&history)?
     };
-    let definition_version =
-        replayed_state.definition_version.context("replayed state is missing definition_version")?;
+    let definition_version = replayed_state
+        .definition_version
+        .context("replayed state is missing definition_version")?;
     let pinned_artifact_hash =
         replayed_state.artifact_hash.clone().context("replayed state is missing artifact_hash")?;
-    if let Some(artifact) =
-        store.get_artifact_version(&args.tenant_id, &replayed_state.definition_id, definition_version).await?
+    if let Some(artifact) = store
+        .get_artifact_version(&args.tenant_id, &replayed_state.definition_id, definition_version)
+        .await?
     {
         if artifact.artifact_hash != pinned_artifact_hash {
             bail!(
@@ -96,7 +100,11 @@ async fn main() -> Result<()> {
         }
     } else {
         let definition = store
-            .get_definition_version(&args.tenant_id, &replayed_state.definition_id, definition_version)
+            .get_definition_version(
+                &args.tenant_id,
+                &replayed_state.definition_id,
+                definition_version,
+            )
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -155,98 +163,4 @@ fn parse_args() -> Result<ReplayArgs> {
     }
 
     Ok(ReplayArgs { tenant_id, instance_id, run_id })
-}
-
-fn replay_history(
-    history: &[fabrik_events::EventEnvelope<fabrik_events::WorkflowEvent>],
-) -> Result<WorkflowInstanceState> {
-    let mut state: Option<WorkflowInstanceState> = None;
-
-    for event in history {
-        match state.as_mut() {
-            Some(current) => current.apply_event(event),
-            None => state = Some(WorkflowInstanceState::try_from(event)?),
-        }
-    }
-
-    state.context("workflow history did not produce a replayable state")
-}
-
-fn replay_compiled_history(
-    history: &[fabrik_events::EventEnvelope<fabrik_events::WorkflowEvent>],
-    artifact: &fabrik_workflow::CompiledWorkflowArtifact,
-) -> Result<WorkflowInstanceState> {
-    let trigger = history
-        .iter()
-        .find_map(|event| match &event.payload {
-            WorkflowEvent::WorkflowTriggered { input } => Some((event, input.clone())),
-            _ => None,
-        })
-        .context("compiled workflow history is missing WorkflowTriggered")?;
-    let mut replayed = WorkflowInstanceState::try_from(trigger.0)?;
-    let mut execution = artifact.execute_trigger(&trigger.1)?;
-    replayed.current_state = Some(execution.final_state.clone());
-    replayed.context = execution.context.clone();
-    replayed.output = execution.output.clone();
-    replayed.artifact_execution = Some(execution.execution_state.clone());
-    for event in history.iter().skip(1) {
-        replayed.apply_event(event);
-        match &event.payload {
-            WorkflowEvent::SignalReceived { signal_type, payload } => {
-                execution = artifact.execute_after_signal(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    signal_type,
-                    payload,
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                )?;
-            }
-            WorkflowEvent::TimerFired { timer_id } => {
-                execution = artifact.execute_after_timer(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    timer_id,
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                )?;
-            }
-            WorkflowEvent::StepCompleted { step_id, output, .. } => {
-                execution = artifact.execute_after_step_completion(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    step_id,
-                    output,
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                )?;
-            }
-            WorkflowEvent::StepFailed { step_id, error, .. } => {
-                execution = artifact.execute_after_step_failure(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    step_id,
-                    error,
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                )?;
-            }
-            _ => continue,
-        }
-        replayed.current_state = Some(execution.final_state.clone());
-        replayed.context = execution.context.clone();
-        replayed.output = execution.output.clone();
-        replayed.artifact_execution = Some(execution.execution_state.clone());
-    }
-
-    Ok(replayed)
-}
-
-fn same_projection(left: &WorkflowInstanceState, right: &WorkflowInstanceState) -> bool {
-    left.tenant_id == right.tenant_id
-        && left.instance_id == right.instance_id
-        && left.run_id == right.run_id
-        && left.definition_id == right.definition_id
-        && left.definition_version == right.definition_version
-        && left.artifact_hash == right.artifact_hash
-        && left.current_state == right.current_state
-        && left.context == right.context
-        && left.status == right.status
-        && left.input == right.input
-        && left.output == right.output
-        && left.event_count == right.event_count
-        && left.last_event_id == right.last_event_id
-        && left.last_event_type == right.last_event_type
 }

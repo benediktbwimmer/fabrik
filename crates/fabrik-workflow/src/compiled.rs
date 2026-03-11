@@ -111,21 +111,49 @@ pub struct Assignment {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Expression {
-    Literal { value: Value },
-    Identifier { name: String },
-    Member { object: Box<Expression>, property: String },
-    Index { object: Box<Expression>, index: Box<Expression> },
-    Binary { op: BinaryOp, left: Box<Expression>, right: Box<Expression> },
-    Unary { op: UnaryOp, expr: Box<Expression> },
-    Logical { op: LogicalOp, left: Box<Expression>, right: Box<Expression> },
+    Literal {
+        value: Value,
+    },
+    Identifier {
+        name: String,
+    },
+    Member {
+        object: Box<Expression>,
+        property: String,
+    },
+    Index {
+        object: Box<Expression>,
+        index: Box<Expression>,
+    },
+    Binary {
+        op: BinaryOp,
+        left: Box<Expression>,
+        right: Box<Expression>,
+    },
+    Unary {
+        op: UnaryOp,
+        expr: Box<Expression>,
+    },
+    Logical {
+        op: LogicalOp,
+        left: Box<Expression>,
+        right: Box<Expression>,
+    },
     Conditional {
         condition: Box<Expression>,
         then_expr: Box<Expression>,
         else_expr: Box<Expression>,
     },
-    Array { items: Vec<Expression> },
-    Object { fields: BTreeMap<String, Expression> },
-    Call { callee: String, args: Vec<Expression> },
+    Array {
+        items: Vec<Expression>,
+    },
+    Object {
+        fields: BTreeMap<String, Expression>,
+    },
+    Call {
+        callee: String,
+        args: Vec<Expression>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -208,8 +236,8 @@ impl CompiledWorkflowArtifact {
         let mut clone = self.clone();
         clone.artifact_hash.clear();
         let value = serde_json::to_value(&clone).expect("compiled artifact serialization failed");
-        let encoded =
-            serde_json::to_vec(&canonicalize_value(value)).expect("compiled artifact serialization failed");
+        let encoded = serde_json::to_vec(&canonicalize_value(value))
+            .expect("compiled artifact serialization failed");
         let digest = Sha256::digest(encoded);
         format!("{digest:x}")
     }
@@ -237,7 +265,10 @@ impl CompiledWorkflowArtifact {
         Ok(())
     }
 
-    pub fn execute_trigger(&self, input: &Value) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
+    pub fn execute_trigger(
+        &self,
+        input: &Value,
+    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
         let mut execution_state = ArtifactExecutionState::default();
         execution_state.bindings.insert("input".to_owned(), input.clone());
         self.execute_from_state(&self.workflow.initial_state, execution_state, true)
@@ -256,16 +287,20 @@ impl CompiledWorkflowArtifact {
             .get(wait_state)
             .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
         match state {
-            CompiledStateNode::WaitForEvent { event_type, next, output_var } if event_type == signal_type => {
+            CompiledStateNode::WaitForEvent { event_type, next, output_var }
+                if event_type == signal_type =>
+            {
                 if let Some(output_var) = output_var {
                     execution_state.bindings.insert(output_var.clone(), payload.clone());
                 }
                 self.execute_from_state(next, execution_state, false)
             }
-            CompiledStateNode::WaitForEvent { event_type, .. } => Err(CompiledWorkflowError::UnexpectedSignal {
-                expected: event_type.clone(),
-                received: signal_type.to_owned(),
-            }),
+            CompiledStateNode::WaitForEvent { event_type, .. } => {
+                Err(CompiledWorkflowError::UnexpectedSignal {
+                    expected: event_type.clone(),
+                    received: signal_type.to_owned(),
+                })
+            }
             _ => Err(CompiledWorkflowError::NotWaitingOnSignal(wait_state.to_owned())),
         }
     }
@@ -365,7 +400,10 @@ impl CompiledWorkflowArtifact {
         }
     }
 
-    pub fn step_retry(&self, step_state: &str) -> Result<Option<&RetryPolicy>, CompiledWorkflowError> {
+    pub fn step_retry(
+        &self,
+        step_state: &str,
+    ) -> Result<Option<&RetryPolicy>, CompiledWorkflowError> {
         let state = self
             .workflow
             .states
@@ -430,8 +468,11 @@ impl CompiledWorkflowArtifact {
             match state {
                 CompiledStateNode::Assign { actions, next } => {
                     for action in actions {
-                        let value =
-                            evaluate_expression(&action.expr, &execution_state.bindings, &self.helpers)?;
+                        let value = evaluate_expression(
+                            &action.expr,
+                            &execution_state.bindings,
+                            &self.helpers,
+                        )?;
                         execution_state.bindings.insert(action.target.clone(), value);
                     }
                     current_state = next.clone();
@@ -439,16 +480,18 @@ impl CompiledWorkflowArtifact {
                 CompiledStateNode::Choice { condition, then_next, else_next } => {
                     let value =
                         evaluate_expression(condition, &execution_state.bindings, &self.helpers)?;
-                    current_state = if truthy(&value) { then_next.clone() } else { else_next.clone() };
+                    current_state =
+                        if truthy(&value) { then_next.clone() } else { else_next.clone() };
                 }
                 CompiledStateNode::Step { input: step_input, .. } => {
                     let input =
                         evaluate_expression(step_input, &execution_state.bindings, &self.helpers)?;
-                    context = Some(input);
+                    context = Some(input.clone());
                     emissions.push(ExecutionEmission {
                         event: WorkflowEvent::StepScheduled {
                             step_id: current_state.clone(),
                             attempt: 1,
+                            input,
                         },
                         state: Some(current_state.clone()),
                     });
@@ -500,7 +543,11 @@ impl CompiledWorkflowArtifact {
                     let value = expression
                         .as_ref()
                         .map(|expression| {
-                            evaluate_expression(expression, &execution_state.bindings, &self.helpers)
+                            evaluate_expression(
+                                expression,
+                                &execution_state.bindings,
+                                &self.helpers,
+                            )
                         })
                         .transpose()?
                         .or_else(|| context.clone())
@@ -524,7 +571,11 @@ impl CompiledWorkflowArtifact {
                     let reason = reason
                         .as_ref()
                         .map(|expression| {
-                            evaluate_expression(expression, &execution_state.bindings, &self.helpers)
+                            evaluate_expression(
+                                expression,
+                                &execution_state.bindings,
+                                &self.helpers,
+                            )
                         })
                         .transpose()?
                         .and_then(|value| stringify_value(&value))
@@ -548,7 +599,11 @@ impl CompiledWorkflowArtifact {
                     let continued_input = input
                         .as_ref()
                         .map(|expression| {
-                            evaluate_expression(expression, &execution_state.bindings, &self.helpers)
+                            evaluate_expression(
+                                expression,
+                                &execution_state.bindings,
+                                &self.helpers,
+                            )
                         })
                         .transpose()?
                         .or_else(|| context.clone())
@@ -579,7 +634,9 @@ impl CompiledStateNode {
     fn next_states(&self) -> Vec<&str> {
         match self {
             Self::Assign { next, .. } => vec![next.as_str()],
-            Self::Choice { then_next, else_next, .. } => vec![then_next.as_str(), else_next.as_str()],
+            Self::Choice { then_next, else_next, .. } => {
+                vec![then_next.as_str(), else_next.as_str()]
+            }
             Self::Step { next, on_error, .. } => next
                 .iter()
                 .map(String::as_str)
@@ -601,17 +658,33 @@ pub fn evaluate_expression(
     match expression {
         Expression::Literal { value } => Ok(value.clone()),
         Expression::Identifier { name } => Ok(bindings.get(name).cloned().unwrap_or(Value::Null)),
-        Expression::Member { object, property } => match evaluate_expression(object, bindings, helpers)? {
-            Value::Array(items) if property == "length" => Ok(Value::Number(Number::from(items.len()))),
-            Value::Object(map) => Ok(map.get(property).cloned().unwrap_or(Value::Null)),
-            _ => Ok(Value::Null),
-        },
+        Expression::Member { object, property } => {
+            match evaluate_expression(object, bindings, helpers)? {
+                Value::Array(items) if property == "length" => {
+                    Ok(Value::Number(Number::from(items.len())))
+                }
+                Value::Object(map) => Ok(map.get(property).cloned().unwrap_or(Value::Null)),
+                _ => Ok(Value::Null),
+            }
+        }
         Expression::Index { object, index } => {
             let object = evaluate_expression(object, bindings, helpers)?;
             let index = evaluate_expression(index, bindings, helpers)?;
             match (object, index) {
                 (Value::Array(items), Value::Number(index)) => {
-                    let index = index.as_u64().unwrap_or_default() as usize;
+                    let index = index
+                        .as_u64()
+                        .map(|value| value as usize)
+                        .or_else(|| {
+                            index.as_f64().and_then(|value| {
+                                if value.is_finite() && value >= 0.0 {
+                                    Some(value.trunc() as usize)
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .unwrap_or_default();
                     Ok(items.get(index).cloned().unwrap_or(Value::Null))
                 }
                 (Value::Object(map), Value::String(index)) => {
@@ -679,16 +752,24 @@ pub fn evaluate_expression(
     }
 }
 
-fn evaluate_binary(op: &BinaryOp, left: Value, right: Value) -> Result<Value, CompiledWorkflowError> {
+fn evaluate_binary(
+    op: &BinaryOp,
+    left: Value,
+    right: Value,
+) -> Result<Value, CompiledWorkflowError> {
     match op {
         BinaryOp::Add => match (left, right) {
-            (Value::String(left), Value::String(right)) => Ok(Value::String(format!("{left}{right}"))),
+            (Value::String(left), Value::String(right)) => {
+                Ok(Value::String(format!("{left}{right}")))
+            }
             (Value::String(left), right) => {
                 Ok(Value::String(format!("{left}{}", stringify_value(&right).unwrap_or_default())))
             }
-            (left, Value::String(right)) => {
-                Ok(Value::String(format!("{}{}", stringify_value(&left).unwrap_or_default(), right)))
-            }
+            (left, Value::String(right)) => Ok(Value::String(format!(
+                "{}{}",
+                stringify_value(&left).unwrap_or_default(),
+                right
+            ))),
             (left, right) => Ok(number_value(numeric(&left)? + numeric(&right)?)),
         },
         BinaryOp::Subtract => Ok(number_value(numeric(&left)? - numeric(&right)?)),
@@ -728,6 +809,15 @@ fn numeric(value: &Value) -> Result<f64, CompiledWorkflowError> {
 }
 
 fn number_value(value: f64) -> Value {
+    if value.is_finite() && value.fract() == 0.0 {
+        if value >= 0.0 && value <= u64::MAX as f64 {
+            return Value::Number(Number::from(value as u64));
+        }
+        if value >= i64::MIN as f64 && value <= i64::MAX as f64 {
+            return Value::Number(Number::from(value as i64));
+        }
+    }
+
     Value::Number(Number::from_f64(value).unwrap_or_else(|| Number::from(0)))
 }
 
@@ -893,5 +983,24 @@ mod tests {
             plan.emissions.last(),
             Some(ExecutionEmission { event: WorkflowEvent::WorkflowCompleted { .. }, .. })
         ));
+    }
+
+    #[test]
+    fn evaluates_array_index_from_arithmetic_result() {
+        let value = evaluate_expression(
+            &Expression::Index {
+                object: Box::new(Expression::Literal { value: json!(["a", "b"]) }),
+                index: Box::new(Expression::Binary {
+                    op: BinaryOp::Add,
+                    left: Box::new(Expression::Literal { value: json!(0) }),
+                    right: Box::new(Expression::Literal { value: json!(1) }),
+                }),
+            },
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(value, json!("b"));
     }
 }

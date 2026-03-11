@@ -64,7 +64,7 @@ async fn process_event(
     client: &Client,
     event: EventEnvelope<WorkflowEvent>,
 ) -> Result<()> {
-    let WorkflowEvent::StepScheduled { step_id, attempt } = &event.payload else {
+    let WorkflowEvent::StepScheduled { step_id, attempt, input } = &event.payload else {
         return Ok(());
     };
 
@@ -84,46 +84,48 @@ async fn process_event(
         }
     };
 
-    let (handler, config, input) = if let Some(artifact) =
-        load_pinned_artifact(store, &event, &instance.definition_id, instance.definition_version).await?
+    let (handler, config) = if let Some(artifact) =
+        load_pinned_artifact(store, &event, &instance.definition_id, instance.definition_version)
+            .await?
     {
-        let default_execution = fabrik_workflow::ArtifactExecutionState::default();
-        let execution = instance.artifact_execution.as_ref().unwrap_or(&default_execution);
-        match artifact.step_details(
-            step_id,
-            execution,
-        ) {
-            Ok((handler, config, input)) => (handler, config, input),
+        match artifact.step_details(step_id, &fabrik_workflow::ArtifactExecutionState::default()) {
+            Ok((handler, config, _)) => (handler, config),
             Err(error) => {
-                publish_step_failure(publisher, &event, step_id, *attempt, error.to_string()).await?;
+                publish_step_failure(publisher, &event, step_id, *attempt, error.to_string())
+                    .await?;
                 return Ok(());
             }
         }
     } else {
-        let definition =
-            load_pinned_definition(store, &event, &instance.definition_id, instance.definition_version)
-                .await?;
+        let definition = load_pinned_definition(
+            store,
+            &event,
+            &instance.definition_id,
+            instance.definition_version,
+        )
+        .await?;
         let handler = match definition.step_handler(step_id) {
             Ok(handler) => handler.to_owned(),
             Err(error) => {
-                publish_step_failure(publisher, &event, step_id, *attempt, error.to_string()).await?;
+                publish_step_failure(publisher, &event, step_id, *attempt, error.to_string())
+                    .await?;
                 return Ok(());
             }
         };
 
-        let input = instance.context.clone().or_else(|| instance.input.clone()).unwrap_or(Value::Null);
         let config = match definition.step_config(step_id) {
             Ok(config) => config.cloned(),
             Err(error) => {
-                publish_step_failure(publisher, &event, step_id, *attempt, error.to_string()).await?;
+                publish_step_failure(publisher, &event, step_id, *attempt, error.to_string())
+                    .await?;
                 return Ok(());
             }
         };
-        (handler, config, input)
+        (handler, config)
     };
     let idempotency_key = build_idempotency_key(&event, step_id, *attempt);
 
-    match execute_step(client, &handler, config.as_ref(), &input, &idempotency_key).await {
+    match execute_step(client, &handler, config.as_ref(), input, &idempotency_key).await {
         Ok(output) => {
             let payload = WorkflowEvent::StepCompleted {
                 step_id: step_id.clone(),

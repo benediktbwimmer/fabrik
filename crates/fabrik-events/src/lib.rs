@@ -102,7 +102,7 @@ pub enum WorkflowEvent {
     WorkflowArtifactPinned,
     WorkflowContinuedAsNew { new_run_id: String, input: Value },
     SignalReceived { signal_type: String, payload: Value },
-    StepScheduled { step_id: String, attempt: u32 },
+    StepScheduled { step_id: String, attempt: u32, input: Value },
     StepCompleted { step_id: String, attempt: u32, output: Value },
     StepFailed { step_id: String, attempt: u32, error: String },
     TimerScheduled { timer_id: String, fire_at: DateTime<Utc> },

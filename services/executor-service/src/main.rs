@@ -207,7 +207,11 @@ async fn process_event(
                     state.current_state = Some(step_id.clone());
                     store.upsert_instance(&state).await?;
                     let emission = ExecutionEmission {
-                        event: WorkflowEvent::StepScheduled { step_id: step_id.clone(), attempt },
+                        event: WorkflowEvent::StepScheduled {
+                            step_id: step_id.clone(),
+                            attempt,
+                            input: state.context.clone().unwrap_or(Value::Null),
+                        },
                         state: Some(step_id.clone()),
                     };
                     publish_plan(
@@ -248,8 +252,14 @@ async fn process_event(
 
             if let Some((step_id, attempt)) = parse_retry_timer_id(timer_id) {
                 let definition = load_pinned_definition(store, &event, &state).await?;
+                let input =
+                    state.context.clone().or_else(|| state.input.clone()).unwrap_or(Value::Null);
                 let emission = ExecutionEmission {
-                    event: WorkflowEvent::StepScheduled { step_id: step_id.clone(), attempt },
+                    event: WorkflowEvent::StepScheduled {
+                        step_id: step_id.clone(),
+                        attempt,
+                        input,
+                    },
                     state: Some(step_id),
                 };
                 publish_plan(
@@ -371,8 +381,8 @@ async fn process_event(
 
                 match artifact.step_retry(&step_state)? {
                     Some(retry_policy) if *attempt < retry_policy.max_attempts => {
-                        let retry =
-                            chrono::Utc::now() + fabrik_workflow::parse_timer_ref(&retry_policy.delay)?;
+                        let retry = chrono::Utc::now()
+                            + fabrik_workflow::parse_timer_ref(&retry_policy.delay)?;
                         let retry_timer_id = build_retry_timer_id(step_id, attempt + 1);
                         let emission = ExecutionEmission {
                             event: WorkflowEvent::TimerScheduled {
@@ -641,7 +651,8 @@ async fn publish_compiled_plan(
         identity.definition_version = artifact.definition_version;
         identity.artifact_hash = artifact.artifact_hash.clone();
         let event_payload = emission.event.clone();
-        if let WorkflowEvent::WorkflowContinuedAsNew { new_run_id, input } = &event_payload.clone() {
+        if let WorkflowEvent::WorkflowContinuedAsNew { new_run_id, input } = &event_payload.clone()
+        {
             let mut envelope =
                 EventEnvelope::new(event_payload.event_type(), identity.clone(), event_payload);
             envelope.causation_id = Some(previous_causation_id);

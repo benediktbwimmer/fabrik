@@ -2,6 +2,7 @@ mod compiled;
 
 use std::collections::BTreeMap;
 
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use serde::{Deserialize, Serialize};
@@ -249,6 +250,7 @@ impl WorkflowDefinition {
                         event: WorkflowEvent::StepScheduled {
                             step_id: current_state.clone(),
                             attempt: 1,
+                            input: last_output.clone(),
                         },
                         state: Some(current_state.clone()),
                     });
@@ -616,6 +618,98 @@ impl TryFrom<&EventEnvelope<WorkflowEvent>> for WorkflowInstanceState {
     }
 }
 
+pub fn replay_history(history: &[EventEnvelope<WorkflowEvent>]) -> Result<WorkflowInstanceState> {
+    let mut state: Option<WorkflowInstanceState> = None;
+
+    for event in history {
+        match state.as_mut() {
+            Some(current) => current.apply_event(event),
+            None => state = Some(WorkflowInstanceState::try_from(event)?),
+        }
+    }
+
+    state.context("workflow history did not produce a replayable state")
+}
+
+pub fn replay_compiled_history(
+    history: &[EventEnvelope<WorkflowEvent>],
+    artifact: &CompiledWorkflowArtifact,
+) -> Result<WorkflowInstanceState> {
+    let trigger = history
+        .iter()
+        .find_map(|event| match &event.payload {
+            WorkflowEvent::WorkflowTriggered { input } => Some((event, input.clone())),
+            _ => None,
+        })
+        .context("compiled workflow history is missing WorkflowTriggered")?;
+    let mut replayed = WorkflowInstanceState::try_from(trigger.0)?;
+    let mut execution = artifact.execute_trigger(&trigger.1)?;
+    replayed.current_state = Some(execution.final_state.clone());
+    replayed.context = execution.context.clone();
+    replayed.output = execution.output.clone();
+    replayed.artifact_execution = Some(execution.execution_state.clone());
+    for event in history.iter().skip(1) {
+        replayed.apply_event(event);
+        match &event.payload {
+            WorkflowEvent::SignalReceived { signal_type, payload } => {
+                execution = artifact.execute_after_signal(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    signal_type,
+                    payload,
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                )?;
+            }
+            WorkflowEvent::TimerFired { timer_id } => {
+                execution = artifact.execute_after_timer(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    timer_id,
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                )?;
+            }
+            WorkflowEvent::StepCompleted { step_id, output, .. } => {
+                execution = artifact.execute_after_step_completion(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    step_id,
+                    output,
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                )?;
+            }
+            WorkflowEvent::StepFailed { step_id, error, .. } => {
+                execution = artifact.execute_after_step_failure(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    step_id,
+                    error,
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                )?;
+            }
+            _ => continue,
+        }
+        replayed.current_state = Some(execution.final_state.clone());
+        replayed.context = execution.context.clone();
+        replayed.output = execution.output.clone();
+        replayed.artifact_execution = Some(execution.execution_state.clone());
+    }
+
+    Ok(replayed)
+}
+
+pub fn same_projection(left: &WorkflowInstanceState, right: &WorkflowInstanceState) -> bool {
+    left.tenant_id == right.tenant_id
+        && left.instance_id == right.instance_id
+        && left.run_id == right.run_id
+        && left.definition_id == right.definition_id
+        && left.definition_version == right.definition_version
+        && left.artifact_hash == right.artifact_hash
+        && left.current_state == right.current_state
+        && left.context == right.context
+        && left.status == right.status
+        && left.input == right.input
+        && left.output == right.output
+        && left.event_count == right.event_count
+        && left.last_event_id == right.last_event_id
+        && left.last_event_type == right.last_event_type
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowStatus {
@@ -819,7 +913,7 @@ mod tests {
         assert!(matches!(
             plan.emissions.last(),
             Some(ExecutionEmission {
-                event: WorkflowEvent::StepScheduled { step_id, attempt },
+                event: WorkflowEvent::StepScheduled { step_id, attempt, .. },
                 ..
             }) if step_id == "first" && *attempt == 1
         ));

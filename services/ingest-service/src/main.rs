@@ -10,7 +10,9 @@ use fabrik_config::{HttpServiceConfig, PostgresConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::WorkflowStore;
-use fabrik_workflow::{CompiledWorkflowArtifact, WorkflowDefinition, WorkflowStatus, artifact_hash};
+use fabrik_workflow::{
+    CompiledWorkflowArtifact, WorkflowDefinition, WorkflowStatus, artifact_hash,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::info;

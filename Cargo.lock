@@ -489,6 +489,7 @@ dependencies = [
 name = "fabrik-workflow"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "chrono",
  "fabrik-events",
  "serde",
@@ -1427,7 +1428,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "fabrik-broker",
  "fabrik-config",
+ "fabrik-events",
  "fabrik-service",
  "fabrik-store",
  "fabrik-workflow",

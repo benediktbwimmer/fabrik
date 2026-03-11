@@ -144,10 +144,11 @@ pub async fn read_workflow_history(
 
         match timeout(Duration::from_millis(250), consumer.next()).await {
             Ok(Some(Ok((record, _high_watermark)))) => {
-                let event = decode_workflow_event(&record)?;
-                if filter.matches(&event) {
-                    last_match_at = Some(Instant::now());
-                    events.push(event);
+                if let Ok(event) = decode_workflow_event(&record) {
+                    if filter.matches(&event) {
+                        last_match_at = Some(Instant::now());
+                        events.push(event);
+                    }
                 }
             }
             Ok(Some(Err(error))) => {

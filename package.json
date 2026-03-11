@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "compile:workflow": "node sdk/typescript-compiler/compiler.mjs"
+    "compile:workflow": "node sdk/typescript-compiler/compiler.mjs",
+    "test:compiler": "node --test sdk/typescript-compiler/compiler.test.mjs"
   },
   "dependencies": {
     "typescript": "^5.8.3"

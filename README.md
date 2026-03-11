@@ -158,6 +158,7 @@ Run all checks:
 cargo check
 cargo test
 npm install
+npm run test:compiler
 ```
 
 Run a service:
@@ -197,6 +198,10 @@ Useful local endpoints:
 - Query definition API: `GET http://localhost:3005/tenants/{tenant_id}/workflow-definitions/{definition_id}/latest`
 - Query artifact API: `GET http://localhost:3005/tenants/{tenant_id}/workflow-artifacts/{definition_id}/versions/{version}`
 - Query instance API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}`
+- Query run history API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/history`
+- Query current-run history API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/history`
+- Query run replay API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/replay`
+- Query current-run replay API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/replay`
 
 Example TypeScript workflows live in [examples/typescript-workflows/order-workflow.ts](/Users/bene/code/fabrik/examples/typescript-workflows/order-workflow.ts) and [examples/typescript-workflows/helpers.ts](/Users/bene/code/fabrik/examples/typescript-workflows/helpers.ts).
 
