@@ -55,13 +55,19 @@ Initial required primitives:
 - `ctx.waitForSignal(name)`
 - `ctx.sleep(duration)`
 - `ctx.activity(name, input)`
-- `ctx.predicate(name, input)`
-- `ctx.now()`
-- `ctx.uuid()`
-- `ctx.sideEffect(name, input)`
 - `ctx.complete(output?)`
 - `ctx.fail(reason)`
 - `ctx.continueAsNew(input?)`
+
+Current compiler status:
+
+- implemented in the TypeScript compiler and compiled runtime today: `waitForSignal`, `sleep`, `activity`, `httpRequest`, `complete`, `fail`, `continueAsNew`, `ctx.now()`, `ctx.uuid()`, `ctx.sideEffect()`
+- `ctx.now()` is deterministic per execution turn and resolves from the causation event timestamp
+- `ctx.uuid()` is deterministic per execution turn and per callsite, derived from the causation event id plus compiler-stable scope
+- `ctx.sideEffect(expr)` records a `MarkerRecorded` event the first time a callsite is evaluated in a turn and reuses the persisted marker value on replay
+- `await ctx.sideEffect("connector", input, { timeout })` lowers to an explicit effect state and runs through `EffectRequested` / `EffectCompleted` / `EffectFailed`, with workflow-owned timeout timers when configured
+- arbitrary guest callbacks inside `ctx.sideEffect()` are still not supported
+- non-`ctx` async operations are rejected at compile time with source locations
 
 ## Compiler Output
 
@@ -74,6 +80,7 @@ Likely artifact sections:
 - signal definitions
 - activity / connector references
 - marker definitions
+- source map from IR state id to source location
 - compiler version
 - artifact hash
 
@@ -123,6 +130,6 @@ Long-lived or chatty workflows need explicit history rollover.
 ## Open Design Questions
 
 - which language should host the first SDK
-- how much source-level debugging should the compiler preserve
+- how rich the source-level debugging and IR inspection experience should become beyond per-state source maps
 - whether signal handlers may interleave with the main workflow body
 - which marker events are required in the first artifact model

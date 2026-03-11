@@ -184,6 +184,16 @@ node sdk/typescript-compiler/compiler.mjs \
   --out /tmp/order-workflow-artifact.json
 ```
 
+Current TypeScript compiler constraints:
+
+- only `await ctx.*` suspension points are allowed
+- compiler errors include source file, line, and column
+- compiled artifacts include a `source_map` for lowered state ids
+- `ctx.now()` and `ctx.uuid()` are implemented as deterministic compiled expressions
+- `ctx.sideEffect(expr)` records `MarkerRecorded` events for compiled expression values
+- `await ctx.sideEffect("connector", input, { timeout })` emits host-backed `EffectRequested` / `EffectCompleted` / `EffectFailed` events and can schedule workflow-owned timeouts
+- arbitrary guest callbacks inside `ctx.sideEffect()` are still not supported
+
 Useful local endpoints:
 
 - Redpanda broker: `localhost:29092`
@@ -195,9 +205,12 @@ Useful local endpoints:
 - Ingest artifact publish API: `POST http://localhost:3001/tenants/{tenant_id}/workflow-artifacts`
 - Ingest signal API: `POST http://localhost:3001/tenants/{tenant_id}/workflows/{instance_id}/signals/{signal_type}`
 - Ingest continue-as-new API: `POST http://localhost:3001/tenants/{tenant_id}/workflows/{instance_id}/continue-as-new`
+- Ingest effect cancel API: `POST http://localhost:3001/tenants/{tenant_id}/workflows/{instance_id}/effects/{effect_id}/cancel`
 - Query definition API: `GET http://localhost:3005/tenants/{tenant_id}/workflow-definitions/{definition_id}/latest`
 - Query artifact API: `GET http://localhost:3005/tenants/{tenant_id}/workflow-artifacts/{definition_id}/versions/{version}`
 - Query instance API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}`
+- Query current-run effects API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/effects`
+- Query run effects API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/effects`
 - Query run history API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/history`
 - Query current-run history API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/history`
 - Query run replay API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/replay`

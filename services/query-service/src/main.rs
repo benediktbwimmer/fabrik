@@ -9,7 +9,7 @@ use fabrik_broker::{BrokerConfig, WorkflowHistoryFilter, read_workflow_history};
 use fabrik_config::{HttpServiceConfig, PostgresConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
-use fabrik_store::WorkflowStore;
+use fabrik_store::{WorkflowEffectRecord, WorkflowStore};
 use fabrik_workflow::{
     CompiledWorkflowArtifact, WorkflowDefinition, WorkflowInstanceState, artifact_hash,
     replay_compiled_history, replay_history, same_projection,
@@ -58,6 +58,15 @@ struct WorkflowReplayResponse {
     replayed_state: WorkflowInstanceState,
 }
 
+#[derive(Debug, Serialize)]
+struct WorkflowEffectsResponse {
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    effect_count: usize,
+    effects: Vec<WorkflowEffectRecord>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = HttpServiceConfig::from_env("QUERY_SERVICE", "query-service", 3005)?;
@@ -92,6 +101,14 @@ async fn main() -> Result<()> {
         get(get_workflow_artifact_version),
     )
     .route("/tenants/{tenant_id}/workflows/{instance_id}", get(get_workflow_instance))
+    .route(
+        "/tenants/{tenant_id}/workflows/{instance_id}/effects",
+        get(get_current_workflow_effects),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/effects",
+        get(get_workflow_effects_for_run),
+    )
     .route(
         "/tenants/{tenant_id}/workflows/{instance_id}/history",
         get(get_current_workflow_history),
@@ -147,6 +164,41 @@ async fn get_current_workflow_history(
             )
         })?;
     let response = load_workflow_history(&state, &tenant_id, &instance_id, &instance.run_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+async fn get_current_workflow_effects(
+    Path((tenant_id, instance_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowEffectsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let instance = state
+        .store
+        .get_instance(&tenant_id, &instance_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    message: format!(
+                        "workflow instance {instance_id} not found for tenant {tenant_id}"
+                    ),
+                }),
+            )
+        })?;
+    let response = load_workflow_effects(&state, &tenant_id, &instance_id, &instance.run_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+async fn get_workflow_effects_for_run(
+    Path((tenant_id, instance_id, run_id)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowEffectsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let response = load_workflow_effects(&state, &tenant_id, &instance_id, &run_id)
         .await
         .map_err(internal_error)?;
     Ok(Json(response))
@@ -237,6 +289,22 @@ async fn load_workflow_history(
         artifact_hash: first_event.artifact_hash.clone(),
         event_count: history.len(),
         events: history,
+    })
+}
+
+async fn load_workflow_effects(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+) -> Result<WorkflowEffectsResponse> {
+    let effects = state.store.list_effects_for_run(tenant_id, instance_id, run_id).await?;
+    Ok(WorkflowEffectsResponse {
+        tenant_id: tenant_id.to_owned(),
+        instance_id: instance_id.to_owned(),
+        run_id: run_id.to_owned(),
+        effect_count: effects.len(),
+        effects,
     })
 }
 

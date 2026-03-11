@@ -50,22 +50,21 @@ Every workflow event must carry:
 - `WorkflowTriggered`
 - `WorkflowStarted`
 - `WorkflowArtifactPinned`
+- `MarkerRecorded`
 - `SignalReceived`
 - `TimerScheduled`
 - `TimerFired`
 - `StepScheduled`
 - `StepCompleted`
 - `StepFailed`
-- `WorkflowContinuedAsNew`
-- `WorkflowCompleted`
-- `WorkflowFailed`
-
-Future event families:
-
-- `MarkerRecorded`
 - `EffectRequested`
 - `EffectCompleted`
 - `EffectFailed`
+- `EffectTimedOut`
+- `EffectCancelled`
+- `WorkflowContinuedAsNew`
+- `WorkflowCompleted`
+- `WorkflowFailed`
 
 ## Compatibility Rule
 

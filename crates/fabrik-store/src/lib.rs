@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_workflow::{CompiledWorkflowArtifact, WorkflowDefinition, WorkflowInstanceState};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::{PgPool, Row, postgres::PgPoolOptions, types::Json};
 use uuid::Uuid;
 
@@ -18,6 +20,63 @@ pub struct ScheduledTimer {
     pub fire_at: DateTime<Utc>,
     pub scheduled_event_id: Uuid,
     pub correlation_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowEffectRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub definition_id: String,
+    pub definition_version: Option<u32>,
+    pub artifact_hash: Option<String>,
+    pub effect_id: String,
+    pub attempt: u32,
+    pub connector: String,
+    pub state: Option<String>,
+    pub status: WorkflowEffectStatus,
+    pub timeout_ref: Option<String>,
+    pub input: Value,
+    pub output: Option<Value>,
+    pub error: Option<String>,
+    pub requested_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub last_event_id: Uuid,
+    pub last_event_type: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowEffectStatus {
+    Requested,
+    Completed,
+    Failed,
+    TimedOut,
+    Cancelled,
+}
+
+impl WorkflowEffectStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "requested" => Ok(Self::Requested),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "timed_out" => Ok(Self::TimedOut),
+            "cancelled" => Ok(Self::Cancelled),
+            other => anyhow::bail!("unknown workflow effect status {other}"),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -168,6 +227,37 @@ impl WorkflowStore {
             .execute(&self.pool)
             .await
             .context("failed to add workflow_timers.artifact_hash")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS workflow_effects (
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                workflow_id TEXT NOT NULL,
+                workflow_version INTEGER,
+                artifact_hash TEXT,
+                effect_id TEXT NOT NULL,
+                attempt INTEGER NOT NULL,
+                connector TEXT NOT NULL,
+                state TEXT,
+                status TEXT NOT NULL,
+                timeout_ref TEXT,
+                input JSONB NOT NULL,
+                output JSONB,
+                error TEXT,
+                requested_at TIMESTAMPTZ NOT NULL,
+                completed_at TIMESTAMPTZ,
+                last_event_id UUID NOT NULL,
+                last_event_type TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, workflow_instance_id, run_id, effect_id, attempt)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_effects table")?;
 
         Ok(())
     }
@@ -689,5 +779,383 @@ impl WorkflowStore {
         .context("failed to delete workflow timers for run")?;
 
         Ok(result.rows_affected())
+    }
+
+    pub async fn upsert_effect_requested(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        definition_id: &str,
+        definition_version: Option<u32>,
+        artifact_hash: Option<&str>,
+        effect_id: &str,
+        attempt: u32,
+        connector: &str,
+        state: Option<&str>,
+        timeout_ref: Option<&str>,
+        input: &Value,
+        event_id: Uuid,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO workflow_effects (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                workflow_id,
+                workflow_version,
+                artifact_hash,
+                effect_id,
+                attempt,
+                connector,
+                state,
+                status,
+                timeout_ref,
+                input,
+                output,
+                error,
+                requested_at,
+                completed_at,
+                last_event_id,
+                last_event_type,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NULL, NULL, $14, NULL, $15, $16, $17)
+            ON CONFLICT (tenant_id, workflow_instance_id, run_id, effect_id, attempt)
+            DO UPDATE SET
+                workflow_id = EXCLUDED.workflow_id,
+                workflow_version = EXCLUDED.workflow_version,
+                artifact_hash = EXCLUDED.artifact_hash,
+                connector = EXCLUDED.connector,
+                state = EXCLUDED.state,
+                status = EXCLUDED.status,
+                timeout_ref = EXCLUDED.timeout_ref,
+                input = EXCLUDED.input,
+                output = NULL,
+                error = NULL,
+                requested_at = EXCLUDED.requested_at,
+                completed_at = NULL,
+                last_event_id = EXCLUDED.last_event_id,
+                last_event_type = EXCLUDED.last_event_type,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(definition_id)
+        .bind(definition_version.map(|version| version as i32))
+        .bind(artifact_hash)
+        .bind(effect_id)
+        .bind(i32::try_from(attempt).context("effect attempt exceeds i32")?)
+        .bind(connector)
+        .bind(state)
+        .bind(WorkflowEffectStatus::Requested.as_str())
+        .bind(timeout_ref)
+        .bind(Json(input))
+        .bind(occurred_at)
+        .bind(event_id)
+        .bind("EffectRequested")
+        .bind(occurred_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert requested workflow effect")?;
+
+        Ok(())
+    }
+
+    pub async fn complete_effect(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        effect_id: &str,
+        attempt: u32,
+        output: &Value,
+        event_id: Uuid,
+        event_type: &str,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.update_effect_terminal(
+            tenant_id,
+            instance_id,
+            run_id,
+            effect_id,
+            attempt,
+            WorkflowEffectStatus::Completed,
+            Some(output),
+            None,
+            event_id,
+            event_type,
+            occurred_at,
+        )
+        .await
+    }
+
+    pub async fn fail_effect(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        effect_id: &str,
+        attempt: u32,
+        status: WorkflowEffectStatus,
+        error: &str,
+        event_id: Uuid,
+        event_type: &str,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.update_effect_terminal(
+            tenant_id,
+            instance_id,
+            run_id,
+            effect_id,
+            attempt,
+            status,
+            None,
+            Some(error),
+            event_id,
+            event_type,
+            occurred_at,
+        )
+        .await
+    }
+
+    async fn update_effect_terminal(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        effect_id: &str,
+        attempt: u32,
+        status: WorkflowEffectStatus,
+        output: Option<&Value>,
+        error: Option<&str>,
+        event_id: Uuid,
+        event_type: &str,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE workflow_effects
+            SET status = $6,
+                output = $7,
+                error = $8,
+                completed_at = $9,
+                last_event_id = $10,
+                last_event_type = $11,
+                updated_at = $12
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND effect_id = $4
+              AND attempt = $5
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(effect_id)
+        .bind(i32::try_from(attempt).context("effect attempt exceeds i32")?)
+        .bind(status.as_str())
+        .bind(output.map(Json))
+        .bind(error)
+        .bind(occurred_at)
+        .bind(event_id)
+        .bind(event_type)
+        .bind(occurred_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to update workflow effect terminal status")?;
+
+        Ok(())
+    }
+
+    pub async fn list_effects_for_run(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+    ) -> Result<Vec<WorkflowEffectRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                workflow_id,
+                workflow_version,
+                artifact_hash,
+                effect_id,
+                attempt,
+                connector,
+                state,
+                status,
+                timeout_ref,
+                input,
+                output,
+                error,
+                requested_at,
+                completed_at,
+                last_event_id,
+                last_event_type,
+                updated_at
+            FROM workflow_effects
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
+            ORDER BY requested_at ASC, effect_id ASC, attempt ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list workflow effects")?;
+
+        rows.into_iter().map(Self::decode_effect_row).collect()
+    }
+
+    pub async fn get_effect_attempt(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        effect_id: &str,
+        attempt: u32,
+    ) -> Result<Option<WorkflowEffectRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                workflow_id,
+                workflow_version,
+                artifact_hash,
+                effect_id,
+                attempt,
+                connector,
+                state,
+                status,
+                timeout_ref,
+                input,
+                output,
+                error,
+                requested_at,
+                completed_at,
+                last_event_id,
+                last_event_type,
+                updated_at
+            FROM workflow_effects
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND effect_id = $4
+              AND attempt = $5
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(effect_id)
+        .bind(i32::try_from(attempt).context("effect attempt exceeds i32")?)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load workflow effect attempt")?;
+
+        row.map(Self::decode_effect_row).transpose()
+    }
+
+    pub async fn get_latest_active_effect(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        effect_id: &str,
+    ) -> Result<Option<WorkflowEffectRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                workflow_id,
+                workflow_version,
+                artifact_hash,
+                effect_id,
+                attempt,
+                connector,
+                state,
+                status,
+                timeout_ref,
+                input,
+                output,
+                error,
+                requested_at,
+                completed_at,
+                last_event_id,
+                last_event_type,
+                updated_at
+            FROM workflow_effects
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND effect_id = $4
+              AND status = 'requested'
+            ORDER BY attempt DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(effect_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load active workflow effect")?;
+
+        row.map(Self::decode_effect_row).transpose()
+    }
+
+    fn decode_effect_row(row: sqlx::postgres::PgRow) -> Result<WorkflowEffectRecord> {
+        Ok(WorkflowEffectRecord {
+            tenant_id: row.try_get("tenant_id").context("effect tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("effect workflow_instance_id missing")?,
+            run_id: row.try_get("run_id").context("effect run_id missing")?,
+            definition_id: row.try_get("workflow_id").context("effect workflow_id missing")?,
+            definition_version: row
+                .try_get::<Option<i32>, _>("workflow_version")
+                .context("effect workflow_version missing")?
+                .map(|version| version as u32),
+            artifact_hash: row.try_get("artifact_hash").context("effect artifact_hash missing")?,
+            effect_id: row.try_get("effect_id").context("effect effect_id missing")?,
+            attempt: row.try_get::<i32, _>("attempt").context("effect attempt missing")? as u32,
+            connector: row.try_get("connector").context("effect connector missing")?,
+            state: row.try_get("state").context("effect state missing")?,
+            status: WorkflowEffectStatus::from_db(
+                &row.try_get::<String, _>("status").context("effect status missing")?,
+            )?,
+            timeout_ref: row.try_get("timeout_ref").context("effect timeout_ref missing")?,
+            input: row
+                .try_get::<Json<Value>, _>("input")
+                .map(|value| value.0)
+                .context("effect input missing")?,
+            output: row
+                .try_get::<Option<Json<Value>>, _>("output")
+                .map(|value: Option<Json<Value>>| value.map(|json| json.0))
+                .context("effect output missing")?,
+            error: row.try_get("error").context("effect error missing")?,
+            requested_at: row.try_get("requested_at").context("effect requested_at missing")?,
+            completed_at: row.try_get("completed_at").context("effect completed_at missing")?,
+            last_event_id: row.try_get("last_event_id").context("effect last_event_id missing")?,
+            last_event_type: row
+                .try_get("last_event_type")
+                .context("effect last_event_type missing")?,
+            updated_at: row.try_get("updated_at").context("effect updated_at missing")?,
+        })
     }
 }

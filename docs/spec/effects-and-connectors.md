@@ -16,11 +16,14 @@ Target protocol:
 - optional `EffectStarted`
 - `EffectCompleted`
 - `EffectFailed`
+- `EffectTimedOut`
+- `EffectCancelled`
 
 Current implementation note:
 
-- the repository currently transports effect execution through `StepScheduled`, `StepCompleted`, and `StepFailed`
-- the semantics defined here are the future canonical shape
+- compiled workflow effects now use `EffectRequested`, `EffectCompleted`, `EffectFailed`, `EffectTimedOut`, and `EffectCancelled`
+- legacy JSON workflow definitions still use `StepScheduled`, `StepCompleted`, and `StepFailed`
+- connector workers must support both during the transition
 
 ## Required Fields
 
@@ -57,6 +60,8 @@ Every effect result must carry:
 - effect timeout semantics must be explicit
 - cancellation must be representable as an event
 - timed-out or cancelled effects still require a terminal result event
+- timeout timers are workflow-owned and visible in history
+- operator cancellation targets the currently active effect attempt for a run
 
 ## Dead-Letter Rule
 

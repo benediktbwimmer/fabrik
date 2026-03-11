@@ -7,7 +7,7 @@ use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::WorkflowStore;
 use fabrik_workflow::{
-    ArtifactExecutionState, CompiledExecutionPlan, CompiledWorkflowArtifact, ExecutionEmission,
+    CompiledExecutionPlan, CompiledWorkflowArtifact, ExecutionEmission, ExecutionTurnContext,
     WorkflowInstanceState,
 };
 use futures_util::StreamExt;
@@ -97,6 +97,16 @@ async fn process_event(
             }
         }
         Some(mut state) => {
+            if should_ignore_effect_terminal_event(&state, &event.payload) {
+                warn!(
+                    event_type = %event.event_type,
+                    workflow_instance_id = %event.instance_id,
+                    run_id = %event.run_id,
+                    current_state = ?state.current_state,
+                    "dropping late effect terminal event for non-active effect state"
+                );
+                return Ok(());
+            }
             state.apply_event(&event);
             state
         }
@@ -120,7 +130,13 @@ async fn process_event(
             if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
                 publish_artifact_pinned(publisher, &event).await?;
                 let input = state.context.clone().unwrap_or(Value::Null);
-                let plan = artifact.execute_trigger(&input)?;
+                let plan = artifact.execute_trigger_with_turn(
+                    &input,
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
                 apply_compiled_plan(&mut state, &plan);
                 store.upsert_instance(&state).await?;
                 publish_compiled_plan(publisher, &event, &artifact, plan).await?;
@@ -193,26 +209,13 @@ async fn process_event(
             store.delete_timer(&event.tenant_id, &event.instance_id, timer_id).await?;
 
             if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
-                if let Some((step_id, attempt)) = parse_retry_timer_id(timer_id) {
-                    let input = artifact
-                        .step_details(
-                            &step_id,
-                            state
-                                .artifact_execution
-                                .as_ref()
-                                .unwrap_or(&ArtifactExecutionState::default()),
-                        )?
-                        .2;
-                    state.context = Some(input);
-                    state.current_state = Some(step_id.clone());
-                    store.upsert_instance(&state).await?;
+                if let Some((effect_id, attempt)) = parse_effect_timeout_timer_id(timer_id) {
+                    if state.current_state.as_deref() != Some(effect_id.as_str()) {
+                        return Ok(());
+                    }
                     let emission = ExecutionEmission {
-                        event: WorkflowEvent::StepScheduled {
-                            step_id: step_id.clone(),
-                            attempt,
-                            input: state.context.clone().unwrap_or(Value::Null),
-                        },
-                        state: Some(step_id.clone()),
+                        event: WorkflowEvent::EffectTimedOut { effect_id, attempt },
+                        state: state.current_state.clone(),
                     };
                     publish_plan(
                         publisher,
@@ -220,12 +223,75 @@ async fn process_event(
                         artifact.definition_version,
                         fabrik_workflow::WorkflowExecutionPlan {
                             workflow_version: artifact.definition_version,
-                            final_state: step_id.clone(),
+                            final_state: state.current_state.clone().unwrap_or_default(),
                             emissions: vec![emission],
                         },
                     )
                     .await?;
                     return Ok(());
+                }
+                if let Some((target_kind, target_id, attempt)) = parse_retry_timer_id(timer_id) {
+                    let mut execution_state = state.artifact_execution.clone().unwrap_or_default();
+                    execution_state.turn_context = Some(ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    });
+                    match target_kind {
+                        RetryTargetKind::Step => {
+                            let input = artifact.step_details(&target_id, &execution_state)?.2;
+                            state.context = Some(input);
+                            state.current_state = Some(target_id.clone());
+                            store.upsert_instance(&state).await?;
+                            let emission = ExecutionEmission {
+                                event: WorkflowEvent::StepScheduled {
+                                    step_id: target_id.clone(),
+                                    attempt,
+                                    input: state.context.clone().unwrap_or(Value::Null),
+                                },
+                                state: Some(target_id.clone()),
+                            };
+                            publish_plan(
+                                publisher,
+                                &event,
+                                artifact.definition_version,
+                                fabrik_workflow::WorkflowExecutionPlan {
+                                    workflow_version: artifact.definition_version,
+                                    final_state: target_id,
+                                    emissions: vec![emission],
+                                },
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        RetryTargetKind::Effect => {
+                            let (connector, _, input) =
+                                artifact.effect_details(&target_id, &execution_state)?;
+                            state.context = Some(input);
+                            state.current_state = Some(target_id.clone());
+                            store.upsert_instance(&state).await?;
+                            let emission = ExecutionEmission {
+                                event: WorkflowEvent::EffectRequested {
+                                    effect_id: target_id.clone(),
+                                    connector,
+                                    attempt,
+                                    input: state.context.clone().unwrap_or(Value::Null),
+                                },
+                                state: Some(target_id.clone()),
+                            };
+                            publish_plan(
+                                publisher,
+                                &event,
+                                artifact.definition_version,
+                                fabrik_workflow::WorkflowExecutionPlan {
+                                    workflow_version: artifact.definition_version,
+                                    final_state: target_id,
+                                    emissions: vec![emission],
+                                },
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                    }
                 }
 
                 let wait_state = match state.current_state.clone() {
@@ -239,10 +305,14 @@ async fn process_event(
                         return Ok(());
                     }
                 };
-                let plan = artifact.execute_after_timer(
+                let plan = artifact.execute_after_timer_with_turn(
                     &wait_state,
                     timer_id,
                     state.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
                 )?;
                 apply_compiled_plan(&mut state, &plan);
                 store.upsert_instance(&state).await?;
@@ -250,17 +320,20 @@ async fn process_event(
                 return Ok(());
             }
 
-            if let Some((step_id, attempt)) = parse_retry_timer_id(timer_id) {
+            if let Some((target_kind, target_id, attempt)) = parse_retry_timer_id(timer_id) {
+                if !matches!(target_kind, RetryTargetKind::Step) {
+                    return Ok(());
+                }
                 let definition = load_pinned_definition(store, &event, &state).await?;
                 let input =
                     state.context.clone().or_else(|| state.input.clone()).unwrap_or(Value::Null);
                 let emission = ExecutionEmission {
                     event: WorkflowEvent::StepScheduled {
-                        step_id: step_id.clone(),
+                        step_id: target_id.clone(),
                         attempt,
                         input,
                     },
-                    state: Some(step_id),
+                    state: Some(target_id),
                 };
                 publish_plan(
                     publisher,
@@ -322,11 +395,15 @@ async fn process_event(
                         return Ok(());
                     }
                 };
-                let plan = artifact.execute_after_step_completion(
+                let plan = artifact.execute_after_step_completion_with_turn(
                     &step_state,
                     step_id,
                     output,
                     state.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
                 )?;
                 apply_compiled_plan(&mut state, &plan);
                 store.upsert_instance(&state).await?;
@@ -383,7 +460,8 @@ async fn process_event(
                     Some(retry_policy) if *attempt < retry_policy.max_attempts => {
                         let retry = chrono::Utc::now()
                             + fabrik_workflow::parse_timer_ref(&retry_policy.delay)?;
-                        let retry_timer_id = build_retry_timer_id(step_id, attempt + 1);
+                        let retry_timer_id =
+                            build_retry_timer_id(RetryTargetKind::Step, step_id, attempt + 1);
                         let emission = ExecutionEmission {
                             event: WorkflowEvent::TimerScheduled {
                                 timer_id: retry_timer_id,
@@ -404,11 +482,15 @@ async fn process_event(
                         .await?;
                     }
                     _ => {
-                        let plan = artifact.execute_after_step_failure(
+                        let plan = artifact.execute_after_step_failure_with_turn(
                             &step_state,
                             step_id,
                             step_error,
                             state.artifact_execution.clone().unwrap_or_default(),
+                            ExecutionTurnContext {
+                                event_id: event.event_id,
+                                occurred_at: event.occurred_at,
+                            },
                         )?;
                         apply_compiled_plan(&mut state, &plan);
                         store.upsert_instance(&state).await?;
@@ -433,7 +515,8 @@ async fn process_event(
             let definition = load_pinned_definition(store, &event, &state).await?;
             match definition.schedule_retry(&step_state, *attempt) {
                 Ok(Some(retry)) => {
-                    let retry_timer_id = build_retry_timer_id(step_id, retry.attempt);
+                    let retry_timer_id =
+                        build_retry_timer_id(RetryTargetKind::Step, step_id, retry.attempt);
                     let emission = ExecutionEmission {
                         event: WorkflowEvent::TimerScheduled {
                             timer_id: retry_timer_id,
@@ -475,6 +558,302 @@ async fn process_event(
                 }
             }
         }
+        WorkflowEvent::EffectRequested { effect_id, connector, attempt, input } => {
+            let timeout_ref =
+                if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
+                    artifact.effect_timeout(effect_id)?.map(str::to_owned)
+                } else {
+                    None
+                };
+            store
+                .upsert_effect_requested(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &event.run_id,
+                    &state.definition_id,
+                    state.definition_version,
+                    state.artifact_hash.as_deref(),
+                    effect_id,
+                    *attempt,
+                    connector,
+                    state.current_state.as_deref(),
+                    timeout_ref.as_deref(),
+                    input,
+                    event.event_id,
+                    event.occurred_at,
+                )
+                .await?;
+
+            if let Some(timeout_ref) = timeout_ref {
+                let fire_at = chrono::Utc::now() + fabrik_workflow::parse_timer_ref(&timeout_ref)?;
+                let emission = ExecutionEmission {
+                    event: WorkflowEvent::TimerScheduled {
+                        timer_id: build_effect_timeout_timer_id(effect_id, *attempt),
+                        fire_at,
+                    },
+                    state: state.current_state.clone(),
+                };
+                publish_plan(
+                    publisher,
+                    &event,
+                    state.definition_version.unwrap_or(event.definition_version),
+                    fabrik_workflow::WorkflowExecutionPlan {
+                        workflow_version: state
+                            .definition_version
+                            .unwrap_or(event.definition_version),
+                        final_state: state.current_state.clone().unwrap_or_default(),
+                        emissions: vec![emission],
+                    },
+                )
+                .await?;
+            }
+        }
+        WorkflowEvent::EffectCompleted { effect_id, attempt, output } => {
+            let _ = store
+                .delete_timer(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &build_effect_timeout_timer_id(effect_id, *attempt),
+                )
+                .await;
+            store
+                .complete_effect(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &event.run_id,
+                    effect_id,
+                    *attempt,
+                    output,
+                    event.event_id,
+                    &event.event_type,
+                    event.occurred_at,
+                )
+                .await?;
+            if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
+                let effect_state = match state.current_state.clone() {
+                    Some(effect_state) => effect_state,
+                    None => {
+                        warn!(
+                            workflow_instance_id = %event.instance_id,
+                            effect_id = %effect_id,
+                            "effect completed without current_state"
+                        );
+                        return Ok(());
+                    }
+                };
+                let plan = artifact.execute_after_effect_completion_with_turn(
+                    &effect_state,
+                    effect_id,
+                    output,
+                    state.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                apply_compiled_plan(&mut state, &plan);
+                store.upsert_instance(&state).await?;
+                publish_compiled_plan(publisher, &event, &artifact, plan).await?;
+            }
+        }
+        WorkflowEvent::EffectFailed { effect_id, attempt, error: effect_error } => {
+            let _ = store
+                .delete_timer(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &build_effect_timeout_timer_id(effect_id, *attempt),
+                )
+                .await;
+            store
+                .fail_effect(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &event.run_id,
+                    effect_id,
+                    *attempt,
+                    fabrik_store::WorkflowEffectStatus::Failed,
+                    effect_error,
+                    event.event_id,
+                    &event.event_type,
+                    event.occurred_at,
+                )
+                .await?;
+            if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
+                let effect_state = match state.current_state.clone() {
+                    Some(effect_state) => effect_state,
+                    None => {
+                        warn!(
+                            workflow_instance_id = %event.instance_id,
+                            effect_id = %effect_id,
+                            "effect failed without current_state"
+                        );
+                        return Ok(());
+                    }
+                };
+
+                match artifact.effect_retry(&effect_state)? {
+                    Some(retry_policy) if *attempt < retry_policy.max_attempts => {
+                        let retry = chrono::Utc::now()
+                            + fabrik_workflow::parse_timer_ref(&retry_policy.delay)?;
+                        let retry_timer_id =
+                            build_retry_timer_id(RetryTargetKind::Effect, effect_id, attempt + 1);
+                        let emission = ExecutionEmission {
+                            event: WorkflowEvent::TimerScheduled {
+                                timer_id: retry_timer_id,
+                                fire_at: retry,
+                            },
+                            state: Some(effect_state),
+                        };
+                        publish_plan(
+                            publisher,
+                            &event,
+                            artifact.definition_version,
+                            fabrik_workflow::WorkflowExecutionPlan {
+                                workflow_version: artifact.definition_version,
+                                final_state: state.current_state.clone().unwrap_or_default(),
+                                emissions: vec![emission],
+                            },
+                        )
+                        .await?;
+                    }
+                    _ => {
+                        let plan = artifact.execute_after_effect_failure_with_turn(
+                            &effect_state,
+                            effect_id,
+                            effect_error,
+                            state.artifact_execution.clone().unwrap_or_default(),
+                            ExecutionTurnContext {
+                                event_id: event.event_id,
+                                occurred_at: event.occurred_at,
+                            },
+                        )?;
+                        apply_compiled_plan(&mut state, &plan);
+                        store.upsert_instance(&state).await?;
+                        publish_compiled_plan(publisher, &event, &artifact, plan).await?;
+                    }
+                }
+            }
+        }
+        WorkflowEvent::EffectTimedOut { effect_id, attempt } => {
+            store
+                .fail_effect(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &event.run_id,
+                    effect_id,
+                    *attempt,
+                    fabrik_store::WorkflowEffectStatus::TimedOut,
+                    "effect timed out",
+                    event.event_id,
+                    &event.event_type,
+                    event.occurred_at,
+                )
+                .await?;
+            if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
+                let effect_state = match state.current_state.clone() {
+                    Some(effect_state) => effect_state,
+                    None => {
+                        warn!(
+                            workflow_instance_id = %event.instance_id,
+                            effect_id = %effect_id,
+                            "effect timed out without current_state"
+                        );
+                        return Ok(());
+                    }
+                };
+
+                match artifact.effect_retry(&effect_state)? {
+                    Some(retry_policy) if *attempt < retry_policy.max_attempts => {
+                        let retry = chrono::Utc::now()
+                            + fabrik_workflow::parse_timer_ref(&retry_policy.delay)?;
+                        let retry_timer_id =
+                            build_retry_timer_id(RetryTargetKind::Effect, effect_id, attempt + 1);
+                        let emission = ExecutionEmission {
+                            event: WorkflowEvent::TimerScheduled {
+                                timer_id: retry_timer_id,
+                                fire_at: retry,
+                            },
+                            state: Some(effect_state),
+                        };
+                        publish_plan(
+                            publisher,
+                            &event,
+                            artifact.definition_version,
+                            fabrik_workflow::WorkflowExecutionPlan {
+                                workflow_version: artifact.definition_version,
+                                final_state: state.current_state.clone().unwrap_or_default(),
+                                emissions: vec![emission],
+                            },
+                        )
+                        .await?;
+                    }
+                    _ => {
+                        let plan = artifact.execute_after_effect_failure_with_turn(
+                            &effect_state,
+                            effect_id,
+                            "effect timed out",
+                            state.artifact_execution.clone().unwrap_or_default(),
+                            ExecutionTurnContext {
+                                event_id: event.event_id,
+                                occurred_at: event.occurred_at,
+                            },
+                        )?;
+                        apply_compiled_plan(&mut state, &plan);
+                        store.upsert_instance(&state).await?;
+                        publish_compiled_plan(publisher, &event, &artifact, plan).await?;
+                    }
+                }
+            }
+        }
+        WorkflowEvent::EffectCancelled { effect_id, attempt, reason } => {
+            let _ = store
+                .delete_timer(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &build_effect_timeout_timer_id(effect_id, *attempt),
+                )
+                .await;
+            store
+                .fail_effect(
+                    &event.tenant_id,
+                    &event.instance_id,
+                    &event.run_id,
+                    effect_id,
+                    *attempt,
+                    fabrik_store::WorkflowEffectStatus::Cancelled,
+                    reason,
+                    event.event_id,
+                    &event.event_type,
+                    event.occurred_at,
+                )
+                .await?;
+            if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
+                let effect_state = match state.current_state.clone() {
+                    Some(effect_state) => effect_state,
+                    None => {
+                        warn!(
+                            workflow_instance_id = %event.instance_id,
+                            effect_id = %effect_id,
+                            "effect cancelled without current_state"
+                        );
+                        return Ok(());
+                    }
+                };
+                let plan = artifact.execute_after_effect_failure_with_turn(
+                    &effect_state,
+                    effect_id,
+                    reason,
+                    state.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                apply_compiled_plan(&mut state, &plan);
+                store.upsert_instance(&state).await?;
+                publish_compiled_plan(publisher, &event, &artifact, plan).await?;
+            }
+        }
         WorkflowEvent::SignalReceived { signal_type, payload } => {
             if let Some(artifact) = load_pinned_artifact(store, &event, &state).await? {
                 let wait_state = match state.current_state.clone() {
@@ -488,11 +867,15 @@ async fn process_event(
                         return Ok(());
                     }
                 };
-                let plan = artifact.execute_after_signal(
+                let plan = artifact.execute_after_signal_with_turn(
                     &wait_state,
                     signal_type,
                     payload,
                     state.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
                 )?;
                 apply_compiled_plan(&mut state, &plan);
                 store.upsert_instance(&state).await?;
@@ -541,7 +924,9 @@ async fn process_event(
                 "continued workflow as new run"
             );
         }
-        WorkflowEvent::WorkflowArtifactPinned | WorkflowEvent::WorkflowStarted => {}
+        WorkflowEvent::WorkflowArtifactPinned
+        | WorkflowEvent::WorkflowStarted
+        | WorkflowEvent::MarkerRecorded { .. } => {}
         _ => {}
     }
 
@@ -696,15 +1081,42 @@ async fn publish_compiled_plan(
     Ok(())
 }
 
-fn build_retry_timer_id(step_id: &str, attempt: u32) -> String {
-    format!("retry:{step_id}:{attempt}")
+#[derive(Clone, Copy)]
+enum RetryTargetKind {
+    Step,
+    Effect,
 }
 
-fn parse_retry_timer_id(timer_id: &str) -> Option<(String, u32)> {
+fn build_retry_timer_id(kind: RetryTargetKind, target_id: &str, attempt: u32) -> String {
+    let kind = match kind {
+        RetryTargetKind::Step => "step",
+        RetryTargetKind::Effect => "effect",
+    };
+    format!("retry:{kind}:{target_id}:{attempt}")
+}
+
+fn parse_retry_timer_id(timer_id: &str) -> Option<(RetryTargetKind, String, u32)> {
     let suffix = timer_id.strip_prefix("retry:")?;
-    let (step_id, attempt) = suffix.rsplit_once(':')?;
+    let (kind_and_id, attempt) = suffix.rsplit_once(':')?;
+    let (kind, target_id) = kind_and_id.split_once(':')?;
     let attempt = attempt.parse::<u32>().ok()?;
-    Some((step_id.to_owned(), attempt))
+    let kind = match kind {
+        "step" => RetryTargetKind::Step,
+        "effect" => RetryTargetKind::Effect,
+        _ => return None,
+    };
+    Some((kind, target_id.to_owned(), attempt))
+}
+
+fn build_effect_timeout_timer_id(effect_id: &str, attempt: u32) -> String {
+    format!("effect-timeout:{effect_id}:{attempt}")
+}
+
+fn parse_effect_timeout_timer_id(timer_id: &str) -> Option<(String, u32)> {
+    let suffix = timer_id.strip_prefix("effect-timeout:")?;
+    let (effect_id, attempt) = suffix.rsplit_once(':')?;
+    let attempt = attempt.parse::<u32>().ok()?;
+    Some((effect_id.to_owned(), attempt))
 }
 
 fn build_workflow_envelope(
@@ -767,5 +1179,21 @@ fn is_run_initialization_event(event: &WorkflowEvent) -> bool {
         WorkflowEvent::WorkflowTriggered { .. }
             | WorkflowEvent::WorkflowStarted
             | WorkflowEvent::WorkflowArtifactPinned
+            | WorkflowEvent::MarkerRecorded { .. }
     )
+}
+
+fn should_ignore_effect_terminal_event(
+    state: &WorkflowInstanceState,
+    event: &WorkflowEvent,
+) -> bool {
+    let effect_id = match event {
+        WorkflowEvent::EffectCompleted { effect_id, .. }
+        | WorkflowEvent::EffectFailed { effect_id, .. }
+        | WorkflowEvent::EffectTimedOut { effect_id, .. }
+        | WorkflowEvent::EffectCancelled { effect_id, .. } => effect_id,
+        _ => return false,
+    };
+
+    state.current_state.as_deref() != Some(effect_id.as_str())
 }

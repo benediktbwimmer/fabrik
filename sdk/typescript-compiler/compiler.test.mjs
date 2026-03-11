@@ -32,6 +32,67 @@ test("compiler emits source maps for compiled workflows", async () => {
   assert.ok(artifact.source_files.some((file) => file.endsWith("valid-helper.ts")));
 });
 
+test("compiler lowers ctx.now and ctx.uuid expressions", async () => {
+  const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/marker-workflow.ts");
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "markerWorkflow",
+    "--definition-id",
+    "marker-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const states = artifact.workflow.states;
+  const assignStates = Object.values(states).filter((state) => state.type === "assign");
+  const serialized = JSON.stringify(assignStates);
+
+  assert.match(serialized, /"kind":"now"/);
+  assert.match(serialized, /"kind":"uuid"/);
+});
+
+test("compiler lowers ctx.sideEffect expressions", async () => {
+  const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/marker-workflow.ts");
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "markerWorkflow",
+    "--definition-id",
+    "marker-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"kind":"side_effect"/);
+  assert.match(serialized, /"marker_id":"marker_/);
+});
+
+test("compiler lowers awaited ctx.sideEffect calls into effect states", async () => {
+  const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/effect-workflow.ts");
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "effectWorkflow",
+    "--definition-id",
+    "effect-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"effect"/);
+  assert.match(serialized, /"connector":"core\.echo"/);
+  assert.match(serialized, /"timeout":"30s"/);
+  assert.match(serialized, /"output_var":"echoed"/);
+});
+
 test("compiler rejects forbidden global access with source location", async () => {
   const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/invalid-global.ts");
   await assert.rejects(
@@ -74,6 +135,69 @@ test("compiler rejects unsupported helper bodies with helper file location", asy
         /sdk\/typescript-compiler\/test-fixtures\/invalid-helper\.ts:\d+:\d+/,
       );
       assert.match(output, /unsupported expression|unsupported global access/);
+      return true;
+    },
+  );
+});
+
+test("compiler keeps state ids stable across unrelated statements", async () => {
+  const baseFixture = path.join(root, "sdk/typescript-compiler/test-fixtures/stable-ids-base.ts");
+  const shiftedFixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/stable-ids-shifted.ts",
+  );
+
+  const [{ stdout: baseOutput }, { stdout: shiftedOutput }] = await Promise.all([
+    runCompiler([
+      "--entry",
+      baseFixture,
+      "--export",
+      "stableIdsWorkflow",
+      "--definition-id",
+      "stable-ids",
+      "--version",
+      "1",
+    ]),
+    runCompiler([
+      "--entry",
+      shiftedFixture,
+      "--export",
+      "stableIdsWorkflow",
+      "--definition-id",
+      "stable-ids",
+      "--version",
+      "1",
+    ]),
+  ]);
+
+  const baseArtifact = JSON.parse(baseOutput);
+  const shiftedArtifact = JSON.parse(shiftedOutput);
+  const baseStateIds = Object.keys(baseArtifact.workflow.states).sort();
+  const shiftedStateIds = Object.keys(shiftedArtifact.workflow.states).sort();
+
+  assert.equal(shiftedStateIds.length, baseStateIds.length + 1);
+  baseStateIds.forEach((stateId) => {
+    assert.ok(shiftedStateIds.includes(stateId), `missing stable state id ${stateId}`);
+  });
+});
+
+test("compiler explains non-ctx await failures", async () => {
+  const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/invalid-await.ts");
+  await assert.rejects(
+    runCompiler([
+      "--entry",
+      fixture,
+      "--export",
+      "invalidAwaitWorkflow",
+      "--definition-id",
+      "invalid-await",
+      "--version",
+      "1",
+    ]),
+    (error) => {
+      const output = `${error.stdout ?? ""}${error.stderr ?? ""}`;
+      assert.match(output, /non-deterministic await detected/);
+      assert.match(output, /ctx\.\* methods/);
       return true;
     },
   );

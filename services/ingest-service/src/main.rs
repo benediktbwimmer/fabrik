@@ -54,6 +54,12 @@ struct ContinueAsNewRequest {
     input: Option<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CancelEffectRequest {
+    #[serde(default = "default_cancel_reason")]
+    reason: String,
+}
+
 #[derive(Debug, Serialize)]
 struct SignalWorkflowResponse {
     instance_id: String,
@@ -73,6 +79,16 @@ struct ContinueAsNewResponse {
     run_id: String,
     continued_event_id: Uuid,
     triggered_event_id: Uuid,
+    status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct CancelEffectResponse {
+    instance_id: String,
+    run_id: String,
+    effect_id: String,
+    attempt: u32,
+    event_id: Uuid,
     status: &'static str,
 }
 
@@ -120,6 +136,10 @@ async fn main() -> Result<()> {
     .route(
         "/tenants/{tenant_id}/workflows/{workflow_instance_id}/continue-as-new",
         post(continue_as_new),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/effects/{effect_id}/cancel",
+        post(cancel_effect),
     )
     .with_state(AppState {
         publisher: WorkflowPublisher::new(&broker, "ingest-service").await?,
@@ -423,10 +443,95 @@ async fn continue_as_new(
     ))
 }
 
+async fn cancel_effect(
+    Path((tenant_id, instance_id, effect_id)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<CancelEffectRequest>,
+) -> Result<(StatusCode, Json<CancelEffectResponse>), (StatusCode, String)> {
+    let instance = state
+        .store
+        .get_instance(&tenant_id, &instance_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("workflow instance {instance_id} not found for tenant {tenant_id}"),
+            )
+        })?;
+
+    if matches!(instance.status, WorkflowStatus::Completed | WorkflowStatus::Failed) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("workflow instance {instance_id} is already {}", instance.status.as_str()),
+        ));
+    }
+
+    let definition_version = instance.definition_version.ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            format!("workflow instance {instance_id} has no pinned definition version"),
+        )
+    })?;
+    let artifact_hash = instance.artifact_hash.clone().ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            format!("workflow instance {instance_id} has no pinned artifact hash"),
+        )
+    })?;
+    let active_effect = state
+        .store
+        .get_latest_active_effect(&tenant_id, &instance_id, &instance.run_id, &effect_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::CONFLICT,
+                format!("effect {effect_id} is not currently active on workflow {instance_id}"),
+            )
+        })?;
+
+    let payload = WorkflowEvent::EffectCancelled {
+        effect_id: effect_id.clone(),
+        attempt: active_effect.attempt,
+        reason: request.reason,
+    };
+    let envelope = EventEnvelope::new(
+        payload.event_type(),
+        WorkflowIdentity::new(
+            tenant_id,
+            instance.definition_id.clone(),
+            definition_version,
+            artifact_hash,
+            instance.instance_id.clone(),
+            instance.run_id.clone(),
+            "ingest-service",
+        ),
+        payload,
+    );
+    state.publisher.publish(&envelope, &envelope.partition_key).await.map_err(internal_error)?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(CancelEffectResponse {
+            instance_id,
+            run_id: instance.run_id,
+            effect_id,
+            attempt: active_effect.attempt,
+            event_id: envelope.event_id,
+            status: "accepted",
+        }),
+    ))
+}
+
 fn internal_error(error: anyhow::Error) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
 
 fn validation_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::BAD_REQUEST, error.to_string())
+}
+
+fn default_cancel_reason() -> String {
+    "cancelled by operator".to_owned()
 }

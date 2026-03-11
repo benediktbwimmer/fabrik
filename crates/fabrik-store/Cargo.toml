@@ -9,5 +9,7 @@ anyhow.workspace = true
 chrono.workspace = true
 fabrik-events = { path = "../fabrik-events" }
 fabrik-workflow = { path = "../fabrik-workflow" }
+serde.workspace = true
+serde_json.workspace = true
 sqlx.workspace = true
 uuid.workspace = true

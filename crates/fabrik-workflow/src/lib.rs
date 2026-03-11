@@ -13,8 +13,8 @@ use uuid::Uuid;
 
 pub use compiled::{
     ArtifactEntrypoint, ArtifactExecutionState, CompiledExecutionPlan, CompiledStateNode,
-    CompiledWorkflow, CompiledWorkflowArtifact, CompiledWorkflowError, ErrorTransition, Expression,
-    HelperFunction, SourceLocation,
+    CompiledWorkflow, CompiledWorkflowArtifact, CompiledWorkflowError, ErrorTransition,
+    ExecutionTurnContext, Expression, HelperFunction, SourceLocation,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -547,7 +547,9 @@ impl WorkflowInstanceState {
                 self.input = Some(input.clone());
                 self.context = Some(input.clone());
             }
-            WorkflowEvent::WorkflowStarted | WorkflowEvent::WorkflowArtifactPinned => {
+            WorkflowEvent::WorkflowStarted
+            | WorkflowEvent::WorkflowArtifactPinned
+            | WorkflowEvent::MarkerRecorded { .. } => {
                 self.status = WorkflowStatus::Running;
             }
             WorkflowEvent::WorkflowContinuedAsNew { input, .. } => {
@@ -561,6 +563,7 @@ impl WorkflowInstanceState {
                 self.context = Some(payload.clone());
             }
             WorkflowEvent::StepScheduled { .. }
+            | WorkflowEvent::EffectRequested { .. }
             | WorkflowEvent::TimerScheduled { .. }
             | WorkflowEvent::TimerFired { .. } => {
                 self.status = WorkflowStatus::Running;
@@ -569,11 +572,22 @@ impl WorkflowInstanceState {
                 self.status = WorkflowStatus::Running;
                 self.context = Some(output.clone());
             }
+            WorkflowEvent::EffectCompleted { output, .. } => {
+                self.status = WorkflowStatus::Running;
+                self.context = Some(output.clone());
+            }
             WorkflowEvent::StepFailed { error, .. }
+            | WorkflowEvent::EffectFailed { error, .. }
+            | WorkflowEvent::EffectCancelled { reason: error, .. }
             | WorkflowEvent::WorkflowFailed { reason: error } => {
                 self.status = WorkflowStatus::Failed;
                 self.output = Some(Value::String(error.clone()));
                 self.context = Some(Value::String(error.clone()));
+            }
+            WorkflowEvent::EffectTimedOut { .. } => {
+                self.status = WorkflowStatus::Failed;
+                self.output = Some(Value::String("effect timed out".to_owned()));
+                self.context = Some(Value::String("effect timed out".to_owned()));
             }
             WorkflowEvent::WorkflowCompleted { output } => {
                 self.status = WorkflowStatus::Completed;
@@ -591,7 +605,8 @@ impl TryFrom<&EventEnvelope<WorkflowEvent>> for WorkflowInstanceState {
         match &event.payload {
             WorkflowEvent::WorkflowTriggered { .. }
             | WorkflowEvent::WorkflowStarted
-            | WorkflowEvent::WorkflowArtifactPinned => {}
+            | WorkflowEvent::WorkflowArtifactPinned
+            | WorkflowEvent::MarkerRecorded { .. } => {}
             _ => return Err(WorkflowProjectionError::MissingWorkflowId(event.event_type.clone())),
         }
 
@@ -643,7 +658,10 @@ pub fn replay_compiled_history(
         })
         .context("compiled workflow history is missing WorkflowTriggered")?;
     let mut replayed = WorkflowInstanceState::try_from(trigger.0)?;
-    let mut execution = artifact.execute_trigger(&trigger.1)?;
+    let mut execution = artifact.execute_trigger_with_turn(
+        &trigger.1,
+        ExecutionTurnContext { event_id: trigger.0.event_id, occurred_at: trigger.0.occurred_at },
+    )?;
     replayed.current_state = Some(execution.final_state.clone());
     replayed.context = execution.context.clone();
     replayed.output = execution.output.clone();
@@ -652,34 +670,98 @@ pub fn replay_compiled_history(
         replayed.apply_event(event);
         match &event.payload {
             WorkflowEvent::SignalReceived { signal_type, payload } => {
-                execution = artifact.execute_after_signal(
+                execution = artifact.execute_after_signal_with_turn(
                     replayed.current_state.as_deref().unwrap_or_default(),
                     signal_type,
                     payload,
                     replayed.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
                 )?;
             }
             WorkflowEvent::TimerFired { timer_id } => {
-                execution = artifact.execute_after_timer(
+                execution = artifact.execute_after_timer_with_turn(
                     replayed.current_state.as_deref().unwrap_or_default(),
                     timer_id,
                     replayed.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
                 )?;
             }
             WorkflowEvent::StepCompleted { step_id, output, .. } => {
-                execution = artifact.execute_after_step_completion(
+                execution = artifact.execute_after_step_completion_with_turn(
                     replayed.current_state.as_deref().unwrap_or_default(),
                     step_id,
                     output,
                     replayed.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+            }
+            WorkflowEvent::EffectCompleted { effect_id, output, .. } => {
+                execution = artifact.execute_after_effect_completion_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    effect_id,
+                    output,
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
                 )?;
             }
             WorkflowEvent::StepFailed { step_id, error, .. } => {
-                execution = artifact.execute_after_step_failure(
+                execution = artifact.execute_after_step_failure_with_turn(
                     replayed.current_state.as_deref().unwrap_or_default(),
                     step_id,
                     error,
                     replayed.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+            }
+            WorkflowEvent::EffectFailed { effect_id, error, .. } => {
+                execution = artifact.execute_after_effect_failure_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    effect_id,
+                    error,
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+            }
+            WorkflowEvent::EffectTimedOut { effect_id, .. } => {
+                execution = artifact.execute_after_effect_failure_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    effect_id,
+                    "effect timed out",
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+            }
+            WorkflowEvent::EffectCancelled { effect_id, reason, .. } => {
+                execution = artifact.execute_after_effect_failure_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    effect_id,
+                    reason,
+                    replayed.artifact_execution.clone().unwrap_or_default(),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
                 )?;
             }
             _ => continue,

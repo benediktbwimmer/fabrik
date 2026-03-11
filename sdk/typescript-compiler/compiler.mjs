@@ -68,6 +68,24 @@ function sourceLocation(node) {
   };
 }
 
+function shortHash(value) {
+  return crypto.createHash("sha1").update(value).digest("hex").slice(0, 10);
+}
+
+function stableNodeKey(node) {
+  const parts = [node.kind, node.getText(node.getSourceFile())];
+  let current = node;
+  let depth = 0;
+  while (current && depth < 3) {
+    current = current.parent;
+    if (current) {
+      parts.push(current.kind);
+    }
+    depth += 1;
+  }
+  return shortHash(parts.join("|"));
+}
+
 function rootIdentifierName(expression) {
   if (ts.isIdentifier(expression)) {
     return expression.text;
@@ -392,12 +410,46 @@ function compileExpression(expression) {
       else_expr: compileExpression(expression.whenFalse),
     };
   }
-  if (ts.isCallExpression(expression) && ts.isIdentifier(expression.expression)) {
-    return {
-      kind: "call",
-      callee: expression.expression.text,
-      args: expression.arguments.map(compileExpression),
-    };
+  if (ts.isCallExpression(expression)) {
+    if (
+      ts.isPropertyAccessExpression(expression.expression) &&
+      expression.expression.expression.getText() === "ctx"
+    ) {
+      const method = expression.expression.name.text;
+      if (method === "now") {
+        if (expression.arguments.length !== 0) {
+          throw compilerError(`ctx.now() does not accept arguments`, expression);
+        }
+        return { kind: "now" };
+      }
+      if (method === "uuid") {
+        if (expression.arguments.length !== 0) {
+          throw compilerError(`ctx.uuid() does not accept arguments`, expression);
+        }
+        return { kind: "uuid", scope: stableNodeKey(expression) };
+      }
+      if (method === "sideEffect") {
+        if (expression.arguments.length !== 1) {
+          throw compilerError(`ctx.sideEffect() requires exactly one argument`, expression);
+        }
+        return {
+          kind: "side_effect",
+          marker_id: `marker_${stableNodeKey(expression)}`,
+          expr: compileExpression(expression.arguments[0]),
+        };
+      }
+      throw compilerError(
+        `ctx.${method} is only allowed as an awaited workflow primitive or terminal call`,
+        expression,
+      );
+    }
+    if (ts.isIdentifier(expression.expression)) {
+      return {
+        kind: "call",
+        callee: expression.expression.text,
+        args: expression.arguments.map(compileExpression),
+      };
+    }
   }
 
   throw compilerError(`unsupported expression: ${expression.getText()}`, expression);
@@ -410,12 +462,20 @@ class WorkflowLowerer {
     this.workflowDeclaration = workflowDeclaration;
     this.states = {};
     this.sourceMap = {};
-    this.id = 0;
+    this.syntheticCounts = new Map();
   }
 
-  nextId(prefix) {
-    this.id += 1;
-    return `${prefix}_${this.id}`;
+  nextId(prefix, node = null) {
+    if (!node) {
+      const count = (this.syntheticCounts.get(prefix) ?? 0) + 1;
+      this.syntheticCounts.set(prefix, count);
+      return `${prefix}_${count}`;
+    }
+
+    const nodeKey = `${prefix}:${stableNodeKey(node)}`;
+    const count = (this.syntheticCounts.get(nodeKey) ?? 0) + 1;
+    this.syntheticCounts.set(nodeKey, count);
+    return count === 1 ? `${prefix}_${stableNodeKey(node)}` : `${prefix}_${stableNodeKey(node)}_${count}`;
   }
 
   lower() {
@@ -434,7 +494,7 @@ class WorkflowLowerer {
   }
 
   addState(prefix, state, node = null) {
-    const id = this.nextId(prefix);
+    const id = this.nextId(prefix, node);
     this.states[id] = state;
     if (node) {
       this.sourceMap[id] = sourceLocation(node);
@@ -539,7 +599,7 @@ class WorkflowLowerer {
     }
 
     if (ts.isWhileStatement(statement)) {
-      const choiceState = this.nextId("while_choice");
+      const choiceState = this.nextId("while_choice", statement.expression);
       const bodyStart = this.lowerStatementOrBlock(
         statement.statement,
         choiceState,
@@ -558,7 +618,7 @@ class WorkflowLowerer {
     }
 
     if (ts.isDoStatement(statement)) {
-      const choiceState = this.nextId("do_choice");
+      const choiceState = this.nextId("do_choice", statement.expression);
       const bodyStart = this.lowerStatementOrBlock(
         statement.statement,
         choiceState,
@@ -580,7 +640,7 @@ class WorkflowLowerer {
       const updateState = statement.incrementor
         ? this.lowerSyntheticExpression(statement.incrementor, null, null, null, null)
         : null;
-      const choiceState = this.nextId("for_choice");
+      const choiceState = this.nextId("for_choice", statement.condition ?? statement);
       const continueState = updateState ?? choiceState;
       const bodyStart = this.lowerStatementOrBlock(
         statement.statement,
@@ -612,8 +672,8 @@ class WorkflowLowerer {
       if (!ts.isIdentifier(loopVar.name)) {
         throw compilerError(`unsupported for-of binding: ${statement.getText()}`, loopVar.name);
       }
-      const arrayVar = this.nextId("__items");
-      const indexVar = this.nextId("__index");
+      const arrayVar = this.nextId("__items", statement.expression);
+      const indexVar = this.nextId("__index", statement.expression);
       const assignLoopVar = this.addState("assign", {
         type: "assign",
         actions: [
@@ -643,7 +703,7 @@ class WorkflowLowerer {
         ],
         next: "",
       }, statement);
-      const choiceState = this.nextId("for_of_choice");
+      const choiceState = this.nextId("for_of_choice", statement.expression);
       const bodyStart = this.lowerStatementOrBlock(
         statement.statement,
         updateIndex,
@@ -794,11 +854,17 @@ class WorkflowLowerer {
 
   lowerAwait(awaitExpression, targetVar, nextState, errorTarget) {
     if (!ts.isCallExpression(awaitExpression.expression)) {
-      throw compilerError(`await must target ctx.* call`, awaitExpression);
+      throw compilerError(
+        `non-deterministic await detected; all async operations must go through ctx.* methods`,
+        awaitExpression,
+      );
     }
     const call = awaitExpression.expression;
     if (!ts.isPropertyAccessExpression(call.expression) || call.expression.expression.getText() !== "ctx") {
-      throw compilerError(`only await ctx.* calls are allowed`, call.expression);
+      throw compilerError(
+        `non-deterministic await detected; only await ctx.* calls are allowed in workflows`,
+        call.expression,
+      );
     }
     const method = call.expression.name.text;
     if (method === "waitForSignal") {
@@ -821,6 +887,26 @@ class WorkflowLowerer {
         type: "step",
         handler: literalString(call.arguments[0], "ctx.activity handler"),
         input: call.arguments[1] ? compileExpression(call.arguments[1]) : { kind: "literal", value: null },
+        next: nextState,
+        output_var: targetVar ?? undefined,
+        on_error: errorTarget ?? undefined,
+      }, awaitExpression);
+    }
+    if (method === "sideEffect") {
+      if (call.arguments.length < 1 || call.arguments.length > 3) {
+        throw compilerError(
+          `await ctx.sideEffect() requires a connector name, optional input, and optional options`,
+          call,
+        );
+      }
+      const options = call.arguments[2] ? compileEffectOptions(call.arguments[2]) : {};
+      return this.addState("effect", {
+        type: "effect",
+        connector: literalString(call.arguments[0], "ctx.sideEffect connector"),
+        input: call.arguments[1]
+          ? compileExpression(call.arguments[1])
+          : { kind: "literal", value: null },
+        timeout: options.timeout,
         next: nextState,
         output_var: targetVar ?? undefined,
         on_error: errorTarget ?? undefined,
@@ -907,6 +993,22 @@ function compileHttpConfig(objectLiteral) {
   return config;
 }
 
+function compileEffectOptions(expression) {
+  if (!ts.isObjectLiteralExpression(expression)) {
+    throw compilerError(`ctx.sideEffect options must be a static object`, expression);
+  }
+  const options = {};
+  for (const property of expression.properties) {
+    if (!ts.isPropertyAssignment(property)) {
+      throw compilerError(`unsupported sideEffect option ${property.getText()}`, property);
+    }
+    const key = property.name.getText().replaceAll(/^["']|["']$/g, "");
+    if (key === "timeout") options.timeout = literalString(property.initializer, "ctx.sideEffect timeout");
+    else throw compilerError(`unsupported sideEffect option ${key}`, property);
+  }
+  return options;
+}
+
 function hashArtifact(artifact) {
   const clone = { ...artifact, artifact_hash: "" };
   return crypto
@@ -964,6 +1066,9 @@ function walkExpression(expression, visitor) {
       break;
     case "call":
       expression.args.forEach((arg) => walkExpression(arg, visitor));
+      break;
+    case "side_effect":
+      walkExpression(expression.expr, visitor);
       break;
     default:
       break;

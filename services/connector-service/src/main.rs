@@ -64,8 +64,22 @@ async fn process_event(
     client: &Client,
     event: EventEnvelope<WorkflowEvent>,
 ) -> Result<()> {
-    let WorkflowEvent::StepScheduled { step_id, attempt, input } = &event.payload else {
-        return Ok(());
+    let target = match &event.payload {
+        WorkflowEvent::StepScheduled { step_id, attempt, input } => ConnectorTarget {
+            id: step_id.clone(),
+            attempt: *attempt,
+            input: input.clone(),
+            kind: ConnectorTargetKind::Step,
+        },
+        WorkflowEvent::EffectRequested { effect_id, attempt, input, .. } => ConnectorTarget {
+            id: effect_id.clone(),
+            attempt: *attempt,
+            input: input.clone(),
+            kind: ConnectorTargetKind::Effect,
+        },
+        _ => {
+            return Ok(());
+        }
     };
 
     if !store.mark_connector_event_processed(&event).await? {
@@ -77,8 +91,8 @@ async fn process_event(
         None => {
             warn!(
                 workflow_instance_id = %event.instance_id,
-                step_id = %step_id,
-                "dropping step execution without workflow state"
+                target_id = %target.id,
+                "dropping connector execution without workflow state"
             );
             return Ok(());
         }
@@ -88,11 +102,14 @@ async fn process_event(
         load_pinned_artifact(store, &event, &instance.definition_id, instance.definition_version)
             .await?
     {
-        match artifact.step_details(step_id, &fabrik_workflow::ArtifactExecutionState::default()) {
-            Ok((handler, config, _)) => (handler, config),
+        let descriptor = match target.kind {
+            ConnectorTargetKind::Step => artifact.step_descriptor(&target.id),
+            ConnectorTargetKind::Effect => artifact.effect_descriptor(&target.id),
+        };
+        match descriptor {
+            Ok((handler, config)) => (handler, config),
             Err(error) => {
-                publish_step_failure(publisher, &event, step_id, *attempt, error.to_string())
-                    .await?;
+                publish_connector_failure(publisher, &event, &target, error.to_string()).await?;
                 return Ok(());
             }
         }
@@ -104,33 +121,38 @@ async fn process_event(
             instance.definition_version,
         )
         .await?;
-        let handler = match definition.step_handler(step_id) {
+        let handler = match definition.step_handler(&target.id) {
             Ok(handler) => handler.to_owned(),
             Err(error) => {
-                publish_step_failure(publisher, &event, step_id, *attempt, error.to_string())
-                    .await?;
+                publish_connector_failure(publisher, &event, &target, error.to_string()).await?;
                 return Ok(());
             }
         };
 
-        let config = match definition.step_config(step_id) {
+        let config = match definition.step_config(&target.id) {
             Ok(config) => config.cloned(),
             Err(error) => {
-                publish_step_failure(publisher, &event, step_id, *attempt, error.to_string())
-                    .await?;
+                publish_connector_failure(publisher, &event, &target, error.to_string()).await?;
                 return Ok(());
             }
         };
         (handler, config)
     };
-    let idempotency_key = build_idempotency_key(&event, step_id, *attempt);
+    let idempotency_key = build_idempotency_key(&event, &target.id, target.attempt);
 
-    match execute_step(client, &handler, config.as_ref(), input, &idempotency_key).await {
+    match execute_step(client, &handler, config.as_ref(), &target.input, &idempotency_key).await {
         Ok(output) => {
-            let payload = WorkflowEvent::StepCompleted {
-                step_id: step_id.clone(),
-                attempt: *attempt,
-                output,
+            let payload = match target.kind {
+                ConnectorTargetKind::Step => WorkflowEvent::StepCompleted {
+                    step_id: target.id.clone(),
+                    attempt: target.attempt,
+                    output,
+                },
+                ConnectorTargetKind::Effect => WorkflowEvent::EffectCompleted {
+                    effect_id: target.id.clone(),
+                    attempt: target.attempt,
+                    output,
+                },
             };
             let mut envelope = EventEnvelope::new(
                 payload.event_type(),
@@ -139,16 +161,30 @@ async fn process_event(
             );
             envelope.causation_id = Some(event.event_id);
             envelope.correlation_id = event.correlation_id.or(Some(event.event_id));
-            envelope.metadata.insert("state".to_owned(), step_id.clone());
-            envelope.metadata.insert("attempt".to_owned(), attempt.to_string());
+            envelope.metadata.insert("state".to_owned(), target.id.clone());
+            envelope.metadata.insert("attempt".to_owned(), target.attempt.to_string());
             publisher.publish(&envelope, &envelope.partition_key).await?;
         }
         Err(error) => {
-            publish_step_failure(publisher, &event, step_id, *attempt, error.to_string()).await?;
+            publish_connector_failure(publisher, &event, &target, error.to_string()).await?;
         }
     }
 
     Ok(())
+}
+
+#[derive(Clone)]
+struct ConnectorTarget {
+    id: String,
+    attempt: u32,
+    input: Value,
+    kind: ConnectorTargetKind,
+}
+
+#[derive(Clone, Copy)]
+enum ConnectorTargetKind {
+    Step,
+    Effect,
 }
 
 async fn execute_step(
@@ -260,23 +296,31 @@ async fn response_body(response: Response) -> Result<Value> {
     Ok(Value::String(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-async fn publish_step_failure(
+async fn publish_connector_failure(
     publisher: &WorkflowPublisher,
     source: &EventEnvelope<WorkflowEvent>,
-    step_id: &str,
-    attempt: u32,
+    target: &ConnectorTarget,
     error: String,
 ) -> Result<()> {
+    let payload = match target.kind {
+        ConnectorTargetKind::Step => {
+            WorkflowEvent::StepFailed { step_id: target.id.clone(), attempt: target.attempt, error }
+        }
+        ConnectorTargetKind::Effect => WorkflowEvent::EffectFailed {
+            effect_id: target.id.clone(),
+            attempt: target.attempt,
+            error,
+        },
+    };
     let mut envelope = EventEnvelope::new(
-        WorkflowEvent::StepFailed { step_id: step_id.to_owned(), attempt, error: error.clone() }
-            .event_type(),
+        payload.event_type(),
         source_identity(source, "connector-service"),
-        WorkflowEvent::StepFailed { step_id: step_id.to_owned(), attempt, error },
+        payload,
     );
     envelope.causation_id = Some(source.event_id);
     envelope.correlation_id = source.correlation_id.or(Some(source.event_id));
-    envelope.metadata.insert("state".to_owned(), step_id.to_owned());
-    envelope.metadata.insert("attempt".to_owned(), attempt.to_string());
+    envelope.metadata.insert("state".to_owned(), target.id.clone());
+    envelope.metadata.insert("attempt".to_owned(), target.attempt.to_string());
     publisher.publish(&envelope, &envelope.partition_key).await?;
     Ok(())
 }
