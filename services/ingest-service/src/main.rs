@@ -123,7 +123,11 @@ async fn main() -> Result<()> {
     init_tracing(&config.log_filter);
     info!(port = config.port, "starting ingest service");
 
-    let broker = BrokerConfig::new(redpanda.brokers, redpanda.workflow_events_topic);
+    let broker = BrokerConfig::new(
+        redpanda.brokers,
+        redpanda.workflow_events_topic,
+        redpanda.workflow_events_partitions,
+    );
     let store = WorkflowStore::connect(&postgres.url).await?;
     store.init().await?;
     let app = default_router::<AppState>(ServiceInfo::new(

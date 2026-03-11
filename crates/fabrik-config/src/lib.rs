@@ -36,6 +36,7 @@ impl HttpServiceConfig {
 pub struct RedpandaConfig {
     pub brokers: String,
     pub workflow_events_topic: String,
+    pub workflow_events_partitions: i32,
 }
 
 impl RedpandaConfig {
@@ -46,6 +47,7 @@ impl RedpandaConfig {
                 "WORKFLOW_EVENTS_TOPIC",
                 "workflow-events",
             )?,
+            workflow_events_partitions: read_i32_with_default("WORKFLOW_EVENTS_PARTITIONS", 4)?,
         })
     }
 }
@@ -61,6 +63,36 @@ impl PostgresConfig {
             url: read_string_with_default(
                 "POSTGRES_URL",
                 "postgres://fabrik:fabrik@localhost:55433/fabrik",
+            )?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryRuntimeConfig {
+    pub default_page_size: usize,
+    pub max_page_size: usize,
+    pub history_retention_days: Option<u64>,
+    pub run_retention_days: Option<u64>,
+    pub effect_retention_days: Option<u64>,
+    pub signal_retention_days: Option<u64>,
+    pub snapshot_retention_days: Option<u64>,
+    pub retention_sweep_interval_seconds: u64,
+}
+
+impl QueryRuntimeConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Ok(Self {
+            default_page_size: read_usize_with_default("QUERY_DEFAULT_PAGE_SIZE", 100)?,
+            max_page_size: read_usize_with_default("QUERY_MAX_PAGE_SIZE", 500)?,
+            history_retention_days: read_optional_u64("QUERY_HISTORY_RETENTION_DAYS")?,
+            run_retention_days: read_optional_u64("QUERY_RUN_RETENTION_DAYS")?,
+            effect_retention_days: read_optional_u64("QUERY_EFFECT_RETENTION_DAYS")?,
+            signal_retention_days: read_optional_u64("QUERY_SIGNAL_RETENTION_DAYS")?,
+            snapshot_retention_days: read_optional_u64("QUERY_SNAPSHOT_RETENTION_DAYS")?,
+            retention_sweep_interval_seconds: read_u64_with_default(
+                "QUERY_RETENTION_SWEEP_INTERVAL_SECONDS",
+                300,
             )?,
         })
     }
@@ -98,19 +130,82 @@ impl ExecutorRuntimeConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnershipConfig {
-    pub partition_id: i32,
+    pub static_partition_ids: Option<Vec<i32>>,
+    pub executor_capacity: usize,
+    pub member_heartbeat_ttl_seconds: u64,
+    pub assignment_poll_interval_seconds: u64,
+    pub rebalance_interval_seconds: u64,
     pub lease_ttl_seconds: u64,
     pub renew_interval_seconds: u64,
 }
 
 impl OwnershipConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
+        let static_partition_ids = match env::var("WORKFLOW_PARTITIONS") {
+            Ok(raw) => Some(parse_partition_ids(&raw)?),
+            Err(env::VarError::NotPresent) => match env::var("WORKFLOW_PARTITION_ID") {
+                Ok(raw) => Some(vec![raw.parse::<i32>().map_err(|_| ConfigError::InvalidI32 {
+                    key: "WORKFLOW_PARTITION_ID".to_owned(),
+                    value: raw,
+                })?]),
+                Err(env::VarError::NotPresent) => None,
+                Err(source) => {
+                    return Err(ConfigError::UnreadableEnv {
+                        key: "WORKFLOW_PARTITION_ID".to_owned(),
+                        source,
+                    });
+                }
+            },
+            Err(source) => {
+                return Err(ConfigError::UnreadableEnv {
+                    key: "WORKFLOW_PARTITIONS".to_owned(),
+                    source,
+                });
+            }
+        };
         Ok(Self {
-            partition_id: read_i32_with_default("WORKFLOW_PARTITION_ID", 0)?,
+            static_partition_ids,
+            executor_capacity: read_usize_with_default("EXECUTOR_CAPACITY", 4)?,
+            member_heartbeat_ttl_seconds: read_u64_with_default(
+                "OWNERSHIP_MEMBER_HEARTBEAT_TTL_SECONDS",
+                15,
+            )?,
+            assignment_poll_interval_seconds: read_u64_with_default(
+                "OWNERSHIP_ASSIGNMENT_POLL_INTERVAL_SECONDS",
+                2,
+            )?,
+            rebalance_interval_seconds: read_u64_with_default(
+                "OWNERSHIP_REBALANCE_INTERVAL_SECONDS",
+                5,
+            )?,
             lease_ttl_seconds: read_u64_with_default("OWNERSHIP_LEASE_TTL_SECONDS", 15)?,
             renew_interval_seconds: read_u64_with_default("OWNERSHIP_RENEW_INTERVAL_SECONDS", 5)?,
         })
     }
+}
+
+fn parse_partition_ids(raw: &str) -> Result<Vec<i32>, ConfigError> {
+    let mut partitions = Vec::new();
+    for token in raw.split(',') {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let partition = trimmed.parse::<i32>().map_err(|_| ConfigError::InvalidI32 {
+            key: "WORKFLOW_PARTITIONS".to_owned(),
+            value: trimmed.to_owned(),
+        })?;
+        partitions.push(partition);
+    }
+    if partitions.is_empty() {
+        return Err(ConfigError::InvalidI32 {
+            key: "WORKFLOW_PARTITIONS".to_owned(),
+            value: raw.to_owned(),
+        });
+    }
+    partitions.sort_unstable();
+    partitions.dedup();
+    Ok(partitions)
 }
 
 fn read_string_with_default(key: &str, default: &str) -> Result<String, ConfigError> {

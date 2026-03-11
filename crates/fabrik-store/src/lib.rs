@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct ScheduledTimer {
+    pub partition_id: i32,
     pub tenant_id: String,
     pub instance_id: String,
     pub run_id: String,
@@ -37,6 +38,23 @@ impl PartitionOwnershipRecord {
     pub fn is_active_at(&self, now: DateTime<Utc>) -> bool {
         self.lease_expires_at > now
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecutorMembershipRecord {
+    pub executor_id: String,
+    pub advertised_capacity: usize,
+    pub heartbeat_expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PartitionAssignmentRecord {
+    pub partition_id: i32,
+    pub executor_id: String,
+    pub assigned_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -100,6 +118,22 @@ pub struct WorkflowRunRecord {
     pub started_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct QueryRetentionPruneResult {
+    pub pruned_runs: u64,
+    pub pruned_effects: u64,
+    pub pruned_signals: u64,
+    pub pruned_snapshots: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QueryRetentionCutoffs {
+    pub run_closed_before: Option<DateTime<Utc>>,
+    pub effect_run_closed_before: Option<DateTime<Utc>>,
+    pub signal_run_closed_before: Option<DateTime<Utc>>,
+    pub snapshot_run_closed_before: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -197,6 +231,15 @@ impl WorkflowStore {
     }
 
     pub async fn init(&self) -> Result<()> {
+        const INIT_LOCK_KEY: i64 = 0x4641_4252_494b;
+
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(INIT_LOCK_KEY)
+            .execute(&self.pool)
+            .await
+            .context("failed to acquire workflow store init lock")?;
+
+        let result: Result<()> = async {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS workflow_instances (
@@ -240,6 +283,7 @@ impl WorkflowStore {
                 event_id UUID PRIMARY KEY,
                 tenant_id TEXT NOT NULL,
                 workflow_instance_id TEXT NOT NULL,
+                dedupe_key TEXT,
                 event_type TEXT NOT NULL,
                 processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
@@ -248,6 +292,24 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize processed_workflow_events table")?;
+
+        sqlx::query(
+            "ALTER TABLE processed_workflow_events ADD COLUMN IF NOT EXISTS dedupe_key TEXT",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add processed_workflow_events.dedupe_key")?;
+
+        sqlx::query(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS processed_workflow_events_dedupe_idx
+            ON processed_workflow_events (tenant_id, workflow_instance_id, dedupe_key)
+            WHERE dedupe_key IS NOT NULL
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize processed_workflow_events dedupe index")?;
 
         sqlx::query(
             r#"
@@ -301,6 +363,7 @@ impl WorkflowStore {
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS workflow_timers (
+                partition_id INTEGER NOT NULL DEFAULT 0,
                 tenant_id TEXT NOT NULL,
                 workflow_instance_id TEXT NOT NULL,
                 workflow_id TEXT NOT NULL,
@@ -318,6 +381,11 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize workflow_timers table")?;
+
+        sqlx::query("ALTER TABLE workflow_timers ADD COLUMN IF NOT EXISTS partition_id INTEGER NOT NULL DEFAULT 0")
+            .execute(&self.pool)
+            .await
+            .context("failed to add workflow_timers.partition_id")?;
 
         sqlx::query("ALTER TABLE workflow_timers ADD COLUMN IF NOT EXISTS run_id TEXT")
             .execute(&self.pool)
@@ -485,6 +553,35 @@ impl WorkflowStore {
         .context("failed to initialize workflow_partition_ownership table")?;
 
         sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS workflow_executor_membership (
+                executor_id TEXT PRIMARY KEY,
+                advertised_capacity INTEGER NOT NULL,
+                heartbeat_expires_at TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_executor_membership table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS workflow_partition_assignments (
+                partition_id INTEGER PRIMARY KEY,
+                executor_id TEXT NOT NULL,
+                assigned_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_partition_assignments table")?;
+
+        sqlx::query(
             "ALTER TABLE workflow_timers ADD COLUMN IF NOT EXISTS dispatch_owner_epoch BIGINT",
         )
         .execute(&self.pool)
@@ -492,6 +589,16 @@ impl WorkflowStore {
         .context("failed to add workflow_timers.dispatch_owner_epoch")?;
 
         Ok(())
+        }
+        .await;
+
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(INIT_LOCK_KEY)
+            .execute(&self.pool)
+            .await
+            .context("failed to release workflow store init lock")?;
+
+        result
     }
 
     pub async fn claim_partition_ownership(
@@ -707,6 +814,155 @@ impl WorkflowStore {
         .context("failed to validate partition ownership")?;
 
         Ok(row.is_some())
+    }
+
+    pub async fn heartbeat_executor_member(
+        &self,
+        executor_id: &str,
+        advertised_capacity: usize,
+        heartbeat_ttl: std::time::Duration,
+    ) -> Result<ExecutorMembershipRecord> {
+        let now = Utc::now();
+        let heartbeat_expires_at =
+            now + chrono::Duration::from_std(heartbeat_ttl).context("heartbeat ttl overflow")?;
+        sqlx::query(
+            r#"
+            INSERT INTO workflow_executor_membership (
+                executor_id,
+                advertised_capacity,
+                heartbeat_expires_at,
+                created_at,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $4)
+            ON CONFLICT (executor_id)
+            DO UPDATE SET
+                advertised_capacity = EXCLUDED.advertised_capacity,
+                heartbeat_expires_at = EXCLUDED.heartbeat_expires_at,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(executor_id)
+        .bind(i32::try_from(advertised_capacity).context("executor capacity exceeds i32")?)
+        .bind(heartbeat_expires_at)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("failed to heartbeat executor membership")?;
+
+        Ok(ExecutorMembershipRecord {
+            executor_id: executor_id.to_owned(),
+            advertised_capacity,
+            heartbeat_expires_at,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub async fn list_active_executor_members(
+        &self,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ExecutorMembershipRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT executor_id, advertised_capacity, heartbeat_expires_at, created_at, updated_at
+            FROM workflow_executor_membership
+            WHERE heartbeat_expires_at > $1
+            ORDER BY executor_id ASC
+            "#,
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list active executor members")?;
+
+        rows.into_iter().map(Self::decode_executor_membership_row).collect()
+    }
+
+    pub async fn list_partition_assignments(&self) -> Result<Vec<PartitionAssignmentRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT partition_id, executor_id, assigned_at, updated_at
+            FROM workflow_partition_assignments
+            ORDER BY partition_id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list partition assignments")?;
+
+        rows.into_iter().map(Self::decode_partition_assignment_row).collect()
+    }
+
+    pub async fn list_assignments_for_executor(
+        &self,
+        executor_id: &str,
+    ) -> Result<Vec<PartitionAssignmentRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT partition_id, executor_id, assigned_at, updated_at
+            FROM workflow_partition_assignments
+            WHERE executor_id = $1
+            ORDER BY partition_id ASC
+            "#,
+        )
+        .bind(executor_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list partition assignments for executor")?;
+
+        rows.into_iter().map(Self::decode_partition_assignment_row).collect()
+    }
+
+    pub async fn reconcile_partition_assignments(
+        &self,
+        partition_count: i32,
+        members: &[ExecutorMembershipRecord],
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin().await.context("failed to begin assignment transaction")?;
+        let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_xact_lock($1)")
+            .bind(4_237_001_i64)
+            .fetch_one(&mut *tx)
+            .await
+            .context("failed to acquire partition assignment lock")?;
+        if !acquired {
+            tx.commit().await.context("failed to close assignment transaction")?;
+            return Ok(false);
+        }
+
+        let assignments = plan_partition_assignments(partition_count, members);
+        let now = Utc::now();
+        for (partition_id, executor_id) in assignments {
+            sqlx::query(
+                r#"
+                INSERT INTO workflow_partition_assignments (
+                    partition_id,
+                    executor_id,
+                    assigned_at,
+                    updated_at
+                )
+                VALUES ($1, $2, $3, $3)
+                ON CONFLICT (partition_id)
+                DO UPDATE SET
+                    executor_id = EXCLUDED.executor_id,
+                    assigned_at = CASE
+                        WHEN workflow_partition_assignments.executor_id = EXCLUDED.executor_id
+                            THEN workflow_partition_assignments.assigned_at
+                        ELSE EXCLUDED.assigned_at
+                    END,
+                    updated_at = EXCLUDED.updated_at
+                "#,
+            )
+            .bind(partition_id)
+            .bind(executor_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .context("failed to upsert partition assignment")?;
+        }
+
+        tx.commit().await.context("failed to commit partition assignments")?;
+        Ok(true)
     }
 
     pub async fn put_definition(
@@ -1106,6 +1362,33 @@ impl WorkflowStore {
         tenant_id: &str,
         instance_id: &str,
     ) -> Result<Vec<WorkflowRunRecord>> {
+        self.list_runs_for_instance_page(tenant_id, instance_id, i64::MAX, 0).await
+    }
+
+    pub async fn count_runs_for_instance(&self, tenant_id: &str, instance_id: &str) -> Result<u64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM workflow_runs
+            WHERE tenant_id = $1 AND workflow_instance_id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to count workflow runs for instance")?;
+
+        Ok(count as u64)
+    }
+
+    pub async fn list_runs_for_instance_page(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<WorkflowRunRecord>> {
         let rows = sqlx::query(
             r#"
             SELECT
@@ -1127,10 +1410,13 @@ impl WorkflowStore {
             FROM workflow_runs
             WHERE tenant_id = $1 AND workflow_instance_id = $2
             ORDER BY started_at ASC
+            LIMIT $3 OFFSET $4
             "#,
         )
         .bind(tenant_id)
         .bind(instance_id)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await
         .context("failed to load workflow runs for instance")?;
@@ -1282,6 +1568,40 @@ impl WorkflowStore {
         instance_id: &str,
         run_id: &str,
     ) -> Result<Vec<WorkflowSignalRecord>> {
+        self.list_signals_for_run_page(tenant_id, instance_id, run_id, i64::MAX, 0).await
+    }
+
+    pub async fn count_signals_for_run(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+    ) -> Result<u64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM workflow_signals
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to count workflow signals for run")?;
+
+        Ok(count as u64)
+    }
+
+    pub async fn list_signals_for_run_page(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<WorkflowSignalRecord>> {
         let rows = sqlx::query(
             r#"
             SELECT
@@ -1302,11 +1622,14 @@ impl WorkflowStore {
             FROM workflow_signals
             WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
             ORDER BY enqueued_at ASC, signal_id ASC
+            LIMIT $4 OFFSET $5
             "#,
         )
         .bind(tenant_id)
         .bind(instance_id)
         .bind(run_id)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await
         .context("failed to list workflow signals for run")?;
@@ -1611,15 +1934,17 @@ impl WorkflowStore {
                 event_id,
                 tenant_id,
                 workflow_instance_id,
+                dedupe_key,
                 event_type
             )
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (event_id) DO NOTHING
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT DO NOTHING
             "#,
         )
         .bind(event.event_id)
         .bind(&event.tenant_id)
         .bind(&event.instance_id)
+        .bind(event.dedupe_key.as_deref())
         .bind(&event.event_type)
         .execute(&self.pool)
         .await
@@ -1657,6 +1982,7 @@ impl WorkflowStore {
 
     pub async fn upsert_timer(
         &self,
+        partition_id: i32,
         tenant_id: &str,
         instance_id: &str,
         run_id: &str,
@@ -1672,6 +1998,7 @@ impl WorkflowStore {
         sqlx::query(
             r#"
             INSERT INTO workflow_timers (
+                partition_id,
                 tenant_id,
                 workflow_instance_id,
                 workflow_id,
@@ -1685,9 +2012,10 @@ impl WorkflowStore {
                 correlation_id,
                 dispatched_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NULL)
             ON CONFLICT (tenant_id, workflow_instance_id, timer_id)
             DO UPDATE SET
+                partition_id = EXCLUDED.partition_id,
                 workflow_id = EXCLUDED.workflow_id,
                 run_id = EXCLUDED.run_id,
                 workflow_version = EXCLUDED.workflow_version,
@@ -1699,6 +2027,7 @@ impl WorkflowStore {
                 dispatched_at = NULL
             "#,
         )
+        .bind(partition_id)
         .bind(tenant_id)
         .bind(instance_id)
         .bind(definition_id)
@@ -1719,6 +2048,7 @@ impl WorkflowStore {
 
     pub async fn claim_due_timers(
         &self,
+        partition_id: i32,
         now: DateTime<Utc>,
         limit: i64,
         owner_epoch: u64,
@@ -1726,6 +2056,7 @@ impl WorkflowStore {
         let rows = sqlx::query(
             r#"
             SELECT
+                partition_id,
                 tenant_id,
                 workflow_instance_id,
                 workflow_id,
@@ -1738,12 +2069,14 @@ impl WorkflowStore {
                 scheduled_event_id,
                 correlation_id
             FROM workflow_timers
-            WHERE fire_at <= $1
-              AND (dispatched_at IS NULL OR dispatch_owner_epoch IS DISTINCT FROM $3)
+            WHERE partition_id = $1
+              AND fire_at <= $2
+              AND (dispatched_at IS NULL OR dispatch_owner_epoch IS DISTINCT FROM $4)
             ORDER BY fire_at ASC
-            LIMIT $2
+            LIMIT $3
             "#,
         )
+        .bind(partition_id)
         .bind(now)
         .bind(limit)
         .bind(i64::try_from(owner_epoch).context("ownership epoch exceeds i64")?)
@@ -1754,6 +2087,7 @@ impl WorkflowStore {
         let mut timers = Vec::with_capacity(rows.len());
         for row in rows {
             timers.push(ScheduledTimer {
+                partition_id: row.try_get("partition_id").context("timer partition_id missing")?,
                 tenant_id: row.try_get("tenant_id").context("timer tenant_id missing")?,
                 instance_id: row
                     .try_get("workflow_instance_id")
@@ -2097,6 +2431,17 @@ impl WorkflowStore {
         instance_id: &str,
         run_id: &str,
     ) -> Result<Vec<WorkflowEffectRecord>> {
+        self.list_effects_for_run_page(tenant_id, instance_id, run_id, i64::MAX, 0).await
+    }
+
+    pub async fn list_effects_for_run_page(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<WorkflowEffectRecord>> {
         let rows = sqlx::query(
             r#"
             SELECT
@@ -2125,14 +2470,149 @@ impl WorkflowStore {
             FROM workflow_effects
             WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
             ORDER BY requested_at ASC, effect_id ASC, attempt ASC
+            LIMIT $4 OFFSET $5
             "#,
         )
         .bind(tenant_id)
         .bind(instance_id)
         .bind(run_id)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await
         .context("failed to list workflow effects")?;
+
+        rows.into_iter().map(Self::decode_effect_row).collect()
+    }
+
+    pub async fn prune_query_retention(
+        &self,
+        cutoffs: &QueryRetentionCutoffs,
+    ) -> Result<QueryRetentionPruneResult> {
+        let pruned_effects = if let Some(cutoff) = cutoffs.effect_run_closed_before {
+            sqlx::query(
+                r#"
+                DELETE FROM workflow_effects effects
+                USING workflow_runs runs
+                WHERE effects.tenant_id = runs.tenant_id
+                  AND effects.workflow_instance_id = runs.workflow_instance_id
+                  AND effects.run_id = runs.run_id
+                  AND runs.closed_at IS NOT NULL
+                  AND runs.closed_at < $1
+                "#,
+            )
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .context("failed to prune workflow effects by retention policy")?
+            .rows_affected()
+        } else {
+            0
+        };
+
+        let pruned_signals = if let Some(cutoff) = cutoffs.signal_run_closed_before {
+            sqlx::query(
+                r#"
+                DELETE FROM workflow_signals signals
+                USING workflow_runs runs
+                WHERE signals.tenant_id = runs.tenant_id
+                  AND signals.workflow_instance_id = runs.workflow_instance_id
+                  AND signals.run_id = runs.run_id
+                  AND runs.closed_at IS NOT NULL
+                  AND runs.closed_at < $1
+                "#,
+            )
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .context("failed to prune workflow signals by retention policy")?
+            .rows_affected()
+        } else {
+            0
+        };
+
+        let pruned_snapshots = if let Some(cutoff) = cutoffs.snapshot_run_closed_before {
+            sqlx::query(
+                r#"
+                DELETE FROM workflow_state_snapshots snapshots
+                USING workflow_runs runs
+                WHERE snapshots.tenant_id = runs.tenant_id
+                  AND snapshots.workflow_instance_id = runs.workflow_instance_id
+                  AND snapshots.run_id = runs.run_id
+                  AND runs.closed_at IS NOT NULL
+                  AND runs.closed_at < $1
+                "#,
+            )
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .context("failed to prune workflow snapshots by retention policy")?
+            .rows_affected()
+        } else {
+            0
+        };
+
+        let pruned_runs = if let Some(cutoff) = cutoffs.run_closed_before {
+            sqlx::query(
+                r#"
+                DELETE FROM workflow_runs
+                WHERE closed_at IS NOT NULL
+                  AND closed_at < $1
+                "#,
+            )
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await
+            .context("failed to prune workflow runs by retention policy")?
+            .rows_affected()
+        } else {
+            0
+        };
+
+        Ok(QueryRetentionPruneResult {
+            pruned_runs,
+            pruned_effects,
+            pruned_signals,
+            pruned_snapshots,
+        })
+    }
+
+    pub async fn list_requested_effects(&self, limit: i64) -> Result<Vec<WorkflowEffectRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                workflow_id,
+                workflow_version,
+                artifact_hash,
+                effect_id,
+                attempt,
+                connector,
+                state,
+                status,
+                timeout_ref,
+                input,
+                output,
+                error,
+                cancellation_reason,
+                cancellation_metadata,
+                requested_at,
+                completed_at,
+                last_event_id,
+                last_event_type,
+                updated_at
+            FROM workflow_effects
+            WHERE status = 'requested'
+            ORDER BY requested_at ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list requested workflow effects")?;
 
         rows.into_iter().map(Self::decode_effect_row).collect()
     }
@@ -2297,6 +2777,48 @@ impl WorkflowStore {
         })
     }
 
+    fn decode_executor_membership_row(
+        row: sqlx::postgres::PgRow,
+    ) -> Result<ExecutorMembershipRecord> {
+        Ok(ExecutorMembershipRecord {
+            executor_id: row
+                .try_get("executor_id")
+                .context("executor membership executor_id missing")?,
+            advertised_capacity: row
+                .try_get::<i32, _>("advertised_capacity")
+                .context("executor membership advertised_capacity missing")?
+                as usize,
+            heartbeat_expires_at: row
+                .try_get("heartbeat_expires_at")
+                .context("executor membership heartbeat_expires_at missing")?,
+            created_at: row
+                .try_get("created_at")
+                .context("executor membership created_at missing")?,
+            updated_at: row
+                .try_get("updated_at")
+                .context("executor membership updated_at missing")?,
+        })
+    }
+
+    fn decode_partition_assignment_row(
+        row: sqlx::postgres::PgRow,
+    ) -> Result<PartitionAssignmentRecord> {
+        Ok(PartitionAssignmentRecord {
+            partition_id: row
+                .try_get("partition_id")
+                .context("partition assignment partition_id missing")?,
+            executor_id: row
+                .try_get("executor_id")
+                .context("partition assignment executor_id missing")?,
+            assigned_at: row
+                .try_get("assigned_at")
+                .context("partition assignment assigned_at missing")?,
+            updated_at: row
+                .try_get("updated_at")
+                .context("partition assignment updated_at missing")?,
+        })
+    }
+
     fn decode_run_row(row: sqlx::postgres::PgRow) -> Result<WorkflowRunRecord> {
         Ok(WorkflowRunRecord {
             tenant_id: row.try_get("tenant_id").context("run tenant_id missing")?,
@@ -2410,4 +2932,37 @@ impl WorkflowStore {
             updated_at: row.try_get("updated_at").context("effect updated_at missing")?,
         })
     }
+}
+
+fn plan_partition_assignments(
+    partition_count: i32,
+    members: &[ExecutorMembershipRecord],
+) -> Vec<(i32, String)> {
+    if members.is_empty() {
+        return Vec::new();
+    }
+
+    let mut loads = vec![0usize; members.len()];
+    let capacities =
+        members.iter().map(|member| member.advertised_capacity.max(1)).collect::<Vec<_>>();
+    let mut assignments = Vec::with_capacity(partition_count.max(0) as usize);
+
+    for partition_id in 0..partition_count {
+        let mut best_index = 0usize;
+        let mut best_ratio = f64::INFINITY;
+        for (index, capacity) in capacities.iter().enumerate() {
+            let ratio = loads[index] as f64 / *capacity as f64;
+            if ratio < best_ratio
+                || ((ratio - best_ratio).abs() < f64::EPSILON
+                    && members[index].executor_id < members[best_index].executor_id)
+            {
+                best_index = index;
+                best_ratio = ratio;
+            }
+        }
+        loads[best_index] += 1;
+        assignments.push((partition_id, members[best_index].executor_id.clone()));
+    }
+
+    assignments
 }

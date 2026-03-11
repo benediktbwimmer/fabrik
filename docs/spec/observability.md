@@ -33,9 +33,10 @@ This document freezes the telemetry vocabulary for `fabrik`.
 
 Current implementation note:
 
-- the executor debug surface at `/debug/runtime` returns cache hit/miss counters, snapshot restore counts, projection restore counts, cache capacity, snapshot cadence, and the current hot-instance list
-- `/debug/ownership` returns the current ownership record, lease expiry, owner epoch, and recent ownership transitions for the local executor process
+- the executor debug surface at `/debug/runtime` returns aggregate counters plus per-partition cache hit/miss counters, snapshot/projection restore counts, cache capacity, snapshot cadence, and partition-local hot-instance lists
+- `/debug/ownership` returns the current owned partition set, lease expiry, owner epoch, and recent ownership transitions for the local executor process
 - `/debug/hot-state/{tenant_id}/{instance_id}` returns the cached run id, definition id, event count, and latest restore source for one hot instance when present
+- partition ownership and assignment diagnosis now depends on both `workflow_partition_ownership` and `workflow_partition_assignments`; recent ownership transitions include `partition_id`
 
 ## Trace Rules
 

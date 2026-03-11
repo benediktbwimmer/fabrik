@@ -1,9 +1,14 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    hash::{Hash, Hasher},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use fabrik_events::{EventEnvelope, WorkflowEvent};
-use futures_util::StreamExt;
+use fabrik_events::{EventEnvelope, WorkflowEvent, workflow_partition_key};
+use futures_util::{StreamExt, stream::BoxStream};
 use rskafka::{
     client::{
         Client, ClientBuilder,
@@ -13,24 +18,60 @@ use rskafka::{
     },
     record::{Record, RecordAndOffset},
 };
-use tokio::time::{Instant, timeout};
+use serde::Serialize;
+use tokio::time::{Instant, sleep, timeout};
 
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
     pub brokers: String,
     pub workflow_events_topic: String,
+    pub workflow_events_partitions: i32,
 }
 
 impl BrokerConfig {
-    pub fn new(brokers: impl Into<String>, workflow_events_topic: impl Into<String>) -> Self {
-        Self { brokers: brokers.into(), workflow_events_topic: workflow_events_topic.into() }
+    pub fn new(
+        brokers: impl Into<String>,
+        workflow_events_topic: impl Into<String>,
+        workflow_events_partitions: i32,
+    ) -> Self {
+        Self {
+            brokers: brokers.into(),
+            workflow_events_topic: workflow_events_topic.into(),
+            workflow_events_partitions,
+        }
     }
+
+    pub fn all_partition_ids(&self) -> Vec<i32> {
+        (0..self.workflow_events_partitions).collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkflowTopicTopology {
+    pub brokers: String,
+    pub topic_name: String,
+    pub configured_partitions: i32,
+    pub configured_partition_ids: Vec<i32>,
+    pub actual_partitions: Option<i32>,
+    pub actual_partition_ids: Vec<i32>,
+    pub healthy: bool,
+    pub status: String,
 }
 
 #[derive(Clone)]
 pub struct WorkflowPublisher {
-    producer: Arc<BatchProducer<RecordAggregator>>,
+    producers: Arc<HashMap<i32, Arc<BatchProducer<RecordAggregator>>>>,
+    partition_count: i32,
 }
+
+#[derive(Debug)]
+pub struct ConsumedWorkflowRecord {
+    pub partition_id: i32,
+    pub record: RecordAndOffset,
+    pub high_watermark: i64,
+}
+
+pub type WorkflowConsumerStream = BoxStream<'static, Result<ConsumedWorkflowRecord>>;
 
 impl WorkflowPublisher {
     pub async fn new(config: &BrokerConfig, client_id: &str) -> Result<Self> {
@@ -39,29 +80,46 @@ impl WorkflowPublisher {
             .build()
             .await
             .context("failed to create kafka client")?;
-        ensure_topic(&client, &config.workflow_events_topic).await?;
+        ensure_topic(&client, &config.workflow_events_topic, config.workflow_events_partitions)
+            .await?;
 
-        let partition_client = Arc::new(
-            client
-                .partition_client(
-                    config.workflow_events_topic.clone(),
-                    0,
-                    UnknownTopicHandling::Retry,
-                )
-                .await
-                .context("failed to create producer partition client")?,
-        );
+        let mut producers = HashMap::new();
+        for partition_id in 0..config.workflow_events_partitions {
+            let partition_client = Arc::new(
+                client
+                    .partition_client(
+                        config.workflow_events_topic.clone(),
+                        partition_id,
+                        UnknownTopicHandling::Retry,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to create producer partition client for partition {partition_id}"
+                        )
+                    })?,
+            );
 
-        let producer = BatchProducerBuilder::new(partition_client)
-            .with_linger(Duration::from_millis(5))
-            .build(RecordAggregator::new(1024 * 1024));
+            let producer = BatchProducerBuilder::new(partition_client)
+                .with_linger(Duration::from_millis(5))
+                .build(RecordAggregator::new(1024 * 1024));
+            producers.insert(partition_id, Arc::new(producer));
+        }
 
-        Ok(Self { producer: Arc::new(producer) })
+        Ok(Self {
+            producers: Arc::new(producers),
+            partition_count: config.workflow_events_partitions,
+        })
     }
 
     pub async fn publish(&self, envelope: &EventEnvelope<WorkflowEvent>, key: &str) -> Result<()> {
         let payload = serde_json::to_vec(envelope).context("failed to serialize event envelope")?;
-        self.producer
+        let partition_id = partition_for_key(key, self.partition_count);
+        let producer = self
+            .producers
+            .get(&partition_id)
+            .with_context(|| format!("missing producer for workflow partition {partition_id}"))?;
+        producer
             .produce(Record {
                 key: Some(key.as_bytes().to_vec()),
                 value: Some(payload),
@@ -72,29 +130,70 @@ impl WorkflowPublisher {
             .context("failed to publish event")?;
         Ok(())
     }
+
+    pub fn partition_for_key(&self, key: &str) -> i32 {
+        partition_for_key(key, self.partition_count)
+    }
 }
 
-pub async fn build_workflow_consumer(
+pub async fn build_workflow_partition_consumer(
     config: &BrokerConfig,
     client_id: &str,
+    partition_id: i32,
 ) -> Result<StreamConsumer> {
     let client = ClientBuilder::new(vec![config.brokers.clone()])
-        .client_id(client_id)
+        .client_id(format!("{client_id}-partition-{partition_id}"))
         .build()
         .await
         .context("failed to create kafka client")?;
-    ensure_topic(&client, &config.workflow_events_topic).await?;
+    ensure_topic(&client, &config.workflow_events_topic, config.workflow_events_partitions).await?;
 
     let partition_client = Arc::new(
         client
-            .partition_client(config.workflow_events_topic.clone(), 0, UnknownTopicHandling::Retry)
+            .partition_client(
+                config.workflow_events_topic.clone(),
+                partition_id,
+                UnknownTopicHandling::Retry,
+            )
             .await
-            .context("failed to create consumer partition client")?,
+            .with_context(|| {
+                format!("failed to create consumer partition client for partition {partition_id}")
+            })?,
     );
 
     Ok(StreamConsumerBuilder::new(partition_client, StartOffset::Earliest)
         .with_max_wait_ms(250)
         .build())
+}
+
+pub async fn build_workflow_consumer(
+    config: &BrokerConfig,
+    client_id: &str,
+    partitions: &[i32],
+) -> Result<WorkflowConsumerStream> {
+    if partitions.is_empty() {
+        anyhow::bail!("workflow consumer requires at least one partition");
+    }
+
+    let mut streams = futures_util::stream::SelectAll::new();
+    for partition_id in partitions {
+        let consumer = build_workflow_partition_consumer(config, client_id, *partition_id).await?;
+        let partition_id = *partition_id;
+        streams.push(
+            consumer
+                .map(move |result| {
+                    result
+                        .map(|(record, high_watermark)| ConsumedWorkflowRecord {
+                            partition_id,
+                            record,
+                            high_watermark,
+                        })
+                        .map_err(anyhow::Error::from)
+                })
+                .boxed(),
+        );
+    }
+    Ok(streams.boxed())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,7 +226,12 @@ pub async fn read_workflow_history(
     idle_timeout: Duration,
     max_scan_duration: Duration,
 ) -> Result<Vec<EventEnvelope<WorkflowEvent>>> {
-    let mut consumer = build_workflow_consumer(config, client_id).await?;
+    let partition_id = partition_for_instance(
+        &filter.tenant_id,
+        &filter.instance_id,
+        config.workflow_events_partitions,
+    );
+    let mut consumer = build_workflow_partition_consumer(config, client_id, partition_id).await?;
     let scan_started_at = Instant::now();
     let mut last_match_at: Option<Instant> = None;
     let mut events = Vec::new();
@@ -162,24 +266,191 @@ pub async fn read_workflow_history(
     Ok(events)
 }
 
+pub async fn describe_workflow_topic(
+    config: &BrokerConfig,
+    client_id: &str,
+) -> Result<WorkflowTopicTopology> {
+    let client = ClientBuilder::new(vec![config.brokers.clone()])
+        .client_id(client_id)
+        .build()
+        .await
+        .context("failed to create kafka client")?;
+    describe_workflow_topic_with_client(config, &client).await
+}
+
+pub fn partition_for_key(key: &str, partition_count: i32) -> i32 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    (hasher.finish() % partition_count as u64) as i32
+}
+
+async fn describe_workflow_topic_with_client(
+    config: &BrokerConfig,
+    client: &Client,
+) -> Result<WorkflowTopicTopology> {
+    let actual_partitions =
+        load_topic_partition_count(client, &config.workflow_events_topic).await?;
+    Ok(build_workflow_topic_topology(config, actual_partitions))
+}
+
+fn build_workflow_topic_topology(
+    config: &BrokerConfig,
+    actual_partitions: Option<i32>,
+) -> WorkflowTopicTopology {
+    let configured_partition_ids = config.all_partition_ids();
+    let actual_partition_ids = match actual_partitions {
+        Some(partitions) if partitions > 0 => (0..partitions).collect(),
+        _ => Vec::new(),
+    };
+    let (healthy, status) = match actual_partitions {
+        Some(actual) if actual < config.workflow_events_partitions => (
+            false,
+            format!(
+                "partition_mismatch: topic has {actual} partitions but configuration requires {}",
+                config.workflow_events_partitions
+            ),
+        ),
+        Some(actual) if actual == config.workflow_events_partitions => (true, "ok".to_owned()),
+        Some(actual) => (
+            true,
+            format!(
+                "topic has {actual} partitions; configuration uses first {}",
+                config.workflow_events_partitions
+            ),
+        ),
+        None => (false, "topic_missing".to_owned()),
+    };
+
+    WorkflowTopicTopology {
+        brokers: config.brokers.clone(),
+        topic_name: config.workflow_events_topic.clone(),
+        configured_partitions: config.workflow_events_partitions,
+        configured_partition_ids,
+        actual_partitions,
+        actual_partition_ids,
+        healthy,
+        status,
+    }
+}
+
+pub fn partition_for_instance(tenant_id: &str, instance_id: &str, partition_count: i32) -> i32 {
+    partition_for_key(&workflow_partition_key(tenant_id, instance_id), partition_count)
+}
+
 pub fn decode_workflow_event(record: &RecordAndOffset) -> Result<EventEnvelope<WorkflowEvent>> {
     let payload = record.record.value.as_deref().context("message payload missing")?;
     serde_json::from_slice(payload).context("failed to deserialize workflow event")
 }
 
-async fn ensure_topic(client: &Client, topic_name: &str) -> Result<()> {
-    let topics = client.list_topics().await.context("failed to list kafka topics")?;
+pub fn decode_consumed_workflow_event(
+    record: &ConsumedWorkflowRecord,
+) -> Result<EventEnvelope<WorkflowEvent>> {
+    decode_workflow_event(&record.record)
+}
 
-    if topics.iter().any(|topic| topic.name == topic_name) {
+async fn ensure_topic(client: &Client, topic_name: &str, partitions: i32) -> Result<()> {
+    if let Some(existing) = load_topic_partition_count(client, topic_name).await? {
+        ensure_topic_partition_count(topic_name, existing, partitions)?;
         return Ok(());
     }
 
-    client
+    let create_result = client
         .controller_client()
         .context("failed to create kafka controller client")?
-        .create_topic(topic_name.to_owned(), 1, 1, 5_000)
-        .await
-        .context("failed to create workflow topic")?;
+        .create_topic(topic_name.to_owned(), partitions, 1, 5_000)
+        .await;
 
+    if let Err(error) = create_result {
+        let message = error.to_string();
+        if message.contains("TopicAlreadyExists") {
+            let existing =
+                load_topic_partition_count(client, topic_name).await?.unwrap_or_default();
+            ensure_topic_partition_count(topic_name, existing, partitions)?;
+            return Ok(());
+        }
+        return Err(error).context("failed to create workflow topic");
+    }
+
+    wait_for_topic_partitions(client, topic_name, partitions).await?;
     Ok(())
+}
+
+async fn load_topic_partition_count(client: &Client, topic_name: &str) -> Result<Option<i32>> {
+    let topics = client.list_topics().await.context("failed to list kafka topics")?;
+    Ok(topics
+        .into_iter()
+        .find(|topic| topic.name == topic_name)
+        .map(|topic| topic.partitions.len() as i32))
+}
+
+fn ensure_topic_partition_count(topic_name: &str, actual: i32, expected: i32) -> Result<()> {
+    if actual < expected {
+        anyhow::bail!(
+            "workflow topic {topic_name} has {actual} partitions but configuration requires {expected}"
+        );
+    }
+    Ok(())
+}
+
+async fn wait_for_topic_partitions(
+    client: &Client,
+    topic_name: &str,
+    partitions: i32,
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(actual) = load_topic_partition_count(client, topic_name).await? {
+            ensure_topic_partition_count(topic_name, actual, partitions)?;
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("workflow topic {topic_name} did not appear in metadata before timeout");
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BrokerConfig, build_workflow_topic_topology, ensure_topic_partition_count};
+
+    #[test]
+    fn rejects_topic_partition_shortfall() {
+        let error = ensure_topic_partition_count("workflow-events", 2, 4).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "workflow topic workflow-events has 2 partitions but configuration requires 4"
+        );
+    }
+
+    #[test]
+    fn topology_marks_missing_topic_unhealthy() {
+        let config = BrokerConfig::new("localhost:29092", "workflow-events", 4);
+        let topology = build_workflow_topic_topology(&config, None);
+        assert!(!topology.healthy);
+        assert_eq!(topology.status, "topic_missing");
+        assert_eq!(topology.configured_partition_ids, vec![0, 1, 2, 3]);
+        assert!(topology.actual_partition_ids.is_empty());
+    }
+
+    #[test]
+    fn topology_marks_partition_shortfall_unhealthy() {
+        let config = BrokerConfig::new("localhost:29092", "workflow-events", 4);
+        let topology = build_workflow_topic_topology(&config, Some(2));
+        assert!(!topology.healthy);
+        assert_eq!(
+            topology.status,
+            "partition_mismatch: topic has 2 partitions but configuration requires 4"
+        );
+        assert_eq!(topology.actual_partition_ids, vec![0, 1]);
+    }
+
+    #[test]
+    fn topology_marks_exact_match_healthy() {
+        let config = BrokerConfig::new("localhost:29092", "workflow-events", 4);
+        let topology = build_workflow_topic_topology(&config, Some(4));
+        assert!(topology.healthy);
+        assert_eq!(topology.status, "ok");
+        assert_eq!(topology.actual_partition_ids, vec![0, 1, 2, 3]);
+    }
 }

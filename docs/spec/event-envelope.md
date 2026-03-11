@@ -42,6 +42,11 @@ Every workflow event must carry:
 - `ingest-service`
 - `executor-service`
 - `timer-service`
+
+Current implementation note:
+
+- `partition_key` is a stable shard-routing key derived from `tenant_id:instance_id`, not `run_id`
+- this keeps all `ContinueAsNew` epochs for one logical workflow instance on the same broker partition and executor shard
 - `connector-service`
 - future SDK compiler or deployment control plane
 

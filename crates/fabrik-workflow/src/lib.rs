@@ -1,6 +1,6 @@
 mod compiled;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -788,6 +788,7 @@ pub fn replay_compiled_history_trace(
     history: &[EventEnvelope<WorkflowEvent>],
     artifact: &CompiledWorkflowArtifact,
 ) -> Result<ReplayTrace> {
+    let mut seen_dedupe_keys = HashSet::new();
     let trigger = history
         .iter()
         .find_map(|event| match &event.payload {
@@ -814,112 +815,117 @@ pub fn replay_compiled_history_trace(
     for event in history.iter().skip(1) {
         let before = replay_checkpoint(&replayed);
         replayed.apply_event(event);
+        let skip_semantic = should_skip_replay_event(event, &mut seen_dedupe_keys);
         let mut advanced = false;
-        match &event.payload {
-            WorkflowEvent::SignalReceived { signal_type, payload, .. } => {
-                execution = artifact.execute_after_signal_with_turn(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    signal_type,
-                    payload,
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                    ExecutionTurnContext {
-                        event_id: event.event_id,
-                        occurred_at: event.occurred_at,
-                    },
-                )?;
-                advanced = true;
+        if !skip_semantic {
+            match &event.payload {
+                WorkflowEvent::SignalReceived { signal_type, payload, .. } => {
+                    execution = artifact.execute_after_signal_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        signal_type,
+                        payload,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    advanced = true;
+                }
+                WorkflowEvent::TimerFired { timer_id } => {
+                    if !is_internal_control_timer(timer_id) {
+                        execution = artifact.execute_after_timer_with_turn(
+                            replayed.current_state.as_deref().unwrap_or_default(),
+                            timer_id,
+                            replayed.artifact_execution.clone().unwrap_or_default(),
+                            ExecutionTurnContext {
+                                event_id: event.event_id,
+                                occurred_at: event.occurred_at,
+                            },
+                        )?;
+                        advanced = true;
+                    }
+                }
+                WorkflowEvent::StepCompleted { step_id, output, .. } => {
+                    execution = artifact.execute_after_step_completion_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        step_id,
+                        output,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    advanced = true;
+                }
+                WorkflowEvent::EffectCompleted { effect_id, output, .. } => {
+                    execution = artifact.execute_after_effect_completion_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        effect_id,
+                        output,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    advanced = true;
+                }
+                WorkflowEvent::StepFailed { step_id, error, .. } => {
+                    execution = artifact.execute_after_step_failure_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        step_id,
+                        error,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    advanced = true;
+                }
+                WorkflowEvent::EffectFailed { effect_id, error, .. } => {
+                    execution = artifact.execute_after_effect_failure_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        effect_id,
+                        error,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    advanced = true;
+                }
+                WorkflowEvent::EffectTimedOut { effect_id, .. } => {
+                    execution = artifact.execute_after_effect_failure_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        effect_id,
+                        "effect timed out",
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    advanced = true;
+                }
+                WorkflowEvent::EffectCancelled { effect_id, reason, .. } => {
+                    execution = artifact.execute_after_effect_failure_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        effect_id,
+                        reason,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    advanced = true;
+                }
+                _ => {}
             }
-            WorkflowEvent::TimerFired { timer_id } => {
-                execution = artifact.execute_after_timer_with_turn(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    timer_id,
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                    ExecutionTurnContext {
-                        event_id: event.event_id,
-                        occurred_at: event.occurred_at,
-                    },
-                )?;
-                advanced = true;
-            }
-            WorkflowEvent::StepCompleted { step_id, output, .. } => {
-                execution = artifact.execute_after_step_completion_with_turn(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    step_id,
-                    output,
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                    ExecutionTurnContext {
-                        event_id: event.event_id,
-                        occurred_at: event.occurred_at,
-                    },
-                )?;
-                advanced = true;
-            }
-            WorkflowEvent::EffectCompleted { effect_id, output, .. } => {
-                execution = artifact.execute_after_effect_completion_with_turn(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    effect_id,
-                    output,
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                    ExecutionTurnContext {
-                        event_id: event.event_id,
-                        occurred_at: event.occurred_at,
-                    },
-                )?;
-                advanced = true;
-            }
-            WorkflowEvent::StepFailed { step_id, error, .. } => {
-                execution = artifact.execute_after_step_failure_with_turn(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    step_id,
-                    error,
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                    ExecutionTurnContext {
-                        event_id: event.event_id,
-                        occurred_at: event.occurred_at,
-                    },
-                )?;
-                advanced = true;
-            }
-            WorkflowEvent::EffectFailed { effect_id, error, .. } => {
-                execution = artifact.execute_after_effect_failure_with_turn(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    effect_id,
-                    error,
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                    ExecutionTurnContext {
-                        event_id: event.event_id,
-                        occurred_at: event.occurred_at,
-                    },
-                )?;
-                advanced = true;
-            }
-            WorkflowEvent::EffectTimedOut { effect_id, .. } => {
-                execution = artifact.execute_after_effect_failure_with_turn(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    effect_id,
-                    "effect timed out",
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                    ExecutionTurnContext {
-                        event_id: event.event_id,
-                        occurred_at: event.occurred_at,
-                    },
-                )?;
-                advanced = true;
-            }
-            WorkflowEvent::EffectCancelled { effect_id, reason, .. } => {
-                execution = artifact.execute_after_effect_failure_with_turn(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    effect_id,
-                    reason,
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                    ExecutionTurnContext {
-                        event_id: event.event_id,
-                        occurred_at: event.occurred_at,
-                    },
-                )?;
-                advanced = true;
-            }
-            _ => {}
         }
         if advanced {
             apply_compiled_execution(&mut replayed, &execution);
@@ -946,115 +952,120 @@ pub fn replay_compiled_history_trace_from_snapshot(
 ) -> Result<ReplayTrace> {
     let mut replayed = snapshot_state.clone();
     let mut transitions = Vec::with_capacity(history_tail.len());
+    let mut seen_dedupe_keys = HashSet::new();
 
     for event in history_tail {
         let before = replay_checkpoint(&replayed);
         replayed.apply_event(event);
-        match &event.payload {
-            WorkflowEvent::SignalReceived { signal_type, payload, .. } => {
-                let execution = artifact.execute_after_signal_with_turn(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    signal_type,
-                    payload,
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                    ExecutionTurnContext {
-                        event_id: event.event_id,
-                        occurred_at: event.occurred_at,
-                    },
-                )?;
-                apply_compiled_execution(&mut replayed, &execution);
+        if !should_skip_replay_event(event, &mut seen_dedupe_keys) {
+            match &event.payload {
+                WorkflowEvent::SignalReceived { signal_type, payload, .. } => {
+                    let execution = artifact.execute_after_signal_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        signal_type,
+                        payload,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    apply_compiled_execution(&mut replayed, &execution);
+                }
+                WorkflowEvent::TimerFired { timer_id } => {
+                    if !is_internal_control_timer(timer_id) {
+                        let execution = artifact.execute_after_timer_with_turn(
+                            replayed.current_state.as_deref().unwrap_or_default(),
+                            timer_id,
+                            replayed.artifact_execution.clone().unwrap_or_default(),
+                            ExecutionTurnContext {
+                                event_id: event.event_id,
+                                occurred_at: event.occurred_at,
+                            },
+                        )?;
+                        apply_compiled_execution(&mut replayed, &execution);
+                    }
+                }
+                WorkflowEvent::StepCompleted { step_id, output, .. } => {
+                    let execution = artifact.execute_after_step_completion_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        step_id,
+                        output,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    apply_compiled_execution(&mut replayed, &execution);
+                }
+                WorkflowEvent::EffectCompleted { effect_id, output, .. } => {
+                    let execution = artifact.execute_after_effect_completion_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        effect_id,
+                        output,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    apply_compiled_execution(&mut replayed, &execution);
+                }
+                WorkflowEvent::StepFailed { step_id, error, .. } => {
+                    let execution = artifact.execute_after_step_failure_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        step_id,
+                        error,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    apply_compiled_execution(&mut replayed, &execution);
+                }
+                WorkflowEvent::EffectFailed { effect_id, error, .. } => {
+                    let execution = artifact.execute_after_effect_failure_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        effect_id,
+                        error,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    apply_compiled_execution(&mut replayed, &execution);
+                }
+                WorkflowEvent::EffectTimedOut { effect_id, .. } => {
+                    let execution = artifact.execute_after_effect_failure_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        effect_id,
+                        "effect timed out",
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    apply_compiled_execution(&mut replayed, &execution);
+                }
+                WorkflowEvent::EffectCancelled { effect_id, reason, .. } => {
+                    let execution = artifact.execute_after_effect_failure_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        effect_id,
+                        reason,
+                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    apply_compiled_execution(&mut replayed, &execution);
+                }
+                _ => {}
             }
-            WorkflowEvent::TimerFired { timer_id } => {
-                let execution = artifact.execute_after_timer_with_turn(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    timer_id,
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                    ExecutionTurnContext {
-                        event_id: event.event_id,
-                        occurred_at: event.occurred_at,
-                    },
-                )?;
-                apply_compiled_execution(&mut replayed, &execution);
-            }
-            WorkflowEvent::StepCompleted { step_id, output, .. } => {
-                let execution = artifact.execute_after_step_completion_with_turn(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    step_id,
-                    output,
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                    ExecutionTurnContext {
-                        event_id: event.event_id,
-                        occurred_at: event.occurred_at,
-                    },
-                )?;
-                apply_compiled_execution(&mut replayed, &execution);
-            }
-            WorkflowEvent::EffectCompleted { effect_id, output, .. } => {
-                let execution = artifact.execute_after_effect_completion_with_turn(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    effect_id,
-                    output,
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                    ExecutionTurnContext {
-                        event_id: event.event_id,
-                        occurred_at: event.occurred_at,
-                    },
-                )?;
-                apply_compiled_execution(&mut replayed, &execution);
-            }
-            WorkflowEvent::StepFailed { step_id, error, .. } => {
-                let execution = artifact.execute_after_step_failure_with_turn(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    step_id,
-                    error,
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                    ExecutionTurnContext {
-                        event_id: event.event_id,
-                        occurred_at: event.occurred_at,
-                    },
-                )?;
-                apply_compiled_execution(&mut replayed, &execution);
-            }
-            WorkflowEvent::EffectFailed { effect_id, error, .. } => {
-                let execution = artifact.execute_after_effect_failure_with_turn(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    effect_id,
-                    error,
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                    ExecutionTurnContext {
-                        event_id: event.event_id,
-                        occurred_at: event.occurred_at,
-                    },
-                )?;
-                apply_compiled_execution(&mut replayed, &execution);
-            }
-            WorkflowEvent::EffectTimedOut { effect_id, .. } => {
-                let execution = artifact.execute_after_effect_failure_with_turn(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    effect_id,
-                    "effect timed out",
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                    ExecutionTurnContext {
-                        event_id: event.event_id,
-                        occurred_at: event.occurred_at,
-                    },
-                )?;
-                apply_compiled_execution(&mut replayed, &execution);
-            }
-            WorkflowEvent::EffectCancelled { effect_id, reason, .. } => {
-                let execution = artifact.execute_after_effect_failure_with_turn(
-                    replayed.current_state.as_deref().unwrap_or_default(),
-                    effect_id,
-                    reason,
-                    replayed.artifact_execution.clone().unwrap_or_default(),
-                    ExecutionTurnContext {
-                        event_id: event.event_id,
-                        occurred_at: event.occurred_at,
-                    },
-                )?;
-                apply_compiled_execution(&mut replayed, &execution);
-            }
-            _ => {}
         }
         transitions.push(ReplayTransitionTraceEntry {
             event_id: event.event_id,
@@ -1084,6 +1095,17 @@ fn apply_compiled_execution(
     replayed.context = execution.context.clone();
     replayed.output = execution.output.clone();
     replayed.artifact_execution = Some(execution.execution_state.clone());
+}
+
+fn should_skip_replay_event(
+    event: &EventEnvelope<WorkflowEvent>,
+    seen_dedupe_keys: &mut HashSet<String>,
+) -> bool {
+    event.dedupe_key.as_ref().is_some_and(|dedupe_key| !seen_dedupe_keys.insert(dedupe_key.clone()))
+}
+
+fn is_internal_control_timer(timer_id: &str) -> bool {
+    timer_id.starts_with("effect-timeout:") || timer_id.starts_with("retry:")
 }
 
 fn replay_checkpoint(state: &WorkflowInstanceState) -> ReplayCheckpoint {
@@ -1270,10 +1292,17 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
+    use crate::compiled::{
+        ArtifactEntrypoint, CompiledStateNode, CompiledWorkflow, CompiledWorkflowArtifact,
+        Expression,
+    };
+
     use super::{
         ExecutionEmission, HttpRequestConfig, ReplaySource, RetryPolicy, StateNode, StepConfig,
         WorkflowDefinition, WorkflowInstanceState, WorkflowProjectionError, WorkflowStatus,
-        WorkflowValidationError, replay_history_trace, replay_history_trace_from_snapshot,
+        WorkflowValidationError, replay_compiled_history_trace,
+        replay_compiled_history_trace_from_snapshot, replay_history_trace,
+        replay_history_trace_from_snapshot,
     };
 
     fn test_event(
@@ -1306,6 +1335,87 @@ mod tests {
             metadata: event_metadata,
             payload,
         }
+    }
+
+    fn test_event_with_dedupe(
+        event_type: &str,
+        run_id: &str,
+        payload: WorkflowEvent,
+        metadata: &[(&str, &str)],
+        dedupe_key: Option<&str>,
+    ) -> EventEnvelope<WorkflowEvent> {
+        let mut event = test_event(event_type, run_id, payload, metadata);
+        event.dedupe_key = dedupe_key.map(str::to_owned);
+        event
+    }
+
+    fn compiled_test_artifact() -> CompiledWorkflowArtifact {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "wait_signal".to_owned(),
+            CompiledStateNode::WaitForEvent {
+                event_type: "external.approved".to_owned(),
+                next: "wait_timer".to_owned(),
+                output_var: Some("approval".to_owned()),
+            },
+        );
+        states.insert(
+            "wait_timer".to_owned(),
+            CompiledStateNode::WaitForTimer {
+                timer_ref: "5s".to_owned(),
+                next: "effect".to_owned(),
+            },
+        );
+        states.insert(
+            "effect".to_owned(),
+            CompiledStateNode::Effect {
+                connector: "core.echo".to_owned(),
+                input: Expression::Object {
+                    fields: BTreeMap::from([
+                        (
+                            "approval".to_owned(),
+                            Expression::Identifier { name: "approval".to_owned() },
+                        ),
+                        (
+                            "originalInput".to_owned(),
+                            Expression::Identifier { name: "input".to_owned() },
+                        ),
+                    ]),
+                },
+                next: "done".to_owned(),
+                timeout: None,
+                retry: None,
+                config: None,
+                output_var: Some("echoed".to_owned()),
+                on_error: None,
+            },
+        );
+        states.insert(
+            "done".to_owned(),
+            CompiledStateNode::Succeed {
+                output: Some(Expression::Object {
+                    fields: BTreeMap::from([
+                        (
+                            "approval".to_owned(),
+                            Expression::Identifier { name: "approval".to_owned() },
+                        ),
+                        ("input".to_owned(), Expression::Identifier { name: "input".to_owned() }),
+                        ("echoed".to_owned(), Expression::Identifier { name: "echoed".to_owned() }),
+                    ]),
+                }),
+            },
+        );
+
+        CompiledWorkflowArtifact::new(
+            "compiled-demo".to_owned(),
+            1,
+            "test-compiler",
+            ArtifactEntrypoint {
+                module: "workflow.ts".to_owned(),
+                export: "liveValidation".to_owned(),
+            },
+            CompiledWorkflow { initial_state: "wait_signal".to_owned(), states },
+        )
     }
 
     #[test]
@@ -1509,6 +1619,242 @@ mod tests {
         assert_eq!(trace.transitions.len(), 1);
         assert_eq!(trace.final_state.current_state, Some("done".to_owned()));
         assert_eq!(trace.final_state.status, WorkflowStatus::Completed);
+    }
+
+    #[test]
+    fn compiled_replay_from_snapshot_preserves_bindings() {
+        let artifact = compiled_test_artifact();
+        let run_id = "run-compiled";
+        let input = json!({"request_id": "live-2"});
+        let approval = json!({"approved": true});
+        let echoed = json!({
+            "approval": approval.clone(),
+            "originalInput": input.clone(),
+        });
+
+        let triggered = test_event(
+            "WorkflowTriggered",
+            run_id,
+            WorkflowEvent::WorkflowTriggered { input: input.clone() },
+            &[],
+        );
+        let pinned = test_event(
+            "WorkflowArtifactPinned",
+            run_id,
+            WorkflowEvent::WorkflowArtifactPinned,
+            &[],
+        );
+        let started = test_event(
+            "WorkflowStarted",
+            run_id,
+            WorkflowEvent::WorkflowStarted,
+            &[("state", "wait_signal")],
+        );
+        let signal = test_event(
+            "SignalReceived",
+            run_id,
+            WorkflowEvent::SignalReceived {
+                signal_id: "sig-1".to_owned(),
+                signal_type: "external.approved".to_owned(),
+                payload: approval.clone(),
+            },
+            &[],
+        );
+        let timer_scheduled = test_event(
+            "TimerScheduled",
+            run_id,
+            WorkflowEvent::TimerScheduled {
+                timer_id: "wait_timer".to_owned(),
+                fire_at: Utc::now(),
+            },
+            &[("state", "wait_timer")],
+        );
+        let timer_fired = test_event_with_dedupe(
+            "TimerFired",
+            run_id,
+            WorkflowEvent::TimerFired { timer_id: "wait_timer".to_owned() },
+            &[("state", "wait_timer")],
+            Some("timer:wait_timer"),
+        );
+        let effect_requested = test_event(
+            "EffectRequested",
+            run_id,
+            WorkflowEvent::EffectRequested {
+                effect_id: "effect".to_owned(),
+                connector: "core.echo".to_owned(),
+                attempt: 1,
+                input: echoed.clone(),
+            },
+            &[("state", "effect")],
+        );
+        let effect_completed = test_event(
+            "EffectCompleted",
+            run_id,
+            WorkflowEvent::EffectCompleted {
+                effect_id: "effect".to_owned(),
+                attempt: 1,
+                output: echoed.clone(),
+            },
+            &[("state", "effect")],
+        );
+        let completed = test_event(
+            "WorkflowCompleted",
+            run_id,
+            WorkflowEvent::WorkflowCompleted {
+                output: json!({
+                    "approval": approval.clone(),
+                    "input": input.clone(),
+                    "echoed": echoed.clone(),
+                }),
+            },
+            &[("state", "done")],
+        );
+
+        let history = vec![
+            triggered.clone(),
+            pinned,
+            started,
+            signal,
+            timer_scheduled.clone(),
+            timer_fired.clone(),
+            effect_requested,
+            effect_completed,
+            completed,
+        ];
+
+        let snapshot_state =
+            replay_compiled_history_trace(&history[..5], &artifact).unwrap().final_state;
+        let trace = replay_compiled_history_trace_from_snapshot(
+            &history[5..],
+            &snapshot_state,
+            &artifact,
+            snapshot_state.event_count,
+            timer_scheduled.event_id,
+            &timer_scheduled.event_type,
+        )
+        .unwrap();
+
+        assert_eq!(
+            trace.final_state.output,
+            Some(json!({
+                "approval": approval,
+                "input": input,
+                "echoed": echoed,
+            }))
+        );
+        let bindings = &trace
+            .final_state
+            .artifact_execution
+            .as_ref()
+            .expect("compiled bindings should exist")
+            .bindings;
+        assert_eq!(bindings.get("approval"), Some(&json!({"approved": true})));
+        assert_eq!(bindings.get("input"), Some(&json!({"request_id": "live-2"})));
+    }
+
+    #[test]
+    fn compiled_replay_skips_duplicate_timer_fires_by_dedupe_key() {
+        let artifact = compiled_test_artifact();
+        let run_id = "run-dedupe";
+        let input = json!({"request_id": "live-3"});
+        let approval = json!({"approved": true});
+        let echoed = json!({
+            "approval": approval.clone(),
+            "originalInput": input.clone(),
+        });
+
+        let history = vec![
+            test_event(
+                "WorkflowTriggered",
+                run_id,
+                WorkflowEvent::WorkflowTriggered { input: input.clone() },
+                &[],
+            ),
+            test_event(
+                "WorkflowArtifactPinned",
+                run_id,
+                WorkflowEvent::WorkflowArtifactPinned,
+                &[],
+            ),
+            test_event(
+                "WorkflowStarted",
+                run_id,
+                WorkflowEvent::WorkflowStarted,
+                &[("state", "wait_signal")],
+            ),
+            test_event(
+                "SignalReceived",
+                run_id,
+                WorkflowEvent::SignalReceived {
+                    signal_id: "sig-1".to_owned(),
+                    signal_type: "external.approved".to_owned(),
+                    payload: approval.clone(),
+                },
+                &[],
+            ),
+            test_event(
+                "TimerScheduled",
+                run_id,
+                WorkflowEvent::TimerScheduled {
+                    timer_id: "wait_timer".to_owned(),
+                    fire_at: Utc::now(),
+                },
+                &[("state", "wait_timer")],
+            ),
+            test_event_with_dedupe(
+                "TimerFired",
+                run_id,
+                WorkflowEvent::TimerFired { timer_id: "wait_timer".to_owned() },
+                &[("state", "wait_timer")],
+                Some("timer:wait_timer"),
+            ),
+            test_event_with_dedupe(
+                "TimerFired",
+                run_id,
+                WorkflowEvent::TimerFired { timer_id: "wait_timer".to_owned() },
+                &[("state", "wait_timer")],
+                Some("timer:wait_timer"),
+            ),
+            test_event(
+                "EffectRequested",
+                run_id,
+                WorkflowEvent::EffectRequested {
+                    effect_id: "effect".to_owned(),
+                    connector: "core.echo".to_owned(),
+                    attempt: 1,
+                    input: echoed.clone(),
+                },
+                &[("state", "effect")],
+            ),
+            test_event(
+                "EffectCompleted",
+                run_id,
+                WorkflowEvent::EffectCompleted {
+                    effect_id: "effect".to_owned(),
+                    attempt: 1,
+                    output: echoed.clone(),
+                },
+                &[("state", "effect")],
+            ),
+            test_event(
+                "WorkflowCompleted",
+                run_id,
+                WorkflowEvent::WorkflowCompleted {
+                    output: json!({
+                        "approval": approval,
+                        "input": input,
+                        "echoed": echoed,
+                    }),
+                },
+                &[("state", "done")],
+            ),
+        ];
+
+        let trace = replay_compiled_history_trace(&history, &artifact).unwrap();
+        assert_eq!(trace.final_state.status, WorkflowStatus::Completed);
+        assert_eq!(trace.transitions.len(), 10);
+        assert_eq!(trace.final_state.event_count, 10);
+        assert_eq!(trace.final_state.current_state, Some("done".to_owned()));
     }
 
     #[test]

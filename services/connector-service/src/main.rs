@@ -1,6 +1,6 @@
 use anyhow::Result;
 use fabrik_broker::{
-    BrokerConfig, WorkflowPublisher, build_workflow_consumer, decode_workflow_event,
+    BrokerConfig, WorkflowPublisher, build_workflow_consumer, decode_consumed_workflow_event,
 };
 use fabrik_config::{HttpServiceConfig, PostgresConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
@@ -10,10 +10,17 @@ use fabrik_workflow::{CompiledWorkflowArtifact, StepConfig, WorkflowDefinition, 
 use futures_util::StreamExt;
 use reqwest::{Client, Method, Response};
 use serde_json::Value;
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
 
 const EFFECT_CANCELLATION_POLL_MS: u64 = 250;
+const EFFECT_REPAIR_INTERVAL_MS: u64 = 1_000;
+
+type InflightEffects = Arc<Mutex<HashSet<String>>>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -23,14 +30,27 @@ async fn main() -> Result<()> {
     init_tracing(&config.log_filter);
     info!(port = config.port, "starting connector service");
 
-    let broker = BrokerConfig::new(redpanda.brokers, redpanda.workflow_events_topic);
+    let broker = BrokerConfig::new(
+        redpanda.brokers,
+        redpanda.workflow_events_topic,
+        redpanda.workflow_events_partitions,
+    );
     let publisher = WorkflowPublisher::new(&broker, "connector-service").await?;
-    let consumer = build_workflow_consumer(&broker, "connector-service").await?;
+    let consumer =
+        build_workflow_consumer(&broker, "connector-service", &broker.all_partition_ids()).await?;
     let store = WorkflowStore::connect(&postgres.url).await?;
     let client = Client::new();
     store.init().await?;
+    let inflight_effects = Arc::new(Mutex::new(HashSet::new()));
 
-    tokio::spawn(run_connector_loop(consumer, publisher, store.clone(), client));
+    tokio::spawn(run_connector_loop(
+        consumer,
+        publisher.clone(),
+        store.clone(),
+        client.clone(),
+        inflight_effects.clone(),
+    ));
+    tokio::spawn(run_effect_repair_loop(store.clone(), publisher, client, inflight_effects));
 
     let app =
         default_router::<()>(ServiceInfo::new(config.name, "connector", env!("CARGO_PKG_VERSION")));
@@ -39,18 +59,21 @@ async fn main() -> Result<()> {
 }
 
 async fn run_connector_loop(
-    consumer: rskafka::client::consumer::StreamConsumer,
+    consumer: fabrik_broker::WorkflowConsumerStream,
     publisher: WorkflowPublisher,
     store: WorkflowStore,
     client: Client,
+    inflight_effects: InflightEffects,
 ) {
     let mut stream = consumer;
 
     while let Some(message) = stream.next().await {
         match message {
-            Ok((record, _high_watermark)) => match decode_workflow_event(&record) {
+            Ok(record) => match decode_consumed_workflow_event(&record) {
                 Ok(event) => {
-                    if let Err(error) = process_event(&store, &publisher, &client, event).await {
+                    if let Err(error) =
+                        process_event(&store, &publisher, &client, &inflight_effects, event).await
+                    {
                         error!(error = %error, "failed to process connector event");
                     }
                 }
@@ -65,6 +88,7 @@ async fn process_event(
     store: &WorkflowStore,
     publisher: &WorkflowPublisher,
     client: &Client,
+    inflight_effects: &InflightEffects,
     event: EventEnvelope<WorkflowEvent>,
 ) -> Result<()> {
     let target = match &event.payload {
@@ -86,6 +110,14 @@ async fn process_event(
     };
 
     if !store.mark_connector_event_processed(&event).await? {
+        return Ok(());
+    }
+
+    let guard = match target.kind {
+        ConnectorTargetKind::Step => None,
+        ConnectorTargetKind::Effect => acquire_effect_guard(inflight_effects, &event, &target),
+    };
+    if matches!(target.kind, ConnectorTargetKind::Effect) && guard.is_none() {
         return Ok(());
     }
 
@@ -182,6 +214,7 @@ async fn process_event(
             );
             envelope.causation_id = Some(event.event_id);
             envelope.correlation_id = event.correlation_id.or(Some(event.event_id));
+            envelope.dedupe_key = Some(connector_terminal_dedupe_key(&event, &target));
             envelope.metadata.insert("state".to_owned(), target.id.clone());
             envelope.metadata.insert("attempt".to_owned(), target.attempt.to_string());
             publisher.publish(&envelope, &envelope.partition_key).await?;
@@ -214,6 +247,19 @@ struct ConnectorTarget {
 enum ConnectorTargetKind {
     Step,
     Effect,
+}
+
+struct EffectExecutionGuard {
+    key: String,
+    inflight: InflightEffects,
+}
+
+impl Drop for EffectExecutionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut inflight) = self.inflight.lock() {
+            inflight.remove(&self.key);
+        }
+    }
 }
 
 async fn execute_effect_with_cooperative_cancellation(
@@ -364,15 +410,7 @@ fn build_idempotency_key(
     step_id: &str,
     attempt: u32,
 ) -> String {
-    format!(
-        "{}:{}:{}:{}:{}:{}",
-        event.tenant_id,
-        event.instance_id,
-        event.run_id,
-        step_id,
-        attempt,
-        event.correlation_id.unwrap_or(event.event_id)
-    )
+    format!("{}:{}:{}:{}:{}", event.tenant_id, event.instance_id, event.run_id, step_id, attempt)
 }
 
 fn response_headers(response: &Response) -> serde_json::Map<String, Value> {
@@ -428,6 +466,7 @@ async fn publish_connector_failure(
     );
     envelope.causation_id = Some(source.event_id);
     envelope.correlation_id = source.correlation_id.or(Some(source.event_id));
+    envelope.dedupe_key = Some(connector_terminal_dedupe_key(source, target));
     envelope.metadata.insert("state".to_owned(), target.id.clone());
     envelope.metadata.insert("attempt".to_owned(), target.attempt.to_string());
     publisher.publish(&envelope, &envelope.partition_key).await?;
@@ -480,4 +519,201 @@ fn source_identity(event: &EventEnvelope<WorkflowEvent>, producer: &str) -> Work
         event.run_id.clone(),
         producer.to_owned(),
     )
+}
+
+fn connector_terminal_dedupe_key(
+    source: &EventEnvelope<WorkflowEvent>,
+    target: &ConnectorTarget,
+) -> String {
+    format!(
+        "connector:{}:{}:{}:{}:{}:terminal",
+        source.tenant_id, source.instance_id, source.run_id, target.id, target.attempt
+    )
+}
+
+fn effect_guard_key(event: &EventEnvelope<WorkflowEvent>, target: &ConnectorTarget) -> String {
+    format!(
+        "{}:{}:{}:{}:{}",
+        event.tenant_id, event.instance_id, event.run_id, target.id, target.attempt
+    )
+}
+
+fn acquire_effect_guard(
+    inflight_effects: &InflightEffects,
+    event: &EventEnvelope<WorkflowEvent>,
+    target: &ConnectorTarget,
+) -> Option<EffectExecutionGuard> {
+    let key = effect_guard_key(event, target);
+    let mut inflight = inflight_effects.lock().ok()?;
+    if !inflight.insert(key.clone()) {
+        return None;
+    }
+    drop(inflight);
+
+    Some(EffectExecutionGuard { key, inflight: inflight_effects.clone() })
+}
+
+fn effect_source_event(
+    record: &fabrik_store::WorkflowEffectRecord,
+) -> EventEnvelope<WorkflowEvent> {
+    let payload = WorkflowEvent::EffectRequested {
+        effect_id: record.effect_id.clone(),
+        connector: record.connector.clone(),
+        attempt: record.attempt,
+        input: record.input.clone(),
+    };
+    let mut envelope = EventEnvelope::new(
+        payload.event_type(),
+        WorkflowIdentity::new(
+            record.tenant_id.clone(),
+            record.definition_id.clone(),
+            record.definition_version.unwrap_or_default(),
+            record.artifact_hash.clone().unwrap_or_default(),
+            record.instance_id.clone(),
+            record.run_id.clone(),
+            "connector-repair",
+        ),
+        payload,
+    );
+    envelope.event_id = record.last_event_id;
+    envelope.occurred_at = record.requested_at;
+    envelope.metadata.insert("state".to_owned(), record.effect_id.clone());
+    envelope.metadata.insert("attempt".to_owned(), record.attempt.to_string());
+    envelope
+}
+
+async fn repair_requested_effect(
+    store: &WorkflowStore,
+    publisher: &WorkflowPublisher,
+    client: &Client,
+    inflight_effects: &InflightEffects,
+    record: fabrik_store::WorkflowEffectRecord,
+) -> Result<()> {
+    let event = effect_source_event(&record);
+    let target = ConnectorTarget {
+        id: record.effect_id.clone(),
+        attempt: record.attempt,
+        input: record.input.clone(),
+        kind: ConnectorTargetKind::Effect,
+    };
+
+    let guard = match acquire_effect_guard(inflight_effects, &event, &target) {
+        Some(guard) => guard,
+        None => return Ok(()),
+    };
+    let _guard = guard;
+
+    if !effect_attempt_is_publishable(store, &event, &target).await? {
+        return Ok(());
+    }
+
+    let instance = match store.get_instance(&event.tenant_id, &event.instance_id).await? {
+        Some(instance) if instance.run_id == event.run_id => instance,
+        _ => return Ok(()),
+    };
+
+    let (handler, config) = if let Some(artifact) =
+        load_pinned_artifact(store, &event, &instance.definition_id, instance.definition_version)
+            .await?
+    {
+        match artifact.effect_descriptor(&target.id) {
+            Ok((handler, config)) => (handler, config),
+            Err(error) => {
+                publish_connector_failure(publisher, &event, &target, error.to_string()).await?;
+                return Ok(());
+            }
+        }
+    } else {
+        let definition = load_pinned_definition(
+            store,
+            &event,
+            &instance.definition_id,
+            instance.definition_version,
+        )
+        .await?;
+        let handler = match definition.step_handler(&target.id) {
+            Ok(handler) => handler.to_owned(),
+            Err(error) => {
+                publish_connector_failure(publisher, &event, &target, error.to_string()).await?;
+                return Ok(());
+            }
+        };
+        let config = match definition.step_config(&target.id) {
+            Ok(config) => config.cloned(),
+            Err(error) => {
+                publish_connector_failure(publisher, &event, &target, error.to_string()).await?;
+                return Ok(());
+            }
+        };
+        (handler, config)
+    };
+
+    let idempotency_key = build_idempotency_key(&event, &target.id, target.attempt);
+    let execution_result = execute_effect_with_cooperative_cancellation(
+        store,
+        client,
+        &handler,
+        config,
+        &target,
+        &event,
+        &idempotency_key,
+    )
+    .await?;
+
+    match execution_result {
+        Some(Ok(output)) => {
+            let payload = WorkflowEvent::EffectCompleted {
+                effect_id: target.id.clone(),
+                attempt: target.attempt,
+                output,
+            };
+            let mut envelope = EventEnvelope::new(
+                payload.event_type(),
+                source_identity(&event, "connector-repair"),
+                payload,
+            );
+            envelope.causation_id = Some(event.event_id);
+            envelope.correlation_id = Some(event.event_id);
+            envelope.dedupe_key = Some(connector_terminal_dedupe_key(&event, &target));
+            envelope.metadata.insert("state".to_owned(), target.id.clone());
+            envelope.metadata.insert("attempt".to_owned(), target.attempt.to_string());
+            publisher.publish(&envelope, &envelope.partition_key).await?;
+        }
+        Some(Err(error)) => {
+            publish_connector_failure(publisher, &event, &target, error.to_string()).await?;
+        }
+        None => {}
+    }
+
+    Ok(())
+}
+
+async fn run_effect_repair_loop(
+    store: WorkflowStore,
+    publisher: WorkflowPublisher,
+    client: Client,
+    inflight_effects: InflightEffects,
+) {
+    loop {
+        match store.list_requested_effects(128).await {
+            Ok(records) => {
+                for record in records {
+                    if let Err(error) = repair_requested_effect(
+                        &store,
+                        &publisher,
+                        &client,
+                        &inflight_effects,
+                        record,
+                    )
+                    .await
+                    {
+                        error!(error = %error, "failed to repair requested effect");
+                    }
+                }
+            }
+            Err(error) => error!(error = %error, "failed to list requested effects"),
+        }
+
+        sleep(Duration::from_millis(EFFECT_REPAIR_INTERVAL_MS)).await;
+    }
 }

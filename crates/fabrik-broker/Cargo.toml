@@ -10,5 +10,6 @@ chrono.workspace = true
 fabrik-events = { path = "../fabrik-events" }
 futures-util.workspace = true
 rskafka.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use chrono::Utc;
 use fabrik_broker::{BrokerConfig, WorkflowPublisher};
-use fabrik_config::{HttpServiceConfig, OwnershipConfig, PostgresConfig, RedpandaConfig};
+use fabrik_config::{HttpServiceConfig, PostgresConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{PartitionOwnershipRecord, ScheduledTimer, WorkflowStore};
@@ -12,16 +12,25 @@ async fn main() -> Result<()> {
     let config = HttpServiceConfig::from_env("TIMER_SERVICE", "timer-service", 3003)?;
     let redpanda = RedpandaConfig::from_env()?;
     let postgres = PostgresConfig::from_env()?;
-    let ownership = OwnershipConfig::from_env()?;
     init_tracing(&config.log_filter);
-    info!(port = config.port, partition_id = ownership.partition_id, "starting timer service");
+    info!(
+        port = config.port,
+        partition_count = redpanda.workflow_events_partitions,
+        "starting timer service"
+    );
 
-    let broker = BrokerConfig::new(redpanda.brokers, redpanda.workflow_events_topic);
+    let broker = BrokerConfig::new(
+        redpanda.brokers,
+        redpanda.workflow_events_topic,
+        redpanda.workflow_events_partitions,
+    );
     let publisher = WorkflowPublisher::new(&broker, "timer-service").await?;
     let store = WorkflowStore::connect(&postgres.url).await?;
     store.init().await?;
 
-    tokio::spawn(run_timer_loop(store.clone(), publisher, ownership.partition_id));
+    for partition_id in 0..redpanda.workflow_events_partitions {
+        tokio::spawn(run_timer_loop(store.clone(), publisher.clone(), partition_id));
+    }
 
     let app =
         default_router::<()>(ServiceInfo::new(config.name, "timer", env!("CARGO_PKG_VERSION")));
@@ -46,7 +55,7 @@ async fn run_timer_loop(store: WorkflowStore, publisher: WorkflowPublisher, part
 
         match ownership {
             Some(ownership) => {
-                match store.claim_due_timers(now, 100, ownership.owner_epoch).await {
+                match store.claim_due_timers(partition_id, now, 100, ownership.owner_epoch).await {
                     Ok(timers) => {
                         for timer in timers {
                             if let Err(error) =

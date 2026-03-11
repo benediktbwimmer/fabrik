@@ -1,18 +1,21 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::get,
 };
 use chrono::{DateTime, Utc};
-use fabrik_broker::{BrokerConfig, WorkflowHistoryFilter, read_workflow_history};
-use fabrik_config::{HttpServiceConfig, PostgresConfig, RedpandaConfig};
+use fabrik_broker::{
+    BrokerConfig, WorkflowHistoryFilter, WorkflowTopicTopology, describe_workflow_topic,
+    read_workflow_history,
+};
+use fabrik_config::{HttpServiceConfig, PostgresConfig, QueryRuntimeConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
-    WorkflowEffectRecord, WorkflowRunRecord, WorkflowSignalRecord, WorkflowStateSnapshot,
-    WorkflowStore,
+    QueryRetentionCutoffs, QueryRetentionPruneResult, WorkflowEffectRecord, WorkflowRunRecord,
+    WorkflowSignalRecord, WorkflowStateSnapshot, WorkflowStore,
 };
 use fabrik_workflow::{
     CompiledWorkflowArtifact, ReplayDivergence, ReplayDivergenceKind, ReplayFieldMismatch,
@@ -21,9 +24,12 @@ use fabrik_workflow::{
     replay_compiled_history_trace, replay_compiled_history_trace_from_snapshot,
     replay_history_trace, replay_history_trace_from_snapshot, same_projection,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, to_value};
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use tracing::info;
 use uuid::Uuid;
 
@@ -34,6 +40,8 @@ const HISTORY_MAX_SCAN_MS: u64 = 10_000;
 struct AppState {
     store: WorkflowStore,
     broker: BrokerConfig,
+    query: QueryRuntimeConfig,
+    retention: Arc<Mutex<RetentionDebugState>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -53,6 +61,7 @@ struct WorkflowHistoryResponse {
     next_run_id: Option<String>,
     continue_reason: Option<String>,
     event_count: usize,
+    page: PageInfo,
     effect_attempt_count: usize,
     effect_attempts: Vec<WorkflowEffectRecord>,
     events: Vec<EventEnvelope<WorkflowEvent>>,
@@ -98,6 +107,7 @@ struct WorkflowEffectsResponse {
     tenant_id: String,
     instance_id: String,
     run_id: String,
+    page: PageInfo,
     effect_count: usize,
     effects: Vec<WorkflowEffectRecord>,
 }
@@ -107,6 +117,7 @@ struct WorkflowSignalsResponse {
     tenant_id: String,
     instance_id: String,
     run_id: String,
+    page: PageInfo,
     signal_count: usize,
     signals: Vec<WorkflowSignalRecord>,
 }
@@ -116,8 +127,54 @@ struct WorkflowRunsResponse {
     tenant_id: String,
     instance_id: String,
     current_run_id: Option<String>,
+    page: PageInfo,
     run_count: usize,
     runs: Vec<WorkflowRunRecord>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct PaginationQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedPage {
+    limit: usize,
+    offset: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PageInfo {
+    limit: usize,
+    offset: usize,
+    returned: usize,
+    total: usize,
+    has_more: bool,
+    next_offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RetentionPolicyResponse {
+    history_retention_days: Option<u64>,
+    run_retention_days: Option<u64>,
+    effect_retention_days: Option<u64>,
+    signal_retention_days: Option<u64>,
+    snapshot_retention_days: Option<u64>,
+    retention_sweep_interval_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RetentionDebugResponse {
+    policy: RetentionPolicyResponse,
+    last_sweep_at: Option<DateTime<Utc>>,
+    last_result: Option<QueryRetentionPruneResult>,
+}
+
+#[derive(Debug, Default)]
+struct RetentionDebugState {
+    last_sweep_at: Option<DateTime<Utc>>,
+    last_result: Option<QueryRetentionPruneResult>,
 }
 
 #[tokio::main]
@@ -125,12 +182,30 @@ async fn main() -> Result<()> {
     let config = HttpServiceConfig::from_env("QUERY_SERVICE", "query-service", 3005)?;
     let postgres = PostgresConfig::from_env()?;
     let redpanda = RedpandaConfig::from_env()?;
+    let query = QueryRuntimeConfig::from_env()?;
     init_tracing(&config.log_filter);
-    info!(port = config.port, "starting query service");
+    info!(
+        port = config.port,
+        default_page_size = query.default_page_size,
+        max_page_size = query.max_page_size,
+        history_retention_days = ?query.history_retention_days,
+        run_retention_days = ?query.run_retention_days,
+        effect_retention_days = ?query.effect_retention_days,
+        signal_retention_days = ?query.signal_retention_days,
+        snapshot_retention_days = ?query.snapshot_retention_days,
+        retention_sweep_interval_seconds = query.retention_sweep_interval_seconds,
+        "starting query service"
+    );
 
     let store = WorkflowStore::connect(&postgres.url).await?;
     store.init().await?;
-    let broker = BrokerConfig::new(redpanda.brokers, redpanda.workflow_events_topic);
+    let broker = BrokerConfig::new(
+        redpanda.brokers,
+        redpanda.workflow_events_topic,
+        redpanda.workflow_events_partitions,
+    );
+    let retention = Arc::new(Mutex::new(RetentionDebugState::default()));
+    tokio::spawn(run_retention_sweeper(store.clone(), query.clone(), retention.clone()));
 
     let app = default_router::<AppState>(ServiceInfo::new(
         config.name,
@@ -153,6 +228,8 @@ async fn main() -> Result<()> {
         "/tenants/{tenant_id}/workflow-artifacts/{definition_id}/versions/{version}",
         get(get_workflow_artifact_version),
     )
+    .route("/debug/broker", get(get_broker_debug))
+    .route("/debug/retention", get(get_retention_debug))
     .route("/tenants/{tenant_id}/workflows/{instance_id}", get(get_workflow_instance))
     .route("/tenants/{tenant_id}/workflows/{instance_id}/runs", get(get_workflow_runs))
     .route(
@@ -188,9 +265,31 @@ async fn main() -> Result<()> {
         "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/replay",
         get(get_workflow_replay_for_run),
     )
-    .with_state(AppState { store, broker });
+    .with_state(AppState { store, broker, query, retention });
 
     serve(app, config.port).await
+}
+
+async fn get_broker_debug(
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowTopicTopology>, (StatusCode, Json<ErrorResponse>)> {
+    let topology = describe_workflow_topic(&state.broker, "query-service-debug")
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(topology))
+}
+
+async fn get_retention_debug(
+    State(state): State<AppState>,
+) -> Result<Json<RetentionDebugResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let snapshot = state.retention.lock().map_err(|_| {
+        internal_error(anyhow::anyhow!("query retention debug state lock poisoned"))
+    })?;
+    Ok(Json(RetentionDebugResponse {
+        policy: retention_policy_response(&state.query),
+        last_sweep_at: snapshot.last_sweep_at,
+        last_result: snapshot.last_result.clone(),
+    }))
 }
 
 async fn get_workflow_instance(
@@ -212,6 +311,7 @@ async fn get_workflow_instance(
 
 async fn get_current_workflow_history(
     Path((tenant_id, instance_id)): Path<(String, String)>,
+    Query(pagination): Query<PaginationQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<WorkflowHistoryResponse>, (StatusCode, Json<ErrorResponse>)> {
     let instance = state
@@ -229,28 +329,42 @@ async fn get_current_workflow_history(
                 }),
             )
         })?;
-    let response = load_workflow_history(&state, &tenant_id, &instance_id, &instance.run_id)
-        .await
-        .map_err(internal_error)?;
+    let response =
+        load_workflow_history(&state, &tenant_id, &instance_id, &instance.run_id, pagination)
+            .await
+            .map_err(internal_error)?;
     Ok(Json(response))
 }
 
 async fn get_workflow_runs(
     Path((tenant_id, instance_id)): Path<(String, String)>,
+    Query(pagination): Query<PaginationQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<WorkflowRunsResponse>, (StatusCode, Json<ErrorResponse>)> {
     let current_instance =
         state.store.get_instance(&tenant_id, &instance_id).await.map_err(internal_error)?;
+    let page = resolve_page(&state.query, &pagination);
+    let total = state
+        .store
+        .count_runs_for_instance(&tenant_id, &instance_id)
+        .await
+        .map_err(internal_error)? as usize;
     let runs = state
         .store
-        .list_runs_for_instance(&tenant_id, &instance_id)
+        .list_runs_for_instance_page(
+            &tenant_id,
+            &instance_id,
+            i64::try_from(page.limit).map_err(internal_error_from_display)?,
+            i64::try_from(page.offset).map_err(internal_error_from_display)?,
+        )
         .await
         .map_err(internal_error)?;
     Ok(Json(WorkflowRunsResponse {
         tenant_id,
         instance_id,
         current_run_id: current_instance.map(|instance| instance.run_id),
-        run_count: runs.len(),
+        page: build_page_info(&page, total, runs.len()),
+        run_count: total,
         runs,
     }))
 }
@@ -274,6 +388,7 @@ async fn get_latest_workflow_snapshot(
 
 async fn get_current_workflow_effects(
     Path((tenant_id, instance_id)): Path<(String, String)>,
+    Query(pagination): Query<PaginationQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<WorkflowEffectsResponse>, (StatusCode, Json<ErrorResponse>)> {
     let instance = state
@@ -291,14 +406,16 @@ async fn get_current_workflow_effects(
                 }),
             )
         })?;
-    let response = load_workflow_effects(&state, &tenant_id, &instance_id, &instance.run_id)
-        .await
-        .map_err(internal_error)?;
+    let response =
+        load_workflow_effects(&state, &tenant_id, &instance_id, &instance.run_id, pagination)
+            .await
+            .map_err(internal_error)?;
     Ok(Json(response))
 }
 
 async fn get_current_workflow_signals(
     Path((tenant_id, instance_id)): Path<(String, String)>,
+    Query(pagination): Query<PaginationQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<WorkflowSignalsResponse>, (StatusCode, Json<ErrorResponse>)> {
     let instance = state
@@ -316,17 +433,19 @@ async fn get_current_workflow_signals(
                 }),
             )
         })?;
-    let response = load_workflow_signals(&state, &tenant_id, &instance_id, &instance.run_id)
-        .await
-        .map_err(internal_error)?;
+    let response =
+        load_workflow_signals(&state, &tenant_id, &instance_id, &instance.run_id, pagination)
+            .await
+            .map_err(internal_error)?;
     Ok(Json(response))
 }
 
 async fn get_workflow_effects_for_run(
     Path((tenant_id, instance_id, run_id)): Path<(String, String, String)>,
+    Query(pagination): Query<PaginationQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<WorkflowEffectsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let response = load_workflow_effects(&state, &tenant_id, &instance_id, &run_id)
+    let response = load_workflow_effects(&state, &tenant_id, &instance_id, &run_id, pagination)
         .await
         .map_err(internal_error)?;
     Ok(Json(response))
@@ -334,9 +453,10 @@ async fn get_workflow_effects_for_run(
 
 async fn get_workflow_signals_for_run(
     Path((tenant_id, instance_id, run_id)): Path<(String, String, String)>,
+    Query(pagination): Query<PaginationQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<WorkflowSignalsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let response = load_workflow_signals(&state, &tenant_id, &instance_id, &run_id)
+    let response = load_workflow_signals(&state, &tenant_id, &instance_id, &run_id, pagination)
         .await
         .map_err(internal_error)?;
     Ok(Json(response))
@@ -344,9 +464,10 @@ async fn get_workflow_signals_for_run(
 
 async fn get_workflow_history_for_run(
     Path((tenant_id, instance_id, run_id)): Path<(String, String, String)>,
+    Query(pagination): Query<PaginationQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<WorkflowHistoryResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let response = load_workflow_history(&state, &tenant_id, &instance_id, &run_id)
+    let response = load_workflow_history(&state, &tenant_id, &instance_id, &run_id, pagination)
         .await
         .map_err(internal_error)?;
     Ok(Json(response))
@@ -401,8 +522,35 @@ async fn get_workflow_replay_for_run(
     Ok(Json(response))
 }
 
+fn resolve_page(config: &QueryRuntimeConfig, pagination: &PaginationQuery) -> ResolvedPage {
+    let limit = pagination.limit.unwrap_or(config.default_page_size).min(config.max_page_size);
+    ResolvedPage { limit: limit.max(1), offset: pagination.offset.unwrap_or(0) }
+}
+
+fn build_page_info(page: &ResolvedPage, total: usize, returned: usize) -> PageInfo {
+    let limit = page.limit;
+    let offset = page.offset;
+    let next_offset = (offset + returned < total).then_some(offset + returned);
+    PageInfo { limit, offset, returned, total, has_more: next_offset.is_some(), next_offset }
+}
+
+fn retention_policy_response(config: &QueryRuntimeConfig) -> RetentionPolicyResponse {
+    RetentionPolicyResponse {
+        history_retention_days: config.history_retention_days,
+        run_retention_days: config.run_retention_days,
+        effect_retention_days: config.effect_retention_days,
+        signal_retention_days: config.signal_retention_days,
+        snapshot_retention_days: config.snapshot_retention_days,
+        retention_sweep_interval_seconds: config.retention_sweep_interval_seconds,
+    }
+}
+
 fn internal_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
     (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { message: error.to_string() }))
+}
+
+fn internal_error_from_display(error: impl std::fmt::Display) -> (StatusCode, Json<ErrorResponse>) {
+    internal_error(anyhow::anyhow!("{error}"))
 }
 
 async fn load_workflow_history(
@@ -410,6 +558,7 @@ async fn load_workflow_history(
     tenant_id: &str,
     instance_id: &str,
     run_id: &str,
+    pagination: PaginationQuery,
 ) -> Result<WorkflowHistoryResponse> {
     let history = read_history(&state.broker, tenant_id, instance_id, run_id).await?;
     let first_event = history.first().ok_or_else(|| {
@@ -417,7 +566,19 @@ async fn load_workflow_history(
             "no workflow history found for tenant={tenant_id}, instance_id={instance_id}, run_id={run_id}"
         )
     })?;
-    let effect_attempts = state.store.list_effects_for_run(tenant_id, instance_id, run_id).await?;
+    let page = resolve_page(&state.query, &pagination);
+    let total = history.len();
+    let events = history.iter().skip(page.offset).take(page.limit).cloned().collect::<Vec<_>>();
+    let effect_attempts = state
+        .store
+        .list_effects_for_run_page(
+            tenant_id,
+            instance_id,
+            run_id,
+            i64::try_from(page.limit).context("history page limit exceeds i64")?,
+            i64::try_from(page.offset).context("history page offset exceeds i64")?,
+        )
+        .await?;
     let run = state.store.get_run_record(tenant_id, instance_id, run_id).await?;
 
     Ok(WorkflowHistoryResponse {
@@ -430,10 +591,14 @@ async fn load_workflow_history(
         previous_run_id: run.as_ref().and_then(|run| run.previous_run_id.clone()),
         next_run_id: run.as_ref().and_then(|run| run.next_run_id.clone()),
         continue_reason: run.and_then(|run| run.continue_reason),
-        event_count: history.len(),
-        effect_attempt_count: effect_attempts.len(),
+        event_count: total,
+        page: build_page_info(&page, total, events.len()),
+        effect_attempt_count: state
+            .store
+            .count_effect_attempts_for_run(tenant_id, instance_id, run_id)
+            .await? as usize,
         effect_attempts,
-        events: history,
+        events,
     })
 }
 
@@ -442,13 +607,27 @@ async fn load_workflow_effects(
     tenant_id: &str,
     instance_id: &str,
     run_id: &str,
+    pagination: PaginationQuery,
 ) -> Result<WorkflowEffectsResponse> {
-    let effects = state.store.list_effects_for_run(tenant_id, instance_id, run_id).await?;
+    let page = resolve_page(&state.query, &pagination);
+    let total =
+        state.store.count_effect_attempts_for_run(tenant_id, instance_id, run_id).await? as usize;
+    let effects = state
+        .store
+        .list_effects_for_run_page(
+            tenant_id,
+            instance_id,
+            run_id,
+            i64::try_from(page.limit).context("effects page limit exceeds i64")?,
+            i64::try_from(page.offset).context("effects page offset exceeds i64")?,
+        )
+        .await?;
     Ok(WorkflowEffectsResponse {
         tenant_id: tenant_id.to_owned(),
         instance_id: instance_id.to_owned(),
         run_id: run_id.to_owned(),
-        effect_count: effects.len(),
+        page: build_page_info(&page, total, effects.len()),
+        effect_count: total,
         effects,
     })
 }
@@ -458,13 +637,26 @@ async fn load_workflow_signals(
     tenant_id: &str,
     instance_id: &str,
     run_id: &str,
+    pagination: PaginationQuery,
 ) -> Result<WorkflowSignalsResponse> {
-    let signals = state.store.list_signals_for_run(tenant_id, instance_id, run_id).await?;
+    let page = resolve_page(&state.query, &pagination);
+    let total = state.store.count_signals_for_run(tenant_id, instance_id, run_id).await? as usize;
+    let signals = state
+        .store
+        .list_signals_for_run_page(
+            tenant_id,
+            instance_id,
+            run_id,
+            i64::try_from(page.limit).context("signals page limit exceeds i64")?,
+            i64::try_from(page.offset).context("signals page offset exceeds i64")?,
+        )
+        .await?;
     Ok(WorkflowSignalsResponse {
         tenant_id: tenant_id.to_owned(),
         instance_id: instance_id.to_owned(),
         run_id: run_id.to_owned(),
-        signal_count: signals.len(),
+        page: build_page_info(&page, total, signals.len()),
+        signal_count: total,
         signals,
     })
 }
@@ -636,7 +828,7 @@ async fn replay_workflow_run(
         .store
         .list_effects_for_run(&current_instance.tenant_id, &current_instance.instance_id, run_id)
         .await?;
-    let projection_matches_store = (current_instance.run_id == active_trace.final_state.run_id)
+    let mut projection_matches_store = (current_instance.run_id == active_trace.final_state.run_id)
         .then(|| same_projection(current_instance, &active_trace.final_state));
     if matches!(projection_matches_store, Some(false)) {
         divergences.push(ReplayDivergence {
@@ -647,6 +839,9 @@ async fn replay_workflow_run(
                 .to_owned(),
             fields: projection_mismatches(current_instance, &active_trace.final_state),
         });
+    }
+    if projection_matches_store.is_some() && !divergences.is_empty() {
+        projection_matches_store = Some(false);
     }
 
     Ok(WorkflowReplayResponse {
@@ -699,6 +894,53 @@ async fn read_history(
         Duration::from_millis(HISTORY_MAX_SCAN_MS),
     )
     .await
+}
+
+async fn run_retention_sweeper(
+    store: WorkflowStore,
+    config: QueryRuntimeConfig,
+    debug: Arc<Mutex<RetentionDebugState>>,
+) {
+    loop {
+        let now = Utc::now();
+        let cutoffs = QueryRetentionCutoffs {
+            run_closed_before: config
+                .run_retention_days
+                .and_then(|days| chrono::Duration::try_days(days as i64))
+                .map(|duration| now - duration),
+            effect_run_closed_before: config
+                .effect_retention_days
+                .and_then(|days| chrono::Duration::try_days(days as i64))
+                .map(|duration| now - duration),
+            signal_run_closed_before: config
+                .signal_retention_days
+                .and_then(|days| chrono::Duration::try_days(days as i64))
+                .map(|duration| now - duration),
+            snapshot_run_closed_before: config
+                .snapshot_retention_days
+                .and_then(|days| chrono::Duration::try_days(days as i64))
+                .map(|duration| now - duration),
+        };
+
+        if cutoffs != QueryRetentionCutoffs::default() {
+            match store.prune_query_retention(&cutoffs).await {
+                Ok(result) => {
+                    if let Ok(mut state) = debug.lock() {
+                        state.last_sweep_at = Some(now);
+                        state.last_result = Some(result);
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "failed to sweep query retention policy");
+                }
+            }
+        } else if let Ok(mut state) = debug.lock() {
+            state.last_sweep_at = Some(now);
+            state.last_result = Some(QueryRetentionPruneResult::default());
+        }
+
+        tokio::time::sleep(Duration::from_secs(config.retention_sweep_interval_seconds)).await;
+    }
 }
 
 async fn get_latest_workflow_definition(

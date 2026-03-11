@@ -7,6 +7,10 @@ use uuid::Uuid;
 
 pub const EVENT_SCHEMA_VERSION: u32 = 1;
 
+pub fn workflow_partition_key(tenant_id: &str, instance_id: &str) -> String {
+    format!("{tenant_id}:{instance_id}")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowIdentity {
     pub tenant_id: String,
@@ -34,7 +38,7 @@ impl WorkflowIdentity {
         let artifact_hash = artifact_hash.into();
         let instance_id = instance_id.into();
         let run_id = run_id.into();
-        let partition_key = format!("{tenant_id}:{instance_id}:{run_id}");
+        let partition_key = workflow_partition_key(&tenant_id, &instance_id);
 
         Self {
             tenant_id,

@@ -73,7 +73,11 @@ async fn main() -> Result<()> {
         })?;
     let run_id = args.run_id.unwrap_or_else(|| current_instance.run_id.clone());
 
-    let broker = BrokerConfig::new(redpanda.brokers, redpanda.workflow_events_topic);
+    let broker = BrokerConfig::new(
+        redpanda.brokers,
+        redpanda.workflow_events_topic,
+        redpanda.workflow_events_partitions,
+    );
     let history = read_workflow_history(
         &broker,
         "replay-tool",
@@ -218,7 +222,7 @@ async fn main() -> Result<()> {
         full_trace.clone()
     };
 
-    let projection_matches_store = (current_instance.run_id == active_trace.final_state.run_id)
+    let mut projection_matches_store = (current_instance.run_id == active_trace.final_state.run_id)
         .then(|| same_projection(&current_instance, &active_trace.final_state));
     if matches!(projection_matches_store, Some(false)) {
         divergences.push(ReplayDivergence {
@@ -229,6 +233,9 @@ async fn main() -> Result<()> {
                 .to_owned(),
             fields: projection_mismatches(&current_instance, &active_trace.final_state),
         });
+    }
+    if projection_matches_store.is_some() && !divergences.is_empty() {
+        projection_matches_store = Some(false);
     }
     let last_event_type = history
         .last()

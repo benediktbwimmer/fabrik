@@ -176,7 +176,19 @@ EXECUTOR_SNAPSHOT_INTERVAL_EVENTS=50 cargo run -p executor-service
 Tune ownership lease behavior with:
 
 ```bash
-WORKFLOW_PARTITION_ID=0 OWNERSHIP_LEASE_TTL_SECONDS=15 OWNERSHIP_RENEW_INTERVAL_SECONDS=5 cargo run -p executor-service
+WORKFLOW_PARTITIONS=0,1 OWNERSHIP_LEASE_TTL_SECONDS=15 OWNERSHIP_RENEW_INTERVAL_SECONDS=5 cargo run -p executor-service
+```
+
+Enable dynamic partition assignment with executor membership heartbeats:
+
+```bash
+EXECUTOR_CAPACITY=4 OWNERSHIP_MEMBER_HEARTBEAT_TTL_SECONDS=15 OWNERSHIP_ASSIGNMENT_POLL_INTERVAL_SECONDS=2 OWNERSHIP_REBALANCE_INTERVAL_SECONDS=5 cargo run -p executor-service
+```
+
+Tune query pagination and closed-run read-model retention with:
+
+```bash
+QUERY_DEFAULT_PAGE_SIZE=100 QUERY_MAX_PAGE_SIZE=500 QUERY_RUN_RETENTION_DAYS=30 QUERY_EFFECT_RETENTION_DAYS=14 QUERY_SIGNAL_RETENTION_DAYS=14 QUERY_SNAPSHOT_RETENTION_DAYS=7 QUERY_RETENTION_SWEEP_INTERVAL_SECONDS=300 cargo run -p query-service
 ```
 
 Enable automatic history rollover with:
@@ -219,13 +231,18 @@ Current TypeScript compiler constraints:
 - arbitrary guest callbacks inside `ctx.sideEffect()` are still not supported
 - workflow history and replay responses include persisted effect attempt timelines alongside the raw event stream
 - the executor keeps a bounded hot-state cache for active instances, persists periodic run-scoped PostgreSQL snapshots, and restores cold runs by replaying the event tail after the snapshot boundary
-- the executor persists a single-partition ownership lease with epochs in PostgreSQL, renews it in the background, clears hot cache on ownership loss, and fences stale turns against that lease
-- timer-service stamps `TimerFired` events with the observed executor ownership epoch and the executor drops stale timer fires after handoff
+- the workflow topic is now partitioned and publishers hash on a stable `tenant_id:instance_id` partition key so all runs for one logical instance stay on the same shard
+- executor-service can either own a configured partition set or discover assignments dynamically through PostgreSQL-backed executor membership and partition assignment tables
+- the executor persists per-partition ownership leases with epochs in PostgreSQL, renews them in the background, clears partition-local hot state on ownership loss, and fences stale turns against those leases
+- executors heartbeat membership, opportunistically rebalance partition assignments under a PostgreSQL advisory lock, and start/stop per-partition worker loops as assignments change
+- timer-service polls all broker partitions, consults the active ownership table, claims due timers by partition, stamps `TimerFired` with the observed executor ownership epoch, and the executor drops stale timer fires after handoff
 - executor-service can automatically emit `WorkflowContinuedAsNew` at durable wait boundaries when configured event-count, effect-attempt, or run-age thresholds are exceeded
 - run lineage is persisted in PostgreSQL so current and historical runs for one logical `instance_id` can be inspected as a chain
 - signals now flow through a durable FIFO mailbox per run: `SignalQueued` records arrival, executor consumes only the oldest pending signal at matching wait states, and query APIs expose queued/dispatching/consumed signal records
-- the executor exposes debug surfaces for cache hit/miss counters, restore-source breakdown, ownership transitions, and current single-partition ownership state
+- the executor exposes debug surfaces for cache hit/miss counters, restore-source breakdown, ownership transitions, and partition-local runtime state across the owned shard set
 - replay responses and the `replay-tool` are snapshot-aware: they report whether replay started from run start or snapshot tail, include compact transition traces, and surface snapshot/projection divergence diagnostics when determinism or restore boundaries drift
+- broker topology is inspectable over HTTP, and startup now fails fast if the configured workflow partition count exceeds the actual topic partition count
+- query responses for runs, history, effects, and signals are paginated with `limit` and `offset`, and query-service can prune closed-run PostgreSQL read-model data on a retention sweep without changing broker event history
 
 Useful local endpoints:
 
@@ -252,9 +269,17 @@ Useful local endpoints:
 - Query current-run history API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/history`
 - Query run replay API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/replay`
 - Query current-run replay API: `GET http://localhost:3005/tenants/{tenant_id}/workflows/{instance_id}/replay`
+- Query broker topology debug API: `GET http://localhost:3005/debug/broker`
+- Query retention debug API: `GET http://localhost:3005/debug/retention`
 - Executor runtime debug API: `GET http://localhost:3002/debug/runtime`
 - Executor ownership debug API: `GET http://localhost:3002/debug/ownership`
+- Executor broker topology debug API: `GET http://localhost:3002/debug/broker`
 - Executor hot-state debug API: `GET http://localhost:3002/debug/hot-state/{tenant_id}/{instance_id}`
+
+Pagination parameters:
+
+- append `?limit={n}&offset={n}` to run lineage, history, effect, and signal query endpoints
+- responses include a `page` object with `limit`, `offset`, `returned`, `total`, `has_more`, and `next_offset`
 
 Example TypeScript workflows live in [examples/typescript-workflows/order-workflow.ts](/Users/bene/code/fabrik/examples/typescript-workflows/order-workflow.ts) and [examples/typescript-workflows/helpers.ts](/Users/bene/code/fabrik/examples/typescript-workflows/helpers.ts).
 

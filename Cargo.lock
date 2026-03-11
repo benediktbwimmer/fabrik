@@ -442,6 +442,7 @@ dependencies = [
  "fabrik-events",
  "futures-util",
  "rskafka",
+ "serde",
  "serde_json",
  "tokio",
 ]

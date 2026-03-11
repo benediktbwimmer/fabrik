@@ -1,8 +1,9 @@
 use anyhow::Result;
 use axum::{Json, extract::Path, extract::State as AxumState, http::StatusCode, routing::get};
 use fabrik_broker::{
-    BrokerConfig, WorkflowHistoryFilter, WorkflowPublisher, build_workflow_consumer,
-    decode_workflow_event, read_workflow_history,
+    BrokerConfig, WorkflowHistoryFilter, WorkflowPublisher, WorkflowTopicTopology,
+    build_workflow_partition_consumer, decode_workflow_event, describe_workflow_topic,
+    read_workflow_history,
 };
 use fabrik_config::{
     ExecutorRuntimeConfig, HttpServiceConfig, OwnershipConfig, PostgresConfig, RedpandaConfig,
@@ -12,13 +13,15 @@ use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{PartitionOwnershipRecord, WorkflowStore};
 use fabrik_workflow::{
     CompiledExecutionPlan, CompiledWorkflowArtifact, ExecutionEmission, ExecutionTurnContext,
-    WorkflowInstanceState,
+    WorkflowInstanceState, replay_compiled_history_trace_from_snapshot,
+    replay_history_trace_from_snapshot,
 };
 use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -39,45 +42,74 @@ async fn main() -> Result<()> {
         continue_as_new_event_threshold = ?runtime.continue_as_new_event_threshold,
         continue_as_new_effect_attempt_threshold = ?runtime.continue_as_new_effect_attempt_threshold,
         continue_as_new_run_age_seconds = ?runtime.continue_as_new_run_age_seconds,
-        partition_id = ownership.partition_id,
+        static_partition_ids = ?ownership.static_partition_ids,
+        executor_capacity = ownership.executor_capacity,
         lease_ttl_seconds = ownership.lease_ttl_seconds,
         renew_interval_seconds = ownership.renew_interval_seconds,
+        member_heartbeat_ttl_seconds = ownership.member_heartbeat_ttl_seconds,
+        assignment_poll_interval_seconds = ownership.assignment_poll_interval_seconds,
+        rebalance_interval_seconds = ownership.rebalance_interval_seconds,
         "starting executor service"
     );
 
-    let broker = BrokerConfig::new(redpanda.brokers, redpanda.workflow_events_topic);
+    let broker = BrokerConfig::new(
+        redpanda.brokers,
+        redpanda.workflow_events_topic,
+        redpanda.workflow_events_partitions,
+    );
     let publisher = WorkflowPublisher::new(&broker, "executor-service").await?;
-    let consumer = build_workflow_consumer(&broker, "executor-service").await?;
     let store = WorkflowStore::connect(&postgres.url).await?;
     store.init().await?;
     let owner_id = format!("executor-service:{}", Uuid::now_v7());
     let lease_ttl = std::time::Duration::from_secs(ownership.lease_ttl_seconds);
-    let initial_ownership =
-        await_initial_partition_ownership(&store, ownership.partition_id, &owner_id, lease_ttl)
-            .await?;
-    let lease_state = Arc::new(Mutex::new(LeaseState::from_record(&initial_ownership)));
+    let initial_partitions = ownership.static_partition_ids.clone().unwrap_or_default();
+    let initial_ownerships = if initial_partitions.is_empty() {
+        Vec::new()
+    } else {
+        let mut ownerships = Vec::new();
+        for partition_id in &initial_partitions {
+            ownerships.push(
+                await_initial_partition_ownership(&store, *partition_id, &owner_id, lease_ttl)
+                    .await?,
+            );
+        }
+        ownerships
+    };
     let debug_state = Arc::new(Mutex::new(ExecutorDebugState::new(
-        &initial_ownership,
+        &initial_ownerships,
         runtime.cache_capacity,
         runtime.snapshot_interval_events,
     )));
-    tokio::spawn(run_ownership_renewal_loop(
-        store.clone(),
-        lease_state.clone(),
-        debug_state.clone(),
-        lease_ttl,
-        std::time::Duration::from_secs(ownership.renew_interval_seconds),
-    ));
-
-    tokio::spawn(run_executor_loop(
-        consumer,
-        publisher,
-        store.clone(),
-        broker.clone(),
-        runtime,
-        debug_state.clone(),
-        lease_state.clone(),
-    ));
+    let workers = Arc::new(Mutex::new(HashMap::new()));
+    if initial_partitions.is_empty() {
+        tokio::spawn(run_assignment_supervisor(
+            store.clone(),
+            broker.clone(),
+            publisher.clone(),
+            runtime.clone(),
+            ownership.clone(),
+            debug_state.clone(),
+            workers.clone(),
+            owner_id.clone(),
+            lease_ttl,
+        ));
+    } else {
+        for record in initial_ownerships {
+            spawn_partition_worker(
+                &store,
+                &broker,
+                &publisher,
+                &runtime,
+                &debug_state,
+                &workers,
+                owner_id.clone(),
+                record,
+                std::time::Duration::from_secs(ownership.renew_interval_seconds),
+                lease_ttl,
+            )
+            .await?;
+        }
+    }
 
     let app = default_router::<ExecutorAppState>(ServiceInfo::new(
         config.name,
@@ -86,8 +118,9 @@ async fn main() -> Result<()> {
     ))
     .route("/debug/runtime", get(get_runtime_debug))
     .route("/debug/ownership", get(get_ownership_debug))
+    .route("/debug/broker", get(get_broker_debug))
     .route("/debug/hot-state/{tenant_id}/{instance_id}", get(get_hot_state_debug))
-    .with_state(ExecutorAppState { debug: debug_state });
+    .with_state(ExecutorAppState { debug: debug_state, broker });
 
     serve(app, config.port).await
 }
@@ -95,6 +128,224 @@ async fn main() -> Result<()> {
 #[derive(Clone)]
 struct ExecutorAppState {
     debug: Arc<Mutex<ExecutorDebugState>>,
+    broker: BrokerConfig,
+}
+
+struct PartitionWorkerHandle {
+    renewal_task: JoinHandle<()>,
+    consumer_task: JoinHandle<()>,
+    lease_state: Arc<Mutex<LeaseState>>,
+}
+
+async fn run_assignment_supervisor(
+    store: WorkflowStore,
+    broker: BrokerConfig,
+    publisher: WorkflowPublisher,
+    runtime_config: ExecutorRuntimeConfig,
+    ownership_config: OwnershipConfig,
+    debug_state: Arc<Mutex<ExecutorDebugState>>,
+    workers: Arc<Mutex<HashMap<i32, PartitionWorkerHandle>>>,
+    owner_id: String,
+    lease_ttl: std::time::Duration,
+) {
+    let heartbeat_ttl =
+        std::time::Duration::from_secs(ownership_config.member_heartbeat_ttl_seconds);
+    let poll_interval =
+        std::time::Duration::from_secs(ownership_config.assignment_poll_interval_seconds);
+    let rebalance_interval =
+        std::time::Duration::from_secs(ownership_config.rebalance_interval_seconds);
+    let renew_interval = std::time::Duration::from_secs(ownership_config.renew_interval_seconds);
+    let mut last_rebalance_at = std::time::Instant::now() - rebalance_interval;
+
+    loop {
+        if let Err(error) = store
+            .heartbeat_executor_member(&owner_id, ownership_config.executor_capacity, heartbeat_ttl)
+            .await
+        {
+            error!(error = %error, "failed to heartbeat executor membership");
+        }
+
+        if last_rebalance_at.elapsed() >= rebalance_interval {
+            match store.list_active_executor_members(chrono::Utc::now()).await {
+                Ok(members) => {
+                    if let Err(error) = store
+                        .reconcile_partition_assignments(
+                            broker.workflow_events_partitions,
+                            &members,
+                        )
+                        .await
+                    {
+                        error!(error = %error, "failed to reconcile partition assignments");
+                    }
+                }
+                Err(error) => error!(error = %error, "failed to load active executor members"),
+            }
+            last_rebalance_at = std::time::Instant::now();
+        }
+
+        match store.list_assignments_for_executor(&owner_id).await {
+            Ok(assignments) => {
+                let desired = assignments
+                    .into_iter()
+                    .map(|assignment| assignment.partition_id)
+                    .collect::<Vec<_>>();
+                if let Err(error) = reconcile_partition_workers(
+                    &store,
+                    &broker,
+                    &publisher,
+                    &runtime_config,
+                    &debug_state,
+                    &workers,
+                    &owner_id,
+                    desired,
+                    renew_interval,
+                    lease_ttl,
+                )
+                .await
+                {
+                    error!(error = %error, "failed to reconcile local partition workers");
+                }
+            }
+            Err(error) => error!(error = %error, "failed to load local partition assignments"),
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+async fn reconcile_partition_workers(
+    store: &WorkflowStore,
+    broker: &BrokerConfig,
+    publisher: &WorkflowPublisher,
+    runtime_config: &ExecutorRuntimeConfig,
+    debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    workers: &Arc<Mutex<HashMap<i32, PartitionWorkerHandle>>>,
+    owner_id: &str,
+    desired_partitions: Vec<i32>,
+    renew_interval: std::time::Duration,
+    lease_ttl: std::time::Duration,
+) -> Result<()> {
+    let active_partitions = workers
+        .lock()
+        .map(|state| state.keys().copied().collect::<Vec<_>>())
+        .map_err(|_| anyhow::anyhow!("partition worker map lock poisoned"))?;
+
+    for partition_id in active_partitions
+        .iter()
+        .copied()
+        .filter(|partition_id| !desired_partitions.contains(partition_id))
+        .collect::<Vec<_>>()
+    {
+        stop_partition_worker(workers, debug_state, partition_id)?;
+    }
+
+    for partition_id in desired_partitions {
+        let already_running = workers
+            .lock()
+            .map(|state| state.contains_key(&partition_id))
+            .map_err(|_| anyhow::anyhow!("partition worker map lock poisoned"))?;
+        if already_running {
+            continue;
+        }
+        let record =
+            await_initial_partition_ownership(store, partition_id, owner_id, lease_ttl).await?;
+        spawn_partition_worker(
+            store,
+            broker,
+            publisher,
+            runtime_config,
+            debug_state,
+            workers,
+            owner_id.to_owned(),
+            record,
+            renew_interval,
+            lease_ttl,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn spawn_partition_worker(
+    store: &WorkflowStore,
+    broker: &BrokerConfig,
+    publisher: &WorkflowPublisher,
+    runtime_config: &ExecutorRuntimeConfig,
+    debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    workers: &Arc<Mutex<HashMap<i32, PartitionWorkerHandle>>>,
+    owner_id: String,
+    initial_ownership: PartitionOwnershipRecord,
+    renew_interval: std::time::Duration,
+    lease_ttl: std::time::Duration,
+) -> Result<()> {
+    let partition_id = initial_ownership.partition_id;
+    let lease_state = Arc::new(Mutex::new(LeaseState::from_record(&initial_ownership)));
+    if let Ok(mut debug) = debug_state.lock() {
+        debug.update_ownership(&initial_ownership, "owned", "partition worker started");
+    }
+
+    let renewal_task = tokio::spawn(run_ownership_renewal_loop(
+        store.clone(),
+        lease_state.clone(),
+        debug_state.clone(),
+        lease_ttl,
+        renew_interval,
+    ));
+    let consumer =
+        build_workflow_partition_consumer(broker, "executor-service", partition_id).await?;
+    let consumer_task = tokio::spawn(run_executor_loop(
+        consumer,
+        publisher.clone(),
+        store.clone(),
+        broker.clone(),
+        runtime_config.clone(),
+        debug_state.clone(),
+        lease_state.clone(),
+    ));
+
+    workers
+        .lock()
+        .map_err(|_| anyhow::anyhow!("partition worker map lock poisoned"))?
+        .insert(partition_id, PartitionWorkerHandle { renewal_task, consumer_task, lease_state });
+    let _ = owner_id;
+    Ok(())
+}
+
+fn stop_partition_worker(
+    workers: &Arc<Mutex<HashMap<i32, PartitionWorkerHandle>>>,
+    debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    partition_id: i32,
+) -> Result<()> {
+    let handle = workers
+        .lock()
+        .map_err(|_| anyhow::anyhow!("partition worker map lock poisoned"))?
+        .remove(&partition_id);
+    if let Some(handle) = handle {
+        let lease_snapshot = handle.lease_state.lock().ok().map(|state| state.clone());
+        handle.consumer_task.abort();
+        handle.renewal_task.abort();
+        if let Some(lease_snapshot) = lease_snapshot {
+            if let Ok(mut debug) = debug_state.lock() {
+                debug.mark_ownership_lost(
+                    partition_id,
+                    lease_snapshot.owner_epoch,
+                    lease_snapshot.lease_expires_at,
+                    "partition assignment removed",
+                );
+                let partition = debug.partition_mut(partition_id);
+                partition.hot_instance_count = 0;
+                partition.hot_instances.clear();
+                partition.cache_hits = 0;
+                partition.cache_misses = 0;
+                partition.restores_from_projection = 0;
+                partition.restores_from_snapshot_replay = 0;
+                partition.restores_after_handoff = 0;
+                debug.recompute_totals();
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn run_executor_loop(
@@ -151,9 +402,6 @@ async fn process_event(
 ) -> Result<()> {
     let lease_snapshot =
         ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
-    if !store.mark_event_processed(&event).await? {
-        return Ok(());
-    }
     if should_drop_stale_timer_event(&event, lease_snapshot.owner_epoch) {
         warn!(
             event_type = %event.event_type,
@@ -165,12 +413,16 @@ async fn process_event(
         );
         return Ok(());
     }
+    if !store.mark_event_processed(&event).await? {
+        return Ok(());
+    }
 
     let mut record = match load_cached_or_snapshot_state(
         store,
         broker,
         runtime,
         debug_state,
+        lease_snapshot.partition_id,
         lease_snapshot.owner_epoch,
         &event,
     )
@@ -239,7 +491,16 @@ async fn process_event(
     };
 
     let mut state = record.state.clone();
-    persist_state(store, runtime, debug_state, lease_state, &mut record, &state).await?;
+    persist_state(
+        store,
+        runtime,
+        debug_state,
+        lease_state,
+        lease_snapshot.partition_id,
+        &mut record,
+        &state,
+    )
+    .await?;
 
     match &event.payload {
         WorkflowEvent::WorkflowTriggered { .. } => {
@@ -262,8 +523,16 @@ async fn process_event(
                     },
                 )?;
                 apply_compiled_plan(&mut state, &plan);
-                persist_state(store, runtime, debug_state, lease_state, &mut record, &state)
-                    .await?;
+                persist_state(
+                    store,
+                    runtime,
+                    debug_state,
+                    lease_state,
+                    lease_snapshot.partition_id,
+                    &mut record,
+                    &state,
+                )
+                .await?;
                 publish_compiled_plan(
                     store,
                     runtime,
@@ -347,6 +616,7 @@ async fn process_event(
         WorkflowEvent::TimerScheduled { timer_id, fire_at } => {
             store
                 .upsert_timer(
+                    lease_snapshot.partition_id,
                     &event.tenant_id,
                     &event.instance_id,
                     &event.run_id,
@@ -407,6 +677,7 @@ async fn process_event(
                                 runtime,
                                 debug_state,
                                 lease_state,
+                                lease_snapshot.partition_id,
                                 &mut record,
                                 &state,
                             )
@@ -447,6 +718,7 @@ async fn process_event(
                                 runtime,
                                 debug_state,
                                 lease_state,
+                                lease_snapshot.partition_id,
                                 &mut record,
                                 &state,
                             )
@@ -502,8 +774,16 @@ async fn process_event(
                     },
                 )?;
                 apply_compiled_plan(&mut state, &plan);
-                persist_state(store, runtime, debug_state, lease_state, &mut record, &state)
-                    .await?;
+                persist_state(
+                    store,
+                    runtime,
+                    debug_state,
+                    lease_state,
+                    lease_snapshot.partition_id,
+                    &mut record,
+                    &state,
+                )
+                .await?;
                 publish_compiled_plan(
                     store,
                     runtime,
@@ -625,8 +905,16 @@ async fn process_event(
                     },
                 )?;
                 apply_compiled_plan(&mut state, &plan);
-                persist_state(store, runtime, debug_state, lease_state, &mut record, &state)
-                    .await?;
+                persist_state(
+                    store,
+                    runtime,
+                    debug_state,
+                    lease_state,
+                    lease_snapshot.partition_id,
+                    &mut record,
+                    &state,
+                )
+                .await?;
                 publish_compiled_plan(
                     store,
                     runtime,
@@ -749,6 +1037,7 @@ async fn process_event(
                             runtime,
                             debug_state,
                             lease_state,
+                            lease_snapshot.partition_id,
                             &mut record,
                             &state,
                         )
@@ -940,8 +1229,16 @@ async fn process_event(
                     },
                 )?;
                 apply_compiled_plan(&mut state, &plan);
-                persist_state(store, runtime, debug_state, lease_state, &mut record, &state)
-                    .await?;
+                persist_state(
+                    store,
+                    runtime,
+                    debug_state,
+                    lease_state,
+                    lease_snapshot.partition_id,
+                    &mut record,
+                    &state,
+                )
+                .await?;
                 publish_compiled_plan(
                     store,
                     runtime,
@@ -1039,6 +1336,7 @@ async fn process_event(
                             runtime,
                             debug_state,
                             lease_state,
+                            lease_snapshot.partition_id,
                             &mut record,
                             &state,
                         )
@@ -1135,6 +1433,7 @@ async fn process_event(
                             runtime,
                             debug_state,
                             lease_state,
+                            lease_snapshot.partition_id,
                             &mut record,
                             &state,
                         )
@@ -1201,8 +1500,16 @@ async fn process_event(
                     },
                 )?;
                 apply_compiled_plan(&mut state, &plan);
-                persist_state(store, runtime, debug_state, lease_state, &mut record, &state)
-                    .await?;
+                persist_state(
+                    store,
+                    runtime,
+                    debug_state,
+                    lease_state,
+                    lease_snapshot.partition_id,
+                    &mut record,
+                    &state,
+                )
+                .await?;
                 publish_compiled_plan(
                     store,
                     runtime,
@@ -1241,8 +1548,16 @@ async fn process_event(
                     },
                 )?;
                 apply_compiled_plan(&mut state, &plan);
-                persist_state(store, runtime, debug_state, lease_state, &mut record, &state)
-                    .await?;
+                persist_state(
+                    store,
+                    runtime,
+                    debug_state,
+                    lease_state,
+                    lease_snapshot.partition_id,
+                    &mut record,
+                    &state,
+                )
+                .await?;
                 publish_compiled_plan(
                     store,
                     runtime,
@@ -1386,7 +1701,6 @@ struct ExecutorRuntime {
 
 #[derive(Debug, Clone, Serialize)]
 struct ExecutorDebugState {
-    ownership: PartitionOwnership,
     cache_capacity: usize,
     snapshot_interval_events: u64,
     cache_hits: u64,
@@ -1395,8 +1709,21 @@ struct ExecutorDebugState {
     restores_from_snapshot_replay: u64,
     restores_after_handoff: u64,
     hot_instance_count: usize,
-    hot_instances: Vec<HotInstanceDebug>,
+    partitions: Vec<PartitionRuntimeDebug>,
     ownership_transitions: Vec<OwnershipTransitionDebug>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PartitionRuntimeDebug {
+    partition_id: i32,
+    ownership: PartitionOwnership,
+    cache_hits: u64,
+    cache_misses: u64,
+    restores_from_projection: u64,
+    restores_from_snapshot_replay: u64,
+    restores_after_handoff: u64,
+    hot_instance_count: usize,
+    hot_instances: Vec<HotInstanceDebug>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1412,6 +1739,7 @@ struct PartitionOwnership {
 
 #[derive(Debug, Clone, Serialize)]
 struct OwnershipTransitionDebug {
+    partition_id: i32,
     status: &'static str,
     epoch: u64,
     transitioned_at: chrono::DateTime<chrono::Utc>,
@@ -1441,6 +1769,7 @@ impl LeaseState {
 
 #[derive(Debug, Clone, Serialize)]
 struct HotInstanceDebug {
+    partition_id: i32,
     tenant_id: String,
     instance_id: String,
     run_id: String,
@@ -1529,12 +1858,11 @@ impl ExecutorRuntime {
 
 impl ExecutorDebugState {
     fn new(
-        ownership: &PartitionOwnershipRecord,
+        ownerships: &[PartitionOwnershipRecord],
         cache_capacity: usize,
         snapshot_interval_events: u64,
     ) -> Self {
         Self {
-            ownership: map_partition_ownership(ownership, "owned"),
             cache_capacity,
             snapshot_interval_events,
             cache_hits: 0,
@@ -1543,27 +1871,46 @@ impl ExecutorDebugState {
             restores_from_snapshot_replay: 0,
             restores_after_handoff: 0,
             hot_instance_count: 0,
-            hot_instances: Vec::new(),
-            ownership_transitions: vec![OwnershipTransitionDebug {
-                status: "acquired",
-                epoch: ownership.owner_epoch,
-                transitioned_at: ownership.last_transition_at,
-                reason: "initial ownership claim".to_owned(),
-            }],
+            partitions: ownerships
+                .iter()
+                .map(|ownership| PartitionRuntimeDebug {
+                    partition_id: ownership.partition_id,
+                    ownership: map_partition_ownership(ownership, "owned"),
+                    cache_hits: 0,
+                    cache_misses: 0,
+                    restores_from_projection: 0,
+                    restores_from_snapshot_replay: 0,
+                    restores_after_handoff: 0,
+                    hot_instance_count: 0,
+                    hot_instances: Vec::new(),
+                })
+                .collect(),
+            ownership_transitions: ownerships
+                .iter()
+                .map(|ownership| OwnershipTransitionDebug {
+                    partition_id: ownership.partition_id,
+                    status: "acquired",
+                    epoch: ownership.owner_epoch,
+                    transitioned_at: ownership.last_transition_at,
+                    reason: "initial ownership claim".to_owned(),
+                })
+                .collect(),
         }
     }
 
-    fn sync_from_runtime(&mut self, runtime: &ExecutorRuntime) {
-        self.cache_hits = runtime.hits;
-        self.cache_misses = runtime.misses;
-        self.restores_from_projection = runtime.restores_from_projection;
-        self.restores_from_snapshot_replay = runtime.restores_from_snapshot_replay;
-        self.restores_after_handoff = runtime.restores_after_handoff;
-        self.hot_instance_count = runtime.cache.len();
-        self.hot_instances = runtime
+    fn sync_from_runtime(&mut self, partition_id: i32, runtime: &ExecutorRuntime) {
+        let partition = self.partition_mut(partition_id);
+        partition.cache_hits = runtime.hits;
+        partition.cache_misses = runtime.misses;
+        partition.restores_from_projection = runtime.restores_from_projection;
+        partition.restores_from_snapshot_replay = runtime.restores_from_snapshot_replay;
+        partition.restores_after_handoff = runtime.restores_after_handoff;
+        partition.hot_instance_count = runtime.cache.len();
+        partition.hot_instances = runtime
             .cache
             .values()
             .map(|entry| HotInstanceDebug {
+                partition_id,
                 tenant_id: entry.record.state.tenant_id.clone(),
                 instance_id: entry.record.state.instance_id.clone(),
                 run_id: entry.record.state.run_id.clone(),
@@ -1574,9 +1921,10 @@ impl ExecutorDebugState {
                 last_snapshot_event_count: entry.record.last_snapshot_event_count,
             })
             .collect();
-        self.hot_instances.sort_by(|left, right| {
+        partition.hot_instances.sort_by(|left, right| {
             left.tenant_id.cmp(&right.tenant_id).then(left.instance_id.cmp(&right.instance_id))
         });
+        self.recompute_totals();
     }
 
     fn update_ownership(
@@ -1585,26 +1933,35 @@ impl ExecutorDebugState {
         status: &'static str,
         reason: impl Into<String>,
     ) {
-        self.ownership = map_partition_ownership(record, status);
-        self.record_transition(status, record.owner_epoch, record.last_transition_at, reason);
+        self.partition_mut(record.partition_id).ownership = map_partition_ownership(record, status);
+        self.record_transition(
+            record.partition_id,
+            status,
+            record.owner_epoch,
+            record.last_transition_at,
+            reason,
+        );
     }
 
     fn mark_ownership_lost(
         &mut self,
+        partition_id: i32,
         epoch: u64,
         lease_expires_at: chrono::DateTime<chrono::Utc>,
         reason: impl Into<String>,
     ) {
         let now = chrono::Utc::now();
-        self.ownership.status = "lost";
-        self.ownership.epoch = epoch;
-        self.ownership.last_transition_at = now;
-        self.ownership.lease_expires_at = lease_expires_at;
-        self.record_transition("lost", epoch, now, reason);
+        let ownership = &mut self.partition_mut(partition_id).ownership;
+        ownership.status = "lost";
+        ownership.epoch = epoch;
+        ownership.last_transition_at = now;
+        ownership.lease_expires_at = lease_expires_at;
+        self.record_transition(partition_id, "lost", epoch, now, reason);
     }
 
     fn record_transition(
         &mut self,
+        partition_id: i32,
         status: &'static str,
         epoch: u64,
         transitioned_at: chrono::DateTime<chrono::Utc>,
@@ -1612,11 +1969,59 @@ impl ExecutorDebugState {
     ) {
         self.ownership_transitions.insert(
             0,
-            OwnershipTransitionDebug { status, epoch, transitioned_at, reason: reason.into() },
+            OwnershipTransitionDebug {
+                partition_id,
+                status,
+                epoch,
+                transitioned_at,
+                reason: reason.into(),
+            },
         );
         if self.ownership_transitions.len() > OWNERSHIP_TRANSITION_HISTORY_LIMIT {
             self.ownership_transitions.truncate(OWNERSHIP_TRANSITION_HISTORY_LIMIT);
         }
+    }
+
+    fn partition_mut(&mut self, partition_id: i32) -> &mut PartitionRuntimeDebug {
+        if let Some(index) =
+            self.partitions.iter().position(|entry| entry.partition_id == partition_id)
+        {
+            return &mut self.partitions[index];
+        }
+        self.partitions.push(PartitionRuntimeDebug {
+            partition_id,
+            ownership: PartitionOwnership {
+                partition_id,
+                owner_id: String::new(),
+                status: "unknown",
+                epoch: 0,
+                acquired_at: chrono::Utc::now(),
+                last_transition_at: chrono::Utc::now(),
+                lease_expires_at: chrono::Utc::now(),
+            },
+            cache_hits: 0,
+            cache_misses: 0,
+            restores_from_projection: 0,
+            restores_from_snapshot_replay: 0,
+            restores_after_handoff: 0,
+            hot_instance_count: 0,
+            hot_instances: Vec::new(),
+        });
+        self.partitions.last_mut().expect("partition debug inserted")
+    }
+
+    fn recompute_totals(&mut self) {
+        self.partitions.sort_by_key(|entry| entry.partition_id);
+        self.cache_hits = self.partitions.iter().map(|entry| entry.cache_hits).sum();
+        self.cache_misses = self.partitions.iter().map(|entry| entry.cache_misses).sum();
+        self.restores_from_projection =
+            self.partitions.iter().map(|entry| entry.restores_from_projection).sum();
+        self.restores_from_snapshot_replay =
+            self.partitions.iter().map(|entry| entry.restores_from_snapshot_replay).sum();
+        self.restores_after_handoff =
+            self.partitions.iter().map(|entry| entry.restores_after_handoff).sum();
+        self.hot_instance_count =
+            self.partitions.iter().map(|entry| entry.hot_instance_count).sum();
     }
 }
 
@@ -1625,23 +2030,27 @@ async fn load_cached_or_snapshot_state(
     broker: &BrokerConfig,
     runtime: &mut ExecutorRuntime,
     debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    partition_id: i32,
     ownership_epoch: u64,
     event: &EventEnvelope<WorkflowEvent>,
 ) -> Result<Option<HotStateRecord>> {
     if let Some(mut record) = runtime.get(&event.tenant_id, &event.instance_id) {
         record.restore_source = RestoreSource::Cache;
-        sync_debug_state(debug_state, runtime);
+        sync_debug_state(debug_state, partition_id, runtime);
         return Ok(Some(record));
     }
 
-    if let Some(snapshot) = store.get_latest_snapshot(&event.tenant_id, &event.instance_id).await? {
-        let record = restore_from_snapshot_tail(broker, snapshot).await?;
+    if let Some(snapshot) =
+        store.get_snapshot_for_run(&event.tenant_id, &event.instance_id, &event.run_id).await?
+    {
+        let record =
+            restore_from_snapshot_tail(store, broker, snapshot, Some(event.event_id)).await?;
         runtime.restores_from_snapshot_replay += 1;
         if ownership_epoch > 1 {
             runtime.restores_after_handoff += 1;
         }
         runtime.put(record.clone());
-        sync_debug_state(debug_state, runtime);
+        sync_debug_state(debug_state, partition_id, runtime);
         return Ok(Some(record));
     }
 
@@ -1656,7 +2065,7 @@ async fn load_cached_or_snapshot_state(
             last_snapshot_event_count: None,
             restore_source: RestoreSource::Projection,
         });
-        sync_debug_state(debug_state, runtime);
+        sync_debug_state(debug_state, partition_id, runtime);
     }
     Ok(instance.map(|state| HotStateRecord {
         state,
@@ -1670,31 +2079,42 @@ async fn persist_state(
     runtime: &mut ExecutorRuntime,
     debug_state: &Arc<Mutex<ExecutorDebugState>>,
     lease_state: &Arc<Mutex<LeaseState>>,
+    partition_id: i32,
     record: &mut HotStateRecord,
     state: &WorkflowInstanceState,
 ) -> Result<()> {
     ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
     store.upsert_instance(state).await?;
-    let should_snapshot = record.last_snapshot_event_count.is_none()
-        || (state.event_count - record.last_snapshot_event_count.unwrap_or_default())
-            >= runtime.snapshot_interval_events as i64
+    let snapshot_safe = state.artifact_hash.is_none()
+        || state.artifact_execution.is_some()
         || matches!(
             state.status,
             fabrik_workflow::WorkflowStatus::Completed | fabrik_workflow::WorkflowStatus::Failed
         );
+    let should_snapshot = snapshot_safe
+        && (record.last_snapshot_event_count.is_none()
+            || (state.event_count - record.last_snapshot_event_count.unwrap_or_default())
+                >= runtime.snapshot_interval_events as i64
+            || matches!(
+                state.status,
+                fabrik_workflow::WorkflowStatus::Completed
+                    | fabrik_workflow::WorkflowStatus::Failed
+            ));
     if should_snapshot {
         store.put_snapshot(state).await?;
         record.last_snapshot_event_count = Some(state.event_count);
     }
     record.state = state.clone();
     runtime.put(record.clone());
-    sync_debug_state(debug_state, runtime);
+    sync_debug_state(debug_state, partition_id, runtime);
     Ok(())
 }
 
 async fn restore_from_snapshot_tail(
+    store: &WorkflowStore,
     broker: &BrokerConfig,
     snapshot: fabrik_store::WorkflowStateSnapshot,
+    exclude_event_id: Option<Uuid>,
 ) -> Result<HotStateRecord> {
     let history = read_workflow_history(
         broker,
@@ -1709,10 +2129,66 @@ async fn restore_from_snapshot_tail(
         .position(|event| event.event_id == snapshot.last_event_id)
         .map(|index| index + 1)
         .unwrap_or(history.len());
-    let mut state = snapshot.state.clone();
-    for event in history.into_iter().skip(tail_start) {
-        state.apply_event(&event);
-    }
+    let tail_events = history[tail_start..]
+        .iter()
+        .filter(|event| Some(event.event_id) != exclude_event_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let tail = tail_events.as_slice();
+    let state = if let Some(definition_version) = snapshot.state.definition_version {
+        if let Some(artifact) = store
+            .get_artifact_version(
+                &snapshot.tenant_id,
+                &snapshot.state.definition_id,
+                definition_version,
+            )
+            .await?
+        {
+            if snapshot.state.artifact_execution.is_some()
+                || matches!(
+                    snapshot.state.status,
+                    fabrik_workflow::WorkflowStatus::Completed
+                        | fabrik_workflow::WorkflowStatus::Failed
+                )
+            {
+                replay_compiled_history_trace_from_snapshot(
+                    tail,
+                    &snapshot.state,
+                    &artifact,
+                    snapshot.event_count,
+                    snapshot.last_event_id,
+                    &snapshot.last_event_type,
+                )?
+                .final_state
+            } else {
+                let replay_history = history
+                    .iter()
+                    .filter(|event| Some(event.event_id) != exclude_event_id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                fabrik_workflow::replay_compiled_history_trace(&replay_history, &artifact)?
+                    .final_state
+            }
+        } else {
+            replay_history_trace_from_snapshot(
+                tail,
+                &snapshot.state,
+                snapshot.event_count,
+                snapshot.last_event_id,
+                &snapshot.last_event_type,
+            )?
+            .final_state
+        }
+    } else {
+        replay_history_trace_from_snapshot(
+            tail,
+            &snapshot.state,
+            snapshot.event_count,
+            snapshot.last_event_id,
+            &snapshot.last_event_type,
+        )?
+        .final_state
+    };
     Ok(HotStateRecord {
         state,
         last_snapshot_event_count: Some(snapshot.event_count),
@@ -1720,9 +2196,13 @@ async fn restore_from_snapshot_tail(
     })
 }
 
-fn sync_debug_state(debug_state: &Arc<Mutex<ExecutorDebugState>>, runtime: &ExecutorRuntime) {
+fn sync_debug_state(
+    debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    partition_id: i32,
+    runtime: &ExecutorRuntime,
+) {
     if let Ok(mut state) = debug_state.lock() {
-        state.sync_from_runtime(runtime);
+        state.sync_from_runtime(partition_id, runtime);
     }
 }
 
@@ -1799,6 +2279,7 @@ async fn run_ownership_renewal_loop(
                     }
                     if let Ok(mut debug) = debug_state.lock() {
                         debug.mark_ownership_lost(
+                            snapshot.partition_id,
                             snapshot.owner_epoch,
                             snapshot.lease_expires_at,
                             "lease renewal lost",
@@ -1841,7 +2322,7 @@ async fn ensure_active_partition_ownership(
 
     if !snapshot.active {
         runtime.clear();
-        sync_debug_state(debug_state, runtime);
+        sync_debug_state(debug_state, snapshot.partition_id, runtime);
         anyhow::bail!("executor does not currently hold partition ownership");
     }
 
@@ -1854,12 +2335,13 @@ async fn ensure_active_partition_ownership(
         .await?
     {
         runtime.clear();
-        sync_debug_state(debug_state, runtime);
+        sync_debug_state(debug_state, snapshot.partition_id, runtime);
         if let Ok(mut state) = lease_state.lock() {
             state.active = false;
         }
         if let Ok(mut debug) = debug_state.lock() {
             debug.mark_ownership_lost(
+                snapshot.partition_id,
                 snapshot.owner_epoch,
                 snapshot.lease_expires_at,
                 "ownership validation failed",
@@ -1901,13 +2383,22 @@ async fn get_runtime_debug(
 
 async fn get_ownership_debug(
     AxumState(state): AxumState<ExecutorAppState>,
-) -> Result<Json<PartitionOwnership>, (StatusCode, Json<ExecutorErrorResponse>)> {
+) -> Result<Json<Vec<PartitionOwnership>>, (StatusCode, Json<ExecutorErrorResponse>)> {
     let snapshot = state
         .debug
         .lock()
-        .map(|state| state.ownership.clone())
+        .map(|state| state.partitions.iter().map(|partition| partition.ownership.clone()).collect())
         .map_err(|_| internal_executor_error("executor debug state lock poisoned"))?;
     Ok(Json(snapshot))
+}
+
+async fn get_broker_debug(
+    AxumState(state): AxumState<ExecutorAppState>,
+) -> Result<Json<WorkflowTopicTopology>, (StatusCode, Json<ExecutorErrorResponse>)> {
+    let topology = describe_workflow_topic(&state.broker, "executor-service-debug").await.map_err(
+        |error| internal_executor_error(format!("failed to describe workflow topic: {error}")),
+    )?;
+    Ok(Json(topology))
 }
 
 async fn get_hot_state_debug(
@@ -1919,8 +2410,9 @@ async fn get_hot_state_debug(
         .lock()
         .map_err(|_| internal_executor_error("executor debug state lock poisoned"))?;
     let instance = snapshot
-        .hot_instances
+        .partitions
         .iter()
+        .flat_map(|partition| partition.hot_instances.iter())
         .find(|entry| entry.tenant_id == tenant_id && entry.instance_id == instance_id)
         .cloned()
         .ok_or_else(|| {
