@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::net::TcpListener;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration as StdDuration, Instant};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -396,6 +396,46 @@ struct WorkflowPublishBuffer<'a> {
     envelopes: Vec<EventEnvelope<WorkflowEvent>>,
 }
 
+const WORKFLOW_LOOKUP_CACHE_CAPACITY: usize = 128;
+const TASK_QUEUE_POLICY_CACHE_CAPACITY: usize = 128;
+
+#[derive(Clone)]
+struct CachedWorkflowLookupEntry {
+    definition: Option<fabrik_workflow::WorkflowDefinition>,
+    artifact: Option<Option<CompiledWorkflowArtifact>>,
+    access_epoch: u64,
+}
+
+#[derive(Default)]
+struct SharedWorkflowLookupCache {
+    access_epoch: u64,
+    entries: HashMap<WorkflowLookupKey, CachedWorkflowLookupEntry>,
+}
+
+static SHARED_WORKFLOW_LOOKUP_CACHE: OnceLock<Mutex<SharedWorkflowLookupCache>> = OnceLock::new();
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct TaskQueuePolicyCacheKey {
+    tenant_id: String,
+    queue_kind: &'static str,
+    task_queue: String,
+}
+
+#[derive(Clone)]
+struct CachedTaskQueuePolicyEntry {
+    backend: String,
+    access_epoch: u64,
+}
+
+#[derive(Default)]
+struct SharedTaskQueuePolicyCache {
+    access_epoch: u64,
+    entries: HashMap<TaskQueuePolicyCacheKey, CachedTaskQueuePolicyEntry>,
+}
+
+static SHARED_TASK_QUEUE_POLICY_CACHE: OnceLock<Mutex<SharedTaskQueuePolicyCache>> =
+    OnceLock::new();
+
 impl<'a> WorkflowPublishBuffer<'a> {
     fn new(publisher: &'a WorkflowPublisher) -> Self {
         Self { publisher, envelopes: Vec::new() }
@@ -414,7 +454,7 @@ impl<'a> WorkflowPublishBuffer<'a> {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Hash, PartialEq, Eq)]
 struct WorkflowLookupKey {
     tenant_id: String,
     definition_id: String,
@@ -426,6 +466,152 @@ struct WorkflowLookupCache {
     key: Option<WorkflowLookupKey>,
     artifact: Option<Option<CompiledWorkflowArtifact>>,
     definition: Option<fabrik_workflow::WorkflowDefinition>,
+}
+
+fn shared_workflow_lookup_cache() -> &'static Mutex<SharedWorkflowLookupCache> {
+    SHARED_WORKFLOW_LOOKUP_CACHE.get_or_init(|| Mutex::new(SharedWorkflowLookupCache::default()))
+}
+
+fn shared_task_queue_policy_cache() -> &'static Mutex<SharedTaskQueuePolicyCache> {
+    SHARED_TASK_QUEUE_POLICY_CACHE
+        .get_or_init(|| Mutex::new(SharedTaskQueuePolicyCache::default()))
+}
+
+fn get_cached_workflow_definition(
+    key: &WorkflowLookupKey,
+) -> Option<fabrik_workflow::WorkflowDefinition> {
+    let mut cache =
+        shared_workflow_lookup_cache().lock().expect("workflow lookup cache lock poisoned");
+    let next_access_epoch = cache.access_epoch.saturating_add(1);
+    cache.access_epoch = next_access_epoch;
+    let entry = cache.entries.get_mut(key)?;
+    entry.access_epoch = next_access_epoch;
+    entry.definition.clone()
+}
+
+fn cache_workflow_definition(
+    key: &WorkflowLookupKey,
+    definition: &fabrik_workflow::WorkflowDefinition,
+) {
+    let mut cache =
+        shared_workflow_lookup_cache().lock().expect("workflow lookup cache lock poisoned");
+    cache.access_epoch = cache.access_epoch.saturating_add(1);
+    let access_epoch = cache.access_epoch;
+    let entry = cache.entries.entry(key.clone()).or_insert_with(|| CachedWorkflowLookupEntry {
+        definition: None,
+        artifact: None,
+        access_epoch,
+    });
+    entry.definition = Some(definition.clone());
+    entry.access_epoch = access_epoch;
+    evict_cached_workflow_lookups(&mut cache);
+}
+
+fn get_cached_workflow_artifact(
+    key: &WorkflowLookupKey,
+) -> Option<Option<CompiledWorkflowArtifact>> {
+    let mut cache =
+        shared_workflow_lookup_cache().lock().expect("workflow lookup cache lock poisoned");
+    let next_access_epoch = cache.access_epoch.saturating_add(1);
+    cache.access_epoch = next_access_epoch;
+    let entry = cache.entries.get_mut(key)?;
+    entry.access_epoch = next_access_epoch;
+    entry.artifact.clone()
+}
+
+fn cache_workflow_artifact(
+    key: &WorkflowLookupKey,
+    artifact: Option<&CompiledWorkflowArtifact>,
+) {
+    let mut cache =
+        shared_workflow_lookup_cache().lock().expect("workflow lookup cache lock poisoned");
+    cache.access_epoch = cache.access_epoch.saturating_add(1);
+    let access_epoch = cache.access_epoch;
+    let entry = cache.entries.entry(key.clone()).or_insert_with(|| CachedWorkflowLookupEntry {
+        definition: None,
+        artifact: None,
+        access_epoch,
+    });
+    entry.artifact = Some(artifact.cloned());
+    entry.access_epoch = access_epoch;
+    evict_cached_workflow_lookups(&mut cache);
+}
+
+fn evict_cached_workflow_lookups(cache: &mut SharedWorkflowLookupCache) {
+    if cache.entries.len() <= WORKFLOW_LOOKUP_CACHE_CAPACITY {
+        return;
+    }
+    if let Some(key) = cache
+        .entries
+        .iter()
+        .min_by_key(|(_, entry)| entry.access_epoch)
+        .map(|(key, _)| key.clone())
+    {
+        cache.entries.remove(&key);
+    }
+}
+
+fn task_queue_kind_name(queue_kind: &TaskQueueKind) -> &'static str {
+    match queue_kind {
+        TaskQueueKind::Workflow => "workflow",
+        TaskQueueKind::Activity => "activity",
+    }
+}
+
+fn get_cached_task_queue_backend(key: &TaskQueuePolicyCacheKey) -> Option<String> {
+    let mut cache =
+        shared_task_queue_policy_cache().lock().expect("task queue policy cache lock poisoned");
+    let next_access_epoch = cache.access_epoch.saturating_add(1);
+    cache.access_epoch = next_access_epoch;
+    let entry = cache.entries.get_mut(key)?;
+    entry.access_epoch = next_access_epoch;
+    Some(entry.backend.clone())
+}
+
+fn cache_task_queue_backend(key: &TaskQueuePolicyCacheKey, backend: &str) {
+    let mut cache =
+        shared_task_queue_policy_cache().lock().expect("task queue policy cache lock poisoned");
+    cache.access_epoch = cache.access_epoch.saturating_add(1);
+    let access_epoch = cache.access_epoch;
+    cache.entries.insert(
+        key.clone(),
+        CachedTaskQueuePolicyEntry { backend: backend.to_owned(), access_epoch },
+    );
+    if cache.entries.len() <= TASK_QUEUE_POLICY_CACHE_CAPACITY {
+        return;
+    }
+    if let Some(evict_key) = cache
+        .entries
+        .iter()
+        .min_by_key(|(_, entry)| entry.access_epoch)
+        .map(|(key, _)| key.clone())
+    {
+        cache.entries.remove(&evict_key);
+    }
+}
+
+async fn load_cached_task_queue_backend(
+    store: &WorkflowStore,
+    tenant_id: &str,
+    queue_kind: TaskQueueKind,
+    task_queue: &str,
+) -> Result<Option<String>> {
+    let key = TaskQueuePolicyCacheKey {
+        tenant_id: tenant_id.to_owned(),
+        queue_kind: task_queue_kind_name(&queue_kind),
+        task_queue: task_queue.to_owned(),
+    };
+    if let Some(backend) = get_cached_task_queue_backend(&key) {
+        return Ok(Some(backend));
+    }
+    let backend = store
+        .get_task_queue_throughput_policy(tenant_id, queue_kind, task_queue)
+        .await?
+        .map(|record| record.backend);
+    if let Some(backend) = backend.as_deref() {
+        cache_task_queue_backend(&key, backend);
+    }
+    Ok(backend)
 }
 
 async fn run_milestone_benchmark(args: Vec<String>) -> Result<()> {
@@ -1300,10 +1486,19 @@ async fn run_executor_loop(
         match message {
             Ok((record, _high_watermark)) => match decode_workflow_event(&record) {
                 Ok(event) => {
+                    let use_local_stream_v2_trigger_fast_path =
+                        should_use_local_stream_v2_trigger_fast_path(&store, &event)
+                            .await
+                            .unwrap_or(false);
+                    if is_executor_observer_only_event(&event.payload) {
+                        continue;
+                    }
                     if matches!(
                         workflow_turn_routing(&event.payload),
                         WorkflowTurnRouting::MatchingPoller
-                    ) {
+                    ) && !is_stream_v2_bulk_terminal_event(&event)
+                        && !use_local_stream_v2_trigger_fast_path
+                    {
                         continue;
                     }
                     if let Ok(mut state) = debug_state.lock() {
@@ -1873,6 +2068,69 @@ fn annotate_workflow_task_event(
     event.metadata.insert("workflow_poller_id".to_owned(), worker_id.to_owned());
 }
 
+fn is_stream_v2_bulk_terminal_event(event: &EventEnvelope<WorkflowEvent>) -> bool {
+    matches!(
+        event.payload,
+        WorkflowEvent::BulkActivityBatchCompleted { .. }
+            | WorkflowEvent::BulkActivityBatchFailed { .. }
+            | WorkflowEvent::BulkActivityBatchCancelled { .. }
+    ) && event.metadata.get("throughput_backend").is_some_and(|backend| backend == "stream-v2")
+}
+
+fn is_executor_observer_only_event(event: &WorkflowEvent) -> bool {
+    matches!(
+        event,
+        WorkflowEvent::WorkflowStarted
+            | WorkflowEvent::WorkflowArtifactPinned
+            | WorkflowEvent::MarkerRecorded { .. }
+            | WorkflowEvent::ActivityTaskScheduled { .. }
+            | WorkflowEvent::ActivityTaskStarted { .. }
+            | WorkflowEvent::ActivityTaskHeartbeatRecorded { .. }
+            | WorkflowEvent::ActivityTaskCancellationRequested { .. }
+            | WorkflowEvent::BulkActivityBatchScheduled { .. }
+            | WorkflowEvent::TimerScheduled { .. }
+    )
+}
+
+async fn should_use_local_stream_v2_trigger_fast_path(
+    store: &WorkflowStore,
+    event: &EventEnvelope<WorkflowEvent>,
+) -> Result<bool> {
+    if !matches!(event.payload, WorkflowEvent::WorkflowTriggered { .. }) {
+        return Ok(false);
+    }
+    let Some(task_queue) = event.metadata.get("workflow_task_queue") else {
+        return Ok(false);
+    };
+    Ok(load_cached_task_queue_backend(
+        store,
+        &event.tenant_id,
+        TaskQueueKind::Activity,
+        task_queue,
+    )
+    .await?
+    .is_some_and(|backend| backend == "stream-v2"))
+}
+
+fn resolve_bulk_wait_state(state: &WorkflowInstanceState, batch_id: &str) -> Option<String> {
+    let binding_wait_state = state
+        .artifact_execution
+        .as_ref()
+        .and_then(|execution| {
+            execution.bindings.values().find_map(|binding| {
+                let object = binding.as_object()?;
+                if object.get("batch_id").and_then(Value::as_str) != Some(batch_id) {
+                    return None;
+                }
+                object
+                    .get("wait_state")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+        });
+    binding_wait_state.or_else(|| state.current_state.clone())
+}
+
 fn signal_dispatch_event_id(source_event_id: Uuid) -> Uuid {
     Uuid::new_v5(
         &SIGNAL_DISPATCH_EVENT_NAMESPACE,
@@ -2283,6 +2541,25 @@ async fn process_event(
         },
     };
 
+    if matches!(
+        event.payload,
+        WorkflowEvent::BulkActivityBatchCompleted { .. }
+            | WorkflowEvent::BulkActivityBatchFailed { .. }
+            | WorkflowEvent::BulkActivityBatchCancelled { .. }
+    ) {
+        if let Some(persisted_state) = store.get_instance(&event.tenant_id, &event.instance_id).await?
+        {
+            if persisted_state.run_id == record.state.run_id
+                && (persisted_state.event_count > record.state.event_count
+                    || (persisted_state.event_count == record.state.event_count
+                        && persisted_state.updated_at >= record.state.updated_at))
+            {
+                record.state = persisted_state;
+                record.restore_source = RestoreSource::Projection;
+            }
+        }
+    }
+
     let mut state = record.state.clone();
     persist_state_with_mode(
         store,
@@ -2650,7 +2927,7 @@ async fn process_event(
             else {
                 return Ok(());
             };
-            let wait_state = match state.current_state.clone() {
+            let wait_state = match resolve_bulk_wait_state(&state, batch_id) {
                 Some(wait_state) => wait_state,
                 None => {
                     warn!(
@@ -2725,7 +3002,7 @@ async fn process_event(
             else {
                 return Ok(());
             };
-            let wait_state = match state.current_state.clone() {
+            let wait_state = match resolve_bulk_wait_state(&state, batch_id) {
                 Some(wait_state) => wait_state,
                 None => {
                     warn!(
@@ -4427,9 +4704,20 @@ async fn load_cached_or_snapshot_state(
         return Ok(Some(record));
     }
 
-    if let Some(snapshot) =
-        store.get_snapshot_for_run(&event.tenant_id, &event.instance_id, &event.run_id).await?
-    {
+    let snapshot =
+        store.get_snapshot_for_run(&event.tenant_id, &event.instance_id, &event.run_id).await?;
+    let instance = store.get_instance(&event.tenant_id, &event.instance_id).await?;
+
+    let should_prefer_snapshot = snapshot.as_ref().is_some_and(|snapshot| {
+        instance.as_ref().is_none_or(|instance| {
+            snapshot.event_count > instance.event_count
+                || (snapshot.event_count == instance.event_count
+                    && snapshot.updated_at >= instance.updated_at)
+        })
+    });
+
+    if should_prefer_snapshot {
+        let snapshot = snapshot.expect("snapshot presence checked");
         let record =
             restore_from_snapshot_tail(store, broker, snapshot, Some(event.event_id)).await?;
         runtime.restores_from_snapshot_replay += 1;
@@ -4441,7 +4729,6 @@ async fn load_cached_or_snapshot_state(
         return Ok(Some(record));
     }
 
-    let instance = store.get_instance(&event.tenant_id, &event.instance_id).await?;
     if let Some(state) = instance.clone() {
         runtime.restores_from_projection += 1;
         if ownership_epoch > 1 {
@@ -4906,17 +5193,22 @@ async fn load_pinned_definition(
         definition_version: state.definition_version,
     };
     if lookup_cache.key.as_ref() != Some(&key) {
-        lookup_cache.key = Some(key);
+        lookup_cache.key = Some(key.clone());
         lookup_cache.artifact = None;
         lookup_cache.definition = None;
     }
     if let Some(definition) = lookup_cache.definition.clone() {
         return Ok(definition);
     }
+    if let Some(definition) = get_cached_workflow_definition(&key) {
+        lookup_cache.definition = Some(definition.clone());
+        return Ok(definition);
+    }
     if let Some(version) = state.definition_version {
         if let Some(definition) =
             store.get_definition_version(&event.tenant_id, &state.definition_id, version).await?
         {
+            cache_workflow_definition(&key, &definition);
             lookup_cache.definition = Some(definition.clone());
             return Ok(definition);
         }
@@ -4932,6 +5224,7 @@ async fn load_pinned_definition(
                 event.tenant_id
             )
         })?;
+    cache_workflow_definition(&key, &definition);
     lookup_cache.definition = Some(definition.clone());
     Ok(definition)
 }
@@ -4948,22 +5241,28 @@ async fn load_pinned_artifact(
         definition_version: state.definition_version,
     };
     if lookup_cache.key.as_ref() != Some(&key) {
-        lookup_cache.key = Some(key);
+        lookup_cache.key = Some(key.clone());
         lookup_cache.artifact = None;
         lookup_cache.definition = None;
     }
     if let Some(artifact) = lookup_cache.artifact.clone() {
         return Ok(artifact);
     }
+    if let Some(artifact) = get_cached_workflow_artifact(&key) {
+        lookup_cache.artifact = Some(artifact.clone());
+        return Ok(artifact);
+    }
     if let Some(version) = state.definition_version {
         if let Some(artifact) =
             store.get_artifact_version(&event.tenant_id, &state.definition_id, version).await?
         {
+            cache_workflow_artifact(&key, Some(&artifact));
             lookup_cache.artifact = Some(Some(artifact.clone()));
             return Ok(Some(artifact));
         }
     }
 
+    cache_workflow_artifact(&key, None);
     lookup_cache.artifact = Some(None);
     Ok(None)
 }
@@ -5167,10 +5466,13 @@ async fn resolve_compiled_emission_event(
             throughput_backend_version: _,
             state,
         } => {
-            let configured_backend = store
-                .get_task_queue_throughput_policy(tenant_id, TaskQueueKind::Activity, &task_queue)
-                .await?
-                .map(|record| record.backend);
+            let configured_backend = load_cached_task_queue_backend(
+                store,
+                tenant_id,
+                TaskQueueKind::Activity,
+                &task_queue,
+            )
+            .await?;
             let (resolved_backend, resolved_version) = runtime.resolve_bulk_backend(
                 &task_queue,
                 configured_backend.as_deref(),
@@ -5939,7 +6241,7 @@ mod tests {
         PollWorkflowTaskResponse, WorkflowTask,
         workflow_worker_api_server::{WorkflowWorkerApi, WorkflowWorkerApiServer},
     };
-    use fabrik_workflow::WorkflowStatus;
+    use fabrik_workflow::{ArtifactExecutionState, WorkflowStatus};
     use serde_json::json;
     use std::{
         collections::HashSet,
@@ -5995,6 +6297,64 @@ mod tests {
             consumed_at: None,
             updated_at: enqueued_at,
         }
+    }
+
+    #[test]
+    fn resolves_bulk_wait_state_from_binding() {
+        let mut state = demo_state("instance-bulk-wait");
+        state.current_state = Some("dispatch".to_owned());
+        state.artifact_execution = Some(ArtifactExecutionState {
+            bindings: BTreeMap::from([(
+                "fanout".to_owned(),
+                json!({
+                    "batch_id": "batch-1",
+                    "wait_state": "join",
+                    "origin_state": "dispatch",
+                }),
+            )]),
+            markers: BTreeMap::new(),
+            active_update: None,
+            turn_context: None,
+            pending_markers: Vec::new(),
+        });
+
+        assert_eq!(resolve_bulk_wait_state(&state, "batch-1").as_deref(), Some("join"));
+    }
+
+    #[test]
+    fn identifies_executor_observer_only_events() {
+        assert!(is_executor_observer_only_event(&WorkflowEvent::WorkflowStarted));
+        assert!(is_executor_observer_only_event(&WorkflowEvent::WorkflowArtifactPinned));
+        assert!(is_executor_observer_only_event(&WorkflowEvent::BulkActivityBatchScheduled {
+            batch_id: "batch-1".to_owned(),
+            activity_type: "benchmark.echo".to_owned(),
+            task_queue: "default".to_owned(),
+            items: Vec::new(),
+            input_handle: json!({"kind": "manifest", "key": "inputs"}),
+            result_handle: json!({"kind": "manifest", "key": "results"}),
+            chunk_size: 100,
+            max_attempts: 1,
+            retry_delay_ms: 0,
+            aggregation_group_count: 1,
+            execution_policy: Some("eager".to_owned()),
+            reducer: Some("collect_results".to_owned()),
+            throughput_backend: "stream-v2".to_owned(),
+            throughput_backend_version: "2.0.0".to_owned(),
+            state: Some("join".to_owned()),
+        }));
+        assert!(!is_executor_observer_only_event(&WorkflowEvent::WorkflowTriggered {
+            input: json!({"ok": true}),
+        }));
+        assert!(!is_executor_observer_only_event(
+            &WorkflowEvent::BulkActivityBatchCompleted {
+                batch_id: "batch-1".to_owned(),
+                total_items: 100,
+                succeeded_items: 100,
+                failed_items: 0,
+                cancelled_items: 0,
+                chunk_count: 1,
+            }
+        ));
     }
 
     fn demo_update(update_id: &str, requested_at: chrono::DateTime<Utc>) -> WorkflowUpdateRecord {
@@ -6767,6 +7127,72 @@ mod tests {
             .context("projected workflow state should still exist")?;
         assert_eq!(persisted_after_flush.event_count, 3);
         assert_eq!(persisted_after_flush.last_event_type, "MarkerRecorded");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_cached_state_prefers_fresher_instance_over_snapshot() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let mut runtime = ExecutorRuntime::new(8, 100, None, None, None, 64, 10_000);
+        let debug = Arc::new(Mutex::new(ExecutorDebugState::new(&[], 8, 100)));
+
+        let mut snapshot_state = demo_state("instance-fresher-projection");
+        snapshot_state.event_count = 1;
+        snapshot_state.last_event_type = "WorkflowTriggered".to_owned();
+        snapshot_state.updated_at = Utc::now();
+        store.put_snapshot(&snapshot_state).await?;
+
+        let mut instance_state = snapshot_state.clone();
+        instance_state.event_count = 5;
+        instance_state.last_event_type = "BulkActivityBatchScheduled".to_owned();
+        instance_state.updated_at = snapshot_state.updated_at + chrono::Duration::seconds(1);
+        store.upsert_instance(&instance_state).await?;
+
+        let identity = WorkflowIdentity::new(
+            &instance_state.tenant_id,
+            &instance_state.definition_id,
+            instance_state.definition_version.unwrap_or_default(),
+            instance_state.artifact_hash.as_deref().unwrap_or_default(),
+            &instance_state.instance_id,
+            &instance_state.run_id,
+            "test",
+        );
+        let event = test_event(
+            &identity,
+            WorkflowEvent::BulkActivityBatchCompleted {
+                batch_id: "batch-1".to_owned(),
+                total_items: 1,
+                succeeded_items: 1,
+                failed_items: 0,
+                cancelled_items: 0,
+                chunk_count: 1,
+            },
+        );
+        let broker = BrokerConfig::new(
+            "127.0.0.1:9092",
+            "unused-workflow-events".to_owned(),
+            1,
+        );
+
+        let restored = load_cached_or_snapshot_state(
+            &store,
+            &broker,
+            &mut runtime,
+            &debug,
+            0,
+            1,
+            &event,
+        )
+        .await?
+        .context("workflow state should restore from projection")?;
+
+        assert_eq!(restored.restore_source, RestoreSource::Projection);
+        assert_eq!(restored.state.event_count, instance_state.event_count);
+        assert_eq!(restored.state.last_event_type, instance_state.last_event_type);
 
         Ok(())
     }

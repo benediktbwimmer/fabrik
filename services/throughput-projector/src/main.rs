@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -15,6 +16,9 @@ use futures_util::StreamExt;
 use serde::Serialize;
 use tracing::error;
 
+const PROJECTION_APPLY_BATCH_SIZE: usize = 128;
+const PROJECTION_APPLY_BATCH_WAIT_MS: u64 = 2;
+
 #[derive(Clone)]
 struct AppState {
     store: WorkflowStore,
@@ -30,6 +34,13 @@ struct ProjectorDebugState {
     manifest_writes: u64,
     last_applied_at: Option<chrono::DateTime<chrono::Utc>>,
     last_failure: Option<String>,
+}
+
+#[derive(Debug)]
+struct BufferedProjectionRecord {
+    partition_id: i32,
+    offset: i64,
+    event: ThroughputProjectionEvent,
 }
 
 #[tokio::main]
@@ -104,21 +115,29 @@ async fn run_projection_consumer(state: AppState, config: JsonTopicConfig) {
             }
         };
         while let Some(message) = consumer.next().await {
-            let record = match message {
-                Ok(record) => record,
-                Err(error) => {
-                    error!(error = %error, "failed to read throughput projection message");
+            let Some(first_record) = decode_projection_record(message) else {
+                break;
+            };
+            let mut batch = vec![first_record];
+            loop {
+                if batch.len() >= PROJECTION_APPLY_BATCH_SIZE {
                     break;
                 }
-            };
-            let event: ThroughputProjectionEvent = match decode_json_record(&record.record) {
-                Ok(event) => event,
-                Err(error) => {
-                    error!(error = %error, "failed to decode throughput projection event");
-                    continue;
-                }
-            };
-            if let Err(error) = apply_projection_event(&state, &event).await {
+                let Ok(Some(message)) =
+                    tokio::time::timeout(
+                        Duration::from_millis(PROJECTION_APPLY_BATCH_WAIT_MS),
+                        consumer.next(),
+                    )
+                    .await
+                else {
+                    break;
+                };
+                let Some(record) = decode_projection_record(message) else {
+                    break;
+                };
+                batch.push(record);
+            }
+            if let Err(error) = apply_projection_batch(&state, &batch).await {
                 {
                     let mut debug =
                         state.debug.lock().expect("throughput projector debug lock poisoned");
@@ -129,24 +148,71 @@ async fn run_projection_consumer(state: AppState, config: JsonTopicConfig) {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 break;
             }
-            if let Err(error) = state
-                .store
-                .commit_throughput_projection_offset(
-                    &state.projector_id,
-                    record.partition_id,
-                    record.record.offset,
-                    Utc::now(),
-                )
-                .await
-            {
+            if let Err(error) = commit_projection_batch_offsets(&state, &batch).await {
                 error!(error = %error, "failed to commit throughput projection offset");
                 break;
             }
             let mut debug = state.debug.lock().expect("throughput projector debug lock poisoned");
-            debug.applied_events = debug.applied_events.saturating_add(1);
+            debug.applied_events = debug.applied_events.saturating_add(batch.len() as u64);
             debug.last_applied_at = Some(Utc::now());
         }
     }
+}
+
+fn decode_projection_record(
+    message: Result<fabrik_broker::ConsumedJsonRecord>,
+) -> Option<BufferedProjectionRecord> {
+    let record = match message {
+        Ok(record) => record,
+        Err(error) => {
+            error!(error = %error, "failed to read throughput projection message");
+            return None;
+        }
+    };
+    let event: ThroughputProjectionEvent = match decode_json_record(&record.record) {
+        Ok(event) => event,
+        Err(error) => {
+            error!(error = %error, "failed to decode throughput projection event");
+            return None;
+        }
+    };
+    Some(BufferedProjectionRecord { partition_id: record.partition_id, offset: record.record.offset, event })
+}
+
+async fn apply_projection_batch(
+    state: &AppState,
+    batch: &[BufferedProjectionRecord],
+) -> Result<()> {
+    for record in batch {
+        apply_projection_event(state, &record.event).await?;
+    }
+    Ok(())
+}
+
+async fn commit_projection_batch_offsets(
+    state: &AppState,
+    batch: &[BufferedProjectionRecord],
+) -> Result<()> {
+    let mut offsets: HashMap<i32, i64> = HashMap::new();
+    for record in batch {
+        offsets
+            .entry(record.partition_id)
+            .and_modify(|offset| *offset = (*offset).max(record.offset))
+            .or_insert(record.offset);
+    }
+    let updated_at = Utc::now();
+    for (partition_id, offset) in offsets {
+        state
+            .store
+            .commit_throughput_projection_offset(
+                &state.projector_id,
+                partition_id,
+                offset,
+                updated_at,
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 async fn apply_projection_event(state: &AppState, event: &ThroughputProjectionEvent) -> Result<()> {
@@ -218,7 +284,7 @@ async fn sync_batch_result_manifest(
     });
     if let Ok(handle) = serde_json::from_value::<PayloadHandle>(batch.result_handle.clone()) {
         let key = match handle {
-            PayloadHandle::Manifest { key, .. } => key,
+            PayloadHandle::Manifest { key, .. } | PayloadHandle::ManifestSlice { key, .. } => key,
             PayloadHandle::Inline { .. } => return Ok(()),
         };
         state.payload_store.write_value(&key, &manifest).await?;

@@ -31,11 +31,10 @@ use fabrik_store::{
     WorkflowBulkBatchStatus, WorkflowBulkChunkRecord, WorkflowBulkChunkStatus, WorkflowStore,
 };
 use fabrik_throughput::{
-    CreateBatchCommand, PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
-    ThroughputBackend, ThroughputBatchIdentity, ThroughputChangelogEntry,
-    ThroughputChangelogPayload, ThroughputChunkReport, ThroughputChunkReportPayload,
-    ThroughputCommand, ThroughputCommandEnvelope, ThroughputReportEnvelope,
-    effective_aggregation_group_count, group_id_for_chunk_index, throughput_partition_key,
+    PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind, ThroughputBackend,
+    ThroughputBatchIdentity, ThroughputChangelogEntry, ThroughputChangelogPayload,
+    ThroughputChunkReport, ThroughputChunkReportPayload, effective_aggregation_group_count,
+    group_id_for_chunk_index, throughput_partition_key,
 };
 use fabrik_worker_protocol::activity_worker::{
     Ack, BulkActivityTask, BulkActivityTaskResult, PollBulkActivityTaskRequest,
@@ -51,6 +50,7 @@ use local_state::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Notify;
+use tokio::task::JoinSet;
 use tonic::{Request, Response, Status, transport::Server};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -58,17 +58,12 @@ use uuid::Uuid;
 const BULK_EVENT_OUTBOX_BATCH_SIZE: usize = 128;
 const BULK_EVENT_OUTBOX_LEASE_SECONDS: i64 = 30;
 const BULK_EVENT_OUTBOX_RETRY_MS: i64 = 250;
-const MAX_BULK_ITEM_BYTES: usize = 256 * 1024;
-const MAX_BULK_TOTAL_INPUT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_BULK_CHUNK_INPUT_BYTES: usize = 1024 * 1024;
-
+const BRIDGE_EVENT_CONCURRENCY: usize = 64;
 #[derive(Clone)]
 struct AppState {
     store: WorkflowStore,
     local_state: LocalThroughputState,
     workflow_publisher: WorkflowPublisher,
-    command_publisher: JsonTopicPublisher<ThroughputCommandEnvelope>,
-    report_publisher: JsonTopicPublisher<ThroughputReportEnvelope>,
     changelog_publisher: JsonTopicPublisher<ThroughputChangelogEntry>,
     projection_publisher: JsonTopicPublisher<ThroughputProjectionEvent>,
     payload_store: PayloadStore,
@@ -252,24 +247,6 @@ async fn main() -> Result<()> {
         redpanda.throughput_partitions,
     );
     let workflow_publisher = WorkflowPublisher::new(&workflow_broker, "throughput-runtime").await?;
-    let command_publisher = JsonTopicPublisher::new(
-        &JsonTopicConfig::new(
-            redpanda.brokers.clone(),
-            redpanda.throughput_commands_topic,
-            redpanda.throughput_partitions,
-        ),
-        "throughput-runtime-commands",
-    )
-    .await?;
-    let report_publisher = JsonTopicPublisher::new(
-        &JsonTopicConfig::new(
-            redpanda.brokers.clone(),
-            redpanda.throughput_reports_topic,
-            redpanda.throughput_partitions,
-        ),
-        "throughput-runtime-reports",
-    )
-    .await?;
     let changelog_publisher = JsonTopicPublisher::new(
         &JsonTopicConfig::new(
             redpanda.brokers.clone(),
@@ -311,8 +288,6 @@ async fn main() -> Result<()> {
         store,
         local_state,
         workflow_publisher,
-        command_publisher,
-        report_publisher,
         changelog_publisher,
         projection_publisher,
         payload_store,
@@ -432,6 +407,7 @@ async fn get_strong_chunk_snapshots(
 }
 
 async fn run_bridge_loop(state: AppState, mut consumer: fabrik_broker::WorkflowConsumerStream) {
+    let mut in_flight = JoinSet::new();
     while let Some(message) = consumer.next().await {
         let record = match message {
             Ok(record) => record,
@@ -447,163 +423,124 @@ async fn run_bridge_loop(state: AppState, mut consumer: fabrik_broker::WorkflowC
                 continue;
             }
         };
-        if let WorkflowEvent::WorkflowCancellationRequested { reason } = &event.payload {
-            if let Err(error) = cancel_stream_batches_for_run(&state, &event, reason).await {
-                let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
-                debug.bridge_failures = debug.bridge_failures.saturating_add(1);
-                error!(error = %error, instance_id = %event.instance_id, run_id = %event.run_id, "failed to cancel stream-v2 batches for workflow cancellation");
+        while in_flight.len() >= BRIDGE_EVENT_CONCURRENCY {
+            if let Some(result) = in_flight.join_next().await {
+                if let Err(error) = result {
+                    error!(error = %error, "throughput-runtime bridge worker task failed");
+                }
             }
-            continue;
         }
-        let WorkflowEvent::BulkActivityBatchScheduled {
+        let state = state.clone();
+        let debug_state = state.clone();
+        in_flight.spawn(async move {
+            if let Err(error) = handle_bridge_event(state, event).await {
+                let mut debug = debug_state.debug.lock().expect("throughput debug lock poisoned");
+                debug.bridge_failures = debug.bridge_failures.saturating_add(1);
+                drop(debug);
+                error!(error = %error, "throughput-runtime failed to handle workflow bridge event");
+            }
+        });
+    }
+
+    while let Some(result) = in_flight.join_next().await {
+        if let Err(error) = result {
+            error!(error = %error, "throughput-runtime bridge worker task failed");
+        }
+    }
+}
+
+async fn handle_bridge_event(state: AppState, event: EventEnvelope<WorkflowEvent>) -> Result<()> {
+    if let WorkflowEvent::WorkflowCancellationRequested { reason } = &event.payload {
+        cancel_stream_batches_for_run(&state, &event, reason).await?;
+        return Ok(());
+    }
+
+    let WorkflowEvent::BulkActivityBatchScheduled {
+        batch_id,
+        task_queue,
+        activity_type: _,
+        items: _,
+        input_handle: _,
+        result_handle: _,
+        chunk_size: _,
+        max_attempts: _,
+        retry_delay_ms: _,
+        aggregation_group_count: _,
+        execution_policy: _,
+        reducer: _,
+        throughput_backend,
+        throughput_backend_version: _,
+        state: _,
+    } = &event.payload
+    else {
+        return Ok(());
+    };
+    if throughput_backend != ThroughputBackend::StreamV2.as_str() {
+        return Ok(());
+    }
+
+    let dedupe_key = format!("throughput-create:{}", event.event_id);
+    let published_at = state
+        .store
+        .ensure_throughput_bridge_progress(
+            event.event_id,
+            &event.tenant_id,
+            &event.instance_id,
+            &event.run_id,
             batch_id,
-            activity_type,
-            task_queue,
-            items,
-            input_handle,
-            result_handle,
-            chunk_size,
-            max_attempts,
-            retry_delay_ms,
-            aggregation_group_count: _,
-            execution_policy: _,
-            reducer: _,
             throughput_backend,
-            throughput_backend_version,
-            state: workflow_state,
-        } = &event.payload
-        else {
-            continue;
-        };
-        if throughput_backend != ThroughputBackend::StreamV2.as_str() {
-            continue;
-        }
-        let dedupe_key = format!("throughput-create:{}", event.event_id);
-        let published_at = match state
-            .store
-            .ensure_throughput_bridge_progress(
-                event.event_id,
-                &event.tenant_id,
-                &event.instance_id,
-                &event.run_id,
-                batch_id,
-                throughput_backend,
-                &dedupe_key,
-                event.occurred_at,
-            )
-            .await
-        {
-            Ok(published_at) => published_at,
-            Err(error) => {
-                let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
-                debug.bridge_failures = debug.bridge_failures.saturating_add(1);
-                error!(error = %error, batch_id = %batch_id, "failed to record throughput bridge progress");
-                continue;
-            }
-        };
-        if published_at.is_some() {
-            let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
-            debug.duplicate_bridge_events = debug.duplicate_bridge_events.saturating_add(1);
-            continue;
-        }
-
-        let (batch, chunks) = match build_stream_projection_records(&state, &event).await {
-            Ok(result) => result,
-            Err(error) => {
-                let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
-                debug.bridge_failures = debug.bridge_failures.saturating_add(1);
-                error!(error = %error, batch_id = %batch_id, "failed to build stream-v2 batch projection records");
-                continue;
-            }
-        };
-        if let Err(error) = sync_stream_batch_projection(&state, &batch).await {
-            error!(error = %error, batch_id = %batch_id, "failed to project stream-v2 batch");
-        }
-        if let Err(error) = sync_stream_chunk_projections(&state, &chunks).await {
-            error!(error = %error, batch_id = %batch_id, "failed to project stream-v2 chunks");
-        }
-        if let Err(error) = state.local_state.upsert_batch_record(&batch) {
-            error!(error = %error, batch_id = %batch_id, "failed to seed local stream-v2 batch state");
-        }
-        for chunk in &chunks {
-            if let Err(error) = state.local_state.upsert_chunk_record(chunk) {
-                error!(error = %error, batch_id = %chunk.batch_id, chunk_id = %chunk.chunk_id, "failed to seed local stream-v2 chunk state");
-            }
-        }
-        publish_changelog(
-            &state,
-            ThroughputChangelogPayload::BatchCreated {
-                identity: ThroughputBatchIdentity {
-                    tenant_id: event.tenant_id.clone(),
-                    instance_id: event.instance_id.clone(),
-                    run_id: event.run_id.clone(),
-                    batch_id: batch_id.clone(),
-                },
-                task_queue: task_queue.clone(),
-                aggregation_group_count: batch.aggregation_group_count,
-                total_items: batch.total_items,
-                chunk_count: batch.chunk_count,
-            },
-            throughput_partition_key(batch_id, 0),
+            &dedupe_key,
+            event.occurred_at,
         )
-        .await;
+        .await
+        .with_context(|| format!("failed to record throughput bridge progress for {batch_id}"))?;
+    if published_at.is_some() {
+        let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
+        debug.duplicate_bridge_events = debug.duplicate_bridge_events.saturating_add(1);
+        return Ok(());
+    }
 
-        let effective_group_count = batch.aggregation_group_count;
-
-        let command = ThroughputCommandEnvelope {
-            command_id: Uuid::now_v7(),
-            occurred_at: event.occurred_at,
-            dedupe_key: dedupe_key.clone(),
-            partition_key: throughput_partition_key(batch_id, 0),
-            payload: ThroughputCommand::CreateBatch(CreateBatchCommand {
-                dedupe_key,
+    let (batch, chunks) =
+        build_stream_projection_records(&state, &event).await.with_context(|| {
+            format!("failed to build stream-v2 batch projection records for {batch_id}")
+        })?;
+    if let Err(error) = sync_stream_batch_projection(&state, &batch).await {
+        error!(error = %error, batch_id = %batch_id, "failed to project stream-v2 batch");
+    }
+    if let Err(error) = state.local_state.upsert_batch_with_chunks(&batch, &chunks) {
+        error!(error = %error, batch_id = %batch_id, "failed to seed local stream-v2 batch state");
+    }
+    publish_changelog(
+        &state,
+        ThroughputChangelogPayload::BatchCreated {
+            identity: ThroughputBatchIdentity {
                 tenant_id: event.tenant_id.clone(),
-                definition_id: event.definition_id.clone(),
-                definition_version: event.definition_version,
-                artifact_hash: event.artifact_hash.clone(),
                 instance_id: event.instance_id.clone(),
                 run_id: event.run_id.clone(),
                 batch_id: batch_id.clone(),
-                activity_type: activity_type.clone(),
-                task_queue: task_queue.clone(),
-                state: workflow_state.clone(),
-                chunk_size: *chunk_size,
-                max_attempts: *max_attempts,
-                retry_delay_ms: *retry_delay_ms,
-                total_items: items.len() as u32,
-                aggregation_group_count: effective_group_count,
-                throughput_backend: throughput_backend.clone(),
-                throughput_backend_version: throughput_backend_version.clone(),
-                input_handle: serde_json::from_value(input_handle.clone()).unwrap_or_else(|_| {
-                    fabrik_throughput::PayloadHandle::inline_batch_input(batch_id)
-                }),
-                result_handle: serde_json::from_value(result_handle.clone()).unwrap_or_else(|_| {
-                    fabrik_throughput::PayloadHandle::inline_batch_result(batch_id)
-                }),
-                items: items.clone(),
-            }),
-        };
-        if let Err(error) = state.command_publisher.publish(&command, &command.partition_key).await
-        {
-            let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
-            debug.bridge_failures = debug.bridge_failures.saturating_add(1);
-            error!(error = %error, batch_id = %batch_id, "failed to publish throughput create command");
-        } else {
-            if let Err(error) = state
-                .store
-                .mark_throughput_bridge_command_published(event.event_id, Utc::now())
-                .await
-            {
-                let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
-                debug.bridge_failures = debug.bridge_failures.saturating_add(1);
-                error!(error = %error, batch_id = %batch_id, "failed to mark throughput create command published");
-            }
-            let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
-            debug.bridged_batches = debug.bridged_batches.saturating_add(1);
-            debug.last_bridge_at = Some(Utc::now());
-        }
-        state.bulk_notify.notify_waiters();
-    }
+            },
+            task_queue: task_queue.clone(),
+            aggregation_group_count: batch.aggregation_group_count,
+            total_items: batch.total_items,
+            chunk_count: batch.chunk_count,
+        },
+        throughput_partition_key(batch_id, 0),
+    )
+    .await;
+
+    state
+        .store
+        .mark_throughput_bridge_command_published(event.event_id, Utc::now())
+        .await
+        .with_context(|| {
+            format!("failed to mark throughput create command published for {batch_id}")
+        })?;
+    let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
+    debug.bridged_batches = debug.bridged_batches.saturating_add(1);
+    debug.last_bridge_at = Some(Utc::now());
+    drop(debug);
+    state.bulk_notify.notify_waiters();
+    Ok(())
 }
 
 async fn restore_local_state_from_changelog(
@@ -667,8 +604,7 @@ async fn seed_local_state_from_store(state: &AppState) -> Result<()> {
         )
         .await?;
     for batch in batches {
-        state.local_state.upsert_batch_record(&batch)?;
-        let chunks = state
+        let existing_chunks = state
             .store
             .list_bulk_chunks_for_batch_page_query_view(
                 &batch.tenant_id,
@@ -679,9 +615,8 @@ async fn seed_local_state_from_store(state: &AppState) -> Result<()> {
                 0,
             )
             .await?;
-        for chunk in &chunks {
-            state.local_state.upsert_chunk_record(chunk)?;
-        }
+        let chunks = reconstruct_missing_stream_chunks(&batch, existing_chunks)?;
+        state.local_state.upsert_batch_with_chunks(&batch, &chunks)?;
     }
     Ok(())
 }
@@ -1448,7 +1383,7 @@ impl ActivityWorkerApi for WorkerApi {
             let leased_local = self
                 .state
                 .local_state
-                .lease_next_ready_chunk(
+                .lease_ready_chunks(
                     &request.tenant_id,
                     &request.task_queue,
                     &request.worker_id,
@@ -1457,14 +1392,14 @@ impl ActivityWorkerApi for WorkerApi {
                     batch_limit,
                     Some(&owned),
                     self.state.throughput_partitions,
+                    max_tasks,
                 )
                 .map_err(internal_status)?;
-            if let Some(leased_local) = leased_local {
-                let mut leased_tasks = Vec::with_capacity(max_tasks);
+            if !leased_local.is_empty() {
+                let mut leased_tasks = Vec::with_capacity(leased_local.len());
                 let mut projection_records = Vec::with_capacity(max_tasks * 2);
                 let mut changelog_records = Vec::with_capacity(max_tasks);
-                let mut current = Some(leased_local);
-                while let Some(leased_local) = current.take() {
+                for leased_local in leased_local {
                     let leased = leased_snapshot_to_projection_chunk(
                         &leased_local,
                         &request.worker_build_id,
@@ -1502,23 +1437,6 @@ impl ActivityWorkerApi for WorkerApi {
                         },
                     ));
                     leased_tasks.push(bulk_chunk_to_proto(&leased));
-                    if leased_tasks.len() >= max_tasks {
-                        break;
-                    }
-                    current = self
-                        .state
-                        .local_state
-                        .lease_next_ready_chunk(
-                            &request.tenant_id,
-                            &request.task_queue,
-                            &request.worker_id,
-                            Utc::now(),
-                            chrono::Duration::seconds(self.state.runtime.lease_ttl_seconds as i64),
-                            batch_limit,
-                            Some(&owned),
-                            self.state.throughput_partitions,
-                        )
-                        .map_err(internal_status)?;
                 }
                 if let Err(error) =
                     publish_projection_records(&self.state, projection_records).await
@@ -1534,45 +1452,38 @@ impl ActivityWorkerApi for WorkerApi {
                 }
                 return Ok(Response::new(PollBulkActivityTaskResponse { tasks: leased_tasks }));
             }
-            let ready_chunk_exists = self
-                .state
-                .local_state
-                .has_ready_chunk(
-                    &request.tenant_id,
-                    &request.task_queue,
-                    Utc::now(),
-                    Some(&owned),
-                    self.state.throughput_partitions,
-                )
-                .map_err(internal_status)?;
-            let lease_selection_debug = self
-                .state
-                .local_state
-                .debug_lease_selection(
-                    &request.tenant_id,
-                    &request.task_queue,
-                    Utc::now(),
-                    batch_limit,
-                    Some(&owned),
-                    self.state.throughput_partitions,
-                )
-                .map_err(internal_status)?;
-            if batch_limit.is_some() && ready_chunk_exists {
-                record_throttle(&self.state, "batch_cap");
-                {
+            {
+                let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
+                debug.empty_polls = debug.empty_polls.saturating_add(1);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let lease_selection_debug = self
+                    .state
+                    .local_state
+                    .debug_lease_selection(
+                        &request.tenant_id,
+                        &request.task_queue,
+                        Utc::now(),
+                        batch_limit,
+                        Some(&owned),
+                        self.state.throughput_partitions,
+                    )
+                    .map_err(internal_status)?;
+                if batch_limit.is_some() && lease_selection_debug.batch_cap_blocked > 0 {
+                    record_throttle(&self.state, "batch_cap");
                     let mut debug =
                         self.state.debug.lock().expect("throughput debug lock poisoned");
                     debug.lease_misses_with_ready_chunks =
                         debug.lease_misses_with_ready_chunks.saturating_add(1);
                     debug.last_lease_miss_with_ready_chunks_at = Some(Utc::now());
+                    debug.last_lease_selection_debug =
+                        serde_json::to_value(lease_selection_debug).ok();
+                } else {
+                    let mut debug =
+                        self.state.debug.lock().expect("throughput debug lock poisoned");
+                    debug.last_lease_selection_debug =
+                        serde_json::to_value(lease_selection_debug).ok();
                 }
-            }
-            {
-                let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
-                debug.empty_polls = debug.empty_polls.saturating_add(1);
-                debug.last_lease_selection_debug = serde_json::to_value(lease_selection_debug).ok();
-            }
-            if tokio::time::Instant::now() >= deadline {
                 return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1661,22 +1572,6 @@ impl ActivityWorkerApi for WorkerApi {
                         throughput_partition_id
                     )));
                 }
-                self.state
-                    .report_publisher
-                    .publish(
-                        &ThroughputReportEnvelope {
-                            report_id: report.report_id.clone(),
-                            occurred_at: report.occurred_at,
-                            partition_key: throughput_partition_key(
-                                &report.batch_id,
-                                report.group_id,
-                            ),
-                            payload: report.clone(),
-                        },
-                        &throughput_partition_key(&report.batch_id, report.group_id),
-                    )
-                    .await
-                    .map_err(internal_status)?;
                 let identity = ThroughputBatchIdentity {
                     tenant_id: report.tenant_id.clone(),
                     instance_id: report.instance_id.clone(),
@@ -1861,7 +1756,7 @@ async fn build_stream_projection_records(
         activity_type,
         task_queue,
         items,
-        input_handle,
+        input_handle: _,
         result_handle,
         chunk_size,
         max_attempts,
@@ -1879,39 +1774,6 @@ async fn build_stream_projection_records(
 
     let chunk_size_usize =
         usize::try_from((*chunk_size).max(1)).context("bulk chunk size exceeds usize")?;
-    let mut total_input_bytes = 0usize;
-    for (chunk_index, chunk_items) in items.chunks(chunk_size_usize).enumerate() {
-        let mut chunk_bytes = 0usize;
-        for item in chunk_items {
-            let item_bytes = serde_json::to_vec(item)
-                .map(|bytes| bytes.len())
-                .context("failed to serialize bulk batch item")?;
-            if item_bytes > MAX_BULK_ITEM_BYTES {
-                anyhow::bail!(
-                    "bulk batch item exceeds per-item byte limit {}",
-                    MAX_BULK_ITEM_BYTES
-                );
-            }
-            total_input_bytes = total_input_bytes.saturating_add(item_bytes);
-            chunk_bytes = chunk_bytes.saturating_add(item_bytes);
-        }
-        if chunk_bytes > MAX_BULK_CHUNK_INPUT_BYTES {
-            anyhow::bail!(
-                "bulk chunk {} serialized to {} bytes, over limit {}",
-                chunk_index,
-                chunk_bytes,
-                MAX_BULK_CHUNK_INPUT_BYTES
-            );
-        }
-    }
-    if total_input_bytes > MAX_BULK_TOTAL_INPUT_BYTES {
-        anyhow::bail!(
-            "bulk batch input serialized to {} bytes, over limit {}",
-            total_input_bytes,
-            MAX_BULK_TOTAL_INPUT_BYTES
-        );
-    }
-
     let chunk_count = if items.is_empty() {
         0
     } else {
@@ -1919,9 +1781,7 @@ async fn build_stream_projection_records(
     };
     let effective_group_count =
         planned_aggregation_group_count(*aggregation_group_count, chunk_count, &app_state.runtime);
-    let batch_input_handle =
-        maybe_externalize_batch_input(app_state, batch_id, items, total_input_bytes, input_handle)
-            .await?;
+    let batch_input_handle = externalize_batch_input(app_state, batch_id, items).await?;
     let batch_result_handle =
         maybe_initialize_batch_result_manifest(app_state, batch_id, result_handle).await?;
     let batch = fabrik_store::WorkflowBulkBatchRecord {
@@ -1935,7 +1795,8 @@ async fn build_stream_projection_records(
         activity_type: activity_type.clone(),
         task_queue: task_queue.clone(),
         state: state.clone(),
-        input_handle: batch_input_handle,
+        input_handle: serde_json::to_value(&batch_input_handle)
+            .context("failed to serialize batch input handle")?,
         result_handle: batch_result_handle,
         throughput_backend: throughput_backend.clone(),
         throughput_backend_version: throughput_backend_version.clone(),
@@ -1954,20 +1815,40 @@ async fn build_stream_projection_records(
         terminal_at: None,
         updated_at: event.occurred_at,
     };
-    let mut chunks = Vec::new();
+    let tenant_id = event.tenant_id.clone();
+    let instance_id = event.instance_id.clone();
+    let run_id = event.run_id.clone();
+    let definition_id = event.definition_id.clone();
+    let definition_version = Some(event.definition_version);
+    let artifact_hash = Some(event.artifact_hash.clone());
+    let activity_type = activity_type.clone();
+    let task_queue = task_queue.clone();
+    let workflow_state = state.clone();
+    let occurred_at = event.occurred_at;
+    let payload_key = payload_handle_key(&batch_input_handle)?.to_owned();
+    let payload_store = payload_handle_store(&batch_input_handle)?.to_owned();
+    let mut chunks = Vec::with_capacity(usize::try_from(chunk_count).unwrap_or_default());
     for (chunk_index, chunk_items) in items.chunks(chunk_size_usize).enumerate() {
         let chunk_index = chunk_index as u32;
         let chunk_id = format!("{batch_id}::{chunk_index}");
         let group_id = group_id_for_chunk_index(chunk_index, effective_group_count);
-        let (items_inline, input_handle) =
-            maybe_externalize_chunk_input(app_state, batch_id, &chunk_id, chunk_items).await?;
+        let chunk_start = usize::try_from(chunk_index)
+            .unwrap_or_default()
+            .saturating_mul(chunk_size_usize);
+        let input_handle = serde_json::to_value(PayloadHandle::ManifestSlice {
+            key: payload_key.clone(),
+            store: payload_store.clone(),
+            start: chunk_start,
+            len: chunk_items.len(),
+        })
+        .context("failed to serialize chunk input handle")?;
         chunks.push(WorkflowBulkChunkRecord {
-            tenant_id: event.tenant_id.clone(),
-            instance_id: event.instance_id.clone(),
-            run_id: event.run_id.clone(),
-            definition_id: event.definition_id.clone(),
-            definition_version: Some(event.definition_version),
-            artifact_hash: Some(event.artifact_hash.clone()),
+            tenant_id: tenant_id.clone(),
+            instance_id: instance_id.clone(),
+            run_id: run_id.clone(),
+            definition_id: definition_id.clone(),
+            definition_version,
+            artifact_hash: artifact_hash.clone(),
             batch_id: batch_id.clone(),
             chunk_id,
             chunk_index,
@@ -1975,7 +1856,7 @@ async fn build_stream_projection_records(
             item_count: chunk_items.len() as u32,
             activity_type: activity_type.clone(),
             task_queue: task_queue.clone(),
-            state: state.clone(),
+            state: workflow_state.clone(),
             status: WorkflowBulkChunkStatus::Scheduled,
             attempt: 1,
             lease_epoch: 0,
@@ -1984,7 +1865,7 @@ async fn build_stream_projection_records(
             retry_delay_ms: *retry_delay_ms,
             input_handle,
             result_handle: Value::Null,
-            items: items_inline,
+            items: Vec::new(),
             output: None,
             error: None,
             cancellation_requested: false,
@@ -1994,12 +1875,12 @@ async fn build_stream_projection_records(
             worker_build_id: None,
             lease_token: None,
             last_report_id: None,
-            scheduled_at: event.occurred_at,
-            available_at: event.occurred_at,
+            scheduled_at: occurred_at,
+            available_at: occurred_at,
             started_at: None,
             lease_expires_at: None,
             completed_at: None,
-            updated_at: event.occurred_at,
+            updated_at: occurred_at,
         });
     }
     Ok((batch, chunks))
@@ -2080,22 +1961,97 @@ fn planned_aggregation_group_count(
     effective_aggregation_group_count(target_groups as u32, chunk_count)
 }
 
-async fn maybe_externalize_batch_input(
+fn reconstruct_missing_stream_chunks(
+    batch: &WorkflowBulkBatchRecord,
+    existing_chunks: Vec<WorkflowBulkChunkRecord>,
+) -> Result<Vec<WorkflowBulkChunkRecord>> {
+    let Some(chunk_size) = usize::try_from(batch.chunk_size).ok().filter(|value| *value > 0) else {
+        return Ok(existing_chunks);
+    };
+    let input_handle = serde_json::from_value::<PayloadHandle>(batch.input_handle.clone())
+        .context("failed to deserialize stream-v2 batch input handle")?;
+    let (key, store) = match input_handle {
+        PayloadHandle::Manifest { key, store } | PayloadHandle::ManifestSlice { key, store, .. } => {
+            (key, store)
+        }
+        PayloadHandle::Inline { .. } => {
+            anyhow::bail!("stream-v2 batch input handle must be object-store-backed")
+        }
+    };
+    let mut chunks_by_index = existing_chunks
+        .into_iter()
+        .map(|chunk| (chunk.chunk_index, chunk))
+        .collect::<HashMap<_, _>>();
+    let mut chunks = Vec::with_capacity(usize::try_from(batch.chunk_count).unwrap_or_default());
+    for chunk_index in 0..batch.chunk_count {
+        if let Some(chunk) = chunks_by_index.remove(&chunk_index) {
+            chunks.push(chunk);
+            continue;
+        }
+        let chunk_start = usize::try_from(chunk_index).unwrap_or_default().saturating_mul(chunk_size);
+        let remaining_items = usize::try_from(batch.total_items)
+            .unwrap_or_default()
+            .saturating_sub(chunk_start);
+        let item_count = remaining_items.min(chunk_size);
+        chunks.push(WorkflowBulkChunkRecord {
+            tenant_id: batch.tenant_id.clone(),
+            instance_id: batch.instance_id.clone(),
+            run_id: batch.run_id.clone(),
+            definition_id: batch.definition_id.clone(),
+            definition_version: batch.definition_version,
+            artifact_hash: batch.artifact_hash.clone(),
+            batch_id: batch.batch_id.clone(),
+            chunk_id: format!("{}::{chunk_index}", batch.batch_id),
+            chunk_index,
+            group_id: group_id_for_chunk_index(chunk_index, batch.aggregation_group_count),
+            item_count: item_count as u32,
+            activity_type: batch.activity_type.clone(),
+            task_queue: batch.task_queue.clone(),
+            state: batch.state.clone(),
+            status: WorkflowBulkChunkStatus::Scheduled,
+            attempt: 1,
+            lease_epoch: 0,
+            owner_epoch: 1,
+            max_attempts: batch.max_attempts,
+            retry_delay_ms: batch.retry_delay_ms,
+            input_handle: serde_json::to_value(PayloadHandle::ManifestSlice {
+                key: key.clone(),
+                store: store.clone(),
+                start: chunk_start,
+                len: item_count,
+            })
+            .context("failed to serialize reconstructed stream-v2 chunk input handle")?,
+            result_handle: Value::Null,
+            items: Vec::new(),
+            output: None,
+            error: None,
+            cancellation_requested: false,
+            cancellation_reason: None,
+            cancellation_metadata: None,
+            worker_id: None,
+            worker_build_id: None,
+            lease_token: None,
+            last_report_id: None,
+            scheduled_at: batch.scheduled_at,
+            available_at: batch.scheduled_at,
+            started_at: None,
+            lease_expires_at: None,
+            completed_at: None,
+            updated_at: batch.updated_at,
+        });
+    }
+    Ok(chunks)
+}
+
+async fn externalize_batch_input(
     state: &AppState,
     batch_id: &str,
     items: &[Value],
-    total_input_bytes: usize,
-    default_handle: &Value,
-) -> Result<Value> {
-    if total_input_bytes <= state.runtime.inline_chunk_input_threshold_bytes {
-        return Ok(default_handle.clone());
-    }
-    let handle = PayloadHandle::Manifest {
-        key: format!("batches/{batch_id}/input"),
-        store: state.payload_store.default_store_kind().as_str().to_owned(),
-    };
-    let _ = items;
-    serde_json::to_value(handle).context("failed to serialize batch input handle")
+) -> Result<PayloadHandle> {
+    state
+        .payload_store
+        .write_value(&format!("batches/{batch_id}/input"), &Value::Array(items.to_vec()))
+        .await
 }
 
 async fn maybe_initialize_batch_result_manifest(
@@ -2110,23 +2066,6 @@ async fn maybe_initialize_batch_result_manifest(
     let serialized =
         serde_json::to_value(handle).context("failed to serialize batch result handle")?;
     if default_handle.is_null() { Ok(serialized) } else { Ok(serialized) }
-}
-
-async fn maybe_externalize_chunk_input(
-    state: &AppState,
-    batch_id: &str,
-    chunk_id: &str,
-    items: &[Value],
-) -> Result<(Vec<Value>, Value)> {
-    let payload = Value::Array(items.to_vec());
-    let handle = state
-        .payload_store
-        .write_value(&format!("batches/{batch_id}/chunks/{chunk_id}/input"), &payload)
-        .await?;
-    Ok((
-        Vec::new(),
-        serde_json::to_value(handle).context("failed to serialize chunk input handle")?,
-    ))
 }
 
 async fn maybe_externalize_chunk_output(
@@ -2651,6 +2590,9 @@ fn projected_apply_projection_records(
             run_id: report.run_id.clone(),
             batch_id: report.batch_id.clone(),
             chunk_id: report.chunk_id.clone(),
+            chunk_index: report.chunk_index,
+            group_id: report.group_id,
+            item_count: projected.chunk_item_count,
             status: projected.chunk_status.clone(),
             attempt: projected.chunk_attempt,
             lease_epoch: report.lease_epoch,
@@ -2701,6 +2643,9 @@ fn leased_chunk_projection_record(chunk: &WorkflowBulkChunkRecord) -> StreamProj
         run_id: chunk.run_id.clone(),
         batch_id: chunk.batch_id.clone(),
         chunk_id: chunk.chunk_id.clone(),
+        chunk_index: chunk.chunk_index,
+        group_id: chunk.group_id,
+        item_count: chunk.item_count,
         status: WorkflowBulkChunkStatus::Started.as_str().to_owned(),
         attempt: chunk.attempt,
         lease_epoch: chunk.lease_epoch,
@@ -2775,6 +2720,26 @@ fn grouped_batch_summary_projection_record(
     }
 }
 
+fn payload_handle_key(handle: &PayloadHandle) -> Result<&str> {
+    match handle {
+        PayloadHandle::Manifest { key, .. } | PayloadHandle::ManifestSlice { key, .. } => Ok(key),
+        PayloadHandle::Inline { .. } => {
+            anyhow::bail!("stream-v2 input handle must be object-store-backed")
+        }
+    }
+}
+
+fn payload_handle_store(handle: &PayloadHandle) -> Result<&str> {
+    match handle {
+        PayloadHandle::Manifest { store, .. } | PayloadHandle::ManifestSlice { store, .. } => {
+            Ok(store)
+        }
+        PayloadHandle::Inline { .. } => {
+            anyhow::bail!("stream-v2 input handle must be object-store-backed")
+        }
+    }
+}
+
 async fn sync_stream_batch_projection(
     state: &AppState,
     batch: &fabrik_store::WorkflowBulkBatchRecord,
@@ -2784,29 +2749,6 @@ async fn sync_stream_batch_projection(
         .upsert_throughput_projection_batch(batch)
         .await
         .with_context(|| format!("failed to sync throughput projection batch {}", batch.batch_id))
-}
-
-async fn sync_stream_chunk_projection(
-    state: &AppState,
-    chunk: &WorkflowBulkChunkRecord,
-) -> Result<()> {
-    state.store.upsert_throughput_projection_chunk(chunk).await.with_context(|| {
-        format!(
-            "failed to sync throughput projection chunk {} for batch {}",
-            chunk.chunk_id, chunk.batch_id
-        )
-    })
-}
-
-async fn sync_stream_chunk_projections(
-    state: &AppState,
-    chunks: &[WorkflowBulkChunkRecord],
-) -> Result<()> {
-    state
-        .store
-        .upsert_throughput_projection_chunks(chunks)
-        .await
-        .context("failed to batch sync throughput projection chunks")
 }
 
 async fn cancel_stream_batches_for_run(
@@ -2824,33 +2766,6 @@ async fn cancel_stream_batches_for_run(
         )
         .await?;
     for batch in batches {
-        let dedupe_key = format!("throughput-cancel:{}:{}", event.event_id, batch.batch_id);
-        let partition_key = throughput_partition_key(&batch.batch_id, 0);
-        state
-            .command_publisher
-            .publish(
-                &ThroughputCommandEnvelope {
-                    command_id: Uuid::now_v7(),
-                    occurred_at: event.occurred_at,
-                    dedupe_key: dedupe_key.clone(),
-                    partition_key: partition_key.clone(),
-                    payload: ThroughputCommand::CancelBatch {
-                        identity: ThroughputBatchIdentity {
-                            tenant_id: batch.tenant_id.clone(),
-                            instance_id: batch.instance_id.clone(),
-                            run_id: batch.run_id.clone(),
-                            batch_id: batch.batch_id.clone(),
-                        },
-                        reason: reason.to_owned(),
-                    },
-                },
-                &partition_key,
-            )
-            .await
-            .with_context(|| {
-                format!("failed to publish throughput cancel command for {}", batch.batch_id)
-            })?;
-
         let chunks = state
             .store
             .list_bulk_chunks_for_batch_page_query_view(
@@ -2881,6 +2796,9 @@ async fn cancel_stream_batches_for_run(
                             run_id: chunk.run_id.clone(),
                             batch_id: chunk.batch_id.clone(),
                             chunk_id: chunk.chunk_id.clone(),
+                            chunk_index: chunk.chunk_index,
+                            group_id: chunk.group_id,
+                            item_count: chunk.item_count,
                             status: WorkflowBulkChunkStatus::Cancelled.as_str().to_owned(),
                             attempt: chunk.attempt,
                             lease_epoch: chunk.lease_epoch,

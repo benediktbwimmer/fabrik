@@ -90,6 +90,7 @@ async fn main() -> Result<()> {
         workers.spawn(run_bulk_result_flusher(
             bulk_endpoint.clone(),
             format!("bulk-result-flusher-{flusher_index}"),
+            payload_store.clone(),
             bulk_result_rx,
         ));
         bulk_result_txs.push(bulk_result_tx);
@@ -177,7 +178,13 @@ fn estimate_bulk_result_size(result: &BulkActivityTaskResult) -> usize {
             fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
                 completed,
             ),
-        ) => completed.output_json.len() + completed.result_handle_json.len(),
+        ) => {
+            if completed.result_handle_json.is_empty() && !completed.output_json.is_empty() {
+                256
+            } else {
+                completed.output_json.len() + completed.result_handle_json.len()
+            }
+        }
         Some(
             fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Failed(
                 failed,
@@ -214,6 +221,8 @@ async fn flush_results(
 
 async fn flush_bulk_results(
     worker: &mut ActivityWorkerApiClient<tonic::transport::Channel>,
+    payload_store: &PayloadStore,
+    flusher_id: &str,
     pending_results: &mut Vec<BulkActivityTaskResult>,
     pending_result_bytes: &mut usize,
     first_pending_at: &mut Option<std::time::Instant>,
@@ -221,6 +230,7 @@ async fn flush_bulk_results(
     if pending_results.is_empty() {
         return Ok(());
     }
+    externalize_bulk_result_outputs(payload_store, flusher_id, pending_results).await?;
     worker
         .report_bulk_activity_task_results(ReportBulkActivityTaskResultsRequest {
             results: std::mem::take(pending_results),
@@ -302,6 +312,7 @@ async fn run_result_flusher(
 async fn run_bulk_result_flusher(
     endpoint: String,
     flusher_id: String,
+    payload_store: Arc<PayloadStore>,
     mut result_rx: UnboundedReceiver<BulkActivityTaskResult>,
 ) -> Result<()> {
     let mut worker = connect_activity_worker_with_retry(&endpoint, &flusher_id).await;
@@ -329,6 +340,8 @@ async fn run_bulk_result_flusher(
         {
             flush_bulk_results(
                 &mut worker,
+                payload_store.as_ref(),
+                &flusher_id,
                 &mut pending_results,
                 &mut pending_result_bytes,
                 &mut first_pending_at,
@@ -353,6 +366,8 @@ async fn run_bulk_result_flusher(
             Ok(None) => {
                 flush_bulk_results(
                     &mut worker,
+                    payload_store.as_ref(),
+                    &flusher_id,
                     &mut pending_results,
                     &mut pending_result_bytes,
                     &mut first_pending_at,
@@ -363,6 +378,8 @@ async fn run_bulk_result_flusher(
             Err(_) => {
                 flush_bulk_results(
                     &mut worker,
+                    payload_store.as_ref(),
+                    &flusher_id,
                     &mut pending_results,
                     &mut pending_result_bytes,
                     &mut first_pending_at,
@@ -562,6 +579,9 @@ async fn execute_bulk_activity_task(
 ) -> Result<BulkActivityTaskResult> {
     let input_handle = task_input_handle(&task)?;
     let items = resolve_bulk_task_items(payload_store, &task, input_handle.as_ref()).await?;
+    if task.activity_type == "benchmark.echo" {
+        return execute_benchmark_echo_bulk_task(task, worker_id, worker_build_id, items);
+    }
     let mut outputs = Vec::with_capacity(items.len());
     for item in items {
         match execute_activity(client, &task.activity_type, task.attempt, None, &item).await {
@@ -620,15 +640,95 @@ async fn execute_bulk_activity_task(
         }
     }
 
-    let output_payload = Value::Array(outputs);
-    let result_handle_json = serde_json::to_string(
-        &payload_store
-            .write_value(
-                &format!("batches/{}/chunks/{}/output", task.batch_id, task.chunk_id),
-                &output_payload,
-            )
-            .await?,
-    )?;
+    Ok(BulkActivityTaskResult {
+        tenant_id: task.tenant_id,
+        instance_id: task.instance_id,
+        run_id: task.run_id,
+        batch_id: task.batch_id,
+        chunk_id: task.chunk_id,
+        chunk_index: task.chunk_index,
+        group_id: task.group_id,
+        attempt: task.attempt,
+        worker_id,
+        worker_build_id,
+        lease_token: task.lease_token,
+        lease_epoch: task.lease_epoch,
+        owner_epoch: task.owner_epoch,
+        report_id: Uuid::now_v7().to_string(),
+        result: Some(
+            fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
+                BulkActivityTaskCompletedResult {
+                    output_json: serde_json::to_string(&Value::Array(outputs))?,
+                    result_handle_json: String::new(),
+                },
+            ),
+        ),
+    })
+}
+
+fn execute_benchmark_echo_bulk_task(
+    task: fabrik_worker_protocol::activity_worker::BulkActivityTask,
+    worker_id: String,
+    worker_build_id: String,
+    items: Vec<Value>,
+) -> Result<BulkActivityTaskResult> {
+    let mut outputs = Vec::with_capacity(items.len());
+    for item in items {
+        match execute_benchmark_echo(task.attempt, &item) {
+            Ok(output) => outputs.push(output),
+            Err(error) if error.to_string() == "activity cancelled" => {
+                return Ok(BulkActivityTaskResult {
+                    tenant_id: task.tenant_id,
+                    instance_id: task.instance_id,
+                    run_id: task.run_id,
+                    batch_id: task.batch_id,
+                    chunk_id: task.chunk_id,
+                    chunk_index: task.chunk_index,
+                    group_id: task.group_id,
+                    attempt: task.attempt,
+                    worker_id,
+                    worker_build_id,
+                    lease_token: task.lease_token,
+                    lease_epoch: task.lease_epoch,
+                    owner_epoch: task.owner_epoch,
+                    report_id: Uuid::now_v7().to_string(),
+                    result: Some(
+                        fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Cancelled(
+                            BulkActivityTaskCancelledResult {
+                                reason: error.to_string(),
+                                metadata_json: String::new(),
+                            },
+                        ),
+                    ),
+                });
+            }
+            Err(error) => {
+                return Ok(BulkActivityTaskResult {
+                    tenant_id: task.tenant_id,
+                    instance_id: task.instance_id,
+                    run_id: task.run_id,
+                    batch_id: task.batch_id,
+                    chunk_id: task.chunk_id,
+                    chunk_index: task.chunk_index,
+                    group_id: task.group_id,
+                    attempt: task.attempt,
+                    worker_id,
+                    worker_build_id,
+                    lease_token: task.lease_token,
+                    lease_epoch: task.lease_epoch,
+                    owner_epoch: task.owner_epoch,
+                    report_id: Uuid::now_v7().to_string(),
+                    result: Some(
+                        fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Failed(
+                            BulkActivityTaskFailedResult {
+                                error: error.to_string(),
+                            },
+                        ),
+                    ),
+                });
+            }
+        }
+    }
 
     Ok(BulkActivityTaskResult {
         tenant_id: task.tenant_id,
@@ -647,10 +747,85 @@ async fn execute_bulk_activity_task(
         report_id: Uuid::now_v7().to_string(),
         result: Some(
             fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
-                BulkActivityTaskCompletedResult { output_json: String::new(), result_handle_json },
+                BulkActivityTaskCompletedResult {
+                    output_json: serde_json::to_string(&Value::Array(outputs))?,
+                    result_handle_json: String::new(),
+                },
             ),
         ),
     })
+}
+
+async fn externalize_bulk_result_outputs(
+    payload_store: &PayloadStore,
+    flusher_id: &str,
+    pending_results: &mut [BulkActivityTaskResult],
+) -> Result<()> {
+    let mut flattened_outputs = Vec::new();
+    let mut completions = Vec::new();
+
+    for (index, result) in pending_results.iter_mut().enumerate() {
+        let Some(
+            fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
+                completed,
+            ),
+        ) = result.result.as_mut()
+        else {
+            continue;
+        };
+        if !completed.output_json.trim().is_empty()
+            && !completed.result_handle_json.trim().is_empty()
+        {
+            continue;
+        }
+        if completed.output_json.trim().is_empty() {
+            continue;
+        }
+
+        let output = serde_json::from_str::<Vec<Value>>(&completed.output_json)?;
+        let start = flattened_outputs.len();
+        let len = output.len();
+        flattened_outputs.extend(output);
+        completions.push((index, start, len));
+    }
+
+    if completions.is_empty() {
+        return Ok(());
+    }
+
+    let handle = payload_store
+        .write_value(
+            &format!("bulk-result-flushes/{flusher_id}/{}", Uuid::now_v7()),
+            &Value::Array(flattened_outputs),
+        )
+        .await?;
+    let (key, store) = match handle {
+        PayloadHandle::Manifest { key, store } => (key, store),
+        PayloadHandle::ManifestSlice { key, store, .. } => (key, store),
+        PayloadHandle::Inline { .. } => {
+            anyhow::bail!("bulk result flush handle must be manifest-backed")
+        }
+    };
+
+    for (index, start, len) in completions {
+        let Some(
+            fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
+                completed,
+            ),
+        ) = pending_results[index].result.as_mut()
+        else {
+            continue;
+        };
+        completed.result_handle_json = serde_json::to_string(&PayloadHandle::ManifestSlice {
+            key: key.clone(),
+            store: store.clone(),
+            start,
+            len,
+        })?;
+        completed.output_json.clear();
+    }
+
+    Ok(())
 }
 
 fn task_input_handle(

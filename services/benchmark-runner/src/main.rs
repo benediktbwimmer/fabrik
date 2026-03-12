@@ -194,6 +194,7 @@ struct StreamProjectionConvergenceRow {
 async fn main() -> Result<()> {
     let args = parse_args()?;
     if let Some(suite_name) = args.suite_name.clone() {
+        warn_suite_selection(&args, &suite_name);
         run_suite(args, suite_name).await?;
         return Ok(());
     }
@@ -202,6 +203,17 @@ async fn main() -> Result<()> {
     println!("{}", summary_text(&report));
     println!("report_path={}", args.output_path.display());
     Ok(())
+}
+
+fn warn_suite_selection(args: &Args, suite_name: &str) {
+    if suite_name != "streaming" {
+        return;
+    }
+    if args.execution_mode != ExecutionMode::Durable || args.throughput_backend.is_some() {
+        eprintln!(
+            "warning: --suite streaming ignores single-scenario selection and runs durable, throughput-pg-v1, and throughput-stream-v2 scenarios"
+        );
+    }
 }
 
 async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
@@ -771,17 +783,48 @@ fn benchmark_suite_scenarios(args: &Args, suite_name: &str) -> Result<Vec<Args>>
 
             Ok(vec![durable, throughput_pg, throughput_stream])
         }
-        other => bail!("unknown suite {other}; expected streaming"),
+        "stream-v2-robustness" => {
+            let mut throughput_stream = args.clone();
+            throughput_stream.suite_name = None;
+            throughput_stream.execution_mode = ExecutionMode::Throughput;
+            throughput_stream.throughput_backend = Some(STREAM_V2_BACKEND.to_owned());
+            throughput_stream.bulk_reducer = "all_settled".to_owned();
+            Ok(vec![throughput_stream])
+        }
+        other => bail!("unknown suite {other}; expected streaming or stream-v2-robustness"),
     }
 }
 
 fn scenario_name(args: &Args) -> String {
-    match args.execution_mode {
+    let mut scenario = match args.execution_mode {
         ExecutionMode::Durable => "durable".to_owned(),
         ExecutionMode::Throughput => {
             format!("throughput-{}", args.throughput_backend.as_deref().unwrap_or(PG_V1_BACKEND))
         }
+    };
+    if matches!(args.execution_mode, ExecutionMode::Throughput)
+        && args.bulk_reducer != "collect_results"
+    {
+        scenario.push('-');
+        scenario.push_str(&args.bulk_reducer.replace('_', "-"));
     }
+    if let Some(suffix) = scenario_rate_suffix("retry", args.retry_rate) {
+        scenario.push('-');
+        scenario.push_str(&suffix);
+    }
+    if let Some(suffix) = scenario_rate_suffix("cancel", args.cancel_rate) {
+        scenario.push('-');
+        scenario.push_str(&suffix);
+    }
+    scenario
+}
+
+fn scenario_rate_suffix(label: &str, rate: f64) -> Option<String> {
+    if rate <= 0.0 {
+        return None;
+    }
+    let basis_points = (rate * 10_000.0).round() as u64;
+    Some(format!("{label}-{basis_points}bp"))
 }
 
 fn scenario_output_path(base: &Path, scenario: &str) -> PathBuf {
@@ -1296,7 +1339,7 @@ fn summary_text(report: &BenchmarkReport) -> String {
         )
     }).unwrap_or_default();
     format!(
-        "scenario={scenario}\nprofile={profile}\nexecution_mode={execution_mode}\nthroughput_backend={throughput_backend}\nchunk_size={chunk_size}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nexecution_duration_ms={execution_duration_ms}\nprojection_convergence_duration_ms={projection_convergence_duration_ms}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nprojection_batch_rows={projection_batch_rows}\nprojection_chunk_rows={projection_chunk_rows}\nmax_aggregation_group_count={max_aggregation_group_count}\ngrouped_batch_rows={grouped_batch_rows}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n{control_plane}",
+        "scenario={scenario}\nprofile={profile}\nexecution_mode={execution_mode}\nthroughput_backend={throughput_backend}\nbulk_reducer={bulk_reducer}\nretry_rate={retry_rate}\ncancel_rate={cancel_rate}\nchunk_size={chunk_size}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nexecution_duration_ms={execution_duration_ms}\nprojection_convergence_duration_ms={projection_convergence_duration_ms}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nprojection_batch_rows={projection_batch_rows}\nprojection_chunk_rows={projection_chunk_rows}\nmax_aggregation_group_count={max_aggregation_group_count}\ngrouped_batch_rows={grouped_batch_rows}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n{control_plane}",
         scenario = report.scenario,
         profile = report.profile,
         execution_mode = match report.execution_mode {
@@ -1304,6 +1347,9 @@ fn summary_text(report: &BenchmarkReport) -> String {
             ExecutionMode::Throughput => "throughput",
         },
         throughput_backend = report.throughput_backend.as_deref().unwrap_or("n/a"),
+        bulk_reducer = report.bulk_reducer,
+        retry_rate = report.retry_rate,
+        cancel_rate = report.cancel_rate,
         chunk_size = report.chunk_size,
         workflows = report.workflow_count,
         activities_per_workflow = report.activities_per_workflow,
@@ -1331,4 +1377,52 @@ fn summary_text(report: &BenchmarkReport) -> String {
         avg_close = report.activity_metrics.avg_start_to_close_latency_ms,
         control_plane = control_plane,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn demo_args() -> Args {
+        Args {
+            suite_name: None,
+            profile_name: "target".to_owned(),
+            profile: BenchmarkProfile { workflow_count: 100, activities_per_workflow: 1_000 },
+            output_path: PathBuf::from("target/benchmark-reports/demo.json"),
+            worker_count: 8,
+            payload_size: 128,
+            retry_rate: 0.0,
+            cancel_rate: 0.0,
+            tenant_id: "benchmark".to_owned(),
+            task_queue: "default".to_owned(),
+            execution_mode: ExecutionMode::Throughput,
+            throughput_backend: Some(STREAM_V2_BACKEND.to_owned()),
+            bulk_reducer: "collect_results".to_owned(),
+            chunk_size: 100,
+            timeout: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn scenario_name_includes_reducer_and_rates_for_robustness_variants() {
+        let mut args = demo_args();
+        args.bulk_reducer = "all_settled".to_owned();
+        args.retry_rate = 0.01;
+        args.cancel_rate = 0.01;
+
+        assert_eq!(
+            scenario_name(&args),
+            "throughput-stream-v2-all-settled-retry-100bp-cancel-100bp"
+        );
+    }
+
+    #[test]
+    fn stream_v2_robustness_suite_uses_all_settled_variant() {
+        let scenarios =
+            benchmark_suite_scenarios(&demo_args(), "stream-v2-robustness").expect("suite");
+        assert_eq!(scenarios.len(), 1);
+        assert_eq!(scenarios[0].execution_mode, ExecutionMode::Throughput);
+        assert_eq!(scenarios[0].throughput_backend.as_deref(), Some(STREAM_V2_BACKEND));
+        assert_eq!(scenarios[0].bulk_reducer, "all_settled");
+    }
 }

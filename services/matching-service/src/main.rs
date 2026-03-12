@@ -57,6 +57,7 @@ struct AppState {
     queues: Arc<QueueIndex>,
     activity_prefetch: Arc<ActivityPrefetchIndex>,
     bulk_prefetch: Arc<BulkPrefetchIndex>,
+    workflow_poller_cache: Arc<WorkflowPollerCache>,
     workflow_notify: Arc<Notify>,
     bulk_notify: Arc<Notify>,
     outbox_notify: Arc<Notify>,
@@ -213,6 +214,72 @@ impl BulkPrefetchIndex {
     }
 }
 
+struct WorkflowPollerCache {
+    build_queues: Mutex<HashMap<String, CachedBuildQueues>>,
+    worker_heartbeats: Mutex<HashMap<String, DateTime<Utc>>>,
+}
+
+#[derive(Clone)]
+struct CachedBuildQueues {
+    queues: Vec<(String, String)>,
+    expires_at: DateTime<Utc>,
+}
+
+impl WorkflowPollerCache {
+    fn new() -> Self {
+        Self {
+            build_queues: Mutex::new(HashMap::new()),
+            worker_heartbeats: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn heartbeat_due(
+        &self,
+        worker_id: &str,
+        worker_build_id: &str,
+        partition_id: i32,
+        now: DateTime<Utc>,
+    ) -> bool {
+        let key = workflow_poller_cache_key(worker_id, worker_build_id, partition_id);
+        let heartbeats = self.worker_heartbeats.lock().await;
+        heartbeats.get(&key).map(|deadline| *deadline <= now).unwrap_or(true)
+    }
+
+    async fn mark_heartbeat(
+        &self,
+        worker_id: &str,
+        worker_build_id: &str,
+        partition_id: i32,
+        next_due_at: DateTime<Utc>,
+    ) {
+        let key = workflow_poller_cache_key(worker_id, worker_build_id, partition_id);
+        self.worker_heartbeats.lock().await.insert(key, next_due_at);
+    }
+
+    async fn cached_queues(
+        &self,
+        worker_build_id: &str,
+        now: DateTime<Utc>,
+    ) -> Option<Vec<(String, String)>> {
+        let build_queues = self.build_queues.lock().await;
+        build_queues
+            .get(worker_build_id)
+            .and_then(|entry| (entry.expires_at > now).then(|| entry.queues.clone()))
+    }
+
+    async fn store_queues(
+        &self,
+        worker_build_id: &str,
+        queues: Vec<(String, String)>,
+        expires_at: DateTime<Utc>,
+    ) {
+        self.build_queues
+            .lock()
+            .await
+            .insert(worker_build_id.to_owned(), CachedBuildQueues { queues, expires_at });
+    }
+}
+
 #[derive(Clone)]
 struct ActivityApi {
     state: AppState,
@@ -239,6 +306,7 @@ async fn main() -> Result<()> {
     let queues = Arc::new(QueueIndex::new());
     let activity_prefetch = Arc::new(ActivityPrefetchIndex::new());
     let bulk_prefetch = Arc::new(BulkPrefetchIndex::new());
+    let workflow_poller_cache = Arc::new(WorkflowPollerCache::new());
     let workflow_notify = Arc::new(Notify::new());
     let bulk_notify = Arc::new(Notify::new());
     let outbox_notify = Arc::new(Notify::new());
@@ -252,6 +320,7 @@ async fn main() -> Result<()> {
         queues: queues.clone(),
         activity_prefetch,
         bulk_prefetch,
+        workflow_poller_cache,
         workflow_notify: workflow_notify.clone(),
         bulk_notify: bulk_notify.clone(),
         outbox_notify: outbox_notify.clone(),
@@ -484,6 +553,9 @@ async fn process_event(
     }
 
     if let Some(kind) = mailbox_kind(&event.payload) {
+        if should_use_local_stream_v2_trigger_fast_path(state, &event).await? {
+            return Ok(());
+        }
         let task_queue = resolve_workflow_task_queue(state, &event).await?;
         let preferred_build_id = state
             .store
@@ -509,6 +581,9 @@ async fn process_event(
     }
 
     if let Some((kind, ref_id, status_label)) = resume_details(&event.payload) {
+        if should_use_local_stream_v2_bulk_terminal_fast_path(&event) {
+            return Ok(());
+        }
         let task_queue = resolve_workflow_task_queue(state, &event).await?;
         let preferred_build_id = state
             .store
@@ -1585,14 +1660,13 @@ impl WorkflowWorkerApi for ActivityApi {
         let timeout_ms =
             if request.poll_timeout_ms == 0 { 30_000 } else { request.poll_timeout_ms };
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
-        heartbeat_workflow_poller_queues(
+        maybe_heartbeat_workflow_poller_queues(
             &self.state,
             &request.worker_id,
             &request.worker_build_id,
             request.partition_id,
         )
-        .await
-        .map_err(internal_status)?;
+        .await;
 
         loop {
             if let Some(record) = self
@@ -2055,6 +2129,34 @@ fn mailbox_payload(payload: &WorkflowEvent) -> Option<&Value> {
     }
 }
 
+fn should_use_local_stream_v2_bulk_terminal_fast_path(
+    event: &EventEnvelope<WorkflowEvent>,
+) -> bool {
+    matches!(
+        event.payload,
+        WorkflowEvent::BulkActivityBatchCompleted { .. }
+            | WorkflowEvent::BulkActivityBatchFailed { .. }
+            | WorkflowEvent::BulkActivityBatchCancelled { .. }
+    ) && event.metadata.get("throughput_backend").is_some_and(|backend| backend == "stream-v2")
+}
+
+async fn should_use_local_stream_v2_trigger_fast_path(
+    state: &AppState,
+    event: &EventEnvelope<WorkflowEvent>,
+) -> Result<bool> {
+    if !matches!(event.payload, WorkflowEvent::WorkflowTriggered { .. }) {
+        return Ok(false);
+    }
+    let Some(task_queue) = event.metadata.get("workflow_task_queue") else {
+        return Ok(false);
+    };
+    Ok(state
+        .store
+        .get_task_queue_throughput_policy(&event.tenant_id, TaskQueueKind::Activity, task_queue)
+        .await?
+        .is_some_and(|policy| policy.backend == "stream-v2"))
+}
+
 fn resume_details(payload: &WorkflowEvent) -> Option<(WorkflowResumeKind, String, Option<&str>)> {
     match payload {
         WorkflowEvent::TimerFired { timer_id } => {
@@ -2163,17 +2265,65 @@ fn activity_worker_key(
     format!("{tenant_id}:{task_queue}:{worker_id}:{worker_build_id}")
 }
 
-async fn heartbeat_workflow_poller_queues(
+fn workflow_poller_cache_key(worker_id: &str, worker_build_id: &str, partition_id: i32) -> String {
+    format!("{worker_id}:{worker_build_id}:{partition_id}")
+}
+
+async fn maybe_heartbeat_workflow_poller_queues(
     state: &AppState,
     worker_id: &str,
     worker_build_id: &str,
     partition_id: i32,
-) -> Result<()> {
-    let ttl = chrono::Duration::seconds(state.runtime.lease_ttl_seconds as i64);
-    for (tenant_id, task_queue) in
-        state.store.list_queues_for_build(TaskQueueKind::Workflow, worker_build_id).await?
+) {
+    let now = Utc::now();
+    if !state
+        .workflow_poller_cache
+        .heartbeat_due(worker_id, worker_build_id, partition_id, now)
+        .await
     {
-        state
+        return;
+    }
+
+    let ttl = chrono::Duration::seconds(state.runtime.lease_ttl_seconds as i64);
+    let heartbeat_interval =
+        chrono::Duration::seconds((state.runtime.lease_ttl_seconds.max(3) / 3) as i64);
+    let queues = if let Some(queues) =
+        state.workflow_poller_cache.cached_queues(worker_build_id, now).await
+    {
+        queues
+    } else {
+        match state.store.list_queues_for_build(TaskQueueKind::Workflow, worker_build_id).await {
+            Ok(queues) => {
+                state
+                    .workflow_poller_cache
+                    .store_queues(worker_build_id, queues.clone(), now + ttl)
+                    .await;
+                queues
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    worker_id = %worker_id,
+                    worker_build_id = %worker_build_id,
+                    partition_id,
+                    "failed to refresh workflow poller queues for build"
+                );
+                state
+                    .workflow_poller_cache
+                    .mark_heartbeat(
+                        worker_id,
+                        worker_build_id,
+                        partition_id,
+                        now + chrono::Duration::seconds(1),
+                    )
+                    .await;
+                return;
+            }
+        }
+    };
+
+    for (tenant_id, task_queue) in queues {
+        if let Err(error) = state
             .store
             .upsert_queue_poller(
                 &tenant_id,
@@ -2185,9 +2335,34 @@ async fn heartbeat_workflow_poller_queues(
                 None,
                 ttl,
             )
-            .await?;
+            .await
+        {
+            warn!(
+                error = %error,
+                tenant_id = %tenant_id,
+                task_queue = %task_queue,
+                worker_id = %worker_id,
+                worker_build_id = %worker_build_id,
+                partition_id,
+                "failed to heartbeat workflow poller queue"
+            );
+            state
+                .workflow_poller_cache
+                .mark_heartbeat(
+                    worker_id,
+                    worker_build_id,
+                    partition_id,
+                    now + chrono::Duration::seconds(1),
+                )
+                .await;
+            return;
+        }
     }
-    Ok(())
+
+    state
+        .workflow_poller_cache
+        .mark_heartbeat(worker_id, worker_build_id, partition_id, now + heartbeat_interval)
+        .await;
 }
 
 async fn resolve_workflow_task_queue(
@@ -2621,6 +2796,7 @@ mod tests {
             queues: Arc::new(QueueIndex::new()),
             activity_prefetch: Arc::new(ActivityPrefetchIndex::new()),
             bulk_prefetch: Arc::new(BulkPrefetchIndex::new()),
+            workflow_poller_cache: Arc::new(WorkflowPollerCache::new()),
             workflow_notify: Arc::new(Notify::new()),
             bulk_notify: Arc::new(Notify::new()),
             outbox_notify: Arc::new(Notify::new()),

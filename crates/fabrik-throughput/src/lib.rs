@@ -50,6 +50,7 @@ impl ThroughputBackend {
 pub enum PayloadHandle {
     Inline { key: String },
     Manifest { key: String, store: String },
+    ManifestSlice { key: String, store: String, start: usize, len: usize },
 }
 
 impl PayloadHandle {
@@ -338,7 +339,9 @@ impl FilesystemPayloadStore {
         let path = self.path_from_handle(handle)?;
         let bytes = fs::read(&path)
             .with_context(|| format!("failed to read payload file {}", path.display()))?;
-        serde_json::from_slice(&bytes).context("failed to deserialize payload value")
+        let value =
+            serde_json::from_slice(&bytes).context("failed to deserialize payload value")?;
+        materialize_payload_handle_value(handle, value)
     }
 
     pub fn read_items(&self, handle: &PayloadHandle) -> Result<Vec<Value>> {
@@ -370,7 +373,13 @@ impl FilesystemPayloadStore {
             PayloadHandle::Manifest { key, store } if store == LOCAL_FILESYSTEM_STORE => {
                 Ok(self.path_for_key(key))
             }
+            PayloadHandle::ManifestSlice { key, store, .. } if store == LOCAL_FILESYSTEM_STORE => {
+                Ok(self.path_for_key(key))
+            }
             PayloadHandle::Manifest { store, .. } => {
+                anyhow::bail!("unsupported payload store {store}")
+            }
+            PayloadHandle::ManifestSlice { store, .. } => {
                 anyhow::bail!("unsupported payload store {store}")
             }
             PayloadHandle::Inline { .. } => {
@@ -491,7 +500,9 @@ impl S3PayloadStore {
             .await
             .context("failed to collect payload object body")?
             .into_bytes();
-        serde_json::from_slice(&bytes).context("failed to deserialize payload value")
+        let value =
+            serde_json::from_slice(&bytes).context("failed to deserialize payload value")?;
+        materialize_payload_handle_value(handle, value)
     }
 
     pub async fn list_keys(&self, prefix: &str) -> Result<Vec<String>> {
@@ -538,7 +549,13 @@ impl S3PayloadStore {
     fn key_from_handle(&self, handle: &PayloadHandle) -> Result<String> {
         match handle {
             PayloadHandle::Manifest { key, store } if store == S3_STORE => Ok(self.object_key(key)),
+            PayloadHandle::ManifestSlice { key, store, .. } if store == S3_STORE => {
+                Ok(self.object_key(key))
+            }
             PayloadHandle::Manifest { store, .. } => {
+                anyhow::bail!("payload handle store {store} does not match configured s3 store")
+            }
+            PayloadHandle::ManifestSlice { store, .. } => {
                 anyhow::bail!("payload handle store {store} does not match configured s3 store")
             }
             PayloadHandle::Inline { .. } => anyhow::bail!("inline payload handle has no s3 object"),
@@ -649,19 +666,24 @@ impl PayloadStore {
 
     pub async fn read_value(&self, handle: &PayloadHandle) -> Result<Value> {
         match handle {
-            PayloadHandle::Manifest { store, .. } if store == LOCAL_FILESYSTEM_STORE => self
-                .filesystem
-                .as_ref()
-                .context("filesystem payload store not configured")?
-                .read_value(handle),
-            PayloadHandle::Manifest { store, .. } if store == S3_STORE => {
+            PayloadHandle::Manifest { store, .. } | PayloadHandle::ManifestSlice { store, .. }
+                if store == LOCAL_FILESYSTEM_STORE =>
+            {
+                self.filesystem
+                    .as_ref()
+                    .context("filesystem payload store not configured")?
+                    .read_value(handle)
+            }
+            PayloadHandle::Manifest { store, .. } | PayloadHandle::ManifestSlice { store, .. }
+                if store == S3_STORE =>
+            {
                 self.s3
                     .as_ref()
                     .context("s3 payload store not configured")?
                     .read_value(handle)
                     .await
             }
-            PayloadHandle::Manifest { store, .. } => {
+            PayloadHandle::Manifest { store, .. } | PayloadHandle::ManifestSlice { store, .. } => {
                 anyhow::bail!("unsupported payload store {store}")
             }
             PayloadHandle::Inline { .. } => {
@@ -707,6 +729,27 @@ impl PayloadStore {
 
 fn normalize_prefix(prefix: String) -> String {
     prefix.trim_matches('/').to_owned()
+}
+
+fn materialize_payload_handle_value(handle: &PayloadHandle, value: Value) -> Result<Value> {
+    match handle {
+        PayloadHandle::ManifestSlice { start, len, .. } => match value {
+            Value::Array(items) => {
+                let end = start.saturating_add(*len);
+                if *start > items.len() || end > items.len() {
+                    anyhow::bail!(
+                        "payload slice {}..{} is out of bounds for {} items",
+                        start,
+                        end,
+                        items.len()
+                    );
+                }
+                Ok(Value::Array(items.into_iter().skip(*start).take(*len).collect()))
+            }
+            other => anyhow::bail!("payload slice handle did not resolve to an array: {other}"),
+        },
+        _ => Ok(value),
+    }
 }
 
 #[cfg(test)]

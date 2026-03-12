@@ -501,6 +501,90 @@ impl LocalThroughputState {
         Ok(())
     }
 
+    pub fn upsert_batch_with_chunks(
+        &self,
+        batch: &WorkflowBulkBatchRecord,
+        chunks: &[WorkflowBulkChunkRecord],
+    ) -> Result<()> {
+        let batch_state = LocalBatchState {
+            identity: ThroughputBatchIdentity {
+                tenant_id: batch.tenant_id.clone(),
+                instance_id: batch.instance_id.clone(),
+                run_id: batch.run_id.clone(),
+                batch_id: batch.batch_id.clone(),
+            },
+            definition_id: batch.definition_id.clone(),
+            definition_version: batch.definition_version,
+            artifact_hash: batch.artifact_hash.clone(),
+            task_queue: batch.task_queue.clone(),
+            aggregation_group_count: batch.aggregation_group_count.max(1),
+            total_items: batch.total_items,
+            chunk_count: batch.chunk_count,
+            terminal_chunk_count: batch.terminal_at.map(|_| batch.chunk_count).unwrap_or_default(),
+            succeeded_items: batch.succeeded_items,
+            failed_items: batch.failed_items,
+            cancelled_items: batch.cancelled_items,
+            status: batch.status.as_str().to_owned(),
+            last_report_id: None,
+            error: batch.error.clone(),
+            created_at: batch.scheduled_at,
+            updated_at: batch.updated_at,
+            terminal_at: batch.terminal_at,
+        };
+        let mut write_batch = WriteBatch::default();
+        write_batch.put(
+            batch_key(&batch_state.identity),
+            serde_json::to_vec(&batch_state)
+                .context("failed to serialize batched direct throughput batch state")?,
+        );
+        for chunk in chunks {
+            let identity = ThroughputBatchIdentity {
+                tenant_id: chunk.tenant_id.clone(),
+                instance_id: chunk.instance_id.clone(),
+                run_id: chunk.run_id.clone(),
+                batch_id: chunk.batch_id.clone(),
+            };
+            let existing = self.load_chunk_state(&identity, &chunk.chunk_id)?;
+            let chunk_state = LocalChunkState {
+                identity,
+                chunk_id: chunk.chunk_id.clone(),
+                activity_type: chunk.activity_type.clone(),
+                task_queue: chunk.task_queue.clone(),
+                chunk_index: chunk.chunk_index,
+                group_id: chunk.group_id,
+                item_count: chunk.item_count,
+                attempt: chunk.attempt,
+                max_attempts: chunk.max_attempts,
+                retry_delay_ms: chunk.retry_delay_ms,
+                lease_epoch: chunk.lease_epoch,
+                owner_epoch: chunk.owner_epoch,
+                status: chunk.status.as_str().to_owned(),
+                worker_id: chunk.worker_id.clone(),
+                lease_token: chunk.lease_token.map(|value| value.to_string()),
+                report_id: chunk.last_report_id.clone(),
+                result_handle: chunk.result_handle.clone(),
+                output: chunk.output.clone(),
+                error: chunk.error.clone(),
+                input_handle: chunk.input_handle.clone(),
+                items: chunk.items.clone(),
+                cancellation_requested: chunk.cancellation_requested,
+                cancellation_reason: chunk.cancellation_reason.clone(),
+                cancellation_metadata: chunk.cancellation_metadata.clone(),
+                scheduled_at: chunk.scheduled_at,
+                available_at: chunk.available_at,
+                started_at: chunk.started_at,
+                lease_expires_at: chunk.lease_expires_at,
+                completed_at: chunk.completed_at,
+                updated_at: chunk.updated_at,
+            };
+            self.write_chunk_state(&mut write_batch, existing.as_ref(), &chunk_state)?;
+        }
+        self.db
+            .write(write_batch)
+            .context("failed to batched-upsert direct throughput batch/chunk state")?;
+        Ok(())
+    }
+
     pub fn upsert_chunk_record(&self, chunk: &WorkflowBulkChunkRecord) -> Result<()> {
         let identity = ThroughputBatchIdentity {
             tenant_id: chunk.tenant_id.clone(),
@@ -761,10 +845,43 @@ impl LocalThroughputState {
         owned_partitions: Option<&HashSet<i32>>,
         partition_count: i32,
     ) -> Result<Option<LeasedChunkSnapshot>> {
+        Ok(self
+            .lease_ready_chunks(
+                tenant_id,
+                task_queue,
+                worker_id,
+                now,
+                lease_ttl,
+                max_active_chunks_per_batch,
+                owned_partitions,
+                partition_count,
+                1,
+            )?
+            .into_iter()
+            .next())
+    }
+
+    pub fn lease_ready_chunks(
+        &self,
+        tenant_id: &str,
+        task_queue: &str,
+        worker_id: &str,
+        now: DateTime<Utc>,
+        lease_ttl: chrono::Duration,
+        max_active_chunks_per_batch: Option<usize>,
+        owned_partitions: Option<&HashSet<i32>>,
+        partition_count: i32,
+        max_chunks: usize,
+    ) -> Result<Vec<LeasedChunkSnapshot>> {
         let _lease_guard = self.lease_lock.lock().expect("local throughput lease lock poisoned");
-        let started_by_batch =
+        let mut started_by_batch =
             self.started_counts_by_batch(tenant_id, task_queue, owned_partitions, partition_count)?;
+        let mut leased_chunks = Vec::with_capacity(max_chunks.max(1));
+        let mut write_batch = WriteBatch::default();
         for candidate in self.load_ready_chunk_entries(tenant_id, task_queue, now)? {
+            if leased_chunks.len() >= max_chunks.max(1) {
+                break;
+            }
             if !owned_partitions
                 .map(|partitions| {
                     partitions.contains(&throughput_partition_id(
@@ -780,6 +897,7 @@ impl LocalThroughputState {
             let Some(batch) = self.load_batch_state(&candidate.identity)? else {
                 continue;
             };
+            let batch_key = batch_key(&candidate.identity);
             if matches!(batch.status.as_str(), "completed" | "failed" | "cancelled")
                 || batch.failed_items > 0
                 || batch.cancelled_items > 0
@@ -787,8 +905,7 @@ impl LocalThroughputState {
                 continue;
             }
             if max_active_chunks_per_batch.is_some_and(|limit| {
-                started_by_batch.get(&batch_key(&candidate.identity)).copied().unwrap_or_default()
-                    >= limit
+                started_by_batch.get(&batch_key).copied().unwrap_or_default() >= limit
             }) {
                 continue;
             }
@@ -811,12 +928,9 @@ impl LocalThroughputState {
             leased_chunk.lease_expires_at = Some(now + lease_ttl);
             leased_chunk.updated_at = now;
 
-            let mut write_batch = WriteBatch::default();
             self.write_chunk_state(&mut write_batch, Some(&existing_chunk), &leased_chunk)?;
-            self.db
-                .write(write_batch)
-                .context("failed to atomically lease ready throughput chunk from local state")?;
-            return Ok(Some(LeasedChunkSnapshot {
+            *started_by_batch.entry(batch_key).or_default() += 1;
+            leased_chunks.push(LeasedChunkSnapshot {
                 identity: leased_chunk.identity.clone(),
                 definition_id: batch.definition_id.clone(),
                 definition_version: batch.definition_version,
@@ -841,9 +955,14 @@ impl LocalThroughputState {
                 started_at: leased_chunk.started_at,
                 lease_expires_at: leased_chunk.lease_expires_at,
                 updated_at: leased_chunk.updated_at,
-            }));
+            });
         }
-        Ok(None)
+        if !leased_chunks.is_empty() {
+            self.db.write(write_batch).context(
+                "failed to atomically lease ready throughput chunks from local state",
+            )?;
+        }
+        Ok(leased_chunks)
     }
 
     pub fn debug_lease_selection(

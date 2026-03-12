@@ -364,6 +364,9 @@ pub struct ThroughputProjectionChunkStateUpdate {
     pub run_id: String,
     pub batch_id: String,
     pub chunk_id: String,
+    pub chunk_index: u32,
+    pub group_id: u32,
+    pub item_count: u32,
     pub status: String,
     pub attempt: u32,
     pub lease_epoch: u64,
@@ -9116,8 +9119,95 @@ impl WorkflowStore {
     ) -> Result<()> {
         sqlx::query(
             r#"
-            UPDATE throughput_projection_chunks
-            SET status = CASE
+            INSERT INTO throughput_projection_chunks (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                workflow_id,
+                workflow_version,
+                artifact_hash,
+                batch_id,
+                chunk_id,
+                chunk_index,
+                group_id,
+                item_count,
+                activity_type,
+                task_queue,
+                state,
+                status,
+                attempt,
+                lease_epoch,
+                owner_epoch,
+                max_attempts,
+                retry_delay_ms,
+                input_handle,
+                result_handle,
+                items,
+                output,
+                error,
+                cancellation_requested,
+                cancellation_reason,
+                cancellation_metadata,
+                worker_id,
+                worker_build_id,
+                lease_token,
+                last_report_id,
+                scheduled_at,
+                available_at,
+                started_at,
+                lease_expires_at,
+                completed_at,
+                updated_at
+            )
+            SELECT
+                $1,
+                $2,
+                $3,
+                batches.workflow_id,
+                batches.workflow_version,
+                batches.artifact_hash,
+                $4,
+                $5,
+                $26,
+                $27,
+                $28,
+                batches.activity_type,
+                batches.task_queue,
+                batches.state,
+                $6,
+                $7,
+                $8,
+                $9,
+                batches.max_attempts,
+                batches.retry_delay_ms,
+                CASE WHEN $10 IS NULL THEN 'null'::jsonb ELSE $10 END,
+                CASE WHEN $11 IS NULL THEN 'null'::jsonb ELSE $11 END,
+                '[]'::jsonb,
+                $12,
+                $13,
+                $14,
+                $15,
+                $16,
+                $17,
+                $18,
+                $19,
+                $20,
+                batches.scheduled_at,
+                $21,
+                $22,
+                $23,
+                $24,
+                $25
+            FROM throughput_projection_batches AS batches
+            WHERE batches.tenant_id = $1
+              AND batches.workflow_instance_id = $2
+              AND batches.run_id = $3
+              AND batches.batch_id = $4
+            ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id, chunk_id) DO UPDATE
+            SET chunk_index = EXCLUDED.chunk_index,
+                group_id = EXCLUDED.group_id,
+                item_count = EXCLUDED.item_count,
+                status = CASE
                     WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
                         THEN throughput_projection_chunks.status
                     ELSE $6
@@ -9137,8 +9227,16 @@ impl WorkflowStore {
                         THEN throughput_projection_chunks.owner_epoch
                     ELSE $9
                 END,
-                input_handle = COALESCE($10, input_handle),
-                result_handle = COALESCE($11, result_handle),
+                input_handle = CASE
+                    WHEN $10 IS NULL
+                        THEN throughput_projection_chunks.input_handle
+                    ELSE EXCLUDED.input_handle
+                END,
+                result_handle = CASE
+                    WHEN $11 IS NULL
+                        THEN throughput_projection_chunks.result_handle
+                    ELSE EXCLUDED.result_handle
+                END,
                 output = CASE
                     WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
                         THEN throughput_projection_chunks.output
@@ -9189,7 +9287,7 @@ impl WorkflowStore {
                         THEN throughput_projection_chunks.available_at
                     ELSE $21
                 END,
-                started_at = COALESCE($22, started_at),
+                started_at = COALESCE($22, throughput_projection_chunks.started_at),
                 lease_expires_at = CASE
                     WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
                         THEN throughput_projection_chunks.lease_expires_at
@@ -9197,11 +9295,6 @@ impl WorkflowStore {
                 END,
                 completed_at = COALESCE(throughput_projection_chunks.completed_at, $24),
                 updated_at = GREATEST(throughput_projection_chunks.updated_at, $25)
-            WHERE tenant_id = $1
-              AND workflow_instance_id = $2
-              AND run_id = $3
-              AND batch_id = $4
-              AND chunk_id = $5
             "#,
         )
         .bind(&update.tenant_id)
@@ -9235,6 +9328,12 @@ impl WorkflowStore {
         .bind(update.lease_expires_at)
         .bind(update.completed_at)
         .bind(update.updated_at)
+        .bind(
+            i32::try_from(update.chunk_index)
+                .context("projection chunk chunk_index exceeds i32")?,
+        )
+        .bind(i32::try_from(update.group_id).context("projection chunk group_id exceeds i32")?)
+        .bind(i32::try_from(update.item_count).context("projection chunk item_count exceeds i32")?)
         .execute(&self.pool)
         .await
         .context("failed to update throughput projection chunk state")?;
@@ -12452,6 +12551,9 @@ mod tests {
                 run_id: "run-bulk-stream-patch".to_owned(),
                 batch_id: "batch-stream-patch".to_owned(),
                 chunk_id: chunks[0].chunk_id.clone(),
+                chunk_index: chunks[0].chunk_index,
+                group_id: chunks[0].group_id,
+                item_count: chunks[0].item_count,
                 status: "completed".to_owned(),
                 attempt: 1,
                 lease_epoch: 1,
@@ -12649,6 +12751,9 @@ mod tests {
                 run_id: "run-bulk-stream-terminal-chunk".to_owned(),
                 batch_id: "batch-stream-terminal-chunk".to_owned(),
                 chunk_id: chunks[0].chunk_id.clone(),
+                chunk_index: chunks[0].chunk_index,
+                group_id: chunks[0].group_id,
+                item_count: chunks[0].item_count,
                 status: "completed".to_owned(),
                 attempt: 1,
                 lease_epoch: 1,
@@ -12680,6 +12785,9 @@ mod tests {
                 run_id: "run-bulk-stream-terminal-chunk".to_owned(),
                 batch_id: "batch-stream-terminal-chunk".to_owned(),
                 chunk_id: chunks[0].chunk_id.clone(),
+                chunk_index: chunks[0].chunk_index,
+                group_id: chunks[0].group_id,
+                item_count: chunks[0].item_count,
                 status: "scheduled".to_owned(),
                 attempt: 2,
                 lease_epoch: 2,
