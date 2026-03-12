@@ -54,6 +54,7 @@ message BulkActivityTask {
   string batch_id = 7;
   string chunk_id = 8;
   uint32 chunk_index = 9;
+  uint32 group_id = 18;
   string activity_type = 10;
   string task_queue = 11;
   uint32 attempt = 12;
@@ -62,6 +63,8 @@ message BulkActivityTask {
   int64 lease_expires_at_unix_ms = 15;
   bool cancellation_requested = 16;
   string lease_token = 17;
+  uint64 lease_epoch = 19;
+  uint64 owner_epoch = 20;
 }
 
 message PollBulkActivityTaskResponse {
@@ -213,10 +216,14 @@ message BulkActivityTaskResult {
   string batch_id = 4;
   string chunk_id = 5;
   uint32 chunk_index = 6;
+  uint32 group_id = 14;
   uint32 attempt = 7;
   string worker_id = 8;
   string worker_build_id = 9;
   string lease_token = 13;
+  uint64 lease_epoch = 15;
+  uint64 owner_epoch = 16;
+  string report_id = 17;
 
   oneof result {
     BulkActivityTaskCompletedResult completed = 10;

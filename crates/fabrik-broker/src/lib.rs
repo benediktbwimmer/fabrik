@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     hash::{Hash, Hasher},
+    marker::PhantomData,
     sync::Arc,
     time::Duration,
 };
@@ -23,6 +24,7 @@ use rskafka::{
     record::{Record, RecordAndOffset},
 };
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tokio::time::{Instant, sleep, timeout};
 
 #[derive(Debug, Clone)]
@@ -62,6 +64,23 @@ pub struct WorkflowTopicTopology {
     pub status: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonTopicConfig {
+    pub brokers: String,
+    pub topic_name: String,
+    pub partitions: i32,
+}
+
+impl JsonTopicConfig {
+    pub fn new(brokers: impl Into<String>, topic_name: impl Into<String>, partitions: i32) -> Self {
+        Self { brokers: brokers.into(), topic_name: topic_name.into(), partitions }
+    }
+
+    pub fn all_partition_ids(&self) -> Vec<i32> {
+        (0..self.partitions).collect()
+    }
+}
+
 #[derive(Clone)]
 pub struct WorkflowPublisher {
     producers: Arc<HashMap<i32, Arc<BatchProducer<RecordAggregator>>>>,
@@ -76,6 +95,22 @@ pub struct ConsumedWorkflowRecord {
 }
 
 pub type WorkflowConsumerStream = BoxStream<'static, Result<ConsumedWorkflowRecord>>;
+
+#[derive(Clone)]
+pub struct JsonTopicPublisher<T> {
+    producers: Arc<HashMap<i32, Arc<BatchProducer<RecordAggregator>>>>,
+    partition_count: i32,
+    marker: PhantomData<T>,
+}
+
+#[derive(Debug)]
+pub struct ConsumedJsonRecord {
+    pub partition_id: i32,
+    pub record: RecordAndOffset,
+    pub high_watermark: i64,
+}
+
+pub type JsonConsumerStream = BoxStream<'static, Result<ConsumedJsonRecord>>;
 
 impl WorkflowPublisher {
     pub async fn new(config: &BrokerConfig, client_id: &str) -> Result<Self> {
@@ -188,6 +223,69 @@ impl WorkflowPublisher {
     }
 }
 
+impl<T> JsonTopicPublisher<T>
+where
+    T: Serialize,
+{
+    pub async fn new(config: &JsonTopicConfig, client_id: &str) -> Result<Self> {
+        let client = ClientBuilder::new(vec![config.brokers.clone()])
+            .client_id(client_id)
+            .build()
+            .await
+            .context("failed to create kafka client")?;
+        ensure_topic(&client, &config.topic_name, config.partitions).await?;
+
+        let mut producers = HashMap::new();
+        for partition_id in 0..config.partitions {
+            let partition_client = Arc::new(
+                client
+                    .partition_client(
+                        config.topic_name.clone(),
+                        partition_id,
+                        UnknownTopicHandling::Retry,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to create producer partition client for topic {} partition {partition_id}",
+                            config.topic_name
+                        )
+                    })?,
+            );
+            let producer = BatchProducerBuilder::new(partition_client)
+                .with_linger(Duration::ZERO)
+                .build(RecordAggregator::new(1024 * 1024));
+            producers.insert(partition_id, Arc::new(producer));
+        }
+
+        Ok(Self {
+            producers: Arc::new(producers),
+            partition_count: config.partitions,
+            marker: PhantomData,
+        })
+    }
+
+    pub async fn publish(&self, payload: &T, key: &str) -> Result<()> {
+        let bytes =
+            serde_json::to_vec(payload).context("failed to serialize json topic payload")?;
+        let partition_id = partition_for_key(key, self.partition_count);
+        let producer = self
+            .producers
+            .get(&partition_id)
+            .with_context(|| format!("missing producer for topic partition {partition_id}"))?;
+        producer
+            .produce(Record {
+                key: Some(key.as_bytes().to_vec()),
+                value: Some(bytes),
+                headers: BTreeMap::new(),
+                timestamp: Utc::now(),
+            })
+            .await
+            .context("failed to publish json topic payload")?;
+        Ok(())
+    }
+}
+
 pub async fn build_workflow_partition_consumer(
     config: &BrokerConfig,
     client_id: &str,
@@ -246,6 +344,103 @@ pub async fn build_workflow_consumer(
         );
     }
     Ok(streams.boxed())
+}
+
+pub async fn build_json_partition_consumer(
+    config: &JsonTopicConfig,
+    client_id: &str,
+    partition_id: i32,
+) -> Result<StreamConsumer> {
+    build_json_partition_consumer_from_offset(
+        config,
+        client_id,
+        partition_id,
+        StartOffset::Earliest,
+    )
+    .await
+}
+
+pub async fn build_json_partition_consumer_from_offset(
+    config: &JsonTopicConfig,
+    client_id: &str,
+    partition_id: i32,
+    start_offset: StartOffset,
+) -> Result<StreamConsumer> {
+    let client = ClientBuilder::new(vec![config.brokers.clone()])
+        .client_id(format!("{client_id}-partition-{partition_id}"))
+        .build()
+        .await
+        .context("failed to create kafka client")?;
+    ensure_topic(&client, &config.topic_name, config.partitions).await?;
+
+    let partition_client = Arc::new(
+        client
+            .partition_client(config.topic_name.clone(), partition_id, UnknownTopicHandling::Retry)
+            .await
+            .with_context(|| {
+                format!("failed to create consumer partition client for partition {partition_id}")
+            })?,
+    );
+
+    Ok(StreamConsumerBuilder::new(partition_client, start_offset).with_max_wait_ms(250).build())
+}
+
+pub async fn build_json_consumer(
+    config: &JsonTopicConfig,
+    client_id: &str,
+    partitions: &[i32],
+) -> Result<JsonConsumerStream> {
+    build_json_consumer_from_offsets(config, client_id, &HashMap::new(), partitions).await
+}
+
+pub async fn build_json_consumer_from_offsets(
+    config: &JsonTopicConfig,
+    client_id: &str,
+    start_offsets: &HashMap<i32, i64>,
+    partitions: &[i32],
+) -> Result<JsonConsumerStream> {
+    if partitions.is_empty() {
+        anyhow::bail!("json consumer requires at least one partition");
+    }
+
+    let mut streams = futures_util::stream::SelectAll::new();
+    for partition_id in partitions {
+        let start_offset = start_offsets
+            .get(partition_id)
+            .copied()
+            .map(StartOffset::At)
+            .unwrap_or(StartOffset::Earliest);
+        let consumer = build_json_partition_consumer_from_offset(
+            config,
+            client_id,
+            *partition_id,
+            start_offset,
+        )
+        .await?;
+        let partition_id = *partition_id;
+        streams.push(
+            consumer
+                .map(move |result| {
+                    result
+                        .map(|(record, high_watermark)| ConsumedJsonRecord {
+                            partition_id,
+                            record,
+                            high_watermark,
+                        })
+                        .map_err(anyhow::Error::from)
+                })
+                .boxed(),
+        );
+    }
+    Ok(streams.boxed())
+}
+
+pub fn decode_json_record<T>(record: &RecordAndOffset) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let payload = record.record.value.as_deref().context("message payload missing")?;
+    serde_json::from_slice(payload).context("failed to deserialize topic payload")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

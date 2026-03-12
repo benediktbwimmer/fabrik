@@ -997,6 +997,7 @@ class WorkflowLowerer {
         next: nextState,
         handle_var: targetVar,
         task_queue: options.task_queue,
+        throughput_backend: options.throughput_backend,
         chunk_size: options.chunk_size,
         retry: options.retry,
       }, awaitExpression);
@@ -1212,6 +1213,17 @@ function compileBulkOptions(expression) {
         );
       }
       options.chunk_size = chunkSize;
+      continue;
+    }
+    if (key === "backend") {
+      const backend = literalString(property.initializer, "ctx.bulkActivity backend");
+      if (backend !== "pg-v1" && backend !== "stream-v2") {
+        throw compilerError(
+          `ctx.bulkActivity backend must be "pg-v1" or "stream-v2"`,
+          property.initializer,
+        );
+      }
+      options.throughput_backend = backend;
       continue;
     }
     if (key === "retry") {

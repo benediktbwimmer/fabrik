@@ -1,9 +1,7 @@
-export async function bulkWorkflow(ctx, input) {
+export async function invalidBulkBackendWorkflow(ctx, input) {
   const bulk = await ctx.bulkActivity("benchmark.echo", input.items, {
-    backend: "stream-v2",
+    backend: "postgres",
     taskQueue: "bulk",
-    chunkSize: 128,
-    retry: { maxAttempts: 2, delay: "1s" },
   });
 
   const summary = await bulk.result();

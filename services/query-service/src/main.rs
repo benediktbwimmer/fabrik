@@ -18,6 +18,7 @@ use fabrik_store::{
     WorkflowBulkBatchRecord, WorkflowBulkChunkRecord, WorkflowRunRecord, WorkflowSignalRecord,
     WorkflowStateSnapshot, WorkflowStore,
 };
+use fabrik_throughput::{FilesystemPayloadStore, PayloadHandle};
 use fabrik_workflow::{
     CompiledWorkflowArtifact, ReplayDivergence, ReplayDivergenceKind, ReplayFieldMismatch,
     ReplaySource, ReplayTransitionTraceEntry, WorkflowDefinition, WorkflowInstanceState,
@@ -42,6 +43,7 @@ struct AppState {
     store: WorkflowStore,
     broker: BrokerConfig,
     query: QueryRuntimeConfig,
+    payload_store: FilesystemPayloadStore,
     retention: Arc<Mutex<RetentionDebugState>>,
 }
 
@@ -118,6 +120,9 @@ struct WorkflowBulkBatchesResponse {
     tenant_id: String,
     instance_id: String,
     run_id: String,
+    consistency: &'static str,
+    authoritative_source: &'static str,
+    projection_lag_ms: Option<i64>,
     page: PageInfo,
     batch_count: usize,
     batches: Vec<WorkflowBulkBatchRecord>,
@@ -128,6 +133,9 @@ struct WorkflowBulkBatchResponse {
     tenant_id: String,
     instance_id: String,
     run_id: String,
+    consistency: &'static str,
+    authoritative_source: &'static str,
+    projection_lag_ms: Option<i64>,
     batch: WorkflowBulkBatchRecord,
 }
 
@@ -137,6 +145,9 @@ struct WorkflowBulkChunksResponse {
     instance_id: String,
     run_id: String,
     batch_id: String,
+    consistency: &'static str,
+    authoritative_source: &'static str,
+    projection_lag_ms: Option<i64>,
     page: PageInfo,
     chunk_count: usize,
     chunks: Vec<WorkflowBulkChunkRecord>,
@@ -148,6 +159,9 @@ struct WorkflowBulkResultsResponse {
     instance_id: String,
     run_id: String,
     batch_id: String,
+    consistency: &'static str,
+    authoritative_source: &'static str,
+    projection_lag_ms: Option<i64>,
     page: PageInfo,
     chunk_count: usize,
     chunks: Vec<WorkflowBulkChunkRecord>,
@@ -257,6 +271,7 @@ async fn main() -> Result<()> {
 
     let store = WorkflowStore::connect(&postgres.url).await?;
     store.init().await?;
+    let payload_store = FilesystemPayloadStore::new(&query.throughput_payload_dir)?;
     let broker = BrokerConfig::new(
         redpanda.brokers,
         redpanda.workflow_events_topic,
@@ -343,7 +358,7 @@ async fn main() -> Result<()> {
         "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/replay",
         get(get_workflow_replay_for_run),
     )
-    .with_state(AppState { store, broker, query, retention });
+    .with_state(AppState { store, broker, query, payload_store, retention });
 
     serve(app, config.port).await
 }
@@ -617,7 +632,15 @@ async fn get_workflow_bulk_batch_for_run(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| not_found(format!("bulk batch {batch_id} not found")))?;
-    Ok(Json(WorkflowBulkBatchResponse { tenant_id, instance_id, run_id, batch }))
+    Ok(Json(WorkflowBulkBatchResponse {
+        tenant_id,
+        instance_id,
+        run_id,
+        consistency: "eventual",
+        authoritative_source: authoritative_bulk_source(&batch.throughput_backend),
+        projection_lag_ms: projection_lag_ms_from_times([Some(batch.updated_at)]),
+        batch,
+    }))
 }
 
 async fn get_workflow_bulk_chunks_for_run(
@@ -625,16 +648,10 @@ async fn get_workflow_bulk_chunks_for_run(
     Query(pagination): Query<PaginationQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<WorkflowBulkChunksResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let response = load_workflow_bulk_chunks(
-        &state,
-        &tenant_id,
-        &instance_id,
-        &run_id,
-        &batch_id,
-        pagination,
-    )
-    .await
-    .map_err(internal_error)?;
+    let response =
+        load_workflow_bulk_chunks(&state, &tenant_id, &instance_id, &run_id, &batch_id, pagination)
+            .await
+            .map_err(internal_error)?;
     Ok(Json(response))
 }
 
@@ -737,6 +754,21 @@ fn build_page_info(page: &ResolvedPage, total: usize, returned: usize) -> PageIn
     let offset = page.offset;
     let next_offset = (offset + returned < total).then_some(offset + returned);
     PageInfo { limit, offset, returned, total, has_more: next_offset.is_some(), next_offset }
+}
+
+fn projection_lag_ms_from_times(
+    times: impl IntoIterator<Item = Option<DateTime<Utc>>>,
+) -> Option<i64> {
+    let now = Utc::now();
+    times
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|updated_at| now.signed_duration_since(updated_at).num_milliseconds().max(0))
+}
+
+fn authoritative_bulk_source(throughput_backend: &str) -> &'static str {
+    if throughput_backend == "stream-v2" { "stream-v2-owner-state" } else { "pg-v1-postgres" }
 }
 
 fn retention_policy_response(config: &QueryRuntimeConfig) -> RetentionPolicyResponse {
@@ -849,11 +881,12 @@ async fn load_workflow_bulk_batches(
     pagination: PaginationQuery,
 ) -> Result<WorkflowBulkBatchesResponse> {
     let page = resolve_page(&state.query, &pagination);
-    let total = state.store.count_bulk_batches_for_run(tenant_id, instance_id, run_id).await?
-        as usize;
+    let total =
+        state.store.count_bulk_batches_for_run_query_view(tenant_id, instance_id, run_id).await?
+            as usize;
     let batches = state
         .store
-        .list_bulk_batches_for_run_page(
+        .list_bulk_batches_for_run_page_query_view(
             tenant_id,
             instance_id,
             run_id,
@@ -865,6 +898,16 @@ async fn load_workflow_bulk_batches(
         tenant_id: tenant_id.to_owned(),
         instance_id: instance_id.to_owned(),
         run_id: run_id.to_owned(),
+        consistency: "eventual",
+        authoritative_source: if batches.iter().any(|batch| batch.throughput_backend == "stream-v2")
+        {
+            "mixed-bulk-backends"
+        } else {
+            "pg-v1-postgres"
+        },
+        projection_lag_ms: projection_lag_ms_from_times(
+            batches.iter().map(|batch| Some(batch.updated_at)),
+        ),
         page: build_page_info(&page, total, batches.len()),
         batch_count: total,
         batches,
@@ -879,14 +922,19 @@ async fn load_workflow_bulk_chunks(
     batch_id: &str,
     pagination: PaginationQuery,
 ) -> Result<WorkflowBulkChunksResponse> {
+    let batch = state
+        .store
+        .get_bulk_batch_query_view(tenant_id, instance_id, run_id, batch_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("bulk batch {batch_id} not found"))?;
     let page = resolve_page(&state.query, &pagination);
     let total = state
         .store
-        .count_bulk_chunks_for_batch(tenant_id, instance_id, run_id, batch_id)
+        .count_bulk_chunks_for_batch_query_view(tenant_id, instance_id, run_id, batch_id)
         .await? as usize;
     let chunks = state
         .store
-        .list_bulk_chunks_for_batch_page(
+        .list_bulk_chunks_for_batch_page_query_view(
             tenant_id,
             instance_id,
             run_id,
@@ -894,12 +942,20 @@ async fn load_workflow_bulk_chunks(
             i64::try_from(page.limit).context("bulk chunk page limit exceeds i64")?,
             i64::try_from(page.offset).context("bulk chunk page offset exceeds i64")?,
         )
-        .await?;
+        .await?
+        .into_iter()
+        .map(|chunk| resolve_chunk_payloads(state, chunk, true, false))
+        .collect::<Result<Vec<_>>>()?;
     Ok(WorkflowBulkChunksResponse {
         tenant_id: tenant_id.to_owned(),
         instance_id: instance_id.to_owned(),
         run_id: run_id.to_owned(),
         batch_id: batch_id.to_owned(),
+        consistency: "eventual",
+        authoritative_source: authoritative_bulk_source(&batch.throughput_backend),
+        projection_lag_ms: projection_lag_ms_from_times(
+            chunks.iter().map(|chunk| Some(chunk.updated_at)),
+        ),
         page: build_page_info(&page, total, chunks.len()),
         chunk_count: total,
         chunks,
@@ -914,14 +970,19 @@ async fn load_workflow_bulk_results(
     batch_id: &str,
     pagination: PaginationQuery,
 ) -> Result<WorkflowBulkResultsResponse> {
+    let batch = state
+        .store
+        .get_bulk_batch_query_view(tenant_id, instance_id, run_id, batch_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("bulk batch {batch_id} not found"))?;
     let page = resolve_page(&state.query, &pagination);
     let total = state
         .store
-        .count_bulk_chunks_for_batch(tenant_id, instance_id, run_id, batch_id)
+        .count_bulk_chunks_for_batch_query_view(tenant_id, instance_id, run_id, batch_id)
         .await? as usize;
     let chunks = state
         .store
-        .list_bulk_chunks_for_batch_page(
+        .list_bulk_chunks_for_batch_page_query_view(
             tenant_id,
             instance_id,
             run_id,
@@ -931,6 +992,9 @@ async fn load_workflow_bulk_results(
         )
         .await?
         .into_iter()
+        .map(|chunk| resolve_chunk_payloads(state, chunk, false, true))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
         .filter(|chunk| chunk.output.is_some())
         .collect::<Vec<_>>();
     Ok(WorkflowBulkResultsResponse {
@@ -938,10 +1002,37 @@ async fn load_workflow_bulk_results(
         instance_id: instance_id.to_owned(),
         run_id: run_id.to_owned(),
         batch_id: batch_id.to_owned(),
+        consistency: "eventual",
+        authoritative_source: authoritative_bulk_source(&batch.throughput_backend),
+        projection_lag_ms: projection_lag_ms_from_times(
+            chunks.iter().map(|chunk| Some(chunk.updated_at)),
+        ),
         page: build_page_info(&page, total, chunks.len()),
         chunk_count: total,
         chunks,
     })
+}
+
+fn resolve_chunk_payloads(
+    state: &AppState,
+    mut chunk: WorkflowBulkChunkRecord,
+    resolve_input: bool,
+    resolve_output: bool,
+) -> Result<WorkflowBulkChunkRecord> {
+    if resolve_input && chunk.items.is_empty() && !chunk.input_handle.is_null() {
+        if let Ok(handle) = serde_json::from_value::<PayloadHandle>(chunk.input_handle.clone()) {
+            chunk.items = state.payload_store.read_items(&handle)?;
+        }
+    }
+    if resolve_output && chunk.output.is_none() && !chunk.result_handle.is_null() {
+        if let Ok(handle) = serde_json::from_value::<PayloadHandle>(chunk.result_handle.clone()) {
+            let value = state.payload_store.read_value(&handle)?;
+            if let Value::Array(items) = value {
+                chunk.output = Some(items);
+            }
+        }
+    }
+    Ok(chunk)
 }
 
 async fn load_workflow_signals(

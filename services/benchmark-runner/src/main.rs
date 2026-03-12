@@ -307,7 +307,9 @@ fn parse_args() -> Result<Args> {
                 execution_mode = match value.as_str() {
                     "durable" => ExecutionMode::Durable,
                     "throughput" => ExecutionMode::Throughput,
-                    other => bail!("unknown --execution-mode {other}; expected durable or throughput"),
+                    other => {
+                        bail!("unknown --execution-mode {other}; expected durable or throughput")
+                    }
                 }
             }
             "--timeout-secs" => {
@@ -377,10 +379,8 @@ fn benchmark_artifact(
                     task_queue: Some(Expression::Literal {
                         value: Value::String(task_queue.to_owned()),
                     }),
-                    retry: enable_retry.then_some(RetryPolicy {
-                        max_attempts: 2,
-                        delay: "1s".to_owned(),
-                    }),
+                    retry: enable_retry
+                        .then_some(RetryPolicy { max_attempts: 2, delay: "1s".to_owned() }),
                     config: None,
                 },
             );
@@ -411,11 +411,10 @@ fn benchmark_artifact(
                     task_queue: Some(Expression::Literal {
                         value: Value::String(task_queue.to_owned()),
                     }),
+                    throughput_backend: None,
                     chunk_size: Some(256),
-                    retry: enable_retry.then_some(RetryPolicy {
-                        max_attempts: 2,
-                        delay: "1s".to_owned(),
-                    }),
+                    retry: enable_retry
+                        .then_some(RetryPolicy { max_attempts: 2, delay: "1s".to_owned() }),
                 },
             );
             states.insert(

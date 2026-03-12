@@ -67,6 +67,10 @@ pub struct RedpandaConfig {
     pub brokers: String,
     pub workflow_events_topic: String,
     pub workflow_events_partitions: i32,
+    pub throughput_commands_topic: String,
+    pub throughput_reports_topic: String,
+    pub throughput_changelog_topic: String,
+    pub throughput_partitions: i32,
 }
 
 impl RedpandaConfig {
@@ -78,6 +82,19 @@ impl RedpandaConfig {
                 "workflow-events",
             )?,
             workflow_events_partitions: read_i32_with_default("WORKFLOW_EVENTS_PARTITIONS", 4)?,
+            throughput_commands_topic: read_string_with_default(
+                "THROUGHPUT_COMMANDS_TOPIC",
+                "throughput-commands",
+            )?,
+            throughput_reports_topic: read_string_with_default(
+                "THROUGHPUT_REPORTS_TOPIC",
+                "throughput-reports",
+            )?,
+            throughput_changelog_topic: read_string_with_default(
+                "THROUGHPUT_CHANGELOG_TOPIC",
+                "throughput-changelog",
+            )?,
+            throughput_partitions: read_i32_with_default("THROUGHPUT_PARTITIONS", 4)?,
         })
     }
 }
@@ -102,6 +119,7 @@ impl PostgresConfig {
 pub struct QueryRuntimeConfig {
     pub default_page_size: usize,
     pub max_page_size: usize,
+    pub throughput_payload_dir: String,
     pub history_retention_days: Option<u64>,
     pub run_retention_days: Option<u64>,
     pub activity_retention_days: Option<u64>,
@@ -120,6 +138,152 @@ pub struct MatchingRuntimeConfig {
     pub activity_result_apply_batch_max_bytes: usize,
     pub activity_result_apply_flush_interval_ms: u64,
     pub result_apply_per_run_coalescing_cap: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThroughputRuntimeConfig {
+    pub lease_ttl_seconds: u64,
+    pub sweep_interval_ms: u64,
+    pub max_active_chunks_per_batch: usize,
+    pub max_active_chunks_per_tenant: usize,
+    pub max_active_chunks_per_task_queue: usize,
+    pub local_state_dir: String,
+    pub checkpoint_dir: String,
+    pub checkpoint_interval_seconds: u64,
+    pub checkpoint_retention: usize,
+    pub restore_idle_timeout_ms: u64,
+    pub payload_store_dir: String,
+    pub inline_chunk_input_threshold_bytes: usize,
+    pub inline_chunk_output_threshold_bytes: usize,
+    pub grouping_chunk_threshold: usize,
+    pub target_chunks_per_group: usize,
+    pub max_aggregation_groups: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThroughputOwnershipConfig {
+    pub static_partition_ids: Option<Vec<i32>>,
+    pub runtime_capacity: usize,
+    pub member_heartbeat_ttl_seconds: u64,
+    pub assignment_poll_interval_seconds: u64,
+    pub rebalance_interval_seconds: u64,
+    pub lease_ttl_seconds: u64,
+    pub renew_interval_seconds: u64,
+    pub partition_id_offset: i32,
+}
+
+impl ThroughputRuntimeConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Ok(Self {
+            lease_ttl_seconds: read_u64_with_default("THROUGHPUT_LEASE_TTL_SECONDS", 30)?,
+            sweep_interval_ms: read_u64_with_default("THROUGHPUT_SWEEP_INTERVAL_MS", 500)?,
+            max_active_chunks_per_batch: read_usize_with_default(
+                "THROUGHPUT_MAX_ACTIVE_CHUNKS_PER_BATCH",
+                256,
+            )?,
+            max_active_chunks_per_tenant: read_usize_with_default(
+                "THROUGHPUT_MAX_ACTIVE_CHUNKS_PER_TENANT",
+                4_096,
+            )?,
+            max_active_chunks_per_task_queue: read_usize_with_default(
+                "THROUGHPUT_MAX_ACTIVE_CHUNKS_PER_TASK_QUEUE",
+                2_048,
+            )?,
+            local_state_dir: read_string_with_default(
+                "THROUGHPUT_LOCAL_STATE_DIR",
+                "/tmp/fabrik-throughput/state",
+            )?,
+            checkpoint_dir: read_string_with_default(
+                "THROUGHPUT_CHECKPOINT_DIR",
+                "/tmp/fabrik-throughput/checkpoints",
+            )?,
+            checkpoint_interval_seconds: read_u64_with_default(
+                "THROUGHPUT_CHECKPOINT_INTERVAL_SECONDS",
+                30,
+            )?,
+            checkpoint_retention: read_usize_with_default("THROUGHPUT_CHECKPOINT_RETENTION", 5)?,
+            restore_idle_timeout_ms: read_u64_with_default(
+                "THROUGHPUT_RESTORE_IDLE_TIMEOUT_MS",
+                1_000,
+            )?,
+            payload_store_dir: read_string_with_default(
+                "THROUGHPUT_PAYLOAD_STORE_DIR",
+                "/tmp/fabrik-throughput/payloads",
+            )?,
+            inline_chunk_input_threshold_bytes: read_usize_with_default(
+                "THROUGHPUT_INLINE_CHUNK_INPUT_THRESHOLD_BYTES",
+                32 * 1024,
+            )?,
+            inline_chunk_output_threshold_bytes: read_usize_with_default(
+                "THROUGHPUT_INLINE_CHUNK_OUTPUT_THRESHOLD_BYTES",
+                32 * 1024,
+            )?,
+            grouping_chunk_threshold: read_usize_with_default(
+                "THROUGHPUT_GROUPING_CHUNK_THRESHOLD",
+                128,
+            )?,
+            target_chunks_per_group: read_usize_with_default(
+                "THROUGHPUT_TARGET_CHUNKS_PER_GROUP",
+                64,
+            )?,
+            max_aggregation_groups: read_usize_with_default(
+                "THROUGHPUT_MAX_AGGREGATION_GROUPS",
+                32,
+            )?,
+        })
+    }
+}
+
+impl ThroughputOwnershipConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        let static_partition_ids = match env::var("THROUGHPUT_OWNERSHIP_PARTITIONS") {
+            Ok(raw) => Some(parse_partition_ids(&raw)?),
+            Err(env::VarError::NotPresent) => match env::var("THROUGHPUT_OWNERSHIP_PARTITION_ID") {
+                Ok(raw) => Some(vec![raw.parse::<i32>().map_err(|_| ConfigError::InvalidI32 {
+                    key: "THROUGHPUT_OWNERSHIP_PARTITION_ID".to_owned(),
+                    value: raw,
+                })?]),
+                Err(env::VarError::NotPresent) => None,
+                Err(source) => {
+                    return Err(ConfigError::UnreadableEnv {
+                        key: "THROUGHPUT_OWNERSHIP_PARTITION_ID".to_owned(),
+                        source,
+                    });
+                }
+            },
+            Err(source) => {
+                return Err(ConfigError::UnreadableEnv {
+                    key: "THROUGHPUT_OWNERSHIP_PARTITIONS".to_owned(),
+                    source,
+                });
+            }
+        };
+        Ok(Self {
+            static_partition_ids,
+            runtime_capacity: read_usize_with_default("THROUGHPUT_RUNTIME_CAPACITY", 4)?,
+            member_heartbeat_ttl_seconds: read_u64_with_default(
+                "THROUGHPUT_OWNERSHIP_MEMBER_HEARTBEAT_TTL_SECONDS",
+                15,
+            )?,
+            assignment_poll_interval_seconds: read_u64_with_default(
+                "THROUGHPUT_OWNERSHIP_ASSIGNMENT_POLL_INTERVAL_SECONDS",
+                2,
+            )?,
+            rebalance_interval_seconds: read_u64_with_default(
+                "THROUGHPUT_OWNERSHIP_REBALANCE_INTERVAL_SECONDS",
+                5,
+            )?,
+            lease_ttl_seconds: read_u64_with_default("THROUGHPUT_OWNERSHIP_LEASE_TTL_SECONDS", 15)?,
+            renew_interval_seconds: read_u64_with_default(
+                "THROUGHPUT_OWNERSHIP_RENEW_INTERVAL_SECONDS",
+                5,
+            )?,
+            partition_id_offset: read_i32_with_default(
+                "THROUGHPUT_OWNERSHIP_PARTITION_ID_OFFSET",
+                1_000_000,
+            )?,
+        })
+    }
 }
 
 impl MatchingRuntimeConfig {
@@ -157,6 +321,10 @@ impl QueryRuntimeConfig {
         Ok(Self {
             default_page_size: read_usize_with_default("QUERY_DEFAULT_PAGE_SIZE", 100)?,
             max_page_size: read_usize_with_default("QUERY_MAX_PAGE_SIZE", 500)?,
+            throughput_payload_dir: read_string_with_default(
+                "THROUGHPUT_PAYLOAD_STORE_DIR",
+                "/tmp/fabrik-throughput/payloads",
+            )?,
             history_retention_days: read_optional_u64("QUERY_HISTORY_RETENTION_DAYS")?,
             run_retention_days: read_optional_u64("QUERY_RUN_RETENTION_DAYS")?,
             activity_retention_days: read_optional_u64("QUERY_ACTIVITY_RETENTION_DAYS")?,

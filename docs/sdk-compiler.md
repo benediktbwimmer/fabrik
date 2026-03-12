@@ -57,6 +57,7 @@ Required workflow primitives include:
 - `ctx.query(name, handler)`
 - `ctx.update(name, handler)`
 - `ctx.activity(name, input, options?)`
+- `ctx.bulkActivity(name, items, options?)` — throughput mode fan-out
 - `ctx.startChild(name, input, options?)`
 - `ctx.sideEffect(fn)`
 - `ctx.version(changeId, min, max)`
@@ -100,6 +101,13 @@ Likely artifact sections:
 - source map
 - compiler version
 - artifact hash
+
+For throughput mode, the compiler additionally lowers `ctx.bulkActivity()` into:
+
+- `start_bulk_activity` — creates batch and chunk manifest
+- `wait_for_bulk_activity` — blocks until batch terminal event
+
+Bulk activity options (`taskQueue`, `chunkSize`, `backend`, `retry`) must be static literals in the compiled artifact. The `items` expression is evaluated at runtime.
 
 The compiler must reject workflow code that breaks determinism, while activity code remains unconstrained.
 

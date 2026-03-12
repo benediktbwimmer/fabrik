@@ -41,6 +41,8 @@ Phase-1 node types must cover:
 - `WaitTimer`
 - `ScheduleActivity`
 - `AwaitActivity`
+- `StartBulkActivity` — throughput mode batch creation
+- `WaitForBulkActivity` — throughput mode batch barrier
 - `StartChildWorkflow`
 - `AwaitChildWorkflow`
 - `InvokePredicate`

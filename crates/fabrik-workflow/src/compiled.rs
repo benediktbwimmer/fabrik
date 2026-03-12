@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use fabrik_events::WorkflowEvent;
+use fabrik_throughput::{DEFAULT_AGGREGATION_GROUP_COUNT, PayloadHandle, ThroughputBackend};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
@@ -109,6 +110,8 @@ pub enum CompiledStateNode {
         handle_var: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task_queue: Option<Expression>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        throughput_backend: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chunk_size: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1426,6 +1429,7 @@ impl CompiledWorkflowArtifact {
                     next,
                     handle_var,
                     task_queue,
+                    throughput_backend,
                     chunk_size,
                     retry,
                 } => {
@@ -1442,7 +1446,8 @@ impl CompiledWorkflowArtifact {
                         .and_then(|value| stringify_value(&value))
                         .unwrap_or_else(|| "default".to_owned());
                     let chunk_size = chunk_size.unwrap_or(256).clamp(1, MAX_BULK_CHUNK_SIZE);
-                    let max_attempts = retry.as_ref().map(|policy| policy.max_attempts).unwrap_or(1);
+                    let max_attempts =
+                        retry.as_ref().map(|policy| policy.max_attempts).unwrap_or(1);
                     let retry_delay_ms = retry
                         .as_ref()
                         .map(|policy| {
@@ -1488,6 +1493,15 @@ impl CompiledWorkflowArtifact {
                         return Err(CompiledWorkflowError::NotWaitingOnBulk(next.clone()));
                     }
                     let total_items = items_len_to_u32(items.len())?;
+                    let throughput_backend = throughput_backend
+                        .clone()
+                        .unwrap_or_else(|| ThroughputBackend::PgV1.as_str().to_owned());
+                    let input_handle =
+                        serde_json::to_value(PayloadHandle::inline_batch_input(&batch_id))
+                            .expect("bulk input handle serializes");
+                    let result_handle =
+                        serde_json::to_value(PayloadHandle::inline_batch_result(&batch_id))
+                            .expect("bulk result handle serializes");
                     emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
                     emissions.push(ExecutionEmission {
                         event: WorkflowEvent::BulkActivityBatchScheduled {
@@ -1495,9 +1509,20 @@ impl CompiledWorkflowArtifact {
                             activity_type: activity_type.clone(),
                             task_queue: task_queue.clone(),
                             items: items.clone(),
+                            input_handle,
+                            result_handle,
                             chunk_size,
                             max_attempts,
                             retry_delay_ms,
+                            aggregation_group_count: DEFAULT_AGGREGATION_GROUP_COUNT,
+                            throughput_backend_version: if throughput_backend
+                                == ThroughputBackend::StreamV2.as_str()
+                            {
+                                ThroughputBackend::StreamV2.default_version().to_owned()
+                            } else {
+                                ThroughputBackend::PgV1.default_version().to_owned()
+                            },
+                            throughput_backend,
                             state: Some(next.clone()),
                         },
                         state: Some(next.clone()),
@@ -2204,13 +2229,21 @@ pub enum CompiledWorkflowError {
     InvalidBulkRetryDelay { state: String, details: String },
     #[error("compiled workflow bulk activity item count {count} exceeds u32")]
     BulkItemsTooLarge { count: usize },
-    #[error("compiled workflow state {state} exceeded bulk item count limit {max} with {count} items")]
+    #[error(
+        "compiled workflow state {state} exceeded bulk item count limit {max} with {count} items"
+    )]
     BulkItemLimitExceeded { state: String, count: usize, max: usize },
-    #[error("compiled workflow state {state} bulk item {index} serialized to {bytes} bytes, over limit {max}")]
+    #[error(
+        "compiled workflow state {state} bulk item {index} serialized to {bytes} bytes, over limit {max}"
+    )]
     BulkItemTooLarge { state: String, index: usize, bytes: usize, max: usize },
-    #[error("compiled workflow state {state} bulk input serialized to {bytes} bytes, over limit {max}")]
+    #[error(
+        "compiled workflow state {state} bulk input serialized to {bytes} bytes, over limit {max}"
+    )]
     BulkInputTooLarge { state: String, bytes: usize, max: usize },
-    #[error("compiled workflow state {state} bulk chunk {chunk_index} serialized to {bytes} bytes, over limit {max}")]
+    #[error(
+        "compiled workflow state {state} bulk chunk {chunk_index} serialized to {bytes} bytes, over limit {max}"
+    )]
     BulkChunkTooLarge { state: String, chunk_index: usize, bytes: usize, max: usize },
     #[error("compiled workflow state {0} is not waiting on a child")]
     NotWaitingOnChild(String),
@@ -2437,11 +2470,9 @@ mod tests {
                         next: "join".to_owned(),
                         handle_var: "bulk".to_owned(),
                         task_queue: None,
+                        throughput_backend: None,
                         chunk_size: Some(2),
-                        retry: Some(RetryPolicy {
-                            max_attempts: 2,
-                            delay: "1s".to_owned(),
-                        }),
+                        retry: Some(RetryPolicy { max_attempts: 2, delay: "1s".to_owned() }),
                     },
                 ),
                 (
@@ -2869,7 +2900,9 @@ mod tests {
             .emissions
             .iter()
             .find_map(|emission| match &emission.event {
-                WorkflowEvent::BulkActivityBatchScheduled { batch_id, .. } => Some(batch_id.clone()),
+                WorkflowEvent::BulkActivityBatchScheduled { batch_id, .. } => {
+                    Some(batch_id.clone())
+                }
                 _ => None,
             })
             .expect("expected bulk schedule event");
@@ -2923,7 +2956,9 @@ mod tests {
             .emissions
             .iter()
             .find_map(|emission| match &emission.event {
-                WorkflowEvent::BulkActivityBatchScheduled { batch_id, .. } => Some(batch_id.clone()),
+                WorkflowEvent::BulkActivityBatchScheduled { batch_id, .. } => {
+                    Some(batch_id.clone())
+                }
                 _ => None,
             })
             .expect("expected bulk schedule event");

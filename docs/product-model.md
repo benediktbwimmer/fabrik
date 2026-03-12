@@ -44,6 +44,7 @@ The runtime model is intentionally not identical to Temporal's internals:
 - large-scale activity fan-out and completion fan-in
 - low workflow-task latency under sticky execution
 - deterministic replay and fast failover
+- high-cardinality bulk workloads via throughput mode with `O(chunks)` overhead
 
 ## Non-Goals
 

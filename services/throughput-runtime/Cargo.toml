@@ -1,5 +1,5 @@
 [package]
-name = "matching-service"
+name = "throughput-runtime"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
@@ -16,7 +16,7 @@ fabrik-store = { path = "../../crates/fabrik-store" }
 fabrik-throughput = { path = "../../crates/fabrik-throughput" }
 fabrik-worker-protocol = { path = "../../crates/fabrik-worker-protocol" }
 futures-util.workspace = true
-prost.workspace = true
+rocksdb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

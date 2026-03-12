@@ -109,6 +109,7 @@ test("compiler lowers bulk activity handles and waits", async () => {
 
   assert.match(serialized, /"type":"start_bulk_activity"/);
   assert.match(serialized, /"activity_type":"benchmark\.echo"/);
+  assert.match(serialized, /"throughput_backend":"stream-v2"/);
   assert.match(serialized, /"chunk_size":128/);
   assert.match(serialized, /"type":"wait_for_bulk_activity"/);
   assert.match(serialized, /"output_var":"summary"/);
@@ -130,6 +131,30 @@ test("compiler rejects non-static bulk options", async () => {
     (error) => {
       const output = `${error.stdout ?? ""}${error.stderr ?? ""}`;
       assert.match(output, /chunkSize must be a numeric literal/);
+      return true;
+    },
+  );
+});
+
+test("compiler rejects unsupported bulk backend options", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/invalid-bulk-backend-workflow.ts",
+  );
+  await assert.rejects(
+    runCompiler([
+      "--entry",
+      fixture,
+      "--export",
+      "invalidBulkBackendWorkflow",
+      "--definition-id",
+      "invalid-bulk-backend",
+      "--version",
+      "1",
+    ]),
+    (error) => {
+      const output = `${error.stdout ?? ""}${error.stderr ?? ""}`;
+      assert.match(output, /backend must be "pg-v1" or "stream-v2"/);
       return true;
     },
   );

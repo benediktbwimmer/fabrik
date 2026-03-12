@@ -7,8 +7,8 @@ use fabrik_worker_protocol::activity_worker::{
     ActivityTaskResult, BulkActivityTaskCancelledResult, BulkActivityTaskCompletedResult,
     BulkActivityTaskFailedResult, BulkActivityTaskResult, PollActivityTaskRequest,
     PollBulkActivityTaskRequest, ReportActivityTaskResultsRequest,
-    ReportBulkActivityTaskResultsRequest,
-    activity_task_result, activity_worker_api_client::ActivityWorkerApiClient,
+    ReportBulkActivityTaskResultsRequest, activity_task_result,
+    activity_worker_api_client::ActivityWorkerApiClient,
 };
 use fabrik_workflow::{StepConfig, execute_handler};
 use reqwest::{Client, Method, Response};
@@ -34,6 +34,7 @@ async fn main() -> Result<()> {
 
     let endpoint = env::var("MATCHING_SERVICE_ENDPOINT")
         .unwrap_or_else(|_| "http://127.0.0.1:50051".to_owned());
+    let bulk_endpoint = env::var("BULK_ACTIVITY_ENDPOINT").unwrap_or_else(|_| endpoint.clone());
     let task_queue = env::var("ACTIVITY_TASK_QUEUE").unwrap_or_else(|_| "default".to_owned());
     let tenant_id = env::var("ACTIVITY_WORKER_TENANT_ID").unwrap_or_default();
     let worker_id = env::var("ACTIVITY_WORKER_ID")
@@ -55,6 +56,7 @@ async fn main() -> Result<()> {
 
     info!(
         matching_endpoint = %endpoint,
+        bulk_endpoint = %bulk_endpoint,
         task_queue = %task_queue,
         tenant_id = %tenant_id,
         worker_id = %worker_id,
@@ -78,7 +80,7 @@ async fn main() -> Result<()> {
         result_txs.push(result_tx);
         let (bulk_result_tx, bulk_result_rx) = unbounded_channel();
         workers.spawn(run_bulk_result_flusher(
-            endpoint.clone(),
+            bulk_endpoint.clone(),
             format!("bulk-result-flusher-{flusher_index}"),
             bulk_result_rx,
         ));
@@ -96,7 +98,7 @@ async fn main() -> Result<()> {
             result_txs[lane % result_txs.len()].clone(),
         ));
         workers.spawn(run_bulk_activity_lane(
-            endpoint.clone(),
+            bulk_endpoint.clone(),
             tenant_id.clone(),
             task_queue.clone(),
             lane_worker_id(&worker_id, lane, concurrency),
@@ -161,12 +163,16 @@ fn estimate_bulk_result_size(result: &BulkActivityTaskResult) -> usize {
         + result.worker_build_id.len()
         + std::mem::size_of::<u32>() * 2;
     size += match result.result.as_ref() {
-        Some(fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
-            completed,
-        )) => completed.output_json.len(),
-        Some(fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Failed(
-            failed,
-        )) => failed.error.len(),
+        Some(
+            fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
+                completed,
+            ),
+        ) => completed.output_json.len(),
+        Some(
+            fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Failed(
+                failed,
+            ),
+        ) => failed.error.len(),
         Some(
             fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Cancelled(
                 cancelled,
@@ -544,10 +550,14 @@ async fn execute_bulk_activity_task(
             batch_id: task.batch_id,
             chunk_id: task.chunk_id,
             chunk_index: task.chunk_index,
+            group_id: task.group_id,
             attempt: task.attempt,
             worker_id,
             worker_build_id,
             lease_token: task.lease_token,
+            lease_epoch: task.lease_epoch,
+            owner_epoch: task.owner_epoch,
+            report_id: Uuid::now_v7().to_string(),
             result: Some(
                 fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Failed(
                     BulkActivityTaskFailedResult {
@@ -573,10 +583,14 @@ async fn execute_bulk_activity_task(
                     batch_id: task.batch_id,
                     chunk_id: task.chunk_id,
                     chunk_index: task.chunk_index,
+                    group_id: task.group_id,
                     attempt: task.attempt,
                     worker_id,
                     worker_build_id,
                     lease_token: task.lease_token,
+                    lease_epoch: task.lease_epoch,
+                    owner_epoch: task.owner_epoch,
+                    report_id: Uuid::now_v7().to_string(),
                     result: Some(
                         fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Cancelled(
                             BulkActivityTaskCancelledResult {
@@ -595,10 +609,14 @@ async fn execute_bulk_activity_task(
                     batch_id: task.batch_id,
                     chunk_id: task.chunk_id,
                     chunk_index: task.chunk_index,
+                    group_id: task.group_id,
                     attempt: task.attempt,
                     worker_id,
                     worker_build_id,
                     lease_token: task.lease_token,
+                    lease_epoch: task.lease_epoch,
+                    owner_epoch: task.owner_epoch,
+                    report_id: Uuid::now_v7().to_string(),
                     result: Some(
                         fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Failed(
                             BulkActivityTaskFailedResult {
@@ -620,10 +638,14 @@ async fn execute_bulk_activity_task(
             batch_id: task.batch_id,
             chunk_id: task.chunk_id,
             chunk_index: task.chunk_index,
+            group_id: task.group_id,
             attempt: task.attempt,
             worker_id,
             worker_build_id,
             lease_token: task.lease_token,
+            lease_epoch: task.lease_epoch,
+            owner_epoch: task.owner_epoch,
+            report_id: Uuid::now_v7().to_string(),
             result: Some(
                 fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Failed(
                     BulkActivityTaskFailedResult {
@@ -644,15 +666,17 @@ async fn execute_bulk_activity_task(
         batch_id: task.batch_id,
         chunk_id: task.chunk_id,
         chunk_index: task.chunk_index,
+        group_id: task.group_id,
         attempt: task.attempt,
         worker_id,
         worker_build_id,
         lease_token: task.lease_token,
+        lease_epoch: task.lease_epoch,
+        owner_epoch: task.owner_epoch,
+        report_id: Uuid::now_v7().to_string(),
         result: Some(
             fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
-                BulkActivityTaskCompletedResult {
-                    output_json,
-                },
+                BulkActivityTaskCompletedResult { output_json },
             ),
         ),
     })

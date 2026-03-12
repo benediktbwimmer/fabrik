@@ -22,6 +22,7 @@ use fabrik_store::{
     WorkflowActivityStatus, WorkflowBulkChunkRecord, WorkflowMailboxKind, WorkflowResumeKind,
     WorkflowStore, WorkflowTaskRecord,
 };
+use fabrik_throughput::ThroughputBackend;
 use fabrik_worker_protocol::activity_worker::{
     Ack, ActivityTask, ActivityTaskResult, BulkActivityTask, BulkActivityTaskResult,
     CompleteActivityTaskRequest, CompleteWorkflowTaskRequest, FailActivityTaskRequest,
@@ -29,8 +30,7 @@ use fabrik_worker_protocol::activity_worker::{
     PollBulkActivityTaskRequest, PollBulkActivityTaskResponse, PollWorkflowTaskRequest,
     PollWorkflowTaskResponse, RecordActivityHeartbeatRequest, RecordActivityHeartbeatResponse,
     ReportActivityTaskCancelledRequest, ReportActivityTaskResultsRequest,
-    ReportBulkActivityTaskResultsRequest, WorkflowTask,
-    activity_task_result,
+    ReportBulkActivityTaskResultsRequest, WorkflowTask, activity_task_result,
     activity_worker_api_server::{ActivityWorkerApi, ActivityWorkerApiServer},
     workflow_worker_api_server::{WorkflowWorkerApi, WorkflowWorkerApiServer},
 };
@@ -379,11 +379,19 @@ async fn process_event(
             activity_type,
             task_queue,
             items,
+            input_handle,
+            result_handle,
             chunk_size,
             max_attempts,
             retry_delay_ms,
+            aggregation_group_count,
+            throughput_backend,
+            throughput_backend_version,
             state: workflow_state,
         } => {
+            if throughput_backend != ThroughputBackend::PgV1.as_str() {
+                return Ok(());
+            }
             state
                 .store
                 .upsert_bulk_batch(
@@ -397,10 +405,15 @@ async fn process_event(
                     activity_type,
                     task_queue,
                     workflow_state.as_deref(),
+                    input_handle,
+                    result_handle,
                     items,
                     *chunk_size,
                     *max_attempts,
                     *retry_delay_ms,
+                    *aggregation_group_count,
+                    throughput_backend,
+                    throughput_backend_version,
                     event.occurred_at,
                 )
                 .await?;
@@ -452,6 +465,18 @@ async fn process_event(
                     }
                 }
             }
+        }
+        WorkflowEvent::WorkflowCancellationRequested { reason } => {
+            cancel_bulk_batches_for_backend(
+                state,
+                &event.tenant_id,
+                &event.instance_id,
+                &event.run_id,
+                ThroughputBackend::PgV1.as_str(),
+                reason,
+                None,
+            )
+            .await?;
         }
         _ => {}
     }
@@ -566,7 +591,14 @@ async fn sweep_activities(state: &AppState) -> Result<()> {
         }
     }
 
-    for record in state.store.list_started_bulk_chunks(state.runtime.max_rebuild_tasks as usize).await? {
+    for record in state
+        .store
+        .list_started_bulk_chunks_for_backend(
+            state.runtime.max_rebuild_tasks as usize,
+            ThroughputBackend::PgV1.as_str(),
+        )
+        .await?
+    {
         if record.lease_expires_at.is_some_and(|expires_at| expires_at <= now) {
             if state
                 .store
@@ -767,7 +799,8 @@ impl ActivityWorkerApi for ActivityApi {
                 .await
                 .map_err(internal_status)?;
             if !leased.is_empty() {
-                let (first, remaining) = leased.split_first().expect("leased bulk batch is non-empty");
+                let (first, remaining) =
+                    leased.split_first().expect("leased bulk batch is non-empty");
                 if !remaining.is_empty() {
                     self.state
                         .bulk_prefetch
@@ -1009,12 +1042,18 @@ async fn report_bulk_activity_results(
     results: Vec<BulkActivityTaskResult>,
 ) -> Result<(), Status> {
     for result in results {
+        ensure_bulk_batch_backend(
+            &state.store,
+            &result.tenant_id,
+            &result.instance_id,
+            &result.run_id,
+            &result.batch_id,
+            ThroughputBackend::PgV1.as_str(),
+        )
+        .await?;
         let update = prepare_bulk_result(result)?;
-        let applied = state
-            .store
-            .apply_bulk_chunk_terminal_update(&update)
-            .await
-            .map_err(internal_status)?;
+        let applied =
+            state.store.apply_bulk_chunk_terminal_update(&update).await.map_err(internal_status)?;
         if let Some(event) = applied.terminal_event {
             let _ = event;
             state.outbox_notify.notify_waiters();
@@ -1033,6 +1072,28 @@ async fn report_bulk_activity_results(
                 notify.notify_waiters();
             });
         }
+    }
+    Ok(())
+}
+
+async fn ensure_bulk_batch_backend(
+    store: &WorkflowStore,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    batch_id: &str,
+    expected_backend: &str,
+) -> Result<(), Status> {
+    let batch = store
+        .get_bulk_batch(tenant_id, instance_id, run_id, batch_id)
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::not_found(format!("bulk batch {batch_id} not found")))?;
+    if batch.throughput_backend != expected_backend {
+        return Err(Status::failed_precondition(format!(
+            "bulk batch {batch_id} is owned by backend {}",
+            batch.throughput_backend
+        )));
     }
     Ok(())
 }
@@ -1072,14 +1133,16 @@ async fn run_workflow_event_outbox_publisher(state: AppState) {
         }
 
         for record in leased {
-            if let Err(error) = state.publisher.publish(&record.event, &record.partition_key).await {
+            if let Err(error) = state.publisher.publish(&record.event, &record.partition_key).await
+            {
                 error!(
                     error = %error,
                     outbox_id = %record.outbox_id,
                     event_type = %record.event_type,
                     "matching-service failed to publish workflow event outbox row"
                 );
-                let retry_at = Utc::now() + chrono::Duration::milliseconds(BULK_EVENT_OUTBOX_RETRY_MS);
+                let retry_at =
+                    Utc::now() + chrono::Duration::milliseconds(BULK_EVENT_OUTBOX_RETRY_MS);
                 if let Err(release_error) = state
                     .store
                     .release_workflow_event_outbox_lease(
@@ -1397,7 +1460,11 @@ fn prepare_bulk_result(result: BulkActivityTaskResult) -> Result<BulkChunkTermin
         batch_id: result.batch_id,
         chunk_id: result.chunk_id,
         chunk_index: result.chunk_index,
+        group_id: result.group_id,
         attempt: result.attempt,
+        lease_epoch: result.lease_epoch,
+        owner_epoch: result.owner_epoch,
+        report_id: result.report_id,
         lease_token,
         worker_id: result.worker_id,
         worker_build_id: result.worker_build_id,
@@ -1802,6 +1869,40 @@ async fn publish_activity_event(
     Ok(())
 }
 
+async fn cancel_bulk_batches_for_backend(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    throughput_backend: &str,
+    reason: &str,
+    metadata: Option<&Value>,
+) -> Result<()> {
+    let batches = state
+        .store
+        .list_nonterminal_bulk_batches_for_run(tenant_id, instance_id, run_id, throughput_backend)
+        .await?;
+    for batch in batches {
+        let cancelled = state
+            .store
+            .cancel_bulk_batch(
+                tenant_id,
+                instance_id,
+                run_id,
+                &batch.batch_id,
+                reason,
+                metadata,
+                Utc::now(),
+            )
+            .await?;
+        if cancelled.terminal_event.is_some() {
+            state.outbox_notify.notify_waiters();
+        }
+        state.bulk_notify.notify_waiters();
+    }
+    Ok(())
+}
+
 fn build_activity_event_envelope(
     record: &WorkflowActivityRecord,
     payload: WorkflowEvent,
@@ -1873,6 +1974,7 @@ fn bulk_chunk_to_proto(record: &WorkflowBulkChunkRecord) -> BulkActivityTask {
         batch_id: record.batch_id.clone(),
         chunk_id: record.chunk_id.clone(),
         chunk_index: record.chunk_index,
+        group_id: record.group_id,
         activity_type: record.activity_type.clone(),
         task_queue: record.task_queue.clone(),
         attempt: record.attempt,
@@ -1884,6 +1986,8 @@ fn bulk_chunk_to_proto(record: &WorkflowBulkChunkRecord) -> BulkActivityTask {
             .unwrap_or_default(),
         cancellation_requested: record.cancellation_requested,
         lease_token: record.lease_token.map(|value| value.to_string()).unwrap_or_default(),
+        lease_epoch: record.lease_epoch,
+        owner_epoch: record.owner_epoch,
     }
 }
 
@@ -2919,6 +3023,52 @@ mod tests {
 
         event_loop.abort();
         let _ = event_loop.await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bulk_backend_guard_rejects_stream_batches() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        store
+            .upsert_bulk_batch(
+                "tenant-a",
+                "wf-stream-bulk",
+                "run-stream-bulk",
+                "demo",
+                Some(1),
+                Some("artifact-1"),
+                "batch-stream",
+                "benchmark.echo",
+                "bulk",
+                Some("join"),
+                &json!({ "kind": "inline", "key": "bulk-input:batch-stream" }),
+                &json!({ "kind": "inline", "key": "bulk-result:batch-stream" }),
+                &[json!({"value": 1})],
+                1,
+                1,
+                0,
+                1,
+                "stream-v2",
+                "2.0.0",
+                Utc::now(),
+            )
+            .await?;
+
+        let error = ensure_bulk_batch_backend(
+            &store,
+            "tenant-a",
+            "wf-stream-bulk",
+            "run-stream-bulk",
+            "batch-stream",
+            ThroughputBackend::PgV1.as_str(),
+        )
+        .await
+        .expect_err("stream-v2 batch should be rejected by pg-v1 matcher");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
         Ok(())
     }
 }

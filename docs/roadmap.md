@@ -132,6 +132,30 @@ Exit criteria:
 - task queue throughput scales horizontally
 - failover preserves correctness under load
 
+## Phase 6.5: Throughput Mode
+
+Goal: enable high-cardinality bulk workloads with chunk-level durability.
+
+Deliverables:
+
+- `ctx.bulkActivity()` workflow primitive
+- `start_bulk_activity` and `wait_for_bulk_activity` IR nodes
+- batch-level workflow history events
+- `pg-v1` Postgres-first backend (default)
+- `stream-v2` streaming backend with dedicated throughput-runtime service
+- configurable backend selection per call-site
+- chunk-level retry and coarse cancellation
+- batch/chunk visibility query endpoints
+- dedicated bulk worker gRPC protocol
+- benchmark harness comparing durable and throughput modes
+
+Exit criteria:
+
+- throughput mode outperforms durable mode by at least 5x on fan-out benchmarks
+- `pg-v1` handles batches up to 100K items
+- `stream-v2` handles batches with millions of items
+- mixed durable and bulk steps work correctly in one workflow
+
 ## Phase 7: Hosted Platform Hardening
 
 Goal: make the system safe for multi-tenant production use.
@@ -157,6 +181,7 @@ Exit criteria:
 - SDK ergonomics
 - operator experience
 - documentation
+- throughput mode backend evolution (v2.1 groups, v2.2 manifests, v2.3 warm failover)
 
 ## Recommended Immediate Next Steps
 

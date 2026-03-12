@@ -235,6 +235,19 @@ The architecture must therefore optimize for:
 - low-overhead join bookkeeping
 - bounded replay cost through snapshots and continue-as-new
 
+### Throughput Mode
+
+For high-cardinality fan-out beyond what durable per-activity execution supports efficiently, workflows can opt into throughput mode using `ctx.bulkActivity()`. This trades per-item durable history for chunk-level durability, reducing workflow overhead from `O(items)` to `O(chunks)`.
+
+Throughput mode supports two interchangeable backends:
+
+- **`pg-v1`** (default): Postgres-first backend. Chunk scheduling and state management run entirely in Postgres. No additional infrastructure required. Suitable for batches up to ~100K items.
+- **`stream-v2`**: Streaming backend. Removes Postgres from the throughput hot path. Uses a dedicated `throughput-runtime` service with RocksDB for shard-local state, Redpanda for command/report/changelog logs, and S3 for durable checkpoints. Suitable for batches with millions of items.
+
+Backend selection is per `ctx.bulkActivity()` call and pinned for the lifetime of the batch. Both backends implement the same internal interface and produce the same workflow-visible batch lifecycle events.
+
+See [throughput-mode.md](spec/throughput-mode.md) for the full specification.
+
 ### Sticky Execution
 
 Sticky execution is required for competitive latency:
@@ -265,6 +278,21 @@ It is trying to replace Temporal by preserving the workflow model users want whi
 - replay efficiency
 
 That means compiled workflows plus arbitrary activities, not compiled workflows instead of arbitrary activities.
+
+### 9. Throughput Runtime (`stream-v2`)
+
+When throughput mode is configured with the `stream-v2` backend, a dedicated `throughput-runtime` service owns throughput shards independently of workflow executors.
+
+The throughput runtime:
+
+- owns shard state in RocksDB with durable checkpoints in S3
+- consumes commands from the command log and reports from the report log
+- applies state mutations through an owner changelog for restore and audit
+- serves dedicated bulk worker RPCs for chunk polling and reporting
+- enforces fencing via `(chunk_id, attempt, lease_epoch, owner_epoch)` tuples
+- projects batch/chunk state asynchronously to Postgres for visibility queries
+
+A workflow-to-throughput bridge consumes `BulkActivityBatchScheduled` events from workflow history and appends idempotent `CreateBatch` commands to the throughput command log. The bridge guarantees exactly one live throughput batch per workflow schedule event.
 
 ## Future Directions
 

@@ -1,5 +1,5 @@
 [package]
-name = "fabrik-workflow"
+name = "fabrik-throughput"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
@@ -7,10 +7,6 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
-fabrik-events = { path = "../fabrik-events" }
-fabrik-throughput = { path = "../fabrik-throughput" }
 serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-thiserror.workspace = true
 uuid.workspace = true

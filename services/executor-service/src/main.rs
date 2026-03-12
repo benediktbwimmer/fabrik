@@ -1549,7 +1549,7 @@ async fn process_workflow_task(
                     &task.run_id,
                     resume_batch_limit.min(256),
                 )
-            .await?;
+                .await?;
             if !resume_batch.is_empty() {
                 let mut max_consumed_resume_seq = None;
                 for resume in resume_batch {
@@ -2669,10 +2669,7 @@ async fn process_event(
                 batch_id,
                 &summary,
                 state.artifact_execution.clone().unwrap_or_default(),
-                ExecutionTurnContext {
-                    event_id: event.event_id,
-                    occurred_at: event.occurred_at,
-                },
+                ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at },
             )?;
             apply_compiled_plan(&mut state, &plan);
             persist_state_with_mode(
@@ -2751,10 +2748,7 @@ async fn process_event(
                 batch_id,
                 &error,
                 state.artifact_execution.clone().unwrap_or_default(),
-                ExecutionTurnContext {
-                    event_id: event.event_id,
-                    occurred_at: event.occurred_at,
-                },
+                ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at },
             )?;
             apply_compiled_plan(&mut state, &plan);
             persist_state_with_mode(
