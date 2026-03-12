@@ -171,6 +171,26 @@ wait_for_redpanda_ready() {
   return 1
 }
 
+wait_for_topic_partitions() {
+  local topic=$1
+  local expected_partitions=$2
+  local timeout=${3:-60}
+  local deadline=$((SECONDS + timeout))
+  while (( SECONDS < deadline )); do
+    local actual
+    actual="$(
+      docker exec fabrik-redpanda-1 rpk topic list 2>/dev/null \
+        | awk -v topic="$topic" '$1 == topic {print $2; exit}'
+    )"
+    if [[ -n "${actual:-}" && "$actual" == "$expected_partitions" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "timed out waiting for topic $topic to report $expected_partitions partitions" >&2
+  return 1
+}
+
 purge_stale_benchmark_topics() {
   local topics=()
   while IFS= read -r topic; do
@@ -290,6 +310,7 @@ do
   name="${topic%%:*}"
   partitions="${topic##*:}"
   docker exec fabrik-redpanda-1 rpk topic create "$name" -p "$partitions" -r 1 >/dev/null 2>&1 || true
+  wait_for_topic_partitions "$name" "$partitions" 60
 done
 
 if [[ "$BUILD_RELEASE" == "1" ]]; then

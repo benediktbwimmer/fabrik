@@ -2,7 +2,9 @@ use std::{env, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use fabrik_config::{GrpcServiceConfig, ThroughputPayloadStoreConfig, ThroughputPayloadStoreKind};
-use fabrik_throughput::{PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind};
+use fabrik_throughput::{
+    PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind, decode_cbor, encode_cbor,
+};
 use fabrik_worker_protocol::activity_worker::{
     ActivityTaskCancelledResult, ActivityTaskCompletedResult, ActivityTaskFailedResult,
     ActivityTaskResult, BulkActivityTaskCancelledResult, BulkActivityTaskCompletedResult,
@@ -179,10 +181,16 @@ fn estimate_bulk_result_size(result: &BulkActivityTaskResult) -> usize {
                 completed,
             ),
         ) => {
-            if completed.result_handle_json.is_empty() && !completed.output_json.is_empty() {
+            if completed.result_handle_json.is_empty()
+                && completed.result_handle_cbor.is_empty()
+                && (!completed.output_json.is_empty() || !completed.output_cbor.is_empty())
+            {
                 256
             } else {
-                completed.output_json.len() + completed.result_handle_json.len()
+                completed.output_json.len()
+                    + completed.result_handle_json.len()
+                    + completed.output_cbor.len()
+                    + completed.result_handle_cbor.len()
             }
         }
         Some(
@@ -458,6 +466,7 @@ async fn run_bulk_activity_lane(
                 worker_build_id: worker_build_id.clone(),
                 poll_timeout_ms: 30_000,
                 max_tasks: bulk_poll_max_tasks,
+                supports_cbor: true,
             })
             .await;
 
@@ -487,6 +496,15 @@ async fn run_bulk_activity_lane(
             }
         }
     }
+}
+
+fn encode_bulk_completed_result(outputs: &[Value]) -> Result<BulkActivityTaskCompletedResult> {
+    Ok(BulkActivityTaskCompletedResult {
+        output_json: String::new(),
+        result_handle_json: String::new(),
+        output_cbor: encode_cbor(&Value::Array(outputs.to_vec()), "bulk result output")?,
+        result_handle_cbor: Vec::new(),
+    })
 }
 
 async fn connect_activity_worker(
@@ -607,6 +625,7 @@ async fn execute_bulk_activity_task(
                             BulkActivityTaskCancelledResult {
                                 reason: error.to_string(),
                                 metadata_json: String::new(),
+                                metadata_cbor: Vec::new(),
                             },
                         ),
                     ),
@@ -657,10 +676,7 @@ async fn execute_bulk_activity_task(
         report_id: Uuid::now_v7().to_string(),
         result: Some(
             fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
-                BulkActivityTaskCompletedResult {
-                    output_json: serde_json::to_string(&Value::Array(outputs))?,
-                    result_handle_json: String::new(),
-                },
+                encode_bulk_completed_result(&outputs)?,
             ),
         ),
     })
@@ -697,6 +713,7 @@ fn execute_benchmark_echo_bulk_task(
                             BulkActivityTaskCancelledResult {
                                 reason: error.to_string(),
                                 metadata_json: String::new(),
+                                metadata_cbor: Vec::new(),
                             },
                         ),
                     ),
@@ -747,10 +764,7 @@ fn execute_benchmark_echo_bulk_task(
         report_id: Uuid::now_v7().to_string(),
         result: Some(
             fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
-                BulkActivityTaskCompletedResult {
-                    output_json: serde_json::to_string(&Value::Array(outputs))?,
-                    result_handle_json: String::new(),
-                },
+                encode_bulk_completed_result(&outputs)?,
             ),
         ),
     })
@@ -773,16 +787,26 @@ async fn externalize_bulk_result_outputs(
         else {
             continue;
         };
-        if !completed.output_json.trim().is_empty()
-            && !completed.result_handle_json.trim().is_empty()
+        if (!completed.output_json.trim().is_empty() || !completed.output_cbor.is_empty())
+            && (!completed.result_handle_json.trim().is_empty()
+                || !completed.result_handle_cbor.is_empty())
         {
             continue;
         }
-        if completed.output_json.trim().is_empty() {
+        if completed.output_json.trim().is_empty() && completed.output_cbor.is_empty() {
             continue;
         }
 
-        let output = serde_json::from_str::<Vec<Value>>(&completed.output_json)?;
+        let output = if !completed.output_cbor.is_empty() {
+            match decode_cbor::<Value>(&completed.output_cbor, "bulk result output")? {
+                Value::Array(items) => items,
+                other => {
+                    anyhow::bail!("bulk result output CBOR must decode to an array, got {other}")
+                }
+            }
+        } else {
+            serde_json::from_str::<Vec<Value>>(&completed.output_json)?
+        };
         let start = flattened_outputs.len();
         let len = output.len();
         flattened_outputs.extend(output);
@@ -816,13 +840,12 @@ async fn externalize_bulk_result_outputs(
         else {
             continue;
         };
-        completed.result_handle_json = serde_json::to_string(&PayloadHandle::ManifestSlice {
-            key: key.clone(),
-            store: store.clone(),
-            start,
-            len,
-        })?;
+        let handle =
+            PayloadHandle::ManifestSlice { key: key.clone(), store: store.clone(), start, len };
+        completed.result_handle_json.clear();
+        completed.result_handle_cbor = encode_cbor(&handle, "bulk result handle")?;
         completed.output_json.clear();
+        completed.output_cbor.clear();
     }
 
     Ok(())
@@ -831,6 +854,9 @@ async fn externalize_bulk_result_outputs(
 fn task_input_handle(
     task: &fabrik_worker_protocol::activity_worker::BulkActivityTask,
 ) -> Result<Option<PayloadHandle>> {
+    if !task.input_handle_cbor.is_empty() {
+        return Ok(Some(decode_cbor(&task.input_handle_cbor, "bulk task input handle")?));
+    }
     if task.input_handle_json.trim().is_empty() {
         return Ok(None);
     }
@@ -848,6 +874,15 @@ async fn resolve_bulk_task_items(
 ) -> Result<Vec<Value>> {
     if let Some(handle) = input_handle {
         return payload_store.read_items(handle).await;
+    }
+    if !task.items_cbor.is_empty() {
+        if task.items_cbor.len() > MAX_BULK_CHUNK_INPUT_BYTES {
+            anyhow::bail!("bulk chunk input exceeded {} bytes", MAX_BULK_CHUNK_INPUT_BYTES);
+        }
+        return match decode_cbor::<Value>(&task.items_cbor, "bulk chunk items")? {
+            Value::Array(items) => Ok(items),
+            other => anyhow::bail!("bulk chunk items CBOR must decode to an array, got {other}"),
+        };
     }
     if task.items_json.len() > MAX_BULK_CHUNK_INPUT_BYTES {
         anyhow::bail!("bulk chunk input exceeded {} bytes", MAX_BULK_CHUNK_INPUT_BYTES);

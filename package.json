@@ -4,9 +4,15 @@
   "type": "module",
   "scripts": {
     "compile:workflow": "node sdk/typescript-compiler/compiler.mjs",
-    "test:compiler": "node --test sdk/typescript-compiler/compiler.test.mjs"
+    "test:compiler": "node --test sdk/typescript-compiler/compiler.test.mjs",
+    "test:benchmarks": "node --test benchmarks/temporal-comparison/helpers.test.mjs",
+    "benchmark:compare-temporal": "bash scripts/run-temporal-comparison-benchmark.sh"
   },
   "dependencies": {
+    "@temporalio/activity": "^1.15.0",
+    "@temporalio/client": "^1.15.0",
+    "@temporalio/worker": "^1.15.0",
+    "@temporalio/workflow": "^1.15.0",
     "typescript": "^5.8.3"
   }
 }

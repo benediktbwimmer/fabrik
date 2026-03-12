@@ -124,6 +124,13 @@ cargo check
 cargo test
 npm install
 npm run test:compiler
+npm run test:benchmarks
+```
+
+Run the Temporal comparison benchmark suite:
+
+```bash
+./scripts/run-temporal-comparison-benchmark.sh --profile smoke
 ```
 
 Run a service:
@@ -161,6 +168,7 @@ node sdk/typescript-compiler/compiler.mjs \
 - [Architecture](/Users/bene/code/fabrik/docs/architecture.md)
 - [Product Model](/Users/bene/code/fabrik/docs/product-model.md)
 - [Roadmap](/Users/bene/code/fabrik/docs/roadmap.md)
+- [Temporal Comparison Benchmarking](/Users/bene/code/fabrik/docs/benchmarking/temporal-comparison.md)
 - [Architecture Decision Record 0001](/Users/bene/code/fabrik/docs/adr/0001-log-first-rust-wasm-platform.md)
 - [Architecture Decision Record 0002](/Users/bene/code/fabrik/docs/adr/0002-code-authored-compiled-workflows.md)
 - [Architecture Decision Record 0003](/Users/bene/code/fabrik/docs/adr/0003-execution-invariants.md)

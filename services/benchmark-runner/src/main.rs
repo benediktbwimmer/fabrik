@@ -148,6 +148,8 @@ struct ControlPlaneMetrics {
     report_batches_applied: u64,
     avg_report_batch_size: f64,
     projection_events_published: u64,
+    projection_events_skipped: u64,
+    projection_events_applied_directly: u64,
     changelog_entries_published: u64,
     manifest_writes: u64,
 }
@@ -791,7 +793,26 @@ fn benchmark_suite_scenarios(args: &Args, suite_name: &str) -> Result<Vec<Args>>
             throughput_stream.bulk_reducer = "all_settled".to_owned();
             Ok(vec![throughput_stream])
         }
-        other => bail!("unknown suite {other}; expected streaming or stream-v2-robustness"),
+        "stream-v2-fast-lane" => {
+            let mut count = args.clone();
+            count.suite_name = None;
+            count.execution_mode = ExecutionMode::Throughput;
+            count.throughput_backend = Some(STREAM_V2_BACKEND.to_owned());
+            count.bulk_reducer = "count".to_owned();
+            count.chunk_size = count.chunk_size.min(64);
+            count.profile.activities_per_workflow =
+                count.profile.activities_per_workflow.max(2_000);
+
+            let mut settled = count.clone();
+            settled.bulk_reducer = "all_settled".to_owned();
+            settled.retry_rate = settled.retry_rate.max(0.01);
+            settled.cancel_rate = settled.cancel_rate.max(0.01);
+
+            Ok(vec![count, settled])
+        }
+        other => bail!(
+            "unknown suite {other}; expected streaming, stream-v2-robustness, or stream-v2-fast-lane"
+        ),
     }
 }
 
@@ -1279,6 +1300,9 @@ fn control_plane_metrics(
     let reports_received = json_u64(runtime, "reports_received");
     let report_batches_applied = json_u64(runtime, "report_batches_applied");
     let projection_events_published = json_u64(runtime, "projection_events_published");
+    let projection_events_skipped = json_u64(runtime, "projection_events_skipped");
+    let projection_events_applied_directly =
+        json_u64(runtime, "projection_events_applied_directly");
     let changelog_entries_published = json_u64(runtime, "changelog_entries_published");
     let manifest_writes = projector_debug
         .and_then(|value| value.get("manifest_writes"))
@@ -1293,6 +1317,8 @@ fn control_plane_metrics(
         report_batches_applied,
         avg_report_batch_size: ratio(reports_received, report_batches_applied),
         projection_events_published,
+        projection_events_skipped,
+        projection_events_applied_directly,
         changelog_entries_published,
         manifest_writes,
     })
@@ -1326,7 +1352,7 @@ fn write_report(output_path: &Path, report: &BenchmarkReport) -> Result<()> {
 fn summary_text(report: &BenchmarkReport) -> String {
     let control_plane = report.control_plane_metrics.as_ref().map(|metrics| {
         format!(
-            "avg_tasks_per_bulk_poll_response={:.2}\navg_results_per_bulk_report_rpc={:.2}\nchangelog_entries_per_completed_chunk={:.2}\nprojection_events_per_completed_chunk={:.2}\nreport_batches_applied={}\navg_report_batch_size={:.2}\nprojection_events_published={}\nchangelog_entries_published={}\nmanifest_writes={}\n",
+            "avg_tasks_per_bulk_poll_response={:.2}\navg_results_per_bulk_report_rpc={:.2}\nchangelog_entries_per_completed_chunk={:.2}\nprojection_events_per_completed_chunk={:.2}\nreport_batches_applied={}\navg_report_batch_size={:.2}\nprojection_events_published={}\nprojection_events_skipped={}\nprojection_events_applied_directly={}\nchangelog_entries_published={}\nmanifest_writes={}\n",
             metrics.avg_tasks_per_bulk_poll_response,
             metrics.avg_results_per_bulk_report_rpc,
             metrics.changelog_entries_per_completed_chunk,
@@ -1334,6 +1360,8 @@ fn summary_text(report: &BenchmarkReport) -> String {
             metrics.report_batches_applied,
             metrics.avg_report_batch_size,
             metrics.projection_events_published,
+            metrics.projection_events_skipped,
+            metrics.projection_events_applied_directly,
             metrics.changelog_entries_published,
             metrics.manifest_writes,
         )
@@ -1424,5 +1452,18 @@ mod tests {
         assert_eq!(scenarios[0].execution_mode, ExecutionMode::Throughput);
         assert_eq!(scenarios[0].throughput_backend.as_deref(), Some(STREAM_V2_BACKEND));
         assert_eq!(scenarios[0].bulk_reducer, "all_settled");
+    }
+
+    #[test]
+    fn stream_v2_fast_lane_suite_emits_mergeable_variants() {
+        let scenarios =
+            benchmark_suite_scenarios(&demo_args(), "stream-v2-fast-lane").expect("suite");
+        assert_eq!(scenarios.len(), 2);
+        assert_eq!(scenarios[0].bulk_reducer, "count");
+        assert_eq!(scenarios[1].bulk_reducer, "all_settled");
+        assert_eq!(scenarios[0].throughput_backend.as_deref(), Some(STREAM_V2_BACKEND));
+        assert!(scenarios[0].profile.activities_per_workflow >= 2_000);
+        assert!(scenarios[1].retry_rate >= 0.01);
+        assert!(scenarios[1].cancel_rate >= 0.01);
     }
 }

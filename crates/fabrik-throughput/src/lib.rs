@@ -11,16 +11,22 @@ use aws_sdk_s3::{
     primitives::ByteStream,
 };
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use uuid::Uuid;
 
 pub const PG_V1_BACKEND: &str = "pg-v1";
 pub const STREAM_V2_BACKEND: &str = "stream-v2";
 pub const STREAM_V2_BACKEND_VERSION: &str = "2.0.0";
+pub const BULK_REDUCER_ALL_SUCCEEDED: &str = "all_succeeded";
+pub const BULK_REDUCER_ALL_SETTLED: &str = "all_settled";
+pub const BULK_REDUCER_COUNT: &str = "count";
+pub const BULK_REDUCER_COLLECT_RESULTS: &str = "collect_results";
 pub const DEFAULT_AGGREGATION_GROUP_COUNT: u32 = 1;
 pub const DEFAULT_GROUP_ID: u32 = 0;
 pub const INITIAL_OWNER_EPOCH: u64 = 1;
+const REDUCTION_GROUP_LEVEL_SHIFT: u32 = 24;
+const REDUCTION_GROUP_SLOT_MASK: u32 = (1 << REDUCTION_GROUP_LEVEL_SHIFT) - 1;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -43,6 +49,163 @@ impl ThroughputBackend {
             Self::StreamV2 => STREAM_V2_BACKEND_VERSION,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BulkReducerClass {
+    Legacy,
+    Mergeable,
+}
+
+impl BulkReducerClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Mergeable => "mergeable",
+        }
+    }
+}
+
+pub fn bulk_reducer_name(reducer: Option<&str>) -> &str {
+    reducer.unwrap_or(BULK_REDUCER_COLLECT_RESULTS)
+}
+
+pub fn bulk_reducer_class(reducer: Option<&str>) -> BulkReducerClass {
+    match bulk_reducer_name(reducer) {
+        BULK_REDUCER_ALL_SUCCEEDED | BULK_REDUCER_ALL_SETTLED | BULK_REDUCER_COUNT => {
+            BulkReducerClass::Mergeable
+        }
+        _ => BulkReducerClass::Legacy,
+    }
+}
+
+pub fn bulk_reducer_is_mergeable(reducer: Option<&str>) -> bool {
+    bulk_reducer_class(reducer) == BulkReducerClass::Mergeable
+}
+
+pub fn stream_v2_fast_lane_enabled(
+    backend: &str,
+    execution_policy: Option<&str>,
+    reducer: Option<&str>,
+) -> bool {
+    backend == STREAM_V2_BACKEND
+        && execution_policy.unwrap_or("default") == "eager"
+        && bulk_reducer_is_mergeable(reducer)
+}
+
+pub fn planned_reduction_tree_depth(
+    chunk_count: u32,
+    aggregation_group_count: u32,
+    reducer: Option<&str>,
+) -> u32 {
+    if !bulk_reducer_is_mergeable(reducer) || chunk_count <= 1 || aggregation_group_count <= 1 {
+        return 1;
+    }
+    if aggregation_group_count >= 16 && chunk_count >= aggregation_group_count.saturating_mul(32) {
+        3
+    } else {
+        2
+    }
+}
+
+pub fn reduction_tree_level_counts(
+    aggregation_group_count: u32,
+    aggregation_tree_depth: u32,
+) -> Vec<u32> {
+    let leaf_count = aggregation_group_count.max(1);
+    let requested_depth = aggregation_tree_depth.max(1) as usize;
+    let mut counts = vec![leaf_count];
+    while counts.len() < requested_depth {
+        let previous = *counts.last().expect("reduction tree counts missing prior level");
+        let next = if counts.len() + 1 == requested_depth {
+            1
+        } else if previous <= 1 {
+            1
+        } else {
+            let sqrt = (previous as f64).sqrt().ceil() as u32;
+            sqrt.max(2).min(previous.saturating_sub(1))
+        };
+        counts.push(next.max(1));
+        if previous <= 1 {
+            break;
+        }
+    }
+    counts
+}
+
+pub fn reduction_tree_node_id(level: u32, slot: u32) -> u32 {
+    if level == 0 {
+        slot
+    } else {
+        (level << REDUCTION_GROUP_LEVEL_SHIFT) | (slot & REDUCTION_GROUP_SLOT_MASK)
+    }
+}
+
+pub fn reduction_tree_node_level(group_id: u32) -> u32 {
+    group_id >> REDUCTION_GROUP_LEVEL_SHIFT
+}
+
+pub fn reduction_tree_node_slot(group_id: u32) -> u32 {
+    if reduction_tree_node_level(group_id) == 0 {
+        group_id
+    } else {
+        group_id & REDUCTION_GROUP_SLOT_MASK
+    }
+}
+
+pub fn reduction_tree_parent_group_id(
+    group_id: u32,
+    aggregation_group_count: u32,
+    aggregation_tree_depth: u32,
+) -> Option<u32> {
+    let level_counts = reduction_tree_level_counts(aggregation_group_count, aggregation_tree_depth);
+    let level = usize::try_from(reduction_tree_node_level(group_id)).ok()?;
+    if level + 1 >= level_counts.len() {
+        return None;
+    }
+    let child_count = level_counts[level];
+    let parent_count = level_counts[level + 1];
+    let slot = reduction_tree_node_slot(group_id);
+    if child_count == 0 || parent_count == 0 {
+        return None;
+    }
+    let parent_slot = ((u64::from(slot) * u64::from(parent_count)) / u64::from(child_count)) as u32;
+    Some(reduction_tree_node_id((level + 1) as u32, parent_slot.min(parent_count - 1)))
+}
+
+pub fn reduction_tree_child_group_ids(
+    parent_group_id: u32,
+    aggregation_group_count: u32,
+    aggregation_tree_depth: u32,
+) -> Vec<u32> {
+    let level_counts = reduction_tree_level_counts(aggregation_group_count, aggregation_tree_depth);
+    let parent_level = match usize::try_from(reduction_tree_node_level(parent_group_id)) {
+        Ok(level) => level,
+        Err(_) => return Vec::new(),
+    };
+    if parent_level == 0 || parent_level >= level_counts.len() {
+        return Vec::new();
+    }
+    let child_level = parent_level - 1;
+    let child_count = level_counts[child_level];
+    let parent_count = level_counts[parent_level];
+    let parent_slot = reduction_tree_node_slot(parent_group_id);
+    (0..child_count)
+        .filter(|child_slot| {
+            (((u64::from(*child_slot) * u64::from(parent_count)) / u64::from(child_count)) as u32)
+                == parent_slot
+        })
+        .map(|child_slot| reduction_tree_node_id(child_level as u32, child_slot))
+        .collect()
+}
+
+pub fn encode_cbor<T: Serialize>(value: &T, subject: &str) -> Result<Vec<u8>> {
+    serde_cbor::to_vec(value).with_context(|| format!("failed to encode {subject} as CBOR"))
+}
+
+pub fn decode_cbor<T: DeserializeOwned>(bytes: &[u8], subject: &str) -> Result<T> {
+    serde_cbor::from_slice(bytes).with_context(|| format!("failed to decode {subject} from CBOR"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -165,6 +328,11 @@ pub enum ThroughputChangelogPayload {
     BatchCreated {
         identity: ThroughputBatchIdentity,
         task_queue: String,
+        execution_policy: Option<String>,
+        reducer: Option<String>,
+        reducer_class: String,
+        aggregation_tree_depth: u32,
+        fast_lane_enabled: bool,
         aggregation_group_count: u32,
         total_items: u32,
         chunk_count: u32,
@@ -220,6 +388,10 @@ pub enum ThroughputChangelogPayload {
     GroupTerminal {
         identity: ThroughputBatchIdentity,
         group_id: u32,
+        #[serde(default)]
+        level: u32,
+        #[serde(default)]
+        parent_group_id: Option<u32>,
         status: String,
         succeeded_items: u32,
         failed_items: u32,
@@ -780,5 +952,18 @@ mod tests {
         );
         assert_eq!(PayloadStoreKind::parse(S3_STORE)?, PayloadStoreKind::S3);
         Ok(())
+    }
+
+    #[test]
+    fn reduction_tree_helpers_plan_three_level_layout() {
+        assert_eq!(reduction_tree_level_counts(16, 3), vec![16, 4, 1]);
+        let parent = reduction_tree_parent_group_id(7, 16, 3).expect("leaf parent should exist");
+        assert_eq!(reduction_tree_node_level(parent), 1);
+        assert_eq!(reduction_tree_child_group_ids(parent, 16, 3), vec![4, 5, 6, 7]);
+        let root =
+            reduction_tree_parent_group_id(parent, 16, 3).expect("intermediate root should exist");
+        assert_eq!(reduction_tree_node_level(root), 2);
+        assert_eq!(reduction_tree_child_group_ids(root, 16, 3).len(), 4);
+        assert!(reduction_tree_parent_group_id(root, 16, 3).is_none());
     }
 }

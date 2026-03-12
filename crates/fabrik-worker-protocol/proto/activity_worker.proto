@@ -43,6 +43,7 @@ message PollBulkActivityTaskRequest {
   string worker_build_id = 4;
   uint64 poll_timeout_ms = 5;
   uint32 max_tasks = 6;
+  bool supports_cbor = 7;
 }
 
 message BulkActivityTask {
@@ -61,6 +62,9 @@ message BulkActivityTask {
   uint32 attempt = 12;
   string items_json = 13;
   string input_handle_json = 21;
+  bytes items_cbor = 22;
+  bytes input_handle_cbor = 23;
+  bool prefer_cbor = 24;
   int64 scheduled_at_unix_ms = 14;
   int64 lease_expires_at_unix_ms = 15;
   bool cancellation_requested = 16;
@@ -201,6 +205,8 @@ message ReportActivityTaskResultsRequest {
 message BulkActivityTaskCompletedResult {
   string output_json = 1;
   string result_handle_json = 2;
+  bytes output_cbor = 3;
+  bytes result_handle_cbor = 4;
 }
 
 message BulkActivityTaskFailedResult {
@@ -210,6 +216,7 @@ message BulkActivityTaskFailedResult {
 message BulkActivityTaskCancelledResult {
   string reason = 1;
   string metadata_json = 2;
+  bytes metadata_cbor = 3;
 }
 
 message BulkActivityTaskResult {

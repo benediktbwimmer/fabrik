@@ -54,6 +54,18 @@ This executes three scenarios sequentially:
 
 The suite writes one JSON/TXT pair per scenario plus a suite JSON aggregate.
 
+For the mergeable fast lane specifically:
+
+```bash
+cargo run -p benchmark-runner -- \
+  --suite stream-v2-fast-lane \
+  --profile target \
+  --chunk-size 64 \
+  --output target/benchmark-reports/stream-v2-fast-lane.json
+```
+
+That suite exercises the `count` and `all_settled` reducers on `stream-v2` with smaller chunks so grouped fan-in and owner-first apply show up in the control-plane metrics.
+
 ## Single-scenario runs
 
 `pg-v1` throughput:
@@ -86,5 +98,37 @@ cargo run -p benchmark-runner -- \
 - `max_activity_backlog`
 - `throughput_runtime_debug`
 - `throughput_projector_debug`
+- `projection_events_skipped`
+- `projection_events_applied_directly`
 
 For `stream-v2`, nonzero `grouped_batch_rows` and `max_aggregation_group_count > 1` show that hierarchical aggregation was enabled during the run.
+
+## Experimental fast lane status
+
+The current `stream-v2` fast lane should still be treated as experimental.
+
+What changed in the benchmark harness:
+
+- owner-first benchmark runs now skip the throughput changelog restore/consumer path inside `throughput-runtime`
+- the isolated harness now waits for Redpanda topics to report the requested partition counts before services start
+- `/debug/throughput` now exposes tree-specific counters so runs can distinguish leaf, parent, and root group terminalization
+
+What the latest controlled runs showed:
+
+- on a forced 2-level grouped workload (`25` workflows, `4096` activities/workflow, `chunk_size=8`), `count` improved throughput by about `2.8%`
+- on a forced 3-level grouped workload (`10` workflows, `4096` activities/workflow, `chunk_size=4`), `count` improved throughput by about `1.3%`
+- the fast lane now emits visible hierarchy counters in debug output:
+  - 2-level case: leaf groups plus root groups
+  - 3-level case: leaf groups, parent groups, and root groups
+
+Why this is still experimental:
+
+- the measured gain is real but small
+- it is still far below the original success gate for the milestone
+- some ownership-renewal warning noise remains during long runs, so small deltas should still be treated cautiously
+
+Recommended use:
+
+- keep the fast lane behind an experiment flag or branch
+- use the isolated benchmark harness for evaluation
+- rely on `batch_tree_depth_counts`, `group_level_counts`, and the runtime terminal counters when judging whether a run actually exercised the intended tree shape

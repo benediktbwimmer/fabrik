@@ -1,0 +1,118 @@
+{
+  "profiles": {
+    "smoke": [
+      {
+        "name": "fanout-baseline",
+        "description": "Balanced fan-out/fan-in without retries or terminal cancellations.",
+        "workflowCount": 12,
+        "activitiesPerWorkflow": 128,
+        "payloadSize": 256,
+        "workerCount": 8,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timeoutSecs": 180
+      },
+      {
+        "name": "fanout-retry",
+        "description": "Fan-out with retryable first-attempt failures on 5% of activities.",
+        "workflowCount": 12,
+        "activitiesPerWorkflow": 128,
+        "payloadSize": 256,
+        "workerCount": 8,
+        "retryRate": 0.05,
+        "cancelRate": 0,
+        "timeoutSecs": 180
+      },
+      {
+        "name": "fanout-cancel",
+        "description": "Fan-out with terminal non-retryable cancellations on 5% of activities.",
+        "workflowCount": 12,
+        "activitiesPerWorkflow": 128,
+        "payloadSize": 256,
+        "workerCount": 8,
+        "retryRate": 0,
+        "cancelRate": 0.05,
+        "timeoutSecs": 180
+      },
+      {
+        "name": "fanout-payload-heavy",
+        "description": "Moderate fan-out with larger activity payloads to expose serialization overhead.",
+        "workflowCount": 8,
+        "activitiesPerWorkflow": 96,
+        "payloadSize": 4096,
+        "workerCount": 8,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timeoutSecs": 180
+      },
+      {
+        "name": "fanout-wide",
+        "description": "Wider fan-out to stress the scheduling and completion path under higher concurrency.",
+        "workflowCount": 6,
+        "activitiesPerWorkflow": 384,
+        "payloadSize": 128,
+        "workerCount": 12,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timeoutSecs": 240
+      }
+    ],
+    "target": [
+      {
+        "name": "fanout-baseline",
+        "description": "Balanced fan-out/fan-in without retries or terminal cancellations.",
+        "workflowCount": 32,
+        "activitiesPerWorkflow": 512,
+        "payloadSize": 256,
+        "workerCount": 16,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timeoutSecs": 300
+      },
+      {
+        "name": "fanout-retry",
+        "description": "Fan-out with retryable first-attempt failures on 5% of activities.",
+        "workflowCount": 32,
+        "activitiesPerWorkflow": 512,
+        "payloadSize": 256,
+        "workerCount": 16,
+        "retryRate": 0.05,
+        "cancelRate": 0,
+        "timeoutSecs": 300
+      },
+      {
+        "name": "fanout-cancel",
+        "description": "Fan-out with terminal non-retryable cancellations on 5% of activities.",
+        "workflowCount": 32,
+        "activitiesPerWorkflow": 512,
+        "payloadSize": 256,
+        "workerCount": 16,
+        "retryRate": 0,
+        "cancelRate": 0.05,
+        "timeoutSecs": 300
+      },
+      {
+        "name": "fanout-payload-heavy",
+        "description": "Moderate fan-out with larger activity payloads to expose serialization overhead.",
+        "workflowCount": 16,
+        "activitiesPerWorkflow": 256,
+        "payloadSize": 4096,
+        "workerCount": 12,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timeoutSecs": 300
+      },
+      {
+        "name": "fanout-wide",
+        "description": "Wider fan-out to stress the scheduling and completion path under higher concurrency.",
+        "workflowCount": 12,
+        "activitiesPerWorkflow": 1536,
+        "payloadSize": 128,
+        "workerCount": 24,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timeoutSecs": 360
+      }
+    ]
+  }
+}

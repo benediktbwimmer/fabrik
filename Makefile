@@ -1,4 +1,4 @@
-.PHONY: up down status smoke-eager-count
+.PHONY: up down status smoke-eager-count benchmark-compare-temporal
 
 up:
 	./scripts/dev-stack.sh up
@@ -11,3 +11,6 @@ status:
 
 smoke-eager-count:
 	./scripts/eager-count-smoke.sh
+
+benchmark-compare-temporal:
+	./scripts/run-temporal-comparison-benchmark.sh

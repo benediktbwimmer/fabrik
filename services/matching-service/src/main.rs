@@ -22,7 +22,10 @@ use fabrik_store::{
     WorkflowActivityStatus, WorkflowBulkChunkRecord, WorkflowMailboxKind, WorkflowResumeKind,
     WorkflowStore, WorkflowTaskRecord,
 };
-use fabrik_throughput::ThroughputBackend;
+use fabrik_throughput::{
+    ThroughputBackend, bulk_reducer_class, decode_cbor, encode_cbor, planned_reduction_tree_depth,
+    stream_v2_fast_lane_enabled,
+};
 use fabrik_worker_protocol::activity_worker::{
     Ack, ActivityTask, ActivityTaskResult, BulkActivityTask, BulkActivityTaskResult,
     CompleteActivityTaskRequest, CompleteWorkflowTaskRequest, FailActivityTaskRequest,
@@ -454,8 +457,8 @@ async fn process_event(
             max_attempts,
             retry_delay_ms,
             aggregation_group_count,
-            execution_policy: _,
-            reducer: _,
+            execution_policy,
+            reducer,
             throughput_backend,
             throughput_backend_version,
             state: workflow_state,
@@ -463,6 +466,21 @@ async fn process_event(
             if throughput_backend != ThroughputBackend::PgV1.as_str() {
                 return Ok(());
             }
+            let reducer_class = bulk_reducer_class(reducer.as_deref());
+            let fast_lane_enabled = stream_v2_fast_lane_enabled(
+                throughput_backend,
+                execution_policy.as_deref(),
+                reducer.as_deref(),
+            );
+            let aggregation_tree_depth = planned_reduction_tree_depth(
+                if *chunk_size == 0 {
+                    0
+                } else {
+                    items.len().div_ceil(*chunk_size as usize) as u32
+                },
+                *aggregation_group_count,
+                reducer.as_deref(),
+            );
             state
                 .store
                 .upsert_bulk_batch(
@@ -482,6 +500,11 @@ async fn process_event(
                     *chunk_size,
                     *max_attempts,
                     *retry_delay_ms,
+                    execution_policy.as_deref(),
+                    reducer.as_deref(),
+                    reducer_class.as_str(),
+                    aggregation_tree_depth,
+                    fast_lane_enabled,
                     *aggregation_group_count,
                     throughput_backend,
                     throughput_backend_version,
@@ -857,7 +880,7 @@ impl ActivityWorkerApi for ActivityApi {
 
         if let Some(record) = self.state.bulk_prefetch.pop(&worker_key).await {
             return Ok(Response::new(PollBulkActivityTaskResponse {
-                tasks: vec![bulk_chunk_to_proto(&record)],
+                tasks: vec![bulk_chunk_to_proto(&record, request.supports_cbor)],
             }));
         }
 
@@ -885,8 +908,12 @@ impl ActivityWorkerApi for ActivityApi {
                         .await;
                 }
                 let mut tasks = Vec::with_capacity(leased.len());
-                tasks.push(bulk_chunk_to_proto(first));
-                tasks.extend(remaining.iter().map(bulk_chunk_to_proto));
+                tasks.push(bulk_chunk_to_proto(first, request.supports_cbor));
+                tasks.extend(
+                    remaining
+                        .iter()
+                        .map(|record| bulk_chunk_to_proto(record, request.supports_cbor)),
+                );
                 return Ok(Response::new(PollBulkActivityTaskResponse { tasks }));
             }
 
@@ -1511,8 +1538,21 @@ fn prepare_bulk_result(result: BulkActivityTaskResult) -> Result<BulkChunkTermin
         fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
             completed,
         ) => BulkChunkTerminalPayload::Completed {
-            output: serde_json::from_str(&completed.output_json)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?,
+            output: if !completed.output_cbor.is_empty() {
+                match decode_cbor::<Value>(&completed.output_cbor, "bulk result output")
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?
+                {
+                    Value::Array(items) => items,
+                    other => {
+                        return Err(Status::invalid_argument(format!(
+                            "bulk result output CBOR must decode to an array, got {other}"
+                        )));
+                    }
+                }
+            } else {
+                serde_json::from_str(&completed.output_json)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?
+            },
         },
         fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Failed(
             failed,
@@ -1520,7 +1560,12 @@ fn prepare_bulk_result(result: BulkActivityTaskResult) -> Result<BulkChunkTermin
         fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Cancelled(
             cancelled,
         ) => {
-            let metadata = if cancelled.metadata_json.trim().is_empty() {
+            let metadata = if !cancelled.metadata_cbor.is_empty() {
+                Some(
+                    decode_cbor::<Value>(&cancelled.metadata_cbor, "bulk cancellation metadata")
+                        .map_err(|error| Status::invalid_argument(error.to_string()))?,
+                )
+            } else if cancelled.metadata_json.trim().is_empty() {
                 None
             } else {
                 Some(
@@ -2040,7 +2085,7 @@ fn record_to_proto(record: &WorkflowActivityRecord) -> ActivityTask {
     }
 }
 
-fn bulk_chunk_to_proto(record: &WorkflowBulkChunkRecord) -> BulkActivityTask {
+fn bulk_chunk_to_proto(record: &WorkflowBulkChunkRecord, supports_cbor: bool) -> BulkActivityTask {
     BulkActivityTask {
         tenant_id: record.tenant_id.clone(),
         definition_id: record.definition_id.clone(),
@@ -2055,9 +2100,28 @@ fn bulk_chunk_to_proto(record: &WorkflowBulkChunkRecord) -> BulkActivityTask {
         activity_type: record.activity_type.clone(),
         task_queue: record.task_queue.clone(),
         attempt: record.attempt,
-        items_json: serde_json::to_string(&record.items).expect("bulk chunk items serialize"),
-        input_handle_json: serde_json::to_string(&record.input_handle)
-            .expect("bulk chunk input handle serializes"),
+        items_json: if supports_cbor {
+            String::new()
+        } else {
+            serde_json::to_string(&record.items).expect("bulk chunk items serialize")
+        },
+        input_handle_json: if supports_cbor {
+            String::new()
+        } else {
+            serde_json::to_string(&record.input_handle).expect("bulk chunk input handle serializes")
+        },
+        items_cbor: if supports_cbor {
+            encode_cbor(&record.items, "bulk chunk items").expect("bulk chunk items encode as CBOR")
+        } else {
+            Vec::new()
+        },
+        input_handle_cbor: if supports_cbor {
+            encode_cbor(&record.input_handle, "bulk chunk input handle")
+                .expect("bulk chunk input handle encodes as CBOR")
+        } else {
+            Vec::new()
+        },
+        prefer_cbor: supports_cbor,
         scheduled_at_unix_ms: record.scheduled_at.timestamp_millis(),
         lease_expires_at_unix_ms: record
             .lease_expires_at
@@ -2951,6 +3015,44 @@ mod tests {
         assert_eq!(batches[1][0].prepared.update.activity_id, "a3");
     }
 
+    #[test]
+    fn prepare_bulk_result_accepts_cbor_payloads() {
+        let output = vec![json!({"ok": true})];
+        let lease_token = Uuid::now_v7();
+        let result = BulkActivityTaskResult {
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "wf-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            batch_id: "batch-a".to_owned(),
+            chunk_id: "chunk-a".to_owned(),
+            chunk_index: 0,
+            group_id: 0,
+            attempt: 1,
+            worker_id: "worker-a".to_owned(),
+            worker_build_id: "build-a".to_owned(),
+            lease_token: lease_token.to_string(),
+            lease_epoch: 1,
+            owner_epoch: 1,
+            report_id: "report-a".to_owned(),
+            result: Some(
+                fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
+                    fabrik_worker_protocol::activity_worker::BulkActivityTaskCompletedResult {
+                        output_json: String::new(),
+                        result_handle_json: String::new(),
+                        output_cbor: encode_cbor(&Value::Array(output.clone()), "bulk result output")
+                            .expect("CBOR output encodes"),
+                        result_handle_cbor: Vec::new(),
+                    },
+                ),
+            ),
+        };
+
+        let prepared = prepare_bulk_result(result).expect("CBOR result should decode");
+
+        assert_eq!(prepared.lease_token, lease_token);
+        assert_eq!(prepared.payload, BulkChunkTerminalPayload::Completed { output });
+    }
+
     #[tokio::test]
     async fn activity_poll_rejects_incompatible_builds() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
@@ -3231,6 +3333,11 @@ mod tests {
                 1,
                 1,
                 0,
+                None,
+                None,
+                "legacy",
+                1,
+                false,
                 1,
                 "stream-v2",
                 "2.0.0",

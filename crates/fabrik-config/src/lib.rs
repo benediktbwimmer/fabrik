@@ -153,6 +153,9 @@ pub struct ThroughputRuntimeConfig {
     pub report_apply_batch_size: usize,
     pub changelog_publish_batch_size: usize,
     pub projection_publish_batch_size: usize,
+    pub publish_transient_projection_updates: bool,
+    pub owner_first_apply: bool,
+    pub publish_projection_events: bool,
     pub max_active_chunks_per_batch: usize,
     pub max_active_chunks_per_tenant: usize,
     pub max_active_chunks_per_task_queue: usize,
@@ -205,6 +208,7 @@ pub struct ThroughputOwnershipConfig {
 
 impl ThroughputRuntimeConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
+        let owner_first_apply = read_bool_with_default("THROUGHPUT_OWNER_FIRST_APPLY", true)?;
         Ok(Self {
             lease_ttl_seconds: read_u64_with_default("THROUGHPUT_LEASE_TTL_SECONDS", 30)?,
             sweep_interval_ms: read_u64_with_default("THROUGHPUT_SWEEP_INTERVAL_MS", 500)?,
@@ -220,6 +224,15 @@ impl ThroughputRuntimeConfig {
             projection_publish_batch_size: read_usize_with_default(
                 "THROUGHPUT_PROJECTION_PUBLISH_BATCH_SIZE",
                 128,
+            )?,
+            publish_transient_projection_updates: read_bool_with_default(
+                "THROUGHPUT_PUBLISH_TRANSIENT_PROJECTION_UPDATES",
+                false,
+            )?,
+            owner_first_apply,
+            publish_projection_events: read_bool_with_default(
+                "THROUGHPUT_PUBLISH_PROJECTION_EVENTS",
+                !owner_first_apply,
             )?,
             max_active_chunks_per_batch: read_usize_with_default(
                 "THROUGHPUT_MAX_ACTIVE_CHUNKS_PER_BATCH",

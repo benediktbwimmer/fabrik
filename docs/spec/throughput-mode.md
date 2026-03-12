@@ -85,6 +85,8 @@ Initial reducers are built-in and deterministic:
 - `count`
 - `collect_results`
 
+`all_succeeded`, `all_settled`, and `count` are the mergeable reducers used by the `stream-v2` fast lane. `collect_results` remains supported, but stays on the legacy result-materialization path rather than the optimized mergeable reduction path.
+
 User-defined reducers are out of scope until they can be compiled, version-pinned, and replay-safe.
 
 `collect_results` remains handle-backed rather than workflow-memory-backed. It may return summary metadata plus an opaque result handle, but it must not force full per-item result materialization inside workflow state.

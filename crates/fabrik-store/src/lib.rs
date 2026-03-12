@@ -250,6 +250,11 @@ pub struct WorkflowBulkBatchRecord {
     pub result_handle: Value,
     pub throughput_backend: String,
     pub throughput_backend_version: String,
+    pub execution_policy: Option<String>,
+    pub reducer: Option<String>,
+    pub reducer_class: String,
+    pub aggregation_tree_depth: u32,
+    pub fast_lane_enabled: bool,
     pub aggregation_group_count: u32,
     pub status: WorkflowBulkBatchStatus,
     pub total_items: u32,
@@ -1193,6 +1198,11 @@ impl WorkflowStore {
                 result_handle JSONB NOT NULL DEFAULT '{}'::jsonb,
                 throughput_backend TEXT NOT NULL DEFAULT 'pg-v1',
                 throughput_backend_version TEXT NOT NULL DEFAULT '1.0.0',
+                execution_policy TEXT,
+                reducer TEXT,
+                reducer_class TEXT NOT NULL DEFAULT 'legacy',
+                aggregation_tree_depth INTEGER NOT NULL DEFAULT 1,
+                fast_lane_enabled BOOLEAN NOT NULL DEFAULT FALSE,
                 aggregation_group_count INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL,
                 total_items INTEGER NOT NULL,
@@ -1222,6 +1232,11 @@ impl WorkflowStore {
             ADD COLUMN IF NOT EXISTS result_handle JSONB NOT NULL DEFAULT '{}'::jsonb,
             ADD COLUMN IF NOT EXISTS throughput_backend TEXT NOT NULL DEFAULT 'pg-v1',
             ADD COLUMN IF NOT EXISTS throughput_backend_version TEXT NOT NULL DEFAULT '1.0.0',
+            ADD COLUMN IF NOT EXISTS execution_policy TEXT,
+            ADD COLUMN IF NOT EXISTS reducer TEXT,
+            ADD COLUMN IF NOT EXISTS reducer_class TEXT NOT NULL DEFAULT 'legacy',
+            ADD COLUMN IF NOT EXISTS aggregation_tree_depth INTEGER NOT NULL DEFAULT 1,
+            ADD COLUMN IF NOT EXISTS fast_lane_enabled BOOLEAN NOT NULL DEFAULT FALSE,
             ADD COLUMN IF NOT EXISTS aggregation_group_count INTEGER NOT NULL DEFAULT 1
             "#,
         )
@@ -1375,6 +1390,11 @@ impl WorkflowStore {
                 result_handle JSONB NOT NULL DEFAULT '{}'::jsonb,
                 throughput_backend TEXT NOT NULL,
                 throughput_backend_version TEXT NOT NULL,
+                execution_policy TEXT,
+                reducer TEXT,
+                reducer_class TEXT NOT NULL DEFAULT 'legacy',
+                aggregation_tree_depth INTEGER NOT NULL DEFAULT 1,
+                fast_lane_enabled BOOLEAN NOT NULL DEFAULT FALSE,
                 aggregation_group_count INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL,
                 total_items INTEGER NOT NULL,
@@ -1396,6 +1416,20 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize throughput_projection_batches table")?;
+
+        sqlx::query(
+            r#"
+            ALTER TABLE throughput_projection_batches
+            ADD COLUMN IF NOT EXISTS execution_policy TEXT,
+            ADD COLUMN IF NOT EXISTS reducer TEXT,
+            ADD COLUMN IF NOT EXISTS reducer_class TEXT NOT NULL DEFAULT 'legacy',
+            ADD COLUMN IF NOT EXISTS aggregation_tree_depth INTEGER NOT NULL DEFAULT 1,
+            ADD COLUMN IF NOT EXISTS fast_lane_enabled BOOLEAN NOT NULL DEFAULT FALSE
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to ensure throughput_projection_batches fast lane columns")?;
 
         sqlx::query(
             r#"
@@ -7419,6 +7453,11 @@ impl WorkflowStore {
         chunk_size: u32,
         max_attempts: u32,
         retry_delay_ms: u64,
+        execution_policy: Option<&str>,
+        reducer: Option<&str>,
+        reducer_class: &str,
+        aggregation_tree_depth: u32,
+        fast_lane_enabled: bool,
         aggregation_group_count: u32,
         throughput_backend: &str,
         throughput_backend_version: &str,
@@ -7499,6 +7538,11 @@ impl WorkflowStore {
                 result_handle,
                 throughput_backend,
                 throughput_backend_version,
+                execution_policy,
+                reducer,
+                reducer_class,
+                aggregation_tree_depth,
+                fast_lane_enabled,
                 aggregation_group_count,
                 status,
                 total_items,
@@ -7510,8 +7554,8 @@ impl WorkflowStore {
                 updated_at
             )
             VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'scheduled',
-                $16, $17, $18, $19, $20, $21, $21
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                $18, $19, $20, 'scheduled', $21, $22, $23, $24, $25, $26, $26
             )
             ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id) DO NOTHING
             "#,
@@ -7530,6 +7574,14 @@ impl WorkflowStore {
         .bind(Json(result_handle))
         .bind(throughput_backend)
         .bind(throughput_backend_version)
+        .bind(execution_policy)
+        .bind(reducer)
+        .bind(reducer_class)
+        .bind(
+            i32::try_from(aggregation_tree_depth)
+                .context("bulk batch aggregation_tree_depth exceeds i32")?,
+        )
+        .bind(fast_lane_enabled)
         .bind(
             i32::try_from(aggregation_group_count)
                 .context("bulk batch aggregation_group_count exceeds i32")?,
@@ -8668,6 +8720,11 @@ impl WorkflowStore {
                 result_handle,
                 throughput_backend,
                 throughput_backend_version,
+                execution_policy,
+                reducer,
+                reducer_class,
+                aggregation_tree_depth,
+                fast_lane_enabled,
                 aggregation_group_count,
                 status,
                 total_items,
@@ -8685,7 +8742,7 @@ impl WorkflowStore {
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28
+                $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33
             )
             ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id) DO UPDATE
             SET activity_type = EXCLUDED.activity_type,
@@ -8695,6 +8752,11 @@ impl WorkflowStore {
                 result_handle = EXCLUDED.result_handle,
                 throughput_backend = EXCLUDED.throughput_backend,
                 throughput_backend_version = EXCLUDED.throughput_backend_version,
+                execution_policy = EXCLUDED.execution_policy,
+                reducer = EXCLUDED.reducer,
+                reducer_class = EXCLUDED.reducer_class,
+                aggregation_tree_depth = EXCLUDED.aggregation_tree_depth,
+                fast_lane_enabled = EXCLUDED.fast_lane_enabled,
                 aggregation_group_count = EXCLUDED.aggregation_group_count,
                 status = EXCLUDED.status,
                 total_items = EXCLUDED.total_items,
@@ -8725,6 +8787,14 @@ impl WorkflowStore {
         .bind(Json(&batch.result_handle))
         .bind(&batch.throughput_backend)
         .bind(&batch.throughput_backend_version)
+        .bind(&batch.execution_policy)
+        .bind(&batch.reducer)
+        .bind(&batch.reducer_class)
+        .bind(
+            i32::try_from(batch.aggregation_tree_depth)
+                .context("projection batch aggregation_tree_depth exceeds i32")?,
+        )
+        .bind(batch.fast_lane_enabled)
         .bind(
             i32::try_from(batch.aggregation_group_count)
                 .context("projection batch aggregation_group_count exceeds i32")?,
@@ -9063,53 +9133,509 @@ impl WorkflowStore {
         &self,
         update: &ThroughputProjectionBatchStateUpdate,
     ) -> Result<()> {
-        sqlx::query(
-            r#"
-            UPDATE throughput_projection_batches
-            SET status = CASE
-                    WHEN throughput_projection_batches.terminal_at IS NOT NULL AND $10 IS NULL
-                        THEN throughput_projection_batches.status
-                    ELSE $5
-                END,
-                succeeded_items = GREATEST(throughput_projection_batches.succeeded_items, $6),
-                failed_items = GREATEST(throughput_projection_batches.failed_items, $7),
-                cancelled_items = GREATEST(throughput_projection_batches.cancelled_items, $8),
-                error = CASE
-                    WHEN throughput_projection_batches.terminal_at IS NOT NULL AND $10 IS NULL
-                        THEN throughput_projection_batches.error
-                    ELSE $9
-                END,
-                terminal_at = COALESCE(throughput_projection_batches.terminal_at, $10),
-                updated_at = GREATEST(throughput_projection_batches.updated_at, $11)
-            WHERE tenant_id = $1
-              AND workflow_instance_id = $2
-              AND run_id = $3
-              AND batch_id = $4
-            "#,
-        )
-        .bind(&update.tenant_id)
-        .bind(&update.instance_id)
-        .bind(&update.run_id)
-        .bind(&update.batch_id)
-        .bind(&update.status)
-        .bind(
-            i32::try_from(update.succeeded_items)
-                .context("projection batch state succeeded_items exceeds i32")?,
-        )
-        .bind(
-            i32::try_from(update.failed_items)
-                .context("projection batch state failed_items exceeds i32")?,
-        )
-        .bind(
-            i32::try_from(update.cancelled_items)
-                .context("projection batch state cancelled_items exceeds i32")?,
-        )
-        .bind(&update.error)
-        .bind(update.terminal_at)
-        .bind(update.updated_at)
-        .execute(&self.pool)
-        .await
-        .context("failed to update throughput projection batch state")?;
+        self.update_throughput_projection_batch_states(std::slice::from_ref(update)).await
+    }
+
+    fn push_throughput_projection_batch_state_update_values<'args>(
+        builder: &mut QueryBuilder<'args, Postgres>,
+        updates: &'args [ThroughputProjectionBatchStateUpdate],
+    ) {
+        builder.push_values(updates, |mut row, update| {
+            row.push_bind(&update.tenant_id)
+                .push_bind(&update.instance_id)
+                .push_bind(&update.run_id)
+                .push_bind(&update.batch_id)
+                .push_bind(&update.status)
+                .push_bind(
+                    i32::try_from(update.succeeded_items)
+                        .expect("projection batch state succeeded_items exceeds i32"),
+                )
+                .push_bind(
+                    i32::try_from(update.failed_items)
+                        .expect("projection batch state failed_items exceeds i32"),
+                )
+                .push_bind(
+                    i32::try_from(update.cancelled_items)
+                        .expect("projection batch state cancelled_items exceeds i32"),
+                )
+                .push_bind(&update.error)
+                .push_bind(update.terminal_at)
+                .push_bind(update.updated_at);
+        });
+    }
+
+    pub async fn update_throughput_projection_batch_states(
+        &self,
+        updates: &[ThroughputProjectionBatchStateUpdate],
+    ) -> Result<()> {
+        const BATCH_STATE_BATCH_SIZE: usize = 250;
+
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        for batch in updates.chunks(BATCH_STATE_BATCH_SIZE) {
+            let mut builder = QueryBuilder::<Postgres>::new(
+                r#"
+                WITH updates (
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    batch_id,
+                    status,
+                    succeeded_items,
+                    failed_items,
+                    cancelled_items,
+                    error,
+                    terminal_at,
+                    updated_at
+                ) AS (
+                "#,
+            );
+            Self::push_throughput_projection_batch_state_update_values(&mut builder, batch);
+            builder.push(
+                r#"
+                )
+                UPDATE throughput_projection_batches
+                SET status = CASE
+                        WHEN throughput_projection_batches.terminal_at IS NOT NULL
+                            AND updates.terminal_at::timestamptz IS NULL
+                            THEN throughput_projection_batches.status
+                        ELSE updates.status::text
+                    END,
+                    succeeded_items = GREATEST(
+                        throughput_projection_batches.succeeded_items,
+                        updates.succeeded_items::integer
+                    ),
+                    failed_items = GREATEST(
+                        throughput_projection_batches.failed_items,
+                        updates.failed_items::integer
+                    ),
+                    cancelled_items = GREATEST(
+                        throughput_projection_batches.cancelled_items,
+                        updates.cancelled_items::integer
+                    ),
+                    error = CASE
+                        WHEN throughput_projection_batches.terminal_at IS NOT NULL
+                            AND updates.terminal_at::timestamptz IS NULL
+                            THEN throughput_projection_batches.error
+                        ELSE updates.error::text
+                    END,
+                    terminal_at = COALESCE(
+                        throughput_projection_batches.terminal_at,
+                        updates.terminal_at::timestamptz
+                    ),
+                    updated_at = GREATEST(
+                        throughput_projection_batches.updated_at,
+                        updates.updated_at::timestamptz
+                    )
+                FROM updates
+                WHERE throughput_projection_batches.tenant_id = updates.tenant_id::text
+                  AND throughput_projection_batches.workflow_instance_id =
+                      updates.workflow_instance_id::text
+                  AND throughput_projection_batches.run_id = updates.run_id::text
+                  AND throughput_projection_batches.batch_id = updates.batch_id::text
+                "#,
+            );
+            builder
+                .build()
+                .execute(&self.pool)
+                .await
+                .context("failed to update throughput projection batch states")?;
+        }
+
+        Ok(())
+    }
+
+    fn push_throughput_projection_chunk_state_update_values<'args>(
+        builder: &mut QueryBuilder<'args, Postgres>,
+        updates: &'args [ThroughputProjectionChunkStateUpdate],
+    ) {
+        builder.push_values(updates, |mut row, update| {
+            row.push_bind(&update.tenant_id)
+                .push_bind(&update.instance_id)
+                .push_bind(&update.run_id)
+                .push_bind(&update.batch_id)
+                .push_bind(&update.chunk_id)
+                .push_bind(
+                    i32::try_from(update.chunk_index)
+                        .expect("projection chunk chunk_index exceeds i32"),
+                )
+                .push_bind(
+                    i32::try_from(update.group_id).expect("projection chunk group_id exceeds i32"),
+                )
+                .push_bind(
+                    i32::try_from(update.item_count)
+                        .expect("projection chunk item_count exceeds i32"),
+                )
+                .push_bind(&update.status)
+                .push_bind(
+                    i32::try_from(update.attempt)
+                        .expect("projection chunk state attempt exceeds i32"),
+                )
+                .push_bind(
+                    i64::try_from(update.lease_epoch)
+                        .expect("projection chunk state lease_epoch exceeds i64"),
+                )
+                .push_bind(
+                    i64::try_from(update.owner_epoch)
+                        .expect("projection chunk state owner_epoch exceeds i64"),
+                )
+                .push_bind(update.input_handle.is_some())
+                .push_bind(update.input_handle.as_ref().map(Json))
+                .push_bind(update.result_handle.is_some())
+                .push_bind(update.result_handle.as_ref().map(Json))
+                .push_bind(update.output.as_ref().map(Json))
+                .push_bind(&update.error)
+                .push_bind(update.cancellation_requested)
+                .push_bind(&update.cancellation_reason)
+                .push_bind(update.cancellation_metadata.as_ref().map(Json))
+                .push_bind(&update.worker_id)
+                .push_bind(&update.worker_build_id)
+                .push_bind(update.lease_token)
+                .push_bind(&update.last_report_id)
+                .push_bind(update.available_at)
+                .push_bind(update.started_at)
+                .push_bind(update.lease_expires_at)
+                .push_bind(update.completed_at)
+                .push_bind(update.updated_at);
+        });
+    }
+
+    pub async fn update_throughput_projection_chunk_states(
+        &self,
+        updates: &[ThroughputProjectionChunkStateUpdate],
+    ) -> Result<()> {
+        const CHUNK_STATE_BATCH_SIZE: usize = 250;
+
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        for batch in updates.chunks(CHUNK_STATE_BATCH_SIZE) {
+            let mut tx =
+                self.pool.begin().await.context(
+                    "failed to begin throughput projection chunk state batch transaction",
+                )?;
+
+            let mut insert_builder = QueryBuilder::<Postgres>::new(
+                r#"
+                WITH updates (
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    batch_id,
+                    chunk_id,
+                    chunk_index,
+                    group_id,
+                    item_count,
+                    status,
+                    attempt,
+                    lease_epoch,
+                    owner_epoch,
+                    input_handle_present,
+                    input_handle,
+                    result_handle_present,
+                    result_handle,
+                    output,
+                    error,
+                    cancellation_requested,
+                    cancellation_reason,
+                    cancellation_metadata,
+                    worker_id,
+                    worker_build_id,
+                    lease_token,
+                    last_report_id,
+                    available_at,
+                    started_at,
+                    lease_expires_at,
+                    completed_at,
+                    updated_at
+                ) AS (
+                "#,
+            );
+            Self::push_throughput_projection_chunk_state_update_values(&mut insert_builder, batch);
+            insert_builder.push(
+                r#"
+                )
+                INSERT INTO throughput_projection_chunks (
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    workflow_id,
+                    workflow_version,
+                    artifact_hash,
+                    batch_id,
+                    chunk_id,
+                    chunk_index,
+                    group_id,
+                    item_count,
+                    activity_type,
+                    task_queue,
+                    state,
+                    status,
+                    attempt,
+                    lease_epoch,
+                    owner_epoch,
+                    max_attempts,
+                    retry_delay_ms,
+                    input_handle,
+                    result_handle,
+                    items,
+                    output,
+                    error,
+                    cancellation_requested,
+                    cancellation_reason,
+                    cancellation_metadata,
+                    worker_id,
+                    worker_build_id,
+                    lease_token,
+                    last_report_id,
+                    scheduled_at,
+                    available_at,
+                    started_at,
+                    lease_expires_at,
+                    completed_at,
+                    updated_at
+                )
+                SELECT
+                    updates.tenant_id::text,
+                    updates.workflow_instance_id::text,
+                    updates.run_id::text,
+                    batches.workflow_id,
+                    batches.workflow_version,
+                    batches.artifact_hash,
+                    updates.batch_id::text,
+                    updates.chunk_id::text,
+                    updates.chunk_index::integer,
+                    updates.group_id::integer,
+                    updates.item_count::integer,
+                    batches.activity_type,
+                    batches.task_queue,
+                    batches.state,
+                    updates.status::text,
+                    updates.attempt::integer,
+                    updates.lease_epoch::bigint,
+                    updates.owner_epoch::bigint,
+                    batches.max_attempts,
+                    batches.retry_delay_ms,
+                    CASE
+                        WHEN updates.input_handle_present::boolean
+                            THEN updates.input_handle::jsonb
+                        ELSE 'null'::jsonb
+                    END,
+                    CASE
+                        WHEN updates.result_handle_present::boolean
+                            THEN updates.result_handle::jsonb
+                        ELSE 'null'::jsonb
+                    END,
+                    '[]'::jsonb,
+                    updates.output::jsonb,
+                    updates.error::text,
+                    updates.cancellation_requested::boolean,
+                    updates.cancellation_reason::text,
+                    updates.cancellation_metadata::jsonb,
+                    updates.worker_id::text,
+                    updates.worker_build_id::text,
+                    updates.lease_token::uuid,
+                    updates.last_report_id::text,
+                    batches.scheduled_at,
+                    updates.available_at::timestamptz,
+                    updates.started_at::timestamptz,
+                    updates.lease_expires_at::timestamptz,
+                    updates.completed_at::timestamptz,
+                    updates.updated_at::timestamptz
+                FROM updates
+                JOIN throughput_projection_batches AS batches
+                  ON batches.tenant_id = updates.tenant_id::text
+                 AND batches.workflow_instance_id = updates.workflow_instance_id::text
+                 AND batches.run_id = updates.run_id::text
+                 AND batches.batch_id = updates.batch_id::text
+                ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id, chunk_id) DO NOTHING
+                "#,
+            );
+            insert_builder
+                .build()
+                .execute(&mut *tx)
+                .await
+                .context("failed to insert missing throughput projection chunk states")?;
+
+            let mut update_builder = QueryBuilder::<Postgres>::new(
+                r#"
+                WITH updates (
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    batch_id,
+                    chunk_id,
+                    chunk_index,
+                    group_id,
+                    item_count,
+                    status,
+                    attempt,
+                    lease_epoch,
+                    owner_epoch,
+                    input_handle_present,
+                    input_handle,
+                    result_handle_present,
+                    result_handle,
+                    output,
+                    error,
+                    cancellation_requested,
+                    cancellation_reason,
+                    cancellation_metadata,
+                    worker_id,
+                    worker_build_id,
+                    lease_token,
+                    last_report_id,
+                    available_at,
+                    started_at,
+                    lease_expires_at,
+                    completed_at,
+                    updated_at
+                ) AS (
+                "#,
+            );
+            Self::push_throughput_projection_chunk_state_update_values(&mut update_builder, batch);
+            update_builder.push(
+                r#"
+                )
+                UPDATE throughput_projection_chunks
+                SET chunk_index = updates.chunk_index::integer,
+                    group_id = updates.group_id::integer,
+                    item_count = updates.item_count::integer,
+                    status = CASE
+                        WHEN throughput_projection_chunks.completed_at IS NOT NULL
+                            AND updates.completed_at::timestamptz IS NULL
+                            THEN throughput_projection_chunks.status
+                        ELSE updates.status::text
+                    END,
+                    attempt = CASE
+                        WHEN throughput_projection_chunks.completed_at IS NOT NULL
+                            AND updates.completed_at::timestamptz IS NULL
+                            THEN throughput_projection_chunks.attempt
+                        ELSE updates.attempt::integer
+                    END,
+                    lease_epoch = CASE
+                        WHEN throughput_projection_chunks.completed_at IS NOT NULL
+                            AND updates.completed_at::timestamptz IS NULL
+                            THEN throughput_projection_chunks.lease_epoch
+                        ELSE updates.lease_epoch::bigint
+                    END,
+                    owner_epoch = CASE
+                        WHEN throughput_projection_chunks.completed_at IS NOT NULL
+                            AND updates.completed_at::timestamptz IS NULL
+                            THEN throughput_projection_chunks.owner_epoch
+                        ELSE updates.owner_epoch::bigint
+                    END,
+                    input_handle = CASE
+                        WHEN updates.input_handle_present::boolean
+                            THEN updates.input_handle::jsonb
+                        ELSE throughput_projection_chunks.input_handle
+                    END,
+                    result_handle = CASE
+                        WHEN updates.result_handle_present::boolean
+                            THEN updates.result_handle::jsonb
+                        ELSE throughput_projection_chunks.result_handle
+                    END,
+                    output = CASE
+                        WHEN throughput_projection_chunks.completed_at IS NOT NULL
+                            AND updates.completed_at::timestamptz IS NULL
+                            THEN throughput_projection_chunks.output
+                        ELSE updates.output::jsonb
+                    END,
+                    error = CASE
+                        WHEN throughput_projection_chunks.completed_at IS NOT NULL
+                            AND updates.completed_at::timestamptz IS NULL
+                            THEN throughput_projection_chunks.error
+                        ELSE updates.error::text
+                    END,
+                    cancellation_requested = CASE
+                        WHEN throughput_projection_chunks.completed_at IS NOT NULL
+                            AND updates.completed_at::timestamptz IS NULL
+                            THEN throughput_projection_chunks.cancellation_requested
+                        ELSE updates.cancellation_requested::boolean
+                    END,
+                    cancellation_reason = CASE
+                        WHEN throughput_projection_chunks.completed_at IS NOT NULL
+                            AND updates.completed_at::timestamptz IS NULL
+                            THEN throughput_projection_chunks.cancellation_reason
+                        ELSE updates.cancellation_reason::text
+                    END,
+                    cancellation_metadata = CASE
+                        WHEN throughput_projection_chunks.completed_at IS NOT NULL
+                            AND updates.completed_at::timestamptz IS NULL
+                            THEN throughput_projection_chunks.cancellation_metadata
+                        ELSE updates.cancellation_metadata::jsonb
+                    END,
+                    worker_id = CASE
+                        WHEN throughput_projection_chunks.completed_at IS NOT NULL
+                            AND updates.completed_at::timestamptz IS NULL
+                            THEN throughput_projection_chunks.worker_id
+                        ELSE updates.worker_id::text
+                    END,
+                    worker_build_id = CASE
+                        WHEN throughput_projection_chunks.completed_at IS NOT NULL
+                            AND updates.completed_at::timestamptz IS NULL
+                            THEN throughput_projection_chunks.worker_build_id
+                        ELSE updates.worker_build_id::text
+                    END,
+                    lease_token = CASE
+                        WHEN throughput_projection_chunks.completed_at IS NOT NULL
+                            AND updates.completed_at::timestamptz IS NULL
+                            THEN throughput_projection_chunks.lease_token
+                        ELSE updates.lease_token::uuid
+                    END,
+                    last_report_id = CASE
+                        WHEN throughput_projection_chunks.completed_at IS NOT NULL
+                            AND updates.completed_at::timestamptz IS NULL
+                            THEN throughput_projection_chunks.last_report_id
+                        ELSE updates.last_report_id::text
+                    END,
+                    available_at = CASE
+                        WHEN throughput_projection_chunks.completed_at IS NOT NULL
+                            AND updates.completed_at::timestamptz IS NULL
+                            THEN throughput_projection_chunks.available_at
+                        ELSE updates.available_at::timestamptz
+                    END,
+                    started_at = COALESCE(
+                        updates.started_at::timestamptz,
+                        throughput_projection_chunks.started_at
+                    ),
+                    lease_expires_at = CASE
+                        WHEN throughput_projection_chunks.completed_at IS NOT NULL
+                            AND updates.completed_at::timestamptz IS NULL
+                            THEN throughput_projection_chunks.lease_expires_at
+                        ELSE updates.lease_expires_at::timestamptz
+                    END,
+                    completed_at = COALESCE(
+                        throughput_projection_chunks.completed_at,
+                        updates.completed_at::timestamptz
+                    ),
+                    updated_at = GREATEST(
+                        throughput_projection_chunks.updated_at,
+                        updates.updated_at::timestamptz
+                    )
+                FROM updates
+                WHERE throughput_projection_chunks.tenant_id = updates.tenant_id::text
+                  AND throughput_projection_chunks.workflow_instance_id =
+                      updates.workflow_instance_id::text
+                  AND throughput_projection_chunks.run_id = updates.run_id::text
+                  AND throughput_projection_chunks.batch_id = updates.batch_id::text
+                  AND throughput_projection_chunks.chunk_id = updates.chunk_id::text
+                "#,
+            );
+            update_builder
+                .build()
+                .execute(&mut *tx)
+                .await
+                .context("failed to update throughput projection chunk states")?;
+
+            tx.commit()
+                .await
+                .context("failed to commit throughput projection chunk state batch transaction")?;
+        }
+
         Ok(())
     }
 
@@ -9117,227 +9643,7 @@ impl WorkflowStore {
         &self,
         update: &ThroughputProjectionChunkStateUpdate,
     ) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO throughput_projection_chunks (
-                tenant_id,
-                workflow_instance_id,
-                run_id,
-                workflow_id,
-                workflow_version,
-                artifact_hash,
-                batch_id,
-                chunk_id,
-                chunk_index,
-                group_id,
-                item_count,
-                activity_type,
-                task_queue,
-                state,
-                status,
-                attempt,
-                lease_epoch,
-                owner_epoch,
-                max_attempts,
-                retry_delay_ms,
-                input_handle,
-                result_handle,
-                items,
-                output,
-                error,
-                cancellation_requested,
-                cancellation_reason,
-                cancellation_metadata,
-                worker_id,
-                worker_build_id,
-                lease_token,
-                last_report_id,
-                scheduled_at,
-                available_at,
-                started_at,
-                lease_expires_at,
-                completed_at,
-                updated_at
-            )
-            SELECT
-                $1,
-                $2,
-                $3,
-                batches.workflow_id,
-                batches.workflow_version,
-                batches.artifact_hash,
-                $4,
-                $5,
-                $26,
-                $27,
-                $28,
-                batches.activity_type,
-                batches.task_queue,
-                batches.state,
-                $6,
-                $7,
-                $8,
-                $9,
-                batches.max_attempts,
-                batches.retry_delay_ms,
-                CASE WHEN $10 IS NULL THEN 'null'::jsonb ELSE $10 END,
-                CASE WHEN $11 IS NULL THEN 'null'::jsonb ELSE $11 END,
-                '[]'::jsonb,
-                $12,
-                $13,
-                $14,
-                $15,
-                $16,
-                $17,
-                $18,
-                $19,
-                $20,
-                batches.scheduled_at,
-                $21,
-                $22,
-                $23,
-                $24,
-                $25
-            FROM throughput_projection_batches AS batches
-            WHERE batches.tenant_id = $1
-              AND batches.workflow_instance_id = $2
-              AND batches.run_id = $3
-              AND batches.batch_id = $4
-            ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id, chunk_id) DO UPDATE
-            SET chunk_index = EXCLUDED.chunk_index,
-                group_id = EXCLUDED.group_id,
-                item_count = EXCLUDED.item_count,
-                status = CASE
-                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
-                        THEN throughput_projection_chunks.status
-                    ELSE $6
-                END,
-                attempt = CASE
-                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
-                        THEN throughput_projection_chunks.attempt
-                    ELSE $7
-                END,
-                lease_epoch = CASE
-                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
-                        THEN throughput_projection_chunks.lease_epoch
-                    ELSE $8
-                END,
-                owner_epoch = CASE
-                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
-                        THEN throughput_projection_chunks.owner_epoch
-                    ELSE $9
-                END,
-                input_handle = CASE
-                    WHEN $10 IS NULL
-                        THEN throughput_projection_chunks.input_handle
-                    ELSE EXCLUDED.input_handle
-                END,
-                result_handle = CASE
-                    WHEN $11 IS NULL
-                        THEN throughput_projection_chunks.result_handle
-                    ELSE EXCLUDED.result_handle
-                END,
-                output = CASE
-                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
-                        THEN throughput_projection_chunks.output
-                    ELSE $12
-                END,
-                error = CASE
-                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
-                        THEN throughput_projection_chunks.error
-                    ELSE $13
-                END,
-                cancellation_requested = CASE
-                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
-                        THEN throughput_projection_chunks.cancellation_requested
-                    ELSE $14
-                END,
-                cancellation_reason = CASE
-                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
-                        THEN throughput_projection_chunks.cancellation_reason
-                    ELSE $15
-                END,
-                cancellation_metadata = CASE
-                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
-                        THEN throughput_projection_chunks.cancellation_metadata
-                    ELSE $16
-                END,
-                worker_id = CASE
-                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
-                        THEN throughput_projection_chunks.worker_id
-                    ELSE $17
-                END,
-                worker_build_id = CASE
-                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
-                        THEN throughput_projection_chunks.worker_build_id
-                    ELSE $18
-                END,
-                lease_token = CASE
-                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
-                        THEN throughput_projection_chunks.lease_token
-                    ELSE $19
-                END,
-                last_report_id = CASE
-                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
-                        THEN throughput_projection_chunks.last_report_id
-                    ELSE $20
-                END,
-                available_at = CASE
-                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
-                        THEN throughput_projection_chunks.available_at
-                    ELSE $21
-                END,
-                started_at = COALESCE($22, throughput_projection_chunks.started_at),
-                lease_expires_at = CASE
-                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
-                        THEN throughput_projection_chunks.lease_expires_at
-                    ELSE $23
-                END,
-                completed_at = COALESCE(throughput_projection_chunks.completed_at, $24),
-                updated_at = GREATEST(throughput_projection_chunks.updated_at, $25)
-            "#,
-        )
-        .bind(&update.tenant_id)
-        .bind(&update.instance_id)
-        .bind(&update.run_id)
-        .bind(&update.batch_id)
-        .bind(&update.chunk_id)
-        .bind(&update.status)
-        .bind(i32::try_from(update.attempt).context("projection chunk state attempt exceeds i32")?)
-        .bind(
-            i64::try_from(update.lease_epoch)
-                .context("projection chunk state lease_epoch exceeds i64")?,
-        )
-        .bind(
-            i64::try_from(update.owner_epoch)
-                .context("projection chunk state owner_epoch exceeds i64")?,
-        )
-        .bind(update.input_handle.as_ref().map(Json))
-        .bind(update.result_handle.as_ref().map(Json))
-        .bind(update.output.as_ref().map(Json))
-        .bind(&update.error)
-        .bind(update.cancellation_requested)
-        .bind(&update.cancellation_reason)
-        .bind(update.cancellation_metadata.as_ref().map(Json))
-        .bind(&update.worker_id)
-        .bind(&update.worker_build_id)
-        .bind(update.lease_token)
-        .bind(&update.last_report_id)
-        .bind(update.available_at)
-        .bind(update.started_at)
-        .bind(update.lease_expires_at)
-        .bind(update.completed_at)
-        .bind(update.updated_at)
-        .bind(
-            i32::try_from(update.chunk_index)
-                .context("projection chunk chunk_index exceeds i32")?,
-        )
-        .bind(i32::try_from(update.group_id).context("projection chunk group_id exceeds i32")?)
-        .bind(i32::try_from(update.item_count).context("projection chunk item_count exceeds i32")?)
-        .execute(&self.pool)
-        .await
-        .context("failed to update throughput projection chunk state")?;
-        Ok(())
+        self.update_throughput_projection_chunk_states(std::slice::from_ref(update)).await
     }
 
     pub async fn count_bulk_batches_for_run_query_view(
@@ -9399,6 +9705,11 @@ impl WorkflowStore {
                 result_handle,
                 throughput_backend,
                 throughput_backend_version,
+                execution_policy,
+                reducer,
+                reducer_class,
+                aggregation_tree_depth,
+                fast_lane_enabled,
                 aggregation_group_count,
                 status,
                 total_items,
@@ -9429,6 +9740,11 @@ impl WorkflowStore {
                     result_handle,
                     throughput_backend,
                     throughput_backend_version,
+                    execution_policy,
+                    reducer,
+                    reducer_class,
+                    aggregation_tree_depth,
+                    fast_lane_enabled,
                     aggregation_group_count,
                     status,
                     total_items,
@@ -9464,6 +9780,11 @@ impl WorkflowStore {
                     result_handle,
                     throughput_backend,
                     throughput_backend_version,
+                    execution_policy,
+                    reducer,
+                    reducer_class,
+                    aggregation_tree_depth,
+                    fast_lane_enabled,
                     aggregation_group_count,
                     status,
                     total_items,
@@ -9522,6 +9843,11 @@ impl WorkflowStore {
                 result_handle,
                 throughput_backend,
                 throughput_backend_version,
+                execution_policy,
+                reducer,
+                reducer_class,
+                aggregation_tree_depth,
+                fast_lane_enabled,
                 aggregation_group_count,
                 status,
                 total_items,
@@ -9552,6 +9878,11 @@ impl WorkflowStore {
                     result_handle,
                     throughput_backend,
                     throughput_backend_version,
+                    execution_policy,
+                    reducer,
+                    reducer_class,
+                    aggregation_tree_depth,
+                    fast_lane_enabled,
                     aggregation_group_count,
                     status,
                     total_items,
@@ -9588,6 +9919,11 @@ impl WorkflowStore {
                     result_handle,
                     throughput_backend,
                     throughput_backend_version,
+                    execution_policy,
+                    reducer,
+                    reducer_class,
+                    aggregation_tree_depth,
+                    fast_lane_enabled,
                     aggregation_group_count,
                     status,
                     total_items,
@@ -11167,6 +11503,20 @@ impl WorkflowStore {
             throughput_backend_version: row
                 .try_get("throughput_backend_version")
                 .context("bulk batch throughput_backend_version missing")?,
+            execution_policy: row
+                .try_get("execution_policy")
+                .context("bulk batch execution_policy missing")?,
+            reducer: row.try_get("reducer").context("bulk batch reducer missing")?,
+            reducer_class: row
+                .try_get("reducer_class")
+                .context("bulk batch reducer_class missing")?,
+            aggregation_tree_depth: row
+                .try_get::<i32, _>("aggregation_tree_depth")
+                .context("bulk batch aggregation_tree_depth missing")?
+                as u32,
+            fast_lane_enabled: row
+                .try_get("fast_lane_enabled")
+                .context("bulk batch fast_lane_enabled missing")?,
             aggregation_group_count: row
                 .try_get::<i32, _>("aggregation_group_count")
                 .context("bulk batch aggregation_group_count missing")?
@@ -12228,6 +12578,11 @@ mod tests {
                 2,
                 1,
                 0,
+                None,
+                None,
+                "legacy",
+                1,
+                false,
                 1,
                 "pg-v1",
                 "1.0.0",
@@ -12336,6 +12691,11 @@ mod tests {
                 1,
                 1,
                 0,
+                None,
+                None,
+                "legacy",
+                1,
+                false,
                 1,
                 "pg-v1",
                 "1.0.0",
@@ -12360,6 +12720,11 @@ mod tests {
                 1,
                 1,
                 0,
+                None,
+                None,
+                "legacy",
+                1,
+                false,
                 1,
                 "stream-v2",
                 "2.0.0",
@@ -12423,6 +12788,11 @@ mod tests {
                 1,
                 1,
                 0,
+                None,
+                None,
+                "legacy",
+                1,
+                false,
                 1,
                 "stream-v2",
                 "2.0.0",
@@ -12532,6 +12902,11 @@ mod tests {
                 2,
                 2,
                 1000,
+                None,
+                None,
+                "legacy",
+                1,
+                false,
                 1,
                 "stream-v2",
                 "2.0.0",
@@ -12622,6 +12997,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_projection_chunk_state_batch_updates_patch_existing_rows() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+
+        let (batch, chunks) = store
+            .upsert_bulk_batch(
+                "tenant-a",
+                "wf-bulk-stream-batch-patch",
+                "run-bulk-stream-batch-patch",
+                "demo",
+                Some(1),
+                Some("artifact-1"),
+                "batch-stream-batch-patch",
+                "benchmark.echo",
+                "bulk",
+                Some("join"),
+                &json!({ "kind": "inline", "key": "bulk-input:batch-stream-batch-patch" }),
+                &json!({ "kind": "inline", "key": "bulk-result:batch-stream-batch-patch" }),
+                &[json!({"value": 1}), json!({"value": 2})],
+                1,
+                2,
+                1000,
+                None,
+                None,
+                "legacy",
+                1,
+                false,
+                1,
+                "stream-v2",
+                "2.0.0",
+                now,
+            )
+            .await?;
+        store.upsert_throughput_projection_batch(&batch).await?;
+        store.upsert_throughput_projection_chunks(&chunks).await?;
+
+        let patch_time = now + chrono::Duration::seconds(5);
+        let lease_expires_at = patch_time + chrono::Duration::seconds(30);
+        store
+            .update_throughput_projection_chunk_states(&[
+                ThroughputProjectionChunkStateUpdate {
+                    tenant_id: "tenant-a".to_owned(),
+                    instance_id: "wf-bulk-stream-batch-patch".to_owned(),
+                    run_id: "run-bulk-stream-batch-patch".to_owned(),
+                    batch_id: "batch-stream-batch-patch".to_owned(),
+                    chunk_id: chunks[0].chunk_id.clone(),
+                    chunk_index: chunks[0].chunk_index,
+                    group_id: chunks[0].group_id,
+                    item_count: chunks[0].item_count,
+                    status: "completed".to_owned(),
+                    attempt: 1,
+                    lease_epoch: 1,
+                    owner_epoch: 1,
+                    input_handle: None,
+                    result_handle: None,
+                    output: Some(vec![json!({"value": "done"})]),
+                    error: None,
+                    cancellation_requested: false,
+                    cancellation_reason: None,
+                    cancellation_metadata: None,
+                    worker_id: None,
+                    worker_build_id: None,
+                    lease_token: None,
+                    last_report_id: Some("report-1".to_owned()),
+                    available_at: patch_time,
+                    started_at: Some(now),
+                    lease_expires_at: None,
+                    completed_at: Some(patch_time),
+                    updated_at: patch_time,
+                },
+                ThroughputProjectionChunkStateUpdate {
+                    tenant_id: "tenant-a".to_owned(),
+                    instance_id: "wf-bulk-stream-batch-patch".to_owned(),
+                    run_id: "run-bulk-stream-batch-patch".to_owned(),
+                    batch_id: "batch-stream-batch-patch".to_owned(),
+                    chunk_id: chunks[1].chunk_id.clone(),
+                    chunk_index: chunks[1].chunk_index,
+                    group_id: chunks[1].group_id,
+                    item_count: chunks[1].item_count,
+                    status: "started".to_owned(),
+                    attempt: 2,
+                    lease_epoch: 2,
+                    owner_epoch: 1,
+                    input_handle: Some(Value::Null),
+                    result_handle: Some(Value::Null),
+                    output: None,
+                    error: None,
+                    cancellation_requested: false,
+                    cancellation_reason: None,
+                    cancellation_metadata: None,
+                    worker_id: Some("worker-a".to_owned()),
+                    worker_build_id: Some("build-a".to_owned()),
+                    lease_token: None,
+                    last_report_id: Some("report-2".to_owned()),
+                    available_at: patch_time,
+                    started_at: Some(patch_time),
+                    lease_expires_at: Some(lease_expires_at),
+                    completed_at: None,
+                    updated_at: patch_time,
+                },
+            ])
+            .await?;
+
+        let query_chunks = store
+            .list_bulk_chunks_for_batch_page_query_view(
+                "tenant-a",
+                "wf-bulk-stream-batch-patch",
+                "run-bulk-stream-batch-patch",
+                "batch-stream-batch-patch",
+                10,
+                0,
+            )
+            .await?;
+        assert_eq!(query_chunks.len(), 2);
+
+        assert_eq!(query_chunks[0].status, WorkflowBulkChunkStatus::Completed);
+        assert_eq!(query_chunks[0].input_handle, chunks[0].input_handle);
+        assert_eq!(query_chunks[0].result_handle, chunks[0].result_handle);
+        assert_eq!(query_chunks[0].output.as_ref(), Some(&vec![json!({"value": "done"})]));
+        assert_eq!(query_chunks[0].last_report_id.as_deref(), Some("report-1"));
+
+        assert_eq!(query_chunks[1].status, WorkflowBulkChunkStatus::Started);
+        assert_eq!(query_chunks[1].input_handle, Value::Null);
+        assert_eq!(query_chunks[1].result_handle, Value::Null);
+        assert_eq!(query_chunks[1].worker_id.as_deref(), Some("worker-a"));
+        assert_eq!(query_chunks[1].worker_build_id.as_deref(), Some("build-a"));
+        assert_eq!(query_chunks[1].last_report_id.as_deref(), Some("report-2"));
+        assert_eq!(query_chunks[1].lease_expires_at, Some(lease_expires_at));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn stream_projection_terminal_batch_update_is_monotonic() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
@@ -12647,6 +13158,11 @@ mod tests {
                 2,
                 2,
                 1000,
+                None,
+                None,
+                "legacy",
+                1,
+                false,
                 3,
                 "stream-v2",
                 "2.0.0",
@@ -12707,6 +13223,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_projection_batch_state_batch_updates_patch_existing_rows() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+
+        let (running_batch, _running_chunks) = store
+            .upsert_bulk_batch(
+                "tenant-a",
+                "wf-bulk-stream-batch-state-a",
+                "run-bulk-stream-batch-state-a",
+                "demo",
+                Some(1),
+                Some("artifact-1"),
+                "batch-stream-batch-state-a",
+                "benchmark.echo",
+                "bulk",
+                Some("join"),
+                &json!({ "kind": "inline", "key": "bulk-input:batch-stream-batch-state-a" }),
+                &json!({ "kind": "inline", "key": "bulk-result:batch-stream-batch-state-a" }),
+                &[json!({"value": 1}), json!({"value": 2})],
+                1,
+                2,
+                1000,
+                None,
+                None,
+                "legacy",
+                1,
+                false,
+                2,
+                "stream-v2",
+                "2.0.0",
+                now,
+            )
+            .await?;
+        store.upsert_throughput_projection_batch(&running_batch).await?;
+
+        let (terminal_batch, _terminal_chunks) = store
+            .upsert_bulk_batch(
+                "tenant-a",
+                "wf-bulk-stream-batch-state-b",
+                "run-bulk-stream-batch-state-b",
+                "demo",
+                Some(1),
+                Some("artifact-1"),
+                "batch-stream-batch-state-b",
+                "benchmark.echo",
+                "bulk",
+                Some("join"),
+                &json!({ "kind": "inline", "key": "bulk-input:batch-stream-batch-state-b" }),
+                &json!({ "kind": "inline", "key": "bulk-result:batch-stream-batch-state-b" }),
+                &[json!({"value": 1})],
+                1,
+                1,
+                1000,
+                None,
+                None,
+                "legacy",
+                1,
+                false,
+                1,
+                "stream-v2",
+                "2.0.0",
+                now,
+            )
+            .await?;
+        store.upsert_throughput_projection_batch(&terminal_batch).await?;
+
+        let patch_time = now + chrono::Duration::seconds(5);
+        store
+            .update_throughput_projection_batch_states(&[
+                ThroughputProjectionBatchStateUpdate {
+                    tenant_id: "tenant-a".to_owned(),
+                    instance_id: "wf-bulk-stream-batch-state-a".to_owned(),
+                    run_id: "run-bulk-stream-batch-state-a".to_owned(),
+                    batch_id: "batch-stream-batch-state-a".to_owned(),
+                    status: "running".to_owned(),
+                    succeeded_items: 1,
+                    failed_items: 0,
+                    cancelled_items: 0,
+                    error: None,
+                    terminal_at: None,
+                    updated_at: patch_time,
+                },
+                ThroughputProjectionBatchStateUpdate {
+                    tenant_id: "tenant-a".to_owned(),
+                    instance_id: "wf-bulk-stream-batch-state-b".to_owned(),
+                    run_id: "run-bulk-stream-batch-state-b".to_owned(),
+                    batch_id: "batch-stream-batch-state-b".to_owned(),
+                    status: "completed".to_owned(),
+                    succeeded_items: 1,
+                    failed_items: 0,
+                    cancelled_items: 0,
+                    error: None,
+                    terminal_at: Some(patch_time),
+                    updated_at: patch_time,
+                },
+            ])
+            .await?;
+
+        let running_projected = store
+            .get_bulk_batch_query_view(
+                "tenant-a",
+                "wf-bulk-stream-batch-state-a",
+                "run-bulk-stream-batch-state-a",
+                "batch-stream-batch-state-a",
+            )
+            .await?
+            .context("running stream batch missing from query view")?;
+        assert_eq!(running_projected.status, WorkflowBulkBatchStatus::Running);
+        assert_eq!(running_projected.succeeded_items, 1);
+        assert_eq!(running_projected.terminal_at, None);
+
+        let terminal_projected = store
+            .get_bulk_batch_query_view(
+                "tenant-a",
+                "wf-bulk-stream-batch-state-b",
+                "run-bulk-stream-batch-state-b",
+                "batch-stream-batch-state-b",
+            )
+            .await?
+            .context("terminal stream batch missing from query view")?;
+        assert_eq!(terminal_projected.status, WorkflowBulkBatchStatus::Completed);
+        assert_eq!(terminal_projected.succeeded_items, 1);
+        assert_eq!(terminal_projected.terminal_at, Some(patch_time));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn stream_projection_terminal_chunk_update_is_monotonic() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
@@ -12732,6 +13379,11 @@ mod tests {
                 2,
                 2,
                 1000,
+                None,
+                None,
+                "legacy",
+                1,
+                false,
                 1,
                 "stream-v2",
                 "2.0.0",
@@ -12915,6 +13567,11 @@ mod tests {
                 1,
                 1,
                 0,
+                None,
+                None,
+                "legacy",
+                1,
+                false,
                 1,
                 "stream-v2",
                 "2.0.0",
@@ -12939,6 +13596,11 @@ mod tests {
                 1,
                 1,
                 0,
+                None,
+                None,
+                "legacy",
+                1,
+                false,
                 1,
                 "stream-v2",
                 "2.0.0",
@@ -13005,6 +13667,11 @@ mod tests {
                 1,
                 1,
                 0,
+                None,
+                None,
+                "legacy",
+                1,
+                false,
                 1,
                 "stream-v2",
                 "2.0.0",
