@@ -8,6 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use fabrik_config::PostgresConfig;
+use fabrik_throughput::{PG_V1_BACKEND, STREAM_V2_BACKEND};
 use fabrik_workflow::{
     ArtifactEntrypoint, CompiledStateNode, CompiledWorkflow, CompiledWorkflowArtifact,
     ErrorTransition, Expression, RetryPolicy,
@@ -34,8 +35,9 @@ enum ExecutionMode {
     Throughput,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Args {
+    suite_name: Option<String>,
     profile_name: String,
     profile: BenchmarkProfile,
     output_path: PathBuf,
@@ -46,11 +48,14 @@ struct Args {
     tenant_id: String,
     task_queue: String,
     execution_mode: ExecutionMode,
+    throughput_backend: Option<String>,
+    chunk_size: u32,
     timeout: Duration,
 }
 
 #[derive(Debug, Serialize)]
 struct BenchmarkReport {
+    scenario: String,
     profile: String,
     started_at: DateTime<Utc>,
     completed_at: DateTime<Utc>,
@@ -65,6 +70,8 @@ struct BenchmarkReport {
     definition_id: String,
     task_queue: String,
     execution_mode: ExecutionMode,
+    throughput_backend: Option<String>,
+    chunk_size: u32,
     instance_prefix: String,
     workflow_outcomes: WorkflowOutcomeMetrics,
     activity_metrics: ActivityMetrics,
@@ -72,7 +79,21 @@ struct BenchmarkReport {
     backlog_metrics: BacklogMetrics,
     bulk_batch_rows: u64,
     bulk_chunk_rows: u64,
+    projection_batch_rows: u64,
+    projection_chunk_rows: u64,
+    max_aggregation_group_count: u64,
+    grouped_batch_rows: u64,
     executor_debug: Value,
+    throughput_runtime_debug: Option<Value>,
+    throughput_projector_debug: Option<Value>,
+}
+
+#[derive(Debug, Serialize)]
+struct BenchmarkSuiteReport {
+    suite: String,
+    profile: String,
+    generated_at: DateTime<Utc>,
+    scenarios: Vec<BenchmarkReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,6 +161,18 @@ struct CoalescingRow {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = parse_args()?;
+    if let Some(suite_name) = args.suite_name.clone() {
+        run_suite(args, suite_name).await?;
+        return Ok(());
+    }
+    let report = run_benchmark(&args).await?;
+    write_report(&args.output_path, &report)?;
+    println!("{}", summary_text(&report));
+    println!("report_path={}", args.output_path.display());
+    Ok(())
+}
+
+async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
     let postgres = PostgresConfig::from_env()?;
     let pool = PgPool::connect(&postgres.url).await.context("failed to connect to postgres")?;
     let client = Client::new();
@@ -148,9 +181,15 @@ async fn main() -> Result<()> {
         env::var("INGEST_SERVICE_URL").unwrap_or_else(|_| "http://127.0.0.1:3001".to_owned());
     let executor_base =
         env::var("EXECUTOR_SERVICE_URL").unwrap_or_else(|_| "http://127.0.0.1:3002".to_owned());
+    let throughput_runtime_debug_base =
+        env::var("THROUGHPUT_DEBUG_URL").unwrap_or_else(|_| "http://127.0.0.1:3006".to_owned());
+    let throughput_projector_base =
+        env::var("THROUGHPUT_PROJECTOR_URL").unwrap_or_else(|_| "http://127.0.0.1:3007".to_owned());
 
     let definition_id = format!("fanout-benchmark-{}", args.profile_name);
-    let instance_prefix = format!("fanout-{}-{}", args.profile_name, Uuid::now_v7());
+    let scenario_name = scenario_name(args);
+    let instance_prefix =
+        format!("fanout-{}-{}-{}", args.profile_name, scenario_name, Uuid::now_v7());
     let started_at = Utc::now();
     let started = Instant::now();
 
@@ -163,6 +202,8 @@ async fn main() -> Result<()> {
             &args.task_queue,
             args.retry_rate > 0.0,
             args.execution_mode,
+            args.throughput_backend.as_deref(),
+            args.chunk_size,
         ),
     )
     .await?;
@@ -191,8 +232,14 @@ async fn main() -> Result<()> {
     let mut max_activity_backlog = 0_u64;
     loop {
         let outcomes = workflow_outcomes(&pool, &args.tenant_id, &instance_prefix).await?;
-        let (workflow_backlog, activity_backlog) =
-            backlog_snapshot(&pool, &args.tenant_id, &instance_prefix).await?;
+        let (workflow_backlog, activity_backlog) = backlog_snapshot(
+            &pool,
+            &args.tenant_id,
+            &instance_prefix,
+            args.execution_mode,
+            args.throughput_backend.as_deref(),
+        )
+        .await?;
         max_workflow_backlog = max_workflow_backlog.max(workflow_backlog);
         max_activity_backlog = max_activity_backlog.max(activity_backlog);
 
@@ -223,13 +270,19 @@ async fn main() -> Result<()> {
         duration_ms,
         args.profile.workflow_count * args.profile.activities_per_workflow,
         args.execution_mode,
+        args.throughput_backend.as_deref(),
     )
     .await?;
     let coalescing_metrics = coalescing_metrics(&pool, &args.tenant_id, &instance_prefix).await?;
-    let (bulk_batch_rows, bulk_chunk_rows) =
-        bulk_metrics(&pool, &args.tenant_id, &instance_prefix).await?;
-    let (final_workflow_backlog, final_activity_backlog) =
-        backlog_snapshot(&pool, &args.tenant_id, &instance_prefix).await?;
+    let (_legacy_batch_rows, _legacy_chunk_rows) = (0_u64, 0_u64);
+    let (final_workflow_backlog, final_activity_backlog) = backlog_snapshot(
+        &pool,
+        &args.tenant_id,
+        &instance_prefix,
+        args.execution_mode,
+        args.throughput_backend.as_deref(),
+    )
+    .await?;
     let executor_debug = client
         .get(format!("{executor_base}/debug/hybrid-routing"))
         .send()
@@ -240,8 +293,43 @@ async fn main() -> Result<()> {
         .json::<Value>()
         .await
         .context("failed to decode executor debug summary")?;
+    let throughput_runtime_debug = if args.execution_mode == ExecutionMode::Throughput
+        && args.throughput_backend.as_deref() == Some(STREAM_V2_BACKEND)
+    {
+        Some(
+            fetch_optional_debug(
+                &client,
+                &format!("{throughput_runtime_debug_base}/debug/throughput"),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let throughput_projector_debug = if args.execution_mode == ExecutionMode::Throughput
+        && args.throughput_backend.as_deref() == Some(STREAM_V2_BACKEND)
+    {
+        Some(
+            fetch_optional_debug(
+                &client,
+                &format!("{throughput_projector_base}/debug/throughput-projector"),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let (
+        bulk_batch_rows,
+        bulk_chunk_rows,
+        projection_batch_rows,
+        projection_chunk_rows,
+        max_aggregation_group_count,
+        grouped_batch_rows,
+    ) = bulk_metrics(&pool, &args.tenant_id, &instance_prefix).await?;
 
-    let report = BenchmarkReport {
+    Ok(BenchmarkReport {
+        scenario: scenario_name,
         profile: args.profile_name.clone(),
         started_at,
         completed_at,
@@ -256,6 +344,8 @@ async fn main() -> Result<()> {
         definition_id,
         task_queue: args.task_queue.clone(),
         execution_mode: args.execution_mode,
+        throughput_backend: args.throughput_backend.clone(),
+        chunk_size: args.chunk_size,
         instance_prefix,
         workflow_outcomes,
         activity_metrics,
@@ -268,16 +358,18 @@ async fn main() -> Result<()> {
         },
         bulk_batch_rows,
         bulk_chunk_rows,
+        projection_batch_rows,
+        projection_chunk_rows,
+        max_aggregation_group_count,
+        grouped_batch_rows,
         executor_debug,
-    };
-
-    write_report(&args.output_path, &report)?;
-    println!("{}", summary_text(&report));
-    println!("report_path={}", args.output_path.display());
-    Ok(())
+        throughput_runtime_debug,
+        throughput_projector_debug,
+    })
 }
 
 fn parse_args() -> Result<Args> {
+    let mut suite_name = None;
     let mut profile_name = "smoke".to_owned();
     let mut output_path = None;
     let mut worker_count = 1_usize;
@@ -287,6 +379,8 @@ fn parse_args() -> Result<Args> {
     let mut tenant_id = "benchmark".to_owned();
     let mut task_queue = "default".to_owned();
     let mut execution_mode = ExecutionMode::Durable;
+    let mut throughput_backend = None;
+    let mut chunk_size = 256_u32;
     let mut timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
     let mut workflow_count = None;
     let mut activities_per_workflow = None;
@@ -295,6 +389,7 @@ fn parse_args() -> Result<Args> {
     while let Some(flag) = args.next() {
         let value = args.next().with_context(|| format!("missing value for argument {flag}"))?;
         match flag.as_str() {
+            "--suite" => suite_name = Some(value),
             "--profile" => profile_name = value,
             "--output" => output_path = Some(PathBuf::from(value)),
             "--worker-count" => worker_count = value.parse().context("invalid --worker-count")?,
@@ -312,6 +407,16 @@ fn parse_args() -> Result<Args> {
                     }
                 }
             }
+            "--throughput-backend" => {
+                throughput_backend = Some(match value.as_str() {
+                    PG_V1_BACKEND => PG_V1_BACKEND.to_owned(),
+                    STREAM_V2_BACKEND => STREAM_V2_BACKEND.to_owned(),
+                    other => bail!(
+                        "unknown --throughput-backend {other}; expected {PG_V1_BACKEND} or {STREAM_V2_BACKEND}"
+                    ),
+                })
+            }
+            "--chunk-size" => chunk_size = value.parse().context("invalid --chunk-size")?,
             "--timeout-secs" => {
                 timeout = Duration::from_secs(value.parse().context("invalid --timeout-secs")?)
             }
@@ -343,6 +448,7 @@ fn parse_args() -> Result<Args> {
     });
 
     Ok(Args {
+        suite_name,
         profile_name,
         profile,
         output_path,
@@ -353,6 +459,8 @@ fn parse_args() -> Result<Args> {
         tenant_id,
         task_queue,
         execution_mode,
+        throughput_backend,
+        chunk_size,
         timeout,
     })
 }
@@ -362,6 +470,8 @@ fn benchmark_artifact(
     task_queue: &str,
     enable_retry: bool,
     execution_mode: ExecutionMode,
+    throughput_backend: Option<&str>,
+    chunk_size: u32,
 ) -> CompiledWorkflowArtifact {
     let mut states = BTreeMap::new();
     match execution_mode {
@@ -411,8 +521,8 @@ fn benchmark_artifact(
                     task_queue: Some(Expression::Literal {
                         value: Value::String(task_queue.to_owned()),
                     }),
-                    throughput_backend: None,
-                    chunk_size: Some(256),
+                    throughput_backend: throughput_backend.map(ToOwned::to_owned),
+                    chunk_size: Some(chunk_size),
                     retry: enable_retry
                         .then_some(RetryPolicy { max_attempts: 2, delay: "1s".to_owned() }),
                 },
@@ -500,6 +610,94 @@ async fn publish_artifact(
     Ok(())
 }
 
+async fn run_suite(args: Args, suite_name: String) -> Result<()> {
+    let scenarios = benchmark_suite_scenarios(&args, &suite_name)?;
+    let mut reports = Vec::new();
+    for scenario in scenarios {
+        let report = run_benchmark(&scenario).await?;
+        let output_path = scenario_output_path(&args.output_path, &report.scenario);
+        write_report(&output_path, &report)?;
+        println!("{}", summary_text(&report));
+        println!("scenario_report_path={}", output_path.display());
+        reports.push(report);
+    }
+
+    let suite_report = BenchmarkSuiteReport {
+        suite: suite_name.clone(),
+        profile: args.profile_name.clone(),
+        generated_at: Utc::now(),
+        scenarios: reports,
+    };
+    write_suite_report(&args.output_path, &suite_report)?;
+    println!("suite_report_path={}", args.output_path.display());
+    Ok(())
+}
+
+fn benchmark_suite_scenarios(args: &Args, suite_name: &str) -> Result<Vec<Args>> {
+    match suite_name {
+        "streaming" => {
+            let mut durable = args.clone();
+            durable.suite_name = None;
+            durable.execution_mode = ExecutionMode::Durable;
+            durable.throughput_backend = None;
+
+            let mut throughput_pg = args.clone();
+            throughput_pg.suite_name = None;
+            throughput_pg.execution_mode = ExecutionMode::Throughput;
+            throughput_pg.throughput_backend = Some(PG_V1_BACKEND.to_owned());
+
+            let mut throughput_stream = args.clone();
+            throughput_stream.suite_name = None;
+            throughput_stream.execution_mode = ExecutionMode::Throughput;
+            throughput_stream.throughput_backend = Some(STREAM_V2_BACKEND.to_owned());
+
+            Ok(vec![durable, throughput_pg, throughput_stream])
+        }
+        other => bail!("unknown suite {other}; expected streaming"),
+    }
+}
+
+fn scenario_name(args: &Args) -> String {
+    match args.execution_mode {
+        ExecutionMode::Durable => "durable".to_owned(),
+        ExecutionMode::Throughput => {
+            format!("throughput-{}", args.throughput_backend.as_deref().unwrap_or(PG_V1_BACKEND))
+        }
+    }
+}
+
+fn scenario_output_path(base: &Path, scenario: &str) -> PathBuf {
+    let stem = base.file_stem().and_then(|value| value.to_str()).unwrap_or("benchmark");
+    let extension = base.extension().and_then(|value| value.to_str()).unwrap_or("json");
+    let file_name = format!("{stem}-{scenario}.{extension}");
+    base.parent().unwrap_or_else(|| Path::new(".")).join(file_name)
+}
+
+fn write_suite_report(output_path: &Path, report: &BenchmarkSuiteReport) -> Result<()> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(
+        output_path,
+        serde_json::to_vec_pretty(report).context("failed to serialize benchmark suite report")?,
+    )
+    .with_context(|| format!("failed to write {}", output_path.display()))?;
+    Ok(())
+}
+
+async fn fetch_optional_debug(client: &Client, url: &str) -> Value {
+    match client.get(url).send().await {
+        Ok(response) => match response.error_for_status() {
+            Ok(ok) => ok.json::<Value>().await.unwrap_or_else(
+                |error| json!({ "error": format!("failed to decode debug payload: {error}") }),
+            ),
+            Err(error) => json!({ "error": error.to_string() }),
+        },
+        Err(error) => json!({ "error": error.to_string() }),
+    }
+}
+
 async fn trigger_workflow(
     client: &Client,
     ingest_base: &str,
@@ -563,23 +761,45 @@ async fn activity_metrics(
     duration_ms: u128,
     total_activities: usize,
     execution_mode: ExecutionMode,
+    throughput_backend: Option<&str>,
 ) -> Result<ActivityMetrics> {
     if execution_mode == ExecutionMode::Throughput {
-        let row = sqlx::query_as::<_, (i64, i64, i64)>(
-            r#"
-            SELECT
-                COALESCE(SUM(succeeded_items), 0) AS completed,
-                COALESCE(SUM(failed_items), 0) AS failed,
-                COALESCE(SUM(cancelled_items), 0) AS cancelled
-            FROM workflow_bulk_batches
-            WHERE tenant_id = $1 AND workflow_instance_id LIKE $2
-            "#,
-        )
-        .bind(tenant_id)
-        .bind(format!("{instance_prefix}%"))
-        .fetch_one(pool)
-        .await
-        .context("failed to query bulk activity metrics")?;
+        let row = if throughput_backend == Some(STREAM_V2_BACKEND) {
+            sqlx::query_as::<_, (i64, i64, i64)>(
+                r#"
+                SELECT
+                    COALESCE(SUM(succeeded_items), 0) AS completed,
+                    COALESCE(SUM(failed_items), 0) AS failed,
+                    COALESCE(SUM(cancelled_items), 0) AS cancelled
+                FROM throughput_projection_batches
+                WHERE tenant_id = $1
+                  AND workflow_instance_id LIKE $2
+                  AND throughput_backend = $3
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(format!("{instance_prefix}%"))
+            .bind(STREAM_V2_BACKEND)
+            .fetch_one(pool)
+            .await
+            .context("failed to query stream-v2 activity metrics")?
+        } else {
+            sqlx::query_as::<_, (i64, i64, i64)>(
+                r#"
+                SELECT
+                    COALESCE(SUM(succeeded_items), 0) AS completed,
+                    COALESCE(SUM(failed_items), 0) AS failed,
+                    COALESCE(SUM(cancelled_items), 0) AS cancelled
+                FROM workflow_bulk_batches
+                WHERE tenant_id = $1 AND workflow_instance_id LIKE $2
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(format!("{instance_prefix}%"))
+            .fetch_one(pool)
+            .await
+            .context("failed to query pg-v1 bulk activity metrics")?
+        };
         let throughput = if duration_ms == 0 {
             0.0
         } else {
@@ -642,8 +862,12 @@ async fn activity_metrics(
     })
 }
 
-async fn bulk_metrics(pool: &PgPool, tenant_id: &str, instance_prefix: &str) -> Result<(u64, u64)> {
-    let row = sqlx::query_as::<_, (i64, i64)>(
+async fn bulk_metrics(
+    pool: &PgPool,
+    tenant_id: &str,
+    instance_prefix: &str,
+) -> Result<(u64, u64, u64, u64, u64, u64)> {
+    let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64)>(
         r#"
         SELECT
             (SELECT COUNT(*)
@@ -651,7 +875,20 @@ async fn bulk_metrics(pool: &PgPool, tenant_id: &str, instance_prefix: &str) -> 
              WHERE tenant_id = $1 AND workflow_instance_id LIKE $2) AS batch_rows,
             (SELECT COUNT(*)
              FROM workflow_bulk_chunks
-             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2) AS chunk_rows
+             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2) AS chunk_rows,
+            (SELECT COUNT(*)
+             FROM throughput_projection_batches
+             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2) AS projection_batch_rows,
+            (SELECT COUNT(*)
+             FROM throughput_projection_chunks
+             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2) AS projection_chunk_rows,
+            (SELECT COALESCE(MAX(aggregation_group_count), 0)
+             FROM throughput_projection_batches
+             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2) AS max_group_count,
+            (SELECT COUNT(*)
+             FROM throughput_projection_batches
+             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2 AND aggregation_group_count > 1)
+             AS grouped_batch_rows
         "#,
     )
     .bind(tenant_id)
@@ -659,7 +896,7 @@ async fn bulk_metrics(pool: &PgPool, tenant_id: &str, instance_prefix: &str) -> 
     .fetch_one(pool)
     .await
     .context("failed to query bulk benchmark metrics")?;
-    Ok((row.0 as u64, row.1 as u64))
+    Ok((row.0 as u64, row.1 as u64, row.2 as u64, row.3 as u64, row.4 as u64, row.5 as u64))
 }
 
 async fn coalescing_metrics(
@@ -701,6 +938,8 @@ async fn backlog_snapshot(
     pool: &PgPool,
     tenant_id: &str,
     instance_prefix: &str,
+    execution_mode: ExecutionMode,
+    throughput_backend: Option<&str>,
 ) -> Result<(u64, u64)> {
     let workflow_backlog = sqlx::query_scalar::<_, i64>(
         r#"
@@ -717,33 +956,65 @@ async fn backlog_snapshot(
     .fetch_one(pool)
     .await
     .context("failed to query workflow backlog")?;
-    let activity_backlog = sqlx::query_scalar::<_, i64>(
-        r#"
-        SELECT
-            (SELECT COUNT(*)
-             FROM workflow_activities
-             WHERE tenant_id = $1
-               AND workflow_instance_id LIKE $2
-               AND status = 'scheduled')
-            +
-            (SELECT COUNT(*)
-             FROM workflow_bulk_chunks chunks
-             JOIN workflow_bulk_batches batches
-               ON batches.tenant_id = chunks.tenant_id
-              AND batches.workflow_instance_id = chunks.workflow_instance_id
-              AND batches.run_id = chunks.run_id
-              AND batches.batch_id = chunks.batch_id
-             WHERE chunks.tenant_id = $1
-               AND chunks.workflow_instance_id LIKE $2
-               AND chunks.status = 'scheduled'
-               AND batches.status IN ('scheduled', 'running'))
-        "#,
-    )
-    .bind(tenant_id)
-    .bind(format!("{instance_prefix}%"))
-    .fetch_one(pool)
-    .await
-    .context("failed to query activity backlog")?;
+    let activity_backlog = if execution_mode == ExecutionMode::Throughput
+        && throughput_backend == Some(STREAM_V2_BACKEND)
+    {
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT
+                (SELECT COUNT(*)
+                 FROM workflow_activities
+                 WHERE tenant_id = $1
+                   AND workflow_instance_id LIKE $2
+                   AND status = 'scheduled')
+                +
+                (SELECT COUNT(*)
+                 FROM throughput_projection_chunks chunks
+                 JOIN throughput_projection_batches batches
+                   ON batches.tenant_id = chunks.tenant_id
+                  AND batches.workflow_instance_id = chunks.workflow_instance_id
+                  AND batches.run_id = chunks.run_id
+                  AND batches.batch_id = chunks.batch_id
+                 WHERE chunks.tenant_id = $1
+                   AND chunks.workflow_instance_id LIKE $2
+                   AND chunks.status = 'scheduled'
+                   AND batches.status IN ('scheduled', 'running'))
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(format!("{instance_prefix}%"))
+        .fetch_one(pool)
+        .await
+        .context("failed to query stream-v2 activity backlog")?
+    } else {
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT
+                (SELECT COUNT(*)
+                 FROM workflow_activities
+                 WHERE tenant_id = $1
+                   AND workflow_instance_id LIKE $2
+                   AND status = 'scheduled')
+                +
+                (SELECT COUNT(*)
+                 FROM workflow_bulk_chunks chunks
+                 JOIN workflow_bulk_batches batches
+                   ON batches.tenant_id = chunks.tenant_id
+                  AND batches.workflow_instance_id = chunks.workflow_instance_id
+                  AND batches.run_id = chunks.run_id
+                  AND batches.batch_id = chunks.batch_id
+                 WHERE chunks.tenant_id = $1
+                   AND chunks.workflow_instance_id LIKE $2
+                   AND chunks.status = 'scheduled'
+                   AND batches.status IN ('scheduled', 'running'))
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(format!("{instance_prefix}%"))
+        .fetch_one(pool)
+        .await
+        .context("failed to query activity backlog")?
+    };
     Ok((workflow_backlog as u64, activity_backlog as u64))
 }
 
@@ -766,12 +1037,15 @@ fn write_report(output_path: &Path, report: &BenchmarkReport) -> Result<()> {
 
 fn summary_text(report: &BenchmarkReport) -> String {
     format!(
-        "profile={profile}\nexecution_mode={execution_mode}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n",
+        "scenario={scenario}\nprofile={profile}\nexecution_mode={execution_mode}\nthroughput_backend={throughput_backend}\nchunk_size={chunk_size}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nprojection_batch_rows={projection_batch_rows}\nprojection_chunk_rows={projection_chunk_rows}\nmax_aggregation_group_count={max_aggregation_group_count}\ngrouped_batch_rows={grouped_batch_rows}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n",
+        scenario = report.scenario,
         profile = report.profile,
         execution_mode = match report.execution_mode {
             ExecutionMode::Durable => "durable",
             ExecutionMode::Throughput => "throughput",
         },
+        throughput_backend = report.throughput_backend.as_deref().unwrap_or("n/a"),
+        chunk_size = report.chunk_size,
         workflows = report.workflow_count,
         activities_per_workflow = report.activities_per_workflow,
         total_activities = report.total_activities,
@@ -784,6 +1058,10 @@ fn summary_text(report: &BenchmarkReport) -> String {
         resume_ratio = report.coalescing_metrics.resume_events_per_task_row,
         bulk_batch_rows = report.bulk_batch_rows,
         bulk_chunk_rows = report.bulk_chunk_rows,
+        projection_batch_rows = report.projection_batch_rows,
+        projection_chunk_rows = report.projection_chunk_rows,
+        max_aggregation_group_count = report.max_aggregation_group_count,
+        grouped_batch_rows = report.grouped_batch_rows,
         max_workflow_backlog = report.backlog_metrics.max_workflow_backlog,
         max_activity_backlog = report.backlog_metrics.max_activity_backlog,
         final_workflow_backlog = report.backlog_metrics.final_workflow_backlog,

@@ -126,16 +126,18 @@ Infrastructure requirements:
 - Redpanda / Kafka (command log, report log, owner changelog)
 - RocksDB (shard-local state)
 - checkpoint storage
-  - current implementation: local filesystem checkpoints
-  - target: S3-compatible object storage for checkpoints and large payload manifests
+  - current implementation: S3-compatible object storage checkpoints with local filesystem fallback for restore compatibility
+- S3-compatible object storage for large payload manifests
+  - local compose stack: MinIO
 
 Behavior:
 
 - authoritative state lives in the throughput shard runtime, not Postgres
 - three log roles: command log, report log, owner changelog
 - recovery from latest checkpoint plus owner changelog tail
-- current implementation restores from a local filesystem checkpoint plus owner changelog replay
+- current implementation restores from the latest object-store checkpoint plus owner changelog replay
 - dedicated `throughput-runtime` service owns throughput shards independently of workflow executors
+- dedicated `throughput-projector` service consumes throughput projection events and updates Postgres asynchronously
 - ownership can run in either static-partition mode or assignment mode
   - static mode: each runtime instance is configured with explicit throughput partition ids
   - assignment mode: runtimes heartbeat membership and advertised capacity, then reconcile partition assignments periodically
@@ -149,13 +151,19 @@ Behavior:
 - in assignment mode, ownership is rebalanced through the `workflow_throughput_membership` and `workflow_throughput_partition_assignments` tables; stale assignment rows are pruned on every reconcile so the partition map converges after topology changes
 - the owner runtime computes expected chunk and batch transitions locally before applying a terminal report, then records divergence if the store result differs
 - grouped batches keep chunk execution and retries shard-local, but only the owner of group `0` emits the batch terminal event
+- grouped batches now emit explicit `GroupTerminal` owner decisions before the parent barrier emits the single batch terminal event
 - success completion for grouped batches waits for the parent barrier to observe every group terminal; permanent failure or cancellation still resolves the batch as soon as that terminal outcome is visible
 - terminal projection updates for `stream-v2` are applied from the owner-derived transition, not copied back from the execution tables
 - lease-expiry requeues are also projected from owner state and persisted through the owner changelog without reloading the chunk from Postgres
+- terminal batches, chunks, and group summaries are pruned from local RocksDB owner state after `THROUGHPUT_TERMINAL_STATE_RETENTION_SECONDS`; long-lived visibility stays in Postgres projections and object-backed manifests
 - terminal workflow events for `stream-v2` are now published directly by `throughput-runtime` instead of being emitted through the bulk execution tables' outbox
 - chunk inputs and outputs may be externalized behind per-chunk `input_handle` / `result_handle` manifests once they cross configured inline-size thresholds
+- current implementation supports both local filesystem and S3-compatible manifest storage, selected by `THROUGHPUT_PAYLOAD_STORE`
+- the local compose stack uses MinIO with path-style S3 requests for throughput payload manifests
+- throughput checkpoints are stored in the same configured object store under `THROUGHPUT_CHECKPOINT_KEY_PREFIX`
 - worker polling and query reads resolve those handles transparently, so the public API stays unchanged while large payloads move out of Postgres rows
-- Postgres receives async projections for visibility queries
+- Postgres receives async projections for visibility queries through the throughput projection log
+- the throughput projector only rebuilds batch result manifests for chunk updates that actually carry output or a non-null `result_handle`
 
 Log roles:
 
@@ -163,11 +171,11 @@ Log roles:
 |---|---|---|
 | Command | `CreateBatch`, `CancelBatch`, `TimeoutBatch` | Intent from workflow bridge |
 | Report | `ChunkCompleted`, `ChunkFailed`, `ChunkCancelled` | Raw worker observations |
-| Owner changelog | `BatchCreated`, `ChunkLeased`, `ChunkRequeued`, `ChunkApplied`, `BatchTerminal` | Restore and audit, including lease-expiry reschedules, retry schedule fields, and terminal counter snapshots |
+| Owner changelog | `BatchCreated`, `ChunkLeased`, `ChunkRequeued`, `ChunkApplied`, `GroupTerminal`, `BatchTerminal` | Restore and audit, including lease-expiry reschedules, group barrier decisions, retry schedule fields, and terminal counter snapshots |
 
 Fencing protocol:
 
-Every leased chunk carries `(chunk_id, attempt, lease_epoch, owner_epoch, report_id)`. A report is valid only if it matches the active lease and current owner epoch. Stale reports are retained for audit but do not mutate state. Retries advance `lease_epoch`. Failover advances `owner_epoch`. Exactly one terminal workflow event is emitted per batch.
+Every leased chunk carries `(chunk_id, attempt, lease_epoch, lease_token, owner_epoch, report_id)`. A report is valid only if it matches the active lease token and current owner epoch. Stale reports are retained for audit but do not mutate state. Retries advance `lease_epoch` and mint a new `lease_token`. Failover advances `owner_epoch`. Exactly one terminal workflow event is emitted per batch.
 
 Tradeoffs:
 

@@ -18,7 +18,7 @@ use fabrik_store::{
     WorkflowBulkBatchRecord, WorkflowBulkChunkRecord, WorkflowRunRecord, WorkflowSignalRecord,
     WorkflowStateSnapshot, WorkflowStore,
 };
-use fabrik_throughput::{FilesystemPayloadStore, PayloadHandle};
+use fabrik_throughput::{PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind};
 use fabrik_workflow::{
     CompiledWorkflowArtifact, ReplayDivergence, ReplayDivergenceKind, ReplayFieldMismatch,
     ReplaySource, ReplayTransitionTraceEntry, WorkflowDefinition, WorkflowInstanceState,
@@ -43,7 +43,7 @@ struct AppState {
     store: WorkflowStore,
     broker: BrokerConfig,
     query: QueryRuntimeConfig,
-    payload_store: FilesystemPayloadStore,
+    payload_store: PayloadStore,
     retention: Arc<Mutex<RetentionDebugState>>,
 }
 
@@ -271,7 +271,7 @@ async fn main() -> Result<()> {
 
     let store = WorkflowStore::connect(&postgres.url).await?;
     store.init().await?;
-    let payload_store = FilesystemPayloadStore::new(&query.throughput_payload_dir)?;
+    let payload_store = PayloadStore::from_config(build_payload_store_config(&query)).await?;
     let broker = BrokerConfig::new(
         redpanda.brokers,
         redpanda.workflow_events_topic,
@@ -942,10 +942,11 @@ async fn load_workflow_bulk_chunks(
             i64::try_from(page.limit).context("bulk chunk page limit exceeds i64")?,
             i64::try_from(page.offset).context("bulk chunk page offset exceeds i64")?,
         )
-        .await?
-        .into_iter()
-        .map(|chunk| resolve_chunk_payloads(state, chunk, true, false))
-        .collect::<Result<Vec<_>>>()?;
+        .await?;
+    let mut resolved_chunks = Vec::new();
+    for chunk in chunks {
+        resolved_chunks.push(resolve_chunk_payloads(state, chunk, true, false).await?);
+    }
     Ok(WorkflowBulkChunksResponse {
         tenant_id: tenant_id.to_owned(),
         instance_id: instance_id.to_owned(),
@@ -954,11 +955,11 @@ async fn load_workflow_bulk_chunks(
         consistency: "eventual",
         authoritative_source: authoritative_bulk_source(&batch.throughput_backend),
         projection_lag_ms: projection_lag_ms_from_times(
-            chunks.iter().map(|chunk| Some(chunk.updated_at)),
+            resolved_chunks.iter().map(|chunk| Some(chunk.updated_at)),
         ),
-        page: build_page_info(&page, total, chunks.len()),
+        page: build_page_info(&page, total, resolved_chunks.len()),
         chunk_count: total,
-        chunks,
+        chunks: resolved_chunks,
     })
 }
 
@@ -990,13 +991,13 @@ async fn load_workflow_bulk_results(
             i64::try_from(page.limit).context("bulk result page limit exceeds i64")?,
             i64::try_from(page.offset).context("bulk result page offset exceeds i64")?,
         )
-        .await?
-        .into_iter()
-        .map(|chunk| resolve_chunk_payloads(state, chunk, false, true))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|chunk| chunk.output.is_some())
-        .collect::<Vec<_>>();
+        .await?;
+    let mut resolved_chunks = Vec::new();
+    for chunk in chunks {
+        resolved_chunks.push(resolve_chunk_payloads(state, chunk, false, true).await?);
+    }
+    let chunks =
+        resolved_chunks.into_iter().filter(|chunk| chunk.output.is_some()).collect::<Vec<_>>();
     Ok(WorkflowBulkResultsResponse {
         tenant_id: tenant_id.to_owned(),
         instance_id: instance_id.to_owned(),
@@ -1013,7 +1014,7 @@ async fn load_workflow_bulk_results(
     })
 }
 
-fn resolve_chunk_payloads(
+async fn resolve_chunk_payloads(
     state: &AppState,
     mut chunk: WorkflowBulkChunkRecord,
     resolve_input: bool,
@@ -1021,18 +1022,37 @@ fn resolve_chunk_payloads(
 ) -> Result<WorkflowBulkChunkRecord> {
     if resolve_input && chunk.items.is_empty() && !chunk.input_handle.is_null() {
         if let Ok(handle) = serde_json::from_value::<PayloadHandle>(chunk.input_handle.clone()) {
-            chunk.items = state.payload_store.read_items(&handle)?;
+            chunk.items = state.payload_store.read_items(&handle).await?;
         }
     }
     if resolve_output && chunk.output.is_none() && !chunk.result_handle.is_null() {
         if let Ok(handle) = serde_json::from_value::<PayloadHandle>(chunk.result_handle.clone()) {
-            let value = state.payload_store.read_value(&handle)?;
+            let value = state.payload_store.read_value(&handle).await?;
             if let Value::Array(items) = value {
                 chunk.output = Some(items);
             }
         }
     }
     Ok(chunk)
+}
+
+fn build_payload_store_config(query: &QueryRuntimeConfig) -> PayloadStoreConfig {
+    PayloadStoreConfig {
+        default_store: match query.throughput_payload_store.kind {
+            fabrik_config::ThroughputPayloadStoreKind::LocalFilesystem => {
+                PayloadStoreKind::LocalFilesystem
+            }
+            fabrik_config::ThroughputPayloadStoreKind::S3 => PayloadStoreKind::S3,
+        },
+        local_dir: query.throughput_payload_store.local_dir.clone(),
+        s3_bucket: query.throughput_payload_store.s3_bucket.clone(),
+        s3_region: query.throughput_payload_store.s3_region.clone(),
+        s3_endpoint: query.throughput_payload_store.s3_endpoint.clone(),
+        s3_access_key_id: query.throughput_payload_store.s3_access_key_id.clone(),
+        s3_secret_access_key: query.throughput_payload_store.s3_secret_access_key.clone(),
+        s3_force_path_style: query.throughput_payload_store.s3_force_path_style,
+        s3_key_prefix: query.throughput_payload_store.s3_key_prefix.clone(),
+    }
 }
 
 async fn load_workflow_signals(

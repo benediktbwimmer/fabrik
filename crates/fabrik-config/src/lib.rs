@@ -70,6 +70,7 @@ pub struct RedpandaConfig {
     pub throughput_commands_topic: String,
     pub throughput_reports_topic: String,
     pub throughput_changelog_topic: String,
+    pub throughput_projections_topic: String,
     pub throughput_partitions: i32,
 }
 
@@ -93,6 +94,10 @@ impl RedpandaConfig {
             throughput_changelog_topic: read_string_with_default(
                 "THROUGHPUT_CHANGELOG_TOPIC",
                 "throughput-changelog",
+            )?,
+            throughput_projections_topic: read_string_with_default(
+                "THROUGHPUT_PROJECTIONS_TOPIC",
+                "throughput-projections",
             )?,
             throughput_partitions: read_i32_with_default("THROUGHPUT_PARTITIONS", 4)?,
         })
@@ -119,7 +124,7 @@ impl PostgresConfig {
 pub struct QueryRuntimeConfig {
     pub default_page_size: usize,
     pub max_page_size: usize,
-    pub throughput_payload_dir: String,
+    pub throughput_payload_store: ThroughputPayloadStoreConfig,
     pub history_retention_days: Option<u64>,
     pub run_retention_days: Option<u64>,
     pub activity_retention_days: Option<u64>,
@@ -151,13 +156,35 @@ pub struct ThroughputRuntimeConfig {
     pub checkpoint_dir: String,
     pub checkpoint_interval_seconds: u64,
     pub checkpoint_retention: usize,
+    pub checkpoint_key_prefix: String,
+    pub terminal_state_retention_seconds: u64,
+    pub terminal_gc_interval_seconds: u64,
     pub restore_idle_timeout_ms: u64,
-    pub payload_store_dir: String,
+    pub payload_store: ThroughputPayloadStoreConfig,
     pub inline_chunk_input_threshold_bytes: usize,
     pub inline_chunk_output_threshold_bytes: usize,
     pub grouping_chunk_threshold: usize,
     pub target_chunks_per_group: usize,
     pub max_aggregation_groups: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThroughputPayloadStoreConfig {
+    pub kind: ThroughputPayloadStoreKind,
+    pub local_dir: String,
+    pub s3_bucket: Option<String>,
+    pub s3_region: String,
+    pub s3_endpoint: Option<String>,
+    pub s3_access_key_id: Option<String>,
+    pub s3_secret_access_key: Option<String>,
+    pub s3_force_path_style: bool,
+    pub s3_key_prefix: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThroughputPayloadStoreKind {
+    LocalFilesystem,
+    S3,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,14 +229,23 @@ impl ThroughputRuntimeConfig {
                 30,
             )?,
             checkpoint_retention: read_usize_with_default("THROUGHPUT_CHECKPOINT_RETENTION", 5)?,
+            checkpoint_key_prefix: read_string_with_default(
+                "THROUGHPUT_CHECKPOINT_KEY_PREFIX",
+                "checkpoints",
+            )?,
+            terminal_state_retention_seconds: read_u64_with_default(
+                "THROUGHPUT_TERMINAL_STATE_RETENTION_SECONDS",
+                3600,
+            )?,
+            terminal_gc_interval_seconds: read_u64_with_default(
+                "THROUGHPUT_TERMINAL_GC_INTERVAL_SECONDS",
+                60,
+            )?,
             restore_idle_timeout_ms: read_u64_with_default(
                 "THROUGHPUT_RESTORE_IDLE_TIMEOUT_MS",
                 1_000,
             )?,
-            payload_store_dir: read_string_with_default(
-                "THROUGHPUT_PAYLOAD_STORE_DIR",
-                "/tmp/fabrik-throughput/payloads",
-            )?,
+            payload_store: ThroughputPayloadStoreConfig::from_env()?,
             inline_chunk_input_threshold_bytes: read_usize_with_default(
                 "THROUGHPUT_INLINE_CHUNK_INPUT_THRESHOLD_BYTES",
                 32 * 1024,
@@ -321,10 +357,7 @@ impl QueryRuntimeConfig {
         Ok(Self {
             default_page_size: read_usize_with_default("QUERY_DEFAULT_PAGE_SIZE", 100)?,
             max_page_size: read_usize_with_default("QUERY_MAX_PAGE_SIZE", 500)?,
-            throughput_payload_dir: read_string_with_default(
-                "THROUGHPUT_PAYLOAD_STORE_DIR",
-                "/tmp/fabrik-throughput/payloads",
-            )?,
+            throughput_payload_store: ThroughputPayloadStoreConfig::from_env()?,
             history_retention_days: read_optional_u64("QUERY_HISTORY_RETENTION_DAYS")?,
             run_retention_days: read_optional_u64("QUERY_RUN_RETENTION_DAYS")?,
             activity_retention_days: read_optional_u64("QUERY_ACTIVITY_RETENTION_DAYS")?,
@@ -333,6 +366,34 @@ impl QueryRuntimeConfig {
             retention_sweep_interval_seconds: read_u64_with_default(
                 "QUERY_RETENTION_SWEEP_INTERVAL_SECONDS",
                 300,
+            )?,
+        })
+    }
+}
+
+impl ThroughputPayloadStoreConfig {
+    pub fn from_env() -> Result<Self, ConfigError> {
+        Ok(Self {
+            kind: read_payload_store_kind_with_default(
+                "THROUGHPUT_PAYLOAD_STORE",
+                ThroughputPayloadStoreKind::LocalFilesystem,
+            )?,
+            local_dir: read_string_with_default(
+                "THROUGHPUT_PAYLOAD_STORE_DIR",
+                "/tmp/fabrik-throughput/payloads",
+            )?,
+            s3_bucket: read_optional_string("THROUGHPUT_PAYLOAD_S3_BUCKET")?,
+            s3_region: read_string_with_default("THROUGHPUT_PAYLOAD_S3_REGION", "us-east-1")?,
+            s3_endpoint: read_optional_string("THROUGHPUT_PAYLOAD_S3_ENDPOINT")?,
+            s3_access_key_id: read_optional_string("THROUGHPUT_PAYLOAD_S3_ACCESS_KEY_ID")?,
+            s3_secret_access_key: read_optional_string("THROUGHPUT_PAYLOAD_S3_SECRET_ACCESS_KEY")?,
+            s3_force_path_style: read_bool_with_default(
+                "THROUGHPUT_PAYLOAD_S3_FORCE_PATH_STYLE",
+                false,
+            )?,
+            s3_key_prefix: read_string_with_default(
+                "THROUGHPUT_PAYLOAD_S3_KEY_PREFIX",
+                "throughput",
             )?,
         })
     }
@@ -518,6 +579,42 @@ fn read_optional_u64(key: &str) -> Result<Option<u64>, ConfigError> {
     }
 }
 
+fn read_optional_string(key: &str) -> Result<Option<String>, ConfigError> {
+    match env::var(key) {
+        Ok(raw) if raw.trim().is_empty() => Ok(None),
+        Ok(raw) => Ok(Some(raw)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
+    }
+}
+
+fn read_bool_with_default(key: &str, default: bool) -> Result<bool, ConfigError> {
+    match env::var(key) {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(ConfigError::InvalidBool { key: key.to_owned(), value: raw }),
+        },
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
+    }
+}
+
+fn read_payload_store_kind_with_default(
+    key: &str,
+    default: ThroughputPayloadStoreKind,
+) -> Result<ThroughputPayloadStoreKind, ConfigError> {
+    match env::var(key) {
+        Ok(raw) => match raw.trim() {
+            "localfs" => Ok(ThroughputPayloadStoreKind::LocalFilesystem),
+            "s3" => Ok(ThroughputPayloadStoreKind::S3),
+            _ => Err(ConfigError::InvalidPayloadStoreKind { key: key.to_owned(), value: raw }),
+        },
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read environment variable {key}: {source}")]
@@ -532,6 +629,10 @@ pub enum ConfigError {
     InvalidI32 { key: String, value: String },
     #[error("environment variable {key} must be a valid i64, got {value}")]
     InvalidI64 { key: String, value: String },
+    #[error("environment variable {key} must be a valid bool, got {value}")]
+    InvalidBool { key: String, value: String },
+    #[error("environment variable {key} must be one of localfs or s3, got {value}")]
+    InvalidPayloadStoreKind { key: String, value: String },
 }
 
 #[cfg(test)]

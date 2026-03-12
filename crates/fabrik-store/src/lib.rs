@@ -387,6 +387,15 @@ pub struct ThroughputProjectionChunkStateUpdate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ThroughputProjectionEvent {
+    UpsertBatch { batch: WorkflowBulkBatchRecord },
+    UpsertChunk { chunk: WorkflowBulkChunkRecord },
+    UpdateBatchState { update: ThroughputProjectionBatchStateUpdate },
+    UpdateChunkState { update: ThroughputProjectionChunkStateUpdate },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CancelledBulkBatch {
     pub batch: WorkflowBulkBatchRecord,
     pub cancelled_chunks: Vec<WorkflowBulkChunkRecord>,
@@ -1967,6 +1976,21 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize workflow_throughput_partition_assignments table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS throughput_projection_offsets (
+                projector_id TEXT NOT NULL,
+                partition_id INTEGER NOT NULL,
+                offset BIGINT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (projector_id, partition_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize throughput_projection_offsets table")?;
 
         sqlx::query(
             r#"
@@ -9049,6 +9073,56 @@ impl WorkflowStore {
         .await
         .context("failed to list nonterminal throughput projection batches for backend")?;
         rows.into_iter().map(Self::decode_bulk_batch_row).collect()
+    }
+
+    pub async fn load_throughput_projection_offsets(
+        &self,
+        projector_id: &str,
+    ) -> Result<std::collections::HashMap<i32, i64>> {
+        let rows = sqlx::query_as::<_, (i32, i64)>(
+            r#"
+            SELECT partition_id, offset
+            FROM throughput_projection_offsets
+            WHERE projector_id = $1
+            "#,
+        )
+        .bind(projector_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load throughput projection offsets")?;
+        Ok(rows.into_iter().collect())
+    }
+
+    pub async fn commit_throughput_projection_offset(
+        &self,
+        projector_id: &str,
+        partition_id: i32,
+        offset: i64,
+        updated_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO throughput_projection_offsets (
+                projector_id,
+                partition_id,
+                offset,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (projector_id, partition_id)
+            DO UPDATE SET
+                offset = EXCLUDED.offset,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(projector_id)
+        .bind(partition_id)
+        .bind(offset)
+        .bind(updated_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to commit throughput projection offset")?;
+        Ok(())
     }
 
     pub async fn count_bulk_chunks_for_batch_query_view(

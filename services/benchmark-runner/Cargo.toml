@@ -15,4 +15,5 @@ tokio.workspace = true
 uuid.workspace = true
 
 fabrik-config = { path = "../../crates/fabrik-config" }
+fabrik-throughput = { path = "../../crates/fabrik-throughput" }
 fabrik-workflow = { path = "../../crates/fabrik-workflow" }

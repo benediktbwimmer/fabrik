@@ -17,6 +17,7 @@ members = [
     "services/query-service",
     "services/replay-tool",
     "services/timer-service",
+    "services/throughput-projector",
     "services/throughput-runtime",
 ]
 resolver = "3"
@@ -29,6 +30,8 @@ version = "0.1.0"
 [workspace.dependencies]
 anyhow = "1.0.100"
 axum = "0.8.6"
+aws-config = "1.8.8"
+aws-sdk-s3 = "1.115.0"
 chrono = { version = "0.4.42", features = ["clock", "serde"] }
 futures-util = "0.3.31"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
