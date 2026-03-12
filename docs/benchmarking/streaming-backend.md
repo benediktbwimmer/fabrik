@@ -2,6 +2,30 @@
 
 Use `benchmark-runner` to compare the durable engine, `pg-v1`, and `stream-v2` under the same workload.
 
+## Turnkey isolated run
+
+Use the isolated harness when you want trustworthy numbers without reusing your normal local service processes:
+
+```bash
+./scripts/run-isolated-benchmark.sh
+```
+
+That command will:
+
+- start or reuse the local Docker infra (`redpanda`, `postgres`, `minio`)
+- create a fresh benchmark database and unique Redpanda topics
+- launch isolated release services on dedicated ports
+- run the benchmark runner with a fresh tenant/task queue namespace
+- write logs under `target/benchmark-runs/<namespace>/logs`
+- write the benchmark report under `target/benchmark-reports/<namespace>.json`
+
+By default it runs the `streaming` suite with the `target` profile. You can pass normal `benchmark-runner` flags through to the script:
+
+```bash
+./scripts/run-isolated-benchmark.sh --suite streaming --profile smoke --worker-count 4
+./scripts/run-isolated-benchmark.sh --execution-mode throughput --throughput-backend stream-v2 --profile target --chunk-size 100
+```
+
 ## Prerequisites
 
 - local stack running, including MinIO, `throughput-runtime`, and `throughput-projector`

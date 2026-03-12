@@ -107,7 +107,9 @@ For throughput mode, the compiler additionally lowers `ctx.bulkActivity()` into:
 - `start_bulk_activity` — creates batch and chunk manifest
 - `wait_for_bulk_activity` — blocks until batch terminal event
 
-Bulk activity options (`taskQueue`, `chunkSize`, `backend`, `retry`) must be static literals in the compiled artifact. The `items` expression is evaluated at runtime.
+Bulk activity options (`taskQueue`, `chunkSize`, `execution`, `reducer`, `retry`) must be static literals in the compiled artifact. The `items` expression is evaluated at runtime.
+
+Backend selection is server-controlled and pinned per batch. Workflow code does not select `pg-v1` vs `stream-v2`.
 
 The compiler must reject workflow code that breaks determinism, while activity code remains unconstrained.
 

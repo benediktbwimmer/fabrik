@@ -7,7 +7,12 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use axum::{Json, routing::get};
+use axum::{
+    Json,
+    extract::{Path, Query, State as AxumState},
+    http::StatusCode,
+    routing::get,
+};
 use chrono::Utc;
 use fabrik_broker::{
     BrokerConfig, JsonTopicConfig, JsonTopicPublisher, WorkflowPublisher,
@@ -20,11 +25,10 @@ use fabrik_config::{
 };
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
-use fabrik_store::PartitionOwnershipRecord;
 use fabrik_store::{
-    ThroughputProjectionBatchStateUpdate, ThroughputProjectionChunkStateUpdate,
-    ThroughputProjectionEvent, WorkflowBulkBatchStatus, WorkflowBulkChunkRecord,
-    WorkflowBulkChunkStatus, WorkflowStore,
+    PartitionOwnershipRecord, ThroughputProjectionBatchStateUpdate,
+    ThroughputProjectionChunkStateUpdate, ThroughputProjectionEvent, WorkflowBulkBatchRecord,
+    WorkflowBulkBatchStatus, WorkflowBulkChunkRecord, WorkflowBulkChunkStatus, WorkflowStore,
 };
 use fabrik_throughput::{
     CreateBatchCommand, PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
@@ -40,8 +44,9 @@ use fabrik_worker_protocol::activity_worker::{
 };
 use futures_util::StreamExt;
 use local_state::{
-    LocalThroughputDebugSnapshot, LocalThroughputState, ProjectedBatchTerminal,
-    ProjectedChunkReschedule, ProjectedGroupTerminal, ProjectedTerminalApply, ReportValidation,
+    LeasedChunkSnapshot, LocalThroughputDebugSnapshot, LocalThroughputState,
+    ProjectedBatchGroupSummary, ProjectedBatchTerminal, ProjectedGroupTerminal,
+    ProjectedTerminalApply, ReportValidation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -83,11 +88,22 @@ struct WorkerApi {
 
 #[derive(Debug, Clone, Serialize, Default)]
 struct ThroughputDebugState {
+    poll_requests: u64,
+    poll_responses: u64,
+    leased_tasks: u64,
+    empty_polls: u64,
+    lease_misses_with_ready_chunks: u64,
+    last_lease_selection_debug: Option<serde_json::Value>,
     bridged_batches: u64,
     duplicate_bridge_events: u64,
     bridge_failures: u64,
+    report_rpcs_received: u64,
     reports_received: u64,
+    report_batches_applied: u64,
+    report_batch_items_total: u64,
     reports_rejected: u64,
+    projection_events_published: u64,
+    changelog_entries_published: u64,
     terminal_events_published: u64,
     tenant_throttle_events: u64,
     task_queue_throttle_events: u64,
@@ -97,6 +113,7 @@ struct ThroughputDebugState {
     last_bridge_at: Option<chrono::DateTime<chrono::Utc>>,
     last_report_at: Option<chrono::DateTime<chrono::Utc>>,
     last_terminal_event_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_lease_miss_with_ready_chunks_at: Option<chrono::DateTime<chrono::Utc>>,
     last_report_rejection_reason: Option<String>,
     last_throttle_at: Option<chrono::DateTime<chrono::Utc>>,
     last_throttle_reason: Option<String>,
@@ -109,6 +126,41 @@ struct ThroughputDebugResponse {
     runtime: ThroughputDebugState,
     local_state: LocalThroughputDebugSnapshot,
     ownership: ThroughputOwnershipDebugSnapshot,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ChunkPageQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StrongBatchResponse {
+    batch: WorkflowBulkBatchRecord,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StrongChunksResponse {
+    chunks: Vec<WorkflowBulkChunkRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct ChunkTerminalArtifacts {
+    result_handle: Option<Value>,
+    cancellation_reason: Option<String>,
+    cancellation_metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamProjectionRecord {
+    key: String,
+    event: ThroughputProjectionEvent,
+}
+
+#[derive(Debug, Clone)]
+struct StreamChangelogRecord {
+    key: String,
+    entry: ThroughputChangelogEntry,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,7 +348,7 @@ async fn main() -> Result<()> {
         ownership.clone(),
         state.local_state.clone(),
         managed_partitions.clone(),
-        format!("http://127.0.0.1:{}/debug/throughput", debug_config.port),
+        format!("http://127.0.0.1:{}", debug_config.port),
         debug.clone(),
         ownership_config,
     ));
@@ -323,6 +375,14 @@ async fn main() -> Result<()> {
             }
         }),
     )
+    .route(
+        "/debug/throughput/batches/{tenant_id}/{instance_id}/{run_id}/{batch_id}",
+        get(get_strong_batch_snapshot),
+    )
+    .route(
+        "/debug/throughput/batches/{tenant_id}/{instance_id}/{run_id}/{batch_id}/chunks",
+        get(get_strong_chunk_snapshots),
+    )
     .with_state(state.clone());
     tokio::spawn(async move {
         if let Err(error) = serve(debug_app, debug_config.port).await {
@@ -337,6 +397,38 @@ async fn main() -> Result<()> {
         .serve(addr)
         .await?;
     Ok(())
+}
+
+async fn get_strong_batch_snapshot(
+    Path((tenant_id, instance_id, run_id, batch_id)): Path<(String, String, String, String)>,
+    AxumState(state): AxumState<AppState>,
+) -> Result<Json<StrongBatchResponse>, (StatusCode, String)> {
+    let batch = load_owner_batch_record(&state, &tenant_id, &instance_id, &run_id, &batch_id)
+        .await
+        .map_err(internal_http_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("bulk batch {batch_id} not found")))?;
+    Ok(Json(StrongBatchResponse { batch }))
+}
+
+async fn get_strong_chunk_snapshots(
+    Path((tenant_id, instance_id, run_id, batch_id)): Path<(String, String, String, String)>,
+    Query(pagination): Query<ChunkPageQuery>,
+    AxumState(state): AxumState<AppState>,
+) -> Result<Json<StrongChunksResponse>, (StatusCode, String)> {
+    let limit = pagination.limit.unwrap_or(100).max(1);
+    let offset = pagination.offset.unwrap_or(0);
+    let chunks = load_owner_chunk_records(
+        &state,
+        &tenant_id,
+        &instance_id,
+        &run_id,
+        &batch_id,
+        limit,
+        offset,
+    )
+    .await
+    .map_err(internal_http_error)?;
+    Ok(Json(StrongChunksResponse { chunks }))
 }
 
 async fn run_bridge_loop(state: AppState, mut consumer: fabrik_broker::WorkflowConsumerStream) {
@@ -374,6 +466,8 @@ async fn run_bridge_loop(state: AppState, mut consumer: fabrik_broker::WorkflowC
             max_attempts,
             retry_delay_ms,
             aggregation_group_count: _,
+            execution_policy: _,
+            reducer: _,
             throughput_backend,
             throughput_backend_version,
             state: workflow_state,
@@ -972,6 +1066,133 @@ fn build_payload_store_config(runtime: &ThroughputRuntimeConfig) -> PayloadStore
     }
 }
 
+async fn load_owner_batch_record(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    batch_id: &str,
+) -> Result<Option<WorkflowBulkBatchRecord>> {
+    let Some(mut batch) =
+        state.store.get_bulk_batch(tenant_id, instance_id, run_id, batch_id).await?.or(state
+            .store
+            .get_bulk_batch_query_view(tenant_id, instance_id, run_id, batch_id)
+            .await?)
+    else {
+        return Ok(None);
+    };
+    if batch.throughput_backend != ThroughputBackend::StreamV2.as_str() {
+        return Ok(Some(batch));
+    }
+    let identity = ThroughputBatchIdentity {
+        tenant_id: tenant_id.to_owned(),
+        instance_id: instance_id.to_owned(),
+        run_id: run_id.to_owned(),
+        batch_id: batch_id.to_owned(),
+    };
+    if let Some(snapshot) = state.local_state.batch_snapshot(&identity)? {
+        batch.status = parse_bulk_batch_status(&snapshot.status)?;
+        batch.succeeded_items = snapshot.succeeded_items;
+        batch.failed_items = snapshot.failed_items;
+        batch.cancelled_items = snapshot.cancelled_items;
+        batch.error = snapshot.error;
+        batch.updated_at = snapshot.updated_at;
+        batch.terminal_at = snapshot.terminal_at;
+    }
+    Ok(Some(batch))
+}
+
+async fn load_owner_chunk_records(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    batch_id: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<WorkflowBulkChunkRecord>> {
+    let Some(batch) =
+        load_owner_batch_record(state, tenant_id, instance_id, run_id, batch_id).await?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut chunks = state
+        .store
+        .list_bulk_chunks_for_batch_page_query_view(
+            tenant_id,
+            instance_id,
+            run_id,
+            batch_id,
+            i64::try_from(limit).context("owner chunk page limit exceeds i64")?,
+            i64::try_from(offset).context("owner chunk page offset exceeds i64")?,
+        )
+        .await?;
+    if batch.throughput_backend != ThroughputBackend::StreamV2.as_str() {
+        return Ok(chunks);
+    }
+    let identity = ThroughputBatchIdentity {
+        tenant_id: tenant_id.to_owned(),
+        instance_id: instance_id.to_owned(),
+        run_id: run_id.to_owned(),
+        batch_id: batch_id.to_owned(),
+    };
+    let chunk_snapshots = state.local_state.chunk_snapshots_for_batch(&identity)?;
+    let chunk_snapshots = chunk_snapshots
+        .into_iter()
+        .map(|snapshot| (snapshot.chunk_id.clone(), snapshot))
+        .collect::<HashMap<_, _>>();
+    for chunk in &mut chunks {
+        if let Some(snapshot) = chunk_snapshots.get(&chunk.chunk_id) {
+            chunk.status = parse_bulk_chunk_status(&snapshot.status)?;
+            chunk.attempt = snapshot.attempt;
+            chunk.lease_epoch = snapshot.lease_epoch;
+            chunk.owner_epoch = snapshot.owner_epoch;
+            chunk.result_handle = snapshot.result_handle.clone();
+            chunk.output = snapshot.output.clone();
+            chunk.error = snapshot.error.clone();
+            chunk.cancellation_requested = snapshot.cancellation_requested;
+            chunk.cancellation_reason = snapshot.cancellation_reason.clone();
+            chunk.cancellation_metadata = snapshot.cancellation_metadata.clone();
+            chunk.worker_id = snapshot.worker_id.clone();
+            chunk.lease_token =
+                snapshot.lease_token.as_deref().and_then(|value| uuid::Uuid::parse_str(value).ok());
+            chunk.last_report_id = snapshot.report_id.clone();
+            chunk.available_at = snapshot.available_at;
+            chunk.started_at = snapshot.started_at;
+            chunk.lease_expires_at = snapshot.lease_expires_at;
+            chunk.completed_at = snapshot.completed_at;
+            chunk.updated_at = snapshot.updated_at;
+        }
+    }
+    Ok(chunks)
+}
+
+fn internal_http_error(error: anyhow::Error) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+fn parse_bulk_batch_status(status: &str) -> Result<WorkflowBulkBatchStatus> {
+    match status {
+        "scheduled" => Ok(WorkflowBulkBatchStatus::Scheduled),
+        "running" => Ok(WorkflowBulkBatchStatus::Running),
+        "completed" => Ok(WorkflowBulkBatchStatus::Completed),
+        "failed" => Ok(WorkflowBulkBatchStatus::Failed),
+        "cancelled" => Ok(WorkflowBulkBatchStatus::Cancelled),
+        other => anyhow::bail!("unknown workflow bulk batch status {other}"),
+    }
+}
+
+fn parse_bulk_chunk_status(status: &str) -> Result<WorkflowBulkChunkStatus> {
+    match status {
+        "scheduled" => Ok(WorkflowBulkChunkStatus::Scheduled),
+        "started" => Ok(WorkflowBulkChunkStatus::Started),
+        "completed" => Ok(WorkflowBulkChunkStatus::Completed),
+        "failed" => Ok(WorkflowBulkChunkStatus::Failed),
+        "cancelled" => Ok(WorkflowBulkChunkStatus::Cancelled),
+        other => anyhow::bail!("unknown workflow bulk chunk status {other}"),
+    }
+}
+
 async fn run_outbox_publisher(state: AppState) {
     loop {
         let now = Utc::now();
@@ -1064,12 +1285,6 @@ async fn run_bulk_requeue_sweep(state: AppState) {
                     continue;
                 }
             };
-            if let Err(error) =
-                sync_stream_projected_requeue(&state, &chunk.identity, &projected).await
-            {
-                error!(error = %error, batch_id = %chunk.identity.batch_id, chunk_id = %chunk.chunk_id, "failed to project requeued stream-v2 chunk");
-                continue;
-            }
             publish_changelog(
                 &state,
                 ThroughputChangelogPayload::ChunkRequeued {
@@ -1150,6 +1365,14 @@ impl ActivityWorkerApi for WorkerApi {
         request: Request<PollBulkActivityTaskRequest>,
     ) -> Result<Response<PollBulkActivityTaskResponse>, Status> {
         let request = request.into_inner();
+        let max_tasks = usize::try_from(request.max_tasks.max(1))
+            .unwrap_or(1)
+            .min(self.state.runtime.poll_max_tasks.max(1));
+        {
+            let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
+            debug.poll_requests = debug.poll_requests.saturating_add(1);
+            debug.poll_responses = debug.poll_responses.saturating_add(1);
+        }
         let batch_limit = (self.state.runtime.max_active_chunks_per_batch > 0)
             .then_some(self.state.runtime.max_active_chunks_per_batch);
         let deadline =
@@ -1158,12 +1381,12 @@ impl ActivityWorkerApi for WorkerApi {
             let owned = owned_throughput_partitions(&self.state);
             if owned.is_empty() {
                 if tokio::time::Instant::now() >= deadline {
-                    return Ok(Response::new(PollBulkActivityTaskResponse { task: None }));
+                    return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
                 }
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if tokio::time::timeout(remaining, self.state.bulk_notify.notified()).await.is_err()
                 {
-                    return Ok(Response::new(PollBulkActivityTaskResponse { task: None }));
+                    return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
                 }
                 continue;
             }
@@ -1185,12 +1408,12 @@ impl ActivityWorkerApi for WorkerApi {
             {
                 record_throttle(&self.state, "tenant_cap");
                 if tokio::time::Instant::now() >= deadline {
-                    return Ok(Response::new(PollBulkActivityTaskResponse { task: None }));
+                    return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
                 }
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if tokio::time::timeout(remaining, self.state.bulk_notify.notified()).await.is_err()
                 {
-                    return Ok(Response::new(PollBulkActivityTaskResponse { task: None }));
+                    return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
                 }
                 continue;
             }
@@ -1212,55 +1435,55 @@ impl ActivityWorkerApi for WorkerApi {
             {
                 record_throttle(&self.state, "task_queue_cap");
                 if tokio::time::Instant::now() >= deadline {
-                    return Ok(Response::new(PollBulkActivityTaskResponse { task: None }));
+                    return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
                 }
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if tokio::time::timeout(remaining, self.state.bulk_notify.notified()).await.is_err()
                 {
-                    return Ok(Response::new(PollBulkActivityTaskResponse { task: None }));
+                    return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
                 }
                 continue;
             }
-            let candidate = self
+            let now = Utc::now();
+            let leased_local = self
                 .state
                 .local_state
-                .next_ready_chunk(
+                .lease_next_ready_chunk(
                     &request.tenant_id,
                     &request.task_queue,
-                    Utc::now(),
+                    &request.worker_id,
+                    now,
+                    chrono::Duration::seconds(self.state.runtime.lease_ttl_seconds as i64),
                     batch_limit,
                     Some(&owned),
                     self.state.throughput_partitions,
                 )
                 .map_err(internal_status)?;
-            if let Some(candidate) = candidate {
-                let projected = self
-                    .state
-                    .store
-                    .get_bulk_chunk_query_view(
-                        &candidate.identity.tenant_id,
-                        &candidate.identity.instance_id,
-                        &candidate.identity.run_id,
-                        &candidate.identity.batch_id,
-                        &candidate.chunk_id,
-                    )
-                    .await
-                    .map_err(internal_status)?;
-                if let Some(record) = projected {
-                    let leased = lease_stream_projection_chunk(
-                        &record,
-                        &request.worker_id,
+            if let Some(leased_local) = leased_local {
+                let mut leased_tasks = Vec::with_capacity(max_tasks);
+                let mut projection_records = Vec::with_capacity(max_tasks * 2);
+                let mut changelog_records = Vec::with_capacity(max_tasks);
+                let mut current = Some(leased_local);
+                while let Some(leased_local) = current.take() {
+                    let leased = leased_snapshot_to_projection_chunk(
+                        &leased_local,
                         &request.worker_build_id,
-                        chrono::Duration::seconds(self.state.runtime.lease_ttl_seconds as i64),
                     )
                     .map_err(internal_status)?;
-                    if let Err(error) = sync_stream_projected_lease(&self.state, &leased).await {
-                        error!(error = %error, batch_id = %leased.batch_id, chunk_id = %leased.chunk_id, "failed to project leased stream-v2 chunk");
+                    let identity = batch_identity(&leased);
+                    if let Some(batch) = self
+                        .state
+                        .local_state
+                        .mark_batch_running(&identity, leased.updated_at)
+                        .map_err(internal_status)?
+                    {
+                        projection_records.push(running_batch_projection_record(&batch));
                     }
-                    publish_changelog(
-                        &self.state,
+                    projection_records.push(leased_chunk_projection_record(&leased));
+                    changelog_records.push(changelog_record(
+                        throughput_partition_key(&leased.batch_id, leased.group_id),
                         ThroughputChangelogPayload::ChunkLeased {
-                            identity: batch_identity(&leased),
+                            identity,
                             chunk_id: leased.chunk_id.clone(),
                             chunk_index: leased.chunk_index,
                             attempt: leased.attempt,
@@ -1277,52 +1500,84 @@ impl ActivityWorkerApi for WorkerApi {
                                 .unwrap_or_default(),
                             lease_expires_at: leased.lease_expires_at.unwrap_or_else(Utc::now),
                         },
-                        throughput_partition_key(&leased.batch_id, leased.group_id),
-                    )
-                    .await;
-                    let mut leased = leased;
-                    leased.items =
-                        resolve_chunk_items(&self.state, &leased).await.map_err(internal_status)?;
-                    return Ok(Response::new(PollBulkActivityTaskResponse {
-                        task: Some(bulk_chunk_to_proto(&leased)),
-                    }));
+                    ));
+                    leased_tasks.push(bulk_chunk_to_proto(&leased));
+                    if leased_tasks.len() >= max_tasks {
+                        break;
+                    }
+                    current = self
+                        .state
+                        .local_state
+                        .lease_next_ready_chunk(
+                            &request.tenant_id,
+                            &request.task_queue,
+                            &request.worker_id,
+                            Utc::now(),
+                            chrono::Duration::seconds(self.state.runtime.lease_ttl_seconds as i64),
+                            batch_limit,
+                            Some(&owned),
+                            self.state.throughput_partitions,
+                        )
+                        .map_err(internal_status)?;
                 }
-                if let Ok(Some(chunk)) = self
-                    .state
-                    .store
-                    .get_bulk_chunk_query_view(
-                        &candidate.identity.tenant_id,
-                        &candidate.identity.instance_id,
-                        &candidate.identity.run_id,
-                        &candidate.identity.batch_id,
-                        &candidate.chunk_id,
-                    )
-                    .await
+                if let Err(error) =
+                    publish_projection_records(&self.state, projection_records).await
                 {
-                    let _ = self.state.local_state.upsert_chunk_record(&chunk);
+                    error!(error = %error, "failed to publish leased stream-v2 projection events");
+                }
+                publish_changelog_records(&self.state, changelog_records).await;
+                {
+                    let mut debug =
+                        self.state.debug.lock().expect("throughput debug lock poisoned");
+                    debug.leased_tasks =
+                        debug.leased_tasks.saturating_add(leased_tasks.len() as u64);
+                }
+                return Ok(Response::new(PollBulkActivityTaskResponse { tasks: leased_tasks }));
+            }
+            let ready_chunk_exists = self
+                .state
+                .local_state
+                .has_ready_chunk(
+                    &request.tenant_id,
+                    &request.task_queue,
+                    Utc::now(),
+                    Some(&owned),
+                    self.state.throughput_partitions,
+                )
+                .map_err(internal_status)?;
+            let lease_selection_debug = self
+                .state
+                .local_state
+                .debug_lease_selection(
+                    &request.tenant_id,
+                    &request.task_queue,
+                    Utc::now(),
+                    batch_limit,
+                    Some(&owned),
+                    self.state.throughput_partitions,
+                )
+                .map_err(internal_status)?;
+            if batch_limit.is_some() && ready_chunk_exists {
+                record_throttle(&self.state, "batch_cap");
+                {
+                    let mut debug =
+                        self.state.debug.lock().expect("throughput debug lock poisoned");
+                    debug.lease_misses_with_ready_chunks =
+                        debug.lease_misses_with_ready_chunks.saturating_add(1);
+                    debug.last_lease_miss_with_ready_chunks_at = Some(Utc::now());
                 }
             }
-            if batch_limit.is_some()
-                && self
-                    .state
-                    .local_state
-                    .has_ready_chunk(
-                        &request.tenant_id,
-                        &request.task_queue,
-                        Utc::now(),
-                        Some(&owned),
-                        self.state.throughput_partitions,
-                    )
-                    .map_err(internal_status)?
             {
-                record_throttle(&self.state, "batch_cap");
+                let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
+                debug.empty_polls = debug.empty_polls.saturating_add(1);
+                debug.last_lease_selection_debug = serde_json::to_value(lease_selection_debug).ok();
             }
             if tokio::time::Instant::now() >= deadline {
-                return Ok(Response::new(PollBulkActivityTaskResponse { task: None }));
+                return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if tokio::time::timeout(remaining, self.state.bulk_notify.notified()).await.is_err() {
-                return Ok(Response::new(PollBulkActivityTaskResponse { task: None }));
+                return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
             }
         }
     }
@@ -1373,158 +1628,203 @@ impl ActivityWorkerApi for WorkerApi {
         &self,
         request: Request<ReportBulkActivityTaskResultsRequest>,
     ) -> Result<Response<Ack>, Status> {
+        let mut reports = Vec::new();
         for result in request.into_inner().results {
+            reports.push(throughput_report_from_result(result)?);
+        }
+        {
+            let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
+            debug.report_rpcs_received = debug.report_rpcs_received.saturating_add(1);
+            debug.reports_received = debug.reports_received.saturating_add(reports.len() as u64);
+            debug.last_report_at = Some(Utc::now());
+        }
+
+        for report_batch in reports.chunks(self.state.runtime.report_apply_batch_size.max(1)) {
+            let mut projection_records = Vec::with_capacity(report_batch.len() * 2);
             {
                 let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
-                debug.reports_received = debug.reports_received.saturating_add(1);
-                debug.last_report_at = Some(Utc::now());
+                debug.report_batches_applied = debug.report_batches_applied.saturating_add(1);
+                debug.report_batch_items_total =
+                    debug.report_batch_items_total.saturating_add(report_batch.len() as u64);
             }
-            ensure_bulk_batch_backend(
-                &self.state.store,
-                &result.tenant_id,
-                &result.instance_id,
-                &result.run_id,
-                &result.batch_id,
-                ThroughputBackend::StreamV2.as_str(),
-            )
-            .await?;
-            let report = throughput_report_from_result(result)?;
-            let throughput_partition_id = throughput_partition_for_batch(
-                &report.batch_id,
-                report.group_id,
-                self.state.throughput_partitions,
-            );
-            if !owns_throughput_partition(&self.state, throughput_partition_id) {
-                return Err(Status::unavailable(format!(
-                    "throughput partition {} is not owned by this runtime",
-                    throughput_partition_id
-                )));
-            }
-            self.state
-                .report_publisher
-                .publish(
-                    &ThroughputReportEnvelope {
-                        report_id: report.report_id.clone(),
-                        occurred_at: report.occurred_at,
-                        partition_key: throughput_partition_key(&report.batch_id, report.group_id),
-                        payload: report.clone(),
-                    },
-                    &throughput_partition_key(&report.batch_id, report.group_id),
-                )
-                .await
-                .map_err(internal_status)?;
-            let identity = ThroughputBatchIdentity {
-                tenant_id: report.tenant_id.clone(),
-                instance_id: report.instance_id.clone(),
-                run_id: report.run_id.clone(),
-                batch_id: report.batch_id.clone(),
-            };
-            let validation = self
-                .state
-                .local_state
-                .validate_report(
-                    &identity,
-                    &report.chunk_id,
-                    report.attempt,
-                    report.lease_epoch,
-                    &report.lease_token,
-                    report.owner_epoch,
-                    &report.report_id,
-                )
-                .map_err(internal_status)?;
-            if validation != ReportValidation::Accept {
-                let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
-                debug.reports_rejected = debug.reports_rejected.saturating_add(1);
-                debug.last_report_rejection_reason =
-                    Some(report_validation_label(validation).to_owned());
-                continue;
-            }
-            let projected = self
-                .state
-                .local_state
-                .project_report_apply(&report)
-                .map_err(internal_status)?
-                .ok_or_else(|| {
-                    Status::failed_precondition(format!(
-                        "report {} could not be projected from local owner state",
-                        report.report_id
-                    ))
-                })?;
-            sync_stream_projected_apply(&self.state, &report, &projected)
-                .await
-                .map_err(internal_status)?;
-            publish_changelog(
-                &self.state,
-                ThroughputChangelogPayload::ChunkApplied {
-                    identity: ThroughputBatchIdentity {
-                        tenant_id: report.tenant_id.clone(),
-                        instance_id: report.instance_id.clone(),
-                        run_id: report.run_id.clone(),
-                        batch_id: report.batch_id.clone(),
-                    },
-                    chunk_id: projected.chunk_id.clone(),
-                    chunk_index: report.chunk_index,
-                    attempt: projected.chunk_attempt,
-                    group_id: report.group_id,
-                    item_count: projected.chunk_item_count,
-                    max_attempts: projected.chunk_max_attempts,
-                    retry_delay_ms: projected.chunk_retry_delay_ms,
-                    lease_epoch: report.lease_epoch,
-                    owner_epoch: report.owner_epoch,
-                    report_id: report.report_id.clone(),
-                    status: projected.chunk_status.clone(),
-                    available_at: projected.chunk_available_at,
-                    error: projected.chunk_error.clone(),
-                },
-                throughput_partition_key(&report.batch_id, report.group_id),
-            )
-            .await;
-            if let Ok(Some(group_terminal)) = self.state.local_state.project_group_terminal(
-                &identity,
-                report.group_id,
-                report.occurred_at,
-            ) {
-                maybe_publish_group_terminal(
-                    &self.state,
-                    &identity,
+
+            for report in report_batch {
+                let report = report.clone();
+                let throughput_partition_id = throughput_partition_for_batch(
+                    &report.batch_id,
                     report.group_id,
-                    group_terminal,
-                )
-                .await;
-            }
-            if projected.batch_terminal {
+                    self.state.throughput_partitions,
+                );
+                if !owns_throughput_partition(&self.state, throughput_partition_id) {
+                    return Err(Status::unavailable(format!(
+                        "throughput partition {} is not owned by this runtime",
+                        throughput_partition_id
+                    )));
+                }
+                self.state
+                    .report_publisher
+                    .publish(
+                        &ThroughputReportEnvelope {
+                            report_id: report.report_id.clone(),
+                            occurred_at: report.occurred_at,
+                            partition_key: throughput_partition_key(
+                                &report.batch_id,
+                                report.group_id,
+                            ),
+                            payload: report.clone(),
+                        },
+                        &throughput_partition_key(&report.batch_id, report.group_id),
+                    )
+                    .await
+                    .map_err(internal_status)?;
+                let identity = ThroughputBatchIdentity {
+                    tenant_id: report.tenant_id.clone(),
+                    instance_id: report.instance_id.clone(),
+                    run_id: report.run_id.clone(),
+                    batch_id: report.batch_id.clone(),
+                };
+                if self
+                    .state
+                    .local_state
+                    .batch_snapshot(&identity)
+                    .map_err(internal_status)?
+                    .is_none()
+                {
+                    return Err(Status::failed_precondition(format!(
+                        "bulk batch {} is not owned by this runtime",
+                        report.batch_id
+                    )));
+                }
+                let validation = self
+                    .state
+                    .local_state
+                    .validate_report(
+                        &identity,
+                        &report.chunk_id,
+                        report.attempt,
+                        report.lease_epoch,
+                        &report.lease_token,
+                        report.owner_epoch,
+                        &report.report_id,
+                    )
+                    .map_err(internal_status)?;
+                if validation != ReportValidation::Accept {
+                    let mut debug =
+                        self.state.debug.lock().expect("throughput debug lock poisoned");
+                    debug.reports_rejected = debug.reports_rejected.saturating_add(1);
+                    debug.last_report_rejection_reason =
+                        Some(report_validation_label(validation).to_owned());
+                    continue;
+                }
+                let projected = self
+                    .state
+                    .local_state
+                    .project_report_apply(&report)
+                    .map_err(internal_status)?
+                    .ok_or_else(|| {
+                        Status::failed_precondition(format!(
+                            "report {} could not be projected from local owner state",
+                            report.report_id
+                        ))
+                    })?;
+                let terminal_artifacts = materialize_chunk_terminal_artifacts(&self.state, &report)
+                    .await
+                    .map_err(internal_status)?;
+                projection_records.extend(projected_apply_projection_records(
+                    &report,
+                    &projected,
+                    &terminal_artifacts,
+                ));
                 publish_changelog(
                     &self.state,
-                    ThroughputChangelogPayload::BatchTerminal {
-                        identity: ThroughputBatchIdentity {
-                            tenant_id: report.tenant_id.clone(),
-                            instance_id: report.instance_id.clone(),
-                            run_id: report.run_id.clone(),
-                            batch_id: report.batch_id.clone(),
-                        },
-                        status: projected.batch_status.clone(),
+                    ThroughputChangelogPayload::ChunkApplied {
+                        identity: identity.clone(),
+                        chunk_id: projected.chunk_id.clone(),
+                        chunk_index: report.chunk_index,
+                        attempt: projected.chunk_attempt,
+                        group_id: report.group_id,
+                        item_count: projected.chunk_item_count,
+                        max_attempts: projected.chunk_max_attempts,
+                        retry_delay_ms: projected.chunk_retry_delay_ms,
+                        lease_epoch: report.lease_epoch,
+                        owner_epoch: report.owner_epoch,
                         report_id: report.report_id.clone(),
-                        succeeded_items: projected.batch_succeeded_items,
-                        failed_items: projected.batch_failed_items,
-                        cancelled_items: projected.batch_cancelled_items,
-                        error: projected.batch_error.clone(),
-                        terminal_at: projected.terminal_at.unwrap_or(report.occurred_at),
+                        status: projected.chunk_status.clone(),
+                        available_at: projected.chunk_available_at,
+                        result_handle: terminal_artifacts.result_handle.clone(),
+                        output: None,
+                        error: projected.chunk_error.clone(),
+                        cancellation_reason: terminal_artifacts.cancellation_reason.clone(),
+                        cancellation_metadata: terminal_artifacts.cancellation_metadata.clone(),
                     },
                     throughput_partition_key(&report.batch_id, report.group_id),
                 )
                 .await;
-                publish_stream_terminal_event(&self.state, &report, &projected)
-                    .await
-                    .map_err(internal_status)?;
-                let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
-                debug.terminal_events_published = debug.terminal_events_published.saturating_add(1);
-                debug.last_terminal_event_at = Some(Utc::now());
+                if let Ok(Some(group_terminal)) = self.state.local_state.project_group_terminal(
+                    &identity,
+                    report.group_id,
+                    report.occurred_at,
+                ) {
+                    maybe_publish_group_terminal(
+                        &self.state,
+                        &identity,
+                        report.group_id,
+                        group_terminal,
+                    )
+                    .await;
+                    if let Some(batch_terminal) = self
+                        .state
+                        .local_state
+                        .project_batch_terminal_from_groups(&identity, report.occurred_at)
+                        .map_err(internal_status)?
+                    {
+                        finalize_grouped_stream_batch(&self.state, &identity, &batch_terminal)
+                            .await
+                            .map_err(internal_status)?;
+                    } else if let Some(summary) = self
+                        .state
+                        .local_state
+                        .project_batch_group_summary(&identity)
+                        .map_err(internal_status)?
+                    {
+                        projection_records
+                            .push(grouped_batch_summary_projection_record(&identity, &summary));
+                    }
+                }
+                if projected.batch_terminal {
+                    publish_changelog(
+                        &self.state,
+                        ThroughputChangelogPayload::BatchTerminal {
+                            identity: identity.clone(),
+                            status: projected.batch_status.clone(),
+                            report_id: report.report_id.clone(),
+                            succeeded_items: projected.batch_succeeded_items,
+                            failed_items: projected.batch_failed_items,
+                            cancelled_items: projected.batch_cancelled_items,
+                            error: projected.batch_error.clone(),
+                            terminal_at: projected.terminal_at.unwrap_or(report.occurred_at),
+                        },
+                        throughput_partition_key(&report.batch_id, report.group_id),
+                    )
+                    .await;
+                    publish_stream_terminal_event(&self.state, &report, &projected)
+                        .await
+                        .map_err(internal_status)?;
+                    let mut debug =
+                        self.state.debug.lock().expect("throughput debug lock poisoned");
+                    debug.terminal_events_published =
+                        debug.terminal_events_published.saturating_add(1);
+                    debug.last_terminal_event_at = Some(Utc::now());
+                }
+                if projected.chunk_status == WorkflowBulkChunkStatus::Scheduled.as_str()
+                    || projected.batch_terminal_deferred
+                {
+                    self.state.bulk_notify.notify_waiters();
+                }
             }
-            if projected.chunk_status == WorkflowBulkChunkStatus::Scheduled.as_str()
-                || projected.batch_terminal_deferred
-            {
-                self.state.bulk_notify.notify_waiters();
-            }
+            publish_projection_records(&self.state, projection_records)
+                .await
+                .map_err(internal_status)?;
         }
         Ok(Response::new(Ack {}))
     }
@@ -1567,6 +1867,8 @@ async fn build_stream_projection_records(
         max_attempts,
         retry_delay_ms,
         aggregation_group_count,
+        execution_policy: _,
+        reducer: _,
         throughput_backend,
         throughput_backend_version,
         state,
@@ -1703,23 +2005,55 @@ async fn build_stream_projection_records(
     Ok((batch, chunks))
 }
 
-fn lease_stream_projection_chunk(
-    chunk: &WorkflowBulkChunkRecord,
-    worker_id: &str,
+fn leased_snapshot_to_projection_chunk(
+    leased_local: &LeasedChunkSnapshot,
     worker_build_id: &str,
-    lease_ttl: chrono::Duration,
 ) -> Result<WorkflowBulkChunkRecord> {
-    let now = Utc::now();
-    let mut leased = chunk.clone();
-    leased.status = WorkflowBulkChunkStatus::Started;
-    leased.worker_id = Some(worker_id.to_owned());
-    leased.worker_build_id = Some(worker_build_id.to_owned());
-    leased.lease_token = Some(Uuid::now_v7());
-    leased.lease_epoch = leased.lease_epoch.saturating_add(1);
-    leased.started_at = leased.started_at.or(Some(now));
-    leased.lease_expires_at = Some(now + lease_ttl);
-    leased.updated_at = now;
-    Ok(leased)
+    Ok(WorkflowBulkChunkRecord {
+        tenant_id: leased_local.identity.tenant_id.clone(),
+        instance_id: leased_local.identity.instance_id.clone(),
+        run_id: leased_local.identity.run_id.clone(),
+        definition_id: leased_local.definition_id.clone(),
+        definition_version: leased_local.definition_version,
+        artifact_hash: leased_local.artifact_hash.clone(),
+        batch_id: leased_local.identity.batch_id.clone(),
+        chunk_id: leased_local.chunk_id.clone(),
+        chunk_index: leased_local.chunk_index,
+        group_id: leased_local.group_id,
+        item_count: leased_local.item_count,
+        activity_type: leased_local.activity_type.clone(),
+        task_queue: leased_local.task_queue.clone(),
+        state: None,
+        status: WorkflowBulkChunkStatus::Started,
+        attempt: leased_local.attempt,
+        lease_epoch: leased_local.lease_epoch,
+        owner_epoch: leased_local.owner_epoch,
+        max_attempts: leased_local.max_attempts,
+        retry_delay_ms: leased_local.retry_delay_ms,
+        input_handle: leased_local.input_handle.clone(),
+        result_handle: Value::Null,
+        items: leased_local.items.clone(),
+        output: None,
+        error: None,
+        cancellation_requested: leased_local.cancellation_requested,
+        cancellation_reason: None,
+        cancellation_metadata: None,
+        worker_id: leased_local.worker_id.clone(),
+        worker_build_id: Some(worker_build_id.to_owned()),
+        lease_token: leased_local
+            .lease_token
+            .as_deref()
+            .map(Uuid::parse_str)
+            .transpose()
+            .context("failed to parse leased local throughput lease token")?,
+        last_report_id: None,
+        scheduled_at: leased_local.scheduled_at,
+        available_at: leased_local.updated_at,
+        started_at: leased_local.started_at,
+        lease_expires_at: leased_local.lease_expires_at,
+        completed_at: None,
+        updated_at: leased_local.updated_at,
+    })
 }
 
 fn planned_aggregation_group_count(
@@ -1756,10 +2090,11 @@ async fn maybe_externalize_batch_input(
     if total_input_bytes <= state.runtime.inline_chunk_input_threshold_bytes {
         return Ok(default_handle.clone());
     }
-    let handle = state
-        .payload_store
-        .write_value(&format!("batches/{batch_id}/input"), &Value::Array(items.to_vec()))
-        .await?;
+    let handle = PayloadHandle::Manifest {
+        key: format!("batches/{batch_id}/input"),
+        store: state.payload_store.default_store_kind().as_str().to_owned(),
+    };
+    let _ = items;
     serde_json::to_value(handle).context("failed to serialize batch input handle")
 }
 
@@ -1768,15 +2103,10 @@ async fn maybe_initialize_batch_result_manifest(
     batch_id: &str,
     default_handle: &Value,
 ) -> Result<Value> {
-    let manifest = serde_json::json!({
-        "kind": "chunk-result-manifest",
-        "batchId": batch_id,
-        "chunks": []
-    });
-    let handle = state
-        .payload_store
-        .write_value(&format!("batches/{batch_id}/results/manifest"), &manifest)
-        .await?;
+    let handle = PayloadHandle::Manifest {
+        key: format!("batches/{batch_id}/results/manifest"),
+        store: state.payload_store.default_store_kind().as_str().to_owned(),
+    };
     let serialized =
         serde_json::to_value(handle).context("failed to serialize batch result handle")?;
     if default_handle.is_null() { Ok(serialized) } else { Ok(serialized) }
@@ -1789,12 +2119,6 @@ async fn maybe_externalize_chunk_input(
     items: &[Value],
 ) -> Result<(Vec<Value>, Value)> {
     let payload = Value::Array(items.to_vec());
-    let item_bytes = serde_json::to_vec(&payload)
-        .map(|bytes| bytes.len())
-        .context("failed to serialize chunk input payload")?;
-    if item_bytes <= state.runtime.inline_chunk_input_threshold_bytes {
-        return Ok((items.to_vec(), Value::Null));
-    }
     let handle = state
         .payload_store
         .write_value(&format!("batches/{batch_id}/chunks/{chunk_id}/input"), &payload)
@@ -1810,34 +2134,52 @@ async fn maybe_externalize_chunk_output(
     batch_id: &str,
     chunk_id: &str,
     output: &[Value],
-) -> Result<(Option<Vec<Value>>, Value)> {
+) -> Result<Value> {
     let payload = Value::Array(output.to_vec());
-    let output_bytes = serde_json::to_vec(&payload)
-        .map(|bytes| bytes.len())
-        .context("failed to serialize chunk output payload")?;
-    if output_bytes <= state.runtime.inline_chunk_output_threshold_bytes {
-        return Ok((Some(output.to_vec()), Value::Null));
-    }
     let handle = state
         .payload_store
         .write_value(&format!("batches/{batch_id}/chunks/{chunk_id}/output"), &payload)
         .await?;
-    Ok((None, serde_json::to_value(handle).context("failed to serialize chunk output handle")?))
+    serde_json::to_value(handle).context("failed to serialize chunk output handle")
 }
 
-async fn resolve_chunk_items(
+async fn materialize_chunk_terminal_artifacts(
     state: &AppState,
-    chunk: &WorkflowBulkChunkRecord,
-) -> Result<Vec<Value>> {
-    if !chunk.items.is_empty() {
-        return Ok(chunk.items.clone());
+    report: &ThroughputChunkReport,
+) -> Result<ChunkTerminalArtifacts> {
+    match &report.payload {
+        ThroughputChunkReportPayload::ChunkCompleted { result_handle, output } => {
+            let resolved_result_handle = if result_handle.is_null() {
+                let Some(output) = output else {
+                    anyhow::bail!(
+                        "stream-v2 completion for chunk {} missing result_handle and compatibility output",
+                        report.chunk_id
+                    );
+                };
+                maybe_externalize_chunk_output(state, &report.batch_id, &report.chunk_id, output)
+                    .await?
+            } else {
+                result_handle.clone()
+            };
+            Ok(ChunkTerminalArtifacts {
+                result_handle: Some(resolved_result_handle),
+                cancellation_reason: None,
+                cancellation_metadata: None,
+            })
+        }
+        ThroughputChunkReportPayload::ChunkFailed { .. } => Ok(ChunkTerminalArtifacts {
+            result_handle: None,
+            cancellation_reason: None,
+            cancellation_metadata: None,
+        }),
+        ThroughputChunkReportPayload::ChunkCancelled { reason, metadata } => {
+            Ok(ChunkTerminalArtifacts {
+                result_handle: None,
+                cancellation_reason: Some(reason.clone()),
+                cancellation_metadata: metadata.clone(),
+            })
+        }
     }
-    if let Ok(handle) =
-        serde_json::from_value::<fabrik_throughput::PayloadHandle>(chunk.input_handle.clone())
-    {
-        return state.payload_store.read_items(&handle).await;
-    }
-    Ok(Vec::new())
 }
 
 async fn publish_stream_terminal_event(
@@ -1845,25 +2187,22 @@ async fn publish_stream_terminal_event(
     report: &ThroughputChunkReport,
     projected: &ProjectedTerminalApply,
 ) -> Result<()> {
-    let Some(batch) = state
-        .store
-        .get_bulk_batch_query_view(
-            &report.tenant_id,
-            &report.instance_id,
-            &report.run_id,
-            &report.batch_id,
-        )
-        .await?
-    else {
-        anyhow::bail!("stream-v2 batch {} not found in query projection", report.batch_id);
+    let identity = ThroughputBatchIdentity {
+        tenant_id: report.tenant_id.clone(),
+        instance_id: report.instance_id.clone(),
+        run_id: report.run_id.clone(),
+        batch_id: report.batch_id.clone(),
+    };
+    let Some(batch) = state.local_state.batch_snapshot(&identity)? else {
+        anyhow::bail!("stream-v2 batch {} not found in local owner state", report.batch_id);
     };
     let identity = WorkflowIdentity::new(
-        batch.tenant_id.clone(),
+        batch.identity.tenant_id.clone(),
         batch.definition_id.clone(),
         batch.definition_version.unwrap_or_default(),
         batch.artifact_hash.clone().unwrap_or_default(),
-        batch.instance_id.clone(),
-        batch.run_id.clone(),
+        batch.identity.instance_id.clone(),
+        batch.identity.run_id.clone(),
         "throughput-runtime",
     );
     let payload = match projected.batch_status.as_str() {
@@ -1961,24 +2300,13 @@ async fn finalize_grouped_stream_batch(
     identity: &ThroughputBatchIdentity,
     projected: &ProjectedBatchTerminal,
 ) -> Result<()> {
-    let Some(existing_batch) = state
-        .store
-        .get_bulk_batch_query_view(
-            &identity.tenant_id,
-            &identity.instance_id,
-            &identity.run_id,
-            &identity.batch_id,
-        )
-        .await?
-    else {
-        anyhow::bail!("grouped throughput batch {} missing from query view", identity.batch_id);
+    let Some(existing_batch) = state.local_state.batch_snapshot(identity)? else {
+        anyhow::bail!(
+            "grouped throughput batch {} missing from local owner state",
+            identity.batch_id
+        );
     };
-    if matches!(
-        existing_batch.status,
-        WorkflowBulkBatchStatus::Completed
-            | WorkflowBulkBatchStatus::Failed
-            | WorkflowBulkBatchStatus::Cancelled
-    ) {
+    if matches!(existing_batch.status.as_str(), "completed" | "failed" | "cancelled") {
         return Ok(());
     }
 
@@ -2002,20 +2330,6 @@ async fn finalize_grouped_stream_batch(
     )
     .await?;
 
-    let mut terminal_batch = existing_batch.clone();
-    terminal_batch.status = match projected.status.as_str() {
-        "completed" => WorkflowBulkBatchStatus::Completed,
-        "failed" => WorkflowBulkBatchStatus::Failed,
-        "cancelled" => WorkflowBulkBatchStatus::Cancelled,
-        other => anyhow::bail!("unexpected grouped batch terminal status {other}"),
-    };
-    terminal_batch.succeeded_items = projected.succeeded_items;
-    terminal_batch.failed_items = projected.failed_items;
-    terminal_batch.cancelled_items = projected.cancelled_items;
-    terminal_batch.error = projected.error.clone();
-    terminal_batch.terminal_at = Some(projected.terminal_at);
-    terminal_batch.updated_at = projected.terminal_at;
-
     publish_changelog(
         state,
         ThroughputChangelogPayload::BatchTerminal {
@@ -2031,7 +2345,45 @@ async fn finalize_grouped_stream_batch(
         throughput_partition_key(&identity.batch_id, 0),
     )
     .await;
-    publish_stream_batch_terminal_event(state, &terminal_batch).await?;
+    publish_stream_batch_terminal_event(
+        state,
+        &fabrik_store::WorkflowBulkBatchRecord {
+            tenant_id: existing_batch.identity.tenant_id.clone(),
+            instance_id: existing_batch.identity.instance_id.clone(),
+            run_id: existing_batch.identity.run_id.clone(),
+            definition_id: existing_batch.definition_id.clone(),
+            definition_version: existing_batch.definition_version,
+            artifact_hash: existing_batch.artifact_hash.clone(),
+            batch_id: existing_batch.identity.batch_id.clone(),
+            activity_type: String::new(),
+            task_queue: existing_batch.task_queue.clone(),
+            state: None,
+            input_handle: Value::Null,
+            result_handle: Value::Null,
+            throughput_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
+            throughput_backend_version: ThroughputBackend::StreamV2.default_version().to_owned(),
+            aggregation_group_count: 1,
+            status: match projected.status.as_str() {
+                "completed" => WorkflowBulkBatchStatus::Completed,
+                "failed" => WorkflowBulkBatchStatus::Failed,
+                "cancelled" => WorkflowBulkBatchStatus::Cancelled,
+                other => anyhow::bail!("unexpected grouped batch terminal status {other}"),
+            },
+            total_items: existing_batch.total_items,
+            chunk_size: 0,
+            chunk_count: existing_batch.chunk_count,
+            succeeded_items: projected.succeeded_items,
+            failed_items: projected.failed_items,
+            cancelled_items: projected.cancelled_items,
+            max_attempts: 0,
+            retry_delay_ms: 0,
+            error: projected.error.clone(),
+            scheduled_at: existing_batch.updated_at,
+            terminal_at: Some(projected.terminal_at),
+            updated_at: projected.terminal_at,
+        },
+    )
+    .await?;
     let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
     debug.terminal_events_published = debug.terminal_events_published.saturating_add(1);
     debug.last_terminal_event_at = Some(Utc::now());
@@ -2052,7 +2404,10 @@ async fn publish_changelog(state: &AppState, payload: ThroughputChangelogPayload
     if let Err(error) = state.local_state.mirror_changelog_entry(&entry) {
         state.local_state.record_changelog_apply_failure();
         error!(error = %error, "failed to mirror throughput changelog entry into local state");
+        return;
     }
+    let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
+    debug.changelog_entries_published = debug.changelog_entries_published.saturating_add(1);
 }
 
 async fn publish_projection_event(
@@ -2064,7 +2419,74 @@ async fn publish_projection_event(
         .projection_publisher
         .publish(&payload, &key)
         .await
-        .context("failed to publish throughput projection event")
+        .context("failed to publish throughput projection event")?;
+    let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
+    debug.projection_events_published = debug.projection_events_published.saturating_add(1);
+    Ok(())
+}
+
+fn changelog_record(key: String, payload: ThroughputChangelogPayload) -> StreamChangelogRecord {
+    StreamChangelogRecord {
+        key: key.clone(),
+        entry: ThroughputChangelogEntry {
+            entry_id: Uuid::now_v7(),
+            occurred_at: Utc::now(),
+            partition_key: key,
+            payload,
+        },
+    }
+}
+
+async fn publish_changelog_records(state: &AppState, records: Vec<StreamChangelogRecord>) {
+    if records.is_empty() {
+        return;
+    }
+
+    for batch in records.chunks(state.runtime.changelog_publish_batch_size.max(1)) {
+        let payloads = batch
+            .iter()
+            .map(|record| (record.key.clone(), record.entry.clone()))
+            .collect::<Vec<_>>();
+        if let Err(error) = state.changelog_publisher.publish_all(payloads).await {
+            error!(error = %error, "failed to publish throughput changelog entries");
+            return;
+        }
+        for record in batch {
+            if let Err(error) = state.local_state.mirror_changelog_entry(&record.entry) {
+                state.local_state.record_changelog_apply_failure();
+                error!(error = %error, "failed to mirror throughput changelog entry into local state");
+                return;
+            }
+        }
+        let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
+        debug.changelog_entries_published =
+            debug.changelog_entries_published.saturating_add(batch.len() as u64);
+    }
+}
+
+async fn publish_projection_records(
+    state: &AppState,
+    records: Vec<StreamProjectionRecord>,
+) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+
+    for batch in records.chunks(state.runtime.projection_publish_batch_size.max(1)) {
+        let payloads = batch
+            .iter()
+            .map(|record| (record.key.clone(), record.event.clone()))
+            .collect::<Vec<_>>();
+        state
+            .projection_publisher
+            .publish_all(payloads)
+            .await
+            .context("failed to publish throughput projection events")?;
+        let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
+        debug.projection_events_published =
+            debug.projection_events_published.saturating_add(batch.len() as u64);
+    }
+    Ok(())
 }
 
 async fn maybe_publish_group_terminal(
@@ -2098,10 +2520,23 @@ fn throughput_report_from_result(
             fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
                 completed,
             ),
-        ) => ThroughputChunkReportPayload::ChunkCompleted {
-            output: serde_json::from_str(&completed.output_json)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?,
-        },
+        ) => {
+            let result_handle = if completed.result_handle_json.trim().is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_str(&completed.result_handle_json)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?
+            };
+            let output = if completed.output_json.trim().is_empty() {
+                None
+            } else {
+                Some(
+                    serde_json::from_str(&completed.output_json)
+                        .map_err(|error| Status::invalid_argument(error.to_string()))?,
+                )
+            };
+            ThroughputChunkReportPayload::ChunkCompleted { result_handle, output }
+        }
         Some(
             fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Failed(
                 failed,
@@ -2159,7 +2594,9 @@ fn bulk_chunk_to_proto(record: &WorkflowBulkChunkRecord) -> BulkActivityTask {
         activity_type: record.activity_type.clone(),
         task_queue: record.task_queue.clone(),
         attempt: record.attempt,
-        items_json: serde_json::to_string(&record.items).expect("bulk chunk items serialize"),
+        items_json: String::new(),
+        input_handle_json: serde_json::to_string(&record.input_handle)
+            .expect("bulk chunk input handle serializes"),
         scheduled_at_unix_ms: record.scheduled_at.timestamp_millis(),
         lease_expires_at_unix_ms: record
             .lease_expires_at
@@ -2181,99 +2618,83 @@ fn batch_identity(record: &WorkflowBulkChunkRecord) -> ThroughputBatchIdentity {
     }
 }
 
-async fn sync_stream_projected_apply(
-    state: &AppState,
+fn projected_apply_projection_records(
     report: &ThroughputChunkReport,
     projected: &ProjectedTerminalApply,
-) -> Result<()> {
-    let batch_update = ThroughputProjectionBatchStateUpdate {
-        tenant_id: report.tenant_id.clone(),
-        instance_id: report.instance_id.clone(),
-        run_id: report.run_id.clone(),
-        batch_id: report.batch_id.clone(),
-        status: projected.batch_status.clone(),
-        succeeded_items: projected.batch_succeeded_items,
-        failed_items: projected.batch_failed_items,
-        cancelled_items: projected.batch_cancelled_items,
-        error: projected.batch_error.clone(),
-        terminal_at: projected.terminal_at,
-        updated_at: report.occurred_at,
-    };
-    publish_projection_event(
-        state,
-        ThroughputProjectionEvent::UpdateBatchState { update: batch_update },
-        throughput_partition_key(&report.batch_id, report.group_id),
-    )
-    .await
-    .with_context(|| {
-        format!("failed to enqueue projected throughput batch state for {}", report.batch_id)
-    })?;
+    artifacts: &ChunkTerminalArtifacts,
+) -> Vec<StreamProjectionRecord> {
+    let mut records = Vec::with_capacity(2);
+    if projected.batch_terminal {
+        let batch_update = ThroughputProjectionBatchStateUpdate {
+            tenant_id: report.tenant_id.clone(),
+            instance_id: report.instance_id.clone(),
+            run_id: report.run_id.clone(),
+            batch_id: report.batch_id.clone(),
+            status: projected.batch_status.clone(),
+            succeeded_items: projected.batch_succeeded_items,
+            failed_items: projected.batch_failed_items,
+            cancelled_items: projected.batch_cancelled_items,
+            error: projected.batch_error.clone(),
+            terminal_at: projected.terminal_at,
+            updated_at: report.occurred_at,
+        };
+        records.push(StreamProjectionRecord {
+            key: throughput_partition_key(&report.batch_id, report.group_id),
+            event: ThroughputProjectionEvent::UpdateBatchState { update: batch_update },
+        });
+    }
 
-    let (output, result_handle, cancellation_reason, cancellation_metadata) = match &report.payload
-    {
-        ThroughputChunkReportPayload::ChunkCompleted { output } => {
-            let (output_inline, result_handle) =
-                maybe_externalize_chunk_output(state, &report.batch_id, &report.chunk_id, output)
-                    .await?;
-            (output_inline, Some(result_handle), None, None)
-        }
-        ThroughputChunkReportPayload::ChunkFailed { .. } => (None, None, None, None),
-        ThroughputChunkReportPayload::ChunkCancelled { reason, metadata } => {
-            (None, None, Some(reason.clone()), metadata.clone())
-        }
-    };
-    let chunk_update = ThroughputProjectionChunkStateUpdate {
-        tenant_id: report.tenant_id.clone(),
-        instance_id: report.instance_id.clone(),
-        run_id: report.run_id.clone(),
-        batch_id: report.batch_id.clone(),
-        chunk_id: report.chunk_id.clone(),
-        status: projected.chunk_status.clone(),
-        attempt: projected.chunk_attempt,
-        lease_epoch: report.lease_epoch,
-        owner_epoch: report.owner_epoch,
-        input_handle: None,
-        result_handle,
-        output,
-        error: projected.chunk_error.clone(),
-        cancellation_requested: false,
-        cancellation_reason,
-        cancellation_metadata,
-        worker_id: None,
-        worker_build_id: None,
-        lease_token: None,
-        last_report_id: Some(report.report_id.clone()),
-        available_at: projected.chunk_available_at,
-        started_at: None,
-        lease_expires_at: None,
-        completed_at: projected.batch_terminal.then_some(report.occurred_at).or_else(
-            || match report.payload {
-                ThroughputChunkReportPayload::ChunkCompleted { .. }
-                | ThroughputChunkReportPayload::ChunkCancelled { .. } => Some(report.occurred_at),
-                ThroughputChunkReportPayload::ChunkFailed { .. }
-                    if projected.chunk_status == WorkflowBulkChunkStatus::Failed.as_str() =>
-                {
-                    Some(report.occurred_at)
+    if projected.chunk_status != WorkflowBulkChunkStatus::Scheduled.as_str() {
+        let chunk_update = ThroughputProjectionChunkStateUpdate {
+            tenant_id: report.tenant_id.clone(),
+            instance_id: report.instance_id.clone(),
+            run_id: report.run_id.clone(),
+            batch_id: report.batch_id.clone(),
+            chunk_id: report.chunk_id.clone(),
+            status: projected.chunk_status.clone(),
+            attempt: projected.chunk_attempt,
+            lease_epoch: report.lease_epoch,
+            owner_epoch: report.owner_epoch,
+            input_handle: None,
+            result_handle: artifacts.result_handle.clone(),
+            output: None,
+            error: projected.chunk_error.clone(),
+            cancellation_requested: false,
+            cancellation_reason: artifacts.cancellation_reason.clone(),
+            cancellation_metadata: artifacts.cancellation_metadata.clone(),
+            worker_id: None,
+            worker_build_id: None,
+            lease_token: None,
+            last_report_id: Some(report.report_id.clone()),
+            available_at: projected.chunk_available_at,
+            started_at: None,
+            lease_expires_at: None,
+            completed_at: projected.batch_terminal.then_some(report.occurred_at).or_else(|| {
+                match report.payload {
+                    ThroughputChunkReportPayload::ChunkCompleted { .. }
+                    | ThroughputChunkReportPayload::ChunkCancelled { .. } => {
+                        Some(report.occurred_at)
+                    }
+                    ThroughputChunkReportPayload::ChunkFailed { .. }
+                        if projected.chunk_status == WorkflowBulkChunkStatus::Failed.as_str() =>
+                    {
+                        Some(report.occurred_at)
+                    }
+                    _ => None,
                 }
-                _ => None,
-            },
-        ),
-        updated_at: report.occurred_at,
-    };
-    publish_projection_event(
-        state,
-        ThroughputProjectionEvent::UpdateChunkState { update: chunk_update },
-        throughput_partition_key(&report.batch_id, report.group_id),
-    )
-    .await?;
-    Ok(())
+            }),
+            updated_at: report.occurred_at,
+        };
+        records.push(StreamProjectionRecord {
+            key: throughput_partition_key(&report.batch_id, report.group_id),
+            event: ThroughputProjectionEvent::UpdateChunkState { update: chunk_update },
+        });
+    }
+
+    records
 }
 
-async fn sync_stream_projected_lease(
-    state: &AppState,
-    chunk: &WorkflowBulkChunkRecord,
-) -> Result<()> {
-    mark_stream_batch_running_projection(state, chunk).await?;
+fn leased_chunk_projection_record(chunk: &WorkflowBulkChunkRecord) -> StreamProjectionRecord {
     let chunk_update = ThroughputProjectionChunkStateUpdate {
         tenant_id: chunk.tenant_id.clone(),
         instance_id: chunk.instance_id.clone(),
@@ -2301,66 +2722,57 @@ async fn sync_stream_projected_lease(
         completed_at: None,
         updated_at: chunk.updated_at,
     };
-    publish_projection_event(
-        state,
-        ThroughputProjectionEvent::UpdateChunkState { update: chunk_update },
-        throughput_partition_key(&chunk.batch_id, chunk.group_id),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "failed to enqueue leased throughput chunk state for {} in {}",
-            chunk.chunk_id, chunk.batch_id
-        )
-    })?;
-    Ok(())
+    StreamProjectionRecord {
+        key: throughput_partition_key(&chunk.batch_id, chunk.group_id),
+        event: ThroughputProjectionEvent::UpdateChunkState { update: chunk_update },
+    }
 }
 
-async fn sync_stream_projected_requeue(
-    state: &AppState,
+fn running_batch_projection_record(
+    batch: &local_state::LocalBatchSnapshot,
+) -> StreamProjectionRecord {
+    StreamProjectionRecord {
+        key: throughput_partition_key(&batch.identity.batch_id, 0),
+        event: ThroughputProjectionEvent::UpdateBatchState {
+            update: ThroughputProjectionBatchStateUpdate {
+                tenant_id: batch.identity.tenant_id.clone(),
+                instance_id: batch.identity.instance_id.clone(),
+                run_id: batch.identity.run_id.clone(),
+                batch_id: batch.identity.batch_id.clone(),
+                status: WorkflowBulkBatchStatus::Running.as_str().to_owned(),
+                succeeded_items: batch.succeeded_items,
+                failed_items: batch.failed_items,
+                cancelled_items: batch.cancelled_items,
+                error: batch.error.clone(),
+                terminal_at: batch.terminal_at,
+                updated_at: batch.updated_at,
+            },
+        },
+    }
+}
+
+fn grouped_batch_summary_projection_record(
     identity: &ThroughputBatchIdentity,
-    projected: &ProjectedChunkReschedule,
-) -> Result<()> {
-    let chunk_update = ThroughputProjectionChunkStateUpdate {
-        tenant_id: identity.tenant_id.clone(),
-        instance_id: identity.instance_id.clone(),
-        run_id: identity.run_id.clone(),
-        batch_id: identity.batch_id.clone(),
-        chunk_id: projected.chunk_id.clone(),
-        status: WorkflowBulkChunkStatus::Scheduled.as_str().to_owned(),
-        attempt: projected.attempt,
-        lease_epoch: projected.lease_epoch,
-        owner_epoch: projected.owner_epoch,
-        input_handle: None,
-        result_handle: None,
-        output: None,
-        error: None,
-        cancellation_requested: false,
-        cancellation_reason: None,
-        cancellation_metadata: None,
-        worker_id: None,
-        worker_build_id: None,
-        lease_token: None,
-        last_report_id: None,
-        available_at: projected.available_at,
-        started_at: projected.started_at,
-        lease_expires_at: None,
-        completed_at: None,
-        updated_at: projected.available_at,
-    };
-    publish_projection_event(
-        state,
-        ThroughputProjectionEvent::UpdateChunkState { update: chunk_update },
-        throughput_partition_key(&identity.batch_id, projected.group_id),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "failed to enqueue requeued throughput chunk state for {} in {}",
-            projected.chunk_id, identity.batch_id
-        )
-    })?;
-    Ok(())
+    summary: &ProjectedBatchGroupSummary,
+) -> StreamProjectionRecord {
+    StreamProjectionRecord {
+        key: throughput_partition_key(&identity.batch_id, 0),
+        event: ThroughputProjectionEvent::UpdateBatchState {
+            update: ThroughputProjectionBatchStateUpdate {
+                tenant_id: identity.tenant_id.clone(),
+                instance_id: identity.instance_id.clone(),
+                run_id: identity.run_id.clone(),
+                batch_id: identity.batch_id.clone(),
+                status: WorkflowBulkBatchStatus::Running.as_str().to_owned(),
+                succeeded_items: summary.succeeded_items,
+                failed_items: summary.failed_items,
+                cancelled_items: summary.cancelled_items,
+                error: summary.error.clone(),
+                terminal_at: None,
+                updated_at: summary.updated_at,
+            },
+        },
+    }
 }
 
 async fn sync_stream_batch_projection(
@@ -2390,10 +2802,11 @@ async fn sync_stream_chunk_projections(
     state: &AppState,
     chunks: &[WorkflowBulkChunkRecord],
 ) -> Result<()> {
-    for chunk in chunks {
-        sync_stream_chunk_projection(state, chunk).await?;
-    }
-    Ok(())
+    state
+        .store
+        .upsert_throughput_projection_chunks(chunks)
+        .await
+        .context("failed to batch sync throughput projection chunks")
 }
 
 async fn cancel_stream_batches_for_run(
@@ -2514,7 +2927,11 @@ async fn cancel_stream_batches_for_run(
                     report_id: format!("batch-cancel:{}:{}", event.event_id, chunk.chunk_id),
                     status: WorkflowBulkChunkStatus::Cancelled.as_str().to_owned(),
                     available_at: chunk.available_at,
+                    result_handle: None,
+                    output: None,
                     error: Some(reason.to_owned()),
+                    cancellation_reason: Some(reason.to_owned()),
+                    cancellation_metadata: None,
                 },
                 throughput_partition_key(&chunk.batch_id, chunk.group_id),
             )
@@ -2579,47 +2996,6 @@ async fn cancel_stream_batches_for_run(
         .await;
         publish_stream_batch_terminal_event(state, &cancelled_batch).await?;
         state.bulk_notify.notify_waiters();
-    }
-    Ok(())
-}
-
-async fn mark_stream_batch_running_projection(
-    state: &AppState,
-    chunk: &WorkflowBulkChunkRecord,
-) -> Result<()> {
-    let Some(batch) = state
-        .store
-        .get_bulk_batch_query_view(
-            &chunk.tenant_id,
-            &chunk.instance_id,
-            &chunk.run_id,
-            &chunk.batch_id,
-        )
-        .await?
-    else {
-        anyhow::bail!("stream-v2 batch {} not found", chunk.batch_id);
-    };
-    if batch.status == WorkflowBulkBatchStatus::Scheduled {
-        publish_projection_event(
-            state,
-            ThroughputProjectionEvent::UpdateBatchState {
-                update: ThroughputProjectionBatchStateUpdate {
-                    tenant_id: batch.tenant_id.clone(),
-                    instance_id: batch.instance_id.clone(),
-                    run_id: batch.run_id.clone(),
-                    batch_id: batch.batch_id.clone(),
-                    status: WorkflowBulkBatchStatus::Running.as_str().to_owned(),
-                    succeeded_items: batch.succeeded_items,
-                    failed_items: batch.failed_items,
-                    cancelled_items: batch.cancelled_items,
-                    error: batch.error.clone(),
-                    terminal_at: batch.terminal_at,
-                    updated_at: Utc::now(),
-                },
-            },
-            throughput_partition_key(&batch.batch_id, 0),
-        )
-        .await?;
     }
     Ok(())
 }

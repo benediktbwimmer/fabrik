@@ -7,7 +7,10 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use fabrik_store::{WorkflowBulkBatchRecord, WorkflowBulkChunkRecord, WorkflowBulkChunkStatus};
+use fabrik_store::{
+    WorkflowBulkBatchRecord, WorkflowBulkBatchStatus, WorkflowBulkChunkRecord,
+    WorkflowBulkChunkStatus,
+};
 use fabrik_throughput::{
     ThroughputBatchIdentity, ThroughputChangelogEntry, ThroughputChangelogPayload,
     ThroughputChunkReport, ThroughputChunkReportPayload,
@@ -17,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const OFFSET_KEY_PREFIX: &str = "meta:offset:";
+const MIRRORED_ENTRY_KEY_PREFIX: &str = "meta:mirrored-entry:";
 const BATCH_KEY_PREFIX: &str = "batch:";
 const CHUNK_KEY_PREFIX: &str = "chunk:";
 const GROUP_KEY_PREFIX: &str = "group:";
@@ -35,6 +39,7 @@ pub struct LocalThroughputState {
     #[cfg_attr(not(test), allow(dead_code))]
     checkpoint_retention: usize,
     meta: Arc<Mutex<LocalStateMeta>>,
+    lease_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -50,10 +55,27 @@ pub struct LocalThroughputDebugSnapshot {
     pub last_changelog_apply_at: Option<DateTime<Utc>>,
     pub batch_count: usize,
     pub chunk_count: usize,
+    pub scheduled_chunk_count: u64,
+    pub ready_chunk_count: u64,
     pub started_chunk_count: u64,
+    pub batch_status_counts: BTreeMap<String, u64>,
     pub last_applied_offsets: BTreeMap<i32, i64>,
     pub observed_high_watermarks: BTreeMap<i32, i64>,
     pub partition_lag: BTreeMap<i32, i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct LeaseSelectionDebug {
+    pub indexed_candidates: u64,
+    pub owned_candidates: u64,
+    pub missing_batch: u64,
+    pub terminal_batch: u64,
+    pub batch_failed_or_cancelled: u64,
+    pub batch_cap_blocked: u64,
+    pub missing_chunk: u64,
+    pub chunk_not_scheduled: u64,
+    pub chunk_not_due: u64,
+    pub leaseable_candidates: u64,
 }
 
 #[derive(Debug, Default)]
@@ -72,6 +94,8 @@ struct LocalStateMeta {
 struct CheckpointFile {
     created_at: DateTime<Utc>,
     offsets: BTreeMap<i32, i64>,
+    #[serde(default)]
+    mirrored_entry_ids: Vec<String>,
     batches: Vec<LocalBatchState>,
     chunks: Vec<LocalChunkState>,
     groups: Vec<LocalGroupState>,
@@ -80,10 +104,15 @@ struct CheckpointFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct LocalBatchState {
     identity: ThroughputBatchIdentity,
+    definition_id: String,
+    definition_version: Option<u32>,
+    artifact_hash: Option<String>,
     task_queue: String,
     aggregation_group_count: u32,
     total_items: u32,
     chunk_count: u32,
+    #[serde(default)]
+    terminal_chunk_count: u32,
     succeeded_items: u32,
     failed_items: u32,
     cancelled_items: u32,
@@ -99,6 +128,7 @@ struct LocalBatchState {
 struct LocalChunkState {
     identity: ThroughputBatchIdentity,
     chunk_id: String,
+    activity_type: String,
     task_queue: String,
     chunk_index: u32,
     group_id: u32,
@@ -113,12 +143,28 @@ struct LocalChunkState {
     #[serde(default)]
     lease_token: Option<String>,
     report_id: Option<String>,
+    #[serde(default)]
+    result_handle: Value,
+    #[serde(default)]
+    output: Option<Vec<Value>>,
     error: Option<String>,
+    #[serde(default)]
+    input_handle: Value,
+    #[serde(default)]
+    items: Vec<Value>,
+    #[serde(default)]
+    cancellation_requested: bool,
+    #[serde(default)]
+    cancellation_reason: Option<String>,
+    #[serde(default)]
+    cancellation_metadata: Option<Value>,
     scheduled_at: DateTime<Utc>,
     available_at: DateTime<Utc>,
     #[serde(default)]
     started_at: Option<DateTime<Utc>>,
     lease_expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    completed_at: Option<DateTime<Utc>>,
     updated_at: DateTime<Utc>,
 }
 
@@ -173,6 +219,84 @@ pub struct ReadyChunkCandidate {
 pub struct ExpiredChunkCandidate {
     pub identity: ThroughputBatchIdentity,
     pub chunk_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LeasedChunkSnapshot {
+    pub identity: ThroughputBatchIdentity,
+    pub definition_id: String,
+    pub definition_version: Option<u32>,
+    pub artifact_hash: Option<String>,
+    pub chunk_id: String,
+    pub activity_type: String,
+    pub task_queue: String,
+    pub chunk_index: u32,
+    pub group_id: u32,
+    pub attempt: u32,
+    pub item_count: u32,
+    pub max_attempts: u32,
+    pub retry_delay_ms: u64,
+    pub items: Vec<Value>,
+    pub input_handle: Value,
+    pub cancellation_requested: bool,
+    pub lease_epoch: u64,
+    pub owner_epoch: u64,
+    pub worker_id: Option<String>,
+    pub lease_token: Option<String>,
+    pub scheduled_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalBatchSnapshot {
+    pub identity: ThroughputBatchIdentity,
+    pub definition_id: String,
+    pub definition_version: Option<u32>,
+    pub artifact_hash: Option<String>,
+    pub task_queue: String,
+    pub total_items: u32,
+    pub chunk_count: u32,
+    pub succeeded_items: u32,
+    pub failed_items: u32,
+    pub cancelled_items: u32,
+    pub status: String,
+    pub error: Option<String>,
+    pub updated_at: DateTime<Utc>,
+    pub terminal_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedBatchGroupSummary {
+    pub succeeded_items: u32,
+    pub failed_items: u32,
+    pub cancelled_items: u32,
+    pub error: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalChunkSnapshot {
+    pub chunk_id: String,
+    pub status: String,
+    pub attempt: u32,
+    pub lease_epoch: u64,
+    pub owner_epoch: u64,
+    pub result_handle: Value,
+    pub output: Option<Vec<Value>>,
+    pub error: Option<String>,
+    pub cancellation_requested: bool,
+    pub cancellation_reason: Option<String>,
+    pub cancellation_metadata: Option<Value>,
+    pub worker_id: Option<String>,
+    pub lease_token: Option<String>,
+    pub report_id: Option<String>,
+    pub available_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +392,7 @@ impl LocalThroughputState {
             checkpoint_dir,
             checkpoint_retention: checkpoint_retention.max(1),
             meta: Arc::new(Mutex::new(LocalStateMeta::default())),
+            lease_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -316,7 +441,11 @@ impl LocalThroughputState {
         }
 
         let mut write_batch = WriteBatch::default();
-        self.write_entry_payload(&mut write_batch, entry)?;
+        if self.is_mirrored_entry_pending(entry.entry_id)? {
+            write_batch.delete(mirrored_entry_key(entry.entry_id).as_bytes());
+        } else {
+            self.write_entry_payload(&mut write_batch, entry)?;
+        }
         write_batch.put(offset_key(partition_id), offset.to_string().as_bytes());
         self.db
             .write(write_batch)
@@ -330,6 +459,7 @@ impl LocalThroughputState {
     pub fn mirror_changelog_entry(&self, entry: &ThroughputChangelogEntry) -> Result<()> {
         let mut write_batch = WriteBatch::default();
         self.write_entry_payload(&mut write_batch, entry)?;
+        write_batch.put(mirrored_entry_key(entry.entry_id), b"1");
         self.db
             .write(write_batch)
             .context("failed to mirror throughput changelog entry into local state")?;
@@ -344,10 +474,14 @@ impl LocalThroughputState {
                 run_id: batch.run_id.clone(),
                 batch_id: batch.batch_id.clone(),
             },
+            definition_id: batch.definition_id.clone(),
+            definition_version: batch.definition_version,
+            artifact_hash: batch.artifact_hash.clone(),
             task_queue: batch.task_queue.clone(),
             aggregation_group_count: batch.aggregation_group_count.max(1),
             total_items: batch.total_items,
             chunk_count: batch.chunk_count,
+            terminal_chunk_count: batch.terminal_at.map(|_| batch.chunk_count).unwrap_or_default(),
             succeeded_items: batch.succeeded_items,
             failed_items: batch.failed_items,
             cancelled_items: batch.cancelled_items,
@@ -378,6 +512,7 @@ impl LocalThroughputState {
         let state = LocalChunkState {
             identity,
             chunk_id: chunk.chunk_id.clone(),
+            activity_type: chunk.activity_type.clone(),
             task_queue: chunk.task_queue.clone(),
             chunk_index: chunk.chunk_index,
             group_id: chunk.group_id,
@@ -391,17 +526,151 @@ impl LocalThroughputState {
             worker_id: chunk.worker_id.clone(),
             lease_token: chunk.lease_token.map(|value| value.to_string()),
             report_id: chunk.last_report_id.clone(),
+            result_handle: chunk.result_handle.clone(),
+            output: chunk.output.clone(),
             error: chunk.error.clone(),
+            input_handle: chunk.input_handle.clone(),
+            items: chunk.items.clone(),
+            cancellation_requested: chunk.cancellation_requested,
+            cancellation_reason: chunk.cancellation_reason.clone(),
+            cancellation_metadata: chunk.cancellation_metadata.clone(),
             scheduled_at: chunk.scheduled_at,
             available_at: chunk.available_at,
             started_at: chunk.started_at,
             lease_expires_at: chunk.lease_expires_at,
+            completed_at: chunk.completed_at,
             updated_at: chunk.updated_at,
         };
         let mut write_batch = WriteBatch::default();
         self.write_chunk_state(&mut write_batch, existing.as_ref(), &state)?;
         self.db.write(write_batch).context("failed to upsert direct throughput chunk state")?;
         Ok(())
+    }
+
+    pub fn batch_snapshot(
+        &self,
+        identity: &ThroughputBatchIdentity,
+    ) -> Result<Option<LocalBatchSnapshot>> {
+        self.load_batch_state(identity).map(|batch| {
+            batch.map(|batch| LocalBatchSnapshot {
+                identity: batch.identity,
+                definition_id: batch.definition_id,
+                definition_version: batch.definition_version,
+                artifact_hash: batch.artifact_hash,
+                task_queue: batch.task_queue,
+                total_items: batch.total_items,
+                chunk_count: batch.chunk_count,
+                succeeded_items: batch.succeeded_items,
+                failed_items: batch.failed_items,
+                cancelled_items: batch.cancelled_items,
+                status: batch.status,
+                error: batch.error,
+                updated_at: batch.updated_at,
+                terminal_at: batch.terminal_at,
+            })
+        })
+    }
+
+    pub fn mark_batch_running(
+        &self,
+        identity: &ThroughputBatchIdentity,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<Option<LocalBatchSnapshot>> {
+        let Some(mut batch) = self.load_batch_state(identity)? else {
+            return Ok(None);
+        };
+        if batch.status != WorkflowBulkBatchStatus::Scheduled.as_str() {
+            return Ok(None);
+        }
+        batch.status = WorkflowBulkBatchStatus::Running.as_str().to_owned();
+        batch.updated_at = occurred_at;
+        self.db
+            .put(
+                batch_key(identity),
+                serde_json::to_vec(&batch).context("failed to serialize running batch state")?,
+            )
+            .context("failed to mark throughput batch running")?;
+        Ok(Some(LocalBatchSnapshot {
+            identity: batch.identity,
+            definition_id: batch.definition_id,
+            definition_version: batch.definition_version,
+            artifact_hash: batch.artifact_hash,
+            task_queue: batch.task_queue,
+            total_items: batch.total_items,
+            chunk_count: batch.chunk_count,
+            succeeded_items: batch.succeeded_items,
+            failed_items: batch.failed_items,
+            cancelled_items: batch.cancelled_items,
+            status: batch.status,
+            error: batch.error,
+            updated_at: batch.updated_at,
+            terminal_at: batch.terminal_at,
+        }))
+    }
+
+    pub fn project_batch_group_summary(
+        &self,
+        identity: &ThroughputBatchIdentity,
+    ) -> Result<Option<ProjectedBatchGroupSummary>> {
+        let groups = self.load_groups_for_batch(identity)?;
+        if groups.is_empty() {
+            return Ok(None);
+        }
+
+        let mut succeeded_items = 0_u32;
+        let mut failed_items = 0_u32;
+        let mut cancelled_items = 0_u32;
+        let mut error = None;
+        let mut updated_at = DateTime::<Utc>::UNIX_EPOCH;
+        for group in groups {
+            succeeded_items = succeeded_items.saturating_add(group.succeeded_items);
+            failed_items = failed_items.saturating_add(group.failed_items);
+            cancelled_items = cancelled_items.saturating_add(group.cancelled_items);
+            if error.is_none() {
+                error = group.error.clone();
+            }
+            updated_at = updated_at.max(group.terminal_at);
+        }
+
+        Ok(Some(ProjectedBatchGroupSummary {
+            succeeded_items,
+            failed_items,
+            cancelled_items,
+            error,
+            updated_at,
+        }))
+    }
+
+    pub fn chunk_snapshots_for_batch(
+        &self,
+        identity: &ThroughputBatchIdentity,
+    ) -> Result<Vec<LocalChunkSnapshot>> {
+        self.load_chunks_for_batch(identity).map(|chunks| {
+            chunks
+                .into_iter()
+                .map(|chunk| LocalChunkSnapshot {
+                    chunk_id: chunk.chunk_id,
+                    status: chunk.status,
+                    attempt: chunk.attempt,
+                    lease_epoch: chunk.lease_epoch,
+                    owner_epoch: chunk.owner_epoch,
+                    result_handle: chunk.result_handle,
+                    output: chunk.output,
+                    error: chunk.error,
+                    cancellation_requested: chunk.cancellation_requested,
+                    cancellation_reason: chunk.cancellation_reason,
+                    cancellation_metadata: chunk.cancellation_metadata,
+                    worker_id: chunk.worker_id,
+                    lease_token: chunk.lease_token,
+                    report_id: chunk.report_id,
+                    available_at: chunk.available_at,
+                    started_at: chunk.started_at,
+                    lease_expires_at: chunk.lease_expires_at,
+                    completed_at: chunk.completed_at,
+                    updated_at: chunk.updated_at,
+                })
+                .collect()
+        })
     }
 
     pub fn count_started_chunks(
@@ -479,6 +748,167 @@ impl LocalThroughputState {
             }));
         }
         Ok(None)
+    }
+
+    pub fn lease_next_ready_chunk(
+        &self,
+        tenant_id: &str,
+        task_queue: &str,
+        worker_id: &str,
+        now: DateTime<Utc>,
+        lease_ttl: chrono::Duration,
+        max_active_chunks_per_batch: Option<usize>,
+        owned_partitions: Option<&HashSet<i32>>,
+        partition_count: i32,
+    ) -> Result<Option<LeasedChunkSnapshot>> {
+        let _lease_guard = self.lease_lock.lock().expect("local throughput lease lock poisoned");
+        let started_by_batch =
+            self.started_counts_by_batch(tenant_id, task_queue, owned_partitions, partition_count)?;
+        for candidate in self.load_ready_chunk_entries(tenant_id, task_queue, now)? {
+            if !owned_partitions
+                .map(|partitions| {
+                    partitions.contains(&throughput_partition_id(
+                        &candidate.identity.batch_id,
+                        candidate.group_id,
+                        partition_count,
+                    ))
+                })
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            let Some(batch) = self.load_batch_state(&candidate.identity)? else {
+                continue;
+            };
+            if matches!(batch.status.as_str(), "completed" | "failed" | "cancelled")
+                || batch.failed_items > 0
+                || batch.cancelled_items > 0
+            {
+                continue;
+            }
+            if max_active_chunks_per_batch.is_some_and(|limit| {
+                started_by_batch.get(&batch_key(&candidate.identity)).copied().unwrap_or_default()
+                    >= limit
+            }) {
+                continue;
+            }
+            let Some(existing_chunk) =
+                self.load_chunk_state(&candidate.identity, &candidate.chunk_id)?
+            else {
+                continue;
+            };
+            if existing_chunk.status != WorkflowBulkChunkStatus::Scheduled.as_str()
+                || existing_chunk.available_at > now
+            {
+                continue;
+            }
+            let mut leased_chunk = existing_chunk.clone();
+            leased_chunk.status = WorkflowBulkChunkStatus::Started.as_str().to_owned();
+            leased_chunk.worker_id = Some(worker_id.to_owned());
+            leased_chunk.lease_epoch = leased_chunk.lease_epoch.saturating_add(1);
+            leased_chunk.lease_token = Some(uuid::Uuid::now_v7().to_string());
+            leased_chunk.started_at = leased_chunk.started_at.or(Some(now));
+            leased_chunk.lease_expires_at = Some(now + lease_ttl);
+            leased_chunk.updated_at = now;
+
+            let mut write_batch = WriteBatch::default();
+            self.write_chunk_state(&mut write_batch, Some(&existing_chunk), &leased_chunk)?;
+            self.db
+                .write(write_batch)
+                .context("failed to atomically lease ready throughput chunk from local state")?;
+            return Ok(Some(LeasedChunkSnapshot {
+                identity: leased_chunk.identity.clone(),
+                definition_id: batch.definition_id.clone(),
+                definition_version: batch.definition_version,
+                artifact_hash: batch.artifact_hash.clone(),
+                chunk_id: leased_chunk.chunk_id.clone(),
+                activity_type: leased_chunk.activity_type.clone(),
+                task_queue: leased_chunk.task_queue.clone(),
+                chunk_index: leased_chunk.chunk_index,
+                group_id: leased_chunk.group_id,
+                attempt: leased_chunk.attempt,
+                item_count: leased_chunk.item_count,
+                max_attempts: leased_chunk.max_attempts,
+                retry_delay_ms: leased_chunk.retry_delay_ms,
+                items: leased_chunk.items.clone(),
+                input_handle: leased_chunk.input_handle.clone(),
+                cancellation_requested: leased_chunk.cancellation_requested,
+                lease_epoch: leased_chunk.lease_epoch,
+                owner_epoch: leased_chunk.owner_epoch,
+                worker_id: leased_chunk.worker_id.clone(),
+                lease_token: leased_chunk.lease_token.clone(),
+                scheduled_at: leased_chunk.scheduled_at,
+                started_at: leased_chunk.started_at,
+                lease_expires_at: leased_chunk.lease_expires_at,
+                updated_at: leased_chunk.updated_at,
+            }));
+        }
+        Ok(None)
+    }
+
+    pub fn debug_lease_selection(
+        &self,
+        tenant_id: &str,
+        task_queue: &str,
+        now: DateTime<Utc>,
+        max_active_chunks_per_batch: Option<usize>,
+        owned_partitions: Option<&HashSet<i32>>,
+        partition_count: i32,
+    ) -> Result<LeaseSelectionDebug> {
+        let started_by_batch =
+            self.started_counts_by_batch(tenant_id, task_queue, owned_partitions, partition_count)?;
+        let mut debug = LeaseSelectionDebug::default();
+        for candidate in self.load_ready_chunk_entries(tenant_id, task_queue, now)? {
+            debug.indexed_candidates = debug.indexed_candidates.saturating_add(1);
+            if !owned_partitions
+                .map(|partitions| {
+                    partitions.contains(&throughput_partition_id(
+                        &candidate.identity.batch_id,
+                        candidate.group_id,
+                        partition_count,
+                    ))
+                })
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            debug.owned_candidates = debug.owned_candidates.saturating_add(1);
+
+            let Some(batch) = self.load_batch_state(&candidate.identity)? else {
+                debug.missing_batch = debug.missing_batch.saturating_add(1);
+                continue;
+            };
+            if matches!(batch.status.as_str(), "completed" | "failed" | "cancelled") {
+                debug.terminal_batch = debug.terminal_batch.saturating_add(1);
+                continue;
+            }
+            if batch.failed_items > 0 || batch.cancelled_items > 0 {
+                debug.batch_failed_or_cancelled = debug.batch_failed_or_cancelled.saturating_add(1);
+                continue;
+            }
+            if max_active_chunks_per_batch.is_some_and(|limit| {
+                started_by_batch.get(&batch_key(&candidate.identity)).copied().unwrap_or_default()
+                    >= limit
+            }) {
+                debug.batch_cap_blocked = debug.batch_cap_blocked.saturating_add(1);
+                continue;
+            }
+            let Some(chunk) = self.load_chunk_state(&candidate.identity, &candidate.chunk_id)?
+            else {
+                debug.missing_chunk = debug.missing_chunk.saturating_add(1);
+                continue;
+            };
+            if chunk.status != WorkflowBulkChunkStatus::Scheduled.as_str() {
+                debug.chunk_not_scheduled = debug.chunk_not_scheduled.saturating_add(1);
+                continue;
+            }
+            if chunk.available_at > now {
+                debug.chunk_not_due = debug.chunk_not_due.saturating_add(1);
+                continue;
+            }
+            debug.leaseable_candidates = debug.leaseable_candidates.saturating_add(1);
+        }
+        Ok(debug)
     }
 
     pub fn has_ready_chunk(
@@ -677,7 +1107,21 @@ impl LocalThroughputState {
                 projected.chunk_error = None;
                 projected.batch_succeeded_items =
                     projected.batch_succeeded_items.saturating_add(chunk.item_count);
-                if batch.total_items > 0 && projected.batch_succeeded_items >= batch.total_items {
+                let all_chunks_terminal =
+                    self.load_chunks_for_batch(&identity)?.into_iter().all(|candidate| {
+                        if candidate.chunk_id == report.chunk_id {
+                            true
+                        } else {
+                            matches!(
+                                candidate.status.as_str(),
+                                "completed" | "failed" | "cancelled"
+                            )
+                        }
+                    });
+                if all_chunks_terminal
+                    && batch.total_items > 0
+                    && projected.batch_succeeded_items >= batch.total_items
+                {
                     projected.batch_status = "completed".to_owned();
                     projected.batch_terminal = true;
                     projected.terminal_at = Some(report.occurred_at);
@@ -984,6 +1428,24 @@ impl LocalThroughputState {
                 (*partition_id, lag.max(0))
             })
             .collect::<BTreeMap<_, _>>();
+        let batches = self.load_all_batches()?;
+        let chunks = self.load_all_chunks()?;
+        let batch_status_counts =
+            batches.iter().fold(BTreeMap::new(), |mut counts: BTreeMap<String, u64>, batch| {
+                *counts.entry(batch.status.clone()).or_default() += 1;
+                counts
+            });
+        let scheduled_chunk_count = chunks
+            .iter()
+            .filter(|chunk| chunk.status == WorkflowBulkChunkStatus::Scheduled.as_str())
+            .count() as u64;
+        let ready_chunk_count = chunks
+            .iter()
+            .filter(|chunk| {
+                chunk.status == WorkflowBulkChunkStatus::Scheduled.as_str()
+                    && chunk.available_at <= Utc::now()
+            })
+            .count() as u64;
         Ok(LocalThroughputDebugSnapshot {
             db_path: self.db_path.display().to_string(),
             checkpoint_dir: self.checkpoint_dir.display().to_string(),
@@ -994,9 +1456,12 @@ impl LocalThroughputState {
             changelog_entries_applied: meta.changelog_entries_applied,
             changelog_apply_failures: meta.changelog_apply_failures,
             last_changelog_apply_at: meta.last_changelog_apply_at,
-            batch_count: self.load_all_batches()?.len(),
-            chunk_count: self.load_all_chunks()?.len(),
+            batch_count: batches.len(),
+            chunk_count: chunks.len(),
+            scheduled_chunk_count,
+            ready_chunk_count,
             started_chunk_count: self.count_started_chunks(None, None, None, None, 1)?,
+            batch_status_counts,
             last_applied_offsets,
             observed_high_watermarks,
             partition_lag,
@@ -1021,6 +1486,14 @@ impl LocalThroughputState {
             .transpose()
     }
 
+    fn is_mirrored_entry_pending(&self, entry_id: uuid::Uuid) -> Result<bool> {
+        Ok(self
+            .db
+            .get(mirrored_entry_key(entry_id))
+            .context("failed to load mirrored throughput entry marker")?
+            .is_some())
+    }
+
     fn load_offsets(&self) -> Result<BTreeMap<i32, i64>> {
         let mut offsets = BTreeMap::new();
         for entry in self.db.iterator(IteratorMode::Start) {
@@ -1039,6 +1512,21 @@ impl LocalThroughputState {
             }
         }
         Ok(offsets)
+    }
+
+    fn load_mirrored_entry_ids(&self) -> Result<Vec<String>> {
+        let mut entry_ids = Vec::new();
+        for entry in self.db.iterator(IteratorMode::Start) {
+            let (key, _value) =
+                entry.context("failed to iterate throughput mirrored-entry markers")?;
+            let key =
+                String::from_utf8(key.to_vec()).context("throughput state key is not utf-8")?;
+            if let Some(entry_id) = key.strip_prefix(MIRRORED_ENTRY_KEY_PREFIX) {
+                entry_ids.push(entry_id.to_owned());
+            }
+        }
+        entry_ids.sort();
+        Ok(entry_ids)
     }
 
     fn load_batch_state(
@@ -1179,10 +1667,14 @@ impl LocalThroughputState {
             let indexed: ReadyChunkIndexEntry = serde_json::from_slice(&value)
                 .context("failed to deserialize ready chunk index entry")?;
             if let Some(chunk) = self.load_chunk_state(&indexed.identity, &indexed.chunk_id)? {
-                if chunk.status == WorkflowBulkChunkStatus::Scheduled.as_str()
-                    && chunk.available_at <= now
-                {
-                    entries.push(indexed);
+                if chunk.status == WorkflowBulkChunkStatus::Scheduled.as_str() {
+                    if chunk.available_at <= now {
+                        entries.push(indexed);
+                    } else {
+                        // The ready index is ordered by `available_at`, so once we hit a future
+                        // scheduled chunk the remaining entries are not leaseable yet either.
+                        break;
+                    }
                     continue;
                 }
             }
@@ -1456,22 +1948,32 @@ impl LocalThroughputState {
                 total_items,
                 chunk_count,
             } => {
-                let state = LocalBatchState {
-                    identity: identity.clone(),
-                    task_queue: task_queue.clone(),
-                    aggregation_group_count: *aggregation_group_count,
-                    total_items: *total_items,
-                    chunk_count: *chunk_count,
-                    succeeded_items: 0,
-                    failed_items: 0,
-                    cancelled_items: 0,
-                    status: "scheduled".to_owned(),
-                    last_report_id: None,
-                    error: None,
-                    created_at: entry.occurred_at,
-                    updated_at: entry.occurred_at,
-                    terminal_at: None,
-                };
+                let mut state =
+                    self.load_batch_state(identity)?.unwrap_or_else(|| LocalBatchState {
+                        identity: identity.clone(),
+                        definition_id: String::new(),
+                        definition_version: None,
+                        artifact_hash: None,
+                        task_queue: String::new(),
+                        aggregation_group_count: 1,
+                        total_items: 0,
+                        chunk_count: 0,
+                        terminal_chunk_count: 0,
+                        succeeded_items: 0,
+                        failed_items: 0,
+                        cancelled_items: 0,
+                        status: "scheduled".to_owned(),
+                        last_report_id: None,
+                        error: None,
+                        created_at: entry.occurred_at,
+                        updated_at: entry.occurred_at,
+                        terminal_at: None,
+                    });
+                state.task_queue = task_queue.clone();
+                state.aggregation_group_count = *aggregation_group_count;
+                state.total_items = *total_items;
+                state.chunk_count = *chunk_count;
+                state.updated_at = entry.occurred_at;
                 write_batch.put(
                     batch_key(identity),
                     serde_json::to_vec(&state).context("failed to serialize batch state")?,
@@ -1496,10 +1998,14 @@ impl LocalThroughputState {
                 let mut batch_state =
                     self.load_batch_state(identity)?.unwrap_or_else(|| LocalBatchState {
                         identity: identity.clone(),
+                        definition_id: String::new(),
+                        definition_version: None,
+                        artifact_hash: None,
                         task_queue: String::new(),
                         aggregation_group_count: 1,
                         total_items: 0,
                         chunk_count: 0,
+                        terminal_chunk_count: 0,
                         succeeded_items: 0,
                         failed_items: 0,
                         cancelled_items: 0,
@@ -1523,6 +2029,10 @@ impl LocalThroughputState {
                 let state = LocalChunkState {
                     identity: identity.clone(),
                     chunk_id: chunk_id.clone(),
+                    activity_type: existing_chunk
+                        .as_ref()
+                        .map(|chunk| chunk.activity_type.clone())
+                        .unwrap_or_default(),
                     task_queue: batch_state.task_queue.clone(),
                     chunk_index: *chunk_index,
                     group_id: *group_id,
@@ -1536,7 +2046,30 @@ impl LocalThroughputState {
                     worker_id: Some(worker_id.clone()),
                     lease_token: Some(lease_token.clone()),
                     report_id: None,
+                    result_handle: existing_chunk
+                        .as_ref()
+                        .map(|chunk| chunk.result_handle.clone())
+                        .unwrap_or(Value::Null),
+                    output: existing_chunk.as_ref().and_then(|chunk| chunk.output.clone()),
                     error: existing_chunk.as_ref().and_then(|chunk| chunk.error.clone()),
+                    input_handle: existing_chunk
+                        .as_ref()
+                        .map(|chunk| chunk.input_handle.clone())
+                        .unwrap_or(Value::Null),
+                    items: existing_chunk
+                        .as_ref()
+                        .map(|chunk| chunk.items.clone())
+                        .unwrap_or_default(),
+                    cancellation_requested: existing_chunk
+                        .as_ref()
+                        .map(|chunk| chunk.cancellation_requested)
+                        .unwrap_or(false),
+                    cancellation_reason: existing_chunk
+                        .as_ref()
+                        .and_then(|chunk| chunk.cancellation_reason.clone()),
+                    cancellation_metadata: existing_chunk
+                        .as_ref()
+                        .and_then(|chunk| chunk.cancellation_metadata.clone()),
                     scheduled_at: existing_chunk
                         .as_ref()
                         .map(|chunk| chunk.scheduled_at)
@@ -1547,6 +2080,7 @@ impl LocalThroughputState {
                         .and_then(|chunk| chunk.started_at)
                         .or(Some(entry.occurred_at)),
                     lease_expires_at: Some(*lease_expires_at),
+                    completed_at: None,
                     updated_at: entry.occurred_at,
                 };
                 self.write_chunk_state(write_batch, existing_chunk.as_ref(), &state)?;
@@ -1565,7 +2099,11 @@ impl LocalThroughputState {
                 report_id,
                 status,
                 available_at,
+                result_handle,
+                output,
                 error,
+                cancellation_reason,
+                cancellation_metadata,
             } => {
                 let existing_chunk = self.load_chunk_state(identity, chunk_id)?;
                 let task_queue = existing_chunk
@@ -1582,6 +2120,10 @@ impl LocalThroughputState {
                 let state = LocalChunkState {
                     identity: identity.clone(),
                     chunk_id: chunk_id.clone(),
+                    activity_type: existing_chunk
+                        .as_ref()
+                        .map(|chunk| chunk.activity_type.clone())
+                        .unwrap_or_default(),
                     task_queue,
                     chunk_index: *chunk_index,
                     group_id: *group_id,
@@ -1595,7 +2137,23 @@ impl LocalThroughputState {
                     worker_id: None,
                     lease_token: None,
                     report_id: Some(report_id.clone()),
+                    result_handle: result_handle.clone().unwrap_or(Value::Null),
+                    output: output.clone(),
                     error: error.clone(),
+                    input_handle: existing_chunk
+                        .as_ref()
+                        .map(|chunk| chunk.input_handle.clone())
+                        .unwrap_or(Value::Null),
+                    items: existing_chunk
+                        .as_ref()
+                        .map(|chunk| chunk.items.clone())
+                        .unwrap_or_default(),
+                    cancellation_requested: existing_chunk
+                        .as_ref()
+                        .map(|chunk| chunk.cancellation_requested)
+                        .unwrap_or(false),
+                    cancellation_reason: cancellation_reason.clone(),
+                    cancellation_metadata: cancellation_metadata.clone(),
                     scheduled_at: existing_chunk
                         .as_ref()
                         .map(|chunk| chunk.scheduled_at)
@@ -1603,16 +2161,22 @@ impl LocalThroughputState {
                     available_at: *available_at,
                     started_at: existing_chunk.as_ref().and_then(|chunk| chunk.started_at),
                     lease_expires_at: None,
+                    completed_at: matches!(status.as_str(), "completed" | "failed" | "cancelled")
+                        .then_some(entry.occurred_at),
                     updated_at: entry.occurred_at,
                 };
                 self.write_chunk_state(write_batch, existing_chunk.as_ref(), &state)?;
                 let mut batch_state =
                     self.load_batch_state(identity)?.unwrap_or_else(|| LocalBatchState {
                         identity: identity.clone(),
+                        definition_id: String::new(),
+                        definition_version: None,
+                        artifact_hash: None,
                         task_queue: String::new(),
                         aggregation_group_count: 1,
                         total_items: 0,
                         chunk_count: 0,
+                        terminal_chunk_count: 0,
                         succeeded_items: 0,
                         failed_items: 0,
                         cancelled_items: 0,
@@ -1631,15 +2195,21 @@ impl LocalThroughputState {
                         "completed" => {
                             batch_state.succeeded_items =
                                 batch_state.succeeded_items.saturating_add(*item_count);
+                            batch_state.terminal_chunk_count =
+                                batch_state.terminal_chunk_count.saturating_add(1);
                         }
                         "failed" => {
                             batch_state.failed_items =
                                 batch_state.failed_items.saturating_add(*item_count);
+                            batch_state.terminal_chunk_count =
+                                batch_state.terminal_chunk_count.saturating_add(1);
                             batch_state.error = error.clone();
                         }
                         "cancelled" => {
                             batch_state.cancelled_items =
                                 batch_state.cancelled_items.saturating_add(*item_count);
+                            batch_state.terminal_chunk_count =
+                                batch_state.terminal_chunk_count.saturating_add(1);
                             batch_state.error = error.clone();
                         }
                         _ => {}
@@ -1684,6 +2254,10 @@ impl LocalThroughputState {
                 let state = LocalChunkState {
                     identity: identity.clone(),
                     chunk_id: chunk_id.clone(),
+                    activity_type: existing_chunk
+                        .as_ref()
+                        .map(|chunk| chunk.activity_type.clone())
+                        .unwrap_or_default(),
                     task_queue,
                     chunk_index: *chunk_index,
                     group_id: *group_id,
@@ -1697,7 +2271,27 @@ impl LocalThroughputState {
                     worker_id: None,
                     lease_token: None,
                     report_id: existing_chunk.as_ref().and_then(|chunk| chunk.report_id.clone()),
+                    result_handle: Value::Null,
+                    output: None,
                     error: existing_chunk.as_ref().and_then(|chunk| chunk.error.clone()),
+                    input_handle: existing_chunk
+                        .as_ref()
+                        .map(|chunk| chunk.input_handle.clone())
+                        .unwrap_or(Value::Null),
+                    items: existing_chunk
+                        .as_ref()
+                        .map(|chunk| chunk.items.clone())
+                        .unwrap_or_default(),
+                    cancellation_requested: existing_chunk
+                        .as_ref()
+                        .map(|chunk| chunk.cancellation_requested)
+                        .unwrap_or(false),
+                    cancellation_reason: existing_chunk
+                        .as_ref()
+                        .and_then(|chunk| chunk.cancellation_reason.clone()),
+                    cancellation_metadata: existing_chunk
+                        .as_ref()
+                        .and_then(|chunk| chunk.cancellation_metadata.clone()),
                     scheduled_at: existing_chunk
                         .as_ref()
                         .map(|chunk| chunk.scheduled_at)
@@ -1705,16 +2299,21 @@ impl LocalThroughputState {
                     available_at: *available_at,
                     started_at: existing_chunk.as_ref().and_then(|chunk| chunk.started_at),
                     lease_expires_at: None,
+                    completed_at: None,
                     updated_at: entry.occurred_at,
                 };
                 self.write_chunk_state(write_batch, existing_chunk.as_ref(), &state)?;
                 let mut batch_state =
                     self.load_batch_state(identity)?.unwrap_or_else(|| LocalBatchState {
                         identity: identity.clone(),
+                        definition_id: String::new(),
+                        definition_version: None,
+                        artifact_hash: None,
                         task_queue: String::new(),
                         aggregation_group_count: 1,
                         total_items: 0,
                         chunk_count: 0,
+                        terminal_chunk_count: 0,
                         succeeded_items: 0,
                         failed_items: 0,
                         cancelled_items: 0,
@@ -1748,12 +2347,16 @@ impl LocalThroughputState {
                 let mut batch_state =
                     self.load_batch_state(identity)?.unwrap_or_else(|| LocalBatchState {
                         identity: identity.clone(),
+                        definition_id: String::new(),
+                        definition_version: None,
+                        artifact_hash: None,
                         task_queue: String::new(),
                         aggregation_group_count: 1,
                         total_items: succeeded_items
                             .saturating_add(*failed_items)
                             .saturating_add(*cancelled_items),
                         chunk_count: 0,
+                        terminal_chunk_count: 0,
                         succeeded_items: 0,
                         failed_items: 0,
                         cancelled_items: 0,
@@ -1769,6 +2372,7 @@ impl LocalThroughputState {
                 batch_state.succeeded_items = *succeeded_items;
                 batch_state.failed_items = *failed_items;
                 batch_state.cancelled_items = *cancelled_items;
+                batch_state.terminal_chunk_count = batch_state.chunk_count;
                 batch_state.error = error.clone();
                 batch_state.updated_at = entry.occurred_at;
                 batch_state.terminal_at = Some(*terminal_at);
@@ -1823,6 +2427,7 @@ impl LocalThroughputState {
         Ok(CheckpointFile {
             created_at: Utc::now(),
             offsets: self.load_offsets()?,
+            mirrored_entry_ids: self.load_mirrored_entry_ids()?,
             batches: self.load_all_batches()?,
             chunks: self.load_all_chunks()?,
             groups: self.load_all_groups()?,
@@ -1836,6 +2441,9 @@ impl LocalThroughputState {
         let mut batch = WriteBatch::default();
         for (partition, offset) in &checkpoint.offsets {
             batch.put(offset_key(*partition), offset.to_string().as_bytes());
+        }
+        for entry_id in &checkpoint.mirrored_entry_ids {
+            batch.put(mirrored_entry_key(entry_id), b"1");
         }
         for state in &checkpoint.batches {
             batch.put(
@@ -1885,6 +2493,10 @@ impl LocalThroughputState {
 
 fn offset_key(partition_id: i32) -> String {
     format!("{OFFSET_KEY_PREFIX}{partition_id}")
+}
+
+fn mirrored_entry_key(entry_id: impl std::fmt::Display) -> String {
+    format!("{MIRRORED_ENTRY_KEY_PREFIX}{entry_id}")
 }
 
 fn batch_key(identity: &ThroughputBatchIdentity) -> String {
@@ -2115,7 +2727,11 @@ mod tests {
                 report_id: "report-1".to_owned(),
                 status: "completed".to_owned(),
                 available_at: Utc::now(),
+                result_handle: None,
+                output: None,
                 error: None,
+                cancellation_reason: None,
+                cancellation_metadata: None,
             }),
         )?;
         state.apply_changelog_entry(
@@ -2205,6 +2821,77 @@ mod tests {
     }
 
     #[test]
+    fn local_state_keeps_future_ready_chunks_indexed_until_due() -> Result<()> {
+        let db_path = temp_path("throughput-state-future-ready-db");
+        let checkpoint_dir = temp_path("throughput-state-future-ready-checkpoints");
+        let state = LocalThroughputState::open(&db_path, &checkpoint_dir, 3)?;
+        let batch_identity = identity();
+        let now = Utc::now();
+        let future_at = now + chrono::Duration::seconds(5);
+
+        state.apply_changelog_entry(
+            0,
+            1,
+            &entry(ThroughputChangelogPayload::BatchCreated {
+                identity: batch_identity.clone(),
+                task_queue: "bulk".to_owned(),
+                aggregation_group_count: 1,
+                total_items: 1,
+                chunk_count: 1,
+            }),
+        )?;
+        state.apply_changelog_entry(
+            0,
+            2,
+            &entry(ThroughputChangelogPayload::ChunkLeased {
+                identity: batch_identity.clone(),
+                chunk_id: "chunk-future".to_owned(),
+                chunk_index: 0,
+                attempt: 1,
+                group_id: 0,
+                item_count: 1,
+                max_attempts: 1,
+                retry_delay_ms: 0,
+                lease_epoch: 1,
+                owner_epoch: 1,
+                worker_id: "worker-a".to_owned(),
+                lease_token: TEST_LEASE_TOKEN.to_owned(),
+                lease_expires_at: now + chrono::Duration::seconds(30),
+            }),
+        )?;
+        state.apply_changelog_entry(
+            0,
+            3,
+            &entry(ThroughputChangelogPayload::ChunkRequeued {
+                identity: batch_identity.clone(),
+                chunk_id: "chunk-future".to_owned(),
+                chunk_index: 0,
+                attempt: 1,
+                group_id: 0,
+                item_count: 1,
+                max_attempts: 1,
+                retry_delay_ms: 0,
+                lease_epoch: 1,
+                owner_epoch: 1,
+                available_at: future_at,
+            }),
+        )?;
+
+        assert!(!state.has_ready_chunk("tenant-a", "bulk", now, None, 1)?);
+        assert!(state.has_ready_chunk(
+            "tenant-a",
+            "bulk",
+            future_at + chrono::Duration::milliseconds(1),
+            None,
+            1,
+        )?);
+
+        let _ = fs::remove_dir_all(&db_path);
+        let _ = fs::remove_dir_all(&checkpoint_dir);
+        Ok(())
+    }
+
+    #[test]
     fn local_state_rejects_stale_report() -> Result<()> {
         let db_path = temp_path("throughput-state-report-db");
         let checkpoint_dir = temp_path("throughput-state-report-checkpoints");
@@ -2285,6 +2972,82 @@ mod tests {
     }
 
     #[test]
+    fn local_state_leases_ready_chunk_once() -> Result<()> {
+        let db_path = temp_path("throughput-state-lease-db");
+        let checkpoint_dir = temp_path("throughput-state-lease-checkpoints");
+        let state = LocalThroughputState::open(&db_path, &checkpoint_dir, 3)?;
+        let batch_identity = identity();
+        let now = Utc::now();
+
+        state.apply_changelog_entry(
+            0,
+            1,
+            &entry(ThroughputChangelogPayload::BatchCreated {
+                identity: batch_identity.clone(),
+                task_queue: "bulk".to_owned(),
+                aggregation_group_count: 1,
+                total_items: 1,
+                chunk_count: 1,
+            }),
+        )?;
+        state.apply_changelog_entry(
+            0,
+            2,
+            &entry(ThroughputChangelogPayload::ChunkApplied {
+                identity: batch_identity.clone(),
+                chunk_id: "chunk-ready".to_owned(),
+                chunk_index: 0,
+                attempt: 1,
+                group_id: 0,
+                item_count: 1,
+                max_attempts: 1,
+                retry_delay_ms: 0,
+                lease_epoch: 0,
+                owner_epoch: 1,
+                report_id: "seed-ready".to_owned(),
+                status: "scheduled".to_owned(),
+                available_at: now,
+                result_handle: None,
+                output: None,
+                error: None,
+                cancellation_reason: None,
+                cancellation_metadata: None,
+            }),
+        )?;
+
+        let first = state.lease_next_ready_chunk(
+            &batch_identity.tenant_id,
+            "bulk",
+            "worker-a",
+            now,
+            chrono::Duration::seconds(30),
+            None,
+            None,
+            1,
+        )?;
+        assert!(first.is_some());
+        let first = first.expect("first lease should succeed");
+        assert_eq!(first.lease_epoch, 1);
+        assert!(first.lease_token.is_some());
+
+        let second = state.lease_next_ready_chunk(
+            &batch_identity.tenant_id,
+            "bulk",
+            "worker-b",
+            now,
+            chrono::Duration::seconds(30),
+            None,
+            None,
+            1,
+        )?;
+        assert!(second.is_none());
+
+        let _ = fs::remove_dir_all(&db_path);
+        let _ = fs::remove_dir_all(&checkpoint_dir);
+        Ok(())
+    }
+
+    #[test]
     fn local_state_tracks_retry_schedule_and_batch_counters() -> Result<()> {
         let db_path = temp_path("throughput-state-counters-db");
         let checkpoint_dir = temp_path("throughput-state-counters-checkpoints");
@@ -2340,7 +3103,11 @@ mod tests {
                 report_id: "report-retry".to_owned(),
                 status: "scheduled".to_owned(),
                 available_at: retry_at,
+                result_handle: None,
+                output: None,
                 error: Some("boom".to_owned()),
+                cancellation_reason: None,
+                cancellation_metadata: None,
             }),
         )?;
 
@@ -2398,7 +3165,11 @@ mod tests {
                 report_id: "report-complete".to_owned(),
                 status: "completed".to_owned(),
                 available_at: retry_at,
+                result_handle: None,
+                output: None,
                 error: None,
+                cancellation_reason: None,
+                cancellation_metadata: None,
             }),
         )?;
         state.apply_changelog_entry(
@@ -2425,6 +3196,121 @@ mod tests {
         assert_eq!(completed_batch.terminal_at, Some(terminal_at));
 
         let _ = fs::remove_dir_all(&db_path);
+        let _ = fs::remove_dir_all(&checkpoint_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn local_state_dedupes_mirrored_entries_when_consumer_catches_up() -> Result<()> {
+        let db_path = temp_path("throughput-state-mirror-dedupe-db");
+        let checkpoint_dir = temp_path("throughput-state-mirror-dedupe-checkpoints");
+        let state = LocalThroughputState::open(&db_path, &checkpoint_dir, 3)?;
+        let batch_identity = identity();
+        let created = entry(ThroughputChangelogPayload::BatchCreated {
+            identity: batch_identity.clone(),
+            task_queue: "bulk".to_owned(),
+            aggregation_group_count: 3,
+            total_items: 100,
+            chunk_count: 1,
+        });
+        let leased = entry(ThroughputChangelogPayload::ChunkLeased {
+            identity: batch_identity.clone(),
+            chunk_id: "chunk-a".to_owned(),
+            chunk_index: 0,
+            attempt: 1,
+            group_id: 0,
+            item_count: 100,
+            max_attempts: 1,
+            retry_delay_ms: 0,
+            lease_epoch: 1,
+            owner_epoch: 1,
+            worker_id: "worker-a".to_owned(),
+            lease_token: TEST_LEASE_TOKEN.to_owned(),
+            lease_expires_at: Utc::now() + chrono::Duration::seconds(30),
+        });
+        let applied = entry(ThroughputChangelogPayload::ChunkApplied {
+            identity: batch_identity.clone(),
+            chunk_id: "chunk-a".to_owned(),
+            chunk_index: 0,
+            attempt: 1,
+            group_id: 0,
+            item_count: 100,
+            max_attempts: 1,
+            retry_delay_ms: 0,
+            lease_epoch: 1,
+            owner_epoch: 1,
+            report_id: "report-a".to_owned(),
+            status: "completed".to_owned(),
+            available_at: Utc::now(),
+            result_handle: None,
+            output: None,
+            error: None,
+            cancellation_reason: None,
+            cancellation_metadata: None,
+        });
+
+        state.mirror_changelog_entry(&created)?;
+        state.mirror_changelog_entry(&leased)?;
+        state.mirror_changelog_entry(&applied)?;
+
+        let mirrored_batch =
+            state.load_batch_state(&batch_identity)?.expect("mirrored batch should exist");
+        assert_eq!(mirrored_batch.succeeded_items, 100);
+        let mirrored_chunk = state
+            .load_chunk_state(&batch_identity, "chunk-a")?
+            .expect("mirrored chunk should exist");
+        assert_eq!(mirrored_chunk.status, "completed");
+
+        assert!(state.apply_changelog_entry(0, 10, &created)?);
+        assert!(state.apply_changelog_entry(0, 11, &leased)?);
+        assert!(state.apply_changelog_entry(0, 12, &applied)?);
+
+        let replayed_batch =
+            state.load_batch_state(&batch_identity)?.expect("replayed batch should exist");
+        assert_eq!(replayed_batch.status, "running");
+        assert_eq!(replayed_batch.succeeded_items, 100);
+        let replayed_chunk = state
+            .load_chunk_state(&batch_identity, "chunk-a")?
+            .expect("replayed chunk should exist");
+        assert_eq!(replayed_chunk.status, "completed");
+        assert_eq!(state.load_mirrored_entry_ids()?, Vec::<String>::new());
+
+        let _ = fs::remove_dir_all(&db_path);
+        let _ = fs::remove_dir_all(&checkpoint_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn local_state_restores_pending_mirror_markers_from_checkpoint() -> Result<()> {
+        let db_path = temp_path("throughput-state-mirror-checkpoint-db");
+        let checkpoint_dir = temp_path("throughput-state-mirror-checkpoint-checkpoints");
+        let state = LocalThroughputState::open(&db_path, &checkpoint_dir, 3)?;
+        let batch_identity = identity();
+        let created = entry(ThroughputChangelogPayload::BatchCreated {
+            identity: batch_identity.clone(),
+            task_queue: "bulk".to_owned(),
+            aggregation_group_count: 1,
+            total_items: 1,
+            chunk_count: 0,
+        });
+
+        state.mirror_changelog_entry(&created)?;
+        let _checkpoint = state.write_checkpoint()?;
+
+        let restored_db_path = temp_path("throughput-state-mirror-checkpoint-restored-db");
+        let restored = LocalThroughputState::open(&restored_db_path, &checkpoint_dir, 3)?;
+        assert!(restored.restore_from_latest_checkpoint_if_empty()?);
+        assert_eq!(restored.load_mirrored_entry_ids()?, vec![created.entry_id.to_string()]);
+        assert!(restored.apply_changelog_entry(0, 1, &created)?);
+        assert_eq!(restored.load_mirrored_entry_ids()?, Vec::<String>::new());
+
+        let batch = restored
+            .load_batch_state(&batch_identity)?
+            .expect("batch should exist after mirrored restore");
+        assert_eq!(batch.total_items, 1);
+
+        let _ = fs::remove_dir_all(&db_path);
+        let _ = fs::remove_dir_all(&restored_db_path);
         let _ = fs::remove_dir_all(&checkpoint_dir);
         Ok(())
     }
@@ -2469,7 +3355,8 @@ mod tests {
 
         let projected = state
             .project_report_apply(&report(ThroughputChunkReportPayload::ChunkCompleted {
-                output: vec![],
+                result_handle: Value::Null,
+                output: Some(vec![]),
             }))?
             .expect("projection should succeed");
         assert_eq!(projected.chunk_status, "completed");
@@ -2686,7 +3573,11 @@ mod tests {
                 report_id: "report-g0".to_owned(),
                 status: "failed".to_owned(),
                 available_at: first_done_at,
+                result_handle: None,
+                output: None,
                 error: Some("boom".to_owned()),
+                cancellation_reason: None,
+                cancellation_metadata: None,
             }),
         )?;
         let first_group_terminal = state
@@ -2729,7 +3620,11 @@ mod tests {
                 report_id: "report-g1".to_owned(),
                 status: "completed".to_owned(),
                 available_at: second_done_at,
+                result_handle: None,
+                output: None,
                 error: None,
+                cancellation_reason: None,
+                cancellation_metadata: None,
             }),
         )?;
         let second_group_terminal = state
@@ -2799,7 +3694,11 @@ mod tests {
                 report_id: "report-g0".to_owned(),
                 status: "completed".to_owned(),
                 available_at: terminal_at,
+                result_handle: None,
+                output: None,
                 error: None,
+                cancellation_reason: None,
+                cancellation_metadata: None,
             }),
         )?;
         state.apply_changelog_entry(
@@ -2878,7 +3777,11 @@ mod tests {
                 report_id: "report-g0".to_owned(),
                 status: "failed".to_owned(),
                 available_at: occurred_at,
+                result_handle: None,
+                output: None,
                 error: Some("boom".to_owned()),
+                cancellation_reason: None,
+                cancellation_metadata: None,
             }),
         )?;
 

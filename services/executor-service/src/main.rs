@@ -18,7 +18,7 @@ use fabrik_events::{
     EventEnvelope, WorkflowEvent, WorkflowIdentity, WorkflowTurnRouting, workflow_turn_routing,
 };
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
-use fabrik_store::{ConsumedSignalRecord, PartitionOwnershipRecord, WorkflowStore};
+use fabrik_store::{ConsumedSignalRecord, PartitionOwnershipRecord, TaskQueueKind, WorkflowStore};
 use fabrik_worker_protocol::activity_worker::{
     CompleteWorkflowTaskRequest, FailWorkflowTaskRequest, PollWorkflowTaskRequest, WorkflowTask,
     workflow_worker_api_client::WorkflowWorkerApiClient,
@@ -67,6 +67,8 @@ async fn main() -> Result<()> {
         continue_as_new_event_threshold = ?runtime.continue_as_new_event_threshold,
         continue_as_new_activity_attempt_threshold = ?runtime.continue_as_new_activity_attempt_threshold,
         continue_as_new_run_age_seconds = ?runtime.continue_as_new_run_age_seconds,
+        throughput_default_backend = %runtime.throughput_default_backend,
+        throughput_task_queue_backends = ?runtime.throughput_task_queue_backends,
         static_partition_ids = ?ownership.static_partition_ids,
         executor_capacity = ownership.executor_capacity,
         lease_ttl_seconds = ownership.lease_ttl_seconds,
@@ -1179,7 +1181,7 @@ async fn spawn_partition_worker(
 ) -> Result<()> {
     let partition_id = initial_ownership.partition_id;
     let lease_state = Arc::new(Mutex::new(LeaseState::from_record(&initial_ownership)));
-    let runtime = Arc::new(tokio::sync::Mutex::new(ExecutorRuntime::new(
+    let mut executor_runtime = ExecutorRuntime::new(
         runtime_config.cache_capacity,
         runtime_config.snapshot_interval_events,
         runtime_config.continue_as_new_event_threshold,
@@ -1187,7 +1189,12 @@ async fn spawn_partition_worker(
         runtime_config.continue_as_new_run_age_seconds,
         runtime_config.max_mailbox_items_per_turn,
         runtime_config.max_transitions_per_turn,
-    )));
+    );
+    executor_runtime.set_throughput_backend_policy(
+        runtime_config.throughput_default_backend.clone(),
+        runtime_config.throughput_task_queue_backends.clone(),
+    );
+    let runtime = Arc::new(tokio::sync::Mutex::new(executor_runtime));
     if let Ok(mut debug) = debug_state.lock() {
         debug.update_ownership(&initial_ownership, "owned", "partition worker started");
     }
@@ -3817,6 +3824,8 @@ struct ExecutorRuntime {
     continue_as_new_run_age_seconds: Option<u64>,
     max_mailbox_items_per_turn: usize,
     max_transitions_per_turn: usize,
+    throughput_default_backend: String,
+    throughput_task_queue_backends: BTreeMap<String, String>,
     access_epoch: u64,
     hits: u64,
     misses: u64,
@@ -4002,6 +4011,8 @@ impl ExecutorRuntime {
             continue_as_new_run_age_seconds,
             max_mailbox_items_per_turn,
             max_transitions_per_turn,
+            throughput_default_backend: "pg-v1".to_owned(),
+            throughput_task_queue_backends: BTreeMap::new(),
             access_epoch: 0,
             hits: 0,
             misses: 0,
@@ -4010,6 +4021,34 @@ impl ExecutorRuntime {
             restores_after_handoff: 0,
             cache: HashMap::new(),
         }
+    }
+
+    fn set_throughput_backend_policy(
+        &mut self,
+        default_backend: String,
+        task_queue_backends: BTreeMap<String, String>,
+    ) {
+        self.throughput_default_backend = default_backend;
+        self.throughput_task_queue_backends = task_queue_backends;
+    }
+
+    fn resolve_bulk_backend(
+        &self,
+        task_queue: &str,
+        configured_backend: Option<&str>,
+        requested_backend: Option<&str>,
+    ) -> (String, &'static str) {
+        let backend = configured_backend
+            .map(ToOwned::to_owned)
+            .or_else(|| self.throughput_task_queue_backends.get(task_queue).cloned())
+            .filter(|backend| !backend.is_empty())
+            .or_else(|| {
+                (!self.throughput_default_backend.is_empty())
+                    .then_some(self.throughput_default_backend.clone())
+            })
+            .unwrap_or_else(|| requested_backend.unwrap_or("pg-v1").to_owned());
+        let version = if backend == "stream-v2" { "2.0.0" } else { "1.0.0" };
+        (backend, version)
     }
 
     fn get(&mut self, tenant_id: &str, instance_id: &str) -> Option<HotStateRecord> {
@@ -5020,7 +5059,31 @@ async fn publish_compiled_plan(
         let mut identity = source_identity(event, "executor-service");
         identity.definition_version = artifact.definition_version;
         identity.artifact_hash = artifact.artifact_hash.clone();
-        let event_payload = emission.event.clone();
+        let event_payload = match resolve_compiled_emission_event(
+            store,
+            runtime,
+            &event.tenant_id,
+            emission.event.clone(),
+        )
+        .await
+        {
+            Ok(event_payload) => event_payload,
+            Err(error) => {
+                publish_failure(
+                    store,
+                    runtime,
+                    debug_state,
+                    lease_state,
+                    publisher,
+                    event,
+                    Some(artifact.definition_version),
+                    error.to_string(),
+                    emission.state.clone().or(Some(final_state.clone())),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
         if let WorkflowEvent::WorkflowContinuedAsNew { new_run_id, input } = &event_payload.clone()
         {
             let mut envelope =
@@ -5078,6 +5141,89 @@ async fn publish_compiled_plan(
     let _ = continued;
 
     Ok(())
+}
+
+async fn resolve_compiled_emission_event(
+    store: &WorkflowStore,
+    runtime: &ExecutorRuntime,
+    tenant_id: &str,
+    event: WorkflowEvent,
+) -> Result<WorkflowEvent> {
+    match event {
+        WorkflowEvent::BulkActivityBatchScheduled {
+            batch_id,
+            activity_type,
+            task_queue,
+            items,
+            input_handle,
+            result_handle,
+            chunk_size,
+            max_attempts,
+            retry_delay_ms,
+            aggregation_group_count,
+            execution_policy,
+            reducer,
+            throughput_backend,
+            throughput_backend_version: _,
+            state,
+        } => {
+            let configured_backend = store
+                .get_task_queue_throughput_policy(tenant_id, TaskQueueKind::Activity, &task_queue)
+                .await?
+                .map(|record| record.backend);
+            let (resolved_backend, resolved_version) = runtime.resolve_bulk_backend(
+                &task_queue,
+                configured_backend.as_deref(),
+                Some(&throughput_backend),
+            );
+            validate_bulk_execution_metadata(
+                execution_policy.as_deref(),
+                reducer.as_deref(),
+                &resolved_backend,
+            )?;
+            Ok(WorkflowEvent::BulkActivityBatchScheduled {
+                batch_id,
+                activity_type,
+                task_queue,
+                items,
+                input_handle,
+                result_handle,
+                chunk_size,
+                max_attempts,
+                retry_delay_ms,
+                aggregation_group_count,
+                execution_policy,
+                reducer,
+                throughput_backend: resolved_backend,
+                throughput_backend_version: resolved_version.to_owned(),
+                state,
+            })
+        }
+        other => Ok(other),
+    }
+}
+
+fn validate_bulk_execution_metadata(
+    execution_policy: Option<&str>,
+    reducer: Option<&str>,
+    backend: &str,
+) -> Result<()> {
+    match execution_policy.unwrap_or("default") {
+        "default" => {}
+        "eager" => {
+            if backend != "stream-v2" {
+                anyhow::bail!(
+                    "bulk execution policy eager requires backend stream-v2, resolved backend was {backend}"
+                );
+            }
+        }
+        other => anyhow::bail!("unsupported bulk execution policy {other}"),
+    }
+
+    match reducer.unwrap_or("collect_results") {
+        "all_succeeded" | "all_settled" | "count" | "collect_results" => Ok(()),
+        other => anyhow::bail!("unsupported bulk reducer {other}"),
+    }
 }
 
 #[derive(Clone, Copy)]

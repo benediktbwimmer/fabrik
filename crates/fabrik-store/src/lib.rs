@@ -491,6 +491,16 @@ pub struct CompatibilitySetRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskQueueThroughputPolicyRecord {
+    pub tenant_id: String,
+    pub queue_kind: TaskQueueKind,
+    pub task_queue: String,
+    pub backend: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct QueuePollerRecord {
     pub tenant_id: String,
     pub queue_kind: TaskQueueKind,
@@ -723,6 +733,7 @@ pub struct TaskQueueInspection {
     pub resume_coalescing: Option<ResumeCoalescingMetrics>,
     pub activity_completion_metrics: Option<ActivityCompletionMetrics>,
     pub default_set_id: Option<String>,
+    pub throughput_policy: Option<TaskQueueThroughputPolicyRecord>,
     pub compatible_build_ids: Vec<String>,
     pub registered_builds: Vec<TaskQueueBuildRecord>,
     pub compatibility_sets: Vec<CompatibilitySetRecord>,
@@ -1643,6 +1654,23 @@ impl WorkflowStore {
 
         sqlx::query(
             r#"
+            CREATE TABLE IF NOT EXISTS task_queue_throughput_policies (
+                tenant_id TEXT NOT NULL,
+                queue_kind TEXT NOT NULL,
+                task_queue TEXT NOT NULL,
+                backend TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, queue_kind, task_queue)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize task_queue_throughput_policies table")?;
+
+        sqlx::query(
+            r#"
             CREATE TABLE IF NOT EXISTS workflow_tasks (
                 task_id UUID PRIMARY KEY,
                 tenant_id TEXT NOT NULL,
@@ -1982,7 +2010,7 @@ impl WorkflowStore {
             CREATE TABLE IF NOT EXISTS throughput_projection_offsets (
                 projector_id TEXT NOT NULL,
                 partition_id INTEGER NOT NULL,
-                offset BIGINT NOT NULL,
+                log_offset BIGINT NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY (projector_id, partition_id)
             )
@@ -2593,6 +2621,38 @@ impl WorkflowStore {
         .context("failed to list active throughput members")?;
 
         rows.into_iter().map(Self::decode_executor_membership_row).collect()
+    }
+
+    pub async fn get_active_throughput_member_for_partition(
+        &self,
+        partition_id: i32,
+        now: DateTime<Utc>,
+    ) -> Result<Option<ExecutorMembershipRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                membership.runtime_id AS executor_id,
+                membership.query_endpoint,
+                membership.advertised_capacity,
+                membership.heartbeat_expires_at,
+                membership.created_at,
+                membership.updated_at
+            FROM workflow_throughput_partition_assignments assignments
+            JOIN workflow_throughput_membership membership
+              ON membership.runtime_id = assignments.runtime_id
+            WHERE assignments.partition_id = $1
+              AND membership.heartbeat_expires_at > $2
+            ORDER BY membership.updated_at DESC, membership.heartbeat_expires_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(partition_id)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load throughput member for partition")?;
+
+        row.map(Self::decode_executor_membership_row).transpose()
     }
 
     pub async fn list_partition_assignments(&self) -> Result<Vec<PartitionAssignmentRecord>> {
@@ -3943,6 +4003,73 @@ impl WorkflowStore {
         rows.into_iter().map(Self::decode_queue_poller_row).collect()
     }
 
+    pub async fn upsert_task_queue_throughput_policy(
+        &self,
+        tenant_id: &str,
+        queue_kind: TaskQueueKind,
+        task_queue: &str,
+        backend: &str,
+    ) -> Result<TaskQueueThroughputPolicyRecord> {
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO task_queue_throughput_policies (
+                tenant_id,
+                queue_kind,
+                task_queue,
+                backend,
+                created_at,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $5)
+            ON CONFLICT (tenant_id, queue_kind, task_queue)
+            DO UPDATE SET
+                backend = EXCLUDED.backend,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(queue_kind.as_str())
+        .bind(task_queue)
+        .bind(backend)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert task queue throughput policy")?;
+
+        Ok(TaskQueueThroughputPolicyRecord {
+            tenant_id: tenant_id.to_owned(),
+            queue_kind,
+            task_queue: task_queue.to_owned(),
+            backend: backend.to_owned(),
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub async fn get_task_queue_throughput_policy(
+        &self,
+        tenant_id: &str,
+        queue_kind: TaskQueueKind,
+        task_queue: &str,
+    ) -> Result<Option<TaskQueueThroughputPolicyRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT tenant_id, queue_kind, task_queue, backend, created_at, updated_at
+            FROM task_queue_throughput_policies
+            WHERE tenant_id = $1 AND queue_kind = $2 AND task_queue = $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(queue_kind.as_str())
+        .bind(task_queue)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load task queue throughput policy")?;
+
+        row.map(Self::decode_task_queue_throughput_policy_row).transpose()
+    }
+
     pub async fn enqueue_workflow_mailbox_message(
         &self,
         partition_id: i32,
@@ -5038,6 +5165,9 @@ impl WorkflowStore {
         let activity_completion_metrics = self
             .task_queue_activity_completion_metrics(tenant_id, queue_kind.clone(), task_queue)
             .await?;
+        let throughput_policy = self
+            .get_task_queue_throughput_policy(tenant_id, queue_kind.clone(), task_queue)
+            .await?;
 
         Ok(TaskQueueInspection {
             tenant_id: tenant_id.to_owned(),
@@ -5049,6 +5179,7 @@ impl WorkflowStore {
             resume_coalescing,
             activity_completion_metrics,
             default_set_id,
+            throughput_policy,
             compatible_build_ids,
             registered_builds,
             compatibility_sets,
@@ -8763,6 +8894,168 @@ impl WorkflowStore {
         Ok(())
     }
 
+    pub async fn upsert_throughput_projection_chunks(
+        &self,
+        chunks: &[WorkflowBulkChunkRecord],
+    ) -> Result<()> {
+        const CHUNK_BATCH_SIZE: usize = 250;
+
+        for batch in chunks.chunks(CHUNK_BATCH_SIZE) {
+            let mut builder = QueryBuilder::<Postgres>::new(
+                r#"
+                INSERT INTO throughput_projection_chunks (
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    workflow_id,
+                    workflow_version,
+                    artifact_hash,
+                    batch_id,
+                    chunk_id,
+                    chunk_index,
+                    group_id,
+                    item_count,
+                    activity_type,
+                    task_queue,
+                    state,
+                    status,
+                    attempt,
+                    lease_epoch,
+                    owner_epoch,
+                    max_attempts,
+                    retry_delay_ms,
+                    input_handle,
+                    result_handle,
+                    items,
+                    output,
+                    error,
+                    cancellation_requested,
+                    cancellation_reason,
+                    cancellation_metadata,
+                    worker_id,
+                    worker_build_id,
+                    lease_token,
+                    last_report_id,
+                    scheduled_at,
+                    available_at,
+                    started_at,
+                    lease_expires_at,
+                    completed_at,
+                    updated_at
+                )
+                "#,
+            );
+
+            builder.push_values(batch, |mut row, chunk| {
+                row.push_bind(&chunk.tenant_id)
+                    .push_bind(&chunk.instance_id)
+                    .push_bind(&chunk.run_id)
+                    .push_bind(&chunk.definition_id)
+                    .push_bind(chunk.definition_version.map(|value| value as i32))
+                    .push_bind(&chunk.artifact_hash)
+                    .push_bind(&chunk.batch_id)
+                    .push_bind(&chunk.chunk_id)
+                    .push_bind(
+                        i32::try_from(chunk.chunk_index)
+                            .expect("projection chunk chunk_index exceeds i32"),
+                    )
+                    .push_bind(
+                        i32::try_from(chunk.group_id)
+                            .expect("projection chunk group_id exceeds i32"),
+                    )
+                    .push_bind(
+                        i32::try_from(chunk.item_count)
+                            .expect("projection chunk item_count exceeds i32"),
+                    )
+                    .push_bind(&chunk.activity_type)
+                    .push_bind(&chunk.task_queue)
+                    .push_bind(&chunk.state)
+                    .push_bind(chunk.status.as_str())
+                    .push_bind(
+                        i32::try_from(chunk.attempt).expect("projection chunk attempt exceeds i32"),
+                    )
+                    .push_bind(
+                        i64::try_from(chunk.lease_epoch)
+                            .expect("projection chunk lease_epoch exceeds i64"),
+                    )
+                    .push_bind(
+                        i64::try_from(chunk.owner_epoch)
+                            .expect("projection chunk owner_epoch exceeds i64"),
+                    )
+                    .push_bind(
+                        i32::try_from(chunk.max_attempts)
+                            .expect("projection chunk max_attempts exceeds i32"),
+                    )
+                    .push_bind(
+                        i64::try_from(chunk.retry_delay_ms)
+                            .expect("projection chunk retry_delay_ms exceeds i64"),
+                    )
+                    .push_bind(Json(&chunk.input_handle))
+                    .push_bind(Json(&chunk.result_handle))
+                    .push_bind(Json(&chunk.items))
+                    .push_bind(chunk.output.as_ref().map(Json))
+                    .push_bind(&chunk.error)
+                    .push_bind(chunk.cancellation_requested)
+                    .push_bind(&chunk.cancellation_reason)
+                    .push_bind(chunk.cancellation_metadata.as_ref().map(Json))
+                    .push_bind(&chunk.worker_id)
+                    .push_bind(&chunk.worker_build_id)
+                    .push_bind(chunk.lease_token)
+                    .push_bind(&chunk.last_report_id)
+                    .push_bind(chunk.scheduled_at)
+                    .push_bind(chunk.available_at)
+                    .push_bind(chunk.started_at)
+                    .push_bind(chunk.lease_expires_at)
+                    .push_bind(chunk.completed_at)
+                    .push_bind(chunk.updated_at);
+            });
+
+            builder.push(
+                r#"
+                ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id, chunk_id) DO UPDATE
+                SET chunk_index = EXCLUDED.chunk_index,
+                    group_id = EXCLUDED.group_id,
+                    item_count = EXCLUDED.item_count,
+                    activity_type = EXCLUDED.activity_type,
+                    task_queue = EXCLUDED.task_queue,
+                    state = EXCLUDED.state,
+                    status = EXCLUDED.status,
+                    attempt = EXCLUDED.attempt,
+                    lease_epoch = EXCLUDED.lease_epoch,
+                    owner_epoch = EXCLUDED.owner_epoch,
+                    max_attempts = EXCLUDED.max_attempts,
+                    retry_delay_ms = EXCLUDED.retry_delay_ms,
+                    input_handle = EXCLUDED.input_handle,
+                    result_handle = EXCLUDED.result_handle,
+                    items = EXCLUDED.items,
+                    output = EXCLUDED.output,
+                    error = EXCLUDED.error,
+                    cancellation_requested = EXCLUDED.cancellation_requested,
+                    cancellation_reason = EXCLUDED.cancellation_reason,
+                    cancellation_metadata = EXCLUDED.cancellation_metadata,
+                    worker_id = EXCLUDED.worker_id,
+                    worker_build_id = EXCLUDED.worker_build_id,
+                    lease_token = EXCLUDED.lease_token,
+                    last_report_id = EXCLUDED.last_report_id,
+                    scheduled_at = EXCLUDED.scheduled_at,
+                    available_at = EXCLUDED.available_at,
+                    started_at = EXCLUDED.started_at,
+                    lease_expires_at = EXCLUDED.lease_expires_at,
+                    completed_at = EXCLUDED.completed_at,
+                    updated_at = EXCLUDED.updated_at
+                "#,
+            );
+
+            builder
+                .build()
+                .execute(&self.pool)
+                .await
+                .context("failed to upsert throughput projection chunk batch")?;
+        }
+
+        Ok(())
+    }
+
     pub async fn update_throughput_projection_batch_state(
         &self,
         update: &ThroughputProjectionBatchStateUpdate,
@@ -8770,13 +9063,21 @@ impl WorkflowStore {
         sqlx::query(
             r#"
             UPDATE throughput_projection_batches
-            SET status = $5,
-                succeeded_items = $6,
-                failed_items = $7,
-                cancelled_items = $8,
-                error = $9,
-                terminal_at = $10,
-                updated_at = $11
+            SET status = CASE
+                    WHEN throughput_projection_batches.terminal_at IS NOT NULL AND $10 IS NULL
+                        THEN throughput_projection_batches.status
+                    ELSE $5
+                END,
+                succeeded_items = GREATEST(throughput_projection_batches.succeeded_items, $6),
+                failed_items = GREATEST(throughput_projection_batches.failed_items, $7),
+                cancelled_items = GREATEST(throughput_projection_batches.cancelled_items, $8),
+                error = CASE
+                    WHEN throughput_projection_batches.terminal_at IS NOT NULL AND $10 IS NULL
+                        THEN throughput_projection_batches.error
+                    ELSE $9
+                END,
+                terminal_at = COALESCE(throughput_projection_batches.terminal_at, $10),
+                updated_at = GREATEST(throughput_projection_batches.updated_at, $11)
             WHERE tenant_id = $1
               AND workflow_instance_id = $2
               AND run_id = $3
@@ -8816,26 +9117,86 @@ impl WorkflowStore {
         sqlx::query(
             r#"
             UPDATE throughput_projection_chunks
-            SET status = $6,
-                attempt = $7,
-                lease_epoch = $8,
-                owner_epoch = $9,
+            SET status = CASE
+                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
+                        THEN throughput_projection_chunks.status
+                    ELSE $6
+                END,
+                attempt = CASE
+                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
+                        THEN throughput_projection_chunks.attempt
+                    ELSE $7
+                END,
+                lease_epoch = CASE
+                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
+                        THEN throughput_projection_chunks.lease_epoch
+                    ELSE $8
+                END,
+                owner_epoch = CASE
+                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
+                        THEN throughput_projection_chunks.owner_epoch
+                    ELSE $9
+                END,
                 input_handle = COALESCE($10, input_handle),
                 result_handle = COALESCE($11, result_handle),
-                output = $12,
-                error = $13,
-                cancellation_requested = $14,
-                cancellation_reason = $15,
-                cancellation_metadata = $16,
-                worker_id = $17,
-                worker_build_id = $18,
-                lease_token = $19,
-                last_report_id = $20,
-                available_at = $21,
+                output = CASE
+                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
+                        THEN throughput_projection_chunks.output
+                    ELSE $12
+                END,
+                error = CASE
+                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
+                        THEN throughput_projection_chunks.error
+                    ELSE $13
+                END,
+                cancellation_requested = CASE
+                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
+                        THEN throughput_projection_chunks.cancellation_requested
+                    ELSE $14
+                END,
+                cancellation_reason = CASE
+                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
+                        THEN throughput_projection_chunks.cancellation_reason
+                    ELSE $15
+                END,
+                cancellation_metadata = CASE
+                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
+                        THEN throughput_projection_chunks.cancellation_metadata
+                    ELSE $16
+                END,
+                worker_id = CASE
+                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
+                        THEN throughput_projection_chunks.worker_id
+                    ELSE $17
+                END,
+                worker_build_id = CASE
+                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
+                        THEN throughput_projection_chunks.worker_build_id
+                    ELSE $18
+                END,
+                lease_token = CASE
+                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
+                        THEN throughput_projection_chunks.lease_token
+                    ELSE $19
+                END,
+                last_report_id = CASE
+                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
+                        THEN throughput_projection_chunks.last_report_id
+                    ELSE $20
+                END,
+                available_at = CASE
+                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
+                        THEN throughput_projection_chunks.available_at
+                    ELSE $21
+                END,
                 started_at = COALESCE($22, started_at),
-                lease_expires_at = $23,
-                completed_at = $24,
-                updated_at = $25
+                lease_expires_at = CASE
+                    WHEN throughput_projection_chunks.completed_at IS NOT NULL AND $24 IS NULL
+                        THEN throughput_projection_chunks.lease_expires_at
+                    ELSE $23
+                END,
+                completed_at = COALESCE(throughput_projection_chunks.completed_at, $24),
+                updated_at = GREATEST(throughput_projection_chunks.updated_at, $25)
             WHERE tenant_id = $1
               AND workflow_instance_id = $2
               AND run_id = $3
@@ -8924,16 +9285,100 @@ impl WorkflowStore {
     ) -> Result<Vec<WorkflowBulkBatchRecord>> {
         let rows = sqlx::query(
             r#"
-            SELECT *
+            SELECT
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                workflow_id,
+                workflow_version,
+                artifact_hash,
+                batch_id,
+                activity_type,
+                task_queue,
+                state,
+                input_handle,
+                result_handle,
+                throughput_backend,
+                throughput_backend_version,
+                aggregation_group_count,
+                status,
+                total_items,
+                chunk_size,
+                chunk_count,
+                succeeded_items,
+                failed_items,
+                cancelled_items,
+                max_attempts,
+                retry_delay_ms,
+                error,
+                scheduled_at,
+                terminal_at,
+                updated_at
             FROM (
-                SELECT *
+                SELECT
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    workflow_id,
+                    workflow_version,
+                    artifact_hash,
+                    batch_id,
+                    activity_type,
+                    task_queue,
+                    state,
+                    input_handle,
+                    result_handle,
+                    throughput_backend,
+                    throughput_backend_version,
+                    aggregation_group_count,
+                    status,
+                    total_items,
+                    chunk_size,
+                    chunk_count,
+                    succeeded_items,
+                    failed_items,
+                    cancelled_items,
+                    max_attempts,
+                    retry_delay_ms,
+                    error,
+                    scheduled_at,
+                    terminal_at,
+                    updated_at
                 FROM workflow_bulk_batches
                 WHERE tenant_id = $1
                   AND workflow_instance_id = $2
                   AND run_id = $3
                   AND throughput_backend = 'pg-v1'
                 UNION ALL
-                SELECT *
+                SELECT
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    workflow_id,
+                    workflow_version,
+                    artifact_hash,
+                    batch_id,
+                    activity_type,
+                    task_queue,
+                    state,
+                    input_handle,
+                    result_handle,
+                    throughput_backend,
+                    throughput_backend_version,
+                    aggregation_group_count,
+                    status,
+                    total_items,
+                    chunk_size,
+                    chunk_count,
+                    succeeded_items,
+                    failed_items,
+                    cancelled_items,
+                    max_attempts,
+                    retry_delay_ms,
+                    error,
+                    scheduled_at,
+                    terminal_at,
+                    updated_at
                 FROM throughput_projection_batches
                 WHERE tenant_id = $1
                   AND workflow_instance_id = $2
@@ -8963,9 +9408,65 @@ impl WorkflowStore {
     ) -> Result<Option<WorkflowBulkBatchRecord>> {
         let row = sqlx::query(
             r#"
-            SELECT *
+            SELECT
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                workflow_id,
+                workflow_version,
+                artifact_hash,
+                batch_id,
+                activity_type,
+                task_queue,
+                state,
+                input_handle,
+                result_handle,
+                throughput_backend,
+                throughput_backend_version,
+                aggregation_group_count,
+                status,
+                total_items,
+                chunk_size,
+                chunk_count,
+                succeeded_items,
+                failed_items,
+                cancelled_items,
+                max_attempts,
+                retry_delay_ms,
+                error,
+                scheduled_at,
+                terminal_at,
+                updated_at
             FROM (
-                SELECT *
+                SELECT
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    workflow_id,
+                    workflow_version,
+                    artifact_hash,
+                    batch_id,
+                    activity_type,
+                    task_queue,
+                    state,
+                    input_handle,
+                    result_handle,
+                    throughput_backend,
+                    throughput_backend_version,
+                    aggregation_group_count,
+                    status,
+                    total_items,
+                    chunk_size,
+                    chunk_count,
+                    succeeded_items,
+                    failed_items,
+                    cancelled_items,
+                    max_attempts,
+                    retry_delay_ms,
+                    error,
+                    scheduled_at,
+                    terminal_at,
+                    updated_at
                 FROM workflow_bulk_batches
                 WHERE tenant_id = $1
                   AND workflow_instance_id = $2
@@ -8973,7 +9474,35 @@ impl WorkflowStore {
                   AND batch_id = $4
                   AND throughput_backend = 'pg-v1'
                 UNION ALL
-                SELECT *
+                SELECT
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    workflow_id,
+                    workflow_version,
+                    artifact_hash,
+                    batch_id,
+                    activity_type,
+                    task_queue,
+                    state,
+                    input_handle,
+                    result_handle,
+                    throughput_backend,
+                    throughput_backend_version,
+                    aggregation_group_count,
+                    status,
+                    total_items,
+                    chunk_size,
+                    chunk_count,
+                    succeeded_items,
+                    failed_items,
+                    cancelled_items,
+                    max_attempts,
+                    retry_delay_ms,
+                    error,
+                    scheduled_at,
+                    terminal_at,
+                    updated_at
                 FROM throughput_projection_batches
                 WHERE tenant_id = $1
                   AND workflow_instance_id = $2
@@ -9081,7 +9610,7 @@ impl WorkflowStore {
     ) -> Result<std::collections::HashMap<i32, i64>> {
         let rows = sqlx::query_as::<_, (i32, i64)>(
             r#"
-            SELECT partition_id, offset
+            SELECT partition_id, log_offset
             FROM throughput_projection_offsets
             WHERE projector_id = $1
             "#,
@@ -9105,13 +9634,13 @@ impl WorkflowStore {
             INSERT INTO throughput_projection_offsets (
                 projector_id,
                 partition_id,
-                offset,
+                log_offset,
                 updated_at
             )
             VALUES ($1, $2, $3, $4)
             ON CONFLICT (projector_id, partition_id)
             DO UPDATE SET
-                offset = EXCLUDED.offset,
+                log_offset = EXCLUDED.log_offset,
                 updated_at = EXCLUDED.updated_at
             "#,
         )
@@ -10052,6 +10581,32 @@ impl WorkflowStore {
             expires_at: row.try_get("expires_at").context("queue poller expires_at missing")?,
             created_at: row.try_get("created_at").context("queue poller created_at missing")?,
             updated_at: row.try_get("updated_at").context("queue poller updated_at missing")?,
+        })
+    }
+
+    fn decode_task_queue_throughput_policy_row(
+        row: sqlx::postgres::PgRow,
+    ) -> Result<TaskQueueThroughputPolicyRecord> {
+        Ok(TaskQueueThroughputPolicyRecord {
+            tenant_id: row
+                .try_get("tenant_id")
+                .context("task queue throughput policy tenant_id missing")?,
+            queue_kind: TaskQueueKind::from_db(
+                &row.try_get::<String, _>("queue_kind")
+                    .context("task queue throughput policy queue_kind missing")?,
+            )?,
+            task_queue: row
+                .try_get("task_queue")
+                .context("task queue throughput policy task_queue missing")?,
+            backend: row
+                .try_get("backend")
+                .context("task queue throughput policy backend missing")?,
+            created_at: row
+                .try_get("created_at")
+                .context("task queue throughput policy created_at missing")?,
+            updated_at: row
+                .try_get("updated_at")
+                .context("task queue throughput policy updated_at missing")?,
         })
     }
 
@@ -11367,6 +11922,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_queue_throughput_policy_and_partition_member_are_queryable() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let ttl = StdDuration::from_secs(30);
+
+        let policy = store
+            .upsert_task_queue_throughput_policy(
+                "tenant-a",
+                TaskQueueKind::Activity,
+                "bulk",
+                "stream-v2",
+            )
+            .await?;
+        assert_eq!(policy.backend, "stream-v2");
+
+        let loaded = store
+            .get_task_queue_throughput_policy("tenant-a", TaskQueueKind::Activity, "bulk")
+            .await?
+            .context("throughput policy should exist")?;
+        assert_eq!(loaded.backend, "stream-v2");
+
+        store.heartbeat_throughput_member("runtime-a", "http://runtime-a", 1, ttl).await?;
+        let members = store.list_active_throughput_members(Utc::now()).await?;
+        assert!(store.reconcile_throughput_partition_assignments(2, &members).await?);
+
+        let member = store
+            .get_active_throughput_member_for_partition(1, Utc::now())
+            .await?
+            .context("throughput member should be assigned")?;
+        assert_eq!(member.executor_id, "runtime-a");
+        assert_eq!(member.query_endpoint, "http://runtime-a");
+
+        let inspection = store
+            .inspect_task_queue("tenant-a", TaskQueueKind::Activity, "bulk", Utc::now())
+            .await?;
+        assert_eq!(
+            inspection.throughput_policy.as_ref().map(|record| record.backend.as_str()),
+            Some("stream-v2")
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
     #[ignore = "perf harness; run with cargo test -p fabrik-store mailbox_task_coalescing_benchmark -- --ignored --nocapture"]
     async fn mailbox_task_coalescing_benchmark() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
@@ -11756,6 +12357,17 @@ mod tests {
                 .await?,
             1
         );
+        let listed_batches = store
+            .list_bulk_batches_for_run_page_query_view(
+                "tenant-a",
+                "wf-bulk-stream-query",
+                "run-bulk-stream-query",
+                10,
+                0,
+            )
+            .await?;
+        assert_eq!(listed_batches.len(), 1);
+        assert_eq!(listed_batches[0].batch_id, "batch-stream-query");
         assert_eq!(
             store
                 .count_bulk_chunks_for_batch_query_view(
@@ -11844,6 +12456,8 @@ mod tests {
                 attempt: 1,
                 lease_epoch: 1,
                 owner_epoch: 1,
+                input_handle: None,
+                result_handle: None,
                 output: Some(vec![json!({"value": "done"})]),
                 error: None,
                 cancellation_requested: false,
@@ -11901,6 +12515,209 @@ mod tests {
         assert_eq!(query_chunks[0].status, WorkflowBulkChunkStatus::Completed);
         assert_eq!(query_chunks[0].output.as_ref(), Some(&vec![json!({"value": "done"})]));
         assert_eq!(query_chunks[0].last_report_id.as_deref(), Some("report-1"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_projection_terminal_batch_update_is_monotonic() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+
+        let (batch, _chunks) = store
+            .upsert_bulk_batch(
+                "tenant-a",
+                "wf-bulk-stream-terminal",
+                "run-bulk-stream-terminal",
+                "demo",
+                Some(1),
+                Some("artifact-1"),
+                "batch-stream-terminal",
+                "benchmark.echo",
+                "bulk",
+                Some("join"),
+                &json!({ "kind": "inline", "key": "bulk-input:batch-stream-terminal" }),
+                &json!({ "kind": "inline", "key": "bulk-result:batch-stream-terminal" }),
+                &[json!({"value": 1}), json!({"value": 2})],
+                2,
+                2,
+                1000,
+                3,
+                "stream-v2",
+                "2.0.0",
+                now,
+            )
+            .await?;
+        store.upsert_throughput_projection_batch(&batch).await?;
+
+        let terminal_at = now + chrono::Duration::seconds(10);
+        store
+            .update_throughput_projection_batch_state(&ThroughputProjectionBatchStateUpdate {
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "wf-bulk-stream-terminal".to_owned(),
+                run_id: "run-bulk-stream-terminal".to_owned(),
+                batch_id: "batch-stream-terminal".to_owned(),
+                status: "completed".to_owned(),
+                succeeded_items: 2,
+                failed_items: 0,
+                cancelled_items: 0,
+                error: None,
+                terminal_at: Some(terminal_at),
+                updated_at: terminal_at,
+            })
+            .await?;
+
+        let stale_running_at = terminal_at + chrono::Duration::seconds(1);
+        store
+            .update_throughput_projection_batch_state(&ThroughputProjectionBatchStateUpdate {
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "wf-bulk-stream-terminal".to_owned(),
+                run_id: "run-bulk-stream-terminal".to_owned(),
+                batch_id: "batch-stream-terminal".to_owned(),
+                status: "running".to_owned(),
+                succeeded_items: 1,
+                failed_items: 0,
+                cancelled_items: 0,
+                error: None,
+                terminal_at: None,
+                updated_at: stale_running_at,
+            })
+            .await?;
+
+        let projected = store
+            .get_bulk_batch_query_view(
+                "tenant-a",
+                "wf-bulk-stream-terminal",
+                "run-bulk-stream-terminal",
+                "batch-stream-terminal",
+            )
+            .await?
+            .context("terminal stream batch missing from query view")?;
+
+        assert_eq!(projected.status, WorkflowBulkBatchStatus::Completed);
+        assert_eq!(projected.succeeded_items, 2);
+        assert_eq!(projected.terminal_at, Some(terminal_at));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_projection_terminal_chunk_update_is_monotonic() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+
+        let (batch, chunks) = store
+            .upsert_bulk_batch(
+                "tenant-a",
+                "wf-bulk-stream-terminal-chunk",
+                "run-bulk-stream-terminal-chunk",
+                "demo",
+                Some(1),
+                Some("artifact-1"),
+                "batch-stream-terminal-chunk",
+                "benchmark.echo",
+                "bulk",
+                Some("join"),
+                &json!({ "kind": "inline", "key": "bulk-input:batch-stream-terminal-chunk" }),
+                &json!({ "kind": "inline", "key": "bulk-result:batch-stream-terminal-chunk" }),
+                &[json!({"value": 1}), json!({"value": 2})],
+                2,
+                2,
+                1000,
+                1,
+                "stream-v2",
+                "2.0.0",
+                now,
+            )
+            .await?;
+        store.upsert_throughput_projection_batch(&batch).await?;
+        for chunk in &chunks {
+            store.upsert_throughput_projection_chunk(chunk).await?;
+        }
+
+        let terminal_at = now + chrono::Duration::seconds(5);
+        store
+            .update_throughput_projection_chunk_state(&ThroughputProjectionChunkStateUpdate {
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "wf-bulk-stream-terminal-chunk".to_owned(),
+                run_id: "run-bulk-stream-terminal-chunk".to_owned(),
+                batch_id: "batch-stream-terminal-chunk".to_owned(),
+                chunk_id: chunks[0].chunk_id.clone(),
+                status: "completed".to_owned(),
+                attempt: 1,
+                lease_epoch: 1,
+                owner_epoch: 1,
+                input_handle: None,
+                result_handle: None,
+                output: Some(vec![json!({"value": "done"})]),
+                error: None,
+                cancellation_requested: false,
+                cancellation_reason: None,
+                cancellation_metadata: None,
+                worker_id: Some("worker-a".to_owned()),
+                worker_build_id: Some("build-a".to_owned()),
+                lease_token: None,
+                last_report_id: Some("report-1".to_owned()),
+                available_at: terminal_at,
+                started_at: Some(now),
+                lease_expires_at: None,
+                completed_at: Some(terminal_at),
+                updated_at: terminal_at,
+            })
+            .await?;
+
+        let stale_nonterminal_at = terminal_at + chrono::Duration::seconds(1);
+        store
+            .update_throughput_projection_chunk_state(&ThroughputProjectionChunkStateUpdate {
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "wf-bulk-stream-terminal-chunk".to_owned(),
+                run_id: "run-bulk-stream-terminal-chunk".to_owned(),
+                batch_id: "batch-stream-terminal-chunk".to_owned(),
+                chunk_id: chunks[0].chunk_id.clone(),
+                status: "scheduled".to_owned(),
+                attempt: 2,
+                lease_epoch: 2,
+                owner_epoch: 1,
+                input_handle: None,
+                result_handle: None,
+                output: None,
+                error: None,
+                cancellation_requested: false,
+                cancellation_reason: None,
+                cancellation_metadata: None,
+                worker_id: Some("worker-b".to_owned()),
+                worker_build_id: Some("build-b".to_owned()),
+                lease_token: None,
+                last_report_id: None,
+                available_at: stale_nonterminal_at,
+                started_at: None,
+                lease_expires_at: None,
+                completed_at: None,
+                updated_at: stale_nonterminal_at,
+            })
+            .await?;
+
+        let projected = store
+            .get_bulk_chunk_query_view(
+                "tenant-a",
+                "wf-bulk-stream-terminal-chunk",
+                "run-bulk-stream-terminal-chunk",
+                "batch-stream-terminal-chunk",
+                &chunks[0].chunk_id,
+            )
+            .await?
+            .context("terminal stream chunk missing from query view")?;
+
+        assert_eq!(projected.status, WorkflowBulkChunkStatus::Completed);
+        assert_eq!(projected.output.as_ref(), Some(&vec![json!({"value": "done"})]));
+        assert_eq!(projected.completed_at, Some(terminal_at));
+        assert_eq!(projected.attempt, 1);
 
         Ok(())
     }

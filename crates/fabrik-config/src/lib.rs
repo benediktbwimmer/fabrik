@@ -1,4 +1,4 @@
-use std::env;
+use std::{collections::BTreeMap, env};
 
 use thiserror::Error;
 
@@ -149,6 +149,10 @@ pub struct MatchingRuntimeConfig {
 pub struct ThroughputRuntimeConfig {
     pub lease_ttl_seconds: u64,
     pub sweep_interval_ms: u64,
+    pub poll_max_tasks: usize,
+    pub report_apply_batch_size: usize,
+    pub changelog_publish_batch_size: usize,
+    pub projection_publish_batch_size: usize,
     pub max_active_chunks_per_batch: usize,
     pub max_active_chunks_per_tenant: usize,
     pub max_active_chunks_per_task_queue: usize,
@@ -204,6 +208,19 @@ impl ThroughputRuntimeConfig {
         Ok(Self {
             lease_ttl_seconds: read_u64_with_default("THROUGHPUT_LEASE_TTL_SECONDS", 30)?,
             sweep_interval_ms: read_u64_with_default("THROUGHPUT_SWEEP_INTERVAL_MS", 500)?,
+            poll_max_tasks: read_usize_with_default("THROUGHPUT_POLL_MAX_TASKS", 32)?,
+            report_apply_batch_size: read_usize_with_default(
+                "THROUGHPUT_REPORT_APPLY_BATCH_SIZE",
+                64,
+            )?,
+            changelog_publish_batch_size: read_usize_with_default(
+                "THROUGHPUT_CHANGELOG_PUBLISH_BATCH_SIZE",
+                128,
+            )?,
+            projection_publish_batch_size: read_usize_with_default(
+                "THROUGHPUT_PROJECTION_PUBLISH_BATCH_SIZE",
+                128,
+            )?,
             max_active_chunks_per_batch: read_usize_with_default(
                 "THROUGHPUT_MAX_ACTIVE_CHUNKS_PER_BATCH",
                 256,
@@ -408,6 +425,8 @@ pub struct ExecutorRuntimeConfig {
     pub continue_as_new_run_age_seconds: Option<u64>,
     pub max_mailbox_items_per_turn: usize,
     pub max_transitions_per_turn: usize,
+    pub throughput_default_backend: String,
+    pub throughput_task_queue_backends: BTreeMap<String, String>,
 }
 
 impl ExecutorRuntimeConfig {
@@ -434,6 +453,13 @@ impl ExecutorRuntimeConfig {
             max_transitions_per_turn: read_usize_with_default(
                 "EXECUTOR_MAX_TRANSITIONS_PER_TURN",
                 10_000,
+            )?,
+            throughput_default_backend: read_throughput_backend_with_default(
+                "EXECUTOR_THROUGHPUT_DEFAULT_BACKEND",
+                "pg-v1",
+            )?,
+            throughput_task_queue_backends: read_task_queue_backend_overrides(
+                "EXECUTOR_THROUGHPUT_TASK_QUEUE_BACKENDS",
             )?,
         })
     }
@@ -588,6 +614,53 @@ fn read_optional_string(key: &str) -> Result<Option<String>, ConfigError> {
     }
 }
 
+fn read_throughput_backend_with_default(key: &str, default: &str) -> Result<String, ConfigError> {
+    match env::var(key) {
+        Ok(raw) => validate_throughput_backend(key, raw),
+        Err(env::VarError::NotPresent) => Ok(default.to_owned()),
+        Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
+    }
+}
+
+fn validate_throughput_backend(key: &str, raw: String) -> Result<String, ConfigError> {
+    match raw.trim() {
+        "pg-v1" | "stream-v2" => Ok(raw.trim().to_owned()),
+        _ => Err(ConfigError::InvalidThroughputBackend { key: key.to_owned(), value: raw }),
+    }
+}
+
+fn read_task_queue_backend_overrides(key: &str) -> Result<BTreeMap<String, String>, ConfigError> {
+    let Some(raw) = read_optional_string(key)? else {
+        return Ok(BTreeMap::new());
+    };
+
+    let mut overrides = BTreeMap::new();
+    for entry in raw.split(',') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((task_queue, backend)) = trimmed.split_once('=') else {
+            return Err(ConfigError::InvalidTaskQueueBackendMapping {
+                key: key.to_owned(),
+                value: trimmed.to_owned(),
+            });
+        };
+        let task_queue = task_queue.trim();
+        if task_queue.is_empty() {
+            return Err(ConfigError::InvalidTaskQueueBackendMapping {
+                key: key.to_owned(),
+                value: trimmed.to_owned(),
+            });
+        }
+        overrides.insert(
+            task_queue.to_owned(),
+            validate_throughput_backend(key, backend.trim().to_owned())?,
+        );
+    }
+    Ok(overrides)
+}
+
 fn read_bool_with_default(key: &str, default: bool) -> Result<bool, ConfigError> {
     match env::var(key) {
         Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
@@ -633,6 +706,12 @@ pub enum ConfigError {
     InvalidBool { key: String, value: String },
     #[error("environment variable {key} must be one of localfs or s3, got {value}")]
     InvalidPayloadStoreKind { key: String, value: String },
+    #[error("environment variable {key} must be pg-v1 or stream-v2, got {value}")]
+    InvalidThroughputBackend { key: String, value: String },
+    #[error(
+        "environment variable {key} must be a comma-separated list of task-queue=backend mappings, got {value}"
+    )]
+    InvalidTaskQueueBackendMapping { key: String, value: String },
 }
 
 #[cfg(test)]

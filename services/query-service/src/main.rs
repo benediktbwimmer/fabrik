@@ -8,7 +8,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use fabrik_broker::{
     BrokerConfig, WorkflowHistoryFilter, WorkflowTopicTopology, describe_workflow_topic,
-    read_workflow_history,
+    partition_for_key, read_workflow_history,
 };
 use fabrik_config::{HttpServiceConfig, PostgresConfig, QueryRuntimeConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
@@ -18,7 +18,10 @@ use fabrik_store::{
     WorkflowBulkBatchRecord, WorkflowBulkChunkRecord, WorkflowRunRecord, WorkflowSignalRecord,
     WorkflowStateSnapshot, WorkflowStore,
 };
-use fabrik_throughput::{PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind};
+use fabrik_throughput::{
+    PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind, ThroughputBackend,
+    throughput_partition_key,
+};
 use fabrik_workflow::{
     CompiledWorkflowArtifact, ReplayDivergence, ReplayDivergenceKind, ReplayFieldMismatch,
     ReplaySource, ReplayTransitionTraceEntry, WorkflowDefinition, WorkflowInstanceState,
@@ -26,6 +29,7 @@ use fabrik_workflow::{
     replay_compiled_history_trace, replay_compiled_history_trace_from_snapshot,
     replay_history_trace, replay_history_trace_from_snapshot, same_projection,
 };
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, to_value};
 use std::{
@@ -44,6 +48,8 @@ struct AppState {
     broker: BrokerConfig,
     query: QueryRuntimeConfig,
     payload_store: PayloadStore,
+    client: Client,
+    throughput_partitions: i32,
     retention: Arc<Mutex<RetentionDebugState>>,
 }
 
@@ -210,6 +216,33 @@ struct PaginationQuery {
     offset: Option<usize>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+struct BulkReadQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    consistency: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ConsistencyQuery {
+    consistency: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadConsistency {
+    Eventual,
+    Strong,
+}
+
+impl ReadConsistency {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Eventual => "eventual",
+            Self::Strong => "strong",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ResolvedPage {
     limit: usize,
@@ -358,7 +391,15 @@ async fn main() -> Result<()> {
         "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/replay",
         get(get_workflow_replay_for_run),
     )
-    .with_state(AppState { store, broker, query, payload_store, retention });
+    .with_state(AppState {
+        store,
+        broker,
+        query,
+        payload_store,
+        client: Client::new(),
+        throughput_partitions: redpanda.throughput_partitions,
+        retention,
+    });
 
     serve(app, config.port).await
 }
@@ -612,52 +653,62 @@ async fn get_workflow_activities_for_run(
 
 async fn get_workflow_bulk_batches_for_run(
     Path((tenant_id, instance_id, run_id)): Path<(String, String, String)>,
-    Query(pagination): Query<PaginationQuery>,
+    Query(query): Query<BulkReadQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<WorkflowBulkBatchesResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let response =
-        load_workflow_bulk_batches(&state, &tenant_id, &instance_id, &run_id, pagination)
-            .await
-            .map_err(internal_error)?;
+    let response = load_workflow_bulk_batches(
+        &state,
+        &tenant_id,
+        &instance_id,
+        &run_id,
+        PaginationQuery { limit: query.limit, offset: query.offset },
+        parse_read_consistency(query.consistency.as_deref()).map_err(invalid_request)?,
+    )
+    .await
+    .map_err(internal_error)?;
     Ok(Json(response))
 }
 
 async fn get_workflow_bulk_batch_for_run(
     Path((tenant_id, instance_id, run_id, batch_id)): Path<(String, String, String, String)>,
+    Query(query): Query<ConsistencyQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<WorkflowBulkBatchResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let batch = state
-        .store
-        .get_bulk_batch(&tenant_id, &instance_id, &run_id, &batch_id)
-        .await
-        .map_err(internal_error)?
-        .ok_or_else(|| not_found(format!("bulk batch {batch_id} not found")))?;
-    Ok(Json(WorkflowBulkBatchResponse {
-        tenant_id,
-        instance_id,
-        run_id,
-        consistency: "eventual",
-        authoritative_source: authoritative_bulk_source(&batch.throughput_backend),
-        projection_lag_ms: projection_lag_ms_from_times([Some(batch.updated_at)]),
-        batch,
-    }))
+    let response = load_workflow_bulk_batch(
+        &state,
+        &tenant_id,
+        &instance_id,
+        &run_id,
+        &batch_id,
+        parse_read_consistency(query.consistency.as_deref()).map_err(invalid_request)?,
+    )
+    .await
+    .map_err(internal_error)?;
+    Ok(Json(response))
 }
 
 async fn get_workflow_bulk_chunks_for_run(
     Path((tenant_id, instance_id, run_id, batch_id)): Path<(String, String, String, String)>,
-    Query(pagination): Query<PaginationQuery>,
+    Query(query): Query<BulkReadQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<WorkflowBulkChunksResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let response =
-        load_workflow_bulk_chunks(&state, &tenant_id, &instance_id, &run_id, &batch_id, pagination)
-            .await
-            .map_err(internal_error)?;
+    let response = load_workflow_bulk_chunks(
+        &state,
+        &tenant_id,
+        &instance_id,
+        &run_id,
+        &batch_id,
+        PaginationQuery { limit: query.limit, offset: query.offset },
+        parse_read_consistency(query.consistency.as_deref()).map_err(invalid_request)?,
+    )
+    .await
+    .map_err(internal_error)?;
     Ok(Json(response))
 }
 
 async fn get_workflow_bulk_results_for_run(
     Path((tenant_id, instance_id, run_id, batch_id)): Path<(String, String, String, String)>,
-    Query(pagination): Query<PaginationQuery>,
+    Query(query): Query<BulkReadQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<WorkflowBulkResultsResponse>, (StatusCode, Json<ErrorResponse>)> {
     let response = load_workflow_bulk_results(
@@ -666,7 +717,8 @@ async fn get_workflow_bulk_results_for_run(
         &instance_id,
         &run_id,
         &batch_id,
-        pagination,
+        PaginationQuery { limit: query.limit, offset: query.offset },
+        parse_read_consistency(query.consistency.as_deref()).map_err(invalid_request)?,
     )
     .await
     .map_err(internal_error)?;
@@ -771,6 +823,14 @@ fn authoritative_bulk_source(throughput_backend: &str) -> &'static str {
     if throughput_backend == "stream-v2" { "stream-v2-owner-state" } else { "pg-v1-postgres" }
 }
 
+fn parse_read_consistency(raw: Option<&str>) -> Result<ReadConsistency> {
+    match raw.unwrap_or("eventual") {
+        "eventual" => Ok(ReadConsistency::Eventual),
+        "strong" => Ok(ReadConsistency::Strong),
+        other => anyhow::bail!("unsupported consistency {other}"),
+    }
+}
+
 fn retention_policy_response(config: &QueryRuntimeConfig) -> RetentionPolicyResponse {
     RetentionPolicyResponse {
         history_retention_days: config.history_retention_days,
@@ -788,6 +848,10 @@ fn internal_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
 
 fn not_found(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
     (StatusCode::NOT_FOUND, Json(ErrorResponse { message: message.into() }))
+}
+
+fn invalid_request(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
+    (StatusCode::BAD_REQUEST, Json(ErrorResponse { message: error.to_string() }))
 }
 
 fn internal_error_from_display(error: impl std::fmt::Display) -> (StatusCode, Json<ErrorResponse>) {
@@ -879,38 +943,155 @@ async fn load_workflow_bulk_batches(
     instance_id: &str,
     run_id: &str,
     pagination: PaginationQuery,
+    consistency: ReadConsistency,
 ) -> Result<WorkflowBulkBatchesResponse> {
     let page = resolve_page(&state.query, &pagination);
-    let total =
-        state.store.count_bulk_batches_for_run_query_view(tenant_id, instance_id, run_id).await?
-            as usize;
-    let batches = state
-        .store
-        .list_bulk_batches_for_run_page_query_view(
-            tenant_id,
-            instance_id,
-            run_id,
-            i64::try_from(page.limit).context("bulk batch page limit exceeds i64")?,
-            i64::try_from(page.offset).context("bulk batch page offset exceeds i64")?,
-        )
-        .await?;
+    let (total, batches) = match consistency {
+        ReadConsistency::Eventual => (
+            state
+                .store
+                .count_bulk_batches_for_run_query_view(tenant_id, instance_id, run_id)
+                .await? as usize,
+            state
+                .store
+                .list_bulk_batches_for_run_page_query_view(
+                    tenant_id,
+                    instance_id,
+                    run_id,
+                    i64::try_from(page.limit).context("bulk batch page limit exceeds i64")?,
+                    i64::try_from(page.offset).context("bulk batch page offset exceeds i64")?,
+                )
+                .await?,
+        ),
+        ReadConsistency::Strong => {
+            let limit = i64::try_from(page.limit).context("bulk batch page limit exceeds i64")?;
+            let offset =
+                i64::try_from(page.offset).context("bulk batch page offset exceeds i64")?;
+            let durable_total =
+                state.store.count_bulk_batches_for_run(tenant_id, instance_id, run_id).await?
+                    as usize;
+            let mut batches = state
+                .store
+                .list_bulk_batches_for_run_page(tenant_id, instance_id, run_id, limit, offset)
+                .await?;
+            let (total, discovery_batches) = if batches.is_empty() {
+                (
+                    state
+                        .store
+                        .count_bulk_batches_for_run_query_view(tenant_id, instance_id, run_id)
+                        .await? as usize,
+                    state
+                        .store
+                        .list_bulk_batches_for_run_page_query_view(
+                            tenant_id,
+                            instance_id,
+                            run_id,
+                            limit,
+                            offset,
+                        )
+                        .await?,
+                )
+            } else {
+                (durable_total, batches.clone())
+            };
+            if batches.is_empty() {
+                batches = discovery_batches;
+            }
+            for batch in &mut batches {
+                if batch.throughput_backend == ThroughputBackend::StreamV2.as_str() {
+                    *batch = fetch_strong_stream_batch(
+                        state,
+                        tenant_id,
+                        instance_id,
+                        run_id,
+                        &batch.batch_id,
+                    )
+                    .await?;
+                }
+            }
+            (total, batches)
+        }
+    };
+    let authoritative_source = if consistency == ReadConsistency::Strong {
+        if batches
+            .iter()
+            .any(|batch| batch.throughput_backend == ThroughputBackend::StreamV2.as_str())
+            && batches
+                .iter()
+                .any(|batch| batch.throughput_backend != ThroughputBackend::StreamV2.as_str())
+        {
+            "mixed-bulk-backends"
+        } else if batches
+            .iter()
+            .any(|batch| batch.throughput_backend == ThroughputBackend::StreamV2.as_str())
+        {
+            "stream-v2-owner-state"
+        } else {
+            "pg-v1-postgres"
+        }
+    } else if batches
+        .iter()
+        .any(|batch| batch.throughput_backend == ThroughputBackend::StreamV2.as_str())
+    {
+        "mixed-bulk-backends"
+    } else {
+        "pg-v1-postgres"
+    };
     Ok(WorkflowBulkBatchesResponse {
         tenant_id: tenant_id.to_owned(),
         instance_id: instance_id.to_owned(),
         run_id: run_id.to_owned(),
-        consistency: "eventual",
-        authoritative_source: if batches.iter().any(|batch| batch.throughput_backend == "stream-v2")
-        {
-            "mixed-bulk-backends"
-        } else {
-            "pg-v1-postgres"
-        },
-        projection_lag_ms: projection_lag_ms_from_times(
-            batches.iter().map(|batch| Some(batch.updated_at)),
-        ),
+        consistency: consistency.as_str(),
+        authoritative_source,
+        projection_lag_ms: (consistency == ReadConsistency::Eventual)
+            .then(|| {
+                projection_lag_ms_from_times(batches.iter().map(|batch| Some(batch.updated_at)))
+            })
+            .flatten(),
         page: build_page_info(&page, total, batches.len()),
         batch_count: total,
         batches,
+    })
+}
+
+async fn load_workflow_bulk_batch(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    batch_id: &str,
+    consistency: ReadConsistency,
+) -> Result<WorkflowBulkBatchResponse> {
+    let batch = match consistency {
+        ReadConsistency::Eventual => {
+            state.store.get_bulk_batch_query_view(tenant_id, instance_id, run_id, batch_id).await?
+        }
+        ReadConsistency::Strong => {
+            let batch =
+                load_bulk_batch_for_strong_read(state, tenant_id, instance_id, run_id, batch_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("bulk batch {batch_id} not found"))?;
+            if batch.throughput_backend == ThroughputBackend::StreamV2.as_str() {
+                Some(
+                    fetch_strong_stream_batch(state, tenant_id, instance_id, run_id, batch_id)
+                        .await?,
+                )
+            } else {
+                Some(batch)
+            }
+        }
+    }
+    .ok_or_else(|| anyhow::anyhow!("bulk batch {batch_id} not found"))?;
+    Ok(WorkflowBulkBatchResponse {
+        tenant_id: tenant_id.to_owned(),
+        instance_id: instance_id.to_owned(),
+        run_id: run_id.to_owned(),
+        consistency: consistency.as_str(),
+        authoritative_source: authoritative_bulk_source(&batch.throughput_backend),
+        projection_lag_ms: (consistency == ReadConsistency::Eventual)
+            .then(|| projection_lag_ms_from_times([Some(batch.updated_at)]))
+            .flatten(),
+        batch,
     })
 }
 
@@ -921,28 +1102,96 @@ async fn load_workflow_bulk_chunks(
     run_id: &str,
     batch_id: &str,
     pagination: PaginationQuery,
+    consistency: ReadConsistency,
 ) -> Result<WorkflowBulkChunksResponse> {
-    let batch = state
-        .store
-        .get_bulk_batch_query_view(tenant_id, instance_id, run_id, batch_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("bulk batch {batch_id} not found"))?;
+    let batch = match consistency {
+        ReadConsistency::Eventual => {
+            state.store.get_bulk_batch_query_view(tenant_id, instance_id, run_id, batch_id).await?
+        }
+        ReadConsistency::Strong => {
+            let batch =
+                load_bulk_batch_for_strong_read(state, tenant_id, instance_id, run_id, batch_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("bulk batch {batch_id} not found"))?;
+            if batch.throughput_backend == ThroughputBackend::StreamV2.as_str() {
+                Some(
+                    fetch_strong_stream_batch(state, tenant_id, instance_id, run_id, batch_id)
+                        .await?,
+                )
+            } else {
+                Some(batch)
+            }
+        }
+    }
+    .ok_or_else(|| anyhow::anyhow!("bulk batch {batch_id} not found"))?;
     let page = resolve_page(&state.query, &pagination);
-    let total = state
-        .store
-        .count_bulk_chunks_for_batch_query_view(tenant_id, instance_id, run_id, batch_id)
-        .await? as usize;
-    let chunks = state
-        .store
-        .list_bulk_chunks_for_batch_page_query_view(
-            tenant_id,
-            instance_id,
-            run_id,
-            batch_id,
-            i64::try_from(page.limit).context("bulk chunk page limit exceeds i64")?,
-            i64::try_from(page.offset).context("bulk chunk page offset exceeds i64")?,
-        )
-        .await?;
+    let total = match consistency {
+        ReadConsistency::Eventual => {
+            state
+                .store
+                .count_bulk_chunks_for_batch_query_view(tenant_id, instance_id, run_id, batch_id)
+                .await? as usize
+        }
+        ReadConsistency::Strong => {
+            if batch.throughput_backend == ThroughputBackend::StreamV2.as_str() {
+                state
+                    .store
+                    .count_bulk_chunks_for_batch_query_view(
+                        tenant_id,
+                        instance_id,
+                        run_id,
+                        batch_id,
+                    )
+                    .await? as usize
+            } else {
+                state
+                    .store
+                    .count_bulk_chunks_for_batch(tenant_id, instance_id, run_id, batch_id)
+                    .await? as usize
+            }
+        }
+    };
+    let chunks = match consistency {
+        ReadConsistency::Eventual => {
+            state
+                .store
+                .list_bulk_chunks_for_batch_page_query_view(
+                    tenant_id,
+                    instance_id,
+                    run_id,
+                    batch_id,
+                    i64::try_from(page.limit).context("bulk chunk page limit exceeds i64")?,
+                    i64::try_from(page.offset).context("bulk chunk page offset exceeds i64")?,
+                )
+                .await?
+        }
+        ReadConsistency::Strong => {
+            if batch.throughput_backend == ThroughputBackend::StreamV2.as_str() {
+                fetch_strong_stream_chunks(
+                    state,
+                    tenant_id,
+                    instance_id,
+                    run_id,
+                    batch_id,
+                    page.limit,
+                    page.offset,
+                )
+                .await?
+            } else {
+                state
+                    .store
+                    .list_bulk_chunks_for_batch_page(
+                        tenant_id,
+                        instance_id,
+                        run_id,
+                        batch_id,
+                        i64::try_from(page.limit).context("bulk chunk page limit exceeds i64")?,
+                        i64::try_from(page.offset).context("bulk chunk page offset exceeds i64")?,
+                    )
+                    .await?
+            }
+        }
+    };
     let mut resolved_chunks = Vec::new();
     for chunk in chunks {
         resolved_chunks.push(resolve_chunk_payloads(state, chunk, true, false).await?);
@@ -952,11 +1201,15 @@ async fn load_workflow_bulk_chunks(
         instance_id: instance_id.to_owned(),
         run_id: run_id.to_owned(),
         batch_id: batch_id.to_owned(),
-        consistency: "eventual",
+        consistency: consistency.as_str(),
         authoritative_source: authoritative_bulk_source(&batch.throughput_backend),
-        projection_lag_ms: projection_lag_ms_from_times(
-            resolved_chunks.iter().map(|chunk| Some(chunk.updated_at)),
-        ),
+        projection_lag_ms: (consistency == ReadConsistency::Eventual)
+            .then(|| {
+                projection_lag_ms_from_times(
+                    resolved_chunks.iter().map(|chunk| Some(chunk.updated_at)),
+                )
+            })
+            .flatten(),
         page: build_page_info(&page, total, resolved_chunks.len()),
         chunk_count: total,
         chunks: resolved_chunks,
@@ -970,28 +1223,81 @@ async fn load_workflow_bulk_results(
     run_id: &str,
     batch_id: &str,
     pagination: PaginationQuery,
+    consistency: ReadConsistency,
 ) -> Result<WorkflowBulkResultsResponse> {
-    let batch = state
-        .store
-        .get_bulk_batch_query_view(tenant_id, instance_id, run_id, batch_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("bulk batch {batch_id} not found"))?;
+    let batch =
+        load_workflow_bulk_batch(state, tenant_id, instance_id, run_id, batch_id, consistency)
+            .await?
+            .batch;
     let page = resolve_page(&state.query, &pagination);
-    let total = state
-        .store
-        .count_bulk_chunks_for_batch_query_view(tenant_id, instance_id, run_id, batch_id)
-        .await? as usize;
-    let chunks = state
-        .store
-        .list_bulk_chunks_for_batch_page_query_view(
-            tenant_id,
-            instance_id,
-            run_id,
-            batch_id,
-            i64::try_from(page.limit).context("bulk result page limit exceeds i64")?,
-            i64::try_from(page.offset).context("bulk result page offset exceeds i64")?,
-        )
-        .await?;
+    let total = match consistency {
+        ReadConsistency::Eventual => {
+            state
+                .store
+                .count_bulk_chunks_for_batch_query_view(tenant_id, instance_id, run_id, batch_id)
+                .await? as usize
+        }
+        ReadConsistency::Strong => {
+            if batch.throughput_backend == ThroughputBackend::StreamV2.as_str() {
+                state
+                    .store
+                    .count_bulk_chunks_for_batch_query_view(
+                        tenant_id,
+                        instance_id,
+                        run_id,
+                        batch_id,
+                    )
+                    .await? as usize
+            } else {
+                state
+                    .store
+                    .count_bulk_chunks_for_batch(tenant_id, instance_id, run_id, batch_id)
+                    .await? as usize
+            }
+        }
+    };
+    let chunks = match consistency {
+        ReadConsistency::Eventual => {
+            state
+                .store
+                .list_bulk_chunks_for_batch_page_query_view(
+                    tenant_id,
+                    instance_id,
+                    run_id,
+                    batch_id,
+                    i64::try_from(page.limit).context("bulk result page limit exceeds i64")?,
+                    i64::try_from(page.offset).context("bulk result page offset exceeds i64")?,
+                )
+                .await?
+        }
+        ReadConsistency::Strong => {
+            if batch.throughput_backend == ThroughputBackend::StreamV2.as_str() {
+                fetch_strong_stream_chunks(
+                    state,
+                    tenant_id,
+                    instance_id,
+                    run_id,
+                    batch_id,
+                    page.limit,
+                    page.offset,
+                )
+                .await?
+            } else {
+                state
+                    .store
+                    .list_bulk_chunks_for_batch_page(
+                        tenant_id,
+                        instance_id,
+                        run_id,
+                        batch_id,
+                        i64::try_from(page.limit).context("bulk result page limit exceeds i64")?,
+                        i64::try_from(page.offset)
+                            .context("bulk result page offset exceeds i64")?,
+                    )
+                    .await?
+            }
+        }
+    };
     let mut resolved_chunks = Vec::new();
     for chunk in chunks {
         resolved_chunks.push(resolve_chunk_payloads(state, chunk, false, true).await?);
@@ -1003,11 +1309,13 @@ async fn load_workflow_bulk_results(
         instance_id: instance_id.to_owned(),
         run_id: run_id.to_owned(),
         batch_id: batch_id.to_owned(),
-        consistency: "eventual",
+        consistency: consistency.as_str(),
         authoritative_source: authoritative_bulk_source(&batch.throughput_backend),
-        projection_lag_ms: projection_lag_ms_from_times(
-            chunks.iter().map(|chunk| Some(chunk.updated_at)),
-        ),
+        projection_lag_ms: (consistency == ReadConsistency::Eventual)
+            .then(|| {
+                projection_lag_ms_from_times(chunks.iter().map(|chunk| Some(chunk.updated_at)))
+            })
+            .flatten(),
         page: build_page_info(&page, total, chunks.len()),
         chunk_count: total,
         chunks,
@@ -1034,6 +1342,99 @@ async fn resolve_chunk_payloads(
         }
     }
     Ok(chunk)
+}
+
+async fn fetch_strong_stream_batch(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    batch_id: &str,
+) -> Result<WorkflowBulkBatchRecord> {
+    let endpoint = throughput_owner_query_endpoint(state, batch_id).await?;
+    let response = state
+        .client
+        .get(format!(
+            "{endpoint}/debug/throughput/batches/{tenant_id}/{instance_id}/{run_id}/{batch_id}"
+        ))
+        .send()
+        .await
+        .context("failed to fetch strong throughput batch")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("bulk batch {batch_id} not found");
+    }
+    let response = response.error_for_status().context("strong throughput batch request failed")?;
+    Ok(response
+        .json::<StrongThroughputBatchResponse>()
+        .await
+        .context("failed to decode strong throughput batch response")?
+        .batch)
+}
+
+async fn load_bulk_batch_for_strong_read(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    batch_id: &str,
+) -> Result<Option<WorkflowBulkBatchRecord>> {
+    if let Some(batch) =
+        state.store.get_bulk_batch(tenant_id, instance_id, run_id, batch_id).await?
+    {
+        return Ok(Some(batch));
+    }
+    state.store.get_bulk_batch_query_view(tenant_id, instance_id, run_id, batch_id).await
+}
+
+async fn fetch_strong_stream_chunks(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    batch_id: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<WorkflowBulkChunkRecord>> {
+    let endpoint = throughput_owner_query_endpoint(state, batch_id).await?;
+    let response = state
+        .client
+        .get(format!(
+            "{endpoint}/debug/throughput/batches/{tenant_id}/{instance_id}/{run_id}/{batch_id}/chunks"
+        ))
+        .query(&[("limit", limit), ("offset", offset)])
+        .send()
+        .await
+        .context("failed to fetch strong throughput chunks")?;
+    let response =
+        response.error_for_status().context("strong throughput chunks request failed")?;
+    Ok(response
+        .json::<StrongThroughputChunksResponse>()
+        .await
+        .context("failed to decode strong throughput chunks response")?
+        .chunks)
+}
+
+async fn throughput_owner_query_endpoint(state: &AppState, batch_id: &str) -> Result<String> {
+    let partition_id = partition_for_key(
+        &throughput_partition_key(batch_id, 0),
+        state.throughput_partitions.max(1),
+    );
+    let member = state
+        .store
+        .get_active_throughput_member_for_partition(partition_id, Utc::now())
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no active throughput owner for batch {batch_id}"))?;
+    Ok(member.query_endpoint.trim_end_matches('/').to_owned())
+}
+
+#[derive(Debug, Deserialize)]
+struct StrongThroughputBatchResponse {
+    batch: WorkflowBulkBatchRecord,
+}
+
+#[derive(Debug, Deserialize)]
+struct StrongThroughputChunksResponse {
+    chunks: Vec<WorkflowBulkChunkRecord>,
 }
 
 fn build_payload_store_config(query: &QueryRuntimeConfig) -> PayloadStoreConfig {

@@ -32,6 +32,11 @@ The strong query API should expose:
 
 Strong query execution is a workflow API feature, not merely a projection lookup.
 
+For throughput mode, strong reads must distinguish owner domains explicitly:
+
+- workflow strong reads route to the workflow owner
+- live batch strong reads route to the throughput owner
+
 ## Visibility View
 
 The visibility API should support:
@@ -67,3 +72,19 @@ The history view should expose:
 - visibility indexes may be eventually consistent
 - strong query and update paths must state their own consistency rules explicitly
 - operational tooling must surface projection lag and indexing lag
+
+## Throughput Read Concerns
+
+Throughput-mode reads must expose consistency as a read concern rather than as an execution option.
+
+Supported read concerns:
+
+- `strong`
+- `eventual`
+
+Rules:
+
+- `strong` reads route to the active owner for the requested domain
+- `eventual` reads may come from projections or other derived read models
+- eventual reads are non-authoritative and not replay-stable
+- operator and UI surfaces should expose projection lag metadata when serving eventual reads

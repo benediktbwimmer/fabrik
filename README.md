@@ -87,16 +87,34 @@ The documentation under `docs/` now reflects the new target architecture:
 
 ## Getting Started
 
-Start local infrastructure:
+Start the local stack:
 
 ```bash
-docker compose up -d
+make up
 ```
 
-If your machine already uses the default host ports, override them when starting compose:
+Stop the local stack:
 
 ```bash
-REDPANDA_HOST_PORT=62303 POSTGRES_HOST_PORT=62304 docker compose up -d
+make down
+```
+
+Show local stack status:
+
+```bash
+make status
+```
+
+Run the first eager/count smoke flow against `stream-v2`:
+
+```bash
+make smoke-eager-count
+```
+
+If your machine already uses the default host ports, override them when starting the stack:
+
+```bash
+REDPANDA_HOST_PORT=62303 POSTGRES_HOST_PORT=62304 make up
 ```
 
 Run all checks:

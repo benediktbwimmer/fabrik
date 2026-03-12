@@ -997,7 +997,8 @@ class WorkflowLowerer {
         next: nextState,
         handle_var: targetVar,
         task_queue: options.task_queue,
-        throughput_backend: options.throughput_backend,
+        execution_policy: options.execution_policy,
+        reducer: options.reducer,
         chunk_size: options.chunk_size,
         retry: options.retry,
       }, awaitExpression);
@@ -1216,14 +1217,36 @@ function compileBulkOptions(expression) {
       continue;
     }
     if (key === "backend") {
-      const backend = literalString(property.initializer, "ctx.bulkActivity backend");
-      if (backend !== "pg-v1" && backend !== "stream-v2") {
+      throw compilerError(
+        `ctx.bulkActivity backend selection is server-controlled; remove the backend option`,
+        property,
+      );
+    }
+    if (key === "execution") {
+      const execution = literalString(property.initializer, "ctx.bulkActivity execution");
+      if (execution !== "default" && execution !== "eager") {
         throw compilerError(
-          `ctx.bulkActivity backend must be "pg-v1" or "stream-v2"`,
+          `ctx.bulkActivity execution must be "default" or "eager"`,
           property.initializer,
         );
       }
-      options.throughput_backend = backend;
+      options.execution_policy = execution;
+      continue;
+    }
+    if (key === "reducer") {
+      const reducer = literalString(property.initializer, "ctx.bulkActivity reducer");
+      if (
+        reducer !== "all_succeeded"
+        && reducer !== "all_settled"
+        && reducer !== "count"
+        && reducer !== "collect_results"
+      ) {
+        throw compilerError(
+          `ctx.bulkActivity reducer must be "all_succeeded", "all_settled", "count", or "collect_results"`,
+          property.initializer,
+        );
+      }
+      options.reducer = reducer;
       continue;
     }
     if (key === "retry") {

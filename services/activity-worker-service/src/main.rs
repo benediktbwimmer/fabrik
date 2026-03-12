@@ -1,7 +1,8 @@
 use std::{env, sync::Arc, time::Duration};
 
 use anyhow::Result;
-use fabrik_config::GrpcServiceConfig;
+use fabrik_config::{GrpcServiceConfig, ThroughputPayloadStoreConfig, ThroughputPayloadStoreKind};
+use fabrik_throughput::{PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind};
 use fabrik_worker_protocol::activity_worker::{
     ActivityTaskCancelledResult, ActivityTaskCompletedResult, ActivityTaskFailedResult,
     ActivityTaskResult, BulkActivityTaskCancelledResult, BulkActivityTaskCompletedResult,
@@ -23,8 +24,8 @@ const RESULT_BATCH_MAX_BYTES: usize = 1_048_576;
 const RESULT_BATCH_FLUSH_INTERVAL_MS: u64 = 5;
 const DEFAULT_ACTIVITY_WORKER_CONCURRENCY: usize = 8;
 const DEFAULT_RESULT_FLUSHER_CONCURRENCY: usize = 1;
+const DEFAULT_BULK_POLL_MAX_TASKS: u32 = 8;
 const MAX_BULK_CHUNK_INPUT_BYTES: usize = 1024 * 1024;
-const MAX_BULK_CHUNK_OUTPUT_BYTES: usize = 1024 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -52,7 +53,13 @@ async fn main() -> Result<()> {
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_RESULT_FLUSHER_CONCURRENCY)
         .min(concurrency);
+    let bulk_poll_max_tasks = env::var("ACTIVITY_BULK_POLL_MAX_TASKS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_BULK_POLL_MAX_TASKS);
     let client = Arc::new(Client::new());
+    let payload_store = Arc::new(PayloadStore::from_config(build_payload_store_config()).await?);
 
     info!(
         matching_endpoint = %endpoint,
@@ -63,6 +70,7 @@ async fn main() -> Result<()> {
         worker_build_id = %worker_build_id,
         concurrency,
         result_flusher_concurrency,
+        bulk_poll_max_tasks,
         port = config.port,
         "activity-worker-service starting"
     );
@@ -104,6 +112,8 @@ async fn main() -> Result<()> {
             lane_worker_id(&worker_id, lane, concurrency),
             worker_build_id.clone(),
             client.clone(),
+            payload_store.clone(),
+            bulk_poll_max_tasks,
             bulk_result_txs[lane % bulk_result_txs.len()].clone(),
         ));
     }
@@ -167,7 +177,7 @@ fn estimate_bulk_result_size(result: &BulkActivityTaskResult) -> usize {
             fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
                 completed,
             ),
-        ) => completed.output_json.len(),
+        ) => completed.output_json.len() + completed.result_handle_json.len(),
         Some(
             fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Failed(
                 failed,
@@ -416,6 +426,8 @@ async fn run_bulk_activity_lane(
     worker_id: String,
     worker_build_id: String,
     client: Arc<Client>,
+    payload_store: Arc<PayloadStore>,
+    bulk_poll_max_tasks: u32,
     result_tx: UnboundedSender<BulkActivityTaskResult>,
 ) -> Result<()> {
     let mut worker = connect_activity_worker_with_retry(&endpoint, &worker_id).await;
@@ -428,29 +440,34 @@ async fn run_bulk_activity_lane(
                 worker_id: worker_id.clone(),
                 worker_build_id: worker_build_id.clone(),
                 poll_timeout_ms: 30_000,
+                max_tasks: bulk_poll_max_tasks,
             })
             .await;
 
-        let Some(task) = (match response {
-            Ok(response) => response.into_inner().task,
+        let tasks = match response {
+            Ok(response) => response.into_inner().tasks,
             Err(error) => {
                 error!(error = %error, worker_id = %worker_id, "failed to poll matching-service for bulk task");
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
-        }) else {
-            continue;
         };
+        if tasks.is_empty() {
+            continue;
+        }
 
-        let activity_result = execute_bulk_activity_task(
-            client.as_ref(),
-            task,
-            worker_id.clone(),
-            worker_build_id.clone(),
-        )
-        .await?;
-        if result_tx.send(activity_result).is_err() {
-            anyhow::bail!("bulk activity result flusher channel closed");
+        for task in tasks {
+            let activity_result = execute_bulk_activity_task(
+                client.as_ref(),
+                payload_store.as_ref(),
+                task,
+                worker_id.clone(),
+                worker_build_id.clone(),
+            )
+            .await?;
+            if result_tx.send(activity_result).is_err() {
+                anyhow::bail!("bulk activity result flusher channel closed");
+            }
         }
     }
 }
@@ -538,39 +555,13 @@ async fn execute_activity_task(
 
 async fn execute_bulk_activity_task(
     client: &Client,
+    payload_store: &PayloadStore,
     task: fabrik_worker_protocol::activity_worker::BulkActivityTask,
     worker_id: String,
     worker_build_id: String,
 ) -> Result<BulkActivityTaskResult> {
-    if task.items_json.len() > MAX_BULK_CHUNK_INPUT_BYTES {
-        return Ok(BulkActivityTaskResult {
-            tenant_id: task.tenant_id,
-            instance_id: task.instance_id,
-            run_id: task.run_id,
-            batch_id: task.batch_id,
-            chunk_id: task.chunk_id,
-            chunk_index: task.chunk_index,
-            group_id: task.group_id,
-            attempt: task.attempt,
-            worker_id,
-            worker_build_id,
-            lease_token: task.lease_token,
-            lease_epoch: task.lease_epoch,
-            owner_epoch: task.owner_epoch,
-            report_id: Uuid::now_v7().to_string(),
-            result: Some(
-                fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Failed(
-                    BulkActivityTaskFailedResult {
-                        error: format!(
-                            "bulk chunk input exceeded {} bytes",
-                            MAX_BULK_CHUNK_INPUT_BYTES
-                        ),
-                    },
-                ),
-            ),
-        });
-    }
-    let items = serde_json::from_str::<Vec<Value>>(&task.items_json)?;
+    let input_handle = task_input_handle(&task)?;
+    let items = resolve_bulk_task_items(payload_store, &task, input_handle.as_ref()).await?;
     let mut outputs = Vec::with_capacity(items.len());
     for item in items {
         match execute_activity(client, &task.activity_type, task.attempt, None, &item).await {
@@ -629,35 +620,15 @@ async fn execute_bulk_activity_task(
         }
     }
 
-    let output_json = serde_json::to_string(&outputs)?;
-    if output_json.len() > MAX_BULK_CHUNK_OUTPUT_BYTES {
-        return Ok(BulkActivityTaskResult {
-            tenant_id: task.tenant_id,
-            instance_id: task.instance_id,
-            run_id: task.run_id,
-            batch_id: task.batch_id,
-            chunk_id: task.chunk_id,
-            chunk_index: task.chunk_index,
-            group_id: task.group_id,
-            attempt: task.attempt,
-            worker_id,
-            worker_build_id,
-            lease_token: task.lease_token,
-            lease_epoch: task.lease_epoch,
-            owner_epoch: task.owner_epoch,
-            report_id: Uuid::now_v7().to_string(),
-            result: Some(
-                fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Failed(
-                    BulkActivityTaskFailedResult {
-                        error: format!(
-                            "bulk chunk output exceeded {} bytes",
-                            MAX_BULK_CHUNK_OUTPUT_BYTES
-                        ),
-                    },
-                ),
-            ),
-        });
-    }
+    let output_payload = Value::Array(outputs);
+    let result_handle_json = serde_json::to_string(
+        &payload_store
+            .write_value(
+                &format!("batches/{}/chunks/{}/output", task.batch_id, task.chunk_id),
+                &output_payload,
+            )
+            .await?,
+    )?;
 
     Ok(BulkActivityTaskResult {
         tenant_id: task.tenant_id,
@@ -676,10 +647,37 @@ async fn execute_bulk_activity_task(
         report_id: Uuid::now_v7().to_string(),
         result: Some(
             fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
-                BulkActivityTaskCompletedResult { output_json },
+                BulkActivityTaskCompletedResult { output_json: String::new(), result_handle_json },
             ),
         ),
     })
+}
+
+fn task_input_handle(
+    task: &fabrik_worker_protocol::activity_worker::BulkActivityTask,
+) -> Result<Option<PayloadHandle>> {
+    if task.input_handle_json.trim().is_empty() {
+        return Ok(None);
+    }
+    let value = serde_json::from_str::<Value>(&task.input_handle_json)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_value(value)?))
+}
+
+async fn resolve_bulk_task_items(
+    payload_store: &PayloadStore,
+    task: &fabrik_worker_protocol::activity_worker::BulkActivityTask,
+    input_handle: Option<&PayloadHandle>,
+) -> Result<Vec<Value>> {
+    if let Some(handle) = input_handle {
+        return payload_store.read_items(handle).await;
+    }
+    if task.items_json.len() > MAX_BULK_CHUNK_INPUT_BYTES {
+        anyhow::bail!("bulk chunk input exceeded {} bytes", MAX_BULK_CHUNK_INPUT_BYTES);
+    }
+    Ok(serde_json::from_str::<Vec<Value>>(&task.items_json)?)
 }
 
 fn lane_worker_id(base_worker_id: &str, lane: usize, concurrency: usize) -> String {
@@ -700,6 +698,25 @@ async fn execute_activity(
         return execute_http_request(client, config.as_ref(), input, "activity-worker").await;
     }
     execute_handler(activity_type, input).map_err(anyhow::Error::from)
+}
+
+fn build_payload_store_config() -> PayloadStoreConfig {
+    let config =
+        ThroughputPayloadStoreConfig::from_env().expect("throughput payload store config loads");
+    PayloadStoreConfig {
+        default_store: match config.kind {
+            ThroughputPayloadStoreKind::LocalFilesystem => PayloadStoreKind::LocalFilesystem,
+            ThroughputPayloadStoreKind::S3 => PayloadStoreKind::S3,
+        },
+        local_dir: config.local_dir,
+        s3_bucket: config.s3_bucket,
+        s3_region: config.s3_region,
+        s3_endpoint: config.s3_endpoint,
+        s3_access_key_id: config.s3_access_key_id,
+        s3_secret_access_key: config.s3_secret_access_key,
+        s3_force_path_style: config.s3_force_path_style,
+        s3_key_prefix: config.s3_key_prefix,
+    }
 }
 
 fn execute_benchmark_echo(attempt: u32, input: &Value) -> Result<Value> {

@@ -109,7 +109,8 @@ test("compiler lowers bulk activity handles and waits", async () => {
 
   assert.match(serialized, /"type":"start_bulk_activity"/);
   assert.match(serialized, /"activity_type":"benchmark\.echo"/);
-  assert.match(serialized, /"throughput_backend":"stream-v2"/);
+  assert.match(serialized, /"execution_policy":"eager"/);
+  assert.match(serialized, /"reducer":"collect_results"/);
   assert.match(serialized, /"chunk_size":128/);
   assert.match(serialized, /"type":"wait_for_bulk_activity"/);
   assert.match(serialized, /"output_var":"summary"/);
@@ -154,7 +155,7 @@ test("compiler rejects unsupported bulk backend options", async () => {
     ]),
     (error) => {
       const output = `${error.stdout ?? ""}${error.stderr ?? ""}`;
-      assert.match(output, /backend must be "pg-v1" or "stream-v2"/);
+      assert.match(output, /backend selection is server-controlled/);
       return true;
     },
   );

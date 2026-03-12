@@ -52,6 +52,11 @@ struct DefaultSetRequest {
     set_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ThroughputPolicyRequest {
+    backend: String,
+}
+
 #[derive(Debug, Serialize)]
 struct WorkflowRoutingResponse {
     tenant_id: String,
@@ -143,6 +148,22 @@ fn build_app(state: AppState, service_name: String) -> Router {
         get(proxy_to_query_get),
     )
     .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs/{run_id}/bulk-batches",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs/{run_id}/bulk-batches/{batch_id}",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs/{run_id}/bulk-batches/{batch_id}/chunks",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs/{run_id}/bulk-batches/{batch_id}/results",
+        get(proxy_to_query_get),
+    )
+    .route(
         "/tenants/{tenant_id}/workflows/{workflow_instance_id}/history",
         get(proxy_to_query_get),
     )
@@ -173,6 +194,10 @@ fn build_app(state: AppState, service_name: String) -> Router {
     .route(
         "/admin/tenants/{tenant_id}/task-queues/{queue_kind}/{task_queue}/default-set",
         post(set_default_set),
+    )
+    .route(
+        "/admin/tenants/{tenant_id}/task-queues/{queue_kind}/{task_queue}/throughput-policy",
+        put(upsert_throughput_policy),
     )
     .route(
         "/admin/tenants/{tenant_id}/task-queues/{queue_kind}/{task_queue}",
@@ -298,6 +323,20 @@ async fn set_default_set(
         "default_set_id": request.set_id,
         "status": "updated"
     })))
+}
+
+async fn upsert_throughput_policy(
+    Path((tenant_id, queue_kind, task_queue)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<ThroughputPolicyRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let queue_kind = parse_queue_kind(&queue_kind)?;
+    let record = state
+        .store
+        .upsert_task_queue_throughput_policy(&tenant_id, queue_kind, &task_queue, &request.backend)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(serde_json::to_value(record).expect("throughput policy serializes")))
 }
 
 async fn get_task_queue_inspection(
@@ -759,6 +798,19 @@ mod tests {
             .await?;
         assert_eq!(promote_response.status(), StatusCode::OK);
 
+        let throughput_policy_response = app
+            .clone()
+            .oneshot(
+                Request::put(
+                    "/admin/tenants/tenant-a/task-queues/workflow/payments/throughput-policy",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"backend":"stream-v2"}"#))
+                .expect("throughput policy request"),
+            )
+            .await?;
+        assert_eq!(throughput_policy_response.status(), StatusCode::OK);
+
         store
             .upsert_queue_poller(
                 "tenant-a",
@@ -822,6 +874,7 @@ mod tests {
         assert_eq!(inspection["sticky_effectiveness"]["sticky_dispatch_count"], 1);
         assert_eq!(inspection["sticky_effectiveness"]["sticky_hit_count"], 1);
         assert_eq!(inspection["sticky_effectiveness"]["sticky_fallback_count"], 0);
+        assert_eq!(inspection["throughput_policy"]["backend"], "stream-v2");
 
         Ok(())
     }

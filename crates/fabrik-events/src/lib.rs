@@ -188,6 +188,10 @@ pub enum WorkflowEvent {
         max_attempts: u32,
         retry_delay_ms: u64,
         aggregation_group_count: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_policy: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reducer: Option<String>,
         throughput_backend: String,
         throughput_backend_version: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]

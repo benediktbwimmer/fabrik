@@ -385,6 +385,8 @@ async fn process_event(
             max_attempts,
             retry_delay_ms,
             aggregation_group_count,
+            execution_policy: _,
+            reducer: _,
             throughput_backend,
             throughput_backend_version,
             state: workflow_state,
@@ -780,7 +782,7 @@ impl ActivityWorkerApi for ActivityApi {
 
         if let Some(record) = self.state.bulk_prefetch.pop(&worker_key).await {
             return Ok(Response::new(PollBulkActivityTaskResponse {
-                task: Some(bulk_chunk_to_proto(&record)),
+                tasks: vec![bulk_chunk_to_proto(&record)],
             }));
         }
 
@@ -807,18 +809,19 @@ impl ActivityWorkerApi for ActivityApi {
                         .push_remaining(&worker_key, remaining.iter().cloned())
                         .await;
                 }
-                return Ok(Response::new(PollBulkActivityTaskResponse {
-                    task: Some(bulk_chunk_to_proto(first)),
-                }));
+                let mut tasks = Vec::with_capacity(leased.len());
+                tasks.push(bulk_chunk_to_proto(first));
+                tasks.extend(remaining.iter().map(bulk_chunk_to_proto));
+                return Ok(Response::new(PollBulkActivityTaskResponse { tasks }));
             }
 
             let now = tokio::time::Instant::now();
             if now >= deadline {
-                return Ok(Response::new(PollBulkActivityTaskResponse { task: None }));
+                return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
             }
             let remaining = deadline.saturating_duration_since(now);
             if tokio::time::timeout(remaining, self.state.bulk_notify.notified()).await.is_err() {
-                return Ok(Response::new(PollBulkActivityTaskResponse { task: None }));
+                return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
             }
         }
     }
@@ -1979,6 +1982,8 @@ fn bulk_chunk_to_proto(record: &WorkflowBulkChunkRecord) -> BulkActivityTask {
         task_queue: record.task_queue.clone(),
         attempt: record.attempt,
         items_json: serde_json::to_string(&record.items).expect("bulk chunk items serialize"),
+        input_handle_json: serde_json::to_string(&record.input_handle)
+            .expect("bulk chunk input handle serializes"),
         scheduled_at_unix_ms: record.scheduled_at.timestamp_millis(),
         lease_expires_at_unix_ms: record
             .lease_expires_at

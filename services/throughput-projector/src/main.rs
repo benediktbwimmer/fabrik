@@ -27,6 +27,7 @@ struct AppState {
 struct ProjectorDebugState {
     applied_events: u64,
     apply_failures: u64,
+    manifest_writes: u64,
     last_applied_at: Option<chrono::DateTime<chrono::Utc>>,
     last_failure: Option<String>,
 }
@@ -157,13 +158,8 @@ async fn apply_projection_event(state: &AppState, event: &ThroughputProjectionEv
             state.store.upsert_throughput_projection_chunk(chunk).await?
         }
         ThroughputProjectionEvent::UpdateBatchState { update } => {
-            state.store.update_throughput_projection_batch_state(update).await?
-        }
-        ThroughputProjectionEvent::UpdateChunkState { update } => {
-            state.store.update_throughput_projection_chunk_state(update).await?;
-            let should_sync_manifest = update.output.is_some()
-                || update.result_handle.as_ref().is_some_and(|handle| !handle.is_null());
-            if should_sync_manifest {
+            state.store.update_throughput_projection_batch_state(update).await?;
+            if update.terminal_at.is_some() {
                 sync_batch_result_manifest(
                     state,
                     &update.tenant_id,
@@ -173,6 +169,9 @@ async fn apply_projection_event(state: &AppState, event: &ThroughputProjectionEv
                 )
                 .await?;
             }
+        }
+        ThroughputProjectionEvent::UpdateChunkState { update } => {
+            state.store.update_throughput_projection_chunk_state(update).await?;
         }
     }
     Ok(())
@@ -223,6 +222,8 @@ async fn sync_batch_result_manifest(
             PayloadHandle::Inline { .. } => return Ok(()),
         };
         state.payload_store.write_value(&key, &manifest).await?;
+        let mut debug = state.debug.lock().expect("throughput projector debug lock poisoned");
+        debug.manifest_writes = debug.manifest_writes.saturating_add(1);
     }
     Ok(())
 }

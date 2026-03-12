@@ -116,9 +116,18 @@ pub struct ThroughputCommandEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ThroughputChunkReportPayload {
-    ChunkCompleted { output: Vec<Value> },
-    ChunkFailed { error: String },
-    ChunkCancelled { reason: String, metadata: Option<Value> },
+    ChunkCompleted {
+        result_handle: Value,
+        #[serde(default)]
+        output: Option<Vec<Value>>,
+    },
+    ChunkFailed {
+        error: String,
+    },
+    ChunkCancelled {
+        reason: String,
+        metadata: Option<Value>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -188,7 +197,11 @@ pub enum ThroughputChangelogPayload {
         report_id: String,
         status: String,
         available_at: DateTime<Utc>,
+        result_handle: Option<Value>,
+        output: Option<Vec<Value>>,
         error: Option<String>,
+        cancellation_reason: Option<String>,
+        cancellation_metadata: Option<Value>,
     },
     ChunkRequeued {
         identity: ThroughputBatchIdentity,

@@ -41,7 +41,7 @@ Phase-1 node types must cover:
 - `WaitTimer`
 - `ScheduleActivity`
 - `AwaitActivity`
-- `StartBulkActivity` — throughput mode batch creation
+- `StartBulkActivity` — throughput mode batch creation with execution-policy metadata
 - `WaitForBulkActivity` — throughput mode batch barrier
 - `StartChildWorkflow`
 - `AwaitChildWorkflow`
@@ -84,6 +84,12 @@ Minimum frame contents:
 - pending updates
 - compensation stack
 - pinned artifact metadata
+
+For throughput mode, bulk-call metadata must be representable in the artifact and frame, including:
+
+- execution policy
+- reducer identity
+- handle and barrier metadata needed to await the terminal batch outcome
 
 ## Determinism Rule
 

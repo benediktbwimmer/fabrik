@@ -284,6 +284,54 @@ where
             .context("failed to publish json topic payload")?;
         Ok(())
     }
+
+    pub async fn publish_all(&self, payloads: Vec<(String, T)>) -> Result<()> {
+        if payloads.is_empty() {
+            return Ok(());
+        }
+
+        let mut records_by_partition = HashMap::<i32, Vec<Record>>::new();
+        for (key, payload) in payloads {
+            let bytes =
+                serde_json::to_vec(&payload).context("failed to serialize json topic payload")?;
+            let partition_id = partition_for_key(&key, self.partition_count);
+            records_by_partition.entry(partition_id).or_default().push(Record {
+                key: Some(key.into_bytes()),
+                value: Some(bytes),
+                headers: BTreeMap::new(),
+                timestamp: Utc::now(),
+            });
+        }
+
+        let mut flushes = Vec::new();
+        for (partition_id, records) in records_by_partition {
+            let producer = self
+                .producers
+                .get(&partition_id)
+                .with_context(|| format!("missing producer for topic partition {partition_id}"))?
+                .clone();
+            flushes.push(async move {
+                let mut pending = FuturesOrdered::new();
+                for record in records {
+                    let producer = producer.clone();
+                    pending.push_back(async move {
+                        producer
+                            .produce(record)
+                            .await
+                            .map(|_| ())
+                            .context("failed to publish json topic payload")
+                    });
+                }
+                while let Some(result) = pending.next().await {
+                    result?;
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+        }
+
+        try_join_all(flushes).await?;
+        Ok(())
+    }
 }
 
 pub async fn build_workflow_partition_consumer(

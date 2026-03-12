@@ -1,6 +1,7 @@
 export async function bulkWorkflow(ctx, input) {
   const bulk = await ctx.bulkActivity("benchmark.echo", input.items, {
-    backend: "stream-v2",
+    execution: "eager",
+    reducer: "collect_results",
     taskQueue: "bulk",
     chunkSize: 128,
     retry: { maxAttempts: 2, delay: "1s" },

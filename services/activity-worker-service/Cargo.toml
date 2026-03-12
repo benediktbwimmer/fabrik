@@ -8,6 +8,7 @@ version.workspace = true
 anyhow.workspace = true
 fabrik-config = { path = "../../crates/fabrik-config" }
 fabrik-service = { path = "../../crates/fabrik-service" }
+fabrik-throughput = { path = "../../crates/fabrik-throughput" }
 fabrik-worker-protocol = { path = "../../crates/fabrik-worker-protocol" }
 fabrik-workflow = { path = "../../crates/fabrik-workflow" }
 reqwest.workspace = true

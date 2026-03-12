@@ -4,28 +4,47 @@
 
 Throughput mode is an explicit workflow primitive for high-cardinality fan-out / fan-in workloads. It trades per-item durable history for chunk-level durability, reducing workflow overhead from `O(items)` to `O(chunks)`.
 
-## Product Contract
+Eager execution is an execution policy inside throughput mode, not a separate workflow model and not a change to the default workflow runtime.
 
-### API Surface
+## Summary
 
-Workflows opt in to throughput mode per call-site using `ctx.bulkActivity()`:
+The product contract for throughput mode is:
+
+- throughput mode is opt-in per `ctx.bulkActivity()` callsite
+- workflow state remains single-owner and strongly ordered
+- bulk work remains batch/chunk based
+- only batch barrier events are workflow-authoritative
+- intermediate batch and chunk progress is projection-only and may be eventually consistent
+
+The core rule is:
+
+> Chunk work may execute and complete ahead of workflow observation, but it does not directly mutate workflow state. The workflow only observes a deterministic batch outcome at the barrier.
+
+This makes eager execution a safe extension of throughput mode rather than eventual consistency for workflows.
+
+## Public Interface
+
+### Workflow API
+
+Workflows opt in to throughput mode per callsite using `ctx.bulkActivity()`:
 
 ```ts
-const bulk = await ctx.bulkActivity("process.enrich", items, {
-  taskQueue: "default",
+const batch = await ctx.bulkActivity("process.enrich", items, {
+  execution: "eager",
   chunkSize: 256,
-  backend: "pg-v1",
-  retry: { maxAttempts: 2, delay: "1s" },
+  retry: { maxAttempts: 3, delay: "1s" },
+  reducer: "collect_results",
 });
 
-const summary = await bulk.result();
+const result = await batch.result();
 ```
 
-- `ctx.bulkActivity()` returns a handle immediately after durable batch/chunk creation.
-- `await handle.result()` blocks the workflow until the batch reaches a terminal state.
+- `ctx.bulkActivity()` returns a handle immediately after durable batch creation.
+- `await handle.result()` is the only workflow-authoritative synchronization point.
 - `items` may be any runtime expression evaluating to an array.
-- `taskQueue`, `chunkSize`, `backend`, and `retry` are static literal options.
+- `taskQueue`, `chunkSize`, `execution`, `retry`, and `reducer` must be static literal options in the compiled artifact.
 - `chunkSize` defaults to `256` when omitted.
+- backend selection is server-controlled and does not appear in workflow code.
 
 ### Result Shape
 
@@ -46,26 +65,148 @@ On success, `await handle.result()` returns:
 
 On failure or cancellation, the workflow resumes through the error path with a structured error containing `batchId`, terminal status, message, and the same counters.
 
-The `resultHandle` is opaque. Workflow code may pass it to downstream activities but must not read chunk storage directly.
+The `resultHandle` is opaque. Workflow code may pass it to downstream activities but must not deserialize chunk storage directly or materialize all per-item results into workflow state.
 
-### Semantics
+### Execution Options
 
-- barrier-only workflow wakeups (one resume per batch terminal)
+Throughput mode supports these execution policies:
+
+- `execution: "default"` — throughput runtime behavior is backend-specific but still barrier-based and replay-safe
+- `execution: "eager"` — chunk work may begin and complete before workflow observation; intermediate progress stays non-authoritative
+
+The `execution` option is a semantic choice. It is not a backend selector.
+
+### Reducers
+
+Initial reducers are built-in and deterministic:
+
+- `all_succeeded`
+- `all_settled`
+- `count`
+- `collect_results`
+
+User-defined reducers are out of scope until they can be compiled, version-pinned, and replay-safe.
+
+`collect_results` remains handle-backed rather than workflow-memory-backed. It may return summary metadata plus an opaque result handle, but it must not force full per-item result materialization inside workflow state.
+
+## Non-Workflow Progress Reads
+
+Intermediate progress reads are useful but must not affect replayed workflow execution.
+
+Progress reads therefore live outside normal workflow execution semantics:
+
+- external client/query APIs
+- operator/debug APIs
+- optional read-only query handlers, if they do not affect workflow state transitions
+
+Example client-side reads:
+
+```ts
+const progress = await client.bulkBatch(batchId).peek({
+  consistency: "eventual",
+});
+```
+
+```ts
+const live = await client.bulkBatch(batchId).peek({
+  consistency: "strong",
+});
+```
+
+Hard rule:
+
+- `peek()` is non-durable, non-replayed, and non-authoritative
+- `peek()` must never influence workflow state transitions
+
+## Semantics
+
+The semantic contract for throughput mode is:
+
+- barrier-only workflow wakeups
 - chunk-level retry and coarse cancellation
 - batch/chunk visibility only; no per-item indexed visibility
 - at-least-once chunk execution
 - batch-level workflow history events only
 - mixed durable and bulk steps are allowed in one workflow
 
-Workflow cancellation fanout:
+The semantic contract for eager execution is:
+
+- workflow state remains single-owner and strongly ordered
+- eager bulk work may start and finish before the workflow observes it
+- intermediate batch/chunk progress is projection-only
+- only terminal batch outcomes are workflow-authoritative
+- workers never directly mutate workflow state
+- owner-applied reduction produces one durable batch outcome
+
+### Consistency Levels
+
+#### Authoritative
+
+Used for:
+
+- workflow history
+- workflow owner state
+- terminal batch outcomes committed into workflow history
+
+#### Strong
+
+Used for owner-routed live reads:
+
+- workflow strong reads route to the workflow owner
+- batch strong reads route to the throughput owner
+
+#### Eventual
+
+Used for:
+
+- projections
+- batch/chunk progress
+- operator and UI status
+- cheap status reads
+
+Eventual reads may lag authoritative state and are not replay-stable.
+
+### Guardrails
+
+Eager execution is valid only for workloads with these properties:
+
+- no per-item workflow-visible side effects
+- no dependence on exact in-order item completion
+- no direct workflow mutation from workers
+- dedupe-safe chunk completion
+- deterministic batch terminal reduction
+- tolerance for eventual intermediate visibility
+- no requirement for per-item replay into workflow code
+
+Good fits:
+
+- enrich
+- score
+- classify
+- validate
+- transform
+- embed
+- mergeable map-style batch work
+
+Bad fits:
+
+- per-item workflow-visible effects
+- order-sensitive orchestration
+- workflows that branch on intermediate chunk progress
+- workloads requiring per-item audit or replay semantics in workflow history
+
+### Workflow Cancellation Fanout
 
 - `WorkflowCancellationRequested` fans out to nonterminal bulk batches
-- v2.0 uses immediate coarse batch cancellation: remaining scheduled or started chunks are marked cancelled and one batch terminal event is emitted
-- late reports from previously leased chunks are ignored by fencing once the batch cancellation clears active leases
+- remaining scheduled or started chunks are marked cancelled coarsely at the batch level
+- late reports from previously leased chunks are ignored by fencing once cancellation clears active leases
+- exactly one terminal batch cancellation outcome is emitted into workflow history
 
 ## Backends
 
-Throughput mode supports multiple backend implementations behind a stable internal interface. The backend is selected per batch and pinned for the lifetime of that batch.
+Throughput mode supports multiple backend implementations behind a stable internal interface. Backend selection is server-controlled per batch and pinned for the lifetime of that batch.
+
+Workflow code does not select `pg-v1` vs `stream-v2`. Selection is made by task-queue policy or other server-side admission and routing rules.
 
 ### Common Backend Interface
 
@@ -89,81 +230,48 @@ Both backends preserve these stable identifiers:
 
 ### `pg-v1` — Postgres-First Backend
 
-The default backend. Suitable for most bulk workloads up to hundreds of thousands of items.
+The Postgres-first backend is suitable for most bulk workloads up to hundreds of thousands of items.
 
 Infrastructure requirements:
 
-- Postgres (shared with the rest of the platform)
+- Postgres
 
 Behavior:
 
-- batch and chunk state stored in `workflow_bulk_batches` and `workflow_bulk_chunks` tables
-- chunk scheduling and leasing through Postgres queries
-- chunk terminal results applied with atomic counter updates in Postgres
-- batch terminal event published via an async `workflow_event_outbox` table
-- the transaction that marks a batch terminal also writes the outbox record and enqueues the workflow resume
+- batch and chunk state is stored in `workflow_bulk_batches` and `workflow_bulk_chunks`
+- chunk scheduling and leasing runs through Postgres queries
+- chunk terminal results apply atomic counter updates in Postgres
+- batch terminal events publish through the async `workflow_event_outbox`
+- query results are immediately consistent
 
 Tradeoffs:
 
 - no additional infrastructure beyond what `fabrik` already requires
-- operationally simple — batch state is queryable with standard SQL
-- Postgres becomes the throughput ceiling for very large batches or very high chunk completion rates
-- batch/chunk visibility is immediately consistent
-
-When to use:
-
-- batches with up to ~100K items
-- workloads where operational simplicity is more important than maximum throughput
-- development and testing environments
+- operationally simple and queryable with standard SQL
+- Postgres becomes the throughput ceiling for very large batches or very high completion rates
 
 ### `stream-v2` — Streaming Throughput Backend
 
-A specialized streaming backend that removes Postgres from the throughput hot path. Suitable for batches with millions of items or sustained high completion rates.
+The streaming backend removes Postgres from the throughput hot path and is suitable for batches with millions of items or sustained high completion rates.
 
 Infrastructure requirements:
 
-- Postgres (projection-only; not on the hot path)
-- Redpanda / Kafka (command log, report log, owner changelog)
-- RocksDB (shard-local state)
+- Postgres for projections
+- Redpanda or Kafka for command, report, and changelog streams
+- RocksDB for shard-local state
 - checkpoint storage
-  - current implementation: S3-compatible object storage checkpoints with local filesystem fallback for restore compatibility
 - S3-compatible object storage for large payload manifests
-  - local compose stack: MinIO
 
 Behavior:
 
 - authoritative state lives in the throughput shard runtime, not Postgres
-- three log roles: command log, report log, owner changelog
-- recovery from latest checkpoint plus owner changelog tail
-- current implementation restores from the latest object-store checkpoint plus owner changelog replay
-- dedicated `throughput-runtime` service owns throughput shards independently of workflow executors
-- dedicated `throughput-projector` service consumes throughput projection events and updates Postgres asynchronously
-- ownership can run in either static-partition mode or assignment mode
-  - static mode: each runtime instance is configured with explicit throughput partition ids
-  - assignment mode: runtimes heartbeat membership and advertised capacity, then reconcile partition assignments periodically
-- workers use a dedicated throughput worker RPC served by the shard owner
-- fencing protocol ensures at-most-once state application and exactly one terminal event per batch
-- local RocksDB state persists batch counters, retry scheduling fields, and lease deadlines so replay rebuilds a usable owner snapshot instead of only coarse statuses
-- new `stream-v2` batches are materialized directly into owner state plus throughput projection rows; they are no longer inserted into `workflow_bulk_batches` / `workflow_bulk_chunks`
-- when `aggregation_group_count > 1`, the runtime assigns chunks across groups deterministically by chunk index and routes each group through its own throughput partition
-- if the caller leaves `aggregation_group_count = 1`, the runtime may still auto-enable grouping for large batches using server-side chunk-count policy
-- throughput partitions use an explicit lease-based ownership protocol; only the active owner of a partition may poll chunks, process reports, or run lease-expiry sweeps for that shard
-- in assignment mode, ownership is rebalanced through the `workflow_throughput_membership` and `workflow_throughput_partition_assignments` tables; stale assignment rows are pruned on every reconcile so the partition map converges after topology changes
-- the owner runtime computes expected chunk and batch transitions locally before applying a terminal report, then records divergence if the store result differs
-- grouped batches keep chunk execution and retries shard-local, but only the owner of group `0` emits the batch terminal event
-- grouped batches now emit explicit `GroupTerminal` owner decisions before the parent barrier emits the single batch terminal event
-- success completion for grouped batches waits for the parent barrier to observe every group terminal; permanent failure or cancellation still resolves the batch as soon as that terminal outcome is visible
-- terminal projection updates for `stream-v2` are applied from the owner-derived transition, not copied back from the execution tables
-- lease-expiry requeues are also projected from owner state and persisted through the owner changelog without reloading the chunk from Postgres
-- terminal batches, chunks, and group summaries are pruned from local RocksDB owner state after `THROUGHPUT_TERMINAL_STATE_RETENTION_SECONDS`; long-lived visibility stays in Postgres projections and object-backed manifests
-- terminal workflow events for `stream-v2` are now published directly by `throughput-runtime` instead of being emitted through the bulk execution tables' outbox
-- chunk inputs and outputs may be externalized behind per-chunk `input_handle` / `result_handle` manifests once they cross configured inline-size thresholds
-- current implementation supports both local filesystem and S3-compatible manifest storage, selected by `THROUGHPUT_PAYLOAD_STORE`
-- the local compose stack uses MinIO with path-style S3 requests for throughput payload manifests
-- throughput checkpoints are stored in the same configured object store under `THROUGHPUT_CHECKPOINT_KEY_PREFIX`
-- worker polling and query reads resolve those handles transparently, so the public API stays unchanged while large payloads move out of Postgres rows
-- Postgres receives async projections for visibility queries through the throughput projection log
-- the throughput projector only rebuilds batch result manifests for chunk updates that actually carry output or a non-null `result_handle`
+- dedicated `throughput-runtime` owns throughput shards independently of workflow executors
+- dedicated `throughput-projector` consumes projection events and updates Postgres asynchronously
+- workers use a dedicated throughput worker RPC served by the throughput owner
+- local owner state persists counters, retry scheduling fields, lease deadlines, and group/barrier state
+- terminal workflow events are emitted directly by the throughput runtime
+- chunk inputs and outputs may be externalized behind payload handles
+- query results are eventually consistent unless routed to the active throughput owner
 
 Log roles:
 
@@ -171,7 +279,7 @@ Log roles:
 |---|---|---|
 | Command | `CreateBatch`, `CancelBatch`, `TimeoutBatch` | Intent from workflow bridge |
 | Report | `ChunkCompleted`, `ChunkFailed`, `ChunkCancelled` | Raw worker observations |
-| Owner changelog | `BatchCreated`, `ChunkLeased`, `ChunkRequeued`, `ChunkApplied`, `GroupTerminal`, `BatchTerminal` | Restore and audit, including lease-expiry reschedules, group barrier decisions, retry schedule fields, and terminal counter snapshots |
+| Owner changelog | `BatchCreated`, `ChunkLeased`, `ChunkRequeued`, `ChunkApplied`, `GroupTerminal`, `BatchTerminal` | Restore and audit |
 
 Fencing protocol:
 
@@ -180,9 +288,9 @@ Every leased chunk carries `(chunk_id, attempt, lease_epoch, lease_token, owner_
 Tradeoffs:
 
 - significantly higher throughput ceiling than `pg-v1`
-- requires additional infrastructure (RocksDB, S3, throughput-runtime service)
-- batch/chunk visibility is eventually consistent (projection lag)
-- more complex operational model
+- requires additional infrastructure
+- batch/chunk visibility is eventually consistent by default
+- operationally more complex
 
 Admission control:
 
@@ -192,37 +300,35 @@ Admission control:
 
 Ownership and rebalancing:
 
-- each runtime instance heartbeats a membership record with an advertised capacity and debug query endpoint
-- reconciles compute partition assignments from the active membership set
-- runtime instances only claim or renew leases for partitions assigned to them
-- replicas already stay warm by continuously applying the owner changelog into local RocksDB, so failover does not require a cold restore
-- in assignment mode, a partition can transfer as soon as the old owner falls out of throughput membership; failover does not have to wait for the full ownership lease TTL
-- a runtime only claims a newly assigned partition once its local changelog mirror has caught up to the observed high watermark for that partition
-- ownership is still active/passive, not dual-active: only one runtime may hold the lease for a partition at a time
+- runtime instances heartbeat membership with advertised capacity and debug endpoints
+- reconciles compute partition assignments from active membership
+- only the active owner of a partition may poll chunks, process reports, or run lease-expiry sweeps
+- ownership remains active/passive, not dual-active
 
-When to use:
+### Backend Pinning
 
-- batches with millions of items
-- sustained high completion rates where Postgres is a bottleneck
-- workloads where throughput matters more than operational simplicity
+`throughput_backend` and `throughput_backend_version` are recorded on every batch. In-flight batches always finish on the backend that started them. Batches are never migrated across backends while active.
 
-### Backend Selection
+## Execution Model
 
-Backend is specified per `ctx.bulkActivity()` call via the `backend` option:
+Eager execution reuses throughput mode internals as much as possible.
 
-```ts
-// Uses default Postgres backend
-const bulk1 = await ctx.bulkActivity("process", items);
+Lifecycle:
 
-// Explicitly selects streaming backend
-const bulk2 = await ctx.bulkActivity("process", items, {
-  backend: "stream-v2",
-});
-```
+1. workflow schedules a bulk activity with `execution: "eager"`
+2. batch is durably created
+3. throughput runtime begins leasing chunks immediately
+4. workers execute chunk work and submit fenced terminal reports
+5. throughput runtime reduces reports into batch state
+6. at barrier resolution, the runtime emits exactly one terminal workflow event:
+   - `BulkActivityBatchCompleted`
+   - `BulkActivityBatchFailed`
+   - `BulkActivityBatchCancelled`
 
-If omitted, the default is `pg-v1`. Server-side task queue configuration may override the default backend for specific queues.
+Key rule:
 
-`throughput_backend` and `throughput_backend_version` are recorded on every batch. In-flight batches always finish on the backend that started them; batches are never migrated across backends.
+- intermediate progress does not resume the workflow
+- only terminal barrier resolution resumes the workflow
 
 ## Workflow History
 
@@ -235,14 +341,22 @@ Throughput mode emits batch-level workflow history events only:
 
 Per-item and per-chunk events are not written to workflow history. Chunk-level visibility is available through dedicated query endpoints, not through workflow replay.
 
+Eager execution does not introduce a separate workflow-visible event family unless a future runtime requirement makes that unavoidable. Execution policy is recorded as batch and event metadata, not as a separate semantic track.
+
 ## IR Nodes
 
-The compiled workflow artifact includes two throughput-mode IR nodes:
+The compiled workflow artifact continues to use the normal throughput-mode IR shape:
 
 - `start_bulk_activity` — creates the batch and chunk manifest
 - `wait_for_bulk_activity` — blocks until the batch terminal event arrives
 
-These follow the same handle pattern as child workflows.
+These nodes carry batch metadata such as:
+
+- `execution_policy`
+- `reducer`
+- read-consistency capabilities
+
+The compiler should reuse the existing bulk handle pattern rather than introducing a separate eager workflow model.
 
 ## Query Endpoints
 
@@ -255,7 +369,20 @@ Batch and chunk visibility is exposed through additive query endpoints:
 
 `/results` is paginated by chunk order and returns chunk output arrays. There is no per-item indexed visibility API.
 
-For `pg-v1`, query results are immediately consistent. For `stream-v2`, query results are eventually consistent projections and may lag behind authoritative shard state.
+Read consistency is a query concern, not an execution concern. Query surfaces should accept `consistency=strong` or `consistency=eventual`.
+
+Strong reads:
+
+- workflow status routes to the workflow owner
+- live batch status routes to the throughput owner
+
+Eventual reads:
+
+- batch progress
+- chunk progress
+- lag-aware operator and UI views
+
+For `pg-v1`, query results are immediately consistent. For `stream-v2`, default query results are eventually consistent projections and may lag authoritative shard state.
 
 ## Worker Protocol
 
@@ -271,11 +398,13 @@ Bulk task payloads include:
 
 Bulk result payloads report one chunk terminal outcome:
 
-- completed (with ordered output array)
-- failed (with error string)
-- cancelled (with reason and optional metadata)
+- completed with ordered output array
+- failed with an error string
+- cancelled with a reason and optional metadata
 
 Workers process items sequentially within a chunk and preserve order in the output array. Throughput comes from chunk amortization and worker parallelism across chunks, not intra-chunk parallelism.
+
+Workers never directly mutate workflow state.
 
 ## Cancellation
 
@@ -291,7 +420,7 @@ Cancellation is coarse-grained at the batch level:
 Retry operates at the chunk level:
 
 - failed chunks are retried up to `maxAttempts`
-- retry re-executes all items in the chunk (the chunk is the atomic unit)
+- retry re-executes all items in the chunk
 - activities invoked via throughput mode should be idempotent
 - if any chunk permanently fails, the default completion policy fails the batch
 
@@ -304,6 +433,6 @@ Retry operates at the chunk level:
 | Workflow task wakeups | per activity completion | one per batch terminal |
 | Retry granularity | per activity | per chunk |
 | Cancellation granularity | per activity | per batch |
-| Result visibility | per activity in workflow state | opaque handle, paginated chunk query |
+| Result visibility | per activity in workflow state | opaque handle plus query surfaces |
 | Overhead scaling | `O(items)` | `O(chunks)` |
 | Use case | individual critical operations | high-cardinality fan-out / fan-in |

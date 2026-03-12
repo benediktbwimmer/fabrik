@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 const DEFAULT_POLL_INTERVAL_MS: u64 = 250;
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_STREAM_PROJECTION_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug, Clone)]
 struct BenchmarkProfile {
@@ -49,6 +50,7 @@ struct Args {
     task_queue: String,
     execution_mode: ExecutionMode,
     throughput_backend: Option<String>,
+    bulk_reducer: String,
     chunk_size: u32,
     timeout: Duration,
 }
@@ -58,7 +60,10 @@ struct BenchmarkReport {
     scenario: String,
     profile: String,
     started_at: DateTime<Utc>,
+    execution_completed_at: DateTime<Utc>,
     completed_at: DateTime<Utc>,
+    execution_duration_ms: u128,
+    projection_convergence_duration_ms: u128,
     duration_ms: u128,
     workflow_count: usize,
     activities_per_workflow: usize,
@@ -71,6 +76,7 @@ struct BenchmarkReport {
     task_queue: String,
     execution_mode: ExecutionMode,
     throughput_backend: Option<String>,
+    bulk_reducer: String,
     chunk_size: u32,
     instance_prefix: String,
     workflow_outcomes: WorkflowOutcomeMetrics,
@@ -86,6 +92,7 @@ struct BenchmarkReport {
     executor_debug: Value,
     throughput_runtime_debug: Option<Value>,
     throughput_projector_debug: Option<Value>,
+    control_plane_metrics: Option<ControlPlaneMetrics>,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,6 +139,19 @@ struct BacklogMetrics {
     max_activity_backlog: u64,
 }
 
+#[derive(Debug, Serialize)]
+struct ControlPlaneMetrics {
+    avg_tasks_per_bulk_poll_response: f64,
+    avg_results_per_bulk_report_rpc: f64,
+    changelog_entries_per_completed_chunk: f64,
+    projection_events_per_completed_chunk: f64,
+    report_batches_applied: u64,
+    avg_report_batch_size: f64,
+    projection_events_published: u64,
+    changelog_entries_published: u64,
+    manifest_writes: u64,
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct WorkflowOutcomeRow {
     completed: i64,
@@ -156,6 +176,18 @@ struct ActivityMetricRow {
 struct CoalescingRow {
     workflow_task_rows: i64,
     resume_rows: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct StreamProjectionConvergenceRow {
+    projection_batch_rows: i64,
+    terminal_batch_rows: i64,
+    batch_accounted_items: i64,
+    completed_items: i64,
+    failed_items: i64,
+    cancelled_items: i64,
+    terminal_chunk_rows: i64,
+    pending_chunks: i64,
 }
 
 #[tokio::main]
@@ -193,6 +225,16 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
     let started_at = Utc::now();
     let started = Instant::now();
 
+    if args.execution_mode == ExecutionMode::Throughput {
+        apply_task_queue_throughput_policy(
+            &pool,
+            &args.tenant_id,
+            &args.task_queue,
+            args.throughput_backend.as_deref().unwrap_or(PG_V1_BACKEND),
+        )
+        .await?;
+    }
+
     publish_artifact(
         &client,
         &ingest_base,
@@ -202,7 +244,7 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
             &args.task_queue,
             args.retry_rate > 0.0,
             args.execution_mode,
-            args.throughput_backend.as_deref(),
+            &args.bulk_reducer,
             args.chunk_size,
         ),
     )
@@ -260,8 +302,26 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         tokio::time::sleep(Duration::from_millis(DEFAULT_POLL_INTERVAL_MS)).await;
     }
 
+    let execution_completed_at = Utc::now();
+    let execution_duration_ms = started.elapsed().as_millis();
+
+    if args.execution_mode == ExecutionMode::Throughput
+        && args.throughput_backend.as_deref() == Some(STREAM_V2_BACKEND)
+    {
+        wait_for_stream_projection_convergence(
+            &pool,
+            &args.tenant_id,
+            &instance_prefix,
+            args.profile.workflow_count as u64,
+            (args.profile.workflow_count * args.profile.activities_per_workflow) as u64,
+            Duration::from_secs(DEFAULT_STREAM_PROJECTION_TIMEOUT_SECS),
+        )
+        .await?;
+    }
+
     let completed_at = Utc::now();
     let duration_ms = started.elapsed().as_millis();
+    let projection_convergence_duration_ms = duration_ms.saturating_sub(execution_duration_ms);
     let workflow_outcomes = workflow_outcomes(&pool, &args.tenant_id, &instance_prefix).await?;
     let activity_metrics = activity_metrics(
         &pool,
@@ -327,12 +387,20 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         max_aggregation_group_count,
         grouped_batch_rows,
     ) = bulk_metrics(&pool, &args.tenant_id, &instance_prefix).await?;
+    let control_plane_metrics = control_plane_metrics(
+        throughput_runtime_debug.as_ref(),
+        throughput_projector_debug.as_ref(),
+        &activity_metrics,
+    );
 
     Ok(BenchmarkReport {
         scenario: scenario_name,
         profile: args.profile_name.clone(),
         started_at,
+        execution_completed_at,
         completed_at,
+        execution_duration_ms,
+        projection_convergence_duration_ms,
         duration_ms,
         workflow_count: args.profile.workflow_count,
         activities_per_workflow: args.profile.activities_per_workflow,
@@ -345,6 +413,7 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         task_queue: args.task_queue.clone(),
         execution_mode: args.execution_mode,
         throughput_backend: args.throughput_backend.clone(),
+        bulk_reducer: args.bulk_reducer.clone(),
         chunk_size: args.chunk_size,
         instance_prefix,
         workflow_outcomes,
@@ -365,6 +434,7 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         executor_debug,
         throughput_runtime_debug,
         throughput_projector_debug,
+        control_plane_metrics,
     })
 }
 
@@ -380,6 +450,7 @@ fn parse_args() -> Result<Args> {
     let mut task_queue = "default".to_owned();
     let mut execution_mode = ExecutionMode::Durable;
     let mut throughput_backend = None;
+    let mut bulk_reducer = "collect_results".to_owned();
     let mut chunk_size = 256_u32;
     let mut timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
     let mut workflow_count = None;
@@ -415,6 +486,14 @@ fn parse_args() -> Result<Args> {
                         "unknown --throughput-backend {other}; expected {PG_V1_BACKEND} or {STREAM_V2_BACKEND}"
                     ),
                 })
+            }
+            "--bulk-reducer" => {
+                bulk_reducer = match value.as_str() {
+                    "all_succeeded" | "all_settled" | "count" | "collect_results" => value,
+                    other => bail!(
+                        "unknown --bulk-reducer {other}; expected all_succeeded, all_settled, count, or collect_results"
+                    ),
+                }
             }
             "--chunk-size" => chunk_size = value.parse().context("invalid --chunk-size")?,
             "--timeout-secs" => {
@@ -460,6 +539,7 @@ fn parse_args() -> Result<Args> {
         task_queue,
         execution_mode,
         throughput_backend,
+        bulk_reducer,
         chunk_size,
         timeout,
     })
@@ -470,7 +550,7 @@ fn benchmark_artifact(
     task_queue: &str,
     enable_retry: bool,
     execution_mode: ExecutionMode,
-    throughput_backend: Option<&str>,
+    bulk_reducer: &str,
     chunk_size: u32,
 ) -> CompiledWorkflowArtifact {
     let mut states = BTreeMap::new();
@@ -521,7 +601,9 @@ fn benchmark_artifact(
                     task_queue: Some(Expression::Literal {
                         value: Value::String(task_queue.to_owned()),
                     }),
-                    throughput_backend: throughput_backend.map(ToOwned::to_owned),
+                    execution_policy: Some("eager".to_owned()),
+                    reducer: Some(bulk_reducer.to_owned()),
+                    throughput_backend: None,
                     chunk_size: Some(chunk_size),
                     retry: enable_retry
                         .then_some(RetryPolicy { max_attempts: 2, delay: "1s".to_owned() }),
@@ -591,6 +673,42 @@ fn benchmark_input(
         .into_iter()
         .collect(),
     )
+}
+
+async fn apply_task_queue_throughput_policy(
+    pool: &PgPool,
+    tenant_id: &str,
+    task_queue: &str,
+    backend: &str,
+) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO task_queue_throughput_policies (
+            tenant_id,
+            queue_kind,
+            task_queue,
+            backend,
+            created_at,
+            updated_at
+        )
+        VALUES ($1, 'activity', $2, $3, NOW(), NOW())
+        ON CONFLICT (tenant_id, queue_kind, task_queue)
+        DO UPDATE SET
+            backend = EXCLUDED.backend,
+            updated_at = EXCLUDED.updated_at
+        "#,
+    )
+        .bind(tenant_id)
+        .bind(task_queue)
+        .bind(backend)
+        .execute(pool)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to apply throughput policy {backend} for tenant {tenant_id} task queue {task_queue}"
+            )
+        })?;
+    Ok(())
 }
 
 async fn publish_artifact(
@@ -754,6 +872,94 @@ async fn workflow_outcomes(
     })
 }
 
+async fn wait_for_stream_projection_convergence(
+    pool: &PgPool,
+    tenant_id: &str,
+    instance_prefix: &str,
+    expected_batches: u64,
+    expected_items: u64,
+    timeout: Duration,
+) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        let row = sqlx::query_as::<_, StreamProjectionConvergenceRow>(
+            r#"
+            SELECT
+                (SELECT COUNT(*)::bigint
+                 FROM throughput_projection_batches
+                 WHERE tenant_id = $1
+                   AND workflow_instance_id LIKE $2) AS projection_batch_rows,
+                (SELECT COUNT(*) FILTER (WHERE status IN ('completed', 'failed', 'cancelled'))::bigint
+                 FROM throughput_projection_batches
+                 WHERE tenant_id = $1
+                   AND workflow_instance_id LIKE $2) AS terminal_batch_rows,
+                (SELECT COALESCE(SUM(succeeded_items + failed_items + cancelled_items), 0)::bigint
+                 FROM throughput_projection_batches
+                 WHERE tenant_id = $1
+                   AND workflow_instance_id LIKE $2
+                   AND status IN ('completed', 'failed', 'cancelled')) AS batch_accounted_items,
+                (SELECT COALESCE(SUM(item_count), 0)::bigint
+                 FROM throughput_projection_chunks
+                 WHERE tenant_id = $1
+                   AND workflow_instance_id LIKE $2
+                   AND status = 'completed') AS completed_items,
+                (SELECT COALESCE(SUM(item_count), 0)::bigint
+                 FROM throughput_projection_chunks
+                 WHERE tenant_id = $1
+                   AND workflow_instance_id LIKE $2
+                   AND status = 'failed') AS failed_items,
+                (SELECT COALESCE(SUM(item_count), 0)::bigint
+                 FROM throughput_projection_chunks
+                 WHERE tenant_id = $1
+                   AND workflow_instance_id LIKE $2
+                   AND status = 'cancelled') AS cancelled_items,
+                (SELECT COUNT(*) FILTER (WHERE status IN ('completed', 'failed', 'cancelled'))::bigint
+                 FROM throughput_projection_chunks
+                 WHERE tenant_id = $1
+                   AND workflow_instance_id LIKE $2) AS terminal_chunk_rows,
+                (
+                    SELECT COUNT(*)::bigint
+                    FROM throughput_projection_chunks
+                    WHERE tenant_id = $1
+                      AND workflow_instance_id LIKE $2
+                      AND status = 'scheduled'
+                ) AS pending_chunks
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(format!("{instance_prefix}%"))
+        .fetch_one(pool)
+        .await
+        .context("failed to query stream-v2 projection convergence")?;
+
+        let chunk_accounted_items = row.completed_items + row.failed_items + row.cancelled_items;
+        let accounted_items = chunk_accounted_items.max(row.batch_accounted_items);
+        if row.projection_batch_rows as u64 >= expected_batches
+            && row.terminal_batch_rows as u64 >= expected_batches
+            && accounted_items as u64 >= expected_items
+        {
+            return Ok(());
+        }
+
+        if started.elapsed() >= timeout {
+            bail!(
+                "timed out waiting for stream-v2 projection convergence: batches={}/{} terminal_batches={}/{} batch_items={}/{} chunk_items={}/{} pending_chunks={}",
+                row.projection_batch_rows,
+                expected_batches,
+                row.terminal_batch_rows,
+                expected_batches,
+                row.batch_accounted_items,
+                expected_items,
+                chunk_accounted_items,
+                expected_items,
+                row.pending_chunks
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(DEFAULT_POLL_INTERVAL_MS)).await;
+    }
+}
+
 async fn activity_metrics(
     pool: &PgPool,
     tenant_id: &str,
@@ -768,18 +974,16 @@ async fn activity_metrics(
             sqlx::query_as::<_, (i64, i64, i64)>(
                 r#"
                 SELECT
-                    COALESCE(SUM(succeeded_items), 0) AS completed,
-                    COALESCE(SUM(failed_items), 0) AS failed,
-                    COALESCE(SUM(cancelled_items), 0) AS cancelled
-                FROM throughput_projection_batches
+                    COALESCE(SUM(item_count) FILTER (WHERE status = 'completed'), 0) AS completed,
+                    COALESCE(SUM(item_count) FILTER (WHERE status = 'failed'), 0) AS failed,
+                    COALESCE(SUM(item_count) FILTER (WHERE status = 'cancelled'), 0) AS cancelled
+                FROM throughput_projection_chunks
                 WHERE tenant_id = $1
                   AND workflow_instance_id LIKE $2
-                  AND throughput_backend = $3
                 "#,
             )
             .bind(tenant_id)
             .bind(format!("{instance_prefix}%"))
-            .bind(STREAM_V2_BACKEND)
             .fetch_one(pool)
             .await
             .context("failed to query stream-v2 activity metrics")?
@@ -884,7 +1088,7 @@ async fn bulk_metrics(
              WHERE tenant_id = $1 AND workflow_instance_id LIKE $2) AS projection_chunk_rows,
             (SELECT COALESCE(MAX(aggregation_group_count), 0)
              FROM throughput_projection_batches
-             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2) AS max_group_count,
+             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2)::bigint AS max_group_count,
             (SELECT COUNT(*)
              FROM throughput_projection_batches
              WHERE tenant_id = $1 AND workflow_instance_id LIKE $2 AND aggregation_group_count > 1)
@@ -1018,6 +1222,47 @@ async fn backlog_snapshot(
     Ok((workflow_backlog as u64, activity_backlog as u64))
 }
 
+fn control_plane_metrics(
+    runtime_debug: Option<&Value>,
+    projector_debug: Option<&Value>,
+    activity_metrics: &ActivityMetrics,
+) -> Option<ControlPlaneMetrics> {
+    let runtime = runtime_debug?.get("runtime")?;
+    let completed_chunks =
+        activity_metrics.completed + activity_metrics.failed + activity_metrics.cancelled;
+    let poll_requests = json_u64(runtime, "poll_requests");
+    let leased_tasks = json_u64(runtime, "leased_tasks");
+    let report_rpcs_received = json_u64(runtime, "report_rpcs_received");
+    let reports_received = json_u64(runtime, "reports_received");
+    let report_batches_applied = json_u64(runtime, "report_batches_applied");
+    let projection_events_published = json_u64(runtime, "projection_events_published");
+    let changelog_entries_published = json_u64(runtime, "changelog_entries_published");
+    let manifest_writes = projector_debug
+        .and_then(|value| value.get("manifest_writes"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+
+    Some(ControlPlaneMetrics {
+        avg_tasks_per_bulk_poll_response: ratio(leased_tasks, poll_requests),
+        avg_results_per_bulk_report_rpc: ratio(reports_received, report_rpcs_received),
+        changelog_entries_per_completed_chunk: ratio(changelog_entries_published, completed_chunks),
+        projection_events_per_completed_chunk: ratio(projection_events_published, completed_chunks),
+        report_batches_applied,
+        avg_report_batch_size: ratio(reports_received, report_batches_applied),
+        projection_events_published,
+        changelog_entries_published,
+        manifest_writes,
+    })
+}
+
+fn json_u64(value: &Value, key: &str) -> u64 {
+    value.get(key).and_then(Value::as_u64).unwrap_or_default()
+}
+
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 { 0.0 } else { numerator as f64 / denominator as f64 }
+}
+
 fn write_report(output_path: &Path, report: &BenchmarkReport) -> Result<()> {
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)
@@ -1036,8 +1281,22 @@ fn write_report(output_path: &Path, report: &BenchmarkReport) -> Result<()> {
 }
 
 fn summary_text(report: &BenchmarkReport) -> String {
+    let control_plane = report.control_plane_metrics.as_ref().map(|metrics| {
+        format!(
+            "avg_tasks_per_bulk_poll_response={:.2}\navg_results_per_bulk_report_rpc={:.2}\nchangelog_entries_per_completed_chunk={:.2}\nprojection_events_per_completed_chunk={:.2}\nreport_batches_applied={}\navg_report_batch_size={:.2}\nprojection_events_published={}\nchangelog_entries_published={}\nmanifest_writes={}\n",
+            metrics.avg_tasks_per_bulk_poll_response,
+            metrics.avg_results_per_bulk_report_rpc,
+            metrics.changelog_entries_per_completed_chunk,
+            metrics.projection_events_per_completed_chunk,
+            metrics.report_batches_applied,
+            metrics.avg_report_batch_size,
+            metrics.projection_events_published,
+            metrics.changelog_entries_published,
+            metrics.manifest_writes,
+        )
+    }).unwrap_or_default();
     format!(
-        "scenario={scenario}\nprofile={profile}\nexecution_mode={execution_mode}\nthroughput_backend={throughput_backend}\nchunk_size={chunk_size}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nprojection_batch_rows={projection_batch_rows}\nprojection_chunk_rows={projection_chunk_rows}\nmax_aggregation_group_count={max_aggregation_group_count}\ngrouped_batch_rows={grouped_batch_rows}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n",
+        "scenario={scenario}\nprofile={profile}\nexecution_mode={execution_mode}\nthroughput_backend={throughput_backend}\nchunk_size={chunk_size}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nexecution_duration_ms={execution_duration_ms}\nprojection_convergence_duration_ms={projection_convergence_duration_ms}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nprojection_batch_rows={projection_batch_rows}\nprojection_chunk_rows={projection_chunk_rows}\nmax_aggregation_group_count={max_aggregation_group_count}\ngrouped_batch_rows={grouped_batch_rows}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n{control_plane}",
         scenario = report.scenario,
         profile = report.profile,
         execution_mode = match report.execution_mode {
@@ -1049,6 +1308,8 @@ fn summary_text(report: &BenchmarkReport) -> String {
         workflows = report.workflow_count,
         activities_per_workflow = report.activities_per_workflow,
         total_activities = report.total_activities,
+        execution_duration_ms = report.execution_duration_ms,
+        projection_convergence_duration_ms = report.projection_convergence_duration_ms,
         duration_ms = report.duration_ms,
         throughput = report.activity_metrics.throughput_activities_per_second,
         completed_workflows = report.workflow_outcomes.completed,
@@ -1068,5 +1329,6 @@ fn summary_text(report: &BenchmarkReport) -> String {
         final_activity_backlog = report.backlog_metrics.final_activity_backlog,
         avg_schedule = report.activity_metrics.avg_schedule_to_start_latency_ms,
         avg_close = report.activity_metrics.avg_start_to_close_latency_ms,
+        control_plane = control_plane,
     )
 }

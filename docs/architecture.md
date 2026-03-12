@@ -239,12 +239,14 @@ The architecture must therefore optimize for:
 
 For high-cardinality fan-out beyond what durable per-activity execution supports efficiently, workflows can opt into throughput mode using `ctx.bulkActivity()`. This trades per-item durable history for chunk-level durability, reducing workflow overhead from `O(items)` to `O(chunks)`.
 
+Throughput mode may run with an eager execution policy. In eager mode, chunk work may execute ahead of workflow observation, but it does not directly mutate workflow state. The workflow still observes only deterministic batch barrier outcomes.
+
 Throughput mode supports two interchangeable backends:
 
 - **`pg-v1`** (default): Postgres-first backend. Chunk scheduling and state management run entirely in Postgres. No additional infrastructure required. Suitable for batches up to ~100K items.
 - **`stream-v2`**: Streaming backend. Removes Postgres from the throughput hot path. Uses a dedicated `throughput-runtime` service with RocksDB for shard-local state, Redpanda for command/report/changelog logs, and S3 for durable checkpoints. Suitable for batches with millions of items.
 
-Backend selection is per `ctx.bulkActivity()` call and pinned for the lifetime of the batch. Both backends implement the same internal interface and produce the same workflow-visible batch lifecycle events.
+Backend selection is server-controlled per batch and pinned for the lifetime of that batch. Workflow code does not select `pg-v1` vs `stream-v2`. Both backends implement the same internal interface and produce the same workflow-visible batch lifecycle events.
 
 See [throughput-mode.md](spec/throughput-mode.md) for the full specification.
 
