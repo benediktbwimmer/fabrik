@@ -54,7 +54,7 @@ configure_redpanda_limits() {
 
 WORKFLOW_PARTITIONS="${WORKFLOW_PARTITIONS:-$(partition_csv "$WORKFLOW_EVENTS_PARTITION_COUNT")}"
 THROUGHPUT_PARTITIONS="${THROUGHPUT_OWNERSHIP_PARTITIONS:-$(partition_csv "$THROUGHPUT_TOPIC_PARTITION_COUNT")}"
-POSTGRES_URL="postgres://fabrik:fabrik@localhost:${POSTGRES_HOST_PORT:-55433}/${DB_NAME}"
+POSTGRES_URL="postgres://fabrik:fabrik@127.0.0.1:${POSTGRES_HOST_PORT:-55433}/${DB_NAME}"
 WORKFLOW_EVENTS_TOPIC="${WORKFLOW_EVENTS_TOPIC:-workflow-events-$NAMESPACE}"
 THROUGHPUT_COMMANDS_TOPIC="${THROUGHPUT_COMMANDS_TOPIC:-throughput-commands-$NAMESPACE}"
 THROUGHPUT_REPORTS_TOPIC="${THROUGHPUT_REPORTS_TOPIC:-throughput-reports-$NAMESPACE}"
@@ -207,6 +207,41 @@ wait_for_container_health() {
   return 1
 }
 
+wait_for_postgres_host_ready() {
+  local host=${1:-127.0.0.1}
+  local port=${2:-${POSTGRES_HOST_PORT:-55433}}
+  local timeout=${3:-60}
+  python3 - "$host" "$port" "$timeout" <<'PY'
+import socket
+import struct
+import sys
+import time
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+timeout = int(sys.argv[3])
+deadline = time.time() + timeout
+
+while time.time() < deadline:
+    sock = socket.socket()
+    sock.settimeout(1.0)
+    try:
+        sock.connect((host, port))
+        sock.sendall(struct.pack("!II", 8, 80877103))
+        response = sock.recv(1)
+        if response in (b"S", b"N"):
+            sys.exit(0)
+    except OSError:
+        pass
+    finally:
+        sock.close()
+    time.sleep(1)
+
+print(f"timed out waiting for postgres handshake on {host}:{port}", file=sys.stderr)
+sys.exit(1)
+PY
+}
+
 wait_for_redpanda_ready() {
   local timeout=${1:-60}
   local deadline=$((SECONDS + timeout))
@@ -354,6 +389,7 @@ echo "[isolated-benchmark] purging stale benchmark topics"
 purge_stale_benchmark_topics
 echo "[isolated-benchmark] waiting for postgres"
 wait_for_container_health fabrik-postgres-1 healthy 90
+wait_for_postgres_host_ready 127.0.0.1 "${POSTGRES_HOST_PORT:-55433}" 90
 
 echo "[isolated-benchmark] waiting for minio"
 until curl -fsS "http://127.0.0.1:${MINIO_API_PORT:-9000}/minio/health/live" >/dev/null; do
@@ -364,6 +400,7 @@ echo "[isolated-benchmark] preparing database and topics"
 docker exec fabrik-postgres-1 psql -U postgres -Atc \
   "SELECT 1 FROM pg_database WHERE datname = '$DB_NAME'" | grep -q 1 \
   || docker exec fabrik-postgres-1 psql -U postgres -c "CREATE DATABASE $DB_NAME OWNER fabrik;" >/dev/null
+wait_for_postgres_host_ready 127.0.0.1 "${POSTGRES_HOST_PORT:-55433}" 30
 
 for topic in \
   "$WORKFLOW_EVENTS_TOPIC:$WORKFLOW_EVENTS_PARTITION_COUNT" \

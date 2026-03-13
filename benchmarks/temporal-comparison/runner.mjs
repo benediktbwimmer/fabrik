@@ -454,33 +454,25 @@ function loadFabrikResult(results, workload, repetition) {
   };
 }
 
-function buildStackPlans(workloads) {
-  const plans = new Map();
-  for (const workload of workloads) {
-    for (const scenario of fabrikScenariosForWorkload(workload)) {
-      const current = plans.get(scenario.stackKey) ?? {
-        key: scenario.stackKey,
-        executionMode: scenario.stackExecutionMode,
-        maxWorkerCount: 0,
-      };
-      current.maxWorkerCount = Math.max(current.maxWorkerCount, workload.workerCount);
-      plans.set(scenario.stackKey, current);
-    }
-  }
-  return Array.from(plans.values());
-}
-
 async function runFabrikMatrix({ outputDir, profile, repetitions, repoRoot, workloads }) {
   const results = new Map();
-  for (const stackPlan of buildStackPlans(workloads)) {
-    const stack = await startFabrikStack({ repoRoot, stackPlan });
-    try {
-      for (let repetition = 1; repetition <= repetitions; repetition += 1) {
-        for (const workload of workloads) {
-          for (const scenario of fabrikScenariosForWorkload(workload)) {
-            if (scenario.stackKey !== stackPlan.key) {
-              continue;
-            }
+  for (let repetition = 1; repetition <= repetitions; repetition += 1) {
+    for (const workload of workloads) {
+      const scenariosByStack = new Map();
+      for (const scenario of fabrikScenariosForWorkload(workload)) {
+        const current = scenariosByStack.get(scenario.stackKey) ?? [];
+        current.push(scenario);
+        scenariosByStack.set(scenario.stackKey, current);
+      }
+      for (const [stackKey, scenarios] of scenariosByStack) {
+        const stackPlan = {
+          key: stackKey,
+          executionMode: scenarios[0].stackExecutionMode,
+          maxWorkerCount: workload.workerCount,
+        };
+        const stack = await startFabrikStack({ repoRoot, stackPlan });
+        try {
+          for (const scenario of scenarios) {
             const report = await runFabrikScenario({
               outputDir,
               profile,
@@ -495,10 +487,10 @@ async function runFabrikMatrix({ outputDir, profile, repetitions, repoRoot, work
             current.push(report);
             results.set(key, current);
           }
+        } finally {
+          await stopFabrikStack({ repoRoot, runDir: stack.runDir });
         }
       }
-    } finally {
-      await stopFabrikStack({ repoRoot, runDir: stack.runDir });
     }
   }
   return results;

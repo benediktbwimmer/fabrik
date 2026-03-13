@@ -4152,8 +4152,23 @@ fn capture_dirty_persisted_state(
     let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
     let reason = inner.dirty_reason.take()?;
     let force_snapshot = std::mem::take(&mut inner.force_snapshot);
+    prune_terminal_instances(&mut inner);
     let persisted = capture_persisted_state(&mut inner);
     Some((reason, force_snapshot, persisted))
+}
+
+fn prune_terminal_instances(inner: &mut RuntimeInner) {
+    let terminal_runs = inner
+        .instances
+        .iter()
+        .filter_map(|(run_key, runtime)| {
+            runtime.instance.status.is_terminal().then_some(run_key.clone())
+        })
+        .collect::<Vec<_>>();
+    for run_key in terminal_runs {
+        remove_run_work(inner, &run_key);
+        inner.instances.remove(&run_key);
+    }
 }
 
 #[tonic::async_trait]
@@ -6016,6 +6031,80 @@ mod tests {
             instance_id: format!("instance-{run_id}"),
             run_id: run_id.to_owned(),
         }
+    }
+
+    #[test]
+    fn prune_terminal_instances_removes_completed_runs_and_work() {
+        let now = Utc::now();
+        let terminal_run = run_key_for("terminal");
+        let active_run = run_key_for("active");
+        let mut terminal_runtime =
+            runtime_workflow_for_run("terminal", WorkflowStatus::Completed, 2, now);
+        terminal_runtime.active_activities.clear();
+        let active_runtime = runtime_workflow_for_run("active", WorkflowStatus::Running, 1, now);
+        let terminal_task = queued_activity_for_run("terminal", "activity-terminal", 1, now);
+        let active_task = queued_activity_for_run("active", "activity-active", 1, now);
+        let terminal_attempt = attempt_key_from_task(&terminal_task);
+        let active_attempt = attempt_key_from_task(&active_task);
+        let mut inner = RuntimeInner::default();
+        inner.instances.insert(terminal_run.clone(), terminal_runtime);
+        inner.instances.insert(active_run.clone(), active_runtime);
+        inner
+            .ready
+            .entry(QueueKey { tenant_id: "tenant".to_owned(), task_queue: "default".to_owned() })
+            .or_default()
+            .push_back(terminal_task.clone());
+        inner
+            .ready
+            .entry(QueueKey { tenant_id: "tenant".to_owned(), task_queue: "default".to_owned() })
+            .or_default()
+            .push_back(active_task.clone());
+        inner.leased.insert(
+            terminal_attempt,
+            LeasedActivity {
+                task: terminal_task.clone(),
+                worker_id: "worker-terminal".to_owned(),
+                worker_build_id: "build".to_owned(),
+                lease_expires_at: now + ChronoDuration::seconds(30),
+                owner_epoch: 1,
+            },
+        );
+        inner.leased.insert(
+            active_attempt,
+            LeasedActivity {
+                task: active_task.clone(),
+                worker_id: "worker-active".to_owned(),
+                worker_build_id: "build".to_owned(),
+                lease_expires_at: now + ChronoDuration::seconds(30),
+                owner_epoch: 1,
+            },
+        );
+        push_delayed_retry(
+            &mut inner,
+            DelayedRetryTask { task: terminal_task, due_at: now + ChronoDuration::seconds(10) },
+        );
+        push_delayed_retry(
+            &mut inner,
+            DelayedRetryTask {
+                task: active_task.clone(),
+                due_at: now + ChronoDuration::seconds(10),
+            },
+        );
+
+        prune_terminal_instances(&mut inner);
+
+        assert!(!inner.instances.contains_key(&terminal_run));
+        assert!(inner.instances.contains_key(&active_run));
+        assert!(inner.ready.values().flatten().all(|task| task.run_id != "terminal"));
+        assert!(inner.ready.values().flatten().any(|task| task.run_id == "active"));
+        assert!(inner.leased.values().all(|leased| leased.task.run_id != "terminal"));
+        assert!(inner.leased.values().any(|leased| leased.task.run_id == "active"));
+        assert!(
+            inner.delayed_retries.values().flatten().all(|retry| retry.task.run_id != "terminal")
+        );
+        assert!(
+            inner.delayed_retries.values().flatten().any(|retry| retry.task.run_id == "active")
+        );
     }
 
     fn test_artifact(task_queue: &str) -> CompiledWorkflowArtifact {

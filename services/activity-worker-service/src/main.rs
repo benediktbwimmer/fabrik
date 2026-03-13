@@ -342,8 +342,7 @@ async fn run_result_flusher(
 
         let wait = first_pending_at
             .map(|started| {
-                Duration::from_millis(flush_interval_ms)
-                    .saturating_sub(started.elapsed())
+                Duration::from_millis(flush_interval_ms).saturating_sub(started.elapsed())
             })
             .unwrap_or_else(|| Duration::from_millis(flush_interval_ms));
 
@@ -422,8 +421,7 @@ async fn run_bulk_result_flusher(
 
         let wait = first_pending_at
             .map(|started| {
-                Duration::from_millis(flush_interval_ms)
-                    .saturating_sub(started.elapsed())
+                Duration::from_millis(flush_interval_ms).saturating_sub(started.elapsed())
             })
             .unwrap_or_else(|| Duration::from_millis(flush_interval_ms));
 
@@ -1304,7 +1302,8 @@ mod tests {
             ..ActivityTask::default()
         };
 
-        let error = execute_benchmark_echo_task_without_output(&task).expect_err("task should fail");
+        let error =
+            execute_benchmark_echo_task_without_output(&task).expect_err("task should fail");
         assert_eq!(error.to_string(), "benchmark configured failure on attempt 1");
     }
 }
