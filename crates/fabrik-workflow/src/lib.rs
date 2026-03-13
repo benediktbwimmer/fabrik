@@ -12,10 +12,11 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub use compiled::{
-    ActiveUpdateState, ArtifactEntrypoint, ArtifactExecutionState, CompiledExecutionPlan,
-    CompiledQueryHandler, CompiledStateNode, CompiledUpdateHandler, CompiledWorkflow,
-    CompiledWorkflowArtifact, CompiledWorkflowError, ErrorTransition, ExecutionTurnContext,
-    Expression, HelperFunction, ParentClosePolicy, SourceLocation,
+    ActiveUpdateState, ArtifactEntrypoint, ArtifactExecutionState, Assignment, BinaryOp,
+    CompiledExecutionPlan, CompiledQueryHandler, CompiledSignalHandler, CompiledStateNode,
+    CompiledUpdateHandler, CompiledWorkflow, CompiledWorkflowArtifact, CompiledWorkflowError,
+    ErrorTransition, ExecutionTurnContext, Expression, HelperFunction, ParentClosePolicy,
+    SourceLocation,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -717,6 +718,10 @@ impl WorkflowInstanceState {
             | WorkflowEvent::WorkflowUpdateRequested { .. }
             | WorkflowEvent::WorkflowCancellationRequested { .. }
             | WorkflowEvent::ChildWorkflowStartRequested { .. }
+            | WorkflowEvent::ChildWorkflowSignalRequested { .. }
+            | WorkflowEvent::ChildWorkflowCancellationRequested { .. }
+            | WorkflowEvent::ExternalWorkflowSignalRequested { .. }
+            | WorkflowEvent::ExternalWorkflowCancellationRequested { .. }
             | WorkflowEvent::ChildWorkflowStarted { .. } => {
                 self.status = WorkflowStatus::Running;
             }
@@ -725,6 +730,12 @@ impl WorkflowInstanceState {
                 self.current_state = None;
                 self.output = None;
                 self.context = Some(input.clone());
+            }
+            WorkflowEvent::VersionMarkerRecorded { change_id, version } => {
+                self.status = WorkflowStatus::Running;
+                if let Some(execution) = self.artifact_execution.as_mut() {
+                    execution.version_markers.insert(change_id.clone(), *version);
+                }
             }
             WorkflowEvent::SignalReceived { payload, .. }
             | WorkflowEvent::WorkflowUpdateAccepted { payload, .. } => {
@@ -853,6 +864,7 @@ impl TryFrom<&EventEnvelope<WorkflowEvent>> for WorkflowInstanceState {
             | WorkflowEvent::WorkflowStarted
             | WorkflowEvent::WorkflowArtifactPinned
             | WorkflowEvent::MarkerRecorded { .. }
+            | WorkflowEvent::VersionMarkerRecorded { .. }
             | WorkflowEvent::SignalQueued { .. } => {}
             _ => return Err(WorkflowProjectionError::MissingWorkflowId(event.event_type.clone())),
         }
@@ -1792,7 +1804,11 @@ mod tests {
                 module: "workflow.ts".to_owned(),
                 export: "liveValidation".to_owned(),
             },
-            CompiledWorkflow { initial_state: "wait_signal".to_owned(), states },
+            CompiledWorkflow {
+                initial_state: "wait_signal".to_owned(),
+                states,
+                non_cancellable_states: std::collections::BTreeSet::new(),
+            },
         )
     }
 

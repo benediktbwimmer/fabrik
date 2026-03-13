@@ -27,6 +27,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::time::{Instant, sleep, timeout};
 
+const MAX_WORKFLOW_EVENT_RECORD_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct BrokerConfig {
     pub brokers: String,
@@ -141,7 +143,7 @@ impl WorkflowPublisher {
 
             let producer = BatchProducerBuilder::new(partition_client)
                 .with_linger(Duration::ZERO)
-                .build(RecordAggregator::new(1024 * 1024));
+                .build(RecordAggregator::new(MAX_WORKFLOW_EVENT_RECORD_BYTES));
             producers.insert(partition_id, Arc::new(producer));
         }
 
@@ -254,7 +256,7 @@ where
             );
             let producer = BatchProducerBuilder::new(partition_client)
                 .with_linger(Duration::ZERO)
-                .build(RecordAggregator::new(1024 * 1024));
+                .build(RecordAggregator::new(MAX_WORKFLOW_EVENT_RECORD_BYTES));
             producers.insert(partition_id, Arc::new(producer));
         }
 

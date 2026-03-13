@@ -11,8 +11,7 @@ export function WorkflowsPage() {
   const { tenantId } = useTenant();
   const [searchParams, setSearchParams] = useSearchParams();
   const query = searchParams.get("q") ?? "";
-  const definitionFilter = searchParams.get("definition_id") ?? "";
-  const needle = definitionFilter || query;
+  const needle = query;
 
   const definitionsQuery = useQuery({
     queryKey: ["workflow-definitions", tenantId, needle],
@@ -97,6 +96,9 @@ export function WorkflowsPage() {
                 <td>
                   <Link className="button ghost" to={`/runs?definition_id=${encodeURIComponent(definition.workflow_id)}`}>
                     View runs
+                  </Link>
+                  <Link className="button ghost" to={`/workflows/${encodeURIComponent(definition.workflow_id)}`}>
+                    Open graph
                   </Link>
                 </td>
               </tr>

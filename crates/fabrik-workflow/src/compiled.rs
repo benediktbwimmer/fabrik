@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
@@ -50,6 +50,8 @@ pub struct SourceLocation {
 pub struct CompiledWorkflow {
     pub initial_state: String,
     pub states: BTreeMap<String, CompiledStateNode>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub non_cancellable_states: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -175,6 +177,33 @@ pub enum CompiledStateNode {
         task_queue: Option<Expression>,
         parent_close_policy: ParentClosePolicy,
     },
+    SignalChild {
+        child_ref_var: String,
+        signal_name: String,
+        payload: Expression,
+        next: String,
+    },
+    CancelChild {
+        child_ref_var: String,
+        reason: Option<Expression>,
+        next: String,
+    },
+    SignalExternal {
+        target_instance_id: Expression,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_run_id: Option<Expression>,
+        signal_name: String,
+        payload: Expression,
+        next: String,
+    },
+    CancelExternal {
+        target_instance_id: Expression,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_run_id: Option<Expression>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<Expression>,
+        next: String,
+    },
     WaitForChild {
         child_ref_var: String,
         next: String,
@@ -192,6 +221,10 @@ pub enum CompiledStateNode {
     WaitForCondition {
         condition: Expression,
         next: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_next: Option<String>,
     },
     WaitForTimer {
         timer_ref: String,
@@ -284,6 +317,11 @@ pub enum Expression {
         marker_id: String,
         expr: Box<Expression>,
     },
+    Version {
+        change_id: String,
+        min_supported: u32,
+        max_supported: u32,
+    },
     Now,
     Uuid {
         scope: String,
@@ -333,13 +371,21 @@ pub struct ArtifactExecutionState {
     #[serde(default)]
     pub markers: BTreeMap<String, Value>,
     #[serde(default)]
+    pub version_markers: BTreeMap<String, u32>,
+    #[serde(default)]
     pub active_signal: Option<ActiveSignalState>,
     #[serde(default)]
     pub active_update: Option<ActiveUpdateState>,
+    #[serde(default)]
+    pub pending_workflow_cancellation: Option<String>,
+    #[serde(default)]
+    pub condition_timers: BTreeSet<String>,
     #[serde(skip)]
     pub turn_context: Option<ExecutionTurnContext>,
     #[serde(skip)]
     pub pending_markers: Vec<(String, Value)>,
+    #[serde(skip)]
+    pub pending_version_markers: Vec<(String, u32)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -475,6 +521,21 @@ impl CompiledWorkflowArtifact {
                 | CompiledStateNode::WaitForTimer { .. }
                 | CompiledStateNode::WaitForAllActivities { .. }
         ))
+    }
+
+    pub fn is_non_cancellable_state(&self, state_id: &str) -> bool {
+        self.workflow.non_cancellable_states.contains(state_id)
+    }
+
+    pub fn pending_workflow_cancellation_ready<'a>(
+        &self,
+        current_state: &str,
+        execution_state: &'a ArtifactExecutionState,
+    ) -> Option<&'a str> {
+        execution_state
+            .pending_workflow_cancellation
+            .as_deref()
+            .filter(|_| !self.is_non_cancellable_state(current_state))
     }
 
     pub fn expected_signal_type(
@@ -796,6 +857,16 @@ impl CompiledWorkflowArtifact {
             .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
         match state {
             CompiledStateNode::WaitForTimer { next, .. } if wait_state == timer_id => {
+                self.execute_from_state_in_graph(states, next, execution_state, false)
+            }
+            CompiledStateNode::WaitForCondition { timeout_next, .. } if wait_state == timer_id => {
+                execution_state.condition_timers.remove(wait_state);
+                let Some(next) = timeout_next else {
+                    return Err(CompiledWorkflowError::UnexpectedTimer {
+                        expected: wait_state.to_owned(),
+                        received: timer_id.to_owned(),
+                    });
+                };
                 self.execute_from_state_in_graph(states, next, execution_state, false)
             }
             CompiledStateNode::WaitForTimer { .. } => Err(CompiledWorkflowError::UnexpectedTimer {
@@ -1547,6 +1618,38 @@ impl CompiledWorkflowArtifact {
         }
     }
 
+    pub fn step_timeouts(
+        &self,
+        step_state: &str,
+    ) -> Result<(Option<u64>, Option<u64>, Option<u64>), CompiledWorkflowError> {
+        let state = self
+            .state_by_id(step_state)
+            .or_else(|| {
+                parse_fanout_activity_id(step_state)
+                    .and_then(|(state_id, _)| self.state_by_id(&state_id))
+            })
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(step_state.to_owned()))?;
+        match state {
+            CompiledStateNode::Step {
+                schedule_to_start_timeout_ms,
+                start_to_close_timeout_ms,
+                heartbeat_timeout_ms,
+                ..
+            }
+            | CompiledStateNode::FanOut {
+                schedule_to_start_timeout_ms,
+                start_to_close_timeout_ms,
+                heartbeat_timeout_ms,
+                ..
+            } => Ok((
+                *schedule_to_start_timeout_ms,
+                *start_to_close_timeout_ms,
+                *heartbeat_timeout_ms,
+            )),
+            _ => Err(CompiledWorkflowError::NotWaitingOnStep(step_state.to_owned())),
+        }
+    }
+
     fn fanout_binding(
         &self,
         state_id: &str,
@@ -1633,6 +1736,17 @@ impl CompiledWorkflowArtifact {
         }
 
         loop {
+            if self.pending_workflow_cancellation_ready(&current_state, &execution_state).is_some()
+            {
+                return Ok(CompiledExecutionPlan {
+                    workflow_version: self.definition_version,
+                    final_state: current_state,
+                    emissions,
+                    execution_state,
+                    context,
+                    output,
+                });
+            }
             visited += 1;
             if visited > self.workflow.states.len() * 8 {
                 return Err(CompiledWorkflowError::LoopDetected(current_state));
@@ -1651,6 +1765,19 @@ impl CompiledWorkflowArtifact {
                     }
                     emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
                     current_state = next.clone();
+                    if self
+                        .pending_workflow_cancellation_ready(&current_state, &execution_state)
+                        .is_some()
+                    {
+                        return Ok(CompiledExecutionPlan {
+                            workflow_version: self.definition_version,
+                            final_state: current_state,
+                            emissions,
+                            execution_state,
+                            context,
+                            output,
+                        });
+                    }
                 }
                 CompiledStateNode::Choice { condition, then_next, else_next } => {
                     let value =
@@ -1658,6 +1785,19 @@ impl CompiledWorkflowArtifact {
                     emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
                     current_state =
                         if truthy(&value) { then_next.clone() } else { else_next.clone() };
+                    if self
+                        .pending_workflow_cancellation_ready(&current_state, &execution_state)
+                        .is_some()
+                    {
+                        return Ok(CompiledExecutionPlan {
+                            workflow_version: self.definition_version,
+                            final_state: current_state,
+                            emissions,
+                            execution_state,
+                            context,
+                            output,
+                        });
+                    }
                 }
                 CompiledStateNode::Step {
                     input: step_input,
@@ -1751,6 +1891,22 @@ impl CompiledWorkflowArtifact {
                                 );
                             }
                             current_state = after_wait.clone();
+                            if self
+                                .pending_workflow_cancellation_ready(
+                                    &current_state,
+                                    &execution_state,
+                                )
+                                .is_some()
+                            {
+                                return Ok(CompiledExecutionPlan {
+                                    workflow_version: self.definition_version,
+                                    final_state: current_state,
+                                    emissions,
+                                    execution_state,
+                                    context,
+                                    output,
+                                });
+                            }
                             continue;
                         }
                         return Err(CompiledWorkflowError::NotWaitingOnFanOut(next.clone()));
@@ -2030,6 +2186,148 @@ impl CompiledWorkflowArtifact {
                         state: Some(next.clone()),
                     });
                     current_state = next.clone();
+                    if self
+                        .pending_workflow_cancellation_ready(&current_state, &execution_state)
+                        .is_some()
+                    {
+                        return Ok(CompiledExecutionPlan {
+                            workflow_version: self.definition_version,
+                            final_state: current_state,
+                            emissions,
+                            execution_state,
+                            context,
+                            output,
+                        });
+                    }
+                }
+                CompiledStateNode::SignalChild { child_ref_var, signal_name, payload, next } => {
+                    let child_id = execution_state
+                        .bindings
+                        .get(child_ref_var)
+                        .ok_or_else(|| {
+                            CompiledWorkflowError::UnknownChildReference(child_ref_var.clone())
+                        })?
+                        .get("child_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            CompiledWorkflowError::UnknownChildReference(child_ref_var.clone())
+                        })?
+                        .to_owned();
+                    let payload =
+                        evaluate_expression(payload, &mut execution_state, &self.helpers)?;
+                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+                    emissions.push(ExecutionEmission {
+                        event: WorkflowEvent::ChildWorkflowSignalRequested {
+                            child_id,
+                            signal_name: signal_name.clone(),
+                            payload,
+                        },
+                        state: Some(next.clone()),
+                    });
+                    current_state = next.clone();
+                }
+                CompiledStateNode::CancelChild { child_ref_var, reason, next } => {
+                    let child_id = execution_state
+                        .bindings
+                        .get(child_ref_var)
+                        .ok_or_else(|| {
+                            CompiledWorkflowError::UnknownChildReference(child_ref_var.clone())
+                        })?
+                        .get("child_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            CompiledWorkflowError::UnknownChildReference(child_ref_var.clone())
+                        })?
+                        .to_owned();
+                    let reason = reason
+                        .as_ref()
+                        .map(|expr| evaluate_expression(expr, &mut execution_state, &self.helpers))
+                        .transpose()?
+                        .and_then(|value| stringify_value(&value))
+                        .unwrap_or_else(|| "cancel requested by parent".to_owned());
+                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+                    emissions.push(ExecutionEmission {
+                        event: WorkflowEvent::ChildWorkflowCancellationRequested {
+                            child_id,
+                            reason,
+                        },
+                        state: Some(next.clone()),
+                    });
+                    current_state = next.clone();
+                }
+                CompiledStateNode::SignalExternal {
+                    target_instance_id,
+                    target_run_id,
+                    signal_name,
+                    payload,
+                    next,
+                } => {
+                    let target_instance_id = evaluate_expression(
+                        target_instance_id,
+                        &mut execution_state,
+                        &self.helpers,
+                    )?
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        CompiledWorkflowError::InvalidExternalWorkflowTarget(current_state.clone())
+                    })?;
+                    let target_run_id = target_run_id
+                        .as_ref()
+                        .map(|expr| evaluate_expression(expr, &mut execution_state, &self.helpers))
+                        .transpose()?
+                        .and_then(|value| stringify_value(&value));
+                    let payload =
+                        evaluate_expression(payload, &mut execution_state, &self.helpers)?;
+                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+                    emissions.push(ExecutionEmission {
+                        event: WorkflowEvent::ExternalWorkflowSignalRequested {
+                            target_instance_id,
+                            target_run_id,
+                            signal_name: signal_name.clone(),
+                            payload,
+                        },
+                        state: Some(next.clone()),
+                    });
+                    current_state = next.clone();
+                }
+                CompiledStateNode::CancelExternal {
+                    target_instance_id,
+                    target_run_id,
+                    reason,
+                    next,
+                } => {
+                    let target_instance_id = evaluate_expression(
+                        target_instance_id,
+                        &mut execution_state,
+                        &self.helpers,
+                    )?
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        CompiledWorkflowError::InvalidExternalWorkflowTarget(current_state.clone())
+                    })?;
+                    let target_run_id = target_run_id
+                        .as_ref()
+                        .map(|expr| evaluate_expression(expr, &mut execution_state, &self.helpers))
+                        .transpose()?
+                        .and_then(|value| stringify_value(&value));
+                    let reason = reason
+                        .as_ref()
+                        .map(|expr| evaluate_expression(expr, &mut execution_state, &self.helpers))
+                        .transpose()?
+                        .and_then(|value| stringify_value(&value))
+                        .unwrap_or_else(|| "cancel requested by external handle".to_owned());
+                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+                    emissions.push(ExecutionEmission {
+                        event: WorkflowEvent::ExternalWorkflowCancellationRequested {
+                            target_instance_id,
+                            target_run_id,
+                            reason,
+                        },
+                        state: Some(next.clone()),
+                    });
+                    current_state = next.clone();
                 }
                 CompiledStateNode::WaitForChild { .. } => {
                     return Ok(CompiledExecutionPlan {
@@ -2051,15 +2349,49 @@ impl CompiledWorkflowArtifact {
                         output,
                     });
                 }
-                CompiledStateNode::WaitForCondition { condition, next } => {
+                CompiledStateNode::WaitForCondition { condition, next, timeout_ref, .. } => {
                     let ready = truthy(&evaluate_expression(
                         condition,
                         &mut execution_state,
                         &self.helpers,
                     )?);
                     if ready {
+                        execution_state.condition_timers.remove(&current_state);
                         current_state = next.clone();
+                        if self
+                            .pending_workflow_cancellation_ready(&current_state, &execution_state)
+                            .is_some()
+                        {
+                            return Ok(CompiledExecutionPlan {
+                                workflow_version: self.definition_version,
+                                final_state: current_state,
+                                emissions,
+                                execution_state,
+                                context,
+                                output,
+                            });
+                        }
                         continue;
+                    }
+                    if let Some(timeout_ref) = timeout_ref {
+                        if !execution_state.condition_timers.contains(&current_state) {
+                            let fire_at = Utc::now()
+                                + crate::parse_timer_ref(timeout_ref).map_err(|source| {
+                                    CompiledWorkflowError::InvalidTimer {
+                                        state: current_state.clone(),
+                                        timer_ref: timeout_ref.clone(),
+                                        details: source.to_string(),
+                                    }
+                                })?;
+                            execution_state.condition_timers.insert(current_state.clone());
+                            emissions.push(ExecutionEmission {
+                                event: WorkflowEvent::TimerScheduled {
+                                    timer_id: current_state.clone(),
+                                    fire_at,
+                                },
+                                state: Some(current_state.clone()),
+                            });
+                        }
                     }
                     return Ok(CompiledExecutionPlan {
                         workflow_version: self.definition_version,
@@ -2118,7 +2450,13 @@ impl CompiledWorkflowArtifact {
                             },
                             state: Some(return_state.clone()),
                         };
-                        if matches!(
+                        if self
+                            .pending_workflow_cancellation_ready(&return_state, &execution_state)
+                            .is_some()
+                        {
+                            emissions.push(completion.clone());
+                            current_state = return_state.clone();
+                        } else if matches!(
                             self.workflow.states.get(&return_state),
                             Some(CompiledStateNode::WaitForCondition { .. })
                         ) {
@@ -2133,10 +2471,25 @@ impl CompiledWorkflowArtifact {
                             resumed.emissions = prefixed;
                             return Ok(resumed);
                         }
-                        emissions.push(completion);
-                        current_state = return_state;
+                        if current_state != return_state {
+                            emissions.push(completion);
+                            current_state = return_state;
+                        }
                     } else if let Some(active_signal) = execution_state.active_signal.take() {
                         current_state = active_signal.return_state;
+                        if self
+                            .pending_workflow_cancellation_ready(&current_state, &execution_state)
+                            .is_some()
+                        {
+                            return Ok(CompiledExecutionPlan {
+                                workflow_version: self.definition_version,
+                                final_state: current_state,
+                                emissions,
+                                execution_state,
+                                context,
+                                output,
+                            });
+                        }
                         if matches!(
                             self.workflow.states.get(&current_state),
                             Some(CompiledStateNode::WaitForCondition { .. })
@@ -2255,12 +2608,16 @@ impl CompiledStateNode {
                 .chain(on_error.iter().map(|transition| transition.next.as_str()))
                 .collect(),
             Self::StartChild { next, .. }
+            | Self::SignalChild { next, .. }
+            | Self::CancelChild { next, .. }
+            | Self::SignalExternal { next, .. }
+            | Self::CancelExternal { next, .. }
             | Self::WaitForEvent { next, .. }
-            | Self::WaitForCondition { next, .. }
             | Self::WaitForTimer { next, .. }
-            | Self::WaitForChild { next, .. } => {
-                vec![next.as_str()]
-            }
+            | Self::WaitForChild { next, .. } => vec![next.as_str()],
+            Self::WaitForCondition { next, timeout_next, .. } => std::iter::once(next.as_str())
+                .chain(timeout_next.iter().map(String::as_str))
+                .collect(),
             Self::Succeed { .. } | Self::Fail { .. } | Self::ContinueAsNew { .. } => Vec::new(),
         }
     }
@@ -2856,7 +3213,9 @@ pub fn evaluate_expression(
             scoped_state.bindings = scoped;
             let result = evaluate_expression(&helper.body, &mut scoped_state, helpers)?;
             execution_state.markers = scoped_state.markers;
+            execution_state.version_markers = scoped_state.version_markers;
             execution_state.pending_markers = scoped_state.pending_markers;
+            execution_state.pending_version_markers = scoped_state.pending_version_markers;
             Ok(result)
         }
         Expression::SideEffect { marker_id, expr } => {
@@ -2868,6 +3227,23 @@ pub fn evaluate_expression(
             execution_state.markers.insert(marker_id.clone(), value.clone());
             execution_state.pending_markers.push((marker_id.clone(), value.clone()));
             Ok(value)
+        }
+        Expression::Version { change_id, min_supported, max_supported } => {
+            if min_supported > max_supported {
+                return Err(CompiledWorkflowError::InvalidVersionRange {
+                    change_id: change_id.clone(),
+                    min_supported: *min_supported,
+                    max_supported: *max_supported,
+                });
+            }
+            if let Some(existing) = execution_state.version_markers.get(change_id) {
+                return Ok(number_value(*existing as f64));
+            }
+
+            let version = *max_supported;
+            execution_state.version_markers.insert(change_id.clone(), version);
+            execution_state.pending_version_markers.push((change_id.clone(), version));
+            Ok(number_value(version as f64))
         }
         Expression::Now => Ok(number_value(
             execution_state
@@ -2931,6 +3307,12 @@ fn emit_pending_markers(
     for (marker_id, value) in execution_state.pending_markers.drain(..) {
         emissions.push(ExecutionEmission {
             event: WorkflowEvent::MarkerRecorded { marker_id, value },
+            state: Some(state.to_owned()),
+        });
+    }
+    for (change_id, version) in execution_state.pending_version_markers.drain(..) {
+        emissions.push(ExecutionEmission {
+            event: WorkflowEvent::VersionMarkerRecorded { change_id, version },
             state: Some(state.to_owned()),
         });
     }
@@ -3117,10 +3499,16 @@ pub enum CompiledWorkflowError {
     UpdateAlreadyActive(String),
     #[error("unknown child workflow reference binding {0}")]
     UnknownChildReference(String),
+    #[error("compiled workflow state {0} evaluated external workflow target to a non-string value")]
+    InvalidExternalWorkflowTarget(String),
     #[error("unknown helper function {0}")]
     UnknownHelper(String),
     #[error("helper {helper} expected {expected} args, received {received}")]
     HelperArityMismatch { helper: String, expected: usize, received: usize },
+    #[error(
+        "version expression for change {change_id} has invalid range min={min_supported} max={max_supported}"
+    )]
+    InvalidVersionRange { change_id: String, min_supported: u32, max_supported: u32 },
     #[error("compiled workflow expression {0} requires execution turn context")]
     MissingTurnContext(String),
     #[error("value {0} cannot be treated as a number")]
@@ -3183,6 +3571,7 @@ mod tests {
                     },
                 ),
             ]),
+            non_cancellable_states: BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
             "demo",
@@ -3213,6 +3602,7 @@ mod tests {
                     output_var: None,
                 },
             )]),
+            non_cancellable_states: BTreeSet::new(),
         };
         let updates = BTreeMap::from([(
             "approve".to_owned(),
@@ -3272,6 +3662,7 @@ mod tests {
                     next: "done".to_owned(),
                 },
             )]),
+            non_cancellable_states: BTreeSet::new(),
         };
         let signals = BTreeMap::from([(
             "approved".to_owned(),
@@ -3314,6 +3705,8 @@ mod tests {
                     CompiledStateNode::WaitForCondition {
                         condition: Expression::Identifier { name: "ready".to_owned() },
                         next: "done".to_owned(),
+                        timeout_ref: None,
+                        timeout_next: None,
                     },
                 ),
                 (
@@ -3323,6 +3716,7 @@ mod tests {
                     },
                 ),
             ]),
+            non_cancellable_states: BTreeSet::new(),
         };
         let signals = BTreeMap::from([(
             "approved".to_owned(),
@@ -3417,6 +3811,7 @@ mod tests {
                     },
                 ),
             ]),
+            non_cancellable_states: BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
             "fanout-demo",
@@ -3506,6 +3901,7 @@ mod tests {
                     },
                 ),
             ]),
+            non_cancellable_states: BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
             "bulk-demo",
@@ -3587,10 +3983,14 @@ mod tests {
         let mut state = ArtifactExecutionState {
             bindings: BTreeMap::new(),
             markers: BTreeMap::new(),
+            version_markers: BTreeMap::new(),
             active_signal: None,
             active_update: None,
+            pending_workflow_cancellation: None,
+            condition_timers: BTreeSet::new(),
             turn_context: Some(turn_context.clone()),
             pending_markers: Vec::new(),
+            pending_version_markers: Vec::new(),
         };
 
         let now = evaluate_expression(&Expression::Now, &mut state, &BTreeMap::new()).unwrap();
@@ -3623,10 +4023,14 @@ mod tests {
         let mut state = ArtifactExecutionState {
             bindings: BTreeMap::new(),
             markers: BTreeMap::new(),
+            version_markers: BTreeMap::new(),
             active_signal: None,
             active_update: None,
+            pending_workflow_cancellation: None,
+            condition_timers: BTreeSet::new(),
             turn_context: Some(turn_context),
             pending_markers: Vec::new(),
+            pending_version_markers: Vec::new(),
         };
         let expression = Expression::SideEffect {
             marker_id: "marker_callsite".to_owned(),
@@ -3644,6 +4048,35 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(state.markers.len(), 1);
         assert_eq!(state.pending_markers.len(), 1);
+    }
+
+    #[test]
+    fn records_version_markers_once_per_change_id() {
+        let mut state = ArtifactExecutionState::default();
+        let expression = Expression::Version {
+            change_id: "feature-x".to_owned(),
+            min_supported: 1,
+            max_supported: 3,
+        };
+
+        let first = evaluate_expression(&expression, &mut state, &BTreeMap::new()).unwrap();
+        let second = evaluate_expression(&expression, &mut state, &BTreeMap::new()).unwrap();
+
+        assert_eq!(first, json!(3));
+        assert_eq!(second, json!(3));
+        assert_eq!(state.version_markers.get("feature-x"), Some(&3));
+        assert_eq!(state.pending_version_markers, vec![("feature-x".to_owned(), 3)]);
+
+        let mut emissions = Vec::new();
+        emit_pending_markers(&mut emissions, &mut state, "dispatch");
+        assert!(state.pending_version_markers.is_empty());
+        assert!(matches!(
+            emissions.as_slice(),
+            [ExecutionEmission {
+                event: WorkflowEvent::VersionMarkerRecorded { change_id, version },
+                ..
+            }] if change_id == "feature-x" && *version == 3
+        ));
     }
 
     #[test]
@@ -3747,6 +4180,7 @@ mod tests {
                     ),
                     ("done".to_owned(), CompiledStateNode::Succeed { output: None }),
                 ]),
+                non_cancellable_states: BTreeSet::new(),
             },
         );
         let mut execution_state = ArtifactExecutionState::default();
@@ -4644,6 +5078,189 @@ mod tests {
             }) if output["status"] == json!("settled")
                 && output["count"] == json!(3)
                 && output.get("resultHandle").is_none()
+        ));
+    }
+
+    #[test]
+    fn pending_cancellation_pauses_at_non_cancellable_boundary() {
+        let artifact = CompiledWorkflowArtifact::new(
+            "non-cancellable-boundary",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "shielded_step".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "shielded_step".to_owned(),
+                        CompiledStateNode::Step {
+                            handler: "benchmark.echo".to_owned(),
+                            input: Expression::Literal {
+                                value: Value::String("inside".to_owned()),
+                            },
+                            next: Some("after_scope".to_owned()),
+                            task_queue: None,
+                            retry: None,
+                            config: None,
+                            schedule_to_start_timeout_ms: None,
+                            start_to_close_timeout_ms: None,
+                            heartbeat_timeout_ms: None,
+                            output_var: None,
+                            on_error: None,
+                        },
+                    ),
+                    (
+                        "after_scope".to_owned(),
+                        CompiledStateNode::Assign {
+                            actions: vec![Assignment {
+                                target: "done".to_owned(),
+                                expr: Expression::Literal { value: Value::Bool(true) },
+                            }],
+                            next: "outside_step".to_owned(),
+                        },
+                    ),
+                    (
+                        "outside_step".to_owned(),
+                        CompiledStateNode::Step {
+                            handler: "benchmark.echo".to_owned(),
+                            input: Expression::Literal {
+                                value: Value::String("outside".to_owned()),
+                            },
+                            next: Some("finish".to_owned()),
+                            task_queue: None,
+                            retry: None,
+                            config: None,
+                            schedule_to_start_timeout_ms: None,
+                            start_to_close_timeout_ms: None,
+                            heartbeat_timeout_ms: None,
+                            output_var: None,
+                            on_error: None,
+                        },
+                    ),
+                    ("finish".to_owned(), CompiledStateNode::Succeed { output: None }),
+                ]),
+                non_cancellable_states: BTreeSet::from(["shielded_step".to_owned()]),
+            },
+        );
+
+        let mut execution_state = ArtifactExecutionState::default();
+        execution_state.pending_workflow_cancellation = Some("cancel later".to_owned());
+
+        let plan = artifact
+            .execute_after_step_completion_with_turn(
+                "shielded_step",
+                "shielded_step",
+                &Value::String("ok".to_owned()),
+                execution_state,
+                CompiledWorkflowArtifact::synthetic_turn_context("non-cancellable-boundary"),
+            )
+            .unwrap();
+
+        assert_eq!(plan.final_state, "after_scope");
+        assert_eq!(
+            plan.execution_state.pending_workflow_cancellation.as_deref(),
+            Some("cancel later")
+        );
+        assert!(!plan.emissions.iter().any(|emission| matches!(
+            emission.event,
+            WorkflowEvent::ActivityTaskScheduled {
+                ref activity_id, ..
+            } if activity_id == "outside_step"
+        )));
+    }
+
+    #[test]
+    fn wait_for_condition_timeout_schedules_timer_and_returns_false_on_fire() {
+        let artifact = CompiledWorkflowArtifact::new(
+            "condition-timeout",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "wait_ready".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "wait_ready".to_owned(),
+                        CompiledStateNode::WaitForCondition {
+                            condition: Expression::Identifier { name: "approved".to_owned() },
+                            next: "assign_true".to_owned(),
+                            timeout_ref: Some("5s".to_owned()),
+                            timeout_next: Some("assign_false".to_owned()),
+                        },
+                    ),
+                    (
+                        "assign_true".to_owned(),
+                        CompiledStateNode::Assign {
+                            actions: vec![Assignment {
+                                target: "result".to_owned(),
+                                expr: Expression::Literal { value: Value::Bool(true) },
+                            }],
+                            next: "done".to_owned(),
+                        },
+                    ),
+                    (
+                        "assign_false".to_owned(),
+                        CompiledStateNode::Assign {
+                            actions: vec![Assignment {
+                                target: "result".to_owned(),
+                                expr: Expression::Literal { value: Value::Bool(false) },
+                            }],
+                            next: "done".to_owned(),
+                        },
+                    ),
+                    (
+                        "done".to_owned(),
+                        CompiledStateNode::Succeed {
+                            output: Some(Expression::Identifier { name: "result".to_owned() }),
+                        },
+                    ),
+                ]),
+                non_cancellable_states: BTreeSet::new(),
+            },
+        );
+
+        let waiting = artifact
+            .execute_trigger_with_turn(
+                &json!({"approved": false}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(waiting.final_state, "wait_ready");
+        assert!(matches!(
+            waiting.emissions.first(),
+            Some(ExecutionEmission { event: WorkflowEvent::WorkflowStarted, .. })
+        ));
+        assert!(waiting.emissions.iter().any(|emission| matches!(
+            emission.event,
+            WorkflowEvent::TimerScheduled {
+                ref timer_id, ..
+            } if timer_id == "wait_ready"
+        )));
+        assert!(waiting.execution_state.condition_timers.contains("wait_ready"));
+
+        let timed_out = artifact
+            .execute_after_timer_with_turn(
+                "wait_ready",
+                "wait_ready",
+                waiting.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_005_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert!(timed_out.execution_state.condition_timers.is_empty());
+        assert!(matches!(
+            timed_out.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output == &json!(false)
         ));
     }
 }

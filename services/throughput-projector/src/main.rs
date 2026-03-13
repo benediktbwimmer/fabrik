@@ -99,10 +99,11 @@ async fn run_projection_consumer(state: AppState, config: JsonTopicConfig) {
                     continue;
                 }
             };
+        let start_offsets = next_unread_offsets(&offsets);
         let mut consumer = match build_json_consumer_from_offsets(
             &config,
             &state.projector_id,
-            &offsets,
+            &start_offsets,
             &config.all_partition_ids(),
         )
         .await
@@ -180,6 +181,10 @@ fn decode_projection_record(
         offset: record.record.offset,
         event,
     })
+}
+
+fn next_unread_offsets(offsets: &HashMap<i32, i64>) -> HashMap<i32, i64> {
+    offsets.iter().map(|(partition_id, offset)| (*partition_id, offset.saturating_add(1))).collect()
 }
 
 async fn apply_projection_batch(
@@ -313,5 +318,22 @@ fn build_payload_store_config(query: &QueryRuntimeConfig) -> PayloadStoreConfig 
         s3_secret_access_key: query.throughput_payload_store.s3_secret_access_key.clone(),
         s3_force_path_style: query.throughput_payload_store.s3_force_path_style,
         s3_key_prefix: query.throughput_payload_store.s3_key_prefix.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_unread_offsets;
+    use std::collections::HashMap;
+
+    #[test]
+    fn next_unread_offsets_advance_past_last_applied_record() {
+        let offsets = HashMap::from([(0, 23), (1, 8), (2, i64::MAX)]);
+
+        let next_offsets = next_unread_offsets(&offsets);
+
+        assert_eq!(next_offsets.get(&0), Some(&24));
+        assert_eq!(next_offsets.get(&1), Some(&9));
+        assert_eq!(next_offsets.get(&2), Some(&i64::MAX));
     }
 }

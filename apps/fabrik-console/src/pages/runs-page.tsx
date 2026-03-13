@@ -10,7 +10,7 @@ const PAGE_SIZE = 25;
 
 function buildParams(searchParams: URLSearchParams) {
   const params = new URLSearchParams();
-  for (const key of ["status", "definition_id", "instance_id", "run_id", "task_queue", "q"]) {
+  for (const key of ["status", "routing_status", "definition_id", "instance_id", "run_id", "task_queue", "q"]) {
     const value = searchParams.get(key)?.trim();
     if (value) params.set(key, value);
   }
@@ -125,6 +125,27 @@ export function RunsPage() {
             <option value="continued">continued</option>
             <option value="closed">closed</option>
           </select>
+          <select
+            className="select"
+            value={searchParams.get("routing_status") ?? ""}
+            onChange={(event) => {
+              const next = new URLSearchParams(searchParams);
+              const value = event.target.value;
+              value ? next.set("routing_status", value) : next.delete("routing_status");
+              next.delete("offset");
+              setSearchParams(next);
+            }}
+          >
+            <option value="">All routing states</option>
+            <option value="sticky_active">sticky_active</option>
+            <option value="queue_default_active">queue_default_active</option>
+            <option value="sticky_incompatible_fallback_required">
+              sticky_incompatible_fallback_required
+            </option>
+            <option value="sticky_artifact_mismatch_fallback_required">
+              sticky_artifact_mismatch_fallback_required
+            </option>
+          </select>
         </div>
       </Panel>
 
@@ -161,6 +182,7 @@ export function RunsPage() {
             <tr>
               <th>Workflow</th>
               <th>Status</th>
+              <th>Routing</th>
               <th>Current step</th>
               <th>Queue</th>
               <th>Started</th>
@@ -180,6 +202,9 @@ export function RunsPage() {
                 </td>
                 <td>
                   <Badge value={item.status} />
+                </td>
+                <td>
+                  <Badge value={item.routing_status} />
                 </td>
                 <td>
                   {item.current_state ?? "-"}

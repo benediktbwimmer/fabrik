@@ -2,9 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 const FABRIK_SCENARIO_LABELS = {
-  durable: "fabrik_durable",
-  "throughput-pg-v1": "fabrik_throughput_pg_v1",
-  "throughput-stream-v2": "fabrik_throughput_stream_v2",
+  "unified-experiment": "fabrik_unified",
 };
 
 function fabrikScenarioLabel(name) {
@@ -44,7 +42,12 @@ function validateWorkload(workload) {
       throw new Error(`workload ${JSON.stringify(workload)} is missing ${field}`);
     }
   }
-  return workload;
+  return {
+    kind: "fanout",
+    timerSecs: 1,
+    continueRounds: 1,
+    ...workload,
+  };
 }
 
 export async function writeJson(outputPath, value) {
@@ -93,9 +96,7 @@ export function buildComparisonReport({
 function collectPlatformRuns(runs) {
   const platforms = {
     temporal: [],
-    fabrik_durable: [],
-    fabrik_throughput_pg_v1: [],
-    fabrik_throughput_stream_v2: [],
+    fabrik_unified: [],
   };
   for (const run of runs) {
     platforms.temporal.push(run.temporal);
@@ -140,11 +141,7 @@ function buildComparisons(platforms) {
     return {};
   }
   const comparisons = {};
-  for (const platform of [
-    "fabrik_durable",
-    "fabrik_throughput_pg_v1",
-    "fabrik_throughput_stream_v2",
-  ]) {
+  for (const platform of ["fabrik_unified"]) {
     if (!platforms[platform]) {
       continue;
     }

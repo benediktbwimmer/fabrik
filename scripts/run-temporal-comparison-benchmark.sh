@@ -167,16 +167,14 @@ echo "[temporal-comparison] building Fabrik release binaries"
 cargo build --release \
   -p benchmark-runner \
   -p ingest-service \
-  -p matching-service \
-  -p executor-service \
   -p unified-runtime \
-  -p throughput-runtime \
-  -p throughput-projector \
+  -p timer-service \
   -p activity-worker-service >/dev/null
 
 echo "[temporal-comparison] running comparison harness"
 TEMPORAL_ADDRESS="127.0.0.1:${TEMPORAL_HOST_PORT}" \
 TEMPORAL_NAMESPACE="$TEMPORAL_NAMESPACE" \
+BUILD_RELEASE_BINARIES=0 \
 node benchmarks/temporal-comparison/runner.mjs \
   --profile "$PROFILE" \
   --manifest "$MANIFEST" \

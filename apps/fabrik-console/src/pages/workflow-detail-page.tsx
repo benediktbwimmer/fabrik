@@ -3,12 +3,13 @@ import { FormEvent, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { toast } from "sonner";
 
+import { WorkflowGraphExplorer } from "../components/graph/workflow-graph-explorer";
 import { Badge, ConsistencyBadge, Panel } from "../components/ui";
 import { api } from "../lib/api";
 import { formatDate, formatDuration, formatInlineValue, formatNumber } from "../lib/format";
 import { useTenant } from "../lib/tenant-context";
 
-const TABS = ["summary", "timeline", "activities", "raw-history"] as const;
+const TABS = ["summary", "graph", "timeline", "activities", "raw-history"] as const;
 type Tab = (typeof TABS)[number];
 
 type TimelineLane = "lifecycle" | "activities" | "messages" | "timers" | "infra" | "other";
@@ -58,6 +59,16 @@ export function WorkflowDetailPage() {
     queryKey: ["run-activities", tenantId, instanceId, resolvedRunId],
     enabled: tenantId !== "" && instanceId !== "" && resolvedRunId !== "",
     queryFn: () => api.getWorkflowActivities(tenantId, instanceId, resolvedRunId)
+  });
+  const graphQuery = useQuery({
+    queryKey: ["run-graph", tenantId, instanceId, resolvedRunId],
+    enabled: tenantId !== "" && instanceId !== "" && resolvedRunId !== "",
+    queryFn: () => api.getRunGraph(tenantId, instanceId, resolvedRunId)
+  });
+  const routingQuery = useQuery({
+    queryKey: ["workflow-routing", tenantId, instanceId],
+    enabled: tenantId !== "" && instanceId !== "",
+    queryFn: () => api.getWorkflowRouting(tenantId, instanceId)
   });
 
   const runs = useMemo(
@@ -133,6 +144,11 @@ export function WorkflowDetailPage() {
   const activityFailures = (activitiesQuery.data?.activities ?? []).filter((activity) =>
     ["failed", "cancelled", "timed_out"].includes(activity.status)
   );
+  const routing = routingQuery.data;
+  const routingQueueHref =
+    routing?.workflow_task_queue != null
+      ? `/task-queues?queue_kind=workflow&task_queue=${encodeURIComponent(routing.workflow_task_queue)}`
+      : null;
 
   async function onSignal(event: FormEvent) {
     event.preventDefault();
@@ -208,10 +224,25 @@ export function WorkflowDetailPage() {
                 <Panel className="nested-panel">
                   <h3>Related routing</h3>
                   <div className="stack">
-                    <div>Definition version {formatInlineValue(selectedRun?.definition_version)}</div>
-                    <div>Artifact hash {selectedRun?.artifact_hash ?? "-"}</div>
-                    <div>Sticky build {selectedRun?.sticky_workflow_build_id ?? "-"}</div>
-                    <div>Sticky poller {selectedRun?.sticky_workflow_poller_id ?? "-"}</div>
+                    <div>Definition version {formatInlineValue(routing?.definition_version ?? selectedRun?.definition_version)}</div>
+                    <div>Artifact hash {routing?.artifact_hash ?? selectedRun?.artifact_hash ?? "-"}</div>
+                    <div>Routing status {routing?.routing_status ?? "-"}</div>
+                    <div>Default set {routing?.default_compatibility_set_id ?? "-"}</div>
+                    <div>Sticky build {routing?.sticky_workflow_build_id ?? selectedRun?.sticky_workflow_build_id ?? "-"}</div>
+                    <div>Sticky poller {routing?.sticky_workflow_poller_id ?? selectedRun?.sticky_workflow_poller_id ?? "-"}</div>
+                    <div>
+                      Sticky queue compatibility {formatInlineValue(routing?.sticky_build_compatible_with_queue)}
+                    </div>
+                    <div>
+                      Sticky artifact support {formatInlineValue(routing?.sticky_build_supports_pinned_artifact)}
+                    </div>
+                    <div>Compatible builds {(routing?.compatible_build_ids ?? []).join(", ") || "-"}</div>
+                    <div>Registered builds {(routing?.registered_build_ids ?? []).join(", ") || "-"}</div>
+                    {routingQueueHref ? (
+                      <Link className="button ghost" to={routingQueueHref}>
+                        Inspect workflow queue
+                      </Link>
+                    ) : null}
                   </div>
                 </Panel>
               </div>
@@ -259,6 +290,14 @@ export function WorkflowDetailPage() {
                 </Panel>
               </div>
             </div>
+          ) : null}
+
+          {activeTab === "graph" ? (
+            <WorkflowGraphExplorer
+              graph={graphQuery.data}
+              onOpenActivities={() => setActiveTab("activities")}
+              onOpenHistory={() => setActiveTab("raw-history")}
+            />
           ) : null}
 
           {activeTab === "timeline" ? (

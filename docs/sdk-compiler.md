@@ -93,17 +93,27 @@ Current implemented compatibility slice in the compiler:
   - async signal handlers can await the same supported workflow primitives as other compiled handler bodies
 - a broader Temporal `condition(...)` subset:
   - awaited `condition(() => predicate)` lowers into a first-class `wait_for_condition` state
+  - awaited `condition(() => predicate, timeout)` lowers into a timed `wait_for_condition` state and resolves to `false` on timeout for supported compiled predicates
   - the condition is re-evaluated after compiled signal handlers or update handlers run and mutate workflow state
 - a narrow Temporal child-workflow subset:
   - `await startChild(workflow, { args, workflowId, taskQueue, parentClosePolicy })`
   - `await childHandle.result()`
+  - `await childHandle.signal(signalDefOrName, payload?)`
+  - `await childHandle.cancel(reason?)`
   - `await executeChild(workflow, { args, workflowId, taskQueue, parentClosePolicy })`
+- a narrow Temporal external-workflow-handle subset:
+  - `const handle = getExternalWorkflowHandle(workflowId, runId?)`
+  - `await handle.signal(signalDefOrName, payload?)`
+  - `await handle.cancel(reason?)`
+  - current runtime support targets the current instance row for `workflowId` and only honors `runId` when it matches that current run
 - a narrow Temporal cancellation-scope subset:
   - `await CancellationScope.cancellable(async () => { ... })`
   - `await CancellationScope.nonCancellable(async () => { ... })`
   - `isCancellation(error)` inside compiled workflow expressions and `catch` branches
   - currently supported scope bodies are straight-line compiled statements that lower to the existing artifact model, including multiple awaited proxy activities or child-workflow waits plus local assignment/return flow
-  - `nonCancellable(...)` is still only a compiler-level wrapper today; it does not yet establish a distinct runtime cancellation shield
+  - supported `nonCancellable(...)` scopes now establish a real runtime cancellation shield for the compiled states inside that scope
+  - cancellation requests are deferred while execution remains inside those marked states and are delivered once the workflow exits the shielded region
+  - this is still a subset, not full Temporal cancellation-scope parity; unsupported dynamic scope shapes are still rejected by the compiler
 - plain `return value` as workflow completion
 - `return continueAsNew(...)` imported from `@temporalio/workflow`, including multi-argument payload packing
 
@@ -113,8 +123,8 @@ Current non-goals for this slice:
 
 - general `Promise.all(...)` lowering beyond the proxy-activity map pattern
 - general `Promise.allSettled(...)` lowering beyond the proxy-activity map pattern
-- broad Temporal `condition(...)` parity beyond handler-driven state changes
-- broad Temporal child workflow handles and signal APIs beyond the narrow start/result and execute forms
+- broad Temporal `condition(...)` parity beyond supported compiled predicates, handler-driven state changes, and the static timeout form
+- broad Temporal child workflow handles, external workflow handles, and signal APIs beyond the narrow supported start/result/signal/cancel and execute forms
 - full proxy activity option parity
   - dynamic or computed retry option values are still rejected; retry options must remain static literals
 - wire-level or server-level Temporal compatibility

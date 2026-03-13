@@ -4251,6 +4251,7 @@ dependencies = [
  "fabrik-events",
  "fabrik-service",
  "fabrik-store",
+ "fabrik-throughput",
  "fabrik-worker-protocol",
  "fabrik-workflow",
  "futures-util",

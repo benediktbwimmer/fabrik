@@ -55,6 +55,68 @@
         "retryRate": 0,
         "cancelRate": 0,
         "timeoutSecs": 240
+      },
+      {
+        "name": "timer-gated-fanout",
+        "description": "One timer wakeup per workflow before the normal fan-out path.",
+        "kind": "timer_gate",
+        "workflowCount": 10,
+        "activitiesPerWorkflow": 96,
+        "payloadSize": 256,
+        "workerCount": 8,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timerSecs": 1,
+        "timeoutSecs": 180
+      },
+      {
+        "name": "signal-gated-fanout",
+        "description": "One external signal per workflow gates fan-out execution.",
+        "kind": "signal_gate",
+        "workflowCount": 10,
+        "activitiesPerWorkflow": 96,
+        "payloadSize": 256,
+        "workerCount": 8,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timeoutSecs": 180
+      },
+      {
+        "name": "update-gated-fanout",
+        "description": "One workflow update per workflow gates fan-out execution and must complete before work starts.",
+        "kind": "update_gate",
+        "workflowCount": 10,
+        "activitiesPerWorkflow": 96,
+        "payloadSize": 256,
+        "workerCount": 8,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timeoutSecs": 180
+      },
+      {
+        "name": "continue-as-new-fanout",
+        "description": "Each workflow rolls once with continue-as-new before executing the fan-out path.",
+        "kind": "continue_as_new",
+        "workflowCount": 10,
+        "activitiesPerWorkflow": 96,
+        "payloadSize": 256,
+        "workerCount": 8,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "continueRounds": 1,
+        "timeoutSecs": 180
+      },
+      {
+        "name": "child-workflow-gated-fanout",
+        "description": "Each parent workflow starts and awaits one child workflow before fan-out execution.",
+        "kind": "child_workflow",
+        "workflowCount": 10,
+        "activitiesPerWorkflow": 96,
+        "payloadSize": 256,
+        "workerCount": 8,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timeoutSecs": 180
       }
     ],
     "target": [
@@ -112,6 +174,68 @@
         "retryRate": 0,
         "cancelRate": 0,
         "timeoutSecs": 360
+      },
+      {
+        "name": "timer-gated-fanout",
+        "description": "One timer wakeup per workflow before the normal fan-out path.",
+        "kind": "timer_gate",
+        "workflowCount": 24,
+        "activitiesPerWorkflow": 384,
+        "payloadSize": 256,
+        "workerCount": 12,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timerSecs": 1,
+        "timeoutSecs": 300
+      },
+      {
+        "name": "signal-gated-fanout",
+        "description": "One external signal per workflow gates fan-out execution.",
+        "kind": "signal_gate",
+        "workflowCount": 24,
+        "activitiesPerWorkflow": 384,
+        "payloadSize": 256,
+        "workerCount": 12,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timeoutSecs": 300
+      },
+      {
+        "name": "update-gated-fanout",
+        "description": "One workflow update per workflow gates fan-out execution and must complete before work starts.",
+        "kind": "update_gate",
+        "workflowCount": 24,
+        "activitiesPerWorkflow": 384,
+        "payloadSize": 256,
+        "workerCount": 12,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timeoutSecs": 300
+      },
+      {
+        "name": "continue-as-new-fanout",
+        "description": "Each workflow rolls once with continue-as-new before executing the fan-out path.",
+        "kind": "continue_as_new",
+        "workflowCount": 24,
+        "activitiesPerWorkflow": 384,
+        "payloadSize": 256,
+        "workerCount": 12,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "continueRounds": 1,
+        "timeoutSecs": 300
+      },
+      {
+        "name": "child-workflow-gated-fanout",
+        "description": "Each parent workflow starts and awaits one child workflow before fan-out execution.",
+        "kind": "child_workflow",
+        "workflowCount": 24,
+        "activitiesPerWorkflow": 384,
+        "payloadSize": 256,
+        "workerCount": 12,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timeoutSecs": 300
       }
     ]
   }

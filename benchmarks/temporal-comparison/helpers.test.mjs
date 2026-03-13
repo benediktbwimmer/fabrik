@@ -28,9 +28,7 @@ test("buildComparisonReport aggregates platform metrics", () => {
             fabrik: {
               suiteReportPath: "/tmp/fabrik-1.json",
               scenarios: [
-                demoFabrikRun("durable", 80, 2500),
-                demoFabrikRun("throughput-pg-v1", 70, 2800),
-                demoFabrikRun("throughput-stream-v2", 60, 3200),
+                demoFabrikRun("unified-experiment", 30, 6000),
               ],
             },
           },
@@ -40,9 +38,7 @@ test("buildComparisonReport aggregates platform metrics", () => {
             fabrik: {
               suiteReportPath: "/tmp/fabrik-2.json",
               scenarios: [
-                demoFabrikRun("durable", 100, 2600),
-                demoFabrikRun("throughput-pg-v1", 90, 3000),
-                demoFabrikRun("throughput-stream-v2", 80, 3300),
+                demoFabrikRun("unified-experiment", 40, 5900),
               ],
             },
           },
@@ -53,11 +49,8 @@ test("buildComparisonReport aggregates platform metrics", () => {
 
   const workload = report.workloads[0];
   assert.equal(workload.summary.platforms.temporal.meanDurationMs, 110);
-  assert.equal(workload.summary.platforms.fabrik_durable.meanActivityThroughputPerSecond, 2550);
-  assert.equal(
-    workload.summary.comparisons.fabrik_throughput_stream_v2.durationRatioVsTemporal,
-    70 / 110,
-  );
+  assert.equal(workload.summary.platforms.fabrik_unified.meanDurationMs, 35);
+  assert.equal(workload.summary.comparisons.fabrik_unified.durationRatioVsTemporal, 35 / 110);
 });
 
 test("buildComparisonReport groups suffixed Fabrik scenarios under their base platform", () => {
@@ -80,9 +73,7 @@ test("buildComparisonReport groups suffixed Fabrik scenarios under their base pl
             temporal: demoTemporalRun(100, 2000),
             fabrik: {
               scenarios: [
-                demoFabrikRun("durable-retry-500bp", 120, 1000),
-                demoFabrikRun("throughput-pg-v1-retry-500bp", 50, 4000),
-                demoFabrikRun("throughput-stream-v2-retry-500bp", 70, 3000),
+                demoFabrikRun("unified-experiment-retry-500bp", 45, 4200),
               ],
             },
           },
@@ -92,9 +83,7 @@ test("buildComparisonReport groups suffixed Fabrik scenarios under their base pl
   });
 
   const workload = report.workloads[0];
-  assert.equal(workload.summary.platforms.fabrik_durable.meanDurationMs, 120);
-  assert.equal(workload.summary.platforms.fabrik_throughput_pg_v1.meanDurationMs, 50);
-  assert.equal(workload.summary.platforms.fabrik_throughput_stream_v2.meanDurationMs, 70);
+  assert.equal(workload.summary.platforms.fabrik_unified.meanDurationMs, 45);
 });
 
 test("formatComparisonSummary renders workload summaries", () => {
@@ -118,9 +107,7 @@ test("formatComparisonSummary renders workload summaries", () => {
             fabrik: {
               suiteReportPath: "/tmp/fabrik.json",
               scenarios: [
-                demoFabrikRun("durable", 80, 2500),
-                demoFabrikRun("throughput-pg-v1", 70, 2800),
-                demoFabrikRun("throughput-stream-v2", 60, 3200),
+                demoFabrikRun("unified-experiment", 35, 6100),
               ],
             },
           },
@@ -131,7 +118,8 @@ test("formatComparisonSummary renders workload summaries", () => {
 
   const summary = formatComparisonSummary(report);
   assert.match(summary, /fanout-baseline/);
-  assert.match(summary, /fabrik_durable_vs_temporal/);
+  assert.match(summary, /fabrik_unified_vs_temporal/);
+  assert.doesNotMatch(summary, /fabrik_durable_vs_temporal/);
 });
 
 function demoTemporalRun(durationMs, throughput) {

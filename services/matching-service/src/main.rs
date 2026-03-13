@@ -881,6 +881,7 @@ impl ActivityWorkerApi for ActivityApi {
                 result: Some(activity_task_result::Result::Completed(
                     fabrik_worker_protocol::activity_worker::ActivityTaskCompletedResult {
                         output_json: request.output_json,
+                        output_cbor: Vec::new(),
                     },
                 )),
             }],
@@ -1029,6 +1030,7 @@ impl ActivityWorkerApi for ActivityApi {
                     fabrik_worker_protocol::activity_worker::ActivityTaskCancelledResult {
                         reason: request.reason,
                         metadata_json: request.metadata_json,
+                        metadata_cbor: Vec::new(),
                     },
                 )),
             }],
@@ -2090,11 +2092,14 @@ fn record_to_proto(record: &WorkflowActivityRecord) -> ActivityTask {
         task_queue: record.task_queue.clone(),
         attempt: record.attempt,
         input_json: serde_json::to_string(&record.input).expect("activity input serializes"),
+        input_cbor: Vec::new(),
         config_json: record
             .config
             .as_ref()
             .map(|config| serde_json::to_string(config).expect("activity config serializes"))
             .unwrap_or_default(),
+        config_cbor: Vec::new(),
+        prefer_cbor: false,
         state: record.state.clone().unwrap_or_default(),
         scheduled_at_unix_ms: record.scheduled_at.timestamp_millis(),
         lease_expires_at_unix_ms: record
@@ -2107,6 +2112,7 @@ fn record_to_proto(record: &WorkflowActivityRecord) -> ActivityTask {
         schedule_to_start_timeout_ms: record.schedule_to_start_timeout_ms.unwrap_or_default(),
         lease_epoch: 0,
         owner_epoch: 0,
+        omit_success_output: false,
     }
 }
 
@@ -3129,6 +3135,7 @@ mod tests {
                 worker_id: "worker-b".to_owned(),
                 worker_build_id: "build-b".to_owned(),
                 poll_timeout_ms: 1,
+                supports_cbor: false,
             }))
             .await
             .expect_err("incompatible activity worker should be rejected");
@@ -3215,6 +3222,7 @@ mod tests {
                 worker_id: "worker-a".to_owned(),
                 worker_build_id: "build-a".to_owned(),
                 poll_timeout_ms: 1,
+                supports_cbor: false,
             }))
             .await?
             .into_inner()
@@ -3256,6 +3264,7 @@ mod tests {
                 worker_id: "worker-a".to_owned(),
                 worker_build_id: "build-a".to_owned(),
                 poll_timeout_ms: 1,
+                supports_cbor: false,
             }))
             .await
             .expect_err("promoted default set should reject old build");
@@ -3268,6 +3277,7 @@ mod tests {
                 worker_id: "worker-b".to_owned(),
                 worker_build_id: "build-b".to_owned(),
                 poll_timeout_ms: 1,
+                supports_cbor: false,
             }))
             .await?
             .into_inner()
@@ -3346,6 +3356,7 @@ mod tests {
                 worker_build_id: "build-a".to_owned(),
                 poll_timeout_ms: 1,
                 max_tasks: 3,
+                supports_cbor: false,
             }))
             .await?
             .into_inner();

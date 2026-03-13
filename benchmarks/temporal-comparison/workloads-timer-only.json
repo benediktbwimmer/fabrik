@@ -1,0 +1,19 @@
+{
+  "profiles": {
+    "smoke": [
+      {
+        "name": "timer-gated-fanout",
+        "description": "One timer wakeup per workflow before the normal fan-out path.",
+        "kind": "timer_gate",
+        "workflowCount": 10,
+        "activitiesPerWorkflow": 96,
+        "payloadSize": 256,
+        "workerCount": 8,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timerSecs": 1,
+        "timeoutSecs": 180
+      }
+    ]
+  }
+}

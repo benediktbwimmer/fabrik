@@ -8486,7 +8486,7 @@ impl WorkflowStore {
             {
                 ActivityTerminalPayload::Completed { output } => (
                     WorkflowActivityStatus::Completed.as_str(),
-                    Some(output.clone()),
+                    (!output.is_null()).then_some(output.clone()),
                     None,
                     None,
                     None,
@@ -12148,15 +12148,11 @@ impl WorkflowStore {
             previous_run_id: row
                 .try_get("previous_run_id")
                 .context("run summary previous_run_id missing")?,
-            next_run_id: row
-                .try_get("next_run_id")
-                .context("run summary next_run_id missing")?,
+            next_run_id: row.try_get("next_run_id").context("run summary next_run_id missing")?,
             continue_reason: row
                 .try_get("continue_reason")
                 .context("run summary continue_reason missing")?,
-            started_at: row
-                .try_get("started_at")
-                .context("run summary started_at missing")?,
+            started_at: row.try_get("started_at").context("run summary started_at missing")?,
             closed_at: row.try_get("closed_at").context("run summary closed_at missing")?,
             updated_at: row.try_get("updated_at").context("run summary updated_at missing")?,
             last_transition_at: row

@@ -72,6 +72,27 @@ test("compiler lowers ctx.sideEffect expressions", async () => {
   assert.match(serialized, /"marker_id":"marker_/);
 });
 
+test("compiler lowers ctx.version expressions", async () => {
+  const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/version-workflow.ts");
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "versionWorkflow",
+    "--definition-id",
+    "version-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"kind":"version"/);
+  assert.match(serialized, /"change_id":"feature-x"/);
+  assert.match(serialized, /"min_supported":1/);
+  assert.match(serialized, /"max_supported":3/);
+});
+
 test("compiler lowers awaited ctx.activity calls into activity states", async () => {
   const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/activity-workflow.ts");
   const { stdout } = await runCompiler([
@@ -414,6 +435,29 @@ test("compiler lowers Temporal condition waits driven by updates without signals
   assert.ok(artifact.queries.currentValue);
 });
 
+test("compiler lowers Temporal condition waits with timeout", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-condition-timeout-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalConditionTimeoutWorkflow",
+    "--definition-id",
+    "temporal-condition-timeout-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serializedWorkflowStates = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serializedWorkflowStates, /"type":"wait_for_condition"/);
+  assert.match(serializedWorkflowStates, /"timeout_ref":"5s"/);
+  assert.match(serializedWorkflowStates, /"timeout_next":"assign_/);
+});
+
 test("compiler emits real compiled signal handler graphs for async Temporal signal handlers", async () => {
   const fixture = path.join(
     root,
@@ -489,6 +533,57 @@ test("compiler lowers narrow Temporal child workflow APIs", async () => {
   assert.match(serialized, /"type":"wait_for_child"/);
   assert.match(serialized, /"output_var":"childResult"/);
   assert.match(serialized, /"output_var":"directResult"/);
+});
+
+test("compiler lowers Temporal child handle signal and cancel calls", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-child-handle-control-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalChildHandleControlWorkflow",
+    "--definition-id",
+    "temporal-child-handle-control-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"start_child"/);
+  assert.match(serialized, /"type":"signal_child"/);
+  assert.match(serialized, /"signal_name":"approve"/);
+  assert.match(serialized, /"type":"cancel_child"/);
+  assert.match(serialized, /"reason":\{"kind":"literal","value":"stop"\}/);
+});
+
+test("compiler lowers Temporal external workflow handle signal and cancel calls", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-external-workflow-handle-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalExternalWorkflowHandleWorkflow",
+    "--definition-id",
+    "temporal-external-workflow-handle-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"signal_external"/);
+  assert.match(serialized, /"type":"cancel_external"/);
+  assert.match(serialized, /"target_instance_id":\{"kind":"literal","value":"target-workflow"\}/);
+  assert.match(serialized, /"target_run_id":\{"kind":"literal","value":"target-run"\}/);
+  assert.match(serialized, /"signal_name":"approve"/);
+  assert.match(serialized, /"reason":\{"kind":"literal","value":"stop"\}/);
 });
 
 test("compiler lowers Temporal cancellation scopes around proxy activities", async () => {

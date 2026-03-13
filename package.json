@@ -1,6 +1,7 @@
 {
   "name": "fabrik",
   "private": true,
+  "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "compile:workflow": "node sdk/typescript-compiler/compiler.mjs",

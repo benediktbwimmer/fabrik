@@ -468,6 +468,7 @@ async fn run_activity_lane(
                         worker_id: worker_id.clone(),
                         worker_build_id: worker_build_id.clone(),
                         poll_timeout_ms: 30_000,
+                        supports_cbor: true,
                     })
                     .await
                     .map(|response| response.into_inner().task.into_iter().collect::<VecDeque<_>>())
@@ -480,6 +481,7 @@ async fn run_activity_lane(
                         worker_build_id: worker_build_id.clone(),
                         poll_timeout_ms: 30_000,
                         max_tasks: activity_poll_max_tasks,
+                        supports_cbor: true,
                     })
                     .await
                     .map(|response| {
@@ -613,8 +615,8 @@ async fn execute_activity_task(
         client,
         &task.activity_type,
         task.attempt,
-        parse_optional_json(&task.config_json)?,
-        &parse_required_json(&task.input_json)?,
+        parse_activity_task_config(&task)?,
+        &parse_activity_task_input(&task)?,
     )
     .await;
 
@@ -629,9 +631,13 @@ async fn execute_activity_task(
             worker_build_id,
             lease_epoch: task.lease_epoch,
             owner_epoch: task.owner_epoch,
-            result: Some(activity_task_result::Result::Completed(ActivityTaskCompletedResult {
-                output_json: serde_json::to_string(&output)?,
-            })),
+            result: Some(activity_task_result::Result::Completed(
+                encode_activity_completed_result(
+                    &output,
+                    task.prefer_cbor,
+                    task.omit_success_output,
+                )?,
+            )),
         },
         Err(error) if error.to_string() == "activity cancelled" => ActivityTaskResult {
             tenant_id: task.tenant_id,
@@ -646,6 +652,7 @@ async fn execute_activity_task(
             result: Some(activity_task_result::Result::Cancelled(ActivityTaskCancelledResult {
                 reason: "activity cancelled".to_owned(),
                 metadata_json: String::new(),
+                metadata_cbor: Vec::new(),
             })),
         },
         Err(error) => ActivityTaskResult {
@@ -662,6 +669,48 @@ async fn execute_activity_task(
                 error: error.to_string(),
             })),
         },
+    })
+}
+
+fn parse_activity_task_input(
+    task: &fabrik_worker_protocol::activity_worker::ActivityTask,
+) -> Result<Value> {
+    if !task.input_cbor.is_empty() {
+        return decode_cbor(&task.input_cbor, "activity task input");
+    }
+    parse_required_json(&task.input_json)
+}
+
+fn parse_activity_task_config(
+    task: &fabrik_worker_protocol::activity_worker::ActivityTask,
+) -> Result<Option<Value>> {
+    if !task.config_cbor.is_empty() {
+        let value = decode_cbor::<Value>(&task.config_cbor, "activity task config")?;
+        return Ok((!value.is_null()).then_some(value));
+    }
+    parse_optional_json(&task.config_json)
+}
+
+fn encode_activity_completed_result(
+    output: &Value,
+    prefer_cbor: bool,
+    omit_success_output: bool,
+) -> Result<ActivityTaskCompletedResult> {
+    if omit_success_output {
+        return Ok(ActivityTaskCompletedResult {
+            output_json: String::new(),
+            output_cbor: Vec::new(),
+        });
+    }
+    if prefer_cbor {
+        return Ok(ActivityTaskCompletedResult {
+            output_json: String::new(),
+            output_cbor: encode_cbor(output, "activity result output")?,
+        });
+    }
+    Ok(ActivityTaskCompletedResult {
+        output_json: serde_json::to_string(output)?,
+        output_cbor: Vec::new(),
     })
 }
 
@@ -1112,7 +1161,7 @@ async fn response_body(response: Response) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fabrik_worker_protocol::activity_worker::BulkActivityTask;
+    use fabrik_worker_protocol::activity_worker::{ActivityTask, BulkActivityTask};
 
     #[test]
     fn cbor_null_input_handle_is_treated_as_absent() {
@@ -1124,5 +1173,49 @@ mod tests {
 
         let handle = task_input_handle(&task).expect("decode null handle");
         assert_eq!(handle, None);
+    }
+
+    #[test]
+    fn normal_activity_input_prefers_cbor() {
+        let task = ActivityTask {
+            input_json: "{\"ignored\":true}".to_owned(),
+            input_cbor: encode_cbor(&serde_json::json!({"ok": true}), "activity task input")
+                .expect("encode activity input"),
+            ..ActivityTask::default()
+        };
+
+        let input = parse_activity_task_input(&task).expect("decode activity input");
+        assert_eq!(input, serde_json::json!({"ok": true}));
+    }
+
+    #[test]
+    fn normal_activity_config_falls_back_to_json() {
+        let task = ActivityTask {
+            config_json: "{\"url\":\"https://example.com\"}".to_owned(),
+            ..ActivityTask::default()
+        };
+
+        let config = parse_activity_task_config(&task).expect("decode activity config");
+        assert_eq!(config, Some(serde_json::json!({"url": "https://example.com"})));
+    }
+
+    #[test]
+    fn completed_results_encode_cbor_when_requested() {
+        let completed =
+            encode_activity_completed_result(&serde_json::json!({"ok": true}), true, false)
+                .expect("encode completed result");
+
+        assert!(completed.output_json.is_empty());
+        assert!(!completed.output_cbor.is_empty());
+    }
+
+    #[test]
+    fn completed_results_elide_success_payload_when_requested() {
+        let completed =
+            encode_activity_completed_result(&serde_json::json!({"ok": true}), true, true)
+                .expect("encode completed result");
+
+        assert!(completed.output_json.is_empty());
+        assert!(completed.output_cbor.is_empty());
     }
 }

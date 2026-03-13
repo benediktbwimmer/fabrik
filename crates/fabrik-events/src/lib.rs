@@ -110,6 +110,10 @@ pub enum WorkflowEvent {
         marker_id: String,
         value: Value,
     },
+    VersionMarkerRecorded {
+        change_id: String,
+        version: u32,
+    },
     ActivityTaskScheduled {
         activity_id: String,
         activity_type: String,
@@ -271,6 +275,28 @@ pub enum WorkflowEvent {
         child_workflow_id: String,
         child_run_id: String,
     },
+    ChildWorkflowSignalRequested {
+        child_id: String,
+        signal_name: String,
+        payload: Value,
+    },
+    ChildWorkflowCancellationRequested {
+        child_id: String,
+        reason: String,
+    },
+    ExternalWorkflowSignalRequested {
+        target_instance_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_run_id: Option<String>,
+        signal_name: String,
+        payload: Value,
+    },
+    ExternalWorkflowCancellationRequested {
+        target_instance_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_run_id: Option<String>,
+        reason: String,
+    },
     ChildWorkflowCompleted {
         child_id: String,
         child_run_id: String,
@@ -322,6 +348,7 @@ impl WorkflowEvent {
             Self::WorkflowStarted => "WorkflowStarted",
             Self::WorkflowArtifactPinned => "WorkflowArtifactPinned",
             Self::MarkerRecorded { .. } => "MarkerRecorded",
+            Self::VersionMarkerRecorded { .. } => "VersionMarkerRecorded",
             Self::ActivityTaskScheduled { .. } => "ActivityTaskScheduled",
             Self::ActivityTaskStarted { .. } => "ActivityTaskStarted",
             Self::ActivityTaskHeartbeatRecorded { .. } => "ActivityTaskHeartbeatRecorded",
@@ -343,6 +370,12 @@ impl WorkflowEvent {
             Self::WorkflowUpdateRejected { .. } => "WorkflowUpdateRejected",
             Self::ChildWorkflowStartRequested { .. } => "ChildWorkflowStartRequested",
             Self::ChildWorkflowStarted { .. } => "ChildWorkflowStarted",
+            Self::ChildWorkflowSignalRequested { .. } => "ChildWorkflowSignalRequested",
+            Self::ChildWorkflowCancellationRequested { .. } => "ChildWorkflowCancellationRequested",
+            Self::ExternalWorkflowSignalRequested { .. } => "ExternalWorkflowSignalRequested",
+            Self::ExternalWorkflowCancellationRequested { .. } => {
+                "ExternalWorkflowCancellationRequested"
+            }
             Self::ChildWorkflowCompleted { .. } => "ChildWorkflowCompleted",
             Self::ChildWorkflowFailed { .. } => "ChildWorkflowFailed",
             Self::ChildWorkflowCancelled { .. } => "ChildWorkflowCancelled",
@@ -379,6 +412,10 @@ pub fn workflow_turn_routing(payload: &WorkflowEvent) -> WorkflowTurnRouting {
         | WorkflowEvent::BulkActivityBatchCompleted { .. }
         | WorkflowEvent::BulkActivityBatchFailed { .. }
         | WorkflowEvent::BulkActivityBatchCancelled { .. }
+        | WorkflowEvent::ChildWorkflowSignalRequested { .. }
+        | WorkflowEvent::ChildWorkflowCancellationRequested { .. }
+        | WorkflowEvent::ExternalWorkflowSignalRequested { .. }
+        | WorkflowEvent::ExternalWorkflowCancellationRequested { .. }
         | WorkflowEvent::ChildWorkflowCompleted { .. }
         | WorkflowEvent::ChildWorkflowFailed { .. }
         | WorkflowEvent::ChildWorkflowCancelled { .. }

@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use fabrik_config::PostgresConfig;
 use fabrik_throughput::{PG_V1_BACKEND, STREAM_V2_BACKEND};
 use fabrik_workflow::{
-    ArtifactEntrypoint, CompiledStateNode, CompiledWorkflow, CompiledWorkflowArtifact,
+    ArtifactEntrypoint, Assignment, CompiledStateNode, CompiledWorkflow, CompiledWorkflowArtifact,
     ErrorTransition, Expression, RetryPolicy,
 };
 use reqwest::Client;
@@ -37,6 +37,43 @@ enum ExecutionMode {
     Unified,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchmarkWorkloadKind {
+    Fanout,
+    TimerGate,
+    SignalGate,
+    UpdateGate,
+    ContinueAsNew,
+    ChildWorkflow,
+}
+
+impl BenchmarkWorkloadKind {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "fanout" => Ok(Self::Fanout),
+            "timer_gate" => Ok(Self::TimerGate),
+            "signal_gate" => Ok(Self::SignalGate),
+            "update_gate" => Ok(Self::UpdateGate),
+            "continue_as_new" => Ok(Self::ContinueAsNew),
+            "child_workflow" => Ok(Self::ChildWorkflow),
+            other => bail!(
+                "unknown --workload-kind {other}; expected fanout, timer_gate, signal_gate, update_gate, continue_as_new, or child_workflow"
+            ),
+        }
+    }
+
+    fn definition_prefix(self) -> &'static str {
+        match self {
+            Self::Fanout => "fanout",
+            Self::TimerGate => "timer-gate",
+            Self::SignalGate => "signal-gate",
+            Self::UpdateGate => "update-gate",
+            Self::ContinueAsNew => "continue-as-new",
+            Self::ChildWorkflow => "child-workflow",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Args {
     suite_name: Option<String>,
@@ -51,8 +88,11 @@ struct Args {
     task_queue: String,
     execution_mode: ExecutionMode,
     throughput_backend: Option<String>,
+    workload_kind: BenchmarkWorkloadKind,
     bulk_reducer: String,
     chunk_size: u32,
+    timer_secs: u32,
+    continue_rounds: u32,
     timeout: Duration,
 }
 
@@ -91,9 +131,13 @@ struct BenchmarkReport {
     max_aggregation_group_count: u64,
     grouped_batch_rows: u64,
     executor_debug: Value,
+    executor_debug_before: Option<Value>,
+    executor_debug_after: Option<Value>,
+    executor_debug_delta: Option<Value>,
     throughput_runtime_debug: Option<Value>,
     throughput_projector_debug: Option<Value>,
     control_plane_metrics: Option<ControlPlaneMetrics>,
+    executor_debug_delta_metrics: Option<ExecutorDebugDeltaMetrics>,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,6 +197,15 @@ struct ControlPlaneMetrics {
     projection_events_applied_directly: u64,
     changelog_entries_published: u64,
     manifest_writes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecutorDebugDeltaMetrics {
+    polls_per_leased_task: f64,
+    report_rpcs_per_completed_activity: f64,
+    report_batches_per_completed_activity: f64,
+    log_writes: u64,
+    snapshot_writes: u64,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -241,6 +294,16 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         format!("fanout-{}-{}-{}", args.profile_name, scenario_name, Uuid::now_v7());
     let started_at = Utc::now();
     let started = Instant::now();
+    let executor_debug_url = match args.execution_mode {
+        ExecutionMode::Unified => format!("{unified_runtime_debug_base}/debug/unified"),
+        _ => format!("{executor_base}/debug/hybrid-routing"),
+    };
+    let executor_debug_before = (args.execution_mode == ExecutionMode::Unified)
+        .then(|| async { fetch_optional_debug(&client, &executor_debug_url).await });
+    let executor_debug_before = match executor_debug_before {
+        Some(fetch) => Some(fetch.await),
+        None => None,
+    };
 
     if args.execution_mode == ExecutionMode::Throughput {
         apply_task_queue_throughput_policy(
@@ -252,29 +315,19 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         .await?;
     }
 
-    publish_artifact(
-        &client,
-        &ingest_base,
-        &args.tenant_id,
-        &benchmark_artifact(
-            &definition_id,
-            &args.task_queue,
-            args.retry_rate > 0.0,
-            args.execution_mode,
-            &args.bulk_reducer,
-            args.throughput_backend.as_deref(),
-            args.chunk_size,
-        ),
-    )
-    .await?;
+    for artifact in benchmark_artifacts(&definition_id, &args.task_queue, args) {
+        publish_artifact(&client, &ingest_base, &args.tenant_id, &artifact).await?;
+    }
 
     for workflow_index in 0..args.profile.workflow_count {
         let instance_id = format!("{instance_prefix}-{workflow_index:04}");
         let input = benchmark_input(
+            args,
             args.profile.activities_per_workflow,
             args.payload_size,
             args.retry_rate,
             args.cancel_rate,
+            &instance_id,
         );
         trigger_workflow(
             &client,
@@ -288,14 +341,32 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         .await?;
     }
 
+    match args.workload_kind {
+        BenchmarkWorkloadKind::SignalGate => {
+            for workflow_index in 0..args.profile.workflow_count {
+                let instance_id = format!("{instance_prefix}-{workflow_index:04}");
+                signal_workflow(&client, &ingest_base, &args.tenant_id, &instance_id).await?;
+            }
+        }
+        BenchmarkWorkloadKind::UpdateGate => {
+            for workflow_index in 0..args.profile.workflow_count {
+                let instance_id = format!("{instance_prefix}-{workflow_index:04}");
+                update_workflow(&client, &ingest_base, &args.tenant_id, &instance_id).await?;
+            }
+        }
+        _ => {}
+    }
+
     let mut max_workflow_backlog = 0_u64;
     let mut max_activity_backlog = 0_u64;
     loop {
-        let outcomes = workflow_outcomes(&pool, &args.tenant_id, &instance_prefix).await?;
+        let outcomes =
+            workflow_outcomes(&pool, &args.tenant_id, &instance_prefix, args.workload_kind).await?;
         let (workflow_backlog, activity_backlog) = backlog_snapshot(
             &pool,
             &args.tenant_id,
             &instance_prefix,
+            args.workload_kind,
             args.execution_mode,
             args.throughput_backend.as_deref(),
         )
@@ -330,6 +401,7 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
             &pool,
             &args.tenant_id,
             &instance_prefix,
+            args.workload_kind,
             args.profile.workflow_count as u64,
             (args.profile.workflow_count * args.profile.activities_per_workflow) as u64,
             Duration::from_secs(DEFAULT_STREAM_PROJECTION_TIMEOUT_SECS),
@@ -340,32 +412,33 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
     let completed_at = Utc::now();
     let duration_ms = started.elapsed().as_millis();
     let projection_convergence_duration_ms = duration_ms.saturating_sub(execution_duration_ms);
-    let workflow_outcomes = workflow_outcomes(&pool, &args.tenant_id, &instance_prefix).await?;
+    let workflow_outcomes =
+        workflow_outcomes(&pool, &args.tenant_id, &instance_prefix, args.workload_kind).await?;
     let activity_metrics = activity_metrics(
         &pool,
         &args.tenant_id,
         &instance_prefix,
+        args.workload_kind,
         duration_ms,
         args.profile.workflow_count * args.profile.activities_per_workflow,
         args.execution_mode,
         args.throughput_backend.as_deref(),
     )
     .await?;
-    let coalescing_metrics = coalescing_metrics(&pool, &args.tenant_id, &instance_prefix).await?;
+    let coalescing_metrics =
+        coalescing_metrics(&pool, &args.tenant_id, &instance_prefix, args.workload_kind).await?;
     let (_legacy_batch_rows, _legacy_chunk_rows) = (0_u64, 0_u64);
     let (final_workflow_backlog, final_activity_backlog) = backlog_snapshot(
         &pool,
         &args.tenant_id,
         &instance_prefix,
+        args.workload_kind,
         args.execution_mode,
         args.throughput_backend.as_deref(),
     )
     .await?;
     let executor_debug = client
-        .get(match args.execution_mode {
-            ExecutionMode::Unified => format!("{unified_runtime_debug_base}/debug/unified"),
-            _ => format!("{executor_base}/debug/hybrid-routing"),
-        })
+        .get(&executor_debug_url)
         .send()
         .await
         .context("failed to fetch benchmark control-plane debug summary")?
@@ -374,6 +447,12 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         .json::<Value>()
         .await
         .context("failed to decode benchmark control-plane debug summary")?;
+    let executor_debug_after =
+        (args.execution_mode == ExecutionMode::Unified).then_some(executor_debug.clone());
+    let executor_debug_delta = executor_debug_before
+        .as_ref()
+        .zip(executor_debug_after.as_ref())
+        .map(|(before, after)| json_numeric_delta(before, after));
     let throughput_runtime_debug = if args.execution_mode == ExecutionMode::Throughput
         && args.throughput_backend.as_deref() == Some(STREAM_V2_BACKEND)
     {
@@ -407,12 +486,14 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         projection_chunk_rows,
         max_aggregation_group_count,
         grouped_batch_rows,
-    ) = bulk_metrics(&pool, &args.tenant_id, &instance_prefix).await?;
+    ) = bulk_metrics(&pool, &args.tenant_id, &instance_prefix, args.workload_kind).await?;
     let control_plane_metrics = control_plane_metrics(
         throughput_runtime_debug.as_ref(),
         throughput_projector_debug.as_ref(),
         &activity_metrics,
     );
+    let executor_debug_delta_metrics =
+        executor_debug_delta_metrics(executor_debug_delta.as_ref(), &activity_metrics);
 
     Ok(BenchmarkReport {
         scenario: scenario_name,
@@ -453,9 +534,13 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         max_aggregation_group_count,
         grouped_batch_rows,
         executor_debug,
+        executor_debug_before,
+        executor_debug_after,
+        executor_debug_delta,
         throughput_runtime_debug,
         throughput_projector_debug,
         control_plane_metrics,
+        executor_debug_delta_metrics,
     })
 }
 
@@ -471,8 +556,12 @@ fn parse_args() -> Result<Args> {
     let mut task_queue = "default".to_owned();
     let mut execution_mode = ExecutionMode::Durable;
     let mut throughput_backend = None;
+    let mut workload_kind = BenchmarkWorkloadKind::Fanout;
     let mut bulk_reducer = "collect_results".to_owned();
+    let mut bulk_reducer_explicit = false;
     let mut chunk_size = 256_u32;
+    let mut timer_secs = 1_u32;
+    let mut continue_rounds = 1_u32;
     let mut timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS);
     let mut workflow_count = None;
     let mut activities_per_workflow = None;
@@ -511,7 +600,9 @@ fn parse_args() -> Result<Args> {
                     ),
                 })
             }
+            "--workload-kind" => workload_kind = BenchmarkWorkloadKind::parse(&value)?,
             "--bulk-reducer" => {
+                bulk_reducer_explicit = true;
                 bulk_reducer = match value.as_str() {
                     "all_succeeded" | "all_settled" | "count" | "collect_results" => value,
                     other => bail!(
@@ -520,6 +611,10 @@ fn parse_args() -> Result<Args> {
                 }
             }
             "--chunk-size" => chunk_size = value.parse().context("invalid --chunk-size")?,
+            "--timer-secs" => timer_secs = value.parse().context("invalid --timer-secs")?,
+            "--continue-rounds" => {
+                continue_rounds = value.parse().context("invalid --continue-rounds")?
+            }
             "--timeout-secs" => {
                 timeout = Duration::from_secs(value.parse().context("invalid --timeout-secs")?)
             }
@@ -533,6 +628,12 @@ fn parse_args() -> Result<Args> {
             other => bail!("unknown argument {other}"),
         }
     }
+
+    bulk_reducer = normalize_bulk_reducer_for_execution_mode(
+        execution_mode,
+        bulk_reducer,
+        bulk_reducer_explicit,
+    )?;
 
     let default_profile = match profile_name.as_str() {
         "smoke" => BenchmarkProfile { workflow_count: 10, activities_per_workflow: 100 },
@@ -563,23 +664,310 @@ fn parse_args() -> Result<Args> {
         task_queue,
         execution_mode,
         throughput_backend,
+        workload_kind,
         bulk_reducer,
         chunk_size,
+        timer_secs,
+        continue_rounds,
         timeout,
     })
+}
+
+fn normalize_bulk_reducer_for_execution_mode(
+    execution_mode: ExecutionMode,
+    bulk_reducer: String,
+    bulk_reducer_explicit: bool,
+) -> Result<String> {
+    if execution_mode != ExecutionMode::Unified {
+        return Ok(bulk_reducer);
+    }
+    if !bulk_reducer_explicit && bulk_reducer == "collect_results" {
+        return Ok("all_settled".to_owned());
+    }
+    if matches!(bulk_reducer.as_str(), "all_settled" | "count") {
+        return Ok(bulk_reducer);
+    }
+    bail!(
+        "unified benchmarks require --bulk-reducer all_settled or count; {bulk_reducer} is unsupported"
+    )
+}
+
+fn benchmark_artifacts(
+    definition_id: &str,
+    task_queue: &str,
+    args: &Args,
+) -> Vec<CompiledWorkflowArtifact> {
+    let mut artifacts = vec![benchmark_artifact(definition_id, task_queue, args)];
+    if args.workload_kind == BenchmarkWorkloadKind::ChildWorkflow {
+        artifacts.push(benchmark_child_artifact(&child_definition_id(definition_id)));
+    }
+    artifacts
 }
 
 fn benchmark_artifact(
     definition_id: &str,
     task_queue: &str,
-    enable_retry: bool,
-    execution_mode: ExecutionMode,
-    bulk_reducer: &str,
-    throughput_backend: Option<&str>,
-    chunk_size: u32,
+    args: &Args,
 ) -> CompiledWorkflowArtifact {
-    let mut states = BTreeMap::new();
-    match execution_mode {
+    let mut states = benchmark_terminal_states();
+    let initial_state = match args.workload_kind {
+        BenchmarkWorkloadKind::Fanout => {
+            insert_dispatch_graph(&mut states, task_queue, args);
+            "dispatch".to_owned()
+        }
+        BenchmarkWorkloadKind::TimerGate => {
+            states.insert(
+                "wait_timer".to_owned(),
+                CompiledStateNode::WaitForTimer {
+                    timer_ref: format!("{}s", args.timer_secs.max(1)),
+                    next: "dispatch".to_owned(),
+                },
+            );
+            insert_dispatch_graph(&mut states, task_queue, args);
+            "wait_timer".to_owned()
+        }
+        BenchmarkWorkloadKind::SignalGate => {
+            states.insert(
+                "init".to_owned(),
+                CompiledStateNode::Assign {
+                    actions: vec![Assignment {
+                        target: "signal_ready".to_owned(),
+                        expr: Expression::Literal { value: Value::Bool(false) },
+                    }],
+                    next: "wait_signal".to_owned(),
+                },
+            );
+            states.insert(
+                "wait_signal".to_owned(),
+                CompiledStateNode::WaitForCondition {
+                    condition: Expression::Identifier { name: "signal_ready".to_owned() },
+                    next: "dispatch".to_owned(),
+                    timeout_ref: None,
+                    timeout_next: None,
+                },
+            );
+            insert_dispatch_graph(&mut states, task_queue, args);
+            let mut artifact = CompiledWorkflowArtifact::new(
+                definition_id,
+                1,
+                "benchmark-runner",
+                ArtifactEntrypoint {
+                    module: "benchmark.ts".to_owned(),
+                    export: "workflow".to_owned(),
+                },
+                CompiledWorkflow {
+                    initial_state: "init".to_owned(),
+                    states,
+                    non_cancellable_states: Default::default(),
+                },
+            );
+            artifact.signals.insert(
+                "approve".to_owned(),
+                fabrik_workflow::CompiledSignalHandler {
+                    arg_name: Some("payload".to_owned()),
+                    initial_state: "mark_ready".to_owned(),
+                    states: BTreeMap::from([
+                        (
+                            "mark_ready".to_owned(),
+                            CompiledStateNode::Assign {
+                                actions: vec![Assignment {
+                                    target: "signal_ready".to_owned(),
+                                    expr: Expression::Literal { value: Value::Bool(true) },
+                                }],
+                                next: "finish_signal".to_owned(),
+                            },
+                        ),
+                        (
+                            "finish_signal".to_owned(),
+                            CompiledStateNode::Succeed {
+                                output: Some(Expression::Identifier { name: "payload".to_owned() }),
+                            },
+                        ),
+                    ]),
+                },
+            );
+            artifact.artifact_hash = artifact.hash();
+            return artifact;
+        }
+        BenchmarkWorkloadKind::UpdateGate => {
+            states.insert(
+                "init".to_owned(),
+                CompiledStateNode::Assign {
+                    actions: vec![Assignment {
+                        target: "update_ready".to_owned(),
+                        expr: Expression::Literal { value: Value::Bool(false) },
+                    }],
+                    next: "wait_update".to_owned(),
+                },
+            );
+            states.insert(
+                "wait_update".to_owned(),
+                CompiledStateNode::WaitForCondition {
+                    condition: Expression::Identifier { name: "update_ready".to_owned() },
+                    next: "dispatch".to_owned(),
+                    timeout_ref: None,
+                    timeout_next: None,
+                },
+            );
+            insert_dispatch_graph(&mut states, task_queue, args);
+            let mut artifact = CompiledWorkflowArtifact::new(
+                definition_id,
+                1,
+                "benchmark-runner",
+                ArtifactEntrypoint {
+                    module: "benchmark.ts".to_owned(),
+                    export: "workflow".to_owned(),
+                },
+                CompiledWorkflow {
+                    initial_state: "init".to_owned(),
+                    states,
+                    non_cancellable_states: Default::default(),
+                },
+            );
+            artifact.updates.insert(
+                "setValue".to_owned(),
+                fabrik_workflow::CompiledUpdateHandler {
+                    arg_name: Some("payload".to_owned()),
+                    initial_state: "mark_ready".to_owned(),
+                    states: BTreeMap::from([
+                        (
+                            "mark_ready".to_owned(),
+                            CompiledStateNode::Assign {
+                                actions: vec![Assignment {
+                                    target: "update_ready".to_owned(),
+                                    expr: Expression::Literal { value: Value::Bool(true) },
+                                }],
+                                next: "finish_update".to_owned(),
+                            },
+                        ),
+                        (
+                            "finish_update".to_owned(),
+                            CompiledStateNode::Succeed {
+                                output: Some(Expression::Identifier { name: "payload".to_owned() }),
+                            },
+                        ),
+                    ]),
+                },
+            );
+            artifact.artifact_hash = artifact.hash();
+            return artifact;
+        }
+        BenchmarkWorkloadKind::ContinueAsNew => {
+            states.insert(
+                "decide".to_owned(),
+                CompiledStateNode::Choice {
+                    condition: Expression::Binary {
+                        op: fabrik_workflow::BinaryOp::GreaterThan,
+                        left: Box::new(Expression::Member {
+                            object: Box::new(Expression::Identifier { name: "input".to_owned() }),
+                            property: "remaining".to_owned(),
+                        }),
+                        right: Box::new(Expression::Literal { value: json!(0) }),
+                    },
+                    then_next: "roll".to_owned(),
+                    else_next: "dispatch".to_owned(),
+                },
+            );
+            states.insert(
+                "roll".to_owned(),
+                CompiledStateNode::ContinueAsNew {
+                    input: Some(Expression::Object {
+                        fields: BTreeMap::from([
+                            (
+                                "remaining".to_owned(),
+                                Expression::Binary {
+                                    op: fabrik_workflow::BinaryOp::Subtract,
+                                    left: Box::new(Expression::Member {
+                                        object: Box::new(Expression::Identifier {
+                                            name: "input".to_owned(),
+                                        }),
+                                        property: "remaining".to_owned(),
+                                    }),
+                                    right: Box::new(Expression::Literal { value: json!(1) }),
+                                },
+                            ),
+                            (
+                                "items".to_owned(),
+                                Expression::Member {
+                                    object: Box::new(Expression::Identifier {
+                                        name: "input".to_owned(),
+                                    }),
+                                    property: "items".to_owned(),
+                                },
+                            ),
+                        ]),
+                    }),
+                },
+            );
+            insert_dispatch_graph(&mut states, task_queue, args);
+            "decide".to_owned()
+        }
+        BenchmarkWorkloadKind::ChildWorkflow => {
+            states.insert(
+                "start_child".to_owned(),
+                CompiledStateNode::StartChild {
+                    child_definition_id: child_definition_id(definition_id),
+                    input: Expression::Literal { value: json!({ "ok": true }) },
+                    next: "await_child".to_owned(),
+                    handle_var: Some("child".to_owned()),
+                    workflow_id: Some(Expression::Member {
+                        object: Box::new(Expression::Identifier { name: "input".to_owned() }),
+                        property: "child_instance_id".to_owned(),
+                    }),
+                    task_queue: None,
+                    parent_close_policy: fabrik_workflow::ParentClosePolicy::Terminate,
+                },
+            );
+            states.insert(
+                "await_child".to_owned(),
+                CompiledStateNode::WaitForChild {
+                    child_ref_var: "child".to_owned(),
+                    next: "dispatch".to_owned(),
+                    output_var: Some("child_result".to_owned()),
+                    on_error: Some(ErrorTransition {
+                        next: "fail".to_owned(),
+                        error_var: Some("error".to_owned()),
+                    }),
+                },
+            );
+            insert_dispatch_graph(&mut states, task_queue, args);
+            "start_child".to_owned()
+        }
+    };
+
+    CompiledWorkflowArtifact::new(
+        definition_id,
+        1,
+        "benchmark-runner",
+        ArtifactEntrypoint { module: "benchmark.ts".to_owned(), export: "workflow".to_owned() },
+        CompiledWorkflow { initial_state, states, non_cancellable_states: Default::default() },
+    )
+}
+
+fn benchmark_terminal_states() -> BTreeMap<String, CompiledStateNode> {
+    BTreeMap::from([
+        (
+            "done".to_owned(),
+            CompiledStateNode::Succeed {
+                output: Some(Expression::Identifier { name: "results".to_owned() }),
+            },
+        ),
+        (
+            "fail".to_owned(),
+            CompiledStateNode::Fail {
+                reason: Some(Expression::Identifier { name: "error".to_owned() }),
+            },
+        ),
+    ])
+}
+
+fn insert_dispatch_graph(
+    states: &mut BTreeMap<String, CompiledStateNode>,
+    task_queue: &str,
+    args: &Args,
+) {
+    let enable_retry = args.retry_rate > 0.0;
+    match args.execution_mode {
         ExecutionMode::Durable | ExecutionMode::Unified => {
             states.insert(
                 "dispatch".to_owned(),
@@ -594,7 +982,7 @@ fn benchmark_artifact(
                     task_queue: Some(Expression::Literal {
                         value: Value::String(task_queue.to_owned()),
                     }),
-                    reducer: Some(bulk_reducer.to_owned()),
+                    reducer: Some(args.bulk_reducer.clone()),
                     retry: enable_retry.then_some(RetryPolicy {
                         max_attempts: 2,
                         delay: "1s".to_owned(),
@@ -633,11 +1021,12 @@ fn benchmark_artifact(
                     task_queue: Some(Expression::Literal {
                         value: Value::String(task_queue.to_owned()),
                     }),
-                    execution_policy: (throughput_backend == Some(STREAM_V2_BACKEND))
-                        .then(|| "eager".to_owned()),
-                    reducer: Some(bulk_reducer.to_owned()),
-                    throughput_backend: throughput_backend.map(str::to_owned),
-                    chunk_size: Some(chunk_size),
+                    execution_policy: (args.throughput_backend.as_deref()
+                        == Some(STREAM_V2_BACKEND))
+                    .then(|| "eager".to_owned()),
+                    reducer: Some(args.bulk_reducer.clone()),
+                    throughput_backend: args.throughput_backend.clone(),
+                    chunk_size: Some(args.chunk_size),
                     retry: enable_retry.then_some(RetryPolicy {
                         max_attempts: 2,
                         delay: "1s".to_owned(),
@@ -659,56 +1048,68 @@ fn benchmark_artifact(
             );
         }
     }
-    states.insert(
-        "done".to_owned(),
-        CompiledStateNode::Succeed {
-            output: Some(Expression::Identifier { name: "results".to_owned() }),
-        },
-    );
-    states.insert(
-        "fail".to_owned(),
-        CompiledStateNode::Fail {
-            reason: Some(Expression::Identifier { name: "error".to_owned() }),
-        },
-    );
+}
 
+fn benchmark_child_artifact(definition_id: &str) -> CompiledWorkflowArtifact {
     CompiledWorkflowArtifact::new(
         definition_id,
         1,
         "benchmark-runner",
-        ArtifactEntrypoint { module: "benchmark.ts".to_owned(), export: "workflow".to_owned() },
-        CompiledWorkflow { initial_state: "dispatch".to_owned(), states },
+        ArtifactEntrypoint {
+            module: "benchmark-child.ts".to_owned(),
+            export: "workflow".to_owned(),
+        },
+        CompiledWorkflow {
+            initial_state: "done".to_owned(),
+            states: BTreeMap::from([(
+                "done".to_owned(),
+                CompiledStateNode::Succeed {
+                    output: Some(Expression::Literal { value: json!({ "ok": true }) }),
+                },
+            )]),
+            non_cancellable_states: Default::default(),
+        },
     )
 }
 
+fn child_definition_id(parent_definition_id: &str) -> String {
+    format!("{parent_definition_id}-child")
+}
+
 fn benchmark_input(
+    args: &Args,
     activities_per_workflow: usize,
     payload_size: usize,
     retry_rate: f64,
     cancel_rate: f64,
+    instance_id: &str,
 ) -> Value {
     let retry_count = ((activities_per_workflow as f64) * retry_rate).round() as usize;
     let cancel_count = ((activities_per_workflow as f64) * cancel_rate).round() as usize;
     let payload = "x".repeat(payload_size);
-    Value::Object(
-        [(
-            "items".to_owned(),
-            Value::Array(
-                (0..activities_per_workflow)
-                    .map(|index| {
-                        json!({
-                            "index": index,
-                            "payload": payload,
-                            "fail_until_attempt": if index < retry_count { 1 } else { 0 },
-                            "cancel": index >= retry_count && index < retry_count + cancel_count,
-                        })
+    let mut object = serde_json::Map::from_iter([(
+        "items".to_owned(),
+        Value::Array(
+            (0..activities_per_workflow)
+                .map(|index| {
+                    json!({
+                        "index": index,
+                        "payload": payload,
+                        "fail_until_attempt": if index < retry_count { 1 } else { 0 },
+                        "cancel": index >= retry_count && index < retry_count + cancel_count,
                     })
-                    .collect(),
-            ),
-        )]
-        .into_iter()
-        .collect(),
-    )
+                })
+                .collect(),
+        ),
+    )]);
+    if args.workload_kind == BenchmarkWorkloadKind::ContinueAsNew {
+        object.insert("remaining".to_owned(), json!(args.continue_rounds));
+    }
+    if args.workload_kind == BenchmarkWorkloadKind::ChildWorkflow {
+        object
+            .insert("child_instance_id".to_owned(), Value::String(format!("{instance_id}-child")));
+    }
+    Value::Object(object)
 }
 
 async fn apply_task_queue_throughput_policy(
@@ -862,7 +1263,12 @@ fn scenario_name(args: &Args) -> String {
 }
 
 fn benchmark_definition_id(args: &Args, scenario_name: &str) -> String {
-    format!("fanout-benchmark-{}-{}", args.profile_name, scenario_name)
+    format!(
+        "{}-benchmark-{}-{}",
+        args.workload_kind.definition_prefix(),
+        args.profile_name,
+        scenario_name
+    )
 }
 
 fn scenario_rate_suffix(label: &str, rate: f64) -> Option<String> {
@@ -931,11 +1337,86 @@ async fn trigger_workflow(
     Ok(())
 }
 
+async fn signal_workflow(
+    client: &Client,
+    ingest_base: &str,
+    tenant_id: &str,
+    instance_id: &str,
+) -> Result<()> {
+    let url = format!("{ingest_base}/tenants/{tenant_id}/workflows/{instance_id}/signals/approve");
+    retry_workflow_mutation(
+        client,
+        &url,
+        json!({
+            "payload": { "approved": true },
+            "request_id": format!("signal:{instance_id}"),
+        }),
+    )
+    .await
+    .with_context(|| format!("benchmark workflow signal failed for {instance_id}"))
+}
+
+async fn update_workflow(
+    client: &Client,
+    ingest_base: &str,
+    tenant_id: &str,
+    instance_id: &str,
+) -> Result<()> {
+    let url = format!("{ingest_base}/tenants/{tenant_id}/workflows/{instance_id}/updates/setValue");
+    retry_workflow_mutation(
+        client,
+        &url,
+        json!({
+            "payload": 1,
+            "request_id": format!("update:{instance_id}"),
+            "wait_for": "completed",
+            "timeout_ms": 5_000,
+        }),
+    )
+    .await
+    .with_context(|| format!("benchmark workflow update failed for {instance_id}"))
+}
+
+async fn retry_workflow_mutation(client: &Client, url: &str, body: Value) -> Result<()> {
+    let mut last_status = None;
+    let mut last_error = None;
+    for _attempt in 0..100 {
+        match client.post(url).json(&body).send().await {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response)
+                if response.status() == reqwest::StatusCode::NOT_FOUND
+                    || response.status() == reqwest::StatusCode::CONFLICT =>
+            {
+                last_status = Some(response.status());
+            }
+            Ok(response) => {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                bail!("request returned {status}: {body}");
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    if let Some(error) = last_error {
+        return Err(error).context("mutation request did not succeed before retry deadline");
+    }
+    if let Some(status) = last_status {
+        bail!("mutation request remained at retryable status {status}");
+    }
+    bail!("mutation request exhausted retries without a response")
+}
+
 async fn workflow_outcomes(
     pool: &PgPool,
     tenant_id: &str,
     instance_prefix: &str,
+    workload_kind: BenchmarkWorkloadKind,
 ) -> Result<WorkflowOutcomeMetrics> {
+    let excluded_child_pattern = instance_exclusion_pattern(workload_kind, instance_prefix);
     let row = sqlx::query_as::<_, WorkflowOutcomeRow>(
         r#"
         SELECT
@@ -944,11 +1425,14 @@ async fn workflow_outcomes(
             COUNT(*) FILTER (WHERE state->>'status' = 'cancelled') AS cancelled,
             COUNT(*) FILTER (WHERE state->>'status' NOT IN ('completed', 'failed', 'cancelled', 'terminated')) AS running
         FROM workflow_instances
-        WHERE tenant_id = $1 AND workflow_instance_id LIKE $2
+        WHERE tenant_id = $1
+          AND workflow_instance_id LIKE $2
+          AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
         "#,
     )
     .bind(tenant_id)
     .bind(format!("{instance_prefix}%"))
+    .bind(excluded_child_pattern)
     .fetch_one(pool)
     .await
     .context("failed to query workflow outcomes")?;
@@ -965,11 +1449,13 @@ async fn wait_for_stream_projection_convergence(
     pool: &PgPool,
     tenant_id: &str,
     instance_prefix: &str,
+    workload_kind: BenchmarkWorkloadKind,
     expected_batches: u64,
     expected_items: u64,
     timeout: Duration,
 ) -> Result<()> {
     let started = Instant::now();
+    let excluded_child_pattern = instance_exclusion_pattern(workload_kind, instance_prefix);
     loop {
         let row = sqlx::query_as::<_, StreamProjectionConvergenceRow>(
             r#"
@@ -977,46 +1463,55 @@ async fn wait_for_stream_projection_convergence(
                 (SELECT COUNT(*)::bigint
                  FROM throughput_projection_batches
                  WHERE tenant_id = $1
-                   AND workflow_instance_id LIKE $2) AS projection_batch_rows,
+                   AND workflow_instance_id LIKE $2
+                   AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)) AS projection_batch_rows,
                 (SELECT COUNT(*) FILTER (WHERE status IN ('completed', 'failed', 'cancelled'))::bigint
                  FROM throughput_projection_batches
                  WHERE tenant_id = $1
-                   AND workflow_instance_id LIKE $2) AS terminal_batch_rows,
+                   AND workflow_instance_id LIKE $2
+                   AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)) AS terminal_batch_rows,
                 (SELECT COALESCE(SUM(succeeded_items + failed_items + cancelled_items), 0)::bigint
                  FROM throughput_projection_batches
                  WHERE tenant_id = $1
                    AND workflow_instance_id LIKE $2
+                   AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
                    AND status IN ('completed', 'failed', 'cancelled')) AS batch_accounted_items,
                 (SELECT COALESCE(SUM(item_count), 0)::bigint
                  FROM throughput_projection_chunks
                  WHERE tenant_id = $1
                    AND workflow_instance_id LIKE $2
+                   AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
                    AND status = 'completed') AS completed_items,
                 (SELECT COALESCE(SUM(item_count), 0)::bigint
                  FROM throughput_projection_chunks
                  WHERE tenant_id = $1
                    AND workflow_instance_id LIKE $2
+                   AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
                    AND status = 'failed') AS failed_items,
                 (SELECT COALESCE(SUM(item_count), 0)::bigint
                  FROM throughput_projection_chunks
                  WHERE tenant_id = $1
                    AND workflow_instance_id LIKE $2
+                   AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
                    AND status = 'cancelled') AS cancelled_items,
                 (SELECT COUNT(*) FILTER (WHERE status IN ('completed', 'failed', 'cancelled'))::bigint
                  FROM throughput_projection_chunks
                  WHERE tenant_id = $1
-                   AND workflow_instance_id LIKE $2) AS terminal_chunk_rows,
+                   AND workflow_instance_id LIKE $2
+                   AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)) AS terminal_chunk_rows,
                 (
                     SELECT COUNT(*)::bigint
                     FROM throughput_projection_chunks
                     WHERE tenant_id = $1
                       AND workflow_instance_id LIKE $2
+                      AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
                       AND status = 'scheduled'
                 ) AS pending_chunks
             "#,
         )
         .bind(tenant_id)
         .bind(format!("{instance_prefix}%"))
+        .bind(excluded_child_pattern.clone())
         .fetch_one(pool)
         .await
         .context("failed to query stream-v2 projection convergence")?;
@@ -1053,11 +1548,13 @@ async fn activity_metrics(
     pool: &PgPool,
     tenant_id: &str,
     instance_prefix: &str,
+    workload_kind: BenchmarkWorkloadKind,
     duration_ms: u128,
     total_activities: usize,
     execution_mode: ExecutionMode,
     throughput_backend: Option<&str>,
 ) -> Result<ActivityMetrics> {
+    let excluded_child_pattern = instance_exclusion_pattern(workload_kind, instance_prefix);
     if execution_mode == ExecutionMode::Throughput {
         let row = if throughput_backend == Some(STREAM_V2_BACKEND) {
             sqlx::query_as::<_, (i64, i64, i64)>(
@@ -1069,10 +1566,12 @@ async fn activity_metrics(
                 FROM throughput_projection_chunks
                 WHERE tenant_id = $1
                   AND workflow_instance_id LIKE $2
+                  AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
                 "#,
             )
             .bind(tenant_id)
             .bind(format!("{instance_prefix}%"))
+            .bind(excluded_child_pattern.clone())
             .fetch_one(pool)
             .await
             .context("failed to query stream-v2 activity metrics")?
@@ -1084,11 +1583,14 @@ async fn activity_metrics(
                     COALESCE(SUM(failed_items), 0) AS failed,
                     COALESCE(SUM(cancelled_items), 0) AS cancelled
                 FROM workflow_bulk_batches
-                WHERE tenant_id = $1 AND workflow_instance_id LIKE $2
+                WHERE tenant_id = $1
+                  AND workflow_instance_id LIKE $2
+                  AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
                 "#,
             )
             .bind(tenant_id)
             .bind(format!("{instance_prefix}%"))
+            .bind(excluded_child_pattern.clone())
             .fetch_one(pool)
             .await
             .context("failed to query pg-v1 bulk activity metrics")?
@@ -1127,11 +1629,14 @@ async fn activity_metrics(
             MAX((EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)::double precision)
                 FILTER (WHERE completed_at IS NOT NULL AND started_at IS NOT NULL) AS max_start_to_close_latency_ms
         FROM workflow_activities
-        WHERE tenant_id = $1 AND workflow_instance_id LIKE $2
+        WHERE tenant_id = $1
+          AND workflow_instance_id LIKE $2
+          AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
         "#,
     )
     .bind(tenant_id)
     .bind(format!("{instance_prefix}%"))
+    .bind(excluded_child_pattern)
     .fetch_one(pool)
     .await
     .context("failed to query activity metrics")?;
@@ -1159,33 +1664,49 @@ async fn bulk_metrics(
     pool: &PgPool,
     tenant_id: &str,
     instance_prefix: &str,
+    workload_kind: BenchmarkWorkloadKind,
 ) -> Result<(u64, u64, u64, u64, u64, u64)> {
+    let excluded_child_pattern = instance_exclusion_pattern(workload_kind, instance_prefix);
     let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64)>(
         r#"
         SELECT
             (SELECT COUNT(*)
              FROM workflow_bulk_batches
-             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2) AS batch_rows,
+             WHERE tenant_id = $1
+               AND workflow_instance_id LIKE $2
+               AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)) AS batch_rows,
             (SELECT COUNT(*)
              FROM workflow_bulk_chunks
-             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2) AS chunk_rows,
+             WHERE tenant_id = $1
+               AND workflow_instance_id LIKE $2
+               AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)) AS chunk_rows,
             (SELECT COUNT(*)
              FROM throughput_projection_batches
-             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2) AS projection_batch_rows,
+             WHERE tenant_id = $1
+               AND workflow_instance_id LIKE $2
+               AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)) AS projection_batch_rows,
             (SELECT COUNT(*)
              FROM throughput_projection_chunks
-             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2) AS projection_chunk_rows,
+             WHERE tenant_id = $1
+               AND workflow_instance_id LIKE $2
+               AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)) AS projection_chunk_rows,
             (SELECT COALESCE(MAX(aggregation_group_count), 0)
              FROM throughput_projection_batches
-             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2)::bigint AS max_group_count,
+             WHERE tenant_id = $1
+               AND workflow_instance_id LIKE $2
+               AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3))::bigint AS max_group_count,
             (SELECT COUNT(*)
              FROM throughput_projection_batches
-             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2 AND aggregation_group_count > 1)
+             WHERE tenant_id = $1
+               AND workflow_instance_id LIKE $2
+               AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
+               AND aggregation_group_count > 1)
              AS grouped_batch_rows
         "#,
     )
     .bind(tenant_id)
     .bind(format!("{instance_prefix}%"))
+    .bind(excluded_child_pattern)
     .fetch_one(pool)
     .await
     .context("failed to query bulk benchmark metrics")?;
@@ -1196,20 +1717,27 @@ async fn coalescing_metrics(
     pool: &PgPool,
     tenant_id: &str,
     instance_prefix: &str,
+    workload_kind: BenchmarkWorkloadKind,
 ) -> Result<CoalescingMetrics> {
+    let excluded_child_pattern = instance_exclusion_pattern(workload_kind, instance_prefix);
     let row = sqlx::query_as::<_, CoalescingRow>(
         r#"
         SELECT
             (SELECT COUNT(*)
              FROM workflow_tasks
-             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2) AS workflow_task_rows,
+             WHERE tenant_id = $1
+               AND workflow_instance_id LIKE $2
+               AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)) AS workflow_task_rows,
             (SELECT COUNT(*)
              FROM workflow_resumes
-             WHERE tenant_id = $1 AND workflow_instance_id LIKE $2) AS resume_rows
+             WHERE tenant_id = $1
+               AND workflow_instance_id LIKE $2
+               AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)) AS resume_rows
         "#,
     )
     .bind(tenant_id)
     .bind(format!("{instance_prefix}%"))
+    .bind(excluded_child_pattern)
     .fetch_one(pool)
     .await
     .context("failed to query coalescing metrics")?;
@@ -1231,21 +1759,25 @@ async fn backlog_snapshot(
     pool: &PgPool,
     tenant_id: &str,
     instance_prefix: &str,
+    workload_kind: BenchmarkWorkloadKind,
     execution_mode: ExecutionMode,
     throughput_backend: Option<&str>,
 ) -> Result<(u64, u64)> {
+    let excluded_child_pattern = instance_exclusion_pattern(workload_kind, instance_prefix);
     let workflow_backlog = sqlx::query_scalar::<_, i64>(
         r#"
         SELECT COUNT(*)
         FROM workflow_tasks
         WHERE tenant_id = $1
           AND workflow_instance_id LIKE $2
+          AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
           AND status = 'pending'
           AND (mailbox_backlog > 0 OR resume_backlog > 0)
         "#,
     )
     .bind(tenant_id)
     .bind(format!("{instance_prefix}%"))
+    .bind(excluded_child_pattern.clone())
     .fetch_one(pool)
     .await
     .context("failed to query workflow backlog")?;
@@ -1267,15 +1799,17 @@ async fn backlog_snapshot(
                    ON batches.tenant_id = chunks.tenant_id
                   AND batches.workflow_instance_id = chunks.workflow_instance_id
                   AND batches.run_id = chunks.run_id
-                  AND batches.batch_id = chunks.batch_id
+                 AND batches.batch_id = chunks.batch_id
                  WHERE chunks.tenant_id = $1
                    AND chunks.workflow_instance_id LIKE $2
+                   AND ($3::text IS NULL OR chunks.workflow_instance_id NOT LIKE $3)
                    AND chunks.status = 'scheduled'
                    AND batches.status IN ('scheduled', 'running'))
             "#,
         )
         .bind(tenant_id)
         .bind(format!("{instance_prefix}%"))
+        .bind(excluded_child_pattern.clone())
         .fetch_one(pool)
         .await
         .context("failed to query stream-v2 activity backlog")?
@@ -1295,20 +1829,30 @@ async fn backlog_snapshot(
                    ON batches.tenant_id = chunks.tenant_id
                   AND batches.workflow_instance_id = chunks.workflow_instance_id
                   AND batches.run_id = chunks.run_id
-                  AND batches.batch_id = chunks.batch_id
+                 AND batches.batch_id = chunks.batch_id
                  WHERE chunks.tenant_id = $1
                    AND chunks.workflow_instance_id LIKE $2
+                   AND ($3::text IS NULL OR chunks.workflow_instance_id NOT LIKE $3)
                    AND chunks.status = 'scheduled'
                    AND batches.status IN ('scheduled', 'running'))
             "#,
         )
         .bind(tenant_id)
         .bind(format!("{instance_prefix}%"))
+        .bind(excluded_child_pattern)
         .fetch_one(pool)
         .await
         .context("failed to query activity backlog")?
     };
     Ok((workflow_backlog as u64, activity_backlog as u64))
+}
+
+fn instance_exclusion_pattern(
+    workload_kind: BenchmarkWorkloadKind,
+    instance_prefix: &str,
+) -> Option<String> {
+    (workload_kind == BenchmarkWorkloadKind::ChildWorkflow)
+        .then(|| format!("{instance_prefix}%-child"))
 }
 
 fn control_plane_metrics(
@@ -1347,6 +1891,56 @@ fn control_plane_metrics(
         changelog_entries_published,
         manifest_writes,
     })
+}
+
+fn executor_debug_delta_metrics(
+    executor_debug_delta: Option<&Value>,
+    activity_metrics: &ActivityMetrics,
+) -> Option<ExecutorDebugDeltaMetrics> {
+    let debug = executor_debug_delta?;
+    let runtime = debug.get("runtime")?;
+    let completed_activities =
+        activity_metrics.completed + activity_metrics.failed + activity_metrics.cancelled;
+    let leased_tasks = json_u64(runtime, "leased_tasks");
+    let poll_requests = json_u64(runtime, "poll_requests");
+    let report_rpcs_received = json_u64(runtime, "report_rpcs_received");
+    let report_batches_applied = json_u64(runtime, "report_batches_applied");
+
+    Some(ExecutorDebugDeltaMetrics {
+        polls_per_leased_task: ratio(poll_requests, leased_tasks),
+        report_rpcs_per_completed_activity: ratio(report_rpcs_received, completed_activities),
+        report_batches_per_completed_activity: ratio(report_batches_applied, completed_activities),
+        log_writes: json_u64(runtime, "log_writes"),
+        snapshot_writes: json_u64(runtime, "snapshot_writes"),
+    })
+}
+
+fn json_numeric_delta(before: &Value, after: &Value) -> Value {
+    match (before, after) {
+        (Value::Object(before), Value::Object(after)) => {
+            let mut merged = serde_json::Map::new();
+            for key in before.keys().chain(after.keys()) {
+                if merged.contains_key(key) {
+                    continue;
+                }
+                let before_value = before.get(key).unwrap_or(&Value::Null);
+                let after_value = after.get(key).unwrap_or(&Value::Null);
+                let delta = json_numeric_delta(before_value, after_value);
+                if !delta.is_null() {
+                    merged.insert(key.clone(), delta);
+                }
+            }
+            Value::Object(merged)
+        }
+        _ => {
+            let before = before.as_i64().or_else(|| before.as_u64().map(|value| value as i64));
+            let after = after.as_i64().or_else(|| after.as_u64().map(|value| value as i64));
+            match (before, after) {
+                (Some(before), Some(after)) => Value::from(after - before),
+                _ => Value::Null,
+            }
+        }
+    }
 }
 
 fn json_u64(value: &Value, key: &str) -> u64 {
@@ -1391,8 +1985,18 @@ fn summary_text(report: &BenchmarkReport) -> String {
             metrics.manifest_writes,
         )
     }).unwrap_or_default();
+    let executor_debug_delta = report.executor_debug_delta_metrics.as_ref().map(|metrics| {
+        format!(
+            "polls_per_leased_task={:.4}\nreport_rpcs_per_completed_activity={:.4}\nreport_batches_per_completed_activity={:.4}\nlog_writes={}\nsnapshot_writes={}\n",
+            metrics.polls_per_leased_task,
+            metrics.report_rpcs_per_completed_activity,
+            metrics.report_batches_per_completed_activity,
+            metrics.log_writes,
+            metrics.snapshot_writes,
+        )
+    }).unwrap_or_default();
     format!(
-        "scenario={scenario}\nprofile={profile}\nexecution_mode={execution_mode}\nthroughput_backend={throughput_backend}\nbulk_reducer={bulk_reducer}\nretry_rate={retry_rate}\ncancel_rate={cancel_rate}\nchunk_size={chunk_size}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nexecution_duration_ms={execution_duration_ms}\nprojection_convergence_duration_ms={projection_convergence_duration_ms}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nprojection_batch_rows={projection_batch_rows}\nprojection_chunk_rows={projection_chunk_rows}\nmax_aggregation_group_count={max_aggregation_group_count}\ngrouped_batch_rows={grouped_batch_rows}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n{control_plane}",
+        "scenario={scenario}\nprofile={profile}\nexecution_mode={execution_mode}\nthroughput_backend={throughput_backend}\nbulk_reducer={bulk_reducer}\nretry_rate={retry_rate}\ncancel_rate={cancel_rate}\nchunk_size={chunk_size}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nexecution_duration_ms={execution_duration_ms}\nprojection_convergence_duration_ms={projection_convergence_duration_ms}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nprojection_batch_rows={projection_batch_rows}\nprojection_chunk_rows={projection_chunk_rows}\nmax_aggregation_group_count={max_aggregation_group_count}\ngrouped_batch_rows={grouped_batch_rows}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n{control_plane}{executor_debug_delta}",
         scenario = report.scenario,
         profile = report.profile,
         execution_mode = match report.execution_mode {
@@ -1430,6 +2034,7 @@ fn summary_text(report: &BenchmarkReport) -> String {
         avg_schedule = report.activity_metrics.avg_schedule_to_start_latency_ms,
         avg_close = report.activity_metrics.avg_start_to_close_latency_ms,
         control_plane = control_plane,
+        executor_debug_delta = executor_debug_delta,
     )
 }
 
@@ -1451,8 +2056,11 @@ mod tests {
             task_queue: "default".to_owned(),
             execution_mode: ExecutionMode::Throughput,
             throughput_backend: Some(STREAM_V2_BACKEND.to_owned()),
+            workload_kind: BenchmarkWorkloadKind::Fanout,
             bulk_reducer: "collect_results".to_owned(),
             chunk_size: 100,
+            timer_secs: 1,
+            continue_rounds: 1,
             timeout: Duration::from_secs(30),
         }
     }
@@ -1498,15 +2106,8 @@ mod tests {
 
         assert_eq!(scenario_name(&durable), "durable-all-settled");
 
-        let artifact = benchmark_artifact(
-            "fanout-benchmark-target-durable-all-settled",
-            "default",
-            false,
-            ExecutionMode::Durable,
-            &durable.bulk_reducer,
-            None,
-            100,
-        );
+        let artifact =
+            benchmark_artifact("fanout-benchmark-target-durable-all-settled", "default", &durable);
         match artifact.workflow.states.get("dispatch") {
             Some(CompiledStateNode::FanOut { reducer, .. }) => {
                 assert_eq!(reducer.as_deref(), Some("all_settled"));
@@ -1516,24 +2117,37 @@ mod tests {
     }
 
     #[test]
+    fn signal_gate_artifact_waits_for_signal_before_dispatch() {
+        let mut args = Args {
+            execution_mode: ExecutionMode::Durable,
+            throughput_backend: None,
+            ..demo_args()
+        };
+        args.workload_kind = BenchmarkWorkloadKind::SignalGate;
+
+        let artifact = benchmark_artifact("signal-gate-benchmark", "default", &args);
+        assert!(matches!(
+            artifact.workflow.states.get("wait_signal"),
+            Some(CompiledStateNode::WaitForCondition { .. })
+        ));
+        assert!(artifact.signals.contains_key("approve"));
+    }
+
+    #[test]
     fn throughput_artifact_uses_backend_specific_execution_policy() {
-        let pg_artifact = benchmark_artifact(
-            "fanout-benchmark-target-throughput-pg-v1",
-            "default",
-            false,
-            ExecutionMode::Throughput,
-            "collect_results",
-            Some(PG_V1_BACKEND),
-            100,
-        );
+        let mut pg_args = demo_args();
+        pg_args.execution_mode = ExecutionMode::Throughput;
+        pg_args.throughput_backend = Some(PG_V1_BACKEND.to_owned());
+        let pg_artifact =
+            benchmark_artifact("fanout-benchmark-target-throughput-pg-v1", "default", &pg_args);
+
+        let mut stream_args = demo_args();
+        stream_args.execution_mode = ExecutionMode::Throughput;
+        stream_args.throughput_backend = Some(STREAM_V2_BACKEND.to_owned());
         let stream_artifact = benchmark_artifact(
             "fanout-benchmark-target-throughput-stream-v2",
             "default",
-            false,
-            ExecutionMode::Throughput,
-            "collect_results",
-            Some(STREAM_V2_BACKEND),
-            100,
+            &stream_args,
         );
 
         let pg_dispatch = pg_artifact.workflow.states.get("dispatch").expect("pg dispatch state");
@@ -1582,5 +2196,101 @@ mod tests {
         assert!(scenarios[0].profile.activities_per_workflow >= 2_000);
         assert!(scenarios[1].retry_rate >= 0.01);
         assert!(scenarios[1].cancel_rate >= 0.01);
+    }
+
+    #[test]
+    fn child_workflow_scope_excludes_child_instances_from_parent_metrics() {
+        assert_eq!(
+            instance_exclusion_pattern(
+                BenchmarkWorkloadKind::ChildWorkflow,
+                "fanout-smoke-unified-1234"
+            ),
+            Some("fanout-smoke-unified-1234%-child".to_owned())
+        );
+        assert_eq!(
+            instance_exclusion_pattern(BenchmarkWorkloadKind::Fanout, "fanout-smoke-unified-1234"),
+            None
+        );
+    }
+
+    #[test]
+    fn json_numeric_delta_recurses_over_nested_numeric_objects() {
+        let before = json!({
+            "runtime": {
+                "poll_requests": 10,
+                "leased_tasks": 5,
+                "label": "ignored"
+            }
+        });
+        let after = json!({
+            "runtime": {
+                "poll_requests": 16,
+                "leased_tasks": 9,
+                "label": "ignored"
+            }
+        });
+
+        let delta = json_numeric_delta(&before, &after);
+        assert_eq!(delta["runtime"]["poll_requests"], json!(6));
+        assert_eq!(delta["runtime"]["leased_tasks"], json!(4));
+        assert!(delta["runtime"].get("label").is_none());
+    }
+
+    #[test]
+    fn unified_executor_debug_delta_metrics_are_derived_from_delta_snapshot() {
+        let delta = json!({
+            "runtime": {
+                "poll_requests": 12,
+                "leased_tasks": 24,
+                "report_rpcs_received": 8,
+                "report_batches_applied": 4,
+                "log_writes": 3,
+                "snapshot_writes": 1
+            }
+        });
+        let activity_metrics = ActivityMetrics {
+            completed: 20,
+            failed: 2,
+            cancelled: 2,
+            timed_out: 0,
+            avg_schedule_to_start_latency_ms: 0.0,
+            max_schedule_to_start_latency_ms: 0,
+            avg_start_to_close_latency_ms: 0.0,
+            max_start_to_close_latency_ms: 0,
+            throughput_activities_per_second: 0.0,
+        };
+
+        let metrics =
+            executor_debug_delta_metrics(Some(&delta), &activity_metrics).expect("delta metrics");
+
+        assert_eq!(metrics.polls_per_leased_task, 0.5);
+        assert_eq!(metrics.report_rpcs_per_completed_activity, 8.0 / 24.0);
+        assert_eq!(metrics.report_batches_per_completed_activity, 4.0 / 24.0);
+        assert_eq!(metrics.log_writes, 3);
+        assert_eq!(metrics.snapshot_writes, 1);
+    }
+
+    #[test]
+    fn unified_defaults_collect_results_to_all_settled() {
+        let reducer = normalize_bulk_reducer_for_execution_mode(
+            ExecutionMode::Unified,
+            "collect_results".to_owned(),
+            false,
+        )
+        .expect("normalized reducer");
+
+        assert_eq!(reducer, "all_settled");
+    }
+
+    #[test]
+    fn unified_rejects_unsupported_reducers() {
+        let error = normalize_bulk_reducer_for_execution_mode(
+            ExecutionMode::Unified,
+            "collect_results".to_owned(),
+            true,
+        )
+        .expect_err("unsupported reducer should fail");
+
+        assert!(error.to_string().contains("all_settled or count"));
     }
 }

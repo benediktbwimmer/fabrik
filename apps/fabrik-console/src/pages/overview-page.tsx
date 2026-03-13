@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 
-import { ConsistencyBadge, Panel } from "../components/ui";
+import { Badge, ConsistencyBadge, Panel } from "../components/ui";
 import { api } from "../lib/api";
 import { formatDate, formatNumber } from "../lib/format";
 import { useTenant } from "../lib/tenant-context";
@@ -69,6 +69,7 @@ export function OverviewPage() {
               <tr>
                 <th>Workflow</th>
                 <th>Status</th>
+                <th>Routing</th>
                 <th>Queue</th>
                 <th>Updated</th>
                 <th />
@@ -81,8 +82,11 @@ export function OverviewPage() {
                     <strong>{item.definition_id}</strong>
                     <div className="muted">{item.instance_id}</div>
                   </td>
-                  <td>{item.status}</td>
-                  <td>{item.workflow_task_queue}</td>
+                <td>{item.status}</td>
+                <td>
+                  <Badge value={item.routing_status} />
+                </td>
+                <td>{item.workflow_task_queue}</td>
                   <td>{formatDate(item.updated_at)}</td>
                   <td>
                     <Link className="button ghost" to={`/runs/${item.instance_id}/${item.run_id}`}>

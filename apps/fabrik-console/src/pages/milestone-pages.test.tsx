@@ -8,6 +8,330 @@ import { AppProviders } from "../providers";
 
 const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
   const url = String(input);
+  if (url.includes("/tenants/tenant-a/workflow-definitions/payments/graph")) {
+    return new Response(
+      JSON.stringify({
+        tenant_id: "tenant-a",
+        definition_id: "payments",
+        definition_version: 2,
+        artifact_hash: "artifact-b",
+        entrypoint_module: "workflows/payments.ts",
+        entrypoint_export: "workflow",
+        consistency: "eventual",
+        authoritative_source: "artifact+projection",
+        source_files: ["workflows/payments.ts"],
+        nodes: [
+          {
+            id: "workflow:entry",
+            graph: "workflow",
+            module_id: "module:workflow:entry",
+            state_id: null,
+            kind: "entry",
+            label: "Entry",
+            subtitle: "workflows/payments.ts::workflow",
+            source_anchor: null,
+            next_ids: ["workflow:charge-card"],
+            raw: {}
+          },
+          {
+            id: "workflow:charge-card",
+            graph: "workflow",
+            module_id: "module:workflow:charge-card",
+            state_id: "charge-card",
+            kind: "step",
+            label: "charge-card",
+            subtitle: "payments.charge",
+            source_anchor: { file: "workflows/payments.ts", line: 12, column: 2 },
+            next_ids: ["workflow:wait-payment"],
+            raw: {}
+          },
+          {
+            id: "workflow:wait-payment",
+            graph: "workflow",
+            module_id: "module:workflow:wait-payment",
+            state_id: "wait-payment",
+            kind: "wait_for_event",
+            label: "wait-payment",
+            subtitle: "wait signal · payment-approved",
+            source_anchor: { file: "workflows/payments.ts", line: 18, column: 2 },
+            next_ids: [],
+            raw: {}
+          },
+          {
+            id: "signal:payment-approved:accepted",
+            graph: "signal_handler",
+            module_id: "module:signal:payment-approved",
+            state_id: "accepted",
+            kind: "succeed",
+            label: "accepted",
+            subtitle: "success",
+            source_anchor: null,
+            next_ids: [],
+            raw: {}
+          }
+        ],
+        edges: [
+          { id: "workflow:entry->workflow:charge-card", source: "workflow:entry", target: "workflow:charge-card", label: "starts", kind: "entry" },
+          { id: "workflow:charge-card->workflow:wait-payment", source: "workflow:charge-card", target: "workflow:wait-payment", label: "success", kind: "transition" },
+          { id: "system:handlers->signal:payment-approved:accepted", source: "system:handlers", target: "signal:payment-approved:accepted", label: "signal payment-approved", kind: "handler" }
+        ],
+        modules: [
+          {
+            id: "module:workflow:entry",
+            graph: "workflow",
+            kind: "entry",
+            label: "Entry",
+            subtitle: "workflows/payments.ts::workflow",
+            node_ids: ["workflow:entry"],
+            state_ids: [],
+            focus_node_id: "workflow:entry",
+            collapsed_by_default: false,
+            source_anchor: null,
+            raw: {}
+          },
+          {
+            id: "module:workflow:charge-card",
+            graph: "workflow",
+            kind: "activity_step",
+            label: "charge-card",
+            subtitle: "payments.charge",
+            node_ids: ["workflow:charge-card"],
+            state_ids: ["charge-card"],
+            focus_node_id: "workflow:charge-card",
+            collapsed_by_default: false,
+            source_anchor: { file: "workflows/payments.ts", line: 12, column: 2 },
+            raw: {}
+          },
+          {
+            id: "module:workflow:wait-payment",
+            graph: "workflow",
+            kind: "wait",
+            label: "wait-payment",
+            subtitle: "wait signal · payment-approved",
+            node_ids: ["workflow:wait-payment"],
+            state_ids: ["wait-payment"],
+            focus_node_id: "workflow:wait-payment",
+            collapsed_by_default: false,
+            source_anchor: { file: "workflows/payments.ts", line: 18, column: 2 },
+            raw: {}
+          },
+          {
+            id: "module:signal:payment-approved",
+            graph: "signal_handler",
+            kind: "signal_handler",
+            label: "payment-approved",
+            subtitle: "signal handler",
+            node_ids: ["signal:payment-approved:accepted"],
+            state_ids: ["accepted"],
+            focus_node_id: "signal:payment-approved:accepted",
+            collapsed_by_default: true,
+            source_anchor: { file: "workflows/payments.ts", line: 22, column: 4 },
+            raw: {}
+          }
+        ],
+        module_edges: [
+          { id: "module:workflow:entry->module:workflow:charge-card", source: "module:workflow:entry", target: "module:workflow:charge-card", label: "starts", kind: "entry" },
+          { id: "module:workflow:charge-card->module:workflow:wait-payment", source: "module:workflow:charge-card", target: "module:workflow:wait-payment", label: "success", kind: "transition" }
+        ],
+        overlay: {
+          mode: "artifact",
+          run_id: null,
+          current_node_id: null,
+          current_module_id: null,
+          blocked_by: null,
+          node_statuses: [],
+          module_statuses: [],
+          trace: [],
+          activity_summaries: [],
+          bulk_summaries: [],
+          signal_summaries: [],
+          update_summaries: [],
+          child_summaries: []
+        }
+      }),
+      { status: 200 }
+    );
+  }
+  if (url.includes("/tenants/tenant-a/workflows/instance-1/runs/") && url.includes("/graph")) {
+    return new Response(
+      JSON.stringify({
+        tenant_id: "tenant-a",
+        definition_id: "payments",
+        definition_version: 2,
+        artifact_hash: "artifact-b",
+        entrypoint_module: "workflows/payments.ts",
+        entrypoint_export: "workflow",
+        consistency: "eventual",
+        authoritative_source: "artifact+projection",
+        source_files: ["workflows/payments.ts"],
+        nodes: [
+          {
+            id: "workflow:charge-card",
+            graph: "workflow",
+            module_id: "module:workflow:charge-card",
+            state_id: "charge-card",
+            kind: "step",
+            label: "charge-card",
+            subtitle: "payments.charge",
+            source_anchor: { file: "workflows/payments.ts", line: 12, column: 2 },
+            next_ids: ["workflow:wait-payment"],
+            raw: {}
+          },
+          {
+            id: "workflow:wait-payment",
+            graph: "workflow",
+            module_id: "module:workflow:wait-payment",
+            state_id: "wait-payment",
+            kind: "wait_for_event",
+            label: "wait-payment",
+            subtitle: "wait signal · payment-approved",
+            source_anchor: { file: "workflows/payments.ts", line: 18, column: 2 },
+            next_ids: [],
+            raw: {}
+          }
+        ],
+        edges: [{ id: "workflow:charge-card->workflow:wait-payment", source: "workflow:charge-card", target: "workflow:wait-payment", label: "success", kind: "transition" }],
+        modules: [
+          {
+            id: "module:workflow:charge-card",
+            graph: "workflow",
+            kind: "activity_step",
+            label: "charge-card",
+            subtitle: "payments.charge",
+            node_ids: ["workflow:charge-card"],
+            state_ids: ["charge-card"],
+            focus_node_id: "workflow:charge-card",
+            collapsed_by_default: false,
+            source_anchor: { file: "workflows/payments.ts", line: 12, column: 2 },
+            raw: {}
+          },
+          {
+            id: "module:workflow:wait-payment",
+            graph: "workflow",
+            kind: "wait",
+            label: "wait-payment",
+            subtitle: "wait signal · payment-approved",
+            node_ids: ["workflow:wait-payment"],
+            state_ids: ["wait-payment"],
+            focus_node_id: "workflow:wait-payment",
+            collapsed_by_default: false,
+            source_anchor: { file: "workflows/payments.ts", line: 18, column: 2 },
+            raw: {}
+          }
+        ],
+        module_edges: [{ id: "module:workflow:charge-card->module:workflow:wait-payment", source: "module:workflow:charge-card", target: "module:workflow:wait-payment", label: "success", kind: "transition" }],
+        overlay: {
+          mode: "run",
+          run_id: "run-2",
+          current_node_id: "workflow:wait-payment",
+          current_module_id: "module:workflow:wait-payment",
+          blocked_by: {
+            kind: "signal",
+            label: "payment-approved",
+            detail: "1 queued/consumed signals",
+            node_id: "workflow:wait-payment",
+            module_id: "module:workflow:wait-payment"
+          },
+          node_statuses: [
+            { id: "workflow:charge-card", status: "failed", summary: "1 failed activity attempts" },
+            { id: "workflow:wait-payment", status: "current", summary: "Current wait point" }
+          ],
+          module_statuses: [
+            { id: "module:workflow:charge-card", status: "failed", summary: "1 failed activity attempts" },
+            { id: "module:workflow:wait-payment", status: "current", summary: "Current wait point" }
+          ],
+          trace: [
+            {
+              id: "trace-1",
+              occurred_at: "2026-03-13T09:01:00Z",
+              lane: "activities",
+              label: "ActivityTaskScheduled",
+              detail: "payments.charge attempt 2",
+              event_type: "ActivityTaskScheduled",
+              node_id: "workflow:charge-card",
+              module_id: "module:workflow:charge-card"
+            },
+            {
+              id: "trace-2",
+              occurred_at: "2026-03-13T09:03:00Z",
+              lane: "messages",
+              label: "SignalQueued",
+              detail: "payment-approved",
+              event_type: "SignalQueued",
+              node_id: "workflow:wait-payment",
+              module_id: "module:workflow:wait-payment"
+            }
+          ],
+          activity_summaries: [
+            {
+              node_id: "workflow:charge-card",
+              module_id: "module:workflow:charge-card",
+              activity_type: "payments.charge",
+              total: 1,
+              pending: 0,
+              completed: 0,
+              failed: 1,
+              retrying: 1,
+              worker_build_ids: ["build-b"]
+            }
+          ],
+          bulk_summaries: [],
+          signal_summaries: [
+            {
+              signal_name: "payment-approved",
+              count: 1,
+              latest_status: "queued",
+              latest_seen_at: "2026-03-13T09:03:00Z",
+              node_id: "workflow:wait-payment",
+              module_id: "module:workflow:wait-payment"
+            }
+          ],
+          update_summaries: [],
+          child_summaries: []
+        }
+      }),
+      { status: 200 }
+    );
+  }
+  if (url.includes("/tenants/tenant-a/workflow-definitions/payments/latest")) {
+    return new Response(
+      JSON.stringify({
+        id: "payments",
+        version: 2,
+        initial_state: "charge-card",
+        states: {
+          "charge-card": { type: "step" },
+          "wait-payment": { type: "wait_for_event" }
+        }
+      }),
+      { status: 200 }
+    );
+  }
+  if (url.includes("/tenants/tenant-a/workflow-artifacts/payments/latest")) {
+    return new Response(
+      JSON.stringify({
+        definition_id: "payments",
+        definition_version: 2,
+        compiler_version: "tsc-0.1",
+        source_language: "typescript",
+        entrypoint: { module: "workflows/payments.ts", export: "workflow" },
+        source_files: ["workflows/payments.ts"],
+        source_map: {},
+        queries: { status: {} },
+        signals: { "payment-approved": {} },
+        updates: { reprice: {} },
+        workflow: {
+          initial_state: "charge-card",
+          states: {
+            "charge-card": { type: "step" },
+            "wait-payment": { type: "wait_for_event" }
+          }
+        },
+        artifact_hash: "artifact-b"
+      }),
+      { status: 200 }
+    );
+  }
   if (url.includes("/tenants/tenant-a/runs") && url.includes("instance_id=instance-1")) {
     return new Response(
       JSON.stringify({
@@ -27,6 +351,7 @@ const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
             workflow_task_queue: "payments",
             sticky_workflow_build_id: "build-b",
             sticky_workflow_poller_id: "poller-b",
+            routing_status: "sticky_active",
             sticky_updated_at: "2026-03-13T09:04:00Z",
             previous_run_id: "run-1",
             next_run_id: null,
@@ -52,6 +377,7 @@ const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
             workflow_task_queue: "payments",
             sticky_workflow_build_id: "build-a",
             sticky_workflow_poller_id: "poller-a",
+            routing_status: "queue_default_active",
             sticky_updated_at: "2026-03-13T08:10:00Z",
             previous_run_id: null,
             next_run_id: "run-2",
@@ -91,6 +417,7 @@ const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
             workflow_task_queue: "payments",
             sticky_workflow_build_id: "build-b",
             sticky_workflow_poller_id: "poller-b",
+            routing_status: "sticky_active",
             sticky_updated_at: "2026-03-13T09:04:00Z",
             previous_run_id: "run-1",
             next_run_id: null,
@@ -159,6 +486,29 @@ const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
             error: null
           }
         ]
+      }),
+      { status: 200 }
+    );
+  }
+  if (url.includes("/tenants/tenant-a/workflows/instance-1/routing")) {
+    return new Response(
+      JSON.stringify({
+        tenant_id: "tenant-a",
+        instance_id: "instance-1",
+        run_id: "run-2",
+        definition_id: "payments",
+        definition_version: 2,
+        artifact_hash: "artifact-b",
+        workflow_task_queue: "payments",
+        routing_status: "sticky_active",
+        default_compatibility_set_id: "stable",
+        compatible_build_ids: ["build-b"],
+        registered_build_ids: ["build-a", "build-b"],
+        sticky_workflow_build_id: "build-b",
+        sticky_workflow_poller_id: "poller-b",
+        sticky_updated_at: "2026-03-13T09:04:00Z",
+        sticky_build_compatible_with_queue: true,
+        sticky_build_supports_pinned_artifact: true
       }),
       { status: 200 }
     );
@@ -258,7 +608,28 @@ const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
         total_pollers: 1,
         total_registered_builds: 1,
         replay_divergence_count: 0,
-        recent_failures: [],
+        recent_failures: [
+          {
+            tenant_id: "tenant-a",
+            instance_id: "instance-failed",
+            run_id: "run-failed",
+            definition_id: "payments",
+            definition_version: 2,
+            artifact_hash: "artifact-b",
+            workflow_task_queue: "payments",
+            sticky_workflow_build_id: "build-b",
+            sticky_workflow_poller_id: "poller-b",
+            routing_status: "sticky_incompatible_fallback_required",
+            current_state: "charge-card",
+            status: "failed",
+            event_count: 9,
+            last_event_id: "evt-failed",
+            last_event_type: "WorkflowFailed",
+            updated_at: "2026-03-13T09:06:00Z",
+            consistency: "eventual",
+            source: "projection"
+          }
+        ],
         hottest_task_queues: []
       }),
       { status: 200 }
@@ -294,7 +665,23 @@ test("renders runs index rows", async () => {
 
   await waitFor(() => expect(screen.getByRole("link", { name: "Inspect" })).toBeInTheDocument());
   expect(screen.getAllByText("payments").length).toBeGreaterThan(0);
+  expect(screen.getAllByText("sticky_active").length).toBeGreaterThan(0);
   expect(screen.getByRole("link", { name: "Inspect" })).toHaveAttribute("href", "/runs/instance-1/run-2");
+});
+
+test("supports routing-status run filtering in the runs view", async () => {
+  renderApp("/runs?routing_status=sticky_active");
+
+  await waitFor(() => expect(screen.getByDisplayValue("sticky_active")).toBeInTheDocument());
+  expect(screen.getByText("sticky_active")).toBeInTheDocument();
+});
+
+test("shows routing status on overview recent failures", async () => {
+  renderApp("/");
+
+  await waitFor(() => expect(screen.getByText("sticky_incompatible_fallback_required")).toBeInTheDocument());
+  expect(screen.getByText("sticky_incompatible_fallback_required")).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Inspect" })).toHaveAttribute("href", "/runs/instance-failed/run-failed");
 });
 
 test("disables safe actions for a historical run detail", async () => {
@@ -302,6 +689,13 @@ test("disables safe actions for a historical run detail", async () => {
 
   await waitFor(() => expect(screen.getByRole("heading", { name: "payments" })).toBeInTheDocument());
   expect(screen.getByRole("button", { name: "Send signal" })).toBeDisabled();
+  expect(screen.getByText("Routing status sticky_active")).toBeInTheDocument();
+  expect(screen.getByText("Default set stable")).toBeInTheDocument();
+  expect(screen.getByText("Compatible builds build-b")).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Inspect workflow queue" })).toHaveAttribute(
+    "href",
+    "/task-queues?queue_kind=workflow&task_queue=payments"
+  );
   await userEvent.click(screen.getByRole("button", { name: "raw-history" }));
   expect(screen.getAllByText("View payload").length).toBeGreaterThan(0);
 });
@@ -313,4 +707,12 @@ test("keeps task queue inspection read-only", async () => {
   expect(screen.getAllByText("payments").length).toBeGreaterThan(0);
   expect(screen.queryByText("Promote default")).not.toBeInTheDocument();
   expect(screen.queryByText("stream-v2")).not.toBeInTheDocument();
+});
+
+test("renders workflow definition graph explorer", async () => {
+  renderApp("/workflows/payments");
+
+  await waitFor(() => expect(screen.getByText("Graph Explorer")).toBeInTheDocument());
+  expect(screen.getByRole("button", { name: "Semantic Map" })).toBeInTheDocument();
+  expect(screen.getByText("Entry")).toBeInTheDocument();
 });

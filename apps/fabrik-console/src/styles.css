@@ -440,6 +440,11 @@ textarea {
   background: rgba(243, 185, 85, 0.16);
 }
 
+.timeline-lane.children {
+  color: #ffd7f7;
+  background: rgba(223, 107, 191, 0.16);
+}
+
 .timeline-lane.infra,
 .timeline-lane.other {
   color: #d4e6ff;
@@ -526,6 +531,47 @@ details summary {
   overflow: hidden;
 }
 
+.graph-workbench {
+  display: grid;
+  gap: 16px;
+}
+
+.graph-workbench-body {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(0, 1.5fr) minmax(340px, 0.9fr);
+}
+
+.graph-main-panel {
+  min-height: 620px;
+}
+
+.graph-surface {
+  height: 620px;
+}
+
+.graph-card {
+  display: grid;
+  gap: 6px;
+}
+
+.graph-timeline-item {
+  width: 100%;
+  text-align: left;
+  background: rgba(8, 18, 24, 0.56);
+}
+
+.graph-timeline-item.active {
+  border-color: rgba(59, 182, 199, 0.4);
+  background: rgba(59, 182, 199, 0.08);
+}
+
+.left-align {
+  width: 100%;
+  text-align: left;
+  justify-content: flex-start;
+}
+
 .empty {
   padding: 24px;
   text-align: center;
@@ -543,6 +589,7 @@ details summary {
   }
 
   .split,
+  .graph-workbench-body,
   .grid.two,
   .filters-grid,
   .timeline-item {

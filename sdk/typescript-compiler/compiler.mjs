@@ -148,6 +148,7 @@ function collectTemporalWorkflowApi(sourceFile) {
     condition: new Set(),
     cancellationScope: new Set(),
     isCancellation: new Set(),
+    getExternalWorkflowHandle: new Set(),
     executeChild: new Set(),
     startChild: new Set(),
     defineQuery: new Set(),
@@ -175,6 +176,7 @@ function collectTemporalWorkflowApi(sourceFile) {
       if (importedName === "condition") api.condition.add(localName);
       if (importedName === "CancellationScope") api.cancellationScope.add(localName);
       if (importedName === "isCancellation") api.isCancellation.add(localName);
+      if (importedName === "getExternalWorkflowHandle") api.getExternalWorkflowHandle.add(localName);
       if (importedName === "executeChild") api.executeChild.add(localName);
       if (importedName === "startChild") api.startChild.add(localName);
       if (importedName === "defineQuery") api.defineQuery.add(localName);
@@ -240,6 +242,16 @@ function parseTemporalDurationMs(expression, label) {
     return value * multiplier;
   }
   throw compilerError(`${label} must be a numeric literal or static duration string`, expression);
+}
+
+function parseTemporalDurationRef(expression, label) {
+  if (ts.isNumericLiteral(expression)) {
+    return `${expression.text}ms`;
+  }
+  if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) {
+    return expression.text;
+  }
+  throw compilerError(`${label} must be a static duration literal`, expression);
 }
 
 function parseTemporalRetryOptions(expression) {
@@ -787,6 +799,17 @@ function compileExpression(expression) {
           expr: compileExpression(expression.arguments[0]),
         };
       }
+      if (method === "version") {
+        if (expression.arguments.length !== 3) {
+          throw compilerError(`ctx.version() requires changeId, minSupported, and maxSupported`, expression);
+        }
+        return {
+          kind: "version",
+          change_id: literalString(expression.arguments[0], "ctx.version changeId"),
+          min_supported: literalNumber(expression.arguments[1], "ctx.version minSupported"),
+          max_supported: literalNumber(expression.arguments[2], "ctx.version maxSupported"),
+        };
+      }
       throw compilerError(
         `ctx.${method} is only allowed as an awaited workflow primitive or terminal call`,
         expression,
@@ -816,6 +839,7 @@ class WorkflowLowerer {
       condition: new Set(),
       cancellationScope: new Set(),
       isCancellation: new Set(),
+      getExternalWorkflowHandle: new Set(),
       executeChild: new Set(),
       startChild: new Set(),
       defineQuery: new Set(),
@@ -836,7 +860,9 @@ class WorkflowLowerer {
     this.queries = {};
     this.signals = {};
     this.updates = {};
+    this.nonCancellableStates = new Set();
     this.childHandleVars = new Set();
+    this.externalHandleVars = new Map();
     this.bulkHandleVars = new Set();
     this.temporalSignalHandlers = new Map();
     const sourceFile =
@@ -929,6 +955,13 @@ class WorkflowLowerer {
     return null;
   }
 
+  resolveTemporalSignalName(expression, label) {
+    if (ts.isIdentifier(expression)) {
+      return this.temporalDefinitions.signal.get(expression.text) ?? expression.text;
+    }
+    return literalString(expression, label);
+  }
+
   resolveTemporalPromiseFanout(call) {
     if (
       !ts.isPropertyAccessExpression(call.expression) ||
@@ -993,6 +1026,23 @@ class WorkflowLowerer {
 
   discoverHandleDeclarations(node) {
     const visit = (current) => {
+      if (
+        ts.isVariableDeclaration(current) &&
+        ts.isIdentifier(current.name) &&
+        current.initializer &&
+        ts.isCallExpression(current.initializer) &&
+        ts.isIdentifier(current.initializer.expression) &&
+        this.temporalApi.getExternalWorkflowHandle.has(current.initializer.expression.text)
+      ) {
+        const call = current.initializer;
+        if (call.arguments.length < 1 || call.arguments.length > 2) {
+          throw compilerError(`getExternalWorkflowHandle requires workflowId and optional runId`, call);
+        }
+        this.externalHandleVars.set(current.name.text, {
+          targetInstanceId: compileExpression(call.arguments[0]),
+          targetRunId: call.arguments[1] ? compileExpression(call.arguments[1]) : null,
+        });
+      }
       if (
         ts.isVariableDeclaration(current) &&
         ts.isIdentifier(current.name) &&
@@ -1073,6 +1123,9 @@ class WorkflowLowerer {
         initial_state: initialState,
         states: lowered.states,
       };
+      for (const stateId of lowered.nonCancellableStates) {
+        this.nonCancellableStates.add(stateId);
+      }
       return;
     }
     if (this.temporalDefinitions.signal.has(definition.text)) {
@@ -1105,6 +1158,9 @@ class WorkflowLowerer {
         initial_state: initialState,
         states: lowered.states,
       };
+      for (const stateId of lowered.nonCancellableStates) {
+        this.nonCancellableStates.add(stateId);
+      }
       const conditionSignalHandler = tryCompileSignalHandlerActions(handler);
       if (conditionSignalHandler) {
         this.temporalSignalHandlers.set(definition.text, {
@@ -1128,6 +1184,9 @@ class WorkflowLowerer {
     if (!predicate || (!ts.isArrowFunction(predicate) && !ts.isFunctionExpression(predicate))) {
       throw compilerError(`condition requires an inline function predicate`, callExpression);
     }
+    if (callExpression.arguments.length > 2) {
+      throw compilerError(`condition accepts at most a predicate and an optional timeout`, callExpression);
+    }
     const predicateExpr = compilePureHandlerExpression(predicate, "condition");
     let continueState = nextState;
     if (targetVar) {
@@ -1137,10 +1196,24 @@ class WorkflowLowerer {
         next: nextState,
       }, callExpression);
     }
+    const timeoutRef = callExpression.arguments[1]
+      ? parseTemporalDurationRef(callExpression.arguments[1], "condition timeout")
+      : null;
+    const timeoutState = timeoutRef
+      ? targetVar
+        ? this.addState("assign", {
+            type: "assign",
+            actions: [{ target: targetVar, expr: { kind: "literal", value: false } }],
+            next: nextState,
+          }, callExpression)
+        : nextState
+      : null;
     return this.addState("wait_condition", {
       type: "wait_for_condition",
       condition: predicateExpr,
       next: continueState,
+      timeout_ref: timeoutRef ?? undefined,
+      timeout_next: timeoutState ?? undefined,
     }, callExpression);
   }
 
@@ -1178,12 +1251,16 @@ class WorkflowLowerer {
       queries: this.queries,
       signals: this.signals,
       updates: this.updates,
+      nonCancellableStates: Array.from(this.nonCancellableStates),
     };
   }
 
   addState(prefix, state, node = null) {
     const id = this.nextId(prefix, node);
     this.states[id] = state;
+    if ((this.nonCancellableDepth ?? 0) > 0) {
+      this.nonCancellableStates.add(id);
+    }
     if (node) {
       this.sourceMap[id] = sourceLocation(node);
     }
@@ -1263,11 +1340,21 @@ class WorkflowLowerer {
         if (!ts.isIdentifier(declaration.name) || !declaration.initializer) {
           throw compilerError(`unsupported declaration: ${statement.getText()}`, declaration);
         }
+        if (
+          ts.isCallExpression(declaration.initializer) &&
+          ts.isIdentifier(declaration.initializer.expression) &&
+          this.temporalApi.getExternalWorkflowHandle.has(declaration.initializer.expression.text)
+        ) {
+          return null;
+        }
         return {
           target: declaration.name.text,
           expr: compileExpression(declaration.initializer),
         };
-      });
+      }).filter(Boolean);
+      if (actions.length === 0) {
+        return nextState;
+      }
       return this.addState("assign", { type: "assign", actions, next: nextState }, statement);
     }
 
@@ -1742,21 +1829,31 @@ class WorkflowLowerer {
             scopeCall.handler.body,
           ),
         ];
-    const fallthroughState = targetVar
-      ? this.addState("assign", {
-          type: "assign",
-          actions: [{ target: targetVar, expr: { kind: "literal", value: null } }],
-          next: nextState,
-        }, originNode)
-      : nextState;
-    return this.lowerBlock(
-      statements,
-      fallthroughState,
-      null,
-      null,
-      errorTarget,
-      { next: nextState, targetVar: targetVar ?? null },
-    );
+    const shielded = scopeCall.method === "nonCancellable";
+    if (shielded) {
+      this.nonCancellableDepth = (this.nonCancellableDepth ?? 0) + 1;
+    }
+    try {
+      const fallthroughState = targetVar
+        ? this.addState("assign", {
+            type: "assign",
+            actions: [{ target: targetVar, expr: { kind: "literal", value: null } }],
+            next: nextState,
+          }, originNode)
+        : nextState;
+      return this.lowerBlock(
+        statements,
+        fallthroughState,
+        null,
+        null,
+        errorTarget,
+        { next: nextState, targetVar: targetVar ?? null },
+      );
+    } finally {
+      if (shielded) {
+        this.nonCancellableDepth -= 1;
+      }
+    }
   }
 
   lowerAwait(awaitExpression, targetVar, nextState, errorTarget) {
@@ -1802,6 +1899,95 @@ class WorkflowLowerer {
         }, awaitExpression);
       }
       throw compilerError(`unknown handle ${handleName}.result()`, awaitExpression);
+    }
+    if (
+      ts.isPropertyAccessExpression(call.expression) &&
+      ts.isIdentifier(call.expression.expression) &&
+      this.childHandleVars.has(call.expression.expression.text)
+    ) {
+      const handleName = call.expression.expression.text;
+      const method = call.expression.name.text;
+      const continueState = targetVar
+        ? this.addState("assign", {
+            type: "assign",
+            actions: [{ target: targetVar, expr: { kind: "literal", value: null } }],
+            next: nextState,
+          }, awaitExpression)
+        : nextState;
+      if (method === "signal") {
+        if (call.arguments.length < 1 || call.arguments.length > 2) {
+          throw compilerError(`childHandle.signal requires a signal name and optional payload`, call);
+        }
+        return this.addState("signal_child", {
+          type: "signal_child",
+          child_ref_var: handleName,
+          signal_name: this.resolveTemporalSignalName(
+            call.arguments[0],
+            "childHandle.signal signal name",
+          ),
+          payload: call.arguments[1]
+            ? compileExpression(call.arguments[1])
+            : { kind: "literal", value: null },
+          next: continueState,
+        }, awaitExpression);
+      }
+      if (method === "cancel") {
+        if (call.arguments.length > 1) {
+          throw compilerError(`childHandle.cancel accepts at most one optional reason`, call);
+        }
+        return this.addState("cancel_child", {
+          type: "cancel_child",
+          child_ref_var: handleName,
+          reason: call.arguments[0] ? compileExpression(call.arguments[0]) : undefined,
+          next: continueState,
+        }, awaitExpression);
+      }
+    }
+    if (
+      ts.isPropertyAccessExpression(call.expression) &&
+      ts.isIdentifier(call.expression.expression) &&
+      this.externalHandleVars.has(call.expression.expression.text)
+    ) {
+      const handleName = call.expression.expression.text;
+      const handle = this.externalHandleVars.get(handleName);
+      const method = call.expression.name.text;
+      const continueState = targetVar
+        ? this.addState("assign", {
+            type: "assign",
+            actions: [{ target: targetVar, expr: { kind: "literal", value: null } }],
+            next: nextState,
+          }, awaitExpression)
+        : nextState;
+      if (method === "signal") {
+        if (call.arguments.length < 1 || call.arguments.length > 2) {
+          throw compilerError(`externalWorkflowHandle.signal requires a signal name and optional payload`, call);
+        }
+        return this.addState("signal_external", {
+          type: "signal_external",
+          target_instance_id: handle.targetInstanceId,
+          target_run_id: handle.targetRunId ?? undefined,
+          signal_name: this.resolveTemporalSignalName(
+            call.arguments[0],
+            "externalWorkflowHandle.signal signal name",
+          ),
+          payload: call.arguments[1]
+            ? compileExpression(call.arguments[1])
+            : { kind: "literal", value: null },
+          next: continueState,
+        }, awaitExpression);
+      }
+      if (method === "cancel") {
+        if (call.arguments.length > 1) {
+          throw compilerError(`externalWorkflowHandle.cancel accepts at most one optional reason`, call);
+        }
+        return this.addState("cancel_external", {
+          type: "cancel_external",
+          target_instance_id: handle.targetInstanceId,
+          target_run_id: handle.targetRunId ?? undefined,
+          reason: call.arguments[0] ? compileExpression(call.arguments[0]) : undefined,
+          next: continueState,
+        }, awaitExpression);
+      }
     }
     const temporalFanout = this.resolveTemporalPromiseFanout(call);
     if (temporalFanout) {
@@ -2055,6 +2241,9 @@ class WorkflowLowerer {
       initial_state: initialState,
       states: lowered.states,
     };
+    for (const stateId of lowered.nonCancellableStates) {
+      this.nonCancellableStates.add(stateId);
+    }
     Object.assign(this.sourceMap, lowered.sourceMap);
   }
 }
@@ -2064,6 +2253,17 @@ function literalString(expression, label) {
     throw compilerError(`${label} must be a string literal`, expression);
   }
   return expression.text;
+}
+
+function literalNumber(expression, label) {
+  if (!expression || !ts.isNumericLiteral(expression)) {
+    throw compilerError(`${label} must be a numeric literal`, expression);
+  }
+  const value = Number(expression.text);
+  if (!Number.isInteger(value) || value < 0) {
+    throw compilerError(`${label} must be a non-negative integer literal`, expression);
+  }
+  return value;
 }
 
 function compileHttpConfig(objectLiteral) {
@@ -2459,7 +2659,7 @@ async function main() {
   const temporalApi = collectTemporalWorkflowApi(workflow.getSourceFile());
   const helpers = injectTemporalBuiltinHelpers(buildHelperRegistry(program, workflow), temporalApi);
   const lowerer = new WorkflowLowerer(args.definitionId, args.version, workflow, temporalApi);
-  const { initialState, states, sourceMap, queries, signals, updates } = lowerer.lower();
+  const { initialState, states, sourceMap, queries, signals, updates, nonCancellableStates } = lowerer.lower();
 
   const artifact = {
     definition_id: args.definitionId,
@@ -2481,6 +2681,7 @@ async function main() {
     workflow: {
       initial_state: initialState,
       states,
+      non_cancellable_states: nonCancellableStates,
     },
     artifact_hash: "",
   };

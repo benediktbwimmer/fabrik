@@ -13,8 +13,63 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-NAMESPACE="${BENCHMARK_NAMESPACE:-bench-$(date +%Y%m%dt%H%M%S)-$RANDOM}"
-NAMESPACE="$(printf '%s' "$NAMESPACE" | tr '[:upper:]' '[:lower:]')"
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  scripts/manage-benchmark-stack.sh start [options]
+  scripts/manage-benchmark-stack.sh stop --run-dir <dir>
+
+options:
+  --execution-mode <durable|throughput|unified>
+  --namespace <value>
+  --run-dir <dir>
+  --tenant-id <value>
+  --task-queue <value>
+EOF
+  exit 1
+}
+
+COMMAND="${1:-}"
+if [[ -z "$COMMAND" ]]; then
+  usage
+fi
+shift
+
+EXECUTION_MODE="durable"
+NAMESPACE_OVERRIDE=""
+RUN_DIR_OVERRIDE=""
+TENANT_ID_OVERRIDE=""
+TASK_QUEUE_OVERRIDE=""
+
+while (($#)); do
+  case "$1" in
+    --execution-mode)
+      EXECUTION_MODE="$2"
+      shift 2
+      ;;
+    --namespace)
+      NAMESPACE_OVERRIDE="$2"
+      shift 2
+      ;;
+    --run-dir)
+      RUN_DIR_OVERRIDE="$2"
+      shift 2
+      ;;
+    --tenant-id)
+      TENANT_ID_OVERRIDE="$2"
+      shift 2
+      ;;
+    --task-queue)
+      TASK_QUEUE_OVERRIDE="$2"
+      shift 2
+      ;;
+    *)
+      echo "unknown argument $1" >&2
+      usage
+      ;;
+  esac
+done
+
 normalize_db_name() {
   python3 - "$1" <<'PY'
 import hashlib
@@ -32,13 +87,6 @@ else:
 PY
 }
 
-DB_NAME_RAW="${BENCHMARK_DB_NAME:-fabrik_${NAMESPACE//-/_}}"
-DB_NAME="$(normalize_db_name "$DB_NAME_RAW")"
-TENANT_ID="${BENCHMARK_TENANT_ID:-$NAMESPACE}"
-TASK_QUEUE="${BENCHMARK_TASK_QUEUE:-default}"
-WORKFLOW_EVENTS_PARTITION_COUNT="${WORKFLOW_EVENTS_PARTITION_COUNT:-8}"
-THROUGHPUT_TOPIC_PARTITION_COUNT="${THROUGHPUT_TOPIC_PARTITION_COUNT:-$WORKFLOW_EVENTS_PARTITION_COUNT}"
-
 partition_csv() {
   python3 - "$1" <<'PY'
 import sys
@@ -52,115 +100,21 @@ configure_redpanda_limits() {
   docker exec fabrik-redpanda-1 rpk cluster config set kafka_batch_max_bytes "$max_bytes" >/dev/null
 }
 
-WORKFLOW_PARTITIONS="${WORKFLOW_PARTITIONS:-$(partition_csv "$WORKFLOW_EVENTS_PARTITION_COUNT")}"
-THROUGHPUT_PARTITIONS="${THROUGHPUT_OWNERSHIP_PARTITIONS:-$(partition_csv "$THROUGHPUT_TOPIC_PARTITION_COUNT")}"
-POSTGRES_URL="postgres://fabrik:fabrik@localhost:${POSTGRES_HOST_PORT:-55433}/${DB_NAME}"
-WORKFLOW_EVENTS_TOPIC="${WORKFLOW_EVENTS_TOPIC:-workflow-events-$NAMESPACE}"
-THROUGHPUT_COMMANDS_TOPIC="${THROUGHPUT_COMMANDS_TOPIC:-throughput-commands-$NAMESPACE}"
-THROUGHPUT_REPORTS_TOPIC="${THROUGHPUT_REPORTS_TOPIC:-throughput-reports-$NAMESPACE}"
-THROUGHPUT_CHANGELOG_TOPIC="${THROUGHPUT_CHANGELOG_TOPIC:-throughput-changelog-$NAMESPACE}"
-THROUGHPUT_PROJECTIONS_TOPIC="${THROUGHPUT_PROJECTIONS_TOPIC:-throughput-projections-$NAMESPACE}"
-THROUGHPUT_BUCKET="${THROUGHPUT_PAYLOAD_S3_BUCKET:-fabrik-throughput}"
-THROUGHPUT_KEY_PREFIX="${THROUGHPUT_PAYLOAD_S3_KEY_PREFIX:-throughput/$NAMESPACE}"
-CHECKPOINT_KEY_PREFIX="${THROUGHPUT_CHECKPOINT_KEY_PREFIX:-checkpoints/$NAMESPACE}"
-RUN_DIR="${BENCHMARK_RUN_DIR:-target/benchmark-runs/$NAMESPACE}"
-LOG_DIR="$RUN_DIR/logs"
-STATE_DIR="$RUN_DIR/state"
-CHECKPOINT_DIR="$RUN_DIR/checkpoints"
-REPORT_PATH_DEFAULT="target/benchmark-reports/${NAMESPACE}.json"
-BUILD_RELEASE="${BUILD_RELEASE_BINARIES:-1}"
-KEEP_DATABASE="${KEEP_BENCHMARK_DATABASE:-0}"
-KEEP_TOPICS="${KEEP_BENCHMARK_TOPICS:-0}"
-KILL_LOCAL_SERVICES="${BENCHMARK_KILL_LOCAL_SERVICES:-1}"
-
-mkdir -p "$LOG_DIR" "$STATE_DIR" "$CHECKPOINT_DIR" target/benchmark-reports
-
-PORTS=()
-while IFS= read -r port; do
-  PORTS+=("$port")
-done < <(python3 - <<'PY'
+reserve_ports() {
+  python3 - <<'PY'
 import socket
 
 def reserve():
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
     return port
 
 for _ in range(12):
     print(reserve())
 PY
-)
-
-INGEST_PORT="${INGEST_SERVICE_PORT:-${PORTS[0]}}"
-EXECUTOR_PORT="${EXECUTOR_SERVICE_PORT:-${PORTS[1]}}"
-MATCHING_PORT="${MATCHING_SERVICE_PORT:-${PORTS[2]}}"
-MATCHING_DEBUG_PORT="${MATCHING_DEBUG_PORT:-${PORTS[3]}}"
-THROUGHPUT_RUNTIME_PORT="${THROUGHPUT_RUNTIME_PORT:-${PORTS[4]}}"
-THROUGHPUT_DEBUG_PORT="${THROUGHPUT_DEBUG_PORT:-${PORTS[5]}}"
-THROUGHPUT_PROJECTOR_PORT="${THROUGHPUT_PROJECTOR_PORT:-${PORTS[6]}}"
-ACTIVITY_WORKER_SERVICE_PORT="${ACTIVITY_WORKER_SERVICE_PORT:-${PORTS[7]}}"
-STREAM_ACTIVITY_WORKER_SERVICE_PORT="${STREAM_ACTIVITY_WORKER_SERVICE_PORT:-${PORTS[8]}}"
-TIMER_SERVICE_PORT="${TIMER_SERVICE_PORT:-${PORTS[9]}}"
-UNIFIED_RUNTIME_PORT="${UNIFIED_RUNTIME_PORT:-${PORTS[10]}}"
-UNIFIED_DEBUG_PORT="${UNIFIED_DEBUG_PORT:-${PORTS[11]}}"
-
-PIDS=()
-REPORT_PATH=""
-
-stop_services() {
-  local pid
-  for pid in "${PIDS[@]:-}"; do
-    if kill -0 "$pid" >/dev/null 2>&1; then
-      kill "$pid" >/dev/null 2>&1 || true
-    fi
-  done
-
-  local deadline=$((SECONDS + 5))
-  while (( SECONDS < deadline )); do
-    local any_running=0
-    for pid in "${PIDS[@]:-}"; do
-      if kill -0 "$pid" >/dev/null 2>&1; then
-        any_running=1
-        break
-      fi
-    done
-    if [[ "$any_running" == "0" ]]; then
-      break
-    fi
-    sleep 1
-  done
-
-  for pid in "${PIDS[@]:-}"; do
-    if kill -0 "$pid" >/dev/null 2>&1; then
-      kill -9 "$pid" >/dev/null 2>&1 || true
-    fi
-    wait "$pid" >/dev/null 2>&1 || true
-  done
 }
-
-cleanup() {
-  local exit_code=$?
-  stop_services
-
-  if [[ $exit_code -ne 0 ]]; then
-    echo >&2
-    echo "benchmark stack failed; recent logs:" >&2
-    for log in "$LOG_DIR"/*.log; do
-      [[ -f "$log" ]] || continue
-      echo >&2
-      echo "==> $log <==" >&2
-      tail -n 40 "$log" >&2 || true
-    done
-  fi
-
-  if [[ $exit_code -eq 0 ]]; then
-    echo
-    echo "report_path=$REPORT_PATH"
-  fi
-}
-trap cleanup EXIT
 
 wait_for_port() {
   local host=$1
@@ -252,60 +206,8 @@ wait_for_topic_partitions() {
   return 1
 }
 
-purge_stale_benchmark_topics() {
-  local topics=()
-  while IFS= read -r topic; do
-    [[ -n "$topic" ]] || continue
-    topics+=("$topic")
-  done < <(
-      docker exec fabrik-redpanda-1 rpk topic list 2>/dev/null \
-        | awk 'NR > 1 {print $1}' \
-        | grep -E '^(workflow-events|throughput-(commands|reports|changelog|projections))-(bench-|temporal-compare-)' \
-        || true
-  )
-  if [[ ${#topics[@]} -eq 0 ]]; then
-    return 0
-  fi
-  docker exec fabrik-redpanda-1 sh -lc "rpk topic delete ${topics[*]}" >/dev/null 2>&1 || true
-  local deadline=$((SECONDS + 60))
-  while (( SECONDS < deadline )); do
-    local remaining
-    remaining="$(
-      docker exec fabrik-redpanda-1 rpk topic list 2>/dev/null \
-        | awk 'NR > 1 {print $1}' \
-        | grep -Ec '^(workflow-events|throughput-(commands|reports|changelog|projections))-(bench-|temporal-compare-)' \
-        || true
-    )"
-    if [[ "${remaining:-0}" == "0" ]]; then
-      return 0
-    fi
-    sleep 2
-  done
-  echo "timed out waiting for stale benchmark topics to be purged" >&2
-  return 1
-}
-
-start_service() {
-  local name=$1
-  local log_file=$2
-  shift 2
-  (
-    while (($#)); do
-      if [[ "$1" == "--" ]]; then
-        shift
-        break
-      fi
-      export "$1"
-      shift
-    done
-    exec "$@"
-  ) >"$log_file" 2>&1 &
-  local pid=$!
-  PIDS+=("$pid")
-}
-
 stop_existing_local_services() {
-  if [[ "$KILL_LOCAL_SERVICES" != "1" ]]; then
+  if [[ "${BENCHMARK_KILL_LOCAL_SERVICES:-0}" != "1" ]]; then
     return 0
   fi
   local patterns=(
@@ -319,48 +221,202 @@ stop_existing_local_services() {
     'target/release/activity-worker-service'
     'target/release/benchmark-runner'
   )
+  local pattern
   for pattern in "${patterns[@]}"; do
     pkill -9 -f "$pattern" >/dev/null 2>&1 || true
   done
 }
 
-has_runner_arg() {
-  local flag=$1
-  shift
-  for arg in "$@"; do
-    if [[ "$arg" == "$flag" ]]; then
-      return 0
-    fi
-  done
-  return 1
+load_env_file() {
+  local env_file=$1
+  if [[ ! -f "$env_file" ]]; then
+    echo "missing environment file: $env_file" >&2
+    exit 1
+  fi
+  set -a
+  # shellcheck disable=SC1090
+  source "$env_file"
+  set +a
 }
 
-echo "namespace=$NAMESPACE"
-echo "db_name=$DB_NAME"
-echo "run_dir=$RUN_DIR"
-echo "logs_dir=$LOG_DIR"
+stop_service_pids() {
+  local pid_file=$1
+  local pids=()
+  if [[ -f "$pid_file" ]]; then
+    while IFS= read -r pid; do
+      [[ -n "$pid" ]] || continue
+      pids+=("$pid")
+    done <"$pid_file"
+  fi
 
-echo "[isolated-benchmark] stopping existing local fabrik services"
+  local pid
+  for pid in "${pids[@]:-}"; do
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      kill "$pid" >/dev/null 2>&1 || true
+    fi
+  done
+
+  local deadline=$((SECONDS + 5))
+  while (( SECONDS < deadline )); do
+    local any_running=0
+    for pid in "${pids[@]:-}"; do
+      if kill -0 "$pid" >/dev/null 2>&1; then
+        any_running=1
+        break
+      fi
+    done
+    if [[ "$any_running" == "0" ]]; then
+      break
+    fi
+    sleep 1
+  done
+
+  for pid in "${pids[@]:-}"; do
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      kill -9 "$pid" >/dev/null 2>&1 || true
+    fi
+    wait "$pid" >/dev/null 2>&1 || true
+  done
+}
+
+if [[ "$COMMAND" == "stop" ]]; then
+  if [[ -z "$RUN_DIR_OVERRIDE" ]]; then
+    echo "--run-dir is required for stop" >&2
+    exit 1
+  fi
+  RUN_DIR="$RUN_DIR_OVERRIDE"
+  ENV_FILE="$RUN_DIR/environment.txt"
+  PID_FILE="$RUN_DIR/pids.txt"
+  load_env_file "$ENV_FILE"
+  stop_service_pids "$PID_FILE"
+
+  if [[ "${KEEP_BENCHMARK_DATABASE:-0}" != "1" ]]; then
+    docker exec fabrik-postgres-1 psql -U postgres -c "DROP DATABASE IF EXISTS $DB_NAME WITH (FORCE);" >/dev/null || true
+  fi
+
+  if [[ "${KEEP_BENCHMARK_TOPICS:-0}" != "1" ]]; then
+    local_topics=(
+      "$WORKFLOW_EVENTS_TOPIC"
+      "$THROUGHPUT_COMMANDS_TOPIC"
+      "$THROUGHPUT_REPORTS_TOPIC"
+      "$THROUGHPUT_CHANGELOG_TOPIC"
+      "$THROUGHPUT_PROJECTIONS_TOPIC"
+    )
+    docker exec fabrik-redpanda-1 sh -lc "rpk topic delete ${local_topics[*]}" >/dev/null 2>&1 || true
+  fi
+
+  echo "stopped_run_dir=$RUN_DIR"
+  exit 0
+fi
+
+if [[ "$COMMAND" != "start" ]]; then
+  usage
+fi
+
+NAMESPACE="${NAMESPACE_OVERRIDE:-${BENCHMARK_NAMESPACE:-bench-$(date +%Y%m%dt%H%M%S)-$RANDOM}}"
+NAMESPACE="$(printf '%s' "$NAMESPACE" | tr '[:upper:]' '[:lower:]')"
+DB_NAME_RAW="${BENCHMARK_DB_NAME:-fabrik_${NAMESPACE//-/_}}"
+DB_NAME="$(normalize_db_name "$DB_NAME_RAW")"
+TENANT_ID="${TENANT_ID_OVERRIDE:-${BENCHMARK_TENANT_ID:-$NAMESPACE}}"
+TASK_QUEUE="${TASK_QUEUE_OVERRIDE:-${BENCHMARK_TASK_QUEUE:-default}}"
+WORKFLOW_EVENTS_PARTITION_COUNT="${WORKFLOW_EVENTS_PARTITION_COUNT:-8}"
+THROUGHPUT_TOPIC_PARTITION_COUNT="${THROUGHPUT_TOPIC_PARTITION_COUNT:-$WORKFLOW_EVENTS_PARTITION_COUNT}"
+WORKFLOW_PARTITIONS="${WORKFLOW_PARTITIONS:-$(partition_csv "$WORKFLOW_EVENTS_PARTITION_COUNT")}"
+THROUGHPUT_PARTITIONS="${THROUGHPUT_OWNERSHIP_PARTITIONS:-$(partition_csv "$THROUGHPUT_TOPIC_PARTITION_COUNT")}"
+POSTGRES_URL="postgres://fabrik:fabrik@localhost:${POSTGRES_HOST_PORT:-55433}/${DB_NAME}"
+WORKFLOW_EVENTS_TOPIC="${WORKFLOW_EVENTS_TOPIC:-workflow-events-$NAMESPACE}"
+THROUGHPUT_COMMANDS_TOPIC="${THROUGHPUT_COMMANDS_TOPIC:-throughput-commands-$NAMESPACE}"
+THROUGHPUT_REPORTS_TOPIC="${THROUGHPUT_REPORTS_TOPIC:-throughput-reports-$NAMESPACE}"
+THROUGHPUT_CHANGELOG_TOPIC="${THROUGHPUT_CHANGELOG_TOPIC:-throughput-changelog-$NAMESPACE}"
+THROUGHPUT_PROJECTIONS_TOPIC="${THROUGHPUT_PROJECTIONS_TOPIC:-throughput-projections-$NAMESPACE}"
+THROUGHPUT_BUCKET="${THROUGHPUT_PAYLOAD_S3_BUCKET:-fabrik-throughput}"
+THROUGHPUT_KEY_PREFIX="${THROUGHPUT_PAYLOAD_S3_KEY_PREFIX:-throughput/$NAMESPACE}"
+CHECKPOINT_KEY_PREFIX="${THROUGHPUT_CHECKPOINT_KEY_PREFIX:-checkpoints/$NAMESPACE}"
+RUN_DIR="${RUN_DIR_OVERRIDE:-${BENCHMARK_RUN_DIR:-target/benchmark-stacks/$NAMESPACE}}"
+LOG_DIR="$RUN_DIR/logs"
+STATE_DIR="$RUN_DIR/state"
+CHECKPOINT_DIR="$RUN_DIR/checkpoints"
+ENV_FILE="$RUN_DIR/environment.txt"
+PID_FILE="$RUN_DIR/pids.txt"
+BUILD_RELEASE="${BUILD_RELEASE_BINARIES:-1}"
+
+mkdir -p "$LOG_DIR" "$STATE_DIR" "$CHECKPOINT_DIR"
+: >"$PID_FILE"
+
+PORTS=()
+while IFS= read -r port; do
+  PORTS+=("$port")
+done < <(reserve_ports)
+INGEST_PORT="${INGEST_SERVICE_PORT:-${PORTS[0]}}"
+EXECUTOR_PORT="${EXECUTOR_SERVICE_PORT:-${PORTS[1]}}"
+MATCHING_PORT="${MATCHING_SERVICE_PORT:-${PORTS[2]}}"
+MATCHING_DEBUG_PORT="${MATCHING_DEBUG_PORT:-${PORTS[3]}}"
+THROUGHPUT_RUNTIME_PORT="${THROUGHPUT_RUNTIME_PORT:-${PORTS[4]}}"
+THROUGHPUT_DEBUG_PORT="${THROUGHPUT_DEBUG_PORT:-${PORTS[5]}}"
+THROUGHPUT_PROJECTOR_PORT="${THROUGHPUT_PROJECTOR_PORT:-${PORTS[6]}}"
+ACTIVITY_WORKER_SERVICE_PORT="${ACTIVITY_WORKER_SERVICE_PORT:-${PORTS[7]}}"
+STREAM_ACTIVITY_WORKER_SERVICE_PORT="${STREAM_ACTIVITY_WORKER_SERVICE_PORT:-${PORTS[8]}}"
+TIMER_SERVICE_PORT="${TIMER_SERVICE_PORT:-${PORTS[9]}}"
+UNIFIED_RUNTIME_PORT="${UNIFIED_RUNTIME_PORT:-${PORTS[10]}}"
+UNIFIED_DEBUG_PORT="${UNIFIED_DEBUG_PORT:-${PORTS[11]}}"
+
+PIDS=()
+START_SUCCEEDED=0
+
+cleanup_failed_start() {
+  local exit_code=$?
+  if [[ "$START_SUCCEEDED" == "1" ]]; then
+    return
+  fi
+  stop_service_pids "$PID_FILE"
+  docker exec fabrik-postgres-1 psql -U postgres -c "DROP DATABASE IF EXISTS $DB_NAME WITH (FORCE);" >/dev/null 2>&1 || true
+  docker exec fabrik-redpanda-1 sh -lc \
+    "rpk topic delete $WORKFLOW_EVENTS_TOPIC $THROUGHPUT_COMMANDS_TOPIC $THROUGHPUT_REPORTS_TOPIC $THROUGHPUT_CHANGELOG_TOPIC $THROUGHPUT_PROJECTIONS_TOPIC" \
+    >/dev/null 2>&1 || true
+  exit "$exit_code"
+}
+trap cleanup_failed_start EXIT
+
+start_service() {
+  local log_file=$1
+  shift
+  (
+    while (($#)); do
+      if [[ "$1" == "--" ]]; then
+        shift
+        break
+      fi
+      export "$1"
+      shift
+    done
+    exec nohup "$@"
+  ) >"$log_file" 2>&1 &
+  local pid=$!
+  PIDS+=("$pid")
+  echo "$pid" >>"$PID_FILE"
+}
+
 stop_existing_local_services
 
-echo "[isolated-benchmark] starting docker infra"
+echo "[benchmark-stack] namespace=$NAMESPACE"
+echo "[benchmark-stack] run_dir=$RUN_DIR"
+echo "[benchmark-stack] execution_mode=$EXECUTION_MODE"
+
+echo "[benchmark-stack] starting docker infra"
 docker compose up -d redpanda postgres minio minio-init >/dev/null
 
-echo "[isolated-benchmark] waiting for redpanda"
+echo "[benchmark-stack] waiting for redpanda"
 wait_for_redpanda_ready 90
-echo "[isolated-benchmark] configuring redpanda limits"
+echo "[benchmark-stack] configuring redpanda limits"
 configure_redpanda_limits "${REDPANDA_KAFKA_BATCH_MAX_BYTES:-8388608}"
-echo "[isolated-benchmark] purging stale benchmark topics"
-purge_stale_benchmark_topics
-echo "[isolated-benchmark] waiting for postgres"
+echo "[benchmark-stack] waiting for postgres"
 wait_for_container_health fabrik-postgres-1 healthy 90
-
-echo "[isolated-benchmark] waiting for minio"
+echo "[benchmark-stack] waiting for minio"
 until curl -fsS "http://127.0.0.1:${MINIO_API_PORT:-9000}/minio/health/live" >/dev/null; do
   sleep 1
 done
 
-echo "[isolated-benchmark] preparing database and topics"
+echo "[benchmark-stack] preparing database and topics"
 docker exec fabrik-postgres-1 psql -U postgres -Atc \
   "SELECT 1 FROM pg_database WHERE datname = '$DB_NAME'" | grep -q 1 \
   || docker exec fabrik-postgres-1 psql -U postgres -c "CREATE DATABASE $DB_NAME OWNER fabrik;" >/dev/null
@@ -390,7 +446,7 @@ do
 done
 
 if [[ "$BUILD_RELEASE" == "1" ]]; then
-  echo "[isolated-benchmark] building release binaries"
+  echo "[benchmark-stack] building release binaries"
   cargo build --release \
     -p benchmark-runner \
     -p ingest-service \
@@ -438,30 +494,17 @@ COMMON_ENV=(
   "RUST_LOG=${RUST_LOG:-warn}"
 )
 
-echo "[isolated-benchmark] starting ingest-service"
-start_service ingest-service "$LOG_DIR/ingest-service.log" \
+echo "[benchmark-stack] starting ingest-service"
+start_service "$LOG_DIR/ingest-service.log" \
   "${COMMON_ENV[@]}" \
   "INGEST_SERVICE_PORT=$INGEST_PORT" \
   -- \
   target/release/ingest-service
 wait_for_port 127.0.0.1 "$INGEST_PORT" "ingest-service"
 
-RUNNER_ARGS=("$@")
-if [[ ${#RUNNER_ARGS[@]} -eq 0 ]]; then
-  RUNNER_ARGS=(--suite streaming --profile target --worker-count 8)
-fi
-
-EXECUTION_MODE="durable"
-for ((i = 0; i < ${#RUNNER_ARGS[@]}; i++)); do
-  if [[ "${RUNNER_ARGS[$i]}" == "--execution-mode" ]] && (( i + 1 < ${#RUNNER_ARGS[@]} )); then
-    EXECUTION_MODE="${RUNNER_ARGS[$((i + 1))]}"
-    break
-  fi
-done
-
 if [[ "$EXECUTION_MODE" == "unified" ]]; then
-  echo "[isolated-benchmark] starting unified-runtime"
-  start_service unified-runtime "$LOG_DIR/unified-runtime.log" \
+  echo "[benchmark-stack] starting unified-runtime"
+  start_service "$LOG_DIR/unified-runtime.log" \
     "${COMMON_ENV[@]}" \
     "UNIFIED_RUNTIME_PORT=$UNIFIED_RUNTIME_PORT" \
     "UNIFIED_DEBUG_PORT=$UNIFIED_DEBUG_PORT" \
@@ -470,16 +513,16 @@ if [[ "$EXECUTION_MODE" == "unified" ]]; then
   wait_for_port 127.0.0.1 "$UNIFIED_RUNTIME_PORT" "unified-runtime"
   wait_for_port 127.0.0.1 "$UNIFIED_DEBUG_PORT" "unified-runtime-debug"
 
-  echo "[isolated-benchmark] starting timer-service"
-  start_service timer-service "$LOG_DIR/timer-service.log" \
+  echo "[benchmark-stack] starting timer-service"
+  start_service "$LOG_DIR/timer-service.log" \
     "${COMMON_ENV[@]}" \
     "TIMER_SERVICE_PORT=$TIMER_SERVICE_PORT" \
     -- \
     target/release/timer-service
   wait_for_port 127.0.0.1 "$TIMER_SERVICE_PORT" "timer-service"
 
-  echo "[isolated-benchmark] starting activity-worker-service (unified)"
-  start_service activity-worker-service-unified "$LOG_DIR/activity-worker-service-unified.log" \
+  echo "[benchmark-stack] starting activity-worker-service (unified)"
+  start_service "$LOG_DIR/activity-worker-service-unified.log" \
     "${COMMON_ENV[@]}" \
     "ACTIVITY_WORKER_SERVICE_PORT=$ACTIVITY_WORKER_SERVICE_PORT" \
     "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
@@ -493,8 +536,8 @@ if [[ "$EXECUTION_MODE" == "unified" ]]; then
     -- \
     target/release/activity-worker-service
 else
-  echo "[isolated-benchmark] starting matching-service"
-  start_service matching-service "$LOG_DIR/matching-service.log" \
+  echo "[benchmark-stack] starting matching-service"
+  start_service "$LOG_DIR/matching-service.log" \
     "${COMMON_ENV[@]}" \
     "MATCHING_SERVICE_PORT=$MATCHING_PORT" \
     "MATCHING_DEBUG_PORT=$MATCHING_DEBUG_PORT" \
@@ -502,8 +545,8 @@ else
     target/release/matching-service
   wait_for_port 127.0.0.1 "$MATCHING_PORT" "matching-service"
 
-  echo "[isolated-benchmark] starting executor-service"
-  start_service executor-service "$LOG_DIR/executor-service.log" \
+  echo "[benchmark-stack] starting executor-service"
+  start_service "$LOG_DIR/executor-service.log" \
     "${COMMON_ENV[@]}" \
     "EXECUTOR_SERVICE_PORT=$EXECUTOR_PORT" \
     "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
@@ -511,8 +554,8 @@ else
     target/release/executor-service
   wait_for_port 127.0.0.1 "$EXECUTOR_PORT" "executor-service"
 
-  echo "[isolated-benchmark] starting throughput-runtime"
-  start_service throughput-runtime "$LOG_DIR/throughput-runtime.log" \
+  echo "[benchmark-stack] starting throughput-runtime"
+  start_service "$LOG_DIR/throughput-runtime.log" \
     "${COMMON_ENV[@]}" \
     "THROUGHPUT_RUNTIME_PORT=$THROUGHPUT_RUNTIME_PORT" \
     "THROUGHPUT_DEBUG_PORT=$THROUGHPUT_DEBUG_PORT" \
@@ -521,24 +564,24 @@ else
   wait_for_port 127.0.0.1 "$THROUGHPUT_RUNTIME_PORT" "throughput-runtime"
   wait_for_port 127.0.0.1 "$THROUGHPUT_DEBUG_PORT" "throughput-runtime-debug"
 
-  echo "[isolated-benchmark] starting throughput-projector"
-  start_service throughput-projector "$LOG_DIR/throughput-projector.log" \
+  echo "[benchmark-stack] starting throughput-projector"
+  start_service "$LOG_DIR/throughput-projector.log" \
     "${COMMON_ENV[@]}" \
     "THROUGHPUT_PROJECTOR_PORT=$THROUGHPUT_PROJECTOR_PORT" \
     -- \
     target/release/throughput-projector
   wait_for_port 127.0.0.1 "$THROUGHPUT_PROJECTOR_PORT" "throughput-projector"
 
-  echo "[isolated-benchmark] starting timer-service"
-  start_service timer-service "$LOG_DIR/timer-service.log" \
+  echo "[benchmark-stack] starting timer-service"
+  start_service "$LOG_DIR/timer-service.log" \
     "${COMMON_ENV[@]}" \
     "TIMER_SERVICE_PORT=$TIMER_SERVICE_PORT" \
     -- \
     target/release/timer-service
   wait_for_port 127.0.0.1 "$TIMER_SERVICE_PORT" "timer-service"
 
-  echo "[isolated-benchmark] starting activity-worker-service (pg-v1/matching)"
-  start_service activity-worker-service "$LOG_DIR/activity-worker-service-pg-v1.log" \
+  echo "[benchmark-stack] starting activity-worker-service (pg-v1/matching)"
+  start_service "$LOG_DIR/activity-worker-service-pg-v1.log" \
     "${COMMON_ENV[@]}" \
     "ACTIVITY_WORKER_SERVICE_PORT=$ACTIVITY_WORKER_SERVICE_PORT" \
     "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
@@ -550,8 +593,8 @@ else
     -- \
     target/release/activity-worker-service
 
-  echo "[isolated-benchmark] starting activity-worker-service (stream-v2)"
-  start_service activity-worker-service-stream-v2 "$LOG_DIR/activity-worker-service-stream-v2.log" \
+  echo "[benchmark-stack] starting activity-worker-service (stream-v2)"
+  start_service "$LOG_DIR/activity-worker-service-stream-v2.log" \
     "${COMMON_ENV[@]}" \
     "ACTIVITY_WORKER_SERVICE_PORT=$STREAM_ACTIVITY_WORKER_SERVICE_PORT" \
     "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
@@ -563,33 +606,14 @@ else
     -- \
     target/release/activity-worker-service
 fi
-sleep 2
 
-if ! has_runner_arg --tenant-id "${RUNNER_ARGS[@]}"; then
-  RUNNER_ARGS+=(--tenant-id "$TENANT_ID")
-fi
-
-if ! has_runner_arg --task-queue "${RUNNER_ARGS[@]}"; then
-  RUNNER_ARGS+=(--task-queue "$TASK_QUEUE")
-fi
-
-if ! has_runner_arg --output "${RUNNER_ARGS[@]}"; then
-  RUNNER_ARGS+=(--output "$REPORT_PATH_DEFAULT")
-fi
-
-REPORT_PATH="$REPORT_PATH_DEFAULT"
-for ((i = 0; i < ${#RUNNER_ARGS[@]}; i++)); do
-  if [[ "${RUNNER_ARGS[$i]}" == "--output" ]] && (( i + 1 < ${#RUNNER_ARGS[@]} )); then
-    REPORT_PATH="${RUNNER_ARGS[$((i + 1))]}"
-    break
-  fi
-done
-
-cat >"$RUN_DIR/environment.txt" <<EOF
+cat >"$ENV_FILE" <<EOF
 NAMESPACE=$NAMESPACE
 DB_NAME=$DB_NAME
 TENANT_ID=$TENANT_ID
 TASK_QUEUE=$TASK_QUEUE
+RUN_DIR=$RUN_DIR
+LOG_DIR=$LOG_DIR
 POSTGRES_URL=$POSTGRES_URL
 WORKFLOW_EVENTS_TOPIC=$WORKFLOW_EVENTS_TOPIC
 THROUGHPUT_COMMANDS_TOPIC=$THROUGHPUT_COMMANDS_TOPIC
@@ -602,32 +626,12 @@ THROUGHPUT_DEBUG_URL=http://127.0.0.1:$THROUGHPUT_DEBUG_PORT
 THROUGHPUT_PROJECTOR_URL=http://127.0.0.1:$THROUGHPUT_PROJECTOR_PORT
 TIMER_SERVICE_URL=http://127.0.0.1:$TIMER_SERVICE_PORT
 UNIFIED_RUNTIME_DEBUG_URL=http://127.0.0.1:$UNIFIED_DEBUG_PORT
+KEEP_BENCHMARK_DATABASE=${KEEP_BENCHMARK_DATABASE:-0}
+KEEP_BENCHMARK_TOPICS=${KEEP_BENCHMARK_TOPICS:-0}
 EOF
 
-echo "[isolated-benchmark] running benchmark-runner"
-env \
-  "${COMMON_ENV[@]}" \
-  "INGEST_SERVICE_URL=http://127.0.0.1:$INGEST_PORT" \
-  "EXECUTOR_SERVICE_URL=http://127.0.0.1:$EXECUTOR_PORT" \
-  "THROUGHPUT_DEBUG_URL=http://127.0.0.1:$THROUGHPUT_DEBUG_PORT" \
-  "THROUGHPUT_PROJECTOR_URL=http://127.0.0.1:$THROUGHPUT_PROJECTOR_PORT" \
-  "UNIFIED_RUNTIME_DEBUG_URL=http://127.0.0.1:$UNIFIED_DEBUG_PORT" \
-  target/release/benchmark-runner "${RUNNER_ARGS[@]}"
+START_SUCCEEDED=1
+trap - EXIT
 
-stop_services
-
-if [[ "$KEEP_DATABASE" != "1" ]]; then
-  docker exec fabrik-postgres-1 psql -U postgres -c "DROP DATABASE IF EXISTS $DB_NAME WITH (FORCE);" >/dev/null || true
-fi
-
-if [[ "$KEEP_TOPICS" != "1" ]]; then
-  for topic in \
-    "$WORKFLOW_EVENTS_TOPIC" \
-    "$THROUGHPUT_COMMANDS_TOPIC" \
-    "$THROUGHPUT_REPORTS_TOPIC" \
-    "$THROUGHPUT_CHANGELOG_TOPIC" \
-    "$THROUGHPUT_PROJECTIONS_TOPIC"
-  do
-    docker exec fabrik-redpanda-1 rpk topic delete "$topic" >/dev/null 2>&1 || true
-  done
-fi
+echo "run_dir=$RUN_DIR"
+echo "env_file=$ENV_FILE"

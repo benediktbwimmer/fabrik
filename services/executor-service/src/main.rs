@@ -964,6 +964,7 @@ fn signal_benchmark_artifact() -> CompiledWorkflowArtifact {
                     output_var: None,
                 },
             )]),
+            non_cancellable_states: std::collections::BTreeSet::new(),
         },
     )
 }
@@ -992,6 +993,7 @@ fn activity_benchmark_artifact() -> CompiledWorkflowArtifact {
                     on_error: None,
                 },
             )]),
+            non_cancellable_states: std::collections::BTreeSet::new(),
         },
     )
 }
@@ -2218,6 +2220,20 @@ async fn try_process_activity_terminal_resume_batch_fast_path(
             state.context.clone().or_else(|| state.input.clone()),
         )
         .await?;
+        maybe_unwind_pending_workflow_cancellation(
+            store,
+            runtime,
+            debug_state,
+            lease_state,
+            publisher,
+            trigger_event,
+            &artifact,
+            &mut state,
+            &mut record,
+            persist_mode,
+            lease_snapshot.partition_id,
+        )
+        .await?;
     }
 
     Ok(Some(applied))
@@ -2840,6 +2856,34 @@ async fn process_event_with_mark_mode(
                     state.context.clone().or_else(|| state.input.clone()),
                 )
                 .await?;
+                maybe_unwind_pending_workflow_cancellation(
+                    store,
+                    runtime,
+                    debug_state,
+                    lease_state,
+                    publisher,
+                    &event,
+                    &artifact,
+                    &mut state,
+                    &mut record,
+                    persist_mode,
+                    lease_snapshot.partition_id,
+                )
+                .await?;
+                maybe_unwind_pending_workflow_cancellation(
+                    store,
+                    runtime,
+                    debug_state,
+                    lease_state,
+                    publisher,
+                    &event,
+                    &artifact,
+                    &mut state,
+                    &mut record,
+                    persist_mode,
+                    lease_snapshot.partition_id,
+                )
+                .await?;
                 return Ok(());
             }
 
@@ -3200,6 +3244,20 @@ async fn process_event_with_mark_mode(
                 state.context.clone().or_else(|| state.input.clone()),
             )
             .await?;
+            maybe_unwind_pending_workflow_cancellation(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                publisher,
+                &event,
+                &artifact,
+                &mut state,
+                &mut record,
+                persist_mode,
+                lease_snapshot.partition_id,
+            )
+            .await?;
         }
         WorkflowEvent::BulkActivityBatchFailed {
             batch_id,
@@ -3279,6 +3337,20 @@ async fn process_event_with_mark_mode(
                 state.context.clone().or_else(|| state.input.clone()),
             )
             .await?;
+            maybe_unwind_pending_workflow_cancellation(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                publisher,
+                &event,
+                &artifact,
+                &mut state,
+                &mut record,
+                persist_mode,
+                lease_snapshot.partition_id,
+            )
+            .await?;
         }
         WorkflowEvent::ActivityTaskCompleted {
             activity_id: step_id, attempt: _, output, ..
@@ -3330,6 +3402,20 @@ async fn process_event_with_mark_mode(
                     &artifact,
                     plan,
                     state.context.clone().or_else(|| state.input.clone()),
+                )
+                .await?;
+                maybe_unwind_pending_workflow_cancellation(
+                    store,
+                    runtime,
+                    debug_state,
+                    lease_state,
+                    publisher,
+                    &event,
+                    &artifact,
+                    &mut state,
+                    &mut record,
+                    persist_mode,
+                    lease_snapshot.partition_id,
                 )
                 .await?;
                 return Ok(());
@@ -3499,6 +3585,20 @@ async fn process_event_with_mark_mode(
                             state.context.clone().or_else(|| state.input.clone()),
                         )
                         .await?;
+                        maybe_unwind_pending_workflow_cancellation(
+                            store,
+                            runtime,
+                            debug_state,
+                            lease_state,
+                            publisher,
+                            &event,
+                            &artifact,
+                            &mut state,
+                            &mut record,
+                            persist_mode,
+                            lease_snapshot.partition_id,
+                        )
+                        .await?;
                     }
                 }
                 return Ok(());
@@ -3660,6 +3760,20 @@ async fn process_event_with_mark_mode(
                             state.context.clone().or_else(|| state.input.clone()),
                         )
                         .await?;
+                        maybe_unwind_pending_workflow_cancellation(
+                            store,
+                            runtime,
+                            debug_state,
+                            lease_state,
+                            publisher,
+                            &event,
+                            &artifact,
+                            &mut state,
+                            &mut record,
+                            persist_mode,
+                            lease_snapshot.partition_id,
+                        )
+                        .await?;
                     }
                 }
                 return Ok(());
@@ -3802,6 +3916,20 @@ async fn process_event_with_mark_mode(
                     state.context.clone().or_else(|| state.input.clone()),
                 )
                 .await?;
+                maybe_unwind_pending_workflow_cancellation(
+                    store,
+                    runtime,
+                    debug_state,
+                    lease_state,
+                    publisher,
+                    &event,
+                    &artifact,
+                    &mut state,
+                    &mut record,
+                    persist_mode,
+                    lease_snapshot.partition_id,
+                )
+                .await?;
                 return Ok(());
             }
 
@@ -3910,6 +4038,20 @@ async fn process_event_with_mark_mode(
                 state.context.clone().or_else(|| state.input.clone()),
             )
             .await?;
+            maybe_unwind_pending_workflow_cancellation(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                publisher,
+                &event,
+                &artifact,
+                &mut state,
+                &mut record,
+                persist_mode,
+                lease_snapshot.partition_id,
+            )
+            .await?;
             return Ok(());
         }
         WorkflowEvent::ChildWorkflowFailed { child_id, error, .. }
@@ -3980,6 +4122,20 @@ async fn process_event_with_mark_mode(
                 state.context.clone().or_else(|| state.input.clone()),
             )
             .await?;
+            maybe_unwind_pending_workflow_cancellation(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                publisher,
+                &event,
+                &artifact,
+                &mut state,
+                &mut record,
+                persist_mode,
+                lease_snapshot.partition_id,
+            )
+            .await?;
             return Ok(());
         }
         WorkflowEvent::WorkflowUpdateRequested { .. } => {}
@@ -4034,6 +4190,20 @@ async fn process_event_with_mark_mode(
                 &artifact,
                 plan,
                 state.context.clone().or_else(|| state.input.clone()),
+            )
+            .await?;
+            maybe_unwind_pending_workflow_cancellation(
+                store,
+                runtime,
+                debug_state,
+                lease_state,
+                publisher,
+                &event,
+                &artifact,
+                &mut state,
+                &mut record,
+                persist_mode,
+                lease_snapshot.partition_id,
             )
             .await?;
             return Ok(());
@@ -4150,6 +4320,32 @@ async fn process_event_with_mark_mode(
         WorkflowEvent::SignalQueued { .. } => {}
         WorkflowEvent::WorkflowCancellationRequested { reason } => {
             let has_compiled_execution = state.artifact_execution.is_some();
+            let current_state = load_pinned_artifact(store, &event, &state, lookup_cache)
+                .await?
+                .map(|artifact| {
+                    state.current_state.clone().and_then(|current| {
+                        artifact.is_non_cancellable_state(&current).then_some(current)
+                    })
+                })
+                .flatten();
+            if has_compiled_execution && current_state.is_some() {
+                state.apply_event(&event);
+                if let Some(execution) = state.artifact_execution.as_mut() {
+                    execution.pending_workflow_cancellation = Some(reason.clone());
+                }
+                persist_state_with_mode(
+                    store,
+                    runtime,
+                    debug_state,
+                    lease_state,
+                    lease_snapshot.partition_id,
+                    &mut record,
+                    &state,
+                    persist_mode,
+                )
+                .await?;
+                return Ok(());
+            }
             let active_activities = if has_compiled_execution {
                 store
                     .list_activities_for_run(&event.tenant_id, &event.instance_id, &event.run_id)
@@ -4172,7 +4368,9 @@ async fn process_event_with_mark_mode(
             } else {
                 Vec::new()
             };
-            if has_compiled_execution && (!active_activities.is_empty() || !open_children.is_empty()) {
+            if has_compiled_execution
+                && (!active_activities.is_empty() || !open_children.is_empty())
+            {
                 state.apply_event(&event);
                 persist_state_with_mode(
                     store,
@@ -4306,6 +4504,246 @@ async fn process_event_with_mark_mode(
                     event.occurred_at,
                 )
                 .await?;
+        }
+        WorkflowEvent::ChildWorkflowSignalRequested { child_id, signal_name, payload } => {
+            let child = store
+                .list_open_children_for_run(&event.tenant_id, &event.instance_id, &event.run_id)
+                .await?
+                .into_iter()
+                .find(|child| &child.child_id == child_id);
+            let Some(child) = child else {
+                warn!(
+                    workflow_instance_id = %event.instance_id,
+                    child_id = %child_id,
+                    "child signal requested for unknown open child"
+                );
+                return Ok(());
+            };
+            let Some(child_run_id) = &child.child_run_id else {
+                warn!(
+                    workflow_instance_id = %event.instance_id,
+                    child_id = %child_id,
+                    "child signal requested before child run started"
+                );
+                return Ok(());
+            };
+            let Some(child_instance) =
+                store.get_instance(&event.tenant_id, &child.child_workflow_id).await?
+            else {
+                warn!(
+                    workflow_instance_id = %event.instance_id,
+                    child_id = %child_id,
+                    child_run_id = %child_run_id,
+                    "child signal requested for missing child instance"
+                );
+                return Ok(());
+            };
+            let signal_id = format!("child-sig-{}", event.event_id);
+            let signal_payload = WorkflowEvent::SignalQueued {
+                signal_id: signal_id.clone(),
+                signal_type: signal_name.clone(),
+                payload: payload.clone(),
+            };
+            let mut signal_event = EventEnvelope::new(
+                signal_payload.event_type(),
+                WorkflowIdentity::new(
+                    event.tenant_id.clone(),
+                    child_instance.definition_id.clone(),
+                    child_instance.definition_version.unwrap_or(event.definition_version),
+                    child_instance
+                        .artifact_hash
+                        .clone()
+                        .unwrap_or_else(|| event.artifact_hash.clone()),
+                    child.child_workflow_id.clone(),
+                    child_run_id.clone(),
+                    "executor-service",
+                ),
+                signal_payload,
+            );
+            signal_event.causation_id = Some(event.event_id);
+            signal_event.correlation_id = event.correlation_id.or(Some(event.event_id));
+            if !store
+                .queue_signal(
+                    &signal_event.tenant_id,
+                    &signal_event.instance_id,
+                    &signal_event.run_id,
+                    &signal_id,
+                    signal_name,
+                    None,
+                    payload,
+                    signal_event.event_id,
+                    signal_event.occurred_at,
+                )
+                .await?
+            {
+                return Ok(());
+            }
+            publisher.publish(&signal_event);
+            return Ok(());
+        }
+        WorkflowEvent::ChildWorkflowCancellationRequested { child_id, reason } => {
+            let child = store
+                .list_open_children_for_run(&event.tenant_id, &event.instance_id, &event.run_id)
+                .await?
+                .into_iter()
+                .find(|child| &child.child_id == child_id);
+            let Some(child) = child else {
+                warn!(
+                    workflow_instance_id = %event.instance_id,
+                    child_id = %child_id,
+                    "child cancellation requested for unknown open child"
+                );
+                return Ok(());
+            };
+            if let Some(child_run_id) = &child.child_run_id {
+                emit_parent_close_child_event(
+                    store,
+                    runtime,
+                    debug_state,
+                    lease_state,
+                    publisher,
+                    &event,
+                    &child,
+                    child_run_id,
+                    WorkflowEvent::WorkflowCancellationRequested { reason: reason.clone() },
+                )
+                .await?;
+            } else {
+                store
+                    .complete_child(
+                        &child.tenant_id,
+                        &child.instance_id,
+                        &child.run_id,
+                        &child.child_id,
+                        "cancelled",
+                        None,
+                        Some("cancel requested before child start"),
+                        event.event_id,
+                        event.occurred_at,
+                    )
+                    .await?;
+            }
+            return Ok(());
+        }
+        WorkflowEvent::ExternalWorkflowSignalRequested {
+            target_instance_id,
+            target_run_id,
+            signal_name,
+            payload,
+        } => {
+            let Some(target_instance) =
+                store.get_instance(&event.tenant_id, target_instance_id).await?
+            else {
+                warn!(
+                    workflow_instance_id = %event.instance_id,
+                    target_instance_id = %target_instance_id,
+                    "external signal requested for missing target instance"
+                );
+                return Ok(());
+            };
+            if target_run_id.as_ref().is_some_and(|run_id| run_id != &target_instance.run_id) {
+                warn!(
+                    workflow_instance_id = %event.instance_id,
+                    target_instance_id = %target_instance_id,
+                    requested_run_id = ?target_run_id,
+                    actual_run_id = %target_instance.run_id,
+                    "external signal requested for non-current target run"
+                );
+                return Ok(());
+            }
+            let signal_id = format!("ext-sig-{}", event.event_id);
+            let signal_payload = WorkflowEvent::SignalQueued {
+                signal_id: signal_id.clone(),
+                signal_type: signal_name.clone(),
+                payload: payload.clone(),
+            };
+            let mut signal_event = EventEnvelope::new(
+                signal_payload.event_type(),
+                WorkflowIdentity::new(
+                    event.tenant_id.clone(),
+                    target_instance.definition_id.clone(),
+                    target_instance.definition_version.unwrap_or(event.definition_version),
+                    target_instance
+                        .artifact_hash
+                        .clone()
+                        .unwrap_or_else(|| event.artifact_hash.clone()),
+                    target_instance.instance_id.clone(),
+                    target_instance.run_id.clone(),
+                    "executor-service",
+                ),
+                signal_payload,
+            );
+            signal_event.causation_id = Some(event.event_id);
+            signal_event.correlation_id = event.correlation_id.or(Some(event.event_id));
+            signal_event.dedupe_key =
+                Some(format!("external-signal:{target_instance_id}:{}", event.event_id));
+            if !store
+                .queue_signal(
+                    &signal_event.tenant_id,
+                    &signal_event.instance_id,
+                    &signal_event.run_id,
+                    &signal_id,
+                    signal_name,
+                    signal_event.dedupe_key.as_deref(),
+                    payload,
+                    signal_event.event_id,
+                    signal_event.occurred_at,
+                )
+                .await?
+            {
+                return Ok(());
+            }
+            publisher.publish(&signal_event);
+            return Ok(());
+        }
+        WorkflowEvent::ExternalWorkflowCancellationRequested {
+            target_instance_id,
+            target_run_id,
+            reason,
+        } => {
+            let Some(target_instance) =
+                store.get_instance(&event.tenant_id, target_instance_id).await?
+            else {
+                warn!(
+                    workflow_instance_id = %event.instance_id,
+                    target_instance_id = %target_instance_id,
+                    "external cancellation requested for missing target instance"
+                );
+                return Ok(());
+            };
+            if target_run_id.as_ref().is_some_and(|run_id| run_id != &target_instance.run_id) {
+                warn!(
+                    workflow_instance_id = %event.instance_id,
+                    target_instance_id = %target_instance_id,
+                    requested_run_id = ?target_run_id,
+                    actual_run_id = %target_instance.run_id,
+                    "external cancellation requested for non-current target run"
+                );
+                return Ok(());
+            }
+            let mut cancel_event = EventEnvelope::new(
+                WorkflowEvent::WorkflowCancellationRequested { reason: reason.clone() }
+                    .event_type(),
+                WorkflowIdentity::new(
+                    event.tenant_id.clone(),
+                    target_instance.definition_id.clone(),
+                    target_instance.definition_version.unwrap_or(event.definition_version),
+                    target_instance
+                        .artifact_hash
+                        .clone()
+                        .unwrap_or_else(|| event.artifact_hash.clone()),
+                    target_instance.instance_id.clone(),
+                    target_instance.run_id.clone(),
+                    "executor-service",
+                ),
+                WorkflowEvent::WorkflowCancellationRequested { reason: reason.clone() },
+            );
+            cancel_event.causation_id = Some(event.event_id);
+            cancel_event.correlation_id = event.correlation_id.or(Some(event.event_id));
+            cancel_event.dedupe_key =
+                Some(format!("external-cancel:{target_instance_id}:{}", event.event_id));
+            publisher.publish(&cancel_event);
+            return Ok(());
         }
         WorkflowEvent::ChildWorkflowCompleted { child_id, output, .. } => {
             store
@@ -5703,6 +6141,131 @@ async fn publish_failure(
     Ok(())
 }
 
+async fn maybe_unwind_pending_workflow_cancellation(
+    store: &WorkflowStore,
+    runtime: &mut ExecutorRuntime,
+    debug_state: &Arc<Mutex<ExecutorDebugState>>,
+    lease_state: &Arc<Mutex<LeaseState>>,
+    publisher: &mut WorkflowPublishBuffer<'_>,
+    event: &EventEnvelope<WorkflowEvent>,
+    artifact: &CompiledWorkflowArtifact,
+    state: &mut WorkflowInstanceState,
+    record: &mut HotStateRecord,
+    persist_mode: &mut PersistMode,
+    partition_id: i32,
+) -> Result<()> {
+    if state.status.is_terminal() {
+        return Ok(());
+    }
+    let current_state =
+        state.current_state.clone().unwrap_or_else(|| artifact.workflow.initial_state.clone());
+    let Some(reason) = state.artifact_execution.as_ref().and_then(|execution| {
+        artifact.pending_workflow_cancellation_ready(&current_state, execution).map(str::to_owned)
+    }) else {
+        return Ok(());
+    };
+    if let Some(execution) = state.artifact_execution.as_mut() {
+        execution.pending_workflow_cancellation = None;
+    }
+    let active_activities = store
+        .list_activities_for_run(&event.tenant_id, &event.instance_id, &event.run_id)
+        .await?
+        .into_iter()
+        .filter(|activity| {
+            matches!(
+                activity.status,
+                WorkflowActivityStatus::Scheduled | WorkflowActivityStatus::Started
+            )
+        })
+        .collect::<Vec<_>>();
+    let open_children = store
+        .list_open_children_for_run(&event.tenant_id, &event.instance_id, &event.run_id)
+        .await?;
+    if !active_activities.is_empty() || !open_children.is_empty() {
+        persist_state_with_mode(
+            store,
+            runtime,
+            debug_state,
+            lease_state,
+            partition_id,
+            record,
+            state,
+            persist_mode,
+        )
+        .await?;
+        ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
+        for activity in active_activities {
+            let mut cancel_requested = EventEnvelope::new(
+                WorkflowEvent::ActivityTaskCancellationRequested {
+                    activity_id: activity.activity_id.clone(),
+                    attempt: activity.attempt,
+                    reason: reason.clone(),
+                    metadata: None,
+                }
+                .event_type(),
+                source_identity(event, "executor-service"),
+                WorkflowEvent::ActivityTaskCancellationRequested {
+                    activity_id: activity.activity_id.clone(),
+                    attempt: activity.attempt,
+                    reason: reason.clone(),
+                    metadata: None,
+                },
+            );
+            cancel_requested.causation_id = Some(event.event_id);
+            cancel_requested.correlation_id = event.correlation_id.or(Some(event.event_id));
+            cancel_requested.dedupe_key = Some(format!(
+                "workflow-cancel-pending-activity:{}:{}",
+                activity.activity_id, activity.attempt
+            ));
+            publisher.publish(&cancel_requested);
+        }
+        for child in open_children {
+            if let Some(child_run_id) = &child.child_run_id {
+                emit_parent_close_child_event(
+                    store,
+                    runtime,
+                    debug_state,
+                    lease_state,
+                    publisher,
+                    event,
+                    &child,
+                    child_run_id,
+                    WorkflowEvent::WorkflowCancellationRequested {
+                        reason: format!("{reason} (propagated from parent run {})", event.run_id),
+                    },
+                )
+                .await?;
+            } else {
+                store
+                    .complete_child(
+                        &child.tenant_id,
+                        &child.instance_id,
+                        &child.run_id,
+                        &child.child_id,
+                        "cancelled",
+                        None,
+                        Some("cancel requested before child start"),
+                        event.event_id,
+                        event.occurred_at,
+                    )
+                    .await?;
+            }
+        }
+        return Ok(());
+    }
+
+    ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
+    let mut cancelled = EventEnvelope::new(
+        WorkflowEvent::WorkflowCancelled { reason: reason.clone() }.event_type(),
+        source_identity(event, "executor-service"),
+        WorkflowEvent::WorkflowCancelled { reason },
+    );
+    cancelled.causation_id = Some(event.event_id);
+    cancelled.correlation_id = event.correlation_id.or(Some(event.event_id));
+    publisher.publish(&cancelled);
+    Ok(())
+}
+
 async fn publish_compiled_plan(
     store: &WorkflowStore,
     runtime: &mut ExecutorRuntime,
@@ -6691,8 +7254,12 @@ mod tests {
             markers: BTreeMap::new(),
             active_signal: None,
             active_update: None,
+            pending_workflow_cancellation: None,
             turn_context: None,
             pending_markers: Vec::new(),
+            version_markers: BTreeMap::new(),
+            pending_version_markers: Vec::new(),
+            condition_timers: std::collections::BTreeSet::new(),
         });
 
         assert_eq!(resolve_bulk_wait_state(&state, "batch-1").as_deref(), Some("join"));

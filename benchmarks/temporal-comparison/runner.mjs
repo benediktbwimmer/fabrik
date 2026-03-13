@@ -18,6 +18,14 @@ import {
 
 const BENCHMARK_FAILURE_TYPE = "BenchmarkConfiguredFailure";
 const BENCHMARK_CANCELLED_TYPE = "BenchmarkCancelled";
+const FABRIK_SCENARIOS = [
+  {
+    name: "unified-experiment",
+    stackKey: "unified-experiment",
+    stackExecutionMode: "unified",
+    args: ["--execution-mode", "unified", "--bulk-reducer", "all_settled"],
+  },
+];
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
@@ -26,6 +34,13 @@ async function main() {
   const outputPath = path.resolve(repoRoot, args.output);
   const outputDir = path.dirname(outputPath);
   const workloads = await loadManifest(manifestPath, args.profile);
+  const fabrikResults = await runFabrikMatrix({
+    outputDir,
+    profile: args.profile,
+    repetitions: args.repetitions,
+    repoRoot,
+    workloads,
+  });
   const connection = await connectWithRetry(args.temporalAddress);
 
   try {
@@ -49,13 +64,7 @@ async function main() {
           temporalNamespace: args.temporalNamespace,
           workload,
         });
-        const fabrik = await runFabrikWorkload({
-          outputDir,
-          profile: args.profile,
-          repoRoot,
-          repetition,
-          workload,
-        });
+        const fabrik = loadFabrikResult(fabrikResults, workload, repetition);
         runs.push({
           repetition,
           temporal,
@@ -182,13 +191,15 @@ async function runTemporalWorkload({
   await worker.runUntil(async () => {
     const handles = await Promise.all(
       Array.from({ length: workload.workflowCount }, (_, workflowIndex) =>
-        client.workflow.start("fanoutBenchmarkWorkflow", {
+        client.workflow.start(workflowTypeFor(workload), {
           args: [
             buildWorkflowInput(
+              workload,
               workload.activitiesPerWorkflow,
               workload.payloadSize,
               workload.retryRate,
               workload.cancelRate,
+              `${workflowIdPrefix}-${workflowIndex.toString().padStart(4, "0")}`,
             ),
           ],
           taskQueue,
@@ -197,6 +208,19 @@ async function runTemporalWorkload({
         }),
       ),
     );
+
+    if (workload.kind === "signal_gate") {
+      await Promise.all(handles.map((handle) => handle.signal("approve", { approved: true })));
+    }
+    if (workload.kind === "update_gate") {
+      await Promise.all(
+        handles.map((handle) =>
+          handle.executeUpdate("setValue", {
+            args: [1],
+          }),
+        ),
+      );
+    }
 
     await Promise.all(
       handles.map(async (handle) => {
@@ -371,11 +395,16 @@ function isWorkflowCancelled(error) {
   return error?.name === "CancelledFailure";
 }
 
-function buildWorkflowInput(activitiesPerWorkflow, payloadSize, retryRate, cancelRate) {
+function workflowTypeFor(workload) {
+  return workload.kind === "fanout" ? "fanoutBenchmarkWorkflow" : "comparisonBenchmarkWorkflow";
+}
+
+function buildWorkflowInput(workload, activitiesPerWorkflow, payloadSize, retryRate, cancelRate, workflowId) {
   const retryCount = Math.round(activitiesPerWorkflow * retryRate);
   const cancelCount = Math.round(activitiesPerWorkflow * cancelRate);
   const payload = "x".repeat(payloadSize);
-  return {
+  const input = {
+    kind: workload.kind,
     items: Array.from({ length: activitiesPerWorkflow }, (_, index) => ({
       index,
       payload,
@@ -383,73 +412,208 @@ function buildWorkflowInput(activitiesPerWorkflow, payloadSize, retryRate, cance
       cancel: index >= retryCount && index < retryCount + cancelCount,
     })),
   };
+  if (workload.kind === "timer_gate") {
+    input.timerSecs = workload.timerSecs ?? 1;
+  }
+  if (workload.kind === "continue_as_new") {
+    input.remaining = workload.continueRounds ?? 1;
+  }
+  if (workload.kind === "child_workflow") {
+    input.childWorkflowId = `${workflowId}/child`;
+  }
+  return input;
 }
 
-async function runFabrikWorkload({ outputDir, profile, repoRoot, repetition, workload }) {
-  const workloadKey = sanitizeIdentifier(workload.name);
-  const scriptPath = path.join(repoRoot, "scripts", "run-isolated-benchmark.sh");
-  const scenarios = [
-    {
-      name: "durable",
-      args: ["--execution-mode", "durable", "--bulk-reducer", "all_settled"],
-    },
-    {
-      name: "unified-experiment",
-      args: ["--execution-mode", "unified", "--bulk-reducer", "all_settled"],
-    },
-    {
-      name: "throughput-pg-v1",
-      args: ["--execution-mode", "throughput", "--throughput-backend", "pg-v1"],
-    },
-    {
-      name: "throughput-stream-v2",
-      args: ["--execution-mode", "throughput", "--throughput-backend", "stream-v2"],
-    },
-  ];
-  const reports = [];
+function fabrikScenariosForWorkload(workload) {
+  return FABRIK_SCENARIOS;
+}
 
-  for (const scenario of scenarios) {
-    const namespace = `temporal-compare-${workloadKey}-${scenario.name}-r${repetition}-${Date.now()}`;
-    const outputPath = path.join(
-      outputDir,
-      `${workloadKey}-fabrik-r${repetition}-${scenario.name}.json`,
+function fabrikResultKey(workloadName, repetition) {
+  return `${workloadName}::${repetition}`;
+}
+
+function loadFabrikResult(results, workload, repetition) {
+  const reports = results.get(fabrikResultKey(workload.name, repetition));
+  if (!reports) {
+    throw new Error(
+      `missing Fabrik reports for workload=${workload.name} repetition=${repetition}`,
     );
-    const args = [
-      ...scenario.args,
-      "--profile",
-      profile,
-      "--workflow-count",
-      String(workload.workflowCount),
-      "--activities-per-workflow",
-      String(workload.activitiesPerWorkflow),
-      "--payload-size",
-      String(workload.payloadSize),
-      "--worker-count",
-      String(workload.workerCount),
-      "--retry-rate",
-      String(workload.retryRate),
-      "--cancel-rate",
-      String(workload.cancelRate),
-      "--timeout-secs",
-      String(workload.timeoutSecs),
-      "--output",
-      outputPath,
-    ];
-    await runCommand(scriptPath, args, {
+  }
+  const expectedOrder = fabrikScenariosForWorkload(workload).map((scenario) => scenario.name);
+  const reportByScenario = new Map(reports.map((report) => [report.scenario, report]));
+  return {
+    scenarios: expectedOrder.map((scenarioName) => {
+      const report = reportByScenario.get(scenarioName);
+      if (!report) {
+        throw new Error(
+          `missing Fabrik scenario=${scenarioName} for workload=${workload.name} repetition=${repetition}`,
+        );
+      }
+      return report;
+    }),
+  };
+}
+
+function buildStackPlans(workloads) {
+  const plans = new Map();
+  for (const workload of workloads) {
+    for (const scenario of fabrikScenariosForWorkload(workload)) {
+      const current = plans.get(scenario.stackKey) ?? {
+        key: scenario.stackKey,
+        executionMode: scenario.stackExecutionMode,
+        maxWorkerCount: 0,
+      };
+      current.maxWorkerCount = Math.max(current.maxWorkerCount, workload.workerCount);
+      plans.set(scenario.stackKey, current);
+    }
+  }
+  return Array.from(plans.values());
+}
+
+async function runFabrikMatrix({ outputDir, profile, repetitions, repoRoot, workloads }) {
+  const results = new Map();
+  for (const stackPlan of buildStackPlans(workloads)) {
+    const stack = await startFabrikStack({ repoRoot, stackPlan });
+    try {
+      for (let repetition = 1; repetition <= repetitions; repetition += 1) {
+        for (const workload of workloads) {
+          for (const scenario of fabrikScenariosForWorkload(workload)) {
+            if (scenario.stackKey !== stackPlan.key) {
+              continue;
+            }
+            const report = await runFabrikScenario({
+              outputDir,
+              profile,
+              repetition,
+              repoRoot,
+              scenario,
+              stack,
+              workload,
+            });
+            const key = fabrikResultKey(workload.name, repetition);
+            const current = results.get(key) ?? [];
+            current.push(report);
+            results.set(key, current);
+          }
+        }
+      }
+    } finally {
+      await stopFabrikStack({ repoRoot, runDir: stack.runDir });
+    }
+  }
+  return results;
+}
+
+async function startFabrikStack({ repoRoot, stackPlan }) {
+  const stackName = `temporal-compare-${stackPlan.key}-${Date.now()}`;
+  const runDir = path.join(repoRoot, "target", "benchmark-stacks", stackName);
+  const scriptPath = path.join(repoRoot, "scripts", "manage-benchmark-stack.sh");
+  await runCommand(
+    scriptPath,
+    [
+      "start",
+      "--execution-mode",
+      stackPlan.executionMode,
+      "--namespace",
+      stackName,
+      "--run-dir",
+      runDir,
+      "--tenant-id",
+      stackName,
+      "--task-queue",
+      "default",
+    ],
+    {
       cwd: repoRoot,
       env: {
         ...process.env,
-        ACTIVITY_WORKER_CONCURRENCY: String(workload.workerCount),
-        BENCHMARK_NAMESPACE: namespace,
-        BUILD_RELEASE_BINARIES: "0",
-        STREAM_ACTIVITY_WORKER_CONCURRENCY: String(workload.workerCount),
+        ACTIVITY_WORKER_CONCURRENCY: String(stackPlan.maxWorkerCount),
+        BUILD_RELEASE_BINARIES: process.env.BUILD_RELEASE_BINARIES ?? "1",
+        STREAM_ACTIVITY_WORKER_CONCURRENCY: String(stackPlan.maxWorkerCount),
       },
-    });
-    reports.push(JSON.parse(await fs.readFile(outputPath, "utf8")));
-  }
+    },
+  );
+  const env = await readEnvFile(path.join(runDir, "environment.txt"));
+  return { env, runDir };
+}
 
+async function stopFabrikStack({ repoRoot, runDir }) {
+  const scriptPath = path.join(repoRoot, "scripts", "manage-benchmark-stack.sh");
+  await runCommand(scriptPath, ["stop", "--run-dir", runDir], {
+    cwd: repoRoot,
+    env: process.env,
+  });
+}
+
+async function readEnvFile(envPath) {
+  const content = await fs.readFile(envPath, "utf8");
+  const env = {};
+  for (const line of content.split("\n")) {
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+    const separator = line.indexOf("=");
+    if (separator === -1) {
+      continue;
+    }
+    env[line.slice(0, separator)] = line.slice(separator + 1);
+  }
+  return env;
+}
+
+async function runFabrikScenario({ outputDir, profile, repetition, repoRoot, scenario, stack, workload }) {
+  const workloadKey = sanitizeIdentifier(workload.name);
+  const outputPath = path.join(
+    outputDir,
+    `${workloadKey}-fabrik-r${repetition}-${scenario.name}.json`,
+  );
+  const benchmarkRunnerPath = path.join(repoRoot, "target", "release", "benchmark-runner");
+  const args = [
+    ...scenario.args,
+    "--profile",
+    profile,
+    "--workflow-count",
+    String(workload.workflowCount),
+    "--activities-per-workflow",
+    String(workload.activitiesPerWorkflow),
+    "--payload-size",
+    String(workload.payloadSize),
+    "--worker-count",
+    String(workload.workerCount),
+    "--retry-rate",
+    String(workload.retryRate),
+    "--cancel-rate",
+    String(workload.cancelRate),
+    "--workload-kind",
+    workload.kind,
+    "--timer-secs",
+    String(workload.timerSecs ?? 1),
+    "--continue-rounds",
+    String(workload.continueRounds ?? 1),
+    "--timeout-secs",
+    String(workload.timeoutSecs),
+    "--tenant-id",
+    stack.env.TENANT_ID,
+    "--task-queue",
+    stack.env.TASK_QUEUE,
+    "--output",
+    outputPath,
+  ];
+  console.log(
+    `[temporal-comparison] fabrik_stack=${scenario.stackKey} scenario=${scenario.name} workload=${workload.name} repetition=${repetition}`,
+  );
+  await runCommand(benchmarkRunnerPath, args, {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      ...stack.env,
+    },
+  });
+  const report = JSON.parse(await fs.readFile(outputPath, "utf8"));
   return {
-    scenarios: reports.map(normalizeFabrikScenario),
+    ...normalizeFabrikScenario(report),
+    rawScenario: report.scenario,
+    scenario: scenario.name,
   };
 }
 

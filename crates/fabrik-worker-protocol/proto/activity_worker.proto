@@ -8,6 +8,7 @@ message PollActivityTaskRequest {
   string worker_id = 3;
   string worker_build_id = 4;
   uint64 poll_timeout_ms = 5;
+  bool supports_cbor = 6;
 }
 
 message PollActivityTasksRequest {
@@ -17,6 +18,7 @@ message PollActivityTasksRequest {
   string worker_build_id = 4;
   uint64 poll_timeout_ms = 5;
   uint32 max_tasks = 6;
+  bool supports_cbor = 7;
 }
 
 message ActivityTask {
@@ -32,6 +34,9 @@ message ActivityTask {
   uint32 attempt = 10;
   string input_json = 11;
   string config_json = 12;
+  bytes input_cbor = 22;
+  bytes config_cbor = 23;
+  bool prefer_cbor = 24;
   string state = 13;
   int64 scheduled_at_unix_ms = 14;
   int64 lease_expires_at_unix_ms = 15;
@@ -41,6 +46,7 @@ message ActivityTask {
   uint64 schedule_to_start_timeout_ms = 19;
   uint64 lease_epoch = 20;
   uint64 owner_epoch = 21;
+  bool omit_success_output = 25;
 }
 
 message PollActivityTaskResponse {
@@ -194,6 +200,7 @@ message ReportActivityTaskCancelledRequest {
 
 message ActivityTaskCompletedResult {
   string output_json = 1;
+  bytes output_cbor = 2;
 }
 
 message ActivityTaskFailedResult {
@@ -203,6 +210,7 @@ message ActivityTaskFailedResult {
 message ActivityTaskCancelledResult {
   string reason = 1;
   string metadata_json = 2;
+  bytes metadata_cbor = 3;
 }
 
 message ActivityTaskResult {

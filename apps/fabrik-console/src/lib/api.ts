@@ -17,6 +17,7 @@ export type WorkflowListItem = {
   workflow_task_queue: string;
   sticky_workflow_build_id: string | null;
   sticky_workflow_poller_id: string | null;
+  routing_status: string;
   current_state: string | null;
   status: string;
   event_count: number;
@@ -182,6 +183,7 @@ export type RunListItem = {
   workflow_task_queue: string;
   sticky_workflow_build_id: string | null;
   sticky_workflow_poller_id: string | null;
+  routing_status: string;
   sticky_updated_at: string | null;
   previous_run_id: string | null;
   next_run_id: string | null;
@@ -225,10 +227,19 @@ export type WorkflowRoutingResponse = {
   tenant_id: string;
   instance_id: string;
   run_id: string;
+  definition_id: string;
+  definition_version: number | null;
+  artifact_hash: string | null;
   workflow_task_queue: string;
+  routing_status: string;
+  default_compatibility_set_id: string | null;
+  compatible_build_ids: string[];
+  registered_build_ids: string[];
   sticky_workflow_build_id: string | null;
   sticky_workflow_poller_id: string | null;
   sticky_updated_at: string | null;
+  sticky_build_compatible_with_queue: boolean | null;
+  sticky_build_supports_pinned_artifact: boolean | null;
 };
 
 export type ExecutionGraphResponse = {
@@ -307,6 +318,178 @@ export type DefinitionSummary = {
 };
 
 export type ArtifactSummary = DefinitionSummary;
+
+export type WorkflowDefinition = {
+  id: string;
+  version: number;
+  initial_state: string;
+  states: Record<string, unknown>;
+};
+
+export type CompiledWorkflowArtifact = {
+  definition_id: string;
+  definition_version: number;
+  compiler_version: string;
+  source_language: string;
+  entrypoint: { module: string; export: string };
+  source_files: string[];
+  source_map: Record<string, { file: string; line: number; column: number }>;
+  queries: Record<string, unknown>;
+  signals: Record<string, unknown>;
+  updates: Record<string, unknown>;
+  workflow: { initial_state: string; states: Record<string, unknown> };
+  artifact_hash: string;
+};
+
+export type WorkflowGraphSourceAnchor = {
+  file: string;
+  line: number;
+  column: number;
+};
+
+export type WorkflowGraphNode = {
+  id: string;
+  graph: string;
+  module_id: string;
+  state_id: string | null;
+  kind: string;
+  label: string;
+  subtitle: string | null;
+  source_anchor: WorkflowGraphSourceAnchor | null;
+  next_ids: string[];
+  raw: unknown;
+};
+
+export type WorkflowGraphEdge = {
+  id: string;
+  source: string;
+  target: string;
+  label: string;
+  kind: string;
+};
+
+export type WorkflowGraphModule = {
+  id: string;
+  graph: string;
+  kind: string;
+  label: string;
+  subtitle: string | null;
+  node_ids: string[];
+  state_ids: string[];
+  focus_node_id: string;
+  collapsed_by_default: boolean;
+  source_anchor: WorkflowGraphSourceAnchor | null;
+  raw: unknown;
+};
+
+export type WorkflowGraphOverlayStatus = {
+  id: string;
+  status: string;
+  summary: string | null;
+};
+
+export type WorkflowGraphBlockedBy = {
+  kind: string;
+  label: string;
+  detail: string | null;
+  node_id: string | null;
+  module_id: string | null;
+};
+
+export type WorkflowGraphTraceStep = {
+  id: string;
+  occurred_at: string;
+  lane: string;
+  label: string;
+  detail: string | null;
+  event_type: string;
+  node_id: string | null;
+  module_id: string | null;
+};
+
+export type WorkflowGraphActivitySummary = {
+  node_id: string;
+  module_id: string;
+  activity_type: string;
+  total: number;
+  pending: number;
+  completed: number;
+  failed: number;
+  retrying: number;
+  worker_build_ids: string[];
+};
+
+export type WorkflowGraphBulkSummary = {
+  node_id: string;
+  module_id: string;
+  batch_id: string;
+  activity_type: string;
+  status: string;
+  total_items: number;
+  succeeded_items: number;
+  failed_items: number;
+  cancelled_items: number;
+};
+
+export type WorkflowGraphSignalSummary = {
+  signal_name: string;
+  count: number;
+  latest_status: string;
+  latest_seen_at: string;
+  node_id: string | null;
+  module_id: string | null;
+};
+
+export type WorkflowGraphUpdateSummary = {
+  update_name: string;
+  count: number;
+  latest_status: string;
+  latest_seen_at: string;
+  module_id: string | null;
+};
+
+export type WorkflowGraphChildSummary = {
+  child_id: string;
+  child_definition_id: string;
+  child_workflow_id: string;
+  child_run_id: string | null;
+  status: string;
+  node_id: string | null;
+  module_id: string | null;
+};
+
+export type WorkflowGraphOverlay = {
+  mode: string;
+  run_id: string | null;
+  current_node_id: string | null;
+  current_module_id: string | null;
+  blocked_by: WorkflowGraphBlockedBy | null;
+  node_statuses: WorkflowGraphOverlayStatus[];
+  module_statuses: WorkflowGraphOverlayStatus[];
+  trace: WorkflowGraphTraceStep[];
+  activity_summaries: WorkflowGraphActivitySummary[];
+  bulk_summaries: WorkflowGraphBulkSummary[];
+  signal_summaries: WorkflowGraphSignalSummary[];
+  update_summaries: WorkflowGraphUpdateSummary[];
+  child_summaries: WorkflowGraphChildSummary[];
+};
+
+export type WorkflowGraphResponse = {
+  tenant_id: string;
+  definition_id: string;
+  definition_version: number;
+  artifact_hash: string;
+  entrypoint_module: string;
+  entrypoint_export: string;
+  consistency: string;
+  authoritative_source: string;
+  source_files: string[];
+  nodes: WorkflowGraphNode[];
+  edges: WorkflowGraphEdge[];
+  modules: WorkflowGraphModule[];
+  module_edges: WorkflowGraphEdge[];
+  overlay: WorkflowGraphOverlay;
+};
 
 type SearchResponse = {
   tenant_id: string;
@@ -397,9 +580,13 @@ export const api = {
   listArtifactSummaries: (tenantId: string, q = "") =>
     request<ArtifactSummariesResponse>(`/tenants/${tenantId}/workflow-artifacts${q ? `?q=${encodeURIComponent(q)}` : ""}`),
   getLatestDefinition: (tenantId: string, definitionId: string) =>
-    request<unknown>(`/tenants/${tenantId}/workflow-definitions/${definitionId}/latest`),
+    request<WorkflowDefinition>(`/tenants/${tenantId}/workflow-definitions/${definitionId}/latest`),
+  getDefinitionGraph: (tenantId: string, definitionId: string) =>
+    request<WorkflowGraphResponse>(`/tenants/${tenantId}/workflow-definitions/${definitionId}/graph`),
   getLatestArtifact: (tenantId: string, definitionId: string) =>
-    request<unknown>(`/tenants/${tenantId}/workflow-artifacts/${definitionId}/latest`),
+    request<CompiledWorkflowArtifact>(`/tenants/${tenantId}/workflow-artifacts/${definitionId}/latest`),
+  getRunGraph: (tenantId: string, instanceId: string, runId: string) =>
+    request<WorkflowGraphResponse>(`/tenants/${tenantId}/workflows/${instanceId}/runs/${runId}/graph`),
   signalWorkflow: (tenantId: string, instanceId: string, signalType: string, payload: unknown) =>
     request(`/tenants/${tenantId}/workflows/${instanceId}/signals/${signalType}`, {
       method: "POST",

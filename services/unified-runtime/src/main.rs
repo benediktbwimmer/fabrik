@@ -17,16 +17,17 @@ use axum::{
 use chrono::{DateTime, Utc};
 use fabrik_broker::{
     BrokerConfig, WorkflowHistoryFilter, build_workflow_consumer, decode_consumed_workflow_event,
-    read_workflow_history,
+    partition_for_instance, read_workflow_history,
 };
 use fabrik_config::{GrpcServiceConfig, HttpServiceConfig, PostgresConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
     ActivityScheduleUpdate, ActivityStartUpdate, ActivityTerminalPayload, ActivityTerminalUpdate,
-    ConsumedSignalRecord, WorkflowActivityStatus, WorkflowMailboxKind, WorkflowMailboxRecord,
-    WorkflowMailboxStatus, WorkflowStore, WorkflowUpdateStatus,
+    ConsumedSignalRecord, TaskQueueKind, WorkflowActivityStatus, WorkflowMailboxKind,
+    WorkflowMailboxRecord, WorkflowMailboxStatus, WorkflowStore, WorkflowUpdateStatus,
 };
+use fabrik_throughput::{decode_cbor, encode_cbor};
 use fabrik_worker_protocol::activity_worker::{
     Ack, ActivityTask, ActivityTaskCancelledResult, ActivityTaskCompletedResult,
     ActivityTaskFailedResult, ActivityTaskResult, PollActivityTaskRequest,
@@ -63,7 +64,9 @@ struct AppState {
     store: WorkflowStore,
     inner: Arc<StdMutex<RuntimeInner>>,
     ownership: Arc<StdMutex<UnifiedOwnershipState>>,
+    workflow_partition_count: i32,
     notify: Arc<Notify>,
+    retry_notify: Arc<Notify>,
     persist_notify: Arc<Notify>,
     persist_lock: Arc<Mutex<()>>,
     persistence: PersistenceConfig,
@@ -121,7 +124,7 @@ struct RuntimeInner {
     instances: HashMap<RunKey, RuntimeWorkflowState>,
     ready: HashMap<QueueKey, VecDeque<QueuedActivity>>,
     leased: HashMap<AttemptKey, LeasedActivity>,
-    delayed_retries: Vec<DelayedRetryTask>,
+    delayed_retries: BTreeMap<DateTime<Utc>, Vec<DelayedRetryTask>>,
     dirty_reason: Option<String>,
     force_snapshot: bool,
 }
@@ -161,6 +164,8 @@ struct ActiveActivityMeta {
     task_queue: String,
     activity_type: String,
     wait_state: String,
+    #[serde(default)]
+    omit_success_output: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,9 +183,14 @@ struct QueuedActivity {
     input: Value,
     config: Option<Value>,
     state: String,
+    schedule_to_start_timeout_ms: Option<u64>,
+    start_to_close_timeout_ms: Option<u64>,
+    heartbeat_timeout_ms: Option<u64>,
     scheduled_at: DateTime<Utc>,
     #[serde(default)]
     cancellation_requested: bool,
+    #[serde(default)]
+    omit_success_output: bool,
     #[serde(default)]
     lease_epoch: u64,
 }
@@ -279,6 +289,40 @@ enum PreparedDbAction {
         error: Option<String>,
         completed_event_id: Uuid,
         completed_at: DateTime<Utc>,
+    },
+    UpsertTimer {
+        partition_id: i32,
+        tenant_id: String,
+        instance_id: String,
+        run_id: String,
+        definition_id: String,
+        definition_version: Option<u32>,
+        artifact_hash: Option<String>,
+        timer_id: String,
+        state: Option<String>,
+        fire_at: DateTime<Utc>,
+        scheduled_event_id: Uuid,
+        correlation_id: Option<Uuid>,
+    },
+    DeleteTimer {
+        tenant_id: String,
+        instance_id: String,
+        timer_id: String,
+    },
+    DeleteTimersForRun {
+        tenant_id: String,
+        instance_id: String,
+        run_id: String,
+    },
+    RecordRunContinuation {
+        tenant_id: String,
+        instance_id: String,
+        previous_run_id: String,
+        new_run_id: String,
+        continue_reason: String,
+        continued_event_id: Uuid,
+        triggered_event_id: Uuid,
+        transitioned_at: DateTime<Utc>,
     },
 }
 
@@ -401,7 +445,9 @@ async fn main() -> Result<()> {
             ownership.partition_id,
             &ownership.owner_id,
         ))),
+        workflow_partition_count: redpanda.workflow_events_partitions,
         notify: Arc::new(Notify::new()),
+        retry_notify: Arc::new(Notify::new()),
         persist_notify: Arc::new(Notify::new()),
         persist_lock: Arc::new(Mutex::new(())),
         persistence,
@@ -444,7 +490,7 @@ async fn main() -> Result<()> {
                     instances: inner.instances.len(),
                     ready_tasks: inner.ready.values().map(VecDeque::len).sum(),
                     leased_tasks: inner.leased.len(),
-                    delayed_retries: inner.delayed_retries.len(),
+                    delayed_retries: delayed_retry_count(&inner.delayed_retries),
                 })
             }
         }),
@@ -548,6 +594,7 @@ async fn restore_runtime_state_from_store(
                         task_queue: activity.task_queue.clone(),
                         activity_type: activity.activity_type.clone(),
                         wait_state: activity.state.clone().unwrap_or_default(),
+                        omit_success_output: false,
                     },
                 );
             }
@@ -587,7 +634,7 @@ fn reconcile_restored_runtime(
             if !shared.instances.is_empty()
                 || !shared.ready.is_empty()
                 || !shared.leased.is_empty()
-                || !shared.delayed_retries.is_empty()
+                || delayed_retry_count(&shared.delayed_retries) > 0
             {
                 let mut debug = debug.lock().expect("unified debug lock poisoned");
                 debug.restored_from_snapshot = true;
@@ -613,7 +660,7 @@ fn reconcile_restored_runtime(
             debug.restored_from_snapshot = !local.instances.is_empty()
                 || !local.ready.is_empty()
                 || !local.leased.is_empty()
-                || !local.delayed_retries.is_empty();
+                || delayed_retry_count(&local.delayed_retries) > 0;
             debug.restore_records_applied = local.instances.len() as u64;
             local
         }
@@ -651,10 +698,13 @@ fn remove_run_work(inner: &mut RuntimeInner, run_key: &RunKey) {
             && leased.task.instance_id == run_key.instance_id
             && leased.task.run_id == run_key.run_id)
     });
-    inner.delayed_retries.retain(|retry| {
-        !(retry.task.tenant_id == run_key.tenant_id
-            && retry.task.instance_id == run_key.instance_id
-            && retry.task.run_id == run_key.run_id)
+    inner.delayed_retries.retain(|_, retries| {
+        retries.retain(|retry| {
+            !(retry.task.tenant_id == run_key.tenant_id
+                && retry.task.instance_id == run_key.instance_id
+                && retry.task.run_id == run_key.run_id)
+        });
+        !retries.is_empty()
     });
 }
 
@@ -682,13 +732,43 @@ fn add_run_work_from_source(inner: &mut RuntimeInner, source: &RuntimeInner, run
     }) {
         inner.leased.insert(attempt_key_from_task(&leased.task), leased.clone());
     }
-    for retry in source.delayed_retries.iter().filter(|retry| {
+    for retry in source.delayed_retries.values().flatten().filter(|retry| {
         retry.task.tenant_id == run_key.tenant_id
             && retry.task.instance_id == run_key.instance_id
             && retry.task.run_id == run_key.run_id
     }) {
-        inner.delayed_retries.push(retry.clone());
+        push_delayed_retry(inner, retry.clone());
     }
+}
+
+fn delayed_retry_count(delayed_retries: &BTreeMap<DateTime<Utc>, Vec<DelayedRetryTask>>) -> usize {
+    delayed_retries.values().map(Vec::len).sum()
+}
+
+fn push_delayed_retry(inner: &mut RuntimeInner, retry: DelayedRetryTask) -> bool {
+    let due_at = retry.due_at;
+    let becomes_earliest =
+        inner.delayed_retries.keys().next().map(|current| due_at < *current).unwrap_or(true);
+    inner.delayed_retries.entry(due_at).or_default().push(retry);
+    becomes_earliest
+}
+
+fn flatten_delayed_retries(
+    delayed_retries: &BTreeMap<DateTime<Utc>, Vec<DelayedRetryTask>>,
+) -> Vec<DelayedRetryTask> {
+    delayed_retries.values().flat_map(|retries| retries.iter().cloned()).collect()
+}
+
+fn take_due_delayed_retries(inner: &mut RuntimeInner, now: DateTime<Utc>) -> Vec<QueuedActivity> {
+    let due_keys =
+        inner.delayed_retries.range(..=now).map(|(due_at, _)| due_at.clone()).collect::<Vec<_>>();
+    let mut released = Vec::new();
+    for due_at in due_keys {
+        if let Some(retries) = inner.delayed_retries.remove(&due_at) {
+            released.extend(retries.into_iter().map(|retry| retry.task));
+        }
+    }
+    released
 }
 
 async fn restore_instance_from_store_snapshot_tail(
@@ -818,6 +898,10 @@ fn current_owner_epoch(state: &AppState) -> Option<u64> {
     ownership_is_active(&ownership, Utc::now()).then_some(ownership.owner_epoch)
 }
 
+fn workflow_partition_id(state: &AppState, tenant_id: &str, instance_id: &str) -> i32 {
+    partition_for_instance(tenant_id, instance_id, state.workflow_partition_count)
+}
+
 fn apply_ownership_record(
     state: &AppState,
     partition_id: i32,
@@ -852,11 +936,39 @@ async fn acquire_initial_ownership(state: &AppState, config: &OwnershipConfig) -
                 record.owner_epoch,
                 record.lease_expires_at,
             );
+            sync_workflow_partition_leases(state, config).await?;
             state.persist_notify.notify_one();
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(config.renew_interval_ms.max(1))).await;
     }
+}
+
+async fn sync_workflow_partition_leases(state: &AppState, config: &OwnershipConfig) -> Result<()> {
+    for partition_id in 0..state.workflow_partition_count {
+        if partition_id == config.partition_id {
+            continue;
+        }
+        match state
+            .store
+            .claim_partition_ownership(partition_id, &config.owner_id, config.lease_ttl)
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => warn!(
+                partition_id,
+                owner_id = %config.owner_id,
+                "unified-runtime could not claim workflow partition lease"
+            ),
+            Err(error) => warn!(
+                error = %error,
+                partition_id,
+                owner_id = %config.owner_id,
+                "unified-runtime failed to sync workflow partition lease"
+            ),
+        }
+    }
+    Ok(())
 }
 
 async fn run_ownership_loop(state: AppState, config: OwnershipConfig) {
@@ -915,6 +1027,9 @@ async fn run_ownership_loop(state: AppState, config: OwnershipConfig) {
                 Err(error) => warn!(error = %error, "unified-runtime failed to claim ownership"),
             }
         }
+        if let Err(error) = sync_workflow_partition_leases(&state, &config).await {
+            warn!(error = %error, "unified-runtime failed to sync workflow partition leases");
+        }
         tokio::time::sleep(interval).await;
     }
 }
@@ -956,6 +1071,39 @@ async fn run_trigger_consumer(
             | WorkflowEvent::SignalQueued { .. } => {
                 if let Err(error) = handle_mailbox_queue_event(&state, event).await {
                     error!(error = %error, "unified-runtime failed to handle mailbox queue");
+                }
+            }
+            WorkflowEvent::ChildWorkflowSignalRequested { .. } => {
+                if let Err(error) = handle_child_signal_requested_event(&state, event).await {
+                    error!(error = %error, "unified-runtime failed to handle child signal request");
+                }
+            }
+            WorkflowEvent::ChildWorkflowCancellationRequested { .. } => {
+                if let Err(error) = handle_child_cancellation_requested_event(&state, event).await {
+                    error!(
+                        error = %error,
+                        "unified-runtime failed to handle child cancellation request"
+                    );
+                }
+            }
+            WorkflowEvent::ExternalWorkflowSignalRequested { .. } => {
+                if let Err(error) = handle_external_signal_requested_event(&state, event).await {
+                    error!(error = %error, "unified-runtime failed to handle external signal request");
+                }
+            }
+            WorkflowEvent::ExternalWorkflowCancellationRequested { .. } => {
+                if let Err(error) =
+                    handle_external_cancellation_requested_event(&state, event).await
+                {
+                    error!(
+                        error = %error,
+                        "unified-runtime failed to handle external cancellation request"
+                    );
+                }
+            }
+            WorkflowEvent::TimerFired { .. } => {
+                if let Err(error) = handle_timer_fired_event(&state, event).await {
+                    error!(error = %error, "unified-runtime failed to handle timer fired");
                 }
             }
             _ => {}
@@ -1027,11 +1175,11 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
         updated_at: event.occurred_at,
     };
     apply_compiled_plan(&mut instance, &plan);
-    let queued = schedule_activities_from_plan(&instance, &plan, event.occurred_at)?;
+    let queued = schedule_activities_from_plan(&artifact, &instance, &plan, event.occurred_at)?;
     {
         let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
         let runtime = RuntimeWorkflowState {
-            artifact,
+            artifact: artifact.clone(),
             instance: instance.clone(),
             active_activities: queued
                 .iter()
@@ -1043,6 +1191,7 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
                             task_queue: task.task_queue.clone(),
                             activity_type: task.activity_type.clone(),
                             wait_state: task.state.clone(),
+                            omit_success_output: task.omit_success_output,
                         },
                     )
                 })
@@ -1065,14 +1214,30 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
         queued.iter().cloned().map(PreparedDbAction::Schedule).collect::<Vec<_>>();
     apply_db_actions(
         state,
-        vec![PreparedDbAction::UpsertInstance(instance.clone())],
+        vec![
+            PreparedDbAction::PutRunStart {
+                tenant_id: instance.tenant_id.clone(),
+                instance_id: instance.instance_id.clone(),
+                run_id: instance.run_id.clone(),
+                definition_id: instance.definition_id.clone(),
+                definition_version: instance.definition_version,
+                artifact_hash: instance.artifact_hash.clone(),
+                workflow_task_queue: instance.workflow_task_queue.clone(),
+                trigger_event_id: event.event_id,
+                started_at: event.occurred_at,
+                previous_run_id: None,
+                triggered_by_run_id: None,
+            },
+            PreparedDbAction::UpsertInstance(instance.clone()),
+        ],
         schedule_actions,
     )
     .await?;
-    apply_post_plan_child_effects(
+    apply_post_plan_effects(
         state,
         PostPlanEffect {
             run_key: run_key.clone(),
+            artifact: artifact.clone(),
             instance: instance.clone(),
             plan: plan.clone(),
             source_event_id: event.event_id,
@@ -1080,11 +1245,137 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
         },
     )
     .await?;
+    maybe_enact_pending_workflow_cancellation_unified(
+        state,
+        &run_key,
+        event.event_id,
+        event.occurred_at,
+    )
+    .await?;
     state.notify.notify_waiters();
     state.persist_notify.notify_one();
     drain_mailbox_for_run(state, &run_key.tenant_id, &run_key.instance_id, &run_key.run_id).await?;
     let mut debug = state.debug.lock().expect("unified debug lock poisoned");
     debug.workflow_triggers_applied = debug.workflow_triggers_applied.saturating_add(1);
+    Ok(())
+}
+
+async fn handle_timer_fired_event(
+    state: &AppState,
+    event: EventEnvelope<WorkflowEvent>,
+) -> Result<()> {
+    let WorkflowEvent::TimerFired { timer_id } = &event.payload else {
+        return Ok(());
+    };
+    let run_key = RunKey {
+        tenant_id: event.tenant_id.clone(),
+        instance_id: event.instance_id.clone(),
+        run_id: event.run_id.clone(),
+    };
+
+    let (artifact, instance) = {
+        let inner = state.inner.lock().expect("unified runtime lock poisoned");
+        let Some(runtime) = inner.instances.get(&run_key) else {
+            return Ok(());
+        };
+        (runtime.artifact.clone(), runtime.instance.clone())
+    };
+    if instance.status.is_terminal() {
+        return Ok(());
+    }
+
+    let current_state =
+        instance.current_state.clone().unwrap_or_else(|| artifact.workflow.initial_state.clone());
+    let execution_state = instance.artifact_execution.clone().unwrap_or_default();
+    let plan = artifact.execute_after_timer_with_turn(
+        &current_state,
+        timer_id,
+        execution_state,
+        ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at },
+    )?;
+
+    let mut general = vec![PreparedDbAction::DeleteTimer {
+        tenant_id: event.tenant_id.clone(),
+        instance_id: event.instance_id.clone(),
+        timer_id: timer_id.clone(),
+    }];
+    let mut schedules = Vec::new();
+    let mut notifies = false;
+    let final_instance;
+    {
+        let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
+        let Some(runtime) = inner.instances.get_mut(&run_key) else {
+            return Ok(());
+        };
+        runtime.instance.apply_event(&event);
+        apply_compiled_plan(&mut runtime.instance, &plan);
+        let scheduled_tasks = schedule_activities_from_plan(
+            &runtime.artifact,
+            &runtime.instance,
+            &plan,
+            event.occurred_at,
+        )?;
+        for task in &scheduled_tasks {
+            schedules.push(PreparedDbAction::Schedule(task.clone()));
+            runtime.active_activities.insert(
+                task.activity_id.clone(),
+                ActiveActivityMeta {
+                    attempt: task.attempt,
+                    task_queue: task.task_queue.clone(),
+                    activity_type: task.activity_type.clone(),
+                    wait_state: task.state.clone(),
+                    omit_success_output: task.omit_success_output,
+                },
+            );
+        }
+        let terminal_instance =
+            runtime.instance.status.is_terminal().then_some(runtime.instance.clone());
+        final_instance = Some(runtime.instance.clone());
+        let _ = runtime;
+        for task in scheduled_tasks {
+            inner
+                .ready
+                .entry(QueueKey {
+                    tenant_id: task.tenant_id.clone(),
+                    task_queue: task.task_queue.clone(),
+                })
+                .or_default()
+                .push_back(task);
+            notifies = true;
+        }
+        if let Some(instance) = terminal_instance {
+            general.push(PreparedDbAction::UpsertInstance(instance));
+            general.push(PreparedDbAction::CloseRun(run_key.clone(), event.occurred_at));
+        }
+        mark_runtime_dirty(&mut inner, "timer_fired", false);
+    }
+
+    apply_db_actions(state, general, schedules).await?;
+    if let Some(post_plan) = final_instance.map(|instance| PostPlanEffect {
+        run_key,
+        artifact,
+        instance,
+        plan,
+        source_event_id: event.event_id,
+        occurred_at: event.occurred_at,
+    }) {
+        apply_post_plan_effects(state, post_plan).await?;
+    }
+    maybe_enact_pending_workflow_cancellation_unified(
+        state,
+        &RunKey {
+            tenant_id: event.tenant_id.clone(),
+            instance_id: event.instance_id.clone(),
+            run_id: event.run_id.clone(),
+        },
+        event.event_id,
+        event.occurred_at,
+    )
+    .await?;
+    if notifies {
+        state.notify.notify_waiters();
+    }
+    state.persist_notify.notify_one();
     Ok(())
 }
 
@@ -1230,13 +1521,18 @@ async fn handle_activity_cancellation_requested_event(
                     runtime.instance.updated_at = event.occurred_at;
                     post_plan = Some(PostPlanEffect {
                         run_key: run_key.clone(),
+                        artifact: runtime.artifact.clone(),
                         instance: runtime.instance.clone(),
                         plan: plan.clone(),
                         source_event_id: event.event_id,
                         occurred_at: event.occurred_at,
                     });
-                    let scheduled_tasks =
-                        schedule_activities_from_plan(&runtime.instance, &plan, event.occurred_at)?;
+                    let scheduled_tasks = schedule_activities_from_plan(
+                        &runtime.artifact,
+                        &runtime.instance,
+                        &plan,
+                        event.occurred_at,
+                    )?;
                     let terminal_instance =
                         runtime.instance.status.is_terminal().then_some(runtime.instance.clone());
                     for task in &scheduled_tasks {
@@ -1248,6 +1544,7 @@ async fn handle_activity_cancellation_requested_event(
                                 task_queue: task.task_queue.clone(),
                                 activity_type: task.activity_type.clone(),
                                 wait_state: task.state.clone(),
+                                omit_success_output: task.omit_success_output,
                             },
                         );
                     }
@@ -1279,12 +1576,486 @@ async fn handle_activity_cancellation_requested_event(
         apply_db_actions(state, general, schedules).await?;
     }
     if let Some(post_plan) = post_plan {
-        apply_post_plan_child_effects(state, post_plan).await?;
+        apply_post_plan_effects(state, post_plan).await?;
     }
     if notifies {
         state.notify.notify_waiters();
     }
     state.persist_notify.notify_one();
+    Ok(())
+}
+
+fn unified_child_signal_event_id(source_event_id: Uuid, child_id: &str) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("unified-child-signal:{source_event_id}:{child_id}").as_bytes(),
+    )
+}
+
+fn unified_child_cancel_event_id(source_event_id: Uuid, child_id: &str) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("unified-child-cancel:{source_event_id}:{child_id}").as_bytes(),
+    )
+}
+
+async fn handle_child_signal_requested_event(
+    state: &AppState,
+    event: EventEnvelope<WorkflowEvent>,
+) -> Result<()> {
+    let WorkflowEvent::ChildWorkflowSignalRequested { child_id, signal_name, payload } =
+        &event.payload
+    else {
+        return Ok(());
+    };
+    let child = state
+        .store
+        .list_open_children_for_run(&event.tenant_id, &event.instance_id, &event.run_id)
+        .await?
+        .into_iter()
+        .find(|child| &child.child_id == child_id);
+    let Some(child) = child else {
+        warn!(
+            workflow_instance_id = %event.instance_id,
+            child_id = %child_id,
+            "child signal requested for unknown open child"
+        );
+        return Ok(());
+    };
+    let Some(child_run_id) = child.child_run_id.clone() else {
+        warn!(
+            workflow_instance_id = %event.instance_id,
+            child_id = %child_id,
+            "child signal requested before child run started"
+        );
+        return Ok(());
+    };
+
+    let hot_child_instance = {
+        let inner = state.inner.lock().expect("unified runtime lock poisoned");
+        inner
+            .instances
+            .get(&RunKey {
+                tenant_id: child.tenant_id.clone(),
+                instance_id: child.child_workflow_id.clone(),
+                run_id: child_run_id.clone(),
+            })
+            .map(|runtime| runtime.instance.clone())
+    };
+    let stored_child_instance = if hot_child_instance.is_none() {
+        state.store.get_instance(&child.tenant_id, &child.child_workflow_id).await?
+    } else {
+        None
+    };
+    let Some(child_instance) = hot_child_instance.or(stored_child_instance) else {
+        warn!(
+            workflow_instance_id = %event.instance_id,
+            child_id = %child_id,
+            child_run_id = %child_run_id,
+            "child signal requested for missing child instance"
+        );
+        return Ok(());
+    };
+    let partition_id = workflow_partition_id(state, &child.tenant_id, &child.child_workflow_id);
+    let child_task_queue = child_instance.workflow_task_queue.clone();
+    let signal_id = format!("child-sig-{}", event.event_id);
+    let signal_payload = WorkflowEvent::SignalQueued {
+        signal_id: signal_id.clone(),
+        signal_type: signal_name.clone(),
+        payload: payload.clone(),
+    };
+    let mut signal_event = EventEnvelope::new(
+        signal_payload.event_type(),
+        WorkflowIdentity::new(
+            child.tenant_id.clone(),
+            child_instance.definition_id.clone(),
+            child_instance.definition_version.unwrap_or(event.definition_version),
+            child_instance.artifact_hash.clone().unwrap_or_else(|| event.artifact_hash.clone()),
+            child.child_workflow_id.clone(),
+            child_run_id.clone(),
+            "unified-runtime",
+        ),
+        signal_payload,
+    )
+    .with_occurred_at(event.occurred_at);
+    signal_event.event_id = unified_child_signal_event_id(event.event_id, child_id);
+    signal_event.causation_id = Some(event.event_id);
+    signal_event.correlation_id = event.correlation_id.or(Some(event.event_id));
+    signal_event.dedupe_key = Some(format!("child-signal:{child_id}:{}", event.event_id));
+
+    if !state
+        .store
+        .queue_signal(
+            &signal_event.tenant_id,
+            &signal_event.instance_id,
+            &signal_event.run_id,
+            &signal_id,
+            signal_name,
+            signal_event.dedupe_key.as_deref(),
+            payload,
+            signal_event.event_id,
+            signal_event.occurred_at,
+        )
+        .await?
+    {
+        return Ok(());
+    }
+
+    state
+        .store
+        .enqueue_workflow_mailbox_message(
+            partition_id,
+            &child_task_queue,
+            None,
+            &signal_event,
+            WorkflowMailboxKind::Signal,
+            Some(&signal_id),
+            Some(signal_name),
+            Some(payload),
+        )
+        .await?;
+
+    let child_run_key = RunKey {
+        tenant_id: child.tenant_id.clone(),
+        instance_id: child.child_workflow_id.clone(),
+        run_id: child_run_id,
+    };
+    let is_hot = {
+        let inner = state.inner.lock().expect("unified runtime lock poisoned");
+        inner.instances.contains_key(&child_run_key)
+    };
+    if is_hot {
+        drain_mailbox_for_run(
+            state,
+            &child_run_key.tenant_id,
+            &child_run_key.instance_id,
+            &child_run_key.run_id,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn handle_child_cancellation_requested_event(
+    state: &AppState,
+    event: EventEnvelope<WorkflowEvent>,
+) -> Result<()> {
+    let WorkflowEvent::ChildWorkflowCancellationRequested { child_id, reason } = &event.payload
+    else {
+        return Ok(());
+    };
+    let child = state
+        .store
+        .list_open_children_for_run(&event.tenant_id, &event.instance_id, &event.run_id)
+        .await?
+        .into_iter()
+        .find(|child| &child.child_id == child_id);
+    let Some(child) = child else {
+        warn!(
+            workflow_instance_id = %event.instance_id,
+            child_id = %child_id,
+            "child cancellation requested for unknown open child"
+        );
+        return Ok(());
+    };
+    let Some(child_run_id) = child.child_run_id.clone() else {
+        state
+            .store
+            .complete_child(
+                &child.tenant_id,
+                &child.instance_id,
+                &child.run_id,
+                &child.child_id,
+                "cancelled",
+                None,
+                Some("cancel requested before child start"),
+                event.event_id,
+                event.occurred_at,
+            )
+            .await?;
+        return Ok(());
+    };
+
+    let hot_child_instance = {
+        let inner = state.inner.lock().expect("unified runtime lock poisoned");
+        inner
+            .instances
+            .get(&RunKey {
+                tenant_id: child.tenant_id.clone(),
+                instance_id: child.child_workflow_id.clone(),
+                run_id: child_run_id.clone(),
+            })
+            .map(|runtime| runtime.instance.clone())
+    };
+    let stored_child_instance = if hot_child_instance.is_none() {
+        state.store.get_instance(&child.tenant_id, &child.child_workflow_id).await?
+    } else {
+        None
+    };
+    let child_task_queue = hot_child_instance
+        .as_ref()
+        .map(|instance| instance.workflow_task_queue.clone())
+        .or_else(|| {
+            stored_child_instance.as_ref().map(|instance| instance.workflow_task_queue.clone())
+        })
+        .unwrap_or_else(|| "default".to_owned());
+    let child_definition_version = hot_child_instance
+        .as_ref()
+        .and_then(|instance| instance.definition_version)
+        .or_else(|| stored_child_instance.as_ref().and_then(|instance| instance.definition_version))
+        .unwrap_or(event.definition_version);
+    let child_artifact_hash = hot_child_instance
+        .as_ref()
+        .and_then(|instance| instance.artifact_hash.clone())
+        .or_else(|| {
+            stored_child_instance.as_ref().and_then(|instance| instance.artifact_hash.clone())
+        })
+        .unwrap_or_else(|| event.artifact_hash.clone());
+    let partition_id = workflow_partition_id(state, &child.tenant_id, &child.child_workflow_id);
+    let mut cancel_event = EventEnvelope::new(
+        WorkflowEvent::WorkflowCancellationRequested { reason: reason.clone() }.event_type(),
+        WorkflowIdentity::new(
+            child.tenant_id.clone(),
+            child.child_definition_id.clone(),
+            child_definition_version,
+            child_artifact_hash,
+            child.child_workflow_id.clone(),
+            child_run_id.clone(),
+            "unified-runtime",
+        ),
+        WorkflowEvent::WorkflowCancellationRequested { reason: reason.clone() },
+    )
+    .with_occurred_at(event.occurred_at);
+    cancel_event.event_id = unified_child_cancel_event_id(event.event_id, child_id);
+    cancel_event.causation_id = Some(event.event_id);
+    cancel_event.correlation_id = event.correlation_id.or(Some(event.event_id));
+    cancel_event.dedupe_key = Some(format!("child-cancel:{child_id}:{}", event.event_id));
+    state
+        .store
+        .enqueue_workflow_mailbox_message(
+            partition_id,
+            &child_task_queue,
+            None,
+            &cancel_event,
+            WorkflowMailboxKind::CancelRequest,
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+    let child_run_key = RunKey {
+        tenant_id: child.tenant_id.clone(),
+        instance_id: child.child_workflow_id.clone(),
+        run_id: child_run_id,
+    };
+    let is_hot = {
+        let inner = state.inner.lock().expect("unified runtime lock poisoned");
+        inner.instances.contains_key(&child_run_key)
+    };
+    if is_hot {
+        drain_mailbox_for_run(
+            state,
+            &child_run_key.tenant_id,
+            &child_run_key.instance_id,
+            &child_run_key.run_id,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn handle_external_signal_requested_event(
+    state: &AppState,
+    event: EventEnvelope<WorkflowEvent>,
+) -> Result<()> {
+    let WorkflowEvent::ExternalWorkflowSignalRequested {
+        target_instance_id,
+        target_run_id,
+        signal_name,
+        payload,
+    } = &event.payload
+    else {
+        return Ok(());
+    };
+    let Some(target_instance) =
+        state.store.get_instance(&event.tenant_id, target_instance_id).await?
+    else {
+        warn!(
+            workflow_instance_id = %event.instance_id,
+            target_instance_id = %target_instance_id,
+            "external signal requested for missing target instance"
+        );
+        return Ok(());
+    };
+    if target_run_id.as_ref().is_some_and(|run_id| run_id != &target_instance.run_id) {
+        warn!(
+            workflow_instance_id = %event.instance_id,
+            target_instance_id = %target_instance_id,
+            requested_run_id = ?target_run_id,
+            actual_run_id = %target_instance.run_id,
+            "external signal requested for non-current target run"
+        );
+        return Ok(());
+    }
+    let partition_id = workflow_partition_id(state, &event.tenant_id, &target_instance.instance_id);
+    let signal_id = format!("ext-sig-{}", event.event_id);
+    let signal_payload = WorkflowEvent::SignalQueued {
+        signal_id: signal_id.clone(),
+        signal_type: signal_name.clone(),
+        payload: payload.clone(),
+    };
+    let mut signal_event = EventEnvelope::new(
+        signal_payload.event_type(),
+        WorkflowIdentity::new(
+            event.tenant_id.clone(),
+            target_instance.definition_id.clone(),
+            target_instance.definition_version.unwrap_or(event.definition_version),
+            target_instance.artifact_hash.clone().unwrap_or_else(|| event.artifact_hash.clone()),
+            target_instance.instance_id.clone(),
+            target_instance.run_id.clone(),
+            "unified-runtime",
+        ),
+        signal_payload,
+    )
+    .with_occurred_at(event.occurred_at);
+    signal_event.causation_id = Some(event.event_id);
+    signal_event.correlation_id = event.correlation_id.or(Some(event.event_id));
+    signal_event.dedupe_key =
+        Some(format!("external-signal:{target_instance_id}:{}", event.event_id));
+    if !state
+        .store
+        .queue_signal(
+            &signal_event.tenant_id,
+            &signal_event.instance_id,
+            &signal_event.run_id,
+            &signal_id,
+            signal_name,
+            signal_event.dedupe_key.as_deref(),
+            payload,
+            signal_event.event_id,
+            signal_event.occurred_at,
+        )
+        .await?
+    {
+        return Ok(());
+    }
+    state
+        .store
+        .enqueue_workflow_mailbox_message(
+            partition_id,
+            &target_instance.workflow_task_queue,
+            None,
+            &signal_event,
+            WorkflowMailboxKind::Signal,
+            Some(&signal_id),
+            Some(signal_name),
+            Some(payload),
+        )
+        .await?;
+    let target_run_key = RunKey {
+        tenant_id: event.tenant_id.clone(),
+        instance_id: target_instance.instance_id.clone(),
+        run_id: target_instance.run_id.clone(),
+    };
+    let is_hot = {
+        let inner = state.inner.lock().expect("unified runtime lock poisoned");
+        inner.instances.contains_key(&target_run_key)
+    };
+    if is_hot {
+        drain_mailbox_for_run(
+            state,
+            &target_run_key.tenant_id,
+            &target_run_key.instance_id,
+            &target_run_key.run_id,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn handle_external_cancellation_requested_event(
+    state: &AppState,
+    event: EventEnvelope<WorkflowEvent>,
+) -> Result<()> {
+    let WorkflowEvent::ExternalWorkflowCancellationRequested {
+        target_instance_id,
+        target_run_id,
+        reason,
+    } = &event.payload
+    else {
+        return Ok(());
+    };
+    let Some(target_instance) =
+        state.store.get_instance(&event.tenant_id, target_instance_id).await?
+    else {
+        warn!(
+            workflow_instance_id = %event.instance_id,
+            target_instance_id = %target_instance_id,
+            "external cancellation requested for missing target instance"
+        );
+        return Ok(());
+    };
+    if target_run_id.as_ref().is_some_and(|run_id| run_id != &target_instance.run_id) {
+        warn!(
+            workflow_instance_id = %event.instance_id,
+            target_instance_id = %target_instance_id,
+            requested_run_id = ?target_run_id,
+            actual_run_id = %target_instance.run_id,
+            "external cancellation requested for non-current target run"
+        );
+        return Ok(());
+    }
+    let partition_id = workflow_partition_id(state, &event.tenant_id, &target_instance.instance_id);
+    let mut cancel_event = EventEnvelope::new(
+        WorkflowEvent::WorkflowCancellationRequested { reason: reason.clone() }.event_type(),
+        WorkflowIdentity::new(
+            event.tenant_id.clone(),
+            target_instance.definition_id.clone(),
+            target_instance.definition_version.unwrap_or(event.definition_version),
+            target_instance.artifact_hash.clone().unwrap_or_else(|| event.artifact_hash.clone()),
+            target_instance.instance_id.clone(),
+            target_instance.run_id.clone(),
+            "unified-runtime",
+        ),
+        WorkflowEvent::WorkflowCancellationRequested { reason: reason.clone() },
+    )
+    .with_occurred_at(event.occurred_at);
+    cancel_event.causation_id = Some(event.event_id);
+    cancel_event.correlation_id = event.correlation_id.or(Some(event.event_id));
+    cancel_event.dedupe_key =
+        Some(format!("external-cancel:{target_instance_id}:{}", event.event_id));
+    state
+        .store
+        .enqueue_workflow_mailbox_message(
+            partition_id,
+            &target_instance.workflow_task_queue,
+            None,
+            &cancel_event,
+            WorkflowMailboxKind::CancelRequest,
+            None,
+            None,
+            None,
+        )
+        .await?;
+    let target_run_key = RunKey {
+        tenant_id: event.tenant_id.clone(),
+        instance_id: target_instance.instance_id.clone(),
+        run_id: target_instance.run_id.clone(),
+    };
+    let is_hot = {
+        let inner = state.inner.lock().expect("unified runtime lock poisoned");
+        inner.instances.contains_key(&target_run_key)
+    };
+    if is_hot {
+        drain_mailbox_for_run(
+            state,
+            &target_run_key.tenant_id,
+            &target_run_key.instance_id,
+            &target_run_key.run_id,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -1297,6 +2068,53 @@ async fn handle_mailbox_queue_event(
         instance_id: event.instance_id.clone(),
         run_id: event.run_id.clone(),
     };
+    let (mailbox_kind, message_id, message_name, payload) = match &event.payload {
+        WorkflowEvent::SignalQueued { signal_id, signal_type, payload } => (
+            WorkflowMailboxKind::Signal,
+            Some(signal_id.as_str()),
+            Some(signal_type.as_str()),
+            Some(payload),
+        ),
+        WorkflowEvent::WorkflowUpdateRequested { update_id, update_name, payload } => (
+            WorkflowMailboxKind::Update,
+            Some(update_id.as_str()),
+            Some(update_name.as_str()),
+            Some(payload),
+        ),
+        WorkflowEvent::WorkflowCancellationRequested { .. } => {
+            (WorkflowMailboxKind::CancelRequest, None, None, None)
+        }
+        _ => return Ok(()),
+    };
+    let hot_task_queue = {
+        let inner = state.inner.lock().expect("unified runtime lock poisoned");
+        inner.instances.get(&run_key).map(|runtime| runtime.instance.workflow_task_queue.clone())
+    };
+    let task_queue = if let Some(task_queue) = hot_task_queue {
+        Some(task_queue)
+    } else {
+        state
+            .store
+            .get_instance(&event.tenant_id, &event.instance_id)
+            .await?
+            .map(|instance| instance.workflow_task_queue)
+    };
+    let Some(task_queue) = task_queue else {
+        return Ok(());
+    };
+    state
+        .store
+        .enqueue_workflow_mailbox_message(
+            workflow_partition_id(state, &event.tenant_id, &event.instance_id),
+            &task_queue,
+            None,
+            &event,
+            mailbox_kind,
+            message_id,
+            message_name,
+            payload,
+        )
+        .await?;
     let should_drain = {
         let inner = state.inner.lock().expect("unified runtime lock poisoned");
         inner.instances.contains_key(&run_key)
@@ -1315,6 +2133,7 @@ enum MailboxDrainOutcome {
         schedules: Vec<PreparedDbAction>,
         notifies: bool,
         post_plan: Option<PostPlanEffect>,
+        terminal_child: Option<(RunKey, WorkflowInstanceState)>,
     },
     ConsumedNoop {
         accepted_seq: u64,
@@ -1325,6 +2144,7 @@ enum MailboxDrainOutcome {
 #[derive(Debug, Clone)]
 struct PostPlanEffect {
     run_key: RunKey,
+    artifact: CompiledWorkflowArtifact,
     instance: WorkflowInstanceState,
     plan: CompiledExecutionPlan,
     source_event_id: Uuid,
@@ -1357,14 +2177,48 @@ async fn drain_mailbox_for_run(
                     schedules,
                     notifies,
                     post_plan,
+                    terminal_child,
                 } => {
                     if let Some(signal) = signal {
                         consumed_signals.push(signal);
                     }
                     apply_db_actions(state, general, schedules).await?;
                     if let Some(post_plan) = post_plan {
-                        apply_post_plan_child_effects(state, post_plan).await?;
+                        let post_plan_run_key = post_plan.run_key.clone();
+                        let post_plan_event_id = post_plan.source_event_id;
+                        let post_plan_occurred_at = post_plan.occurred_at;
+                        apply_post_plan_effects(state, post_plan).await?;
+                        maybe_enact_pending_workflow_cancellation_unified(
+                            state,
+                            &post_plan_run_key,
+                            post_plan_event_id,
+                            post_plan_occurred_at,
+                        )
+                        .await?;
                     }
+                    if let Some(terminal_child) = terminal_child {
+                        let (general, schedules, child_notifies) =
+                            reflect_terminal_children_to_parents(state, vec![terminal_child])
+                                .await?;
+                        if !general.is_empty() || !schedules.is_empty() {
+                            apply_db_actions(state, general, schedules).await?;
+                        }
+                        if child_notifies {
+                            state.notify.notify_waiters();
+                        }
+                    }
+                    let run_key = RunKey {
+                        tenant_id: tenant_id.to_owned(),
+                        instance_id: instance_id.to_owned(),
+                        run_id: run_id.to_owned(),
+                    };
+                    maybe_enact_pending_workflow_cancellation_unified(
+                        state,
+                        &run_key,
+                        item.source_event.event_id,
+                        item.source_event.occurred_at,
+                    )
+                    .await?;
                     if notifies {
                         state.notify.notify_waiters();
                     }
@@ -1525,7 +2379,7 @@ async fn dispatch_signal_mailbox_item_unified(
     let mut general = Vec::new();
     let mut schedules = Vec::new();
     let mut notifies = false;
-    let mut final_instance = None;
+    let final_instance;
     {
         let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
         let Some(runtime) = inner.instances.get_mut(&run_key) else {
@@ -1533,8 +2387,12 @@ async fn dispatch_signal_mailbox_item_unified(
         };
         runtime.instance.apply_event(&signal_event);
         apply_compiled_plan(&mut runtime.instance, &plan);
-        let scheduled_tasks =
-            schedule_activities_from_plan(&runtime.instance, &plan, signal_event.occurred_at)?;
+        let scheduled_tasks = schedule_activities_from_plan(
+            &runtime.artifact,
+            &runtime.instance,
+            &plan,
+            signal_event.occurred_at,
+        )?;
         for task in &scheduled_tasks {
             schedules.push(PreparedDbAction::Schedule(task.clone()));
             runtime.active_activities.insert(
@@ -1544,6 +2402,7 @@ async fn dispatch_signal_mailbox_item_unified(
                     task_queue: task.task_queue.clone(),
                     activity_type: task.activity_type.clone(),
                     wait_state: task.state.clone(),
+                    omit_success_output: task.omit_success_output,
                 },
             );
         }
@@ -1581,11 +2440,13 @@ async fn dispatch_signal_mailbox_item_unified(
         notifies,
         post_plan: final_instance.map(|instance| PostPlanEffect {
             run_key,
+            artifact: artifact.clone(),
             instance,
             plan,
             source_event_id: signal_event.event_id,
             occurred_at: signal_event.occurred_at,
         }),
+        terminal_child: None,
     })
 }
 
@@ -1608,9 +2469,7 @@ async fn dispatch_cancel_mailbox_item_unified(
             item.payload.as_ref().and_then(Value::as_str).unwrap_or("workflow cancelled").to_owned()
         }
     };
-    propagate_cancellation_to_open_children_unified(state, &item.source_event, &reason).await?;
-
-    let unwindable_activities = {
+    let deferred = {
         let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
         let Some(runtime) = inner.instances.get_mut(&run_key) else {
             return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
@@ -1618,7 +2477,46 @@ async fn dispatch_cancel_mailbox_item_unified(
         if runtime.instance.status.is_terminal() {
             return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
         }
+        let current_state = runtime
+            .instance
+            .current_state
+            .clone()
+            .unwrap_or_else(|| runtime.artifact.workflow.initial_state.clone());
         runtime.instance.apply_event(&item.source_event);
+        if runtime.artifact.is_non_cancellable_state(&current_state) {
+            if let Some(execution) = runtime.instance.artifact_execution.as_mut() {
+                execution.pending_workflow_cancellation = Some(reason.clone());
+            }
+            let instance = runtime.instance.clone();
+            mark_runtime_dirty(&mut inner, "mailbox_cancel_deferred", false);
+            Some(instance)
+        } else {
+            None
+        }
+    };
+    if let Some(instance) = deferred {
+        state.store.upsert_instance(&instance).await?;
+        return Ok(MailboxDrainOutcome::Processed {
+            signal: None,
+            accepted_seq: item.accepted_seq,
+            general: Vec::new(),
+            schedules: Vec::new(),
+            notifies: false,
+            post_plan: None,
+            terminal_child: None,
+        });
+    }
+
+    propagate_cancellation_to_open_children_unified(state, &item.source_event, &reason).await?;
+
+    let unwindable_activities = {
+        let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
+        let Some(runtime) = inner.instances.get_mut(&run_key) else {
+            return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
+        };
+        if let Some(execution) = runtime.instance.artifact_execution.as_mut() {
+            execution.pending_workflow_cancellation = None;
+        }
         let unwindable = runtime.instance.artifact_execution.is_some()
             && !runtime.active_activities.is_empty()
             && runtime.active_activities.values().all(|active| active.attempt > 0);
@@ -1678,6 +2576,7 @@ async fn dispatch_cancel_mailbox_item_unified(
             schedules: Vec::new(),
             notifies: false,
             post_plan: None,
+            terminal_child: None,
         });
     }
 
@@ -1720,13 +2619,173 @@ async fn dispatch_cancel_mailbox_item_unified(
         signal: None,
         accepted_seq: item.accepted_seq,
         general: vec![
-            PreparedDbAction::UpsertInstance(terminal_instance),
+            PreparedDbAction::UpsertInstance(terminal_instance.clone()),
             PreparedDbAction::CloseRun(run_key, cancelled_event.occurred_at),
         ],
         schedules: Vec::new(),
         notifies: true,
         post_plan: None,
+        terminal_child: Some((
+            RunKey {
+                tenant_id: item.tenant_id.clone(),
+                instance_id: item.instance_id.clone(),
+                run_id: item.run_id.clone(),
+            },
+            terminal_instance,
+        )),
     })
+}
+
+async fn maybe_enact_pending_workflow_cancellation_unified(
+    state: &AppState,
+    run_key: &RunKey,
+    source_event_id: Uuid,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    let (source_event, instance_after_request, cancellations) = {
+        let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
+        let Some(runtime) = inner.instances.get_mut(run_key) else {
+            return Ok(());
+        };
+        if runtime.instance.status.is_terminal() {
+            return Ok(());
+        }
+        let Some(execution) = runtime.instance.artifact_execution.as_mut() else {
+            return Ok(());
+        };
+        let current_state = runtime
+            .instance
+            .current_state
+            .clone()
+            .unwrap_or_else(|| runtime.artifact.workflow.initial_state.clone());
+        let Some(reason) = runtime
+            .artifact
+            .pending_workflow_cancellation_ready(&current_state, execution)
+            .map(str::to_owned)
+        else {
+            return Ok(());
+        };
+        execution.pending_workflow_cancellation = None;
+        let identity = WorkflowIdentity::new(
+            runtime.instance.tenant_id.clone(),
+            runtime.instance.definition_id.clone(),
+            runtime.instance.definition_version.unwrap_or(runtime.artifact.definition_version),
+            runtime.instance.artifact_hash.clone().unwrap_or_default(),
+            runtime.instance.instance_id.clone(),
+            runtime.instance.run_id.clone(),
+            "unified-runtime",
+        );
+        let mut source_event = EventEnvelope::new(
+            WorkflowEvent::WorkflowCancellationRequested { reason: reason.clone() }.event_type(),
+            identity,
+            WorkflowEvent::WorkflowCancellationRequested { reason: reason.clone() },
+        )
+        .with_occurred_at(occurred_at);
+        source_event.event_id = source_event_id;
+        source_event.correlation_id = Some(source_event_id);
+        let cancellations = runtime
+            .active_activities
+            .iter()
+            .map(|(activity_id, active)| {
+                (activity_id.clone(), active.attempt, reason.clone(), None::<Value>)
+            })
+            .collect::<Vec<_>>();
+        let instance = runtime.instance.clone();
+        mark_runtime_dirty(
+            &mut inner,
+            if cancellations.is_empty() {
+                "pending_cancel_finalize"
+            } else {
+                "pending_cancel_unwind"
+            },
+            cancellations.is_empty(),
+        );
+        (source_event, instance, cancellations)
+    };
+
+    let reason = match &source_event.payload {
+        WorkflowEvent::WorkflowCancellationRequested { reason } => reason.clone(),
+        _ => return Ok(()),
+    };
+    propagate_cancellation_to_open_children_unified(state, &source_event, &reason).await?;
+
+    if !cancellations.is_empty() {
+        state.store.upsert_instance(&instance_after_request).await?;
+        for (activity_id, attempt, reason, metadata) in cancellations {
+            let payload = WorkflowEvent::ActivityTaskCancellationRequested {
+                activity_id,
+                attempt,
+                reason,
+                metadata,
+            };
+            let mut cancel_event = EventEnvelope::new(
+                payload.event_type(),
+                WorkflowIdentity::new(
+                    run_key.tenant_id.clone(),
+                    source_event.definition_id.clone(),
+                    source_event.definition_version,
+                    source_event.artifact_hash.clone(),
+                    run_key.instance_id.clone(),
+                    run_key.run_id.clone(),
+                    "unified-runtime",
+                ),
+                payload,
+            );
+            cancel_event.occurred_at = source_event.occurred_at;
+            cancel_event.causation_id = Some(source_event.event_id);
+            cancel_event.correlation_id = Some(source_event.event_id);
+            handle_activity_cancellation_requested_event(state, cancel_event).await?;
+        }
+        return Ok(());
+    }
+
+    let mut cancelled_event = EventEnvelope::new(
+        WorkflowEvent::WorkflowCancelled { reason: reason.clone() }.event_type(),
+        WorkflowIdentity::new(
+            run_key.tenant_id.clone(),
+            source_event.definition_id.clone(),
+            source_event.definition_version,
+            source_event.artifact_hash.clone(),
+            run_key.instance_id.clone(),
+            run_key.run_id.clone(),
+            "unified-runtime",
+        ),
+        WorkflowEvent::WorkflowCancelled { reason },
+    )
+    .with_occurred_at(occurred_at);
+    cancelled_event.event_id = unified_cancelled_event_id(source_event.event_id);
+    cancelled_event.causation_id = Some(source_event.event_id);
+    cancelled_event.correlation_id = Some(source_event.event_id);
+    cancelled_event.dedupe_key = Some(format!("workflow-cancelled:{}", source_event.event_id));
+
+    let terminal_instance = {
+        let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
+        let Some(runtime) = inner.instances.get_mut(run_key) else {
+            return Ok(());
+        };
+        runtime.instance.apply_event(&cancelled_event);
+        if let Some(execution) = runtime.instance.artifact_execution.as_mut() {
+            execution.active_update = None;
+            execution.active_signal = None;
+            execution.pending_workflow_cancellation = None;
+        }
+        runtime.active_activities.clear();
+        let terminal_instance = runtime.instance.clone();
+        remove_run_work(&mut inner, run_key);
+        terminal_instance
+    };
+    apply_db_actions(
+        state,
+        vec![
+            PreparedDbAction::UpsertInstance(terminal_instance),
+            PreparedDbAction::CloseRun(run_key.clone(), cancelled_event.occurred_at),
+        ],
+        Vec::new(),
+    )
+    .await?;
+    state.notify.notify_waiters();
+    state.persist_notify.notify_one();
+    Ok(())
 }
 
 async fn propagate_cancellation_to_open_children_unified(
@@ -1736,16 +2795,17 @@ async fn propagate_cancellation_to_open_children_unified(
 ) -> Result<()> {
     let children = state
         .store
-        .list_open_children_for_run(&source_event.tenant_id, &source_event.instance_id, &source_event.run_id)
+        .list_open_children_for_run(
+            &source_event.tenant_id,
+            &source_event.instance_id,
+            &source_event.run_id,
+        )
         .await?;
     if children.is_empty() {
         return Ok(());
     }
-    let partition_id = {
-        let ownership = state.ownership.lock().expect("unified ownership lock poisoned");
-        ownership.partition_id
-    };
     for child in children {
+        let partition_id = workflow_partition_id(state, &child.tenant_id, &child.child_workflow_id);
         let Some(child_run_id) = child.child_run_id.clone() else {
             state
                 .store
@@ -1783,25 +2843,28 @@ async fn propagate_cancellation_to_open_children_unified(
         let child_task_queue = hot_child_instance
             .as_ref()
             .map(|instance| instance.workflow_task_queue.clone())
-            .or_else(|| stored_child_instance.as_ref().map(|instance| instance.workflow_task_queue.clone()))
+            .or_else(|| {
+                stored_child_instance.as_ref().map(|instance| instance.workflow_task_queue.clone())
+            })
             .unwrap_or_else(|| "default".to_owned());
         let child_definition_version = hot_child_instance
             .as_ref()
             .and_then(|instance| instance.definition_version)
-            .or_else(|| stored_child_instance.as_ref().and_then(|instance| instance.definition_version))
+            .or_else(|| {
+                stored_child_instance.as_ref().and_then(|instance| instance.definition_version)
+            })
             .unwrap_or(source_event.definition_version);
         let child_artifact_hash = hot_child_instance
             .as_ref()
             .and_then(|instance| instance.artifact_hash.clone())
-            .or_else(|| stored_child_instance.as_ref().and_then(|instance| instance.artifact_hash.clone()))
+            .or_else(|| {
+                stored_child_instance.as_ref().and_then(|instance| instance.artifact_hash.clone())
+            })
             .unwrap_or_else(|| source_event.artifact_hash.clone());
 
         let mut cancel_event = EventEnvelope::new(
             WorkflowEvent::WorkflowCancellationRequested {
-                reason: format!(
-                    "{reason} (propagated from parent run {})",
-                    source_event.run_id
-                ),
+                reason: format!("{reason} (propagated from parent run {})", source_event.run_id),
             }
             .event_type(),
             WorkflowIdentity::new(
@@ -1814,10 +2877,7 @@ async fn propagate_cancellation_to_open_children_unified(
                 "unified-runtime",
             ),
             WorkflowEvent::WorkflowCancellationRequested {
-                reason: format!(
-                    "{reason} (propagated from parent run {})",
-                    source_event.run_id
-                ),
+                reason: format!("{reason} (propagated from parent run {})", source_event.run_id),
             },
         )
         .with_occurred_at(source_event.occurred_at);
@@ -1848,16 +2908,13 @@ async fn propagate_cancellation_to_open_children_unified(
             inner.instances.contains_key(&child_run_key)
         };
         if is_hot {
-            let state = state.clone();
-            tokio::spawn(async move {
-                let _ = drain_mailbox_for_run(
-                    &state,
-                    &child_run_key.tenant_id,
-                    &child_run_key.instance_id,
-                    &child_run_key.run_id,
-                )
-                .await;
-            });
+            Box::pin(drain_mailbox_for_run(
+                state,
+                &child_run_key.tenant_id,
+                &child_run_key.instance_id,
+                &child_run_key.run_id,
+            ))
+            .await?;
         }
     }
     Ok(())
@@ -2001,7 +3058,7 @@ async fn dispatch_update_mailbox_item_unified(
     let mut general = Vec::new();
     let mut schedules = Vec::new();
     let mut notifies = false;
-    let mut final_instance = None;
+    let final_instance;
     {
         let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
         let Some(runtime) = inner.instances.get_mut(&run_key) else {
@@ -2009,8 +3066,12 @@ async fn dispatch_update_mailbox_item_unified(
         };
         runtime.instance.apply_event(&accepted_event);
         apply_compiled_plan(&mut runtime.instance, &plan);
-        let scheduled_tasks =
-            schedule_activities_from_plan(&runtime.instance, &plan, accepted_event.occurred_at)?;
+        let scheduled_tasks = schedule_activities_from_plan(
+            &runtime.artifact,
+            &runtime.instance,
+            &plan,
+            accepted_event.occurred_at,
+        )?;
         for task in &scheduled_tasks {
             schedules.push(PreparedDbAction::Schedule(task.clone()));
             runtime.active_activities.insert(
@@ -2020,6 +3081,7 @@ async fn dispatch_update_mailbox_item_unified(
                     task_queue: task.task_queue.clone(),
                     activity_type: task.activity_type.clone(),
                     wait_state: task.state.clone(),
+                    omit_success_output: task.omit_success_output,
                 },
             );
         }
@@ -2059,11 +3121,13 @@ async fn dispatch_update_mailbox_item_unified(
         notifies,
         post_plan: final_instance.map(|instance| PostPlanEffect {
             run_key,
+            artifact: artifact.clone(),
             instance,
             plan,
             source_event_id: accepted_event.event_id,
             occurred_at: accepted_event.occurred_at,
         }),
+        terminal_child: None,
     })
 }
 
@@ -2142,8 +3206,12 @@ async fn materialize_child_workflows_from_plan(
         )?;
         let mut child_instance = WorkflowInstanceState::try_from(&child_trigger)?;
         apply_compiled_plan(&mut child_instance, &child_plan);
-        let child_tasks =
-            schedule_activities_from_plan(&child_instance, &child_plan, child_trigger.occurred_at)?;
+        let child_tasks = schedule_activities_from_plan(
+            &artifact,
+            &child_instance,
+            &child_plan,
+            child_trigger.occurred_at,
+        )?;
         let child_run_key = RunKey {
             tenant_id: child_instance.tenant_id.clone(),
             instance_id: child_instance.instance_id.clone(),
@@ -2207,6 +3275,7 @@ async fn materialize_child_workflows_from_plan(
                                     task_queue: task.task_queue.clone(),
                                     activity_type: task.activity_type.clone(),
                                     wait_state: task.state.clone(),
+                                    omit_success_output: task.omit_success_output,
                                 },
                             )
                         })
@@ -2420,6 +3489,7 @@ async fn reflect_terminal_children_to_parents(
             parent_runtime.instance.apply_event(&reflection_event);
             apply_compiled_plan(&mut parent_runtime.instance, &plan);
             let scheduled_tasks = schedule_activities_from_plan(
+                &parent_runtime.artifact,
                 &parent_runtime.instance,
                 &plan,
                 reflection_event.occurred_at,
@@ -2433,6 +3503,7 @@ async fn reflect_terminal_children_to_parents(
                         task_queue: task.task_queue.clone(),
                         activity_type: task.activity_type.clone(),
                         wait_state: task.state.clone(),
+                        omit_success_output: task.omit_success_output,
                     },
                 );
             }
@@ -2486,8 +3557,202 @@ async fn reflect_terminal_children_to_parents(
     Ok((general, schedules, notifies))
 }
 
-async fn apply_post_plan_child_effects(state: &AppState, effect: PostPlanEffect) -> Result<()> {
-    let (general, schedules, mut notifies, terminal_children) =
+fn unified_timer_scheduled_event_id(source_event_id: Uuid, timer_id: &str) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("unified-timer-scheduled:{source_event_id}:{timer_id}").as_bytes(),
+    )
+}
+
+fn prepared_timer_actions_from_plan(
+    state: &AppState,
+    effect: &PostPlanEffect,
+) -> Vec<PreparedDbAction> {
+    let partition_id =
+        workflow_partition_id(state, &effect.instance.tenant_id, &effect.instance.instance_id);
+    let mut actions = Vec::new();
+    for emission in &effect.plan.emissions {
+        let WorkflowEvent::TimerScheduled { timer_id, fire_at } = &emission.event else {
+            continue;
+        };
+        actions.push(PreparedDbAction::UpsertTimer {
+            partition_id,
+            tenant_id: effect.instance.tenant_id.clone(),
+            instance_id: effect.instance.instance_id.clone(),
+            run_id: effect.instance.run_id.clone(),
+            definition_id: effect.instance.definition_id.clone(),
+            definition_version: effect.instance.definition_version,
+            artifact_hash: effect.instance.artifact_hash.clone(),
+            timer_id: timer_id.clone(),
+            state: emission.state.clone().or_else(|| effect.instance.current_state.clone()),
+            fire_at: *fire_at,
+            scheduled_event_id: unified_timer_scheduled_event_id(effect.source_event_id, timer_id),
+            correlation_id: Some(effect.source_event_id),
+        });
+    }
+    actions
+}
+
+async fn materialize_continue_as_new_from_plan(
+    state: &AppState,
+    effect: &PostPlanEffect,
+) -> Result<bool> {
+    let mut handled = false;
+    for emission in &effect.plan.emissions {
+        let WorkflowEvent::WorkflowContinuedAsNew { new_run_id, input } = &emission.event else {
+            continue;
+        };
+        handled = true;
+        let continued_event_id = unified_continue_event_id(effect.source_event_id, new_run_id);
+        let triggered_event_id =
+            unified_continue_trigger_event_id(effect.source_event_id, new_run_id);
+        let continued_at = effect.occurred_at;
+
+        let mut trigger_event = EventEnvelope::new(
+            WorkflowEvent::WorkflowTriggered { input: input.clone() }.event_type(),
+            WorkflowIdentity::new(
+                effect.instance.tenant_id.clone(),
+                effect.instance.definition_id.clone(),
+                effect.instance.definition_version.unwrap_or(effect.artifact.definition_version),
+                effect
+                    .instance
+                    .artifact_hash
+                    .clone()
+                    .unwrap_or_else(|| effect.artifact.artifact_hash.clone()),
+                effect.instance.instance_id.clone(),
+                new_run_id.clone(),
+                "unified-runtime",
+            ),
+            WorkflowEvent::WorkflowTriggered { input: input.clone() },
+        )
+        .with_occurred_at(continued_at);
+        trigger_event.event_id = triggered_event_id;
+        trigger_event.causation_id = Some(continued_event_id);
+        trigger_event.correlation_id = Some(effect.source_event_id);
+        trigger_event
+            .metadata
+            .insert("workflow_task_queue".to_owned(), effect.instance.workflow_task_queue.clone());
+        trigger_event.metadata.insert("continue_reason".to_owned(), "continued_as_new".to_owned());
+
+        let plan = effect.artifact.execute_trigger_with_turn(
+            input,
+            ExecutionTurnContext {
+                event_id: trigger_event.event_id,
+                occurred_at: trigger_event.occurred_at,
+            },
+        )?;
+        let mut new_instance = WorkflowInstanceState::try_from(&trigger_event)?;
+        apply_compiled_plan(&mut new_instance, &plan);
+        let scheduled_tasks = schedule_activities_from_plan(
+            &effect.artifact,
+            &new_instance,
+            &plan,
+            trigger_event.occurred_at,
+        )?;
+        let new_run_key = RunKey {
+            tenant_id: new_instance.tenant_id.clone(),
+            instance_id: new_instance.instance_id.clone(),
+            run_id: new_instance.run_id.clone(),
+        };
+
+        {
+            let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
+            remove_run_work(&mut inner, &effect.run_key);
+            inner.instances.remove(&effect.run_key);
+            inner.instances.insert(
+                new_run_key.clone(),
+                RuntimeWorkflowState {
+                    artifact: effect.artifact.clone(),
+                    instance: new_instance.clone(),
+                    active_activities: scheduled_tasks
+                        .iter()
+                        .map(|task| {
+                            (
+                                task.activity_id.clone(),
+                                ActiveActivityMeta {
+                                    attempt: task.attempt,
+                                    task_queue: task.task_queue.clone(),
+                                    activity_type: task.activity_type.clone(),
+                                    wait_state: task.state.clone(),
+                                    omit_success_output: task.omit_success_output,
+                                },
+                            )
+                        })
+                        .collect(),
+                },
+            );
+            for task in &scheduled_tasks {
+                inner
+                    .ready
+                    .entry(QueueKey {
+                        tenant_id: task.tenant_id.clone(),
+                        task_queue: task.task_queue.clone(),
+                    })
+                    .or_default()
+                    .push_back(task.clone());
+            }
+            mark_runtime_dirty(&mut inner, "continue_as_new", true);
+        }
+
+        let mut general = vec![
+            PreparedDbAction::DeleteTimersForRun {
+                tenant_id: effect.run_key.tenant_id.clone(),
+                instance_id: effect.run_key.instance_id.clone(),
+                run_id: effect.run_key.run_id.clone(),
+            },
+            PreparedDbAction::PutRunStart {
+                tenant_id: new_instance.tenant_id.clone(),
+                instance_id: new_instance.instance_id.clone(),
+                run_id: new_instance.run_id.clone(),
+                definition_id: new_instance.definition_id.clone(),
+                definition_version: new_instance.definition_version,
+                artifact_hash: new_instance.artifact_hash.clone(),
+                workflow_task_queue: new_instance.workflow_task_queue.clone(),
+                trigger_event_id: triggered_event_id,
+                started_at: trigger_event.occurred_at,
+                previous_run_id: Some(effect.run_key.run_id.clone()),
+                triggered_by_run_id: Some(effect.run_key.run_id.clone()),
+            },
+            PreparedDbAction::RecordRunContinuation {
+                tenant_id: effect.run_key.tenant_id.clone(),
+                instance_id: effect.run_key.instance_id.clone(),
+                previous_run_id: effect.run_key.run_id.clone(),
+                new_run_id: new_run_id.clone(),
+                continue_reason: "continued_as_new".to_owned(),
+                continued_event_id,
+                triggered_event_id,
+                transitioned_at: continued_at,
+            },
+            PreparedDbAction::UpsertInstance(new_instance.clone()),
+        ];
+        let mut schedules =
+            scheduled_tasks.iter().cloned().map(PreparedDbAction::Schedule).collect::<Vec<_>>();
+        if new_instance.status.is_terminal() {
+            general.push(PreparedDbAction::CloseRun(new_run_key.clone(), new_instance.updated_at));
+        }
+        apply_db_actions(state, general, std::mem::take(&mut schedules)).await?;
+        state.persist_notify.notify_one();
+        if !scheduled_tasks.is_empty() {
+            state.notify.notify_waiters();
+        }
+        Box::pin(apply_post_plan_effects(
+            state,
+            PostPlanEffect {
+                run_key: new_run_key,
+                artifact: effect.artifact.clone(),
+                instance: new_instance,
+                plan,
+                source_event_id: trigger_event.event_id,
+                occurred_at: trigger_event.occurred_at,
+            },
+        ))
+        .await?;
+    }
+    Ok(handled)
+}
+
+async fn apply_post_plan_effects(state: &AppState, effect: PostPlanEffect) -> Result<()> {
+    let (mut general, schedules, mut notifies, terminal_children) =
         materialize_child_workflows_from_plan(
             state,
             &effect.instance,
@@ -2496,13 +3761,151 @@ async fn apply_post_plan_child_effects(state: &AppState, effect: PostPlanEffect)
             effect.source_event_id,
         )
         .await?;
+    general.extend(prepared_timer_actions_from_plan(state, &effect));
     if !general.is_empty() || !schedules.is_empty() {
         apply_db_actions(state, general, schedules).await?;
         state.persist_notify.notify_one();
     }
 
+    for emission in &effect.plan.emissions {
+        match &emission.event {
+            WorkflowEvent::ChildWorkflowSignalRequested { child_id, signal_name, payload } => {
+                let child_event = EventEnvelope::new(
+                    WorkflowEvent::ChildWorkflowSignalRequested {
+                        child_id: child_id.clone(),
+                        signal_name: signal_name.clone(),
+                        payload: payload.clone(),
+                    }
+                    .event_type(),
+                    WorkflowIdentity::new(
+                        effect.instance.tenant_id.clone(),
+                        effect.instance.definition_id.clone(),
+                        effect.instance.definition_version.unwrap_or(effect.plan.workflow_version),
+                        effect.instance.artifact_hash.clone().unwrap_or_default(),
+                        effect.instance.instance_id.clone(),
+                        effect.instance.run_id.clone(),
+                        "unified-runtime",
+                    ),
+                    WorkflowEvent::ChildWorkflowSignalRequested {
+                        child_id: child_id.clone(),
+                        signal_name: signal_name.clone(),
+                        payload: payload.clone(),
+                    },
+                )
+                .with_occurred_at(effect.occurred_at);
+                let mut child_event = child_event;
+                child_event.event_id =
+                    unified_child_signal_event_id(effect.source_event_id, child_id);
+                child_event.causation_id = Some(effect.source_event_id);
+                child_event.correlation_id = Some(effect.source_event_id);
+                Box::pin(handle_child_signal_requested_event(state, child_event)).await?;
+            }
+            WorkflowEvent::ChildWorkflowCancellationRequested { child_id, reason } => {
+                let child_event = EventEnvelope::new(
+                    WorkflowEvent::ChildWorkflowCancellationRequested {
+                        child_id: child_id.clone(),
+                        reason: reason.clone(),
+                    }
+                    .event_type(),
+                    WorkflowIdentity::new(
+                        effect.instance.tenant_id.clone(),
+                        effect.instance.definition_id.clone(),
+                        effect.instance.definition_version.unwrap_or(effect.plan.workflow_version),
+                        effect.instance.artifact_hash.clone().unwrap_or_default(),
+                        effect.instance.instance_id.clone(),
+                        effect.instance.run_id.clone(),
+                        "unified-runtime",
+                    ),
+                    WorkflowEvent::ChildWorkflowCancellationRequested {
+                        child_id: child_id.clone(),
+                        reason: reason.clone(),
+                    },
+                )
+                .with_occurred_at(effect.occurred_at);
+                let mut child_event = child_event;
+                child_event.event_id =
+                    unified_child_cancel_event_id(effect.source_event_id, child_id);
+                child_event.causation_id = Some(effect.source_event_id);
+                child_event.correlation_id = Some(effect.source_event_id);
+                Box::pin(handle_child_cancellation_requested_event(state, child_event)).await?;
+            }
+            WorkflowEvent::ExternalWorkflowSignalRequested {
+                target_instance_id,
+                target_run_id,
+                signal_name,
+                payload,
+            } => {
+                let external_event = EventEnvelope::new(
+                    WorkflowEvent::ExternalWorkflowSignalRequested {
+                        target_instance_id: target_instance_id.clone(),
+                        target_run_id: target_run_id.clone(),
+                        signal_name: signal_name.clone(),
+                        payload: payload.clone(),
+                    }
+                    .event_type(),
+                    WorkflowIdentity::new(
+                        effect.instance.tenant_id.clone(),
+                        effect.instance.definition_id.clone(),
+                        effect.instance.definition_version.unwrap_or(effect.plan.workflow_version),
+                        effect.instance.artifact_hash.clone().unwrap_or_default(),
+                        effect.instance.instance_id.clone(),
+                        effect.instance.run_id.clone(),
+                        "unified-runtime",
+                    ),
+                    WorkflowEvent::ExternalWorkflowSignalRequested {
+                        target_instance_id: target_instance_id.clone(),
+                        target_run_id: target_run_id.clone(),
+                        signal_name: signal_name.clone(),
+                        payload: payload.clone(),
+                    },
+                )
+                .with_occurred_at(effect.occurred_at);
+                let mut external_event = external_event;
+                external_event.causation_id = Some(effect.source_event_id);
+                external_event.correlation_id = Some(effect.source_event_id);
+                Box::pin(handle_external_signal_requested_event(state, external_event)).await?;
+            }
+            WorkflowEvent::ExternalWorkflowCancellationRequested {
+                target_instance_id,
+                target_run_id,
+                reason,
+            } => {
+                let external_event = EventEnvelope::new(
+                    WorkflowEvent::ExternalWorkflowCancellationRequested {
+                        target_instance_id: target_instance_id.clone(),
+                        target_run_id: target_run_id.clone(),
+                        reason: reason.clone(),
+                    }
+                    .event_type(),
+                    WorkflowIdentity::new(
+                        effect.instance.tenant_id.clone(),
+                        effect.instance.definition_id.clone(),
+                        effect.instance.definition_version.unwrap_or(effect.plan.workflow_version),
+                        effect.instance.artifact_hash.clone().unwrap_or_default(),
+                        effect.instance.instance_id.clone(),
+                        effect.instance.run_id.clone(),
+                        "unified-runtime",
+                    ),
+                    WorkflowEvent::ExternalWorkflowCancellationRequested {
+                        target_instance_id: target_instance_id.clone(),
+                        target_run_id: target_run_id.clone(),
+                        reason: reason.clone(),
+                    },
+                )
+                .with_occurred_at(effect.occurred_at);
+                let mut external_event = external_event;
+                external_event.causation_id = Some(effect.source_event_id);
+                external_event.correlation_id = Some(effect.source_event_id);
+                Box::pin(handle_external_cancellation_requested_event(state, external_event))
+                    .await?;
+            }
+            _ => {}
+        }
+    }
+
+    let continued = materialize_continue_as_new_from_plan(state, &effect).await?;
     let mut pending_terminals = terminal_children;
-    if effect.instance.status.is_terminal() {
+    if !continued && effect.instance.status.is_terminal() {
         pending_terminals.push((effect.run_key, effect.instance));
     }
     if !pending_terminals.is_empty() {
@@ -2523,26 +3926,31 @@ async fn apply_post_plan_child_effects(state: &AppState, effect: PostPlanEffect)
 
 async fn run_retry_release_loop(state: AppState) {
     loop {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let retry_notified = state.retry_notify.notified();
+        let next_due_at = {
+            let inner = state.inner.lock().expect("unified runtime lock poisoned");
+            inner.delayed_retries.keys().next().cloned()
+        };
+        match next_due_at {
+            Some(next_due_at) => {
+                let wait = next_due_at
+                    .signed_duration_since(Utc::now())
+                    .to_std()
+                    .unwrap_or_else(|_| Duration::from_millis(0));
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = retry_notified => continue,
+                }
+            }
+            None => {
+                retry_notified.await;
+                continue;
+            }
+        }
         let now = Utc::now();
         let released = {
             let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
-            let mut released = Vec::new();
-            let mut remaining = Vec::with_capacity(inner.delayed_retries.len());
-            for retry in inner.delayed_retries.drain(..) {
-                if retry.due_at <= now {
-                    released.push(retry.task);
-                } else {
-                    remaining.push(retry);
-                }
-            }
-            if released.is_empty() {
-                inner.delayed_retries = remaining;
-                Vec::new()
-            } else {
-                inner.delayed_retries = remaining;
-                released
-            }
+            take_due_delayed_retries(&mut inner, now)
         };
         if released.is_empty() {
             continue;
@@ -2762,6 +4170,7 @@ impl ActivityWorkerApi for WorkerApi {
                 worker_build_id: request.get_ref().worker_build_id.clone(),
                 poll_timeout_ms: request.get_ref().poll_timeout_ms,
                 max_tasks: 1,
+                supports_cbor: request.get_ref().supports_cbor,
             }))
             .await?
             .into_inner();
@@ -2785,11 +4194,36 @@ impl ActivityWorkerApi for WorkerApi {
             tenant_id: request.tenant_id.clone(),
             task_queue: request.task_queue.clone(),
         };
+        self.state
+            .store
+            .upsert_queue_poller(
+                &request.tenant_id,
+                TaskQueueKind::Activity,
+                &request.task_queue,
+                &request.worker_id,
+                &request.worker_build_id,
+                None,
+                None,
+                chrono::Duration::seconds(DEFAULT_LEASE_TTL_SECS),
+            )
+            .await
+            .map_err(internal_status)?;
+        let queue_compatible = self
+            .state
+            .store
+            .is_build_compatible_with_queue(
+                &request.tenant_id,
+                TaskQueueKind::Activity,
+                &request.task_queue,
+                &request.worker_build_id,
+            )
+            .await
+            .map_err(internal_status)?;
         let deadline = tokio::time::Instant::now()
             + Duration::from_millis(request.poll_timeout_ms.max(1).min(30_000));
 
         loop {
-            let leased = {
+            let leased = if queue_compatible {
                 let mut inner = self.state.inner.lock().expect("unified runtime lock poisoned");
                 lease_ready_tasks(
                     &mut inner,
@@ -2798,6 +4232,8 @@ impl ActivityWorkerApi for WorkerApi {
                     &request.worker_build_id,
                     max_tasks,
                 )
+            } else {
+                Vec::new()
             };
             if !leased.is_empty() {
                 let applied = self
@@ -2850,7 +4286,7 @@ impl ActivityWorkerApi for WorkerApi {
                                 .push_front(leased_task.task.clone());
                             continue;
                         }
-                        tasks.push(activity_proto(&leased_task));
+                        tasks.push(activity_proto(&leased_task, request.supports_cbor));
                     }
                     tasks
                 };
@@ -2896,7 +4332,10 @@ impl ActivityWorkerApi for WorkerApi {
                 lease_epoch: request.lease_epoch,
                 owner_epoch: request.owner_epoch,
                 result: Some(activity_task_result::Result::Completed(
-                    ActivityTaskCompletedResult { output_json: request.output_json },
+                    ActivityTaskCompletedResult {
+                        output_json: request.output_json,
+                        output_cbor: Vec::new(),
+                    },
                 )),
             }],
         }))
@@ -3010,6 +4449,7 @@ impl ActivityWorkerApi for WorkerApi {
                     ActivityTaskCancelledResult {
                         reason: request.reason,
                         metadata_json: request.metadata_json,
+                        metadata_cbor: Vec::new(),
                     },
                 )),
             }],
@@ -3039,7 +4479,18 @@ impl ActivityWorkerApi for WorkerApi {
             .await
             .map_err(internal_status)?;
         for post_plan in actions.post_plans {
-            apply_post_plan_child_effects(&self.state, post_plan).await.map_err(internal_status)?;
+            let run_key = post_plan.run_key.clone();
+            let event_id = post_plan.source_event_id;
+            let occurred_at = post_plan.occurred_at;
+            apply_post_plan_effects(&self.state, post_plan).await.map_err(internal_status)?;
+            maybe_enact_pending_workflow_cancellation_unified(
+                &self.state,
+                &run_key,
+                event_id,
+                occurred_at,
+            )
+            .await
+            .map_err(internal_status)?;
         }
         if actions.notifies {
             self.state.notify.notify_waiters();
@@ -3185,7 +4636,7 @@ fn prepare_result_application(
         );
         let payload = match result.result.as_ref() {
             Some(activity_task_result::Result::Completed(completed)) => {
-                let output = parse_json_or_string(&completed.output_json);
+                let output = decode_normal_activity_output(completed, active.omit_success_output)?;
                 general.push(PreparedDbAction::Terminal(ActivityTerminalUpdate {
                     tenant_id: result.tenant_id.clone(),
                     instance_id: result.instance_id.clone(),
@@ -3241,6 +4692,7 @@ fn prepare_result_application(
                                     task_queue: retry_task.task.task_queue.clone(),
                                     activity_type: retry_task.task.activity_type.clone(),
                                     wait_state: retry_task.task.state.clone(),
+                                    omit_success_output: retry_task.task.omit_success_output,
                                 },
                             );
                             delayed_retry = Some(retry_task);
@@ -3264,6 +4716,7 @@ fn prepare_result_application(
                 payload
             }
             Some(activity_task_result::Result::Cancelled(cancelled)) => {
+                let metadata = decode_cancelled_metadata(cancelled)?;
                 general.push(PreparedDbAction::Terminal(ActivityTerminalUpdate {
                     tenant_id: result.tenant_id.clone(),
                     instance_id: result.instance_id.clone(),
@@ -3274,7 +4727,7 @@ fn prepare_result_application(
                     worker_build_id: result.worker_build_id.clone(),
                     payload: ActivityTerminalPayload::Cancelled {
                         reason: cancelled.reason.clone(),
-                        metadata: parse_optional_json(&cancelled.metadata_json),
+                        metadata: metadata.clone(),
                     },
                     event_id: Uuid::now_v7(),
                     event_type: "UnifiedActivityCancelled".to_owned(),
@@ -3287,13 +4740,17 @@ fn prepare_result_application(
                     reason: cancelled.reason.clone(),
                     worker_id: result.worker_id.clone(),
                     worker_build_id: result.worker_build_id.clone(),
-                    metadata: parse_optional_json(&cancelled.metadata_json),
+                    metadata,
                 }
             }
             None => continue,
         };
         if let Some(retry_task) = delayed_retry {
-            inner.delayed_retries.push(retry_task);
+            let _ = runtime;
+            let notify_retry_loop = push_delayed_retry(&mut inner, retry_task);
+            if notify_retry_loop {
+                state.retry_notify.notify_one();
+            }
             continue;
         }
         grouped.entry(run_key).or_default().push(synthetic_runtime_event(
@@ -3323,12 +4780,14 @@ fn prepare_result_application(
             runtime.instance.updated_at = now;
             post_plans.push(PostPlanEffect {
                 run_key: run_key.clone(),
+                artifact: runtime.artifact.clone(),
                 instance: runtime.instance.clone(),
                 plan: plan.clone(),
                 source_event_id: runtime.instance.last_event_id,
                 occurred_at: now,
             });
-            let scheduled_tasks = schedule_activities_from_plan(&runtime.instance, &plan, now)?;
+            let scheduled_tasks =
+                schedule_activities_from_plan(&runtime.artifact, &runtime.instance, &plan, now)?;
             let mut terminal_instance = None;
             for task in &scheduled_tasks {
                 schedules.push(PreparedDbAction::Schedule(task.clone()));
@@ -3339,6 +4798,7 @@ fn prepare_result_application(
                         task_queue: task.task_queue.clone(),
                         activity_type: task.activity_type.clone(),
                         wait_state: task.state.clone(),
+                        omit_success_output: task.omit_success_output,
                     },
                 );
             }
@@ -3555,6 +5015,68 @@ async fn apply_db_actions(
                     )
                     .await?;
             }
+            PreparedDbAction::UpsertTimer {
+                partition_id,
+                tenant_id,
+                instance_id,
+                run_id,
+                definition_id,
+                definition_version,
+                artifact_hash,
+                timer_id,
+                state: timer_state,
+                fire_at,
+                scheduled_event_id,
+                correlation_id,
+            } => {
+                state
+                    .store
+                    .upsert_timer(
+                        partition_id,
+                        &tenant_id,
+                        &instance_id,
+                        &run_id,
+                        &definition_id,
+                        definition_version,
+                        artifact_hash.as_deref(),
+                        &timer_id,
+                        timer_state.as_deref(),
+                        fire_at,
+                        scheduled_event_id,
+                        correlation_id,
+                    )
+                    .await?;
+            }
+            PreparedDbAction::DeleteTimer { tenant_id, instance_id, timer_id } => {
+                state.store.delete_timer(&tenant_id, &instance_id, &timer_id).await?;
+            }
+            PreparedDbAction::DeleteTimersForRun { tenant_id, instance_id, run_id } => {
+                state.store.delete_timers_for_run(&tenant_id, &instance_id, &run_id).await?;
+            }
+            PreparedDbAction::RecordRunContinuation {
+                tenant_id,
+                instance_id,
+                previous_run_id,
+                new_run_id,
+                continue_reason,
+                continued_event_id,
+                triggered_event_id,
+                transitioned_at,
+            } => {
+                state
+                    .store
+                    .record_run_continuation(
+                        &tenant_id,
+                        &instance_id,
+                        &previous_run_id,
+                        &new_run_id,
+                        &continue_reason,
+                        continued_event_id,
+                        triggered_event_id,
+                        transitioned_at,
+                    )
+                    .await?;
+            }
         }
     }
     Ok(())
@@ -3575,9 +5097,9 @@ fn activity_schedule_update(task: &QueuedActivity) -> ActivityScheduleUpdate {
         state: Some(task.state.clone()),
         input: task.input.clone(),
         config: task.config.clone(),
-        schedule_to_start_timeout_ms: None,
-        start_to_close_timeout_ms: None,
-        heartbeat_timeout_ms: None,
+        schedule_to_start_timeout_ms: task.schedule_to_start_timeout_ms,
+        start_to_close_timeout_ms: task.start_to_close_timeout_ms,
+        heartbeat_timeout_ms: task.heartbeat_timeout_ms,
         event_id: Uuid::now_v7(),
         event_type: "UnifiedActivityScheduled".to_owned(),
         occurred_at: task.scheduled_at,
@@ -3599,8 +5121,12 @@ fn queued_activity_from_record(record: &fabrik_store::WorkflowActivityRecord) ->
         input: record.input.clone(),
         config: record.config.clone(),
         state: record.state.clone().unwrap_or_default(),
+        schedule_to_start_timeout_ms: record.schedule_to_start_timeout_ms,
+        start_to_close_timeout_ms: record.start_to_close_timeout_ms,
+        heartbeat_timeout_ms: record.heartbeat_timeout_ms,
         scheduled_at: record.scheduled_at,
         cancellation_requested: record.cancellation_requested,
+        omit_success_output: false,
         lease_epoch: 0,
     }
 }
@@ -3635,7 +5161,7 @@ fn lease_ready_tasks(
     leased
 }
 
-fn activity_proto(leased: &LeasedActivity) -> ActivityTask {
+fn activity_proto(leased: &LeasedActivity, supports_cbor: bool) -> ActivityTask {
     ActivityTask {
         tenant_id: leased.task.tenant_id.clone(),
         definition_id: leased.task.definition_id.clone(),
@@ -3648,6 +5174,11 @@ fn activity_proto(leased: &LeasedActivity) -> ActivityTask {
         task_queue: leased.task.task_queue.clone(),
         attempt: leased.task.attempt,
         input_json: serde_json::to_string(&leased.task.input).unwrap_or_else(|_| "null".to_owned()),
+        input_cbor: if supports_cbor {
+            encode_cbor(&leased.task.input, "activity task input").unwrap_or_default()
+        } else {
+            Vec::new()
+        },
         config_json: leased
             .task
             .config
@@ -3657,19 +5188,58 @@ fn activity_proto(leased: &LeasedActivity) -> ActivityTask {
             .ok()
             .flatten()
             .unwrap_or_default(),
+        config_cbor: if supports_cbor {
+            leased
+                .task
+                .config
+                .as_ref()
+                .and_then(|config| encode_cbor(config, "activity task config").ok())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        },
+        prefer_cbor: supports_cbor,
         state: leased.task.state.clone(),
         scheduled_at_unix_ms: leased.task.scheduled_at.timestamp_millis(),
         lease_expires_at_unix_ms: leased.lease_expires_at.timestamp_millis(),
-        start_to_close_timeout_ms: 0,
-        heartbeat_timeout_ms: 0,
+        start_to_close_timeout_ms: leased.task.start_to_close_timeout_ms.unwrap_or_default(),
+        heartbeat_timeout_ms: leased.task.heartbeat_timeout_ms.unwrap_or_default(),
         cancellation_requested: leased.task.cancellation_requested,
-        schedule_to_start_timeout_ms: 0,
+        schedule_to_start_timeout_ms: leased.task.schedule_to_start_timeout_ms.unwrap_or_default(),
         lease_epoch: leased.task.lease_epoch,
         owner_epoch: leased.owner_epoch,
+        omit_success_output: leased.task.omit_success_output,
     }
 }
 
+fn parse_fanout_activity_id(activity_id: &str) -> Option<(&str, usize)> {
+    let (origin_state, index) = activity_id.rsplit_once("::")?;
+    Some((origin_state, index.parse().ok()?))
+}
+
+fn should_omit_success_output(
+    artifact: &CompiledWorkflowArtifact,
+    wait_state: &str,
+    activity_id: &str,
+) -> bool {
+    if !matches!(
+        artifact.workflow.states.get(wait_state),
+        Some(fabrik_workflow::CompiledStateNode::WaitForAllActivities { .. })
+    ) {
+        return false;
+    }
+    let Some((origin_state, _)) = parse_fanout_activity_id(activity_id) else {
+        return false;
+    };
+    matches!(
+        artifact.workflow.states.get(origin_state),
+        Some(fabrik_workflow::CompiledStateNode::FanOut { reducer, .. })
+            if matches!(reducer.as_deref().unwrap_or("collect_results"), "all_settled" | "count")
+    )
+}
+
 fn schedule_activities_from_plan(
+    artifact: &CompiledWorkflowArtifact,
     instance: &WorkflowInstanceState,
     plan: &CompiledExecutionPlan,
     scheduled_at: DateTime<Utc>,
@@ -3684,9 +5254,16 @@ fn schedule_activities_from_plan(
             input,
             config,
             state,
+            schedule_to_start_timeout_ms,
+            start_to_close_timeout_ms,
+            heartbeat_timeout_ms,
             ..
         } = &emission.event
         {
+            let wait_state = state
+                .clone()
+                .or_else(|| emission.state.clone())
+                .unwrap_or_else(|| instance.current_state.clone().unwrap_or_default());
             tasks.push(QueuedActivity {
                 tenant_id: instance.tenant_id.clone(),
                 definition_id: instance.definition_id.clone(),
@@ -3700,12 +5277,13 @@ fn schedule_activities_from_plan(
                 attempt: *attempt,
                 input: input.clone(),
                 config: config.clone(),
-                state: state
-                    .clone()
-                    .or_else(|| emission.state.clone())
-                    .unwrap_or_else(|| instance.current_state.clone().unwrap_or_default()),
+                state: wait_state.clone(),
+                schedule_to_start_timeout_ms: *schedule_to_start_timeout_ms,
+                start_to_close_timeout_ms: *start_to_close_timeout_ms,
+                heartbeat_timeout_ms: *heartbeat_timeout_ms,
                 scheduled_at,
                 cancellation_requested: false,
+                omit_success_output: should_omit_success_output(artifact, &wait_state, activity_id),
                 lease_epoch: 0,
             });
         }
@@ -3726,6 +5304,8 @@ fn build_retry_task(
     let execution_state = runtime_execution_state(runtime).clone();
     let (activity_type, config, input) =
         runtime.artifact.step_details(activity_id, &execution_state)?;
+    let (schedule_to_start_timeout_ms, start_to_close_timeout_ms, heartbeat_timeout_ms) =
+        runtime.artifact.step_timeouts(activity_id)?;
     let due_at = now + parse_timer_ref(&retry.delay)?;
     Ok(Some(DelayedRetryTask {
         task: QueuedActivity {
@@ -3746,8 +5326,12 @@ fn build_retry_task(
             config: config
                 .map(|value| serde_json::to_value(value).expect("step config serializes")),
             state: active.wait_state.clone(),
+            schedule_to_start_timeout_ms,
+            start_to_close_timeout_ms,
+            heartbeat_timeout_ms,
             scheduled_at: due_at,
             cancellation_requested: false,
+            omit_success_output: active.omit_success_output,
             lease_epoch: 0,
         },
         due_at,
@@ -3852,7 +5436,7 @@ fn capture_persisted_state(inner: &mut RuntimeInner) -> PersistedRuntimeState {
         instances: inner.instances.values().cloned().collect(),
         ready: inner.ready.values().flat_map(|queue| queue.iter().cloned()).collect(),
         leased: inner.leased.values().cloned().collect(),
-        delayed_retries: inner.delayed_retries.clone(),
+        delayed_retries: flatten_delayed_retries(&inner.delayed_retries),
     }
 }
 
@@ -3983,7 +5567,7 @@ fn runtime_inner_from_persisted(
                     .push_back(retry.task);
             }
         } else {
-            inner.delayed_retries.push(retry);
+            push_delayed_retry(&mut inner, retry);
         }
     }
 
@@ -4026,6 +5610,31 @@ fn parse_json_or_string(raw: &str) -> Value {
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()))
 }
 
+fn decode_normal_activity_output(
+    completed: &ActivityTaskCompletedResult,
+    omit_success_output: bool,
+) -> Result<Value> {
+    if !completed.output_cbor.is_empty() {
+        return decode_cbor::<Value>(&completed.output_cbor, "activity result output");
+    }
+    if !completed.output_json.trim().is_empty() {
+        return Ok(parse_json_or_string(&completed.output_json));
+    }
+    if omit_success_output {
+        return Ok(Value::Null);
+    }
+    Ok(Value::Null)
+}
+
+fn decode_cancelled_metadata(cancelled: &ActivityTaskCancelledResult) -> Result<Option<Value>> {
+    if !cancelled.metadata_cbor.is_empty() {
+        let value =
+            decode_cbor::<Value>(&cancelled.metadata_cbor, "activity cancellation metadata")?;
+        return Ok((!value.is_null()).then_some(value));
+    }
+    Ok(parse_optional_json(&cancelled.metadata_json))
+}
+
 fn parse_optional_json(raw: &str) -> Option<Value> {
     if raw.trim().is_empty() {
         None
@@ -4046,6 +5655,20 @@ fn unified_child_trigger_event_id(parent_event_id: Uuid, child_id: &str) -> Uuid
     Uuid::new_v5(
         &Uuid::NAMESPACE_URL,
         format!("unified-child-trigger:{parent_event_id}:{child_id}").as_bytes(),
+    )
+}
+
+fn unified_continue_trigger_event_id(source_event_id: Uuid, new_run_id: &str) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("unified-continue-trigger:{source_event_id}:{new_run_id}").as_bytes(),
+    )
+}
+
+fn unified_continue_event_id(source_event_id: Uuid, new_run_id: &str) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("unified-continue:{source_event_id}:{new_run_id}").as_bytes(),
     )
 }
 
@@ -4128,8 +5751,8 @@ mod tests {
     use fabrik_broker::WorkflowPublisher;
     use fabrik_events::WorkflowIdentity;
     use fabrik_workflow::{
-        ArtifactEntrypoint, CompiledStateNode, CompiledUpdateHandler, CompiledWorkflow, Expression,
-        ParentClosePolicy,
+        ArtifactEntrypoint, CompiledStateNode, CompiledUpdateHandler, CompiledWorkflow,
+        ErrorTransition, Expression, ParentClosePolicy,
     };
     use serde_json::json;
     use std::{
@@ -4160,8 +5783,12 @@ mod tests {
             input: Value::Null,
             config: None,
             state: "join".to_owned(),
+            schedule_to_start_timeout_ms: None,
+            start_to_close_timeout_ms: None,
+            heartbeat_timeout_ms: None,
             scheduled_at,
             cancellation_requested: false,
+            omit_success_output: false,
             lease_epoch: 0,
         }
     }
@@ -4177,6 +5804,143 @@ mod tests {
             run_id: run_id.to_owned(),
             ..queued_activity(activity_id, attempt, scheduled_at)
         }
+    }
+
+    fn continue_as_new_artifact() -> CompiledWorkflowArtifact {
+        CompiledWorkflowArtifact::new(
+            "continue-as-new-demo".to_owned(),
+            1,
+            "unified-runtime-test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "decide".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "decide".to_owned(),
+                        CompiledStateNode::Choice {
+                            condition: Expression::Binary {
+                                op: fabrik_workflow::BinaryOp::GreaterThan,
+                                left: Box::new(Expression::Member {
+                                    object: Box::new(Expression::Identifier {
+                                        name: "input".to_owned(),
+                                    }),
+                                    property: "remaining".to_owned(),
+                                }),
+                                right: Box::new(Expression::Literal { value: json!(0) }),
+                            },
+                            then_next: "roll".to_owned(),
+                            else_next: "done".to_owned(),
+                        },
+                    ),
+                    (
+                        "roll".to_owned(),
+                        CompiledStateNode::ContinueAsNew {
+                            input: Some(Expression::Object {
+                                fields: BTreeMap::from([(
+                                    "remaining".to_owned(),
+                                    Expression::Binary {
+                                        op: fabrik_workflow::BinaryOp::Subtract,
+                                        left: Box::new(Expression::Member {
+                                            object: Box::new(Expression::Identifier {
+                                                name: "input".to_owned(),
+                                            }),
+                                            property: "remaining".to_owned(),
+                                        }),
+                                        right: Box::new(Expression::Literal { value: json!(1) }),
+                                    },
+                                )]),
+                            }),
+                        },
+                    ),
+                    (
+                        "done".to_owned(),
+                        CompiledStateNode::Succeed {
+                            output: Some(Expression::Literal { value: json!({ "done": true }) }),
+                        },
+                    ),
+                ]),
+                non_cancellable_states: std::collections::BTreeSet::new(),
+            },
+        )
+    }
+
+    fn timer_artifact() -> CompiledWorkflowArtifact {
+        CompiledWorkflowArtifact::new(
+            "timer-demo".to_owned(),
+            1,
+            "unified-runtime-test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "wait".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "wait".to_owned(),
+                        CompiledStateNode::WaitForTimer {
+                            timer_ref: "1s".to_owned(),
+                            next: "done".to_owned(),
+                        },
+                    ),
+                    (
+                        "done".to_owned(),
+                        CompiledStateNode::Succeed {
+                            output: Some(Expression::Literal { value: json!({ "done": true }) }),
+                        },
+                    ),
+                ]),
+                non_cancellable_states: std::collections::BTreeSet::new(),
+            },
+        )
+    }
+
+    fn fanout_artifact_with_reducer(reducer: Option<&str>) -> CompiledWorkflowArtifact {
+        CompiledWorkflowArtifact::new(
+            "fanout-demo".to_owned(),
+            1,
+            "unified-runtime-test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "dispatch".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "dispatch".to_owned(),
+                        CompiledStateNode::FanOut {
+                            activity_type: "benchmark.echo".to_owned(),
+                            items: Expression::Member {
+                                object: Box::new(Expression::Identifier {
+                                    name: "input".to_owned(),
+                                }),
+                                property: "items".to_owned(),
+                            },
+                            next: "join".to_owned(),
+                            handle_var: "fanout".to_owned(),
+                            task_queue: None,
+                            reducer: reducer.map(str::to_owned),
+                            retry: None,
+                            config: None,
+                            schedule_to_start_timeout_ms: None,
+                            start_to_close_timeout_ms: None,
+                            heartbeat_timeout_ms: None,
+                        },
+                    ),
+                    (
+                        "join".to_owned(),
+                        CompiledStateNode::WaitForAllActivities {
+                            fanout_ref_var: "fanout".to_owned(),
+                            next: "done".to_owned(),
+                            output_var: Some("result".to_owned()),
+                            on_error: None,
+                        },
+                    ),
+                    (
+                        "done".to_owned(),
+                        CompiledStateNode::Succeed {
+                            output: Some(Expression::Identifier { name: "result".to_owned() }),
+                        },
+                    ),
+                ]),
+                non_cancellable_states: std::collections::BTreeSet::new(),
+            },
+        )
     }
 
     fn persistence_config_for(path: PathBuf) -> PersistenceConfig {
@@ -4228,6 +5992,7 @@ mod tests {
                     task_queue: "default".to_owned(),
                     activity_type: "benchmark.echo".to_owned(),
                     wait_state: "join".to_owned(),
+                    omit_success_output: false,
                 },
             )]),
         }
@@ -4285,7 +6050,11 @@ mod tests {
             1,
             "unified-runtime-test",
             ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
-            CompiledWorkflow { initial_state: "dispatch".to_owned(), states },
+            CompiledWorkflow {
+                initial_state: "dispatch".to_owned(),
+                states,
+                non_cancellable_states: std::collections::BTreeSet::new(),
+            },
         )
     }
 
@@ -4323,6 +6092,7 @@ mod tests {
                     },
                 ),
             ]),
+            non_cancellable_states: std::collections::BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
             "unified-parent-child".to_owned(),
@@ -4347,12 +6117,172 @@ mod tests {
                     }),
                 },
             )]),
+            non_cancellable_states: std::collections::BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
             "childDefinition".to_owned(),
             1,
             "unified-runtime-test",
             ArtifactEntrypoint { module: "child.ts".to_owned(), export: "workflow".to_owned() },
+            workflow,
+        );
+        artifact.artifact_hash = artifact.hash();
+        artifact
+    }
+
+    fn child_wait_for_signal_artifact() -> CompiledWorkflowArtifact {
+        let workflow = CompiledWorkflow {
+            initial_state: "wait_approve".to_owned(),
+            states: BTreeMap::from([
+                (
+                    "wait_approve".to_owned(),
+                    CompiledStateNode::WaitForEvent {
+                        event_type: "approve".to_owned(),
+                        next: "done".to_owned(),
+                        output_var: Some("approved".to_owned()),
+                    },
+                ),
+                (
+                    "done".to_owned(),
+                    CompiledStateNode::Succeed {
+                        output: Some(Expression::Identifier { name: "approved".to_owned() }),
+                    },
+                ),
+            ]),
+            non_cancellable_states: std::collections::BTreeSet::new(),
+        };
+        let mut artifact = CompiledWorkflowArtifact::new(
+            "childSignalDefinition".to_owned(),
+            1,
+            "unified-runtime-test",
+            ArtifactEntrypoint {
+                module: "child-signal.ts".to_owned(),
+                export: "workflow".to_owned(),
+            },
+            workflow,
+        );
+        artifact.artifact_hash = artifact.hash();
+        artifact
+    }
+
+    fn child_signal_parent_artifact() -> CompiledWorkflowArtifact {
+        let workflow = CompiledWorkflow {
+            initial_state: "start_child".to_owned(),
+            states: BTreeMap::from([
+                (
+                    "start_child".to_owned(),
+                    CompiledStateNode::StartChild {
+                        child_definition_id: "childSignalDefinition".to_owned(),
+                        input: Expression::Literal { value: json!({"seed": true}) },
+                        next: "signal_child".to_owned(),
+                        handle_var: Some("child".to_owned()),
+                        workflow_id: Some(Expression::Literal {
+                            value: Value::String("child-instance-signal".to_owned()),
+                        }),
+                        task_queue: None,
+                        parent_close_policy: ParentClosePolicy::RequestCancel,
+                    },
+                ),
+                (
+                    "signal_child".to_owned(),
+                    CompiledStateNode::SignalChild {
+                        child_ref_var: "child".to_owned(),
+                        signal_name: "approve".to_owned(),
+                        payload: Expression::Literal {
+                            value: Value::String("approved".to_owned()),
+                        },
+                        next: "await_child".to_owned(),
+                    },
+                ),
+                (
+                    "await_child".to_owned(),
+                    CompiledStateNode::WaitForChild {
+                        child_ref_var: "child".to_owned(),
+                        next: "done".to_owned(),
+                        output_var: Some("child_result".to_owned()),
+                        on_error: None,
+                    },
+                ),
+                (
+                    "done".to_owned(),
+                    CompiledStateNode::Succeed {
+                        output: Some(Expression::Identifier { name: "child_result".to_owned() }),
+                    },
+                ),
+            ]),
+            non_cancellable_states: std::collections::BTreeSet::new(),
+        };
+        let mut artifact = CompiledWorkflowArtifact::new(
+            "unified-parent-child-signal".to_owned(),
+            1,
+            "unified-runtime-test",
+            ArtifactEntrypoint {
+                module: "parent-child-signal.ts".to_owned(),
+                export: "workflow".to_owned(),
+            },
+            workflow,
+        );
+        artifact.artifact_hash = artifact.hash();
+        artifact
+    }
+
+    fn child_cancel_parent_artifact() -> CompiledWorkflowArtifact {
+        let workflow = CompiledWorkflow {
+            initial_state: "start_child".to_owned(),
+            states: BTreeMap::from([
+                (
+                    "start_child".to_owned(),
+                    CompiledStateNode::StartChild {
+                        child_definition_id: "childSignalDefinition".to_owned(),
+                        input: Expression::Literal { value: json!({"seed": true}) },
+                        next: "cancel_child".to_owned(),
+                        handle_var: Some("child".to_owned()),
+                        workflow_id: Some(Expression::Literal {
+                            value: Value::String("child-instance-cancel".to_owned()),
+                        }),
+                        task_queue: None,
+                        parent_close_policy: ParentClosePolicy::RequestCancel,
+                    },
+                ),
+                (
+                    "cancel_child".to_owned(),
+                    CompiledStateNode::CancelChild {
+                        child_ref_var: "child".to_owned(),
+                        reason: Some(Expression::Literal {
+                            value: Value::String("stop".to_owned()),
+                        }),
+                        next: "await_child".to_owned(),
+                    },
+                ),
+                (
+                    "await_child".to_owned(),
+                    CompiledStateNode::WaitForChild {
+                        child_ref_var: "child".to_owned(),
+                        next: "done".to_owned(),
+                        output_var: None,
+                        on_error: Some(ErrorTransition {
+                            next: "done".to_owned(),
+                            error_var: Some("child_error".to_owned()),
+                        }),
+                    },
+                ),
+                (
+                    "done".to_owned(),
+                    CompiledStateNode::Succeed {
+                        output: Some(Expression::Identifier { name: "child_error".to_owned() }),
+                    },
+                ),
+            ]),
+            non_cancellable_states: std::collections::BTreeSet::new(),
+        };
+        let mut artifact = CompiledWorkflowArtifact::new(
+            "unified-parent-child-cancel".to_owned(),
+            1,
+            "unified-runtime-test",
+            ArtifactEntrypoint {
+                module: "parent-child-cancel.ts".to_owned(),
+                export: "workflow".to_owned(),
+            },
             workflow,
         );
         artifact.artifact_hash = artifact.hash();
@@ -4370,6 +6300,7 @@ mod tests {
                     output_var: None,
                 },
             )]),
+            non_cancellable_states: std::collections::BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
             "unified-update-child".to_owned(),
@@ -4439,6 +6370,7 @@ mod tests {
                 ),
                 ("done".to_owned(), CompiledStateNode::Succeed { output: None }),
             ]),
+            non_cancellable_states: std::collections::BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
             "unified-update-demo".to_owned(),
@@ -4470,7 +6402,9 @@ mod tests {
             store,
             inner: Arc::new(StdMutex::new(inner)),
             ownership: Arc::new(StdMutex::new(UnifiedOwnershipState::inactive(1, "test-owner"))),
+            workflow_partition_count: 8,
             notify: Arc::new(Notify::new()),
+            retry_notify: Arc::new(Notify::new()),
             persist_notify: Arc::new(Notify::new()),
             persist_lock: Arc::new(Mutex::new(())),
             persistence: persistence_config_for(state_dir),
@@ -4514,6 +6448,88 @@ mod tests {
         event.occurred_at = occurred_at;
         event.metadata.insert("workflow_task_queue".to_owned(), "default".to_owned());
         event
+    }
+
+    #[test]
+    fn activity_proto_includes_timeouts() {
+        let scheduled_at = Utc::now();
+        let leased = LeasedActivity {
+            task: QueuedActivity {
+                schedule_to_start_timeout_ms: Some(1_000),
+                start_to_close_timeout_ms: Some(30_000),
+                heartbeat_timeout_ms: Some(5_000),
+                ..queued_activity("activity-1", 1, scheduled_at)
+            },
+            worker_id: "worker-a".to_owned(),
+            worker_build_id: "build-a".to_owned(),
+            lease_expires_at: scheduled_at + ChronoDuration::seconds(30),
+            owner_epoch: 7,
+        };
+
+        let proto = activity_proto(&leased, true);
+
+        assert_eq!(proto.schedule_to_start_timeout_ms, 1_000);
+        assert_eq!(proto.start_to_close_timeout_ms, 30_000);
+        assert_eq!(proto.heartbeat_timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn activity_proto_populates_cbor_when_worker_supports_it() {
+        let scheduled_at = Utc::now();
+        let leased = LeasedActivity {
+            task: QueuedActivity {
+                input: json!({"ok": true}),
+                config: Some(json!({"url": "https://example.com"})),
+                ..queued_activity("dispatch::0", 1, scheduled_at)
+            },
+            worker_id: "worker-a".to_owned(),
+            worker_build_id: "build-a".to_owned(),
+            lease_expires_at: scheduled_at + ChronoDuration::seconds(30),
+            owner_epoch: 7,
+        };
+
+        let proto = activity_proto(&leased, true);
+
+        assert!(proto.prefer_cbor);
+        assert!(!proto.input_cbor.is_empty());
+        assert!(!proto.config_cbor.is_empty());
+    }
+
+    #[test]
+    fn omit_success_output_only_applies_to_counter_state_fanout_reducers() {
+        let all_settled = fanout_artifact_with_reducer(Some("all_settled"));
+        let count = fanout_artifact_with_reducer(Some("count"));
+        let collect_results = fanout_artifact_with_reducer(Some("collect_results"));
+        let collect_settled = fanout_artifact_with_reducer(Some("collect_settled_results"));
+
+        assert!(should_omit_success_output(&all_settled, "join", "dispatch::0"));
+        assert!(should_omit_success_output(&count, "join", "dispatch::0"));
+        assert!(!should_omit_success_output(&collect_results, "join", "dispatch::0"));
+        assert!(!should_omit_success_output(&collect_settled, "join", "dispatch::0"));
+        assert!(!should_omit_success_output(&all_settled, "dispatch", "dispatch::0"));
+        assert!(!should_omit_success_output(&all_settled, "join", "single-step"));
+    }
+
+    #[test]
+    fn deadline_ordered_retry_queue_releases_only_due_tasks() {
+        let now = Utc::now();
+        let mut inner = RuntimeInner::default();
+        let earliest = DelayedRetryTask {
+            task: queued_activity("activity-early", 1, now),
+            due_at: now + ChronoDuration::milliseconds(25),
+        };
+        let later = DelayedRetryTask {
+            task: queued_activity("activity-later", 1, now),
+            due_at: now + ChronoDuration::milliseconds(50),
+        };
+
+        assert!(push_delayed_retry(&mut inner, later.clone()));
+        assert!(push_delayed_retry(&mut inner, earliest.clone()));
+
+        let released = take_due_delayed_retries(&mut inner, now + ChronoDuration::milliseconds(30));
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].activity_id, earliest.task.activity_id);
+        assert_eq!(delayed_retry_count(&inner.delayed_retries), 1);
     }
 
     struct TestPostgres {
@@ -4613,48 +6629,66 @@ mod tests {
                 return Ok(None);
             }
 
-            let kafka_port = choose_free_port().context("failed to allocate kafka host port")?;
-            let container_name = format!("fabrik-unified-test-rp-{}", Uuid::now_v7());
             let image = std::env::var("FABRIK_TEST_REDPANDA_IMAGE")
                 .unwrap_or_else(|_| "docker.redpanda.com/redpandadata/redpanda:v25.1.2".to_owned());
             let topic = format!("workflow-events-test-{}", Uuid::now_v7());
-            let output = Command::new("docker")
-                .args([
-                    "run",
-                    "--detach",
-                    "--rm",
-                    "--name",
-                    &container_name,
-                    "--publish",
-                    &format!("{kafka_port}:{kafka_port}"),
-                    &image,
-                    "redpanda",
-                    "start",
-                    "--overprovisioned",
-                    "--smp",
-                    "1",
-                    "--memory",
-                    "1G",
-                    "--reserve-memory",
-                    "0M",
-                    "--node-id",
-                    "0",
-                    "--check=false",
-                    "--kafka-addr",
-                    &format!("PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:{kafka_port}"),
-                    "--advertise-kafka-addr",
-                    &format!("PLAINTEXT://127.0.0.1:9092,OUTSIDE://127.0.0.1:{kafka_port}"),
-                    "--rpc-addr",
-                    "0.0.0.0:33145",
-                    "--advertise-rpc-addr",
-                    "127.0.0.1:33145",
-                ])
-                .output()
-                .with_context(|| format!("failed to start docker container {container_name}"))?;
-            if !output.status.success() {
+            let mut last_error = None;
+            let mut container_name = String::new();
+            let mut kafka_port = 0_u16;
+            let mut started = false;
+            for _ in 0..5 {
+                kafka_port = choose_free_port().context("failed to allocate kafka host port")?;
+                container_name = format!("fabrik-unified-test-rp-{}", Uuid::now_v7());
+                let output = Command::new("docker")
+                    .args([
+                        "run",
+                        "--detach",
+                        "--rm",
+                        "--name",
+                        &container_name,
+                        "--publish",
+                        &format!("{kafka_port}:{kafka_port}"),
+                        &image,
+                        "redpanda",
+                        "start",
+                        "--overprovisioned",
+                        "--smp",
+                        "1",
+                        "--memory",
+                        "1G",
+                        "--reserve-memory",
+                        "0M",
+                        "--node-id",
+                        "0",
+                        "--check=false",
+                        "--kafka-addr",
+                        &format!("PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:{kafka_port}"),
+                        "--advertise-kafka-addr",
+                        &format!("PLAINTEXT://127.0.0.1:9092,OUTSIDE://127.0.0.1:{kafka_port}"),
+                        "--rpc-addr",
+                        "0.0.0.0:33145",
+                        "--advertise-rpc-addr",
+                        "127.0.0.1:33145",
+                    ])
+                    .output()
+                    .with_context(|| {
+                        format!("failed to start docker container {container_name}")
+                    })?;
+                if output.status.success() {
+                    started = true;
+                    break;
+                }
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                if stderr.contains("address already in use") {
+                    last_error = Some(stderr);
+                    continue;
+                }
+                anyhow::bail!("docker failed to start redpanda test container: {stderr}");
+            }
+            if !started {
                 anyhow::bail!(
-                    "docker failed to start redpanda test container: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
+                    "docker failed to start redpanda test container after retries: {}",
+                    last_error.unwrap_or_else(|| "unknown error".to_owned())
                 );
             }
 
@@ -4772,6 +6806,7 @@ mod tests {
                 task_queue: "default".to_owned(),
                 activity_type: "benchmark.echo".to_owned(),
                 wait_state: "join".to_owned(),
+                omit_success_output: false,
             },
         );
 
@@ -4958,6 +6993,7 @@ mod tests {
                         task_queue: queued.task_queue.clone(),
                         activity_type: queued.activity_type.clone(),
                         wait_state: queued.state.clone(),
+                        omit_success_output: queued.omit_success_output,
                     },
                 )]),
             },
@@ -4967,10 +7003,10 @@ mod tests {
             .entry(QueueKey { tenant_id: "tenant".to_owned(), task_queue: "default".to_owned() })
             .or_default()
             .push_back(queued.clone());
-        inner.delayed_retries.push(DelayedRetryTask {
-            task: queued.clone(),
-            due_at: now + ChronoDuration::seconds(30),
-        });
+        push_delayed_retry(
+            &mut inner,
+            DelayedRetryTask { task: queued.clone(), due_at: now + ChronoDuration::seconds(30) },
+        );
         let state_dir =
             std::env::temp_dir().join(format!("unified-runtime-cancel-test-{}", Uuid::now_v7()));
         let app_state = test_app_state(store.clone(), inner, state_dir.clone());
@@ -5001,7 +7037,7 @@ mod tests {
         assert_eq!(runtime.instance.status, WorkflowStatus::Cancelled);
         assert!(runtime.active_activities.is_empty());
         assert!(inner.ready.values().all(VecDeque::is_empty));
-        assert!(inner.delayed_retries.is_empty());
+        assert_eq!(delayed_retry_count(&inner.delayed_retries), 0);
         drop(inner);
 
         let stored = store
@@ -5015,8 +7051,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_mailbox_item_unwinds_active_activity_instead_of_force_cancelling_workflow(
-    ) -> Result<()> {
+    async fn cancel_mailbox_item_unwinds_active_activity_instead_of_force_cancelling_workflow()
+    -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
         };
@@ -5048,13 +7084,8 @@ mod tests {
             WorkflowEvent::WorkflowCancellationRequested { reason: "stop".to_owned() },
             Utc::now(),
         );
-        let item = mailbox_record(
-            WorkflowMailboxKind::CancelRequest,
-            cancel_requested,
-            None,
-            None,
-            None,
-        );
+        let item =
+            mailbox_record(WorkflowMailboxKind::CancelRequest, cancel_requested, None, None, None);
 
         let outcome = dispatch_cancel_mailbox_item_unified(&app_state, &item).await?;
         let MailboxDrainOutcome::Processed { general, schedules, .. } = outcome else {
@@ -5069,9 +7100,9 @@ mod tests {
         assert_ne!(stored.status, WorkflowStatus::Cancelled);
         assert_eq!(stored.status, WorkflowStatus::Completed);
 
-        let activities =
-            store.list_activities_for_run("tenant", "instance-cancel-unwind", "run-cancel-unwind")
-                .await?;
+        let activities = store
+            .list_activities_for_run("tenant", "instance-cancel-unwind", "run-cancel-unwind")
+            .await?;
         assert_eq!(activities.len(), 1);
         assert_eq!(activities[0].status, fabrik_store::WorkflowActivityStatus::Cancelled);
 
@@ -5107,6 +7138,7 @@ mod tests {
                         task_queue: "default".to_owned(),
                         activity_type: "benchmark.echo".to_owned(),
                         wait_state: "join".to_owned(),
+                        omit_success_output: false,
                     },
                 )]),
             },
@@ -5393,7 +7425,7 @@ mod tests {
         };
         apply_db_actions(&app_state, general, schedules).await?;
         if let Some(post_plan) = post_plan {
-            apply_post_plan_child_effects(&app_state, post_plan).await?;
+            apply_post_plan_effects(&app_state, post_plan).await?;
         }
 
         let update = store
@@ -5422,6 +7454,103 @@ mod tests {
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].status, "completed");
         assert_eq!(children[0].output, Some(Value::String("hello-child".to_owned())));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trigger_signal_child_completes_child_and_reflects_to_parent() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let parent_artifact = child_signal_parent_artifact();
+        let child_artifact = child_wait_for_signal_artifact();
+        store.put_artifact("tenant", &parent_artifact).await?;
+        store.put_artifact("tenant", &child_artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-child-signal-test-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &parent_artifact.definition_id,
+            parent_artifact.definition_version,
+            parent_artifact.artifact_hash.clone(),
+            "parent-instance-signal",
+            "parent-run-signal",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({"seed": true}) },
+            Utc::now(),
+        );
+
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let parent = store
+            .get_instance("tenant", "parent-instance-signal")
+            .await?
+            .context("parent instance should exist")?;
+        assert_eq!(parent.status, WorkflowStatus::Completed);
+        assert_eq!(parent.output, Some(Value::String("approved".to_owned())));
+
+        let child = store
+            .get_instance("tenant", "child-instance-signal")
+            .await?
+            .context("child instance should exist")?;
+        assert_eq!(child.status, WorkflowStatus::Completed);
+        assert_eq!(child.output, Some(Value::String("approved".to_owned())));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trigger_cancel_child_reflects_cancellation_to_parent_error_transition() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let parent_artifact = child_cancel_parent_artifact();
+        let child_artifact = child_wait_for_signal_artifact();
+        store.put_artifact("tenant", &parent_artifact).await?;
+        store.put_artifact("tenant", &child_artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-child-cancel-test-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &parent_artifact.definition_id,
+            parent_artifact.definition_version,
+            parent_artifact.artifact_hash.clone(),
+            "parent-instance-cancel",
+            "parent-run-cancel",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({"seed": true}) },
+            Utc::now(),
+        );
+
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let parent = store
+            .get_instance("tenant", "parent-instance-cancel")
+            .await?
+            .context("parent instance should exist")?;
+        assert_eq!(parent.status, WorkflowStatus::Completed);
+        assert_eq!(parent.output, Some(Value::String("stop".to_owned())));
+
+        let child = store
+            .get_instance("tenant", "child-instance-cancel")
+            .await?
+            .context("child instance should exist")?;
+        assert_eq!(child.status, WorkflowStatus::Cancelled);
 
         fs::remove_dir_all(state_dir).ok();
         Ok(())
@@ -5466,12 +7595,18 @@ mod tests {
 
         assert_eq!(inner.owner_epoch, 9);
         assert_eq!(inner.leased.len(), 0);
-        assert_eq!(inner.delayed_retries.len(), 1);
+        assert_eq!(delayed_retry_count(&inner.delayed_retries), 1);
         assert_eq!(ready_tasks.len(), 3);
         assert!(ready_tasks.iter().any(|task| task.activity_id == ready_task.activity_id));
         assert!(ready_tasks.iter().any(|task| task.activity_id == leased_task.activity_id));
         assert!(ready_tasks.iter().any(|task| task.activity_id == due_retry_task.activity_id));
-        assert_eq!(inner.delayed_retries[0].task.activity_id, future_retry_task.activity_id);
+        let future_retry = inner
+            .delayed_retries
+            .values()
+            .next()
+            .and_then(|retries| retries.first())
+            .expect("future retry task");
+        assert_eq!(future_retry.task.activity_id, future_retry_task.activity_id);
     }
 
     #[test]
@@ -5591,10 +7726,13 @@ mod tests {
                 owner_epoch: 1,
             },
         );
-        local.delayed_retries.push(DelayedRetryTask {
-            task: local_retry_task.clone(),
-            due_at: now + ChronoDuration::seconds(30),
-        });
+        push_delayed_retry(
+            &mut local,
+            DelayedRetryTask {
+                task: local_retry_task.clone(),
+                due_at: now + ChronoDuration::seconds(30),
+            },
+        );
 
         let mut shared = RuntimeInner { next_seq: 7, ..RuntimeInner::default() };
         let mut shared_runtime = runtime_workflow_for_run(
@@ -5626,7 +7764,7 @@ mod tests {
         assert_eq!(ready_tasks.len(), 1);
         assert_eq!(ready_tasks[0].activity_id, shared_task.activity_id);
         assert!(merged.leased.is_empty());
-        assert!(merged.delayed_retries.is_empty());
+        assert_eq!(delayed_retry_count(&merged.delayed_retries), 0);
     }
 
     #[test]
@@ -5681,6 +7819,319 @@ mod tests {
         assert_eq!(merged_runtime.instance.status, WorkflowStatus::Completed);
         assert_eq!(ready_tasks.len(), 1);
         assert_eq!(ready_tasks[0].activity_id, local_task.activity_id);
+    }
+
+    #[tokio::test]
+    async fn trigger_continue_as_new_rolls_run_lineage() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = continue_as_new_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+        let state_dir =
+            std::env::temp_dir().join(format!("unified-runtime-continue-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir);
+
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-continue",
+            "run-continue-1",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({ "remaining": 1 }) },
+            Utc::now(),
+        );
+
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let current =
+            store.get_instance("tenant", "instance-continue").await?.context("current instance")?;
+        assert_ne!(current.run_id, "run-continue-1");
+        assert_eq!(current.status, WorkflowStatus::Completed);
+
+        let previous_run = store
+            .get_run_record("tenant", "instance-continue", "run-continue-1")
+            .await?
+            .context("previous run record")?;
+        assert_eq!(previous_run.next_run_id.as_deref(), Some(current.run_id.as_str()));
+        assert_eq!(previous_run.continue_reason.as_deref(), Some("continued_as_new"));
+
+        let new_run = store
+            .get_run_record("tenant", "instance-continue", &current.run_id)
+            .await?
+            .context("new run record")?;
+        assert_eq!(new_run.previous_run_id.as_deref(), Some("run-continue-1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trigger_wait_timer_persists_and_firing_timer_completes_run() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = timer_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+        let state_dir =
+            std::env::temp_dir().join(format!("unified-runtime-timer-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir);
+        {
+            let mut ownership =
+                app_state.ownership.lock().expect("unified ownership lock poisoned");
+            ownership.partition_id = DEFAULT_OWNERSHIP_PARTITION_ID;
+        }
+
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-timer",
+            "run-timer-1",
+            "unified-runtime-test",
+        );
+        let trigger_time = Utc::now();
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({}) },
+            trigger_time,
+        );
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let workflow_partition = workflow_partition_id(&app_state, "tenant", "instance-timer");
+        let due = store
+            .claim_due_timers(workflow_partition, trigger_time + ChronoDuration::seconds(2), 10, 1)
+            .await?;
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].timer_id, "wait");
+        let misrouted = store
+            .claim_due_timers(
+                DEFAULT_OWNERSHIP_PARTITION_ID,
+                trigger_time + ChronoDuration::seconds(2),
+                10,
+                1,
+            )
+            .await?;
+        assert!(misrouted.is_empty());
+
+        let timer_event = test_event(
+            &identity,
+            WorkflowEvent::TimerFired { timer_id: "wait".to_owned() },
+            trigger_time + ChronoDuration::seconds(2),
+        );
+        handle_timer_fired_event(&app_state, timer_event).await?;
+
+        let current =
+            store.get_instance("tenant", "instance-timer").await?.context("timer instance")?;
+        assert_eq!(current.status, WorkflowStatus::Completed);
+        let remaining = store
+            .claim_due_timers(workflow_partition, trigger_time + ChronoDuration::seconds(5), 10, 2)
+            .await?;
+        assert!(remaining.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn brokered_signal_event_enqueues_mailbox_and_completes_hot_run() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = child_wait_for_signal_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-brokered-signal-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir);
+
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-signal",
+            "run-signal-1",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: Value::Null },
+            Utc::now(),
+        );
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let signal_event = test_event(
+            &identity,
+            WorkflowEvent::SignalQueued {
+                signal_id: "sig-1".to_owned(),
+                signal_type: "approve".to_owned(),
+                payload: Value::String("approved".to_owned()),
+            },
+            Utc::now(),
+        );
+        store
+            .queue_signal(
+                "tenant",
+                "instance-signal",
+                "run-signal-1",
+                "sig-1",
+                "approve",
+                None,
+                &Value::String("approved".to_owned()),
+                signal_event.event_id,
+                signal_event.occurred_at,
+            )
+            .await?;
+
+        handle_mailbox_queue_event(&app_state, signal_event).await?;
+
+        let current =
+            store.get_instance("tenant", "instance-signal").await?.context("signal instance")?;
+        assert_eq!(current.status, WorkflowStatus::Completed);
+        assert_eq!(current.output, Some(Value::String("approved".to_owned())));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_activity_tasks_records_queue_poller_for_visibility() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir =
+            std::env::temp_dir().join(format!("unified-runtime-poller-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        apply_ownership_record(
+            &app_state,
+            1,
+            "test-owner",
+            3,
+            Utc::now() + ChronoDuration::seconds(30),
+        );
+        let worker = WorkerApi { state: app_state.clone() };
+
+        let response = worker
+            .poll_activity_tasks(Request::new(PollActivityTasksRequest {
+                tenant_id: "tenant".to_owned(),
+                task_queue: "payments".to_owned(),
+                worker_id: "worker-a".to_owned(),
+                worker_build_id: "build-a".to_owned(),
+                poll_timeout_ms: 10,
+                max_tasks: 1,
+                supports_cbor: false,
+            }))
+            .await?
+            .into_inner();
+        assert!(response.tasks.is_empty());
+
+        let inspection = store
+            .inspect_task_queue("tenant", TaskQueueKind::Activity, "payments", Utc::now())
+            .await?;
+        assert_eq!(inspection.pollers.len(), 1);
+        assert_eq!(inspection.pollers[0].poller_id, "worker-a");
+        assert_eq!(inspection.pollers[0].build_id, "build-a");
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_activity_tasks_respects_activity_build_compatibility() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        store
+            .register_task_queue_build(
+                "tenant",
+                TaskQueueKind::Activity,
+                "payments",
+                "build-a",
+                &[],
+                None,
+            )
+            .await?;
+        store
+            .register_task_queue_build(
+                "tenant",
+                TaskQueueKind::Activity,
+                "payments",
+                "build-b",
+                &[],
+                None,
+            )
+            .await?;
+        store
+            .upsert_compatibility_set(
+                "tenant",
+                TaskQueueKind::Activity,
+                "payments",
+                "stable",
+                &["build-a".to_owned()],
+                true,
+            )
+            .await?;
+
+        let now = Utc::now();
+        let mut inner = RuntimeInner::default();
+        let queue_key =
+            QueueKey { tenant_id: "tenant".to_owned(), task_queue: "payments".to_owned() };
+        let queued = QueuedActivity {
+            task_queue: "payments".to_owned(),
+            ..queued_activity("activity-1", 1, now)
+        };
+        store.upsert_activities_scheduled_batch(&[activity_schedule_update(&queued)]).await?;
+        inner.ready.entry(queue_key.clone()).or_default().push_back(queued);
+
+        let state_dir =
+            std::env::temp_dir().join(format!("unified-runtime-compatibility-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), inner, state_dir.clone());
+        apply_ownership_record(&app_state, 1, "test-owner", 4, now + ChronoDuration::seconds(30));
+        let worker = WorkerApi { state: app_state.clone() };
+
+        let incompatible = worker
+            .poll_activity_tasks(Request::new(PollActivityTasksRequest {
+                tenant_id: "tenant".to_owned(),
+                task_queue: "payments".to_owned(),
+                worker_id: "worker-b".to_owned(),
+                worker_build_id: "build-b".to_owned(),
+                poll_timeout_ms: 10,
+                max_tasks: 1,
+                supports_cbor: false,
+            }))
+            .await?
+            .into_inner();
+        assert!(incompatible.tasks.is_empty());
+
+        {
+            let inner = app_state.inner.lock().expect("unified runtime lock poisoned");
+            let queue = inner.ready.get(&queue_key).context("ready queue should still exist")?;
+            assert_eq!(queue.len(), 1);
+        }
+
+        let compatible = worker
+            .poll_activity_tasks(Request::new(PollActivityTasksRequest {
+                tenant_id: "tenant".to_owned(),
+                task_queue: "payments".to_owned(),
+                worker_id: "worker-a".to_owned(),
+                worker_build_id: "build-a".to_owned(),
+                poll_timeout_ms: 10,
+                max_tasks: 1,
+                supports_cbor: false,
+            }))
+            .await?
+            .into_inner();
+        assert_eq!(compatible.tasks.len(), 1);
+        assert_eq!(compatible.tasks[0].activity_id, "activity-1");
+        assert_eq!(compatible.tasks[0].task_queue, "payments");
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
     }
 
     #[test]
@@ -5762,7 +8213,7 @@ mod tests {
         store.upsert_instance(&instance).await?;
         store.put_snapshot(&instance).await?;
 
-        let scheduled = schedule_activities_from_plan(&instance, &plan, emitted_at)?;
+        let scheduled = schedule_activities_from_plan(&artifact, &instance, &plan, emitted_at)?;
         let scheduled_updates = scheduled.iter().map(activity_schedule_update).collect::<Vec<_>>();
         store.upsert_activities_scheduled_batch(&scheduled_updates).await?;
 

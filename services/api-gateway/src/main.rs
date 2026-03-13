@@ -62,10 +62,19 @@ struct WorkflowRoutingResponse {
     tenant_id: String,
     instance_id: String,
     run_id: String,
+    definition_id: String,
+    definition_version: Option<u32>,
+    artifact_hash: Option<String>,
     workflow_task_queue: String,
+    routing_status: &'static str,
+    default_compatibility_set_id: Option<String>,
+    compatible_build_ids: Vec<String>,
+    registered_build_ids: Vec<String>,
     sticky_workflow_build_id: Option<String>,
     sticky_workflow_poller_id: Option<String>,
     sticky_updated_at: Option<chrono::DateTime<Utc>>,
+    sticky_build_compatible_with_queue: Option<bool>,
+    sticky_build_supports_pinned_artifact: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -209,6 +218,10 @@ fn build_app(state: AppState, service_name: String) -> Router {
         get(proxy_to_query_get),
     )
     .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs/{run_id}/graph",
+        get(proxy_to_query_get),
+    )
+    .route(
         "/tenants/{tenant_id}/workflows/{workflow_instance_id}/execution-graph",
         get(proxy_to_query_get),
     )
@@ -218,6 +231,10 @@ fn build_app(state: AppState, service_name: String) -> Router {
     )
     .route(
         "/tenants/{tenant_id}/workflow-definitions/{definition_id}/latest",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflow-definitions/{definition_id}/graph",
         get(proxy_to_query_get),
     )
     .route(
@@ -501,10 +518,7 @@ async fn search(
         .store
         .list_runs_page_with_filters(
             &tenant_id,
-            &WorkflowRunFilters {
-                query: Some(needle.clone()),
-                ..WorkflowRunFilters::default()
-            },
+            &WorkflowRunFilters { query: Some(needle.clone()), ..WorkflowRunFilters::default() },
             limit as i64,
             0,
         )
@@ -558,7 +572,7 @@ async fn search(
             "id": definition.workflow_id,
             "title": definition.workflow_id,
             "subtitle": format!("definition v{}", definition.latest_version),
-            "href": format!("/workflows?definition_id={}", definition.workflow_id),
+            "href": format!("/workflows/{}", definition.workflow_id),
             "tenant_id": definition.tenant_id
         }));
     }
@@ -596,15 +610,79 @@ async fn get_workflow_routing(
                 format!("workflow run {} not found for tenant {tenant_id}", instance.run_id),
             )
         })?;
+    let inspection = state
+        .store
+        .inspect_task_queue(
+            &tenant_id,
+            TaskQueueKind::Workflow,
+            &run.workflow_task_queue,
+            Utc::now(),
+        )
+        .await
+        .map_err(internal_error)?;
+    let sticky_build_compatible_with_queue =
+        if let Some(build_id) = run.sticky_workflow_build_id.as_deref() {
+            Some(
+                state
+                    .store
+                    .is_build_compatible_with_queue(
+                        &tenant_id,
+                        TaskQueueKind::Workflow,
+                        &run.workflow_task_queue,
+                        build_id,
+                    )
+                    .await
+                    .map_err(internal_error)?,
+            )
+        } else {
+            None
+        };
+    let sticky_build_supports_pinned_artifact =
+        if let Some(build_id) = run.sticky_workflow_build_id.as_deref() {
+            Some(
+                state
+                    .store
+                    .workflow_build_supports_artifact(
+                        &tenant_id,
+                        &run.workflow_task_queue,
+                        build_id,
+                        run.artifact_hash.as_deref(),
+                    )
+                    .await
+                    .map_err(internal_error)?,
+            )
+        } else {
+            None
+        };
+    let routing_status =
+        match (sticky_build_compatible_with_queue, sticky_build_supports_pinned_artifact) {
+            (Some(false), _) => "sticky_incompatible_fallback_required",
+            (_, Some(false)) => "sticky_artifact_mismatch_fallback_required",
+            (Some(true), Some(true)) | (Some(true), None) | (None, Some(true)) => "sticky_active",
+            (None, None) => "queue_default_active",
+        };
 
     Ok(Json(WorkflowRoutingResponse {
         tenant_id,
         instance_id,
         run_id: run.run_id,
+        definition_id: run.definition_id,
+        definition_version: run.definition_version,
+        artifact_hash: run.artifact_hash.clone(),
         workflow_task_queue: run.workflow_task_queue,
+        routing_status,
+        default_compatibility_set_id: inspection.default_set_id,
+        compatible_build_ids: inspection.compatible_build_ids,
+        registered_build_ids: inspection
+            .registered_builds
+            .into_iter()
+            .map(|record| record.build_id)
+            .collect(),
         sticky_workflow_build_id: run.sticky_workflow_build_id,
         sticky_workflow_poller_id: run.sticky_workflow_poller_id,
         sticky_updated_at: run.sticky_updated_at,
+        sticky_build_compatible_with_queue,
+        sticky_build_supports_pinned_artifact,
     }))
 }
 
@@ -1110,6 +1188,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workflow_routing_reports_pinned_artifact_and_sticky_compatibility() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let app = build_app(
+            AppState {
+                client: Client::new(),
+                ingest_base: "http://127.0.0.1:1".to_owned(),
+                query_base: "http://127.0.0.1:1".to_owned(),
+                executor_base: "http://127.0.0.1:1".to_owned(),
+                matching_base: "http://127.0.0.1:1".to_owned(),
+                store: store.clone(),
+            },
+            "api-gateway-test".to_owned(),
+        );
+
+        store
+            .register_task_queue_build(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "payments",
+                "build-a",
+                &["artifact-a".to_owned()],
+                None,
+            )
+            .await?;
+        store
+            .register_task_queue_build(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "payments",
+                "build-b",
+                &["artifact-b".to_owned()],
+                None,
+            )
+            .await?;
+        store
+            .upsert_compatibility_set(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "payments",
+                "stable",
+                &["build-a".to_owned()],
+                true,
+            )
+            .await?;
+        store
+            .put_run_start(
+                "tenant-a",
+                "instance-1",
+                "run-1",
+                "payments",
+                Some(1),
+                Some("artifact-a"),
+                "payments",
+                uuid::Uuid::now_v7(),
+                chrono::Utc::now(),
+                None,
+                None,
+            )
+            .await?;
+        store
+            .upsert_instance(&WorkflowInstanceState {
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "instance-1".to_owned(),
+                run_id: "run-1".to_owned(),
+                definition_id: "payments".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                workflow_task_queue: "payments".to_owned(),
+                sticky_workflow_build_id: Some("build-a".to_owned()),
+                sticky_workflow_poller_id: Some("poller-a".to_owned()),
+                current_state: Some("charge-card".to_owned()),
+                context: None,
+                artifact_execution: None,
+                status: WorkflowStatus::Running,
+                input: Some(json!({"orderId": 42})),
+                output: None,
+                event_count: 4,
+                last_event_id: uuid::Uuid::now_v7(),
+                last_event_type: "ActivityScheduled".to_owned(),
+                updated_at: chrono::Utc::now(),
+            })
+            .await?;
+        store
+            .update_run_workflow_sticky(
+                "tenant-a",
+                "instance-1",
+                "run-1",
+                "payments",
+                "build-a",
+                "poller-a",
+                chrono::Utc::now(),
+            )
+            .await?;
+
+        let response = app
+            .oneshot(
+                Request::get("/tenants/tenant-a/workflows/instance-1/routing")
+                    .body(Body::empty())
+                    .expect("routing request"),
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await?;
+        let payload: Value = serde_json::from_slice(&body)?;
+        assert_eq!(payload["definition_id"], "payments");
+        assert_eq!(payload["definition_version"], 1);
+        assert_eq!(payload["artifact_hash"], "artifact-a");
+        assert_eq!(payload["workflow_task_queue"], "payments");
+        assert_eq!(payload["routing_status"], "sticky_active");
+        assert_eq!(payload["default_compatibility_set_id"], "stable");
+        assert_eq!(payload["compatible_build_ids"][0], "build-a");
+        let registered_build_ids = payload["registered_build_ids"]
+            .as_array()
+            .context("registered_build_ids should be an array")?;
+        assert!(registered_build_ids.iter().any(|value| value == "build-a"));
+        assert!(registered_build_ids.iter().any(|value| value == "build-b"));
+        assert_eq!(payload["sticky_workflow_build_id"], "build-a");
+        assert_eq!(payload["sticky_workflow_poller_id"], "poller-a");
+        assert_eq!(payload["sticky_build_compatible_with_queue"], true);
+        assert_eq!(payload["sticky_build_supports_pinned_artifact"], true);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn search_returns_milestone_run_and_definition_targets() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
@@ -1184,8 +1390,16 @@ mod tests {
         .map_err(|(_, message)| anyhow::anyhow!(message))?;
 
         let items = payload["items"].as_array().expect("search items array");
-        assert!(items.iter().any(|item| item["kind"] == "run" && item["href"] == "/runs/instance-1/run-1"));
-        assert!(items.iter().any(|item| item["kind"] == "definition" && item["href"] == "/workflows?definition_id=payments"));
+        assert!(
+            items
+                .iter()
+                .any(|item| item["kind"] == "run" && item["href"] == "/runs/instance-1/run-1")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item["kind"] == "definition" && item["href"] == "/workflows/payments")
+        );
         Ok(())
     }
 }
