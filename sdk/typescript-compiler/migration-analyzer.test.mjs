@@ -55,9 +55,17 @@ test("migration analyzer supports default-compatible payload converters and bloc
     root,
     "crates/fabrik-cli/test-fixtures/temporal-supported-api-qualified",
   );
+  const activityFailureQualifiedFixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-activity-failure-qualified",
+  );
   const workerVersioningQualifiedFixture = path.join(
     root,
     "crates/fabrik-cli/test-fixtures/temporal-worker-versioning-qualified",
+  );
+  const searchAttributesQualifiedFixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-search-attributes-qualified",
   );
   const patchingQualifiedFixture = path.join(
     root,
@@ -73,7 +81,9 @@ test("migration analyzer supports default-compatible payload converters and bloc
   const bootstrapEsmQualified = await analyze(bootstrapEsmQualifiedFixture);
   const payloadPathQualified = await analyze(payloadPathQualifiedFixture);
   const supportedApiQualified = await analyze(supportedApiQualifiedFixture);
+  const activityFailureQualified = await analyze(activityFailureQualifiedFixture);
   const workerVersioningQualified = await analyze(workerVersioningQualifiedFixture);
+  const searchAttributesQualified = await analyze(searchAttributesQualifiedFixture);
   const patchingQualified = await analyze(patchingQualifiedFixture);
   const payloadPathQualifiedV2 = await analyze(payloadPathQualifiedV2Fixture);
   const visibilityFixture = path.join(
@@ -98,10 +108,15 @@ test("migration analyzer supports default-compatible payload converters and bloc
   );
   assert.equal(supportedApiQualified.summary.hard_block_count, 0);
   assert.equal(supportedApiQualified.workers[0].task_queue, "supported-api");
+  assert.equal(activityFailureQualified.summary.hard_block_count, 0);
+  assert.equal(activityFailureQualified.workers[0].task_queue, "activity-failure-qualified");
   assert.equal(workerVersioningQualified.summary.hard_block_count, 0);
   assert.equal(workerVersioningQualified.workers[0].task_queue, "worker-versioning-qualified");
   assert.equal(workerVersioningQualified.workflows[0].versioning_behavior, "AUTO_UPGRADE");
   assert.equal(workerVersioningQualified.workflows[1].versioning_behavior, "PINNED");
+  assert.equal(searchAttributesQualified.summary.hard_block_count, 0);
+  assert.equal(searchAttributesQualified.workers[0].task_queue, "search-attributes-qualified");
+  assert.ok(searchAttributesQualified.files.some((file) => file.uses.includes("search_attributes_memo")));
   assert.equal(patchingQualified.summary.hard_block_count, 0);
   assert.equal(patchingQualified.workers[0].task_queue, "patching-qualified");
   assert.equal(payloadPathQualifiedV2.summary.hard_block_count, 0);

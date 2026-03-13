@@ -5,7 +5,13 @@ import { toast } from "sonner";
 
 import { WorkflowGraphExplorer } from "../components/graph/workflow-graph-explorer";
 import { Badge, ConsistencyBadge, Panel } from "../components/ui";
-import { api } from "../lib/api";
+import {
+  api,
+  type WatchEvent,
+  type WorkflowBulkBatch,
+  type WorkflowBulkBatchResponse,
+  type WorkflowBulkBatchesResponse
+} from "../lib/api";
 import { formatDate, formatDuration, formatInlineValue, formatNumber } from "../lib/format";
 import { useTenant } from "../lib/tenant-context";
 
@@ -20,6 +26,9 @@ type LiveBatchRoutingSignal = {
   selected_backend: string | null;
   routing_reason: string | null;
   admission_policy_version: string | null;
+  reducer_kind: string | null;
+  reducer_execution_path: string | null;
+  reducer_output: unknown | null;
   status: string | null;
 };
 
@@ -28,6 +37,9 @@ type LiveBatchCapacitySignal = {
   task_queue: string | null;
   selected_backend: string | null;
   routing_reason: string | null;
+  reducer_kind: string | null;
+  reducer_execution_path: string | null;
+  reducer_output: unknown | null;
   admission: {
     stream_v2_capacity?: {
       state?: string | null;
@@ -37,10 +49,23 @@ type LiveBatchCapacitySignal = {
   } | null;
 };
 
+type LiveThroughputBatchDelta = {
+  batch_id: string;
+  batch: WorkflowBulkBatch;
+};
+
 function parseWatchBody<T>(event: MessageEvent<string>): T | null {
   try {
     const parsed = JSON.parse(event.data) as { body?: T };
     return parsed.body ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function parseWatchEnvelope<T>(event: MessageEvent<string>): WatchEvent<T> | null {
+  try {
+    return JSON.parse(event.data) as WatchEvent<T>;
   } catch {
     return null;
   }
@@ -62,6 +87,52 @@ function metadataPreview(value: unknown) {
       }`
     )
     .join(" · ");
+}
+
+function reducerOutputPreview(value: unknown) {
+  if (value == null) return "-";
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "string") {
+    return String(value);
+  }
+  return JSON.stringify(value);
+}
+
+function mergeBatchIntoList(
+  previous: WorkflowBulkBatchesResponse | undefined,
+  batch: WorkflowBulkBatch,
+  metadata?: Partial<Pick<WorkflowBulkBatchesResponse, "consistency" | "authoritative_source" | "projection_lag_ms" | "watch_cursor">>
+) {
+  if (!previous) return previous;
+  const index = previous.batches.findIndex((item) => item.batch_id === batch.batch_id);
+  const batches =
+    index >= 0
+      ? previous.batches.map((item) => (item.batch_id === batch.batch_id ? batch : item))
+      : [batch, ...previous.batches];
+  return {
+    ...previous,
+    consistency: metadata?.consistency ?? previous.consistency,
+    authoritative_source: metadata?.authoritative_source ?? previous.authoritative_source,
+    projection_lag_ms: metadata?.projection_lag_ms ?? previous.projection_lag_ms,
+    watch_cursor: metadata?.watch_cursor ?? previous.watch_cursor,
+    batch_count: index >= 0 ? previous.batch_count : previous.batch_count + 1,
+    batches
+  };
+}
+
+function mergeBatchIntoDetail(
+  previous: WorkflowBulkBatchResponse | undefined,
+  batch: WorkflowBulkBatch,
+  metadata?: Partial<Pick<WorkflowBulkBatchResponse, "consistency" | "authoritative_source" | "projection_lag_ms" | "watch_cursor">>
+) {
+  if (!previous) return previous;
+  return {
+    ...previous,
+    consistency: metadata?.consistency ?? previous.consistency,
+    authoritative_source: metadata?.authoritative_source ?? previous.authoritative_source,
+    projection_lag_ms: metadata?.projection_lag_ms ?? previous.projection_lag_ms,
+    watch_cursor: metadata?.watch_cursor ?? previous.watch_cursor,
+    batch
+  };
 }
 
 function eventLane(eventType: string): TimelineLane {
@@ -189,7 +260,62 @@ export function WorkflowDetailPage() {
       }
     };
     source.addEventListener("workflow_state_changed", refresh);
-    source.addEventListener("throughput_batches_changed", refreshBatches);
+    source.addEventListener("throughput_batches_changed", (event) => {
+      const body = parseWatchBody<WorkflowBulkBatchesResponse>(event as MessageEvent<string>);
+      if (!body) {
+        refreshBatches();
+        return;
+      }
+      client.setQueryData<WorkflowBulkBatchesResponse>(
+        ["run-bulk-batches", tenantId, instanceId, resolvedRunId],
+        body
+      );
+      if (selectedBatchId !== "") {
+        const selectedBatch = body.batches.find((batch) => batch.batch_id === selectedBatchId);
+        if (selectedBatch) {
+          client.setQueryData<WorkflowBulkBatchResponse | undefined>(
+            ["run-bulk-batch", tenantId, instanceId, resolvedRunId, selectedBatchId],
+            (previous) =>
+              mergeBatchIntoDetail(previous, selectedBatch, {
+                consistency: body.consistency,
+                authoritative_source: body.authoritative_source,
+                projection_lag_ms: body.projection_lag_ms,
+                watch_cursor: body.watch_cursor
+              })
+          );
+        }
+      }
+    });
+    source.addEventListener("throughput_batch_delta", (event) => {
+      const envelope = parseWatchEnvelope<LiveThroughputBatchDelta>(event as MessageEvent<string>);
+      if (!envelope?.body?.batch) {
+        refreshBatches();
+        return;
+      }
+      const batch = envelope.body.batch;
+      client.setQueryData<WorkflowBulkBatchesResponse | undefined>(
+        ["run-bulk-batches", tenantId, instanceId, resolvedRunId],
+        (previous) =>
+          mergeBatchIntoList(previous, batch, {
+            consistency: envelope.consistency,
+            authoritative_source: envelope.authoritative_source,
+            projection_lag_ms: envelope.projection_lag_ms,
+            watch_cursor: envelope.cursor
+          })
+      );
+      if (batch.batch_id === selectedBatchId) {
+        client.setQueryData<WorkflowBulkBatchResponse | undefined>(
+          ["run-bulk-batch", tenantId, instanceId, resolvedRunId, selectedBatchId],
+          (previous) =>
+            mergeBatchIntoDetail(previous, batch, {
+              consistency: envelope.consistency,
+              authoritative_source: envelope.authoritative_source,
+              projection_lag_ms: envelope.projection_lag_ms,
+              watch_cursor: envelope.cursor
+            })
+        );
+      }
+    });
     return () => source.close();
   }, [client, instanceId, resolvedRunId, selectedBatchId, tenantId]);
 
@@ -205,13 +331,39 @@ export function WorkflowDetailPage() {
         queryKey: ["run-bulk-batch", tenantId, instanceId, resolvedRunId, selectedBatchId]
       });
     };
-    source.addEventListener("batch_progress", refresh);
-    source.addEventListener("batch_terminal", refresh);
-    source.addEventListener("projection_lag", refresh);
+    const applyBatchWatchUpdate = (event: MessageEvent<string>) => {
+      const body = parseWatchBody<WorkflowBulkBatchResponse>(event);
+      if (!body) {
+        refresh();
+        return;
+      }
+      client.setQueryData<WorkflowBulkBatchResponse>(
+        ["run-bulk-batch", tenantId, instanceId, resolvedRunId, selectedBatchId],
+        body
+      );
+      client.setQueryData<WorkflowBulkBatchesResponse | undefined>(
+        ["run-bulk-batches", tenantId, instanceId, resolvedRunId],
+        (previous) =>
+          mergeBatchIntoList(previous, body.batch, {
+            consistency: body.consistency,
+            authoritative_source: body.authoritative_source,
+            projection_lag_ms: body.projection_lag_ms,
+            watch_cursor: body.watch_cursor
+          })
+      );
+    };
+    source.addEventListener("batch_progress", (event) => {
+      applyBatchWatchUpdate(event as MessageEvent<string>);
+    });
+    source.addEventListener("batch_terminal", (event) => {
+      applyBatchWatchUpdate(event as MessageEvent<string>);
+    });
+    source.addEventListener("projection_lag", (event) => {
+      applyBatchWatchUpdate(event as MessageEvent<string>);
+    });
     source.addEventListener("routing_changed", (event) => {
       const body = parseWatchBody<LiveBatchRoutingSignal>(event as MessageEvent<string>);
       if (body) setLiveBatchRouting(body);
-      refresh();
     });
     source.addEventListener("capacity_pressure", (event) => {
       const body = parseWatchBody<LiveBatchCapacitySignal>(event as MessageEvent<string>);
@@ -547,8 +699,17 @@ export function WorkflowDetailPage() {
                                 : "-"}
                             </div>
                             <div>
+                              Live reducer signal{" "}
+                              {liveBatchRouting
+                                ? `${liveBatchRouting.reducer_kind ?? "-"} · ${reducerOutputPreview(liveBatchRouting.reducer_output)}`
+                                : "-"}
+                            </div>
+                            <div>
                               Live capacity signal{" "}
                               {liveBatchCapacity?.admission?.stream_v2_capacity?.state ?? "-"}
+                            </div>
+                            <div>
+                              Capacity reducer snapshot {reducerOutputPreview(liveBatchCapacity?.reducer_output)}
                             </div>
                             <div>
                               Live queue utilization{" "}
@@ -558,6 +719,7 @@ export function WorkflowDetailPage() {
                             </div>
                             <div>Reducer {selectedBatch.reducer_kind}</div>
                             <div>Reducer path {selectedBatch.reducer_execution_path}</div>
+                            <div>Reducer output {reducerOutputPreview(selectedBatch.reducer_output)}</div>
                             <div>Projection lag {formatInlineValue(bulkBatchDetailQuery.data?.projection_lag_ms)}</div>
                             <div>Fast lane {formatInlineValue(selectedBatch.fast_lane_enabled)}</div>
                             <div>Tree depth {formatInlineValue(selectedBatch.aggregation_tree_depth)}</div>

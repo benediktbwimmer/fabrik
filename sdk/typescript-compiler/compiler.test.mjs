@@ -138,6 +138,71 @@ test("compiler accepts static top-level Temporal setWorkflowOptions annotations"
   assert.match(serialized, /"handler":"greet"/);
 });
 
+test("compiler lowers Temporal search attribute upserts onto durable workflow effects", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-search-attributes-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "searchAttributesWorkflow",
+    "--definition-id",
+    "search-attributes-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"target":"__search_attributes"/);
+  assert.match(serialized, /"callee":"__builtin_search_attributes_upsert"/);
+});
+
+test("compiler lowers Temporal ActivityFailure and ApplicationFailure instanceof checks", async () => {
+  const fixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-activity-failure-qualified/src/workflows.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "activityFailureWorkflow",
+    "--definition-id",
+    "activity-failure-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"callee":"__temporal_is_activity_failure"/);
+  assert.match(serialized, /"callee":"__temporal_is_application_failure"/);
+});
+
+test("compiler ignores imported helper factories used only in Temporal ReturnType annotations", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-imported-helper-type-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalImportedHelperTypeWorkflow",
+    "--definition-id",
+    "temporal-imported-helper-type-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"handler":"greet"/);
+});
+
 test("compiler lowers awaited ctx.activity calls into activity states", async () => {
   const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/activity-workflow.ts");
   const { stdout } = await runCompiler([
@@ -558,6 +623,29 @@ test("compiler lowers block-bodied pure helpers with for-range statements", asyn
   assert.match(serializedHelper, /"type":"assign_index"/);
   assert.match(serializedHelper, /"callee":"__builtin_math_floor"/);
   assert.match(serializedHelper, /"callee":"__builtin_array_fill"/);
+});
+
+test("compiler lowers block-bodied pure helpers with if statements", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-helper-if-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalHelperIfWorkflow",
+    "--definition-id",
+    "temporal-helper-if-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const helper = artifact.helpers.prettyErrorMessage;
+  const serializedHelper = JSON.stringify(helper);
+
+  assert.match(serializedHelper, /"type":"if"/);
+  assert.match(serializedHelper, /"target":"errMessage"/);
 });
 
 test("compiler lowers array reduce expressions", async () => {

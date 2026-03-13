@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, convert::Infallible, env, time::Duration};
+use std::{collections::{BTreeMap, HashMap}, convert::Infallible, env, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -709,6 +709,9 @@ async fn watch_bulk_batch(
                             "selected_backend": batch.get("selected_backend").cloned().unwrap_or(Value::Null),
                             "routing_reason": batch.get("routing_reason").cloned().unwrap_or(Value::Null),
                             "admission_policy_version": batch.get("admission_policy_version").cloned().unwrap_or(Value::Null),
+                            "reducer_kind": batch.get("reducer_kind").cloned().unwrap_or(Value::Null),
+                            "reducer_execution_path": batch.get("reducer_execution_path").cloned().unwrap_or(Value::Null),
+                            "reducer_output": batch.get("reducer_output").cloned().unwrap_or(Value::Null),
                             "status": batch.get("status").cloned().unwrap_or(Value::Null),
                         });
                         if let Ok(encoded_routing) = serde_json::to_string(&routing_body) {
@@ -819,6 +822,21 @@ async fn watch_bulk_batch(
                                 .and_then(|value| value.get("routing_reason"))
                                 .cloned()
                                 .unwrap_or(Value::Null),
+                            "reducer_kind": strong_body
+                                .get("batch")
+                                .and_then(|value| value.get("reducer_kind"))
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                            "reducer_execution_path": strong_body
+                                .get("batch")
+                                .and_then(|value| value.get("reducer_execution_path"))
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                            "reducer_output": strong_body
+                                .get("batch")
+                                .and_then(|value| value.get("reducer_output"))
+                                .cloned()
+                                .unwrap_or(Value::Null),
                             "admission": admission,
                         });
                         if let Ok(encoded_capacity) = serde_json::to_string(&capacity_body) {
@@ -867,6 +885,7 @@ async fn watch_workflow_run(
     spawn(async move {
         let mut last_body = None::<String>;
         let mut last_batches = None::<String>;
+        let mut last_batch_deltas = HashMap::<String, String>::new();
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             let run = query_json(
@@ -945,11 +964,53 @@ async fn watch_workflow_run(
                             &consistency,
                             &authoritative_source,
                             batch_body.get("projection_lag_ms").and_then(Value::as_i64),
-                            cursor,
-                            batch_body,
+                            cursor.clone(),
+                            batch_body.clone(),
                         )
                         .await
                         {
+                            break;
+                        }
+                        let mut watch_closed = false;
+                        if let Some(batches) = batch_body.get("batches").and_then(Value::as_array) {
+                            let mut current_batch_ids = Vec::with_capacity(batches.len());
+                            for batch in batches {
+                                let Some(batch_id) = batch
+                                    .get("batch_id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned)
+                                else {
+                                    continue;
+                                };
+                                current_batch_ids.push(batch_id.clone());
+                                let delta_body = json!({
+                                    "batch_id": batch_id,
+                                    "batch": batch.clone(),
+                                });
+                                if let Ok(encoded_delta) = serde_json::to_string(&delta_body) {
+                                    if last_batch_deltas.get(&batch_id) != Some(&encoded_delta) {
+                                        if send_watch_event(
+                                            &tx,
+                                            "throughput_batch_delta",
+                                            &consistency,
+                                            &authoritative_source,
+                                            batch_body.get("projection_lag_ms").and_then(Value::as_i64),
+                                            cursor.clone(),
+                                            delta_body,
+                                        )
+                                        .await
+                                        {
+                                            watch_closed = true;
+                                            break;
+                                        }
+                                        last_batch_deltas.insert(batch_id, encoded_delta);
+                                    }
+                                }
+                            }
+                            last_batch_deltas
+                                .retain(|batch_id, _| current_batch_ids.iter().any(|current| current == batch_id));
+                        }
+                        if watch_closed {
                             break;
                         }
                         last_batches = Some(encoded);

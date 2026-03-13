@@ -885,6 +885,10 @@ impl WorkflowInstanceState {
                     execution.version_markers.insert(change_id.clone(), *version);
                 }
             }
+            WorkflowEvent::SearchAttributesUpserted { search_attributes } => {
+                self.status = WorkflowStatus::Running;
+                self.search_attributes = Some(search_attributes.clone());
+            }
             WorkflowEvent::SignalReceived { payload, .. }
             | WorkflowEvent::WorkflowUpdateAccepted { payload, .. } => {
                 self.status = WorkflowStatus::Running;
@@ -2598,6 +2602,53 @@ mod tests {
             trace.final_state.search_attributes,
             Some(json!({"CustomKeywordField": ["vip", "alpha"], "Region": "eu"}))
         );
+        assert_eq!(trace.final_state.status, WorkflowStatus::Completed);
+    }
+
+    #[test]
+    fn projection_applies_search_attribute_upserts() {
+        let triggered = test_event(
+            "WorkflowTriggered",
+            "run-1",
+            WorkflowEvent::WorkflowTriggered { input: json!({"approved": true}) },
+            &[(
+                "search_attributes_json",
+                "{\"CustomIntField\":[2],\"CustomBoolField\":[true]}",
+            )],
+        );
+        let upserted = test_event(
+            "SearchAttributesUpserted",
+            "run-1",
+            WorkflowEvent::SearchAttributesUpserted {
+                search_attributes: json!({
+                    "CustomIntField": [3],
+                    "CustomDoubleField": [3.14],
+                }),
+            },
+            &[("state", "mutated")],
+        );
+        let completed = test_event(
+            "WorkflowCompleted",
+            "run-1",
+            WorkflowEvent::WorkflowCompleted {
+                output: json!({
+                    "CustomIntField": [3],
+                    "CustomDoubleField": [3.14],
+                }),
+            },
+            &[("state", "done")],
+        );
+
+        let trace = replay_history_trace(&[triggered, upserted, completed]).unwrap();
+
+        assert_eq!(
+            trace.final_state.search_attributes,
+            Some(json!({
+                "CustomIntField": [3],
+                "CustomDoubleField": [3.14],
+            })),
+        );
+        assert_eq!(trace.final_state.current_state, Some("done".to_owned()));
         assert_eq!(trace.final_state.status, WorkflowStatus::Completed);
     }
 

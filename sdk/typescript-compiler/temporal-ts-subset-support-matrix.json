@@ -206,7 +206,7 @@
       "semantic_fixtures": false,
       "trust_fixtures": true,
       "upgrade_fixtures": false,
-      "semantic_caveats": ["alpha support is limited to start-time memo objects and top-level search attributes with static string or string-array values plus exact-match visibility filters"],
+      "semantic_caveats": ["alpha support covers start-time memo objects, start-time search attributes with static-evaluable primitive or Date values, workflow-side upsertSearchAttributes within the compiler subset, and exact-match visibility filters"],
       "blocking_severity": "warning"
     },
     {

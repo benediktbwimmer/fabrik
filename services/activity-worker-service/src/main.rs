@@ -1235,6 +1235,9 @@ fn execute_benchmark_echo(attempt: u32, input: &Value) -> Result<Value> {
     if attempt <= fail_until_attempt {
         anyhow::bail!("benchmark configured failure on attempt {attempt}");
     }
+    if let Some(reducer_value) = input.get("reducer_value") {
+        return Ok(reducer_value.clone());
+    }
     Ok(input.clone())
 }
 
@@ -1329,6 +1332,7 @@ async fn response_body(response: Response) -> Result<Value> {
 mod tests {
     use super::*;
     use fabrik_worker_protocol::activity_worker::{ActivityTask, BulkActivityTask};
+    use serde_json::json;
     use std::{
         fs,
         time::{SystemTime, UNIX_EPOCH},
@@ -1442,6 +1446,21 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_echo_returns_numeric_reducer_value_when_present() {
+        let output = execute_benchmark_echo(
+            1,
+            &serde_json::json!({
+                "index": 0,
+                "payload": "ignored",
+                "reducer_value": 42
+            }),
+        )
+        .expect("benchmark echo succeeds");
+
+        assert_eq!(output, json!(42));
+    }
+
+    #[test]
     fn managed_node_activity_executes_exported_function() {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
         let dir = std::env::temp_dir().join(format!("managed-node-activity-{nonce}"));
@@ -1479,4 +1498,5 @@ mod tests {
                 .expect("managed activity succeeds");
         assert_eq!(output, serde_json::json!("hello alice"));
     }
+
 }

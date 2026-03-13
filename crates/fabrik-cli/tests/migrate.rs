@@ -197,6 +197,19 @@ fn supported_temporal_workflow_api_slice_qualifies_and_packages() {
 }
 
 #[test]
+fn temporal_activity_failure_type_checks_qualify_and_package() {
+    let output_dir = temp_output_dir("activity-failure-qualified");
+    let (status, report) =
+        run_cli(&fixture("temporal-activity-failure-qualified"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
+    assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
+    assert_eq!(report["worker_packages"][0]["task_queue"], "activity-failure-qualified");
+}
+
+#[test]
 fn temporal_patching_api_slice_qualifies_and_packages() {
     let output_dir = temp_output_dir("patching-qualified");
     let (status, report) = run_cli(&fixture("temporal-patching-qualified"), &output_dir, &[]);
@@ -218,6 +231,20 @@ fn temporal_worker_versioning_annotations_qualify_and_package() {
     assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
     assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
     assert_eq!(report["worker_packages"][0]["task_queue"], "worker-versioning-qualified");
+}
+
+#[test]
+fn temporal_search_attributes_workflow_slice_qualifies_and_packages() {
+    let output_dir = temp_output_dir("search-attributes-qualified");
+    let (status, report) =
+        run_cli(&fixture("temporal-search-attributes-qualified"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["validation"]["visibility_search_validation"]["status"], "passed");
+    assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
+    assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
+    assert_eq!(report["worker_packages"][0]["task_queue"], "search-attributes-qualified");
 }
 
 #[test]

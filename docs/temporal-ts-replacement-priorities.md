@@ -26,21 +26,16 @@ The latest compiler and packaging passes materially shifted the remaining replac
 - `unsupported_temporal_api` hard blocks dropped from `34` to `10`
 - `unsupported_packaging_bootstrap` blocker occurrences dropped from `72` to `8`
 - qualified official samples rose from `4` to `18`
-- `log`, `workflowInfo`, `uuid4`, `ApplicationFailure`, `ParentClosePolicy`, and `ActivityCancellationType` are no longer explicit hard-block imports in the official sample census
+- `log`, `workflowInfo`, `uuid4`, `ApplicationFailure`, `ActivityFailure`, `ParentClosePolicy`, `ActivityCancellationType`, `patched`, `deprecatePatch`, `setWorkflowOptions`, `SearchAttributes`, and `upsertSearchAttributes` are no longer explicit hard-block imports in the official sample frontier
 - workflow-only workers no longer falsely block packaging, which moved `continue-as-new`, `nexus-hello`, and several other sample repos into the qualified set
 - `batch-sliding-window` and `cron-workflows` now compile cleanly in the official census after the recent compiler passes
-- post-census direct migration checks also moved `child-workflows`, `patching-api`, and `worker-versioning` onto the qualified side; the next full census should reflect that
+- post-census direct migration checks also moved `child-workflows`, `patching-api`, `worker-versioning`, and `search-attributes` onto the qualified side; the next full census should reflect that
+- imported helper factories used only inside Temporal `ReturnType<typeof ...>` annotations no longer poison workflow compilation; the real `saga` sample now fails later on async local helper support instead of imported helper analysis
 - The remaining explicit unsupported-import census is now dominated by:
-  - `patched`: `2`
-  - `deprecatePatch`: `1`
   - `WorkflowInterceptors`: `1`
-  - `ActivityFailure`: `1`
   - `inWorkflowContext`: `1`
-  - `SearchAttributes`: `1`
-  - `upsertSearchAttributes`: `1`
   - `Sinks`: `1`
   - `proxySinks`: `1`
-  - `setWorkflowOptions`: `1`
 
 This means broad import coverage is no longer the main hard-blocker class. The next replacement bottlenecks are:
 - remaining compiler-subset gaps hidden behind generic `unsupported_api` compile failures
@@ -55,11 +50,10 @@ This means broad import coverage is no longer the main hard-blocker class. The n
 - Blocker-category occurrences: `26`
 - The explicit import backlog is now narrow. The bigger problem inside this category is generic compile-subset failure on otherwise-recognized APIs.
 - Remaining explicit import frontier:
-  - patching/versioning APIs: `patched`, `deprecatePatch`, `setWorkflowOptions`
-  - failure/interceptor shapes: `ActivityFailure`, `WorkflowInterceptors`
-  - visibility/sinks APIs: `SearchAttributes`, `upsertSearchAttributes`, `Sinks`, `proxySinks`
-- Recommendation: stop chasing generic import coverage and instead burn down one real compile-subset cluster at a time, starting with the official samples still failing after import support landed: `batch-sliding-window`, `child-workflows`, `cron-workflows`, `timer-examples`.
-- Recommendation: stop chasing generic import coverage and instead burn down one real compile-subset cluster at a time, starting with the official samples still failing after import support landed: `timer-examples`, `query-subscriptions`, `search-attributes`, and the remaining environment/bootstrap outliers.
+  - interceptor shapes: `WorkflowInterceptors`
+  - remaining workflow APIs: `inWorkflowContext`
+  - sinks APIs: `Sinks`, `proxySinks`
+- Recommendation: stop chasing generic import coverage and instead burn down one real compile-subset cluster at a time. The current highest-signal clusters are `saga` (async local helpers), `timer-examples` (Promise-like timers and `Promise.race`), and the remaining environment/bootstrap outliers.
 
 2. Remaining worker bootstrap edge cases
 - Hard-block findings: `9`
@@ -88,23 +82,29 @@ This means broad import coverage is no longer the main hard-blocker class. The n
 
 5. Visibility/search expansion
 - Hard-block findings: `2`
-- Affected sample: `search-attributes`
-- Current alpha slice supports static start-time memo/search plus exact-match filtering.
-- Recommendation: expand only if a target repo needs richer query or update-time search semantics.
+- Affected sample: none in the latest direct checks; `search-attributes` now qualifies outside the last full census snapshot
+- Current alpha slice supports static start-time memo/search plus exact-match filtering, plus workflow-side `upsertSearchAttributes` within the compiler subset.
+- Recommendation: expand only if a target repo needs richer query or update-time search semantics beyond the current alpha slice.
 
 6. Interceptors and middleware
 - Hard-block findings: `1`
 - Affected sample: `query-subscriptions`
 - Recommendation: leave blocked until a real repo makes this urgent or until the unsupported API backlog has materially shrunk.
 
+7. Async local workflow helpers
+- Hard-block findings: not yet reflected in the last full census summary because this surfaced in a direct `saga` rerun after the latest compiler fixes
+- Affected sample: `saga`
+- Current frontier: imported helper/type-position analysis is fixed; the remaining blocker is local `async` helper functions that contain awaited workflow work.
+- Recommendation: treat this as the next generic compiler feature if we want the fastest progress on broad workflow-shape parity without opening interceptors yet.
+
 ## Near-Term Execution
 
 1. Burn down the next generic compile-subset cluster, not just import lists.
 - Use the official samples still failing with `One or more workflows failed to compile into the currently supported Fabrik subset.` as the next queue.
 - Best first targets:
-  - `timer-examples`
   - `query-subscriptions`
-  - `search-attributes`
+  - `saga`
+  - `timer-examples`
   - `sinks`
 - Success criterion: reduce `unsupported_api` occurrences again without increasing trust debt.
 

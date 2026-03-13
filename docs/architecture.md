@@ -283,18 +283,24 @@ That means compiled workflows plus arbitrary activities, not compiled workflows 
 
 ### 9. Throughput Runtime (`stream-v2`)
 
-When throughput mode is configured with the `stream-v2` backend, a dedicated `throughput-runtime` service owns throughput shards independently of workflow executors.
+When throughput mode is configured with the `stream-v2` backend, `throughput-runtime` is the execution owner for active throughput runs. `unified-runtime` remains the workflow barrier owner, but only for admission and terminal resume.
 
-The throughput runtime:
+The intended `stream-v2` split is:
 
-- owns shard state in RocksDB with durable checkpoints in S3
-- consumes commands from the command log and reports from the report log
-- applies state mutations through an owner changelog for restore and audit
+- `unified-runtime` validates a bulk step, persists minimal throughput admission plus workflow resume metadata, and emits `StartThroughputRun`
+- `throughput-runtime` owns chunk planning, worker leasing, retries, reducer state, cancellation, checkpointing, and terminalization
+- `throughput-runtime` returns exactly one terminal run outcome to `unified-runtime`
+- `unified-runtime` appends the authoritative workflow barrier event and resumes the workflow turn
+
+The throughput runtime therefore:
+
+- owns partition-local hot state with durable checkpoints
+- consumes throughput run commands and worker reports
 - serves dedicated bulk worker RPCs for chunk polling and reporting
 - enforces fencing via `(chunk_id, attempt, lease_epoch, owner_epoch)` tuples
-- projects batch/chunk state asynchronously to Postgres for visibility queries
+- materializes visibility asynchronously instead of depending on SQL rows for execution
 
-A workflow-to-throughput bridge consumes `BulkActivityBatchScheduled` events from workflow history and appends idempotent `CreateBatch` commands to the throughput command log. The bridge guarantees exactly one live throughput batch per workflow schedule event.
+The current workflow-to-throughput bridge and per-chunk projection tables are transitional compatibility machinery, not the long-term architecture. The target model is a stream-native throughput engine rather than a workflow-event bridge.
 
 ## Future Directions
 

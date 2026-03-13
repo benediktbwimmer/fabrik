@@ -404,6 +404,12 @@ pub struct HelperFunction {
 pub enum HelperStatement {
     Assign { target: String, expr: Expression },
     AssignIndex { target: String, index: Expression, expr: Expression },
+    If {
+        condition: Expression,
+        then_body: Vec<HelperStatement>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        else_body: Vec<HelperStatement>,
+    },
     ForRange { index_var: String, start: Expression, end: Expression, body: Vec<HelperStatement> },
 }
 
@@ -431,6 +437,8 @@ pub struct ArtifactExecutionState {
     pub pending_markers: Vec<(String, Value)>,
     #[serde(skip)]
     pub pending_version_markers: Vec<(String, u32)>,
+    #[serde(skip)]
+    pub pending_search_attribute_updates: Vec<Value>,
 }
 
 impl ArtifactExecutionState {
@@ -1919,7 +1927,7 @@ impl CompiledWorkflowArtifact {
                     for action in actions {
                         let value =
                             evaluate_expression(&action.expr, &mut execution_state, &self.helpers)?;
-                        execution_state.bindings.insert(action.target.clone(), value);
+                        apply_assignment_value(&action.target, value, &mut execution_state);
                     }
                     emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
                     current_state = next.clone();
@@ -3439,6 +3447,28 @@ pub fn evaluate_expression(
                 let value = evaluate_expression(&args[0], execution_state, helpers)?;
                 return Ok(Value::Bool(is_cancellation_value(&value)));
             }
+            if callee == "__temporal_is_activity_failure" {
+                if args.len() != 1 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 1,
+                        received: args.len(),
+                    });
+                }
+                let value = evaluate_expression(&args[0], execution_state, helpers)?;
+                return Ok(Value::Bool(is_activity_failure_value(&value)));
+            }
+            if callee == "__temporal_is_application_failure" {
+                if args.len() != 1 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 1,
+                        received: args.len(),
+                    });
+                }
+                let value = evaluate_expression(&args[0], execution_state, helpers)?;
+                return Ok(Value::Bool(is_application_failure_value(&value)));
+            }
             if callee == "__builtin_object_keys" {
                 if args.len() != 1 {
                     return Err(CompiledWorkflowError::HelperArityMismatch {
@@ -3622,6 +3652,18 @@ pub fn evaluate_expression(
                 map.insert(key, value);
                 return Ok(Value::Object(map));
             }
+            if callee == "__builtin_search_attributes_upsert" {
+                if args.len() != 2 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 2,
+                        received: args.len(),
+                    });
+                }
+                let current = evaluate_expression(&args[0], execution_state, helpers)?;
+                let patch = evaluate_expression(&args[1], execution_state, helpers)?;
+                return Ok(search_attributes_upsert(current, patch));
+            }
             if callee == "__builtin_array_sort_default"
                 || callee == "__builtin_array_sort_numeric_asc"
             {
@@ -3669,6 +3711,8 @@ pub fn evaluate_expression(
             execution_state.version_markers = scoped_state.version_markers;
             execution_state.pending_markers = scoped_state.pending_markers;
             execution_state.pending_version_markers = scoped_state.pending_version_markers;
+            execution_state.pending_search_attribute_updates =
+                scoped_state.pending_search_attribute_updates;
             Ok(result)
         }
         Expression::WorkflowInfo => {
@@ -3791,7 +3835,7 @@ fn execute_helper_statements(
         match statement {
             HelperStatement::Assign { target, expr } => {
                 let value = evaluate_expression(expr, execution_state, helpers)?;
-                execution_state.bindings.insert(target.clone(), value);
+                apply_assignment_value(target, value, execution_state);
             }
             HelperStatement::AssignIndex { target, index, expr } => {
                 let current = execution_state.bindings.get(target).cloned().unwrap_or(Value::Null);
@@ -3799,6 +3843,14 @@ fn execute_helper_statements(
                 let value = evaluate_expression(expr, execution_state, helpers)?;
                 let updated = assign_index_value(current, index, value);
                 execution_state.bindings.insert(target.clone(), updated);
+            }
+            HelperStatement::If { condition, then_body, else_body } => {
+                let predicate = truthy(&evaluate_expression(condition, execution_state, helpers)?);
+                if predicate {
+                    execute_helper_statements(then_body, execution_state, helpers)?;
+                } else if !else_body.is_empty() {
+                    execute_helper_statements(else_body, execution_state, helpers)?;
+                }
             }
             HelperStatement::ForRange { index_var, start, end, body } => {
                 let start =
@@ -3821,6 +3873,15 @@ fn execute_helper_statements(
         }
     }
     Ok(())
+}
+
+fn apply_assignment_value(target: &str, value: Value, execution_state: &mut ArtifactExecutionState) {
+    if target == "__search_attributes" {
+        set_workflow_info_search_attributes(execution_state, value.clone());
+        execution_state.pending_search_attribute_updates.push(value);
+        return;
+    }
+    execution_state.bindings.insert(target.to_owned(), value);
 }
 
 fn assign_index_value(current: Value, index: Value, value: Value) -> Value {
@@ -3886,6 +3947,51 @@ fn is_cancellation_value(value: &Value) -> bool {
     }
 }
 
+fn is_activity_failure_value(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => temporal_failure_type_matches(
+            object,
+            &[
+                "activityfailure",
+                "temporal.activityfailure",
+                "activity_error",
+                "activityerror",
+            ],
+        ),
+        _ => false,
+    }
+}
+
+fn is_application_failure_value(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => temporal_failure_type_matches(
+            object,
+            &[
+                "applicationfailure",
+                "temporal.applicationfailure",
+                "application_error",
+                "applicationerror",
+            ],
+        ),
+        _ => false,
+    }
+}
+
+fn temporal_failure_type_matches(object: &Map<String, Value>, expected: &[&str]) -> bool {
+    let field_matches = |field: &str| {
+        object.get(field).and_then(Value::as_str).is_some_and(|value| {
+            let lower = value.to_ascii_lowercase();
+            expected.iter().any(|candidate| lower == *candidate)
+        })
+    };
+    field_matches("type")
+        || field_matches("name")
+        || field_matches("errorType")
+        || object
+            .get("cause")
+            .is_some_and(is_application_failure_value)
+}
+
 fn emit_pending_markers(
     emissions: &mut Vec<ExecutionEmission>,
     execution_state: &mut ArtifactExecutionState,
@@ -3903,6 +4009,41 @@ fn emit_pending_markers(
             state: Some(state.to_owned()),
         });
     }
+    for search_attributes in execution_state.pending_search_attribute_updates.drain(..) {
+        emissions.push(ExecutionEmission {
+            event: WorkflowEvent::SearchAttributesUpserted { search_attributes },
+            state: Some(state.to_owned()),
+        });
+    }
+}
+
+fn search_attributes_upsert(current: Value, patch: Value) -> Value {
+    let mut merged = match current {
+        Value::Object(object) => object,
+        _ => Map::new(),
+    };
+    let Value::Object(patch_object) = patch else {
+        return Value::Object(merged);
+    };
+    for (key, value) in patch_object {
+        if matches!(&value, Value::Array(items) if items.is_empty()) {
+            merged.remove(&key);
+            continue;
+        }
+        merged.insert(key, value);
+    }
+    Value::Object(merged)
+}
+
+fn set_workflow_info_search_attributes(execution_state: &mut ArtifactExecutionState, value: Value) {
+    let mut workflow_info = execution_state
+        .workflow_info
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    workflow_info.insert("searchAttributes".to_owned(), value);
+    execution_state.workflow_info = Some(Value::Object(workflow_info));
 }
 
 fn evaluate_binary(
@@ -4751,6 +4892,7 @@ mod tests {
             turn_context: Some(turn_context.clone()),
             pending_markers: Vec::new(),
             pending_version_markers: Vec::new(),
+            pending_search_attribute_updates: Vec::new(),
         };
 
         let now = evaluate_expression(&Expression::Now, &mut state, &BTreeMap::new()).unwrap();
@@ -4906,6 +5048,105 @@ mod tests {
     }
 
     #[test]
+    fn search_attribute_upserts_emit_events_and_update_workflow_info() {
+        let workflow = CompiledWorkflow {
+            initial_state: "seed".to_owned(),
+            states: BTreeMap::from([
+                (
+                    "seed".to_owned(),
+                    CompiledStateNode::Assign {
+                        actions: vec![Assignment {
+                            target: "__search_attributes".to_owned(),
+                            expr: Expression::Call {
+                                callee: "__builtin_search_attributes_upsert".to_owned(),
+                                args: vec![
+                                    Expression::Member {
+                                        object: Box::new(Expression::WorkflowInfo),
+                                        property: "searchAttributes".to_owned(),
+                                    },
+                                    Expression::Object {
+                                        fields: BTreeMap::from([
+                                            (
+                                                "CustomIntField".to_owned(),
+                                                Expression::Array {
+                                                    items: vec![Expression::Literal {
+                                                        value: json!(3),
+                                                    }],
+                                                },
+                                            ),
+                                            (
+                                                "CustomBoolField".to_owned(),
+                                                Expression::Array { items: vec![] },
+                                            ),
+                                            (
+                                                "CustomDoubleField".to_owned(),
+                                                Expression::Array {
+                                                    items: vec![Expression::Literal {
+                                                        value: json!(3.14),
+                                                    }],
+                                                },
+                                            ),
+                                        ]),
+                                    },
+                                ],
+                            },
+                        }],
+                        next: "done".to_owned(),
+                    },
+                ),
+                (
+                    "done".to_owned(),
+                    CompiledStateNode::Succeed {
+                        output: Some(Expression::Member {
+                            object: Box::new(Expression::WorkflowInfo),
+                            property: "searchAttributes".to_owned(),
+                        }),
+                    },
+                ),
+            ]),
+            params: Vec::new(),
+            non_cancellable_states: BTreeSet::new(),
+        };
+        let artifact = CompiledWorkflowArtifact::new(
+            "search-attrs",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            workflow,
+        );
+        let plan = artifact
+            .execute_trigger_with_state_and_turn(
+                &Value::Null,
+                ArtifactExecutionState {
+                    workflow_info: Some(json!({
+                        "searchAttributes": {
+                            "CustomIntField": [2],
+                            "CustomBoolField": [true],
+                        },
+                    })),
+                    ..ArtifactExecutionState::default()
+                },
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::parse_str("bbbbbbbb-cccc-dddd-eeee-ffffffffffff").unwrap(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_123).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            plan.output,
+            Some(json!({
+                "CustomIntField": [3],
+                "CustomDoubleField": [3.14],
+            })),
+        );
+        assert!(plan.emissions.iter().any(|emission| matches!(
+            emission.event,
+            WorkflowEvent::SearchAttributesUpserted { .. }
+        )));
+    }
+
+    #[test]
     fn records_side_effect_markers_once_per_callsite() {
         let turn_context = ExecutionTurnContext {
             event_id: uuid::Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap(),
@@ -4923,6 +5164,7 @@ mod tests {
             turn_context: Some(turn_context),
             pending_markers: Vec::new(),
             pending_version_markers: Vec::new(),
+            pending_search_attribute_updates: Vec::new(),
         };
         let expression = Expression::SideEffect {
             marker_id: "marker_callsite".to_owned(),
@@ -5151,6 +5393,69 @@ mod tests {
     }
 
     #[test]
+    fn builtin_failure_type_checks_match_temporal_like_errors() {
+        let helpers = BTreeMap::from([
+            (
+                "isActivityFailure".to_owned(),
+                HelperFunction {
+                    params: vec!["error".to_owned()],
+                    statements: Vec::new(),
+                    body: Expression::Call {
+                        callee: "__temporal_is_activity_failure".to_owned(),
+                        args: vec![Expression::Identifier { name: "error".to_owned() }],
+                    },
+                },
+            ),
+            (
+                "isApplicationFailure".to_owned(),
+                HelperFunction {
+                    params: vec!["error".to_owned()],
+                    statements: Vec::new(),
+                    body: Expression::Call {
+                        callee: "__temporal_is_application_failure".to_owned(),
+                        args: vec![Expression::Identifier { name: "error".to_owned() }],
+                    },
+                },
+            ),
+        ]);
+        let mut state = ArtifactExecutionState::default();
+        state.bindings.insert(
+            "error".to_owned(),
+            json!({
+                "type": "ActivityFailure",
+                "cause": { "type": "ApplicationFailure", "message": "boom" },
+            }),
+        );
+        assert_eq!(
+            evaluate_expression(
+                &Expression::Call {
+                    callee: "isActivityFailure".to_owned(),
+                    args: vec![Expression::Identifier { name: "error".to_owned() }],
+                },
+                &mut state,
+                &helpers,
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            evaluate_expression(
+                &Expression::Call {
+                    callee: "isApplicationFailure".to_owned(),
+                    args: vec![Expression::Member {
+                        object: Box::new(Expression::Identifier { name: "error".to_owned() }),
+                        property: "cause".to_owned(),
+                    }],
+                },
+                &mut state,
+                &helpers,
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
     fn evaluates_block_bodied_helpers_with_for_range() {
         let helper = HelperFunction {
             params: vec!["total".to_owned(), "n".to_owned()],
@@ -5222,6 +5527,108 @@ mod tests {
         .unwrap();
 
         assert_eq!(value, json!([4, 3, 3]));
+    }
+
+    #[test]
+    fn evaluates_block_bodied_helpers_with_if_statements() {
+        let helper = HelperFunction {
+            params: vec!["message".to_owned(), "err".to_owned()],
+            statements: vec![
+                HelperStatement::Assign {
+                    target: "errMessage".to_owned(),
+                    expr: Expression::Conditional {
+                        condition: Box::new(Expression::Logical {
+                            op: LogicalOp::And,
+                            left: Box::new(Expression::Identifier {
+                                name: "err".to_owned(),
+                            }),
+                            right: Box::new(Expression::Member {
+                                object: Box::new(Expression::Identifier {
+                                    name: "err".to_owned(),
+                                }),
+                                property: "message".to_owned(),
+                            }),
+                        }),
+                        then_expr: Box::new(Expression::Member {
+                            object: Box::new(Expression::Identifier {
+                                name: "err".to_owned(),
+                            }),
+                            property: "message".to_owned(),
+                        }),
+                        else_expr: Box::new(Expression::Literal {
+                            value: Value::String(String::new()),
+                        }),
+                    },
+                },
+                HelperStatement::If {
+                    condition: Expression::Logical {
+                        op: LogicalOp::And,
+                        left: Box::new(Expression::Identifier {
+                            name: "err".to_owned(),
+                        }),
+                        right: Box::new(Expression::Member {
+                            object: Box::new(Expression::Member {
+                                object: Box::new(Expression::Identifier {
+                                    name: "err".to_owned(),
+                                }),
+                                property: "cause".to_owned(),
+                            }),
+                            property: "message".to_owned(),
+                        }),
+                    },
+                    then_body: vec![HelperStatement::Assign {
+                        target: "errMessage".to_owned(),
+                        expr: Expression::Member {
+                            object: Box::new(Expression::Member {
+                                object: Box::new(Expression::Identifier {
+                                    name: "err".to_owned(),
+                                }),
+                                property: "cause".to_owned(),
+                            }),
+                            property: "message".to_owned(),
+                        },
+                    }],
+                    else_body: Vec::new(),
+                },
+            ],
+            body: Expression::Binary {
+                op: BinaryOp::Add,
+                left: Box::new(Expression::Binary {
+                    op: BinaryOp::Add,
+                    left: Box::new(Expression::Identifier {
+                        name: "message".to_owned(),
+                    }),
+                    right: Box::new(Expression::Literal {
+                        value: Value::String(": ".to_owned()),
+                    }),
+                }),
+                right: Box::new(Expression::Identifier {
+                    name: "errMessage".to_owned(),
+                }),
+            },
+        };
+        let helpers = BTreeMap::from([("prettyErrorMessage".to_owned(), helper)]);
+        let mut state = ArtifactExecutionState::default();
+        let value = evaluate_expression(
+            &Expression::Call {
+                callee: "prettyErrorMessage".to_owned(),
+                args: vec![
+                    Expression::Literal {
+                        value: Value::String("failed".to_owned()),
+                    },
+                    Expression::Literal {
+                        value: json!({
+                            "message": "fallback",
+                            "cause": { "message": "boom" }
+                        }),
+                    },
+                ],
+            },
+            &mut state,
+            &helpers,
+        )
+        .unwrap();
+        assert_eq!(value, Value::String("failed: boom".to_owned()));
     }
 
     #[test]

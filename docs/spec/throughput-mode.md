@@ -268,10 +268,11 @@ Behavior:
 
 - authoritative state lives in the throughput shard runtime, not Postgres
 - dedicated `throughput-runtime` owns throughput shards independently of workflow executors
+- `unified-runtime` admits the run and later resumes the workflow, but it does not own nonterminal chunk lifecycle
 - dedicated `throughput-projector` consumes projection events and updates Postgres asynchronously
 - workers use a dedicated throughput worker RPC served by the throughput owner
 - local owner state persists counters, retry scheduling fields, lease deadlines, and group/barrier state
-- terminal workflow events are emitted directly by the throughput runtime
+- terminal run outcomes are produced by `throughput-runtime` and turned into authoritative workflow events by `unified-runtime`
 - chunk inputs and outputs may be externalized behind payload handles
 - query results are eventually consistent unless routed to the active throughput owner
 
@@ -279,13 +280,13 @@ Log roles:
 
 | Log | Contents | Purpose |
 |---|---|---|
-| Command | `CreateBatch`, `CancelBatch`, `TimeoutBatch` | Intent from workflow bridge |
+| Command | `StartThroughputRun`, `CancelThroughputRun`, `TimeoutThroughputRun` | Admission and control intent from `unified-runtime` |
 | Report | `ChunkCompleted`, `ChunkFailed`, `ChunkCancelled` | Raw worker observations |
-| Owner changelog | `BatchCreated`, `ChunkLeased`, `ChunkRequeued`, `ChunkApplied`, `GroupTerminal`, `BatchTerminal` | Restore and audit |
+| Owner changelog | `RunStarted`, `ChunkLeased`, `ChunkRequeued`, `ChunkApplied`, `GroupTerminal`, `RunTerminal` | Checkpoint and audit for the throughput owner |
 
 Fencing protocol:
 
-Every leased chunk carries `(chunk_id, attempt, lease_epoch, lease_token, owner_epoch, report_id)`. A report is valid only if it matches the active lease token and current owner epoch. Stale reports are retained for audit but do not mutate state. Retries advance `lease_epoch` and mint a new `lease_token`. Failover advances `owner_epoch`. Exactly one terminal workflow event is emitted per batch.
+Every leased chunk carries `(chunk_id, attempt, lease_epoch, lease_token, owner_epoch, report_id)`. A report is valid only if it matches the active lease token and current owner epoch. Stale reports are retained for audit but do not mutate state. Retries advance `lease_epoch` and mint a new `lease_token`. Failover advances `owner_epoch`. Exactly one terminal run outcome is emitted per batch, and exactly one corresponding workflow barrier event is appended.
 
 Tradeoffs:
 

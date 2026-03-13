@@ -107,10 +107,24 @@ function stableNodeKey(node) {
 }
 
 function rootIdentifierName(expression) {
+  if (
+    ts.isParenthesizedExpression(expression) ||
+    ts.isAsExpression(expression) ||
+    ts.isTypeAssertionExpression(expression) ||
+    ts.isNonNullExpression(expression) ||
+    ts.isSatisfiesExpression?.(expression)
+  ) {
+    return rootIdentifierName(expression.expression);
+  }
   if (ts.isIdentifier(expression)) {
     return expression.text;
   }
-  if (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) {
+  if (
+    ts.isPropertyAccessExpression(expression) ||
+    ts.isElementAccessExpression(expression) ||
+    ts.isPropertyAccessChain?.(expression) ||
+    ts.isElementAccessChain?.(expression)
+  ) {
     return rootIdentifierName(expression.expression);
   }
   return null;
@@ -142,6 +156,7 @@ function createProgram(entry) {
 
 function collectTemporalWorkflowApi(sourceFile) {
   const api = {
+    activityFailure: new Set(),
     proxyActivities: new Set(),
     sleep: new Set(),
     continueAsNew: new Set(),
@@ -156,6 +171,7 @@ function collectTemporalWorkflowApi(sourceFile) {
     defineSignal: new Set(),
     setHandler: new Set(),
     setWorkflowOptions: new Set(),
+    upsertSearchAttributes: new Set(),
     workflowInfo: new Set(),
     log: new Set(),
     uuid4: new Set(),
@@ -184,6 +200,7 @@ function collectTemporalWorkflowApi(sourceFile) {
     for (const element of namedBindings.elements) {
       const importedName = element.propertyName?.text ?? element.name.text;
       const localName = element.name.text;
+      if (importedName === "ActivityFailure") api.activityFailure.add(localName);
       if (importedName === "proxyActivities") api.proxyActivities.add(localName);
       if (importedName === "sleep") api.sleep.add(localName);
       if (importedName === "continueAsNew") api.continueAsNew.add(localName);
@@ -198,6 +215,7 @@ function collectTemporalWorkflowApi(sourceFile) {
       if (importedName === "defineSignal") api.defineSignal.add(localName);
       if (importedName === "setHandler") api.setHandler.add(localName);
       if (importedName === "setWorkflowOptions") api.setWorkflowOptions.add(localName);
+      if (importedName === "upsertSearchAttributes") api.upsertSearchAttributes.add(localName);
       if (importedName === "workflowInfo") api.workflowInfo.add(localName);
       if (importedName === "log") api.log.add(localName);
       if (importedName === "uuid4") api.uuid4.add(localName);
@@ -524,6 +542,15 @@ function isTemporalDefinitionDeclaration(declaration, temporalApi) {
 
 function isStaticTopLevelInitializer(expression) {
   if (
+    ts.isParenthesizedExpression(expression) ||
+    ts.isAsExpression(expression) ||
+    ts.isTypeAssertionExpression(expression) ||
+    ts.isNonNullExpression(expression) ||
+    ts.isSatisfiesExpression?.(expression)
+  ) {
+    return isStaticTopLevelInitializer(expression.expression);
+  }
+  if (
     ts.isStringLiteral(expression) ||
     ts.isNoSubstitutionTemplateLiteral(expression) ||
     ts.isNumericLiteral(expression) ||
@@ -581,6 +608,7 @@ function assertNoTopLevelSideEffects(sourceFile) {
   for (const statement of sourceFile.statements) {
     if (
       ts.isImportDeclaration(statement) ||
+      ts.isImportEqualsDeclaration(statement) ||
       ts.isExportDeclaration(statement) ||
       ts.isClassDeclaration(statement) ||
       ts.isFunctionDeclaration(statement) ||
@@ -660,8 +688,12 @@ function buildHelperRegistry(program, workflowDeclaration) {
 
   const visit = (node) => {
     if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
-      if (importedHelpers.has(node.expression.text)) {
-        helpers.set(node.expression.text, importedHelpers.get(node.expression.text));
+      const importedDeclaration = importedHelpers.get(node.expression.text);
+      if (importedDeclaration) {
+        helpers.set(
+          node.expression.text,
+          compileHelperFunction(node.expression.text, importedDeclaration),
+        );
       }
       const symbol = checker.getSymbolAtLocation(node.expression);
       if (symbol) {
@@ -709,7 +741,7 @@ function collectImportedHelpers(program, sourceFile) {
     for (const binding of extractImportedBindings(statement.importClause)) {
       const declaration = findExportedFunctionDeclaration(importedSource, binding.exportName);
       if (hasCompilableHelperBody(declaration)) {
-        helpers.set(binding.localName, compileHelperFunction(binding.localName, declaration));
+        helpers.set(binding.localName, declaration);
       }
     }
   }
@@ -848,9 +880,30 @@ function compileHelperStatements(statements) {
       compiled.push(compileHelperForStatement(statement));
       continue;
     }
+    if (ts.isIfStatement(statement)) {
+      compiled.push(compileHelperIfStatement(statement));
+      continue;
+    }
     throw compilerError(`unsupported helper statement: ${statement.getText()}`, statement);
   }
   return compiled;
+}
+
+function compileHelperIfStatement(statement) {
+  const thenStatements = ts.isBlock(statement.thenStatement)
+    ? statement.thenStatement.statements
+    : [statement.thenStatement];
+  const elseStatements = statement.elseStatement
+    ? ts.isBlock(statement.elseStatement)
+      ? statement.elseStatement.statements
+      : [statement.elseStatement]
+    : [];
+  return {
+    type: "if",
+    condition: compileExpression(statement.expression),
+    then_body: compileHelperStatements(thenStatements),
+    else_body: compileHelperStatements(elseStatements),
+  };
 }
 
 function compileHelperAssignmentStatement(statement, left, operatorKind, right) {
@@ -1202,6 +1255,15 @@ function tryCompileSignalHandlerActions(handler) {
 }
 
 function compileExpression(expression) {
+  while (
+    ts.isParenthesizedExpression(expression) ||
+    ts.isAsExpression(expression) ||
+    ts.isTypeAssertionExpression(expression) ||
+    ts.isNonNullExpression(expression) ||
+    ts.isSatisfiesExpression?.(expression)
+  ) {
+    expression = expression.expression;
+  }
   assertAllowedRootIdentifier(expression);
   if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) {
     return { kind: "literal", value: expression.text };
@@ -1241,14 +1303,14 @@ function compileExpression(expression) {
   if (ts.isIdentifier(expression)) {
     return { kind: "identifier", name: expression.text };
   }
-  if (ts.isPropertyAccessExpression(expression)) {
+  if (ts.isPropertyAccessExpression(expression) || ts.isPropertyAccessChain?.(expression)) {
     return {
       kind: "member",
       object: compileExpression(expression.expression),
       property: expression.name.text,
     };
   }
-  if (ts.isElementAccessExpression(expression)) {
+  if (ts.isElementAccessExpression(expression) || ts.isElementAccessChain?.(expression)) {
     return {
       kind: "index",
       object: compileExpression(expression.expression),
@@ -1307,6 +1369,34 @@ function compileExpression(expression) {
     }
   }
   if (ts.isBinaryExpression(expression)) {
+    if (
+      expression.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword &&
+      temporalImportedReferenceMatches(
+        expression.right,
+        currentTemporalApi.activityFailure,
+        "ActivityFailure",
+      )
+    ) {
+      return {
+        kind: "call",
+        callee: "__temporal_is_activity_failure",
+        args: [compileExpression(expression.left)],
+      };
+    }
+    if (
+      expression.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword &&
+      temporalImportedReferenceMatches(
+        expression.right,
+        currentTemporalApi.applicationFailure,
+        "ApplicationFailure",
+      )
+    ) {
+      return {
+        kind: "call",
+        callee: "__temporal_is_application_failure",
+        args: [compileExpression(expression.left)],
+      };
+    }
     const logicalMap = new Map([
       [ts.SyntaxKind.AmpersandAmpersandToken, "and"],
       [ts.SyntaxKind.BarBarToken, "or"],
@@ -1646,6 +1736,7 @@ class WorkflowLowerer {
     version,
     workflowDeclaration,
     temporalApi = {
+      activityFailure: new Set(),
       proxyActivities: new Set(),
       sleep: new Set(),
       continueAsNew: new Set(),
@@ -1660,6 +1751,7 @@ class WorkflowLowerer {
       defineSignal: new Set(),
       setHandler: new Set(),
       setWorkflowOptions: new Set(),
+      upsertSearchAttributes: new Set(),
       workflowInfo: new Set(),
       log: new Set(),
       uuid4: new Set(),
@@ -2162,6 +2254,42 @@ class WorkflowLowerer {
           throw compilerError(`deprecatePatch() requires exactly one change id`, statement.expression);
         }
         return nextState;
+      }
+      if (
+        temporalImportedCallMatches(
+          statement.expression,
+          this.temporalApi.upsertSearchAttributes,
+          "upsertSearchAttributes",
+          this.temporalApi,
+        )
+      ) {
+        if (statement.expression.arguments.length !== 1) {
+          throw compilerError(
+            `upsertSearchAttributes() requires exactly one search attribute patch object`,
+            statement.expression,
+          );
+        }
+        return this.addState("assign", {
+          type: "assign",
+          actions: [
+            {
+              target: "__search_attributes",
+              expr: {
+                kind: "call",
+                callee: "__builtin_search_attributes_upsert",
+                args: [
+                  {
+                    kind: "member",
+                    object: { kind: "workflow_info" },
+                    property: "searchAttributes",
+                  },
+                  compileExpression(statement.expression.arguments[0]),
+                ],
+              },
+            },
+          ],
+          next: nextState,
+        }, statement);
       }
       const pushedChildState = this.lowerTemporalChildPromisePush(statement.expression, nextState, statement);
       if (pushedChildState) {
@@ -3932,6 +4060,8 @@ function validateArtifactCalls(artifact) {
   const helperNames = new Set(Object.keys(artifact.helpers));
   const builtinCallNames = new Set([
     "__temporal_is_cancellation",
+    "__temporal_is_activity_failure",
+    "__temporal_is_application_failure",
     "__builtin_array_join",
     "__builtin_array_fill",
     "__builtin_array_append",
@@ -3945,6 +4075,7 @@ function validateArtifactCalls(artifact) {
     "__builtin_object_omit",
     "__builtin_object_set",
     "__builtin_object_keys",
+    "__builtin_search_attributes_upsert",
     "__builtin_string",
   ]);
   const validateExpression = (expression) => {

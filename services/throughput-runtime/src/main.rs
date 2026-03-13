@@ -34,10 +34,11 @@ use fabrik_throughput::{
     ADMISSION_POLICY_VERSION, PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
     ThroughputBackend, ThroughputBatchIdentity, ThroughputChangelogEntry,
     ThroughputChangelogPayload, ThroughputChunkReport, ThroughputChunkReportPayload,
-    bulk_reducer_class, bulk_reducer_name, decode_cbor, effective_aggregation_group_count,
-    encode_cbor, group_id_for_chunk_index, planned_reduction_tree_depth,
-    stream_v2_fast_lane_enabled, throughput_execution_mode, throughput_partition_key,
-    throughput_reducer_execution_path, throughput_reducer_version, throughput_routing_reason,
+    bulk_reducer_class, bulk_reducer_name, bulk_reducer_summary_field_name, decode_cbor,
+    effective_aggregation_group_count, encode_cbor, group_id_for_chunk_index,
+    planned_reduction_tree_depth, stream_v2_fast_lane_enabled, throughput_execution_mode,
+    throughput_partition_key, throughput_reducer_execution_path, throughput_reducer_version,
+    throughput_routing_reason,
 };
 use fabrik_worker_protocol::activity_worker::{
     Ack, BulkActivityTask, BulkActivityTaskResult, PollBulkActivityTaskRequest,
@@ -1105,6 +1106,8 @@ async fn load_owner_batch_record(
         batch.updated_at = snapshot.updated_at;
         batch.terminal_at = snapshot.terminal_at;
     }
+    batch.reducer_output =
+        state.local_state.reduce_batch_success_outputs_after_report(&identity, None)?;
     Ok(Some(batch))
 }
 
@@ -1765,10 +1768,18 @@ impl ActivityWorkerApi for WorkerApi {
                 )
                 .await
                 .map_err(internal_status)?;
+                let batch_reducer_output = reduce_stream_batch_output(
+                    &self.state,
+                    &identity,
+                    projected.batch_reducer.as_deref(),
+                    Some(&report),
+                )
+                .map_err(internal_status)?;
                 projection_records.extend(projected_apply_projection_records(
                     &report,
                     &projected,
                     &terminal_artifacts,
+                    batch_reducer_output.clone(),
                 ));
                 let mut changelog_records = vec![changelog_record(
                     throughput_partition_key(&report.batch_id, report.group_id),
@@ -1806,6 +1817,7 @@ impl ActivityWorkerApi for WorkerApi {
                         projection_records.push(grouped_batch_terminal_projection_record(
                             &identity,
                             batch_terminal,
+                            batch_reducer_output.clone(),
                         ));
                         changelog_records.push(grouped_batch_terminal_changelog_record(
                             &identity,
@@ -1813,8 +1825,11 @@ impl ActivityWorkerApi for WorkerApi {
                         ));
                     } else if let Some(summary) = projected.grouped_batch_summary.as_ref() {
                         if self.state.runtime.publish_transient_projection_updates {
-                            projection_records
-                                .push(grouped_batch_summary_projection_record(&identity, summary));
+                            projection_records.push(grouped_batch_summary_projection_record(
+                                &identity,
+                                summary,
+                                batch_reducer_output.clone(),
+                            ));
                         } else {
                             skipped_projection_events = skipped_projection_events.saturating_add(1);
                         }
@@ -2027,6 +2042,7 @@ async fn build_stream_projection_records(
         max_attempts: *max_attempts,
         retry_delay_ms: *retry_delay_ms,
         error: None,
+        reducer_output: None,
         scheduled_at: event.occurred_at,
         terminal_at: None,
         updated_at: event.occurred_at,
@@ -2367,11 +2383,39 @@ async fn materialize_chunk_terminal_artifacts(
     }
 }
 
+fn reduce_stream_batch_output(
+    state: &AppState,
+    identity: &ThroughputBatchIdentity,
+    reducer: Option<&str>,
+    pending_report: Option<&ThroughputChunkReport>,
+) -> Result<Option<Value>> {
+    if bulk_reducer_summary_field_name(reducer).is_none() {
+        return Ok(None);
+    }
+    state.local_state.reduce_batch_success_outputs_after_report(identity, pending_report)
+}
+
 async fn publish_stream_terminal_event(
     state: &AppState,
     report: &ThroughputChunkReport,
     projected: &ProjectedTerminalApply,
 ) -> Result<()> {
+    let identity_key = ThroughputBatchIdentity {
+        tenant_id: report.tenant_id.clone(),
+        instance_id: report.instance_id.clone(),
+        run_id: report.run_id.clone(),
+        batch_id: report.batch_id.clone(),
+    };
+    let reducer_output = if projected.batch_status == "completed" {
+        reduce_stream_batch_output(
+            state,
+            &identity_key,
+            projected.batch_reducer.as_deref(),
+            Some(report),
+        )?
+    } else {
+        None
+    };
     let identity = WorkflowIdentity::new(
         report.tenant_id.clone(),
         projected.batch_definition_id.clone(),
@@ -2389,7 +2433,7 @@ async fn publish_stream_terminal_event(
             failed_items: projected.batch_failed_items,
             cancelled_items: projected.batch_cancelled_items,
             chunk_count: projected.batch_chunk_count,
-            reducer_output: None,
+            reducer_output,
         },
         "failed" => WorkflowEvent::BulkActivityBatchFailed {
             batch_id: report.batch_id.clone(),
@@ -2439,7 +2483,19 @@ async fn publish_stream_terminal_event(
 async fn publish_stream_batch_terminal_event(
     state: &AppState,
     batch: &fabrik_store::WorkflowBulkBatchRecord,
+    pending_report: Option<&ThroughputChunkReport>,
 ) -> Result<()> {
+    let identity_key = ThroughputBatchIdentity {
+        tenant_id: batch.tenant_id.clone(),
+        instance_id: batch.instance_id.clone(),
+        run_id: batch.run_id.clone(),
+        batch_id: batch.batch_id.clone(),
+    };
+    let reducer_output = if batch.status == WorkflowBulkBatchStatus::Completed {
+        reduce_stream_batch_output(state, &identity_key, batch.reducer.as_deref(), pending_report)?
+    } else {
+        None
+    };
     let identity = WorkflowIdentity::new(
         batch.tenant_id.clone(),
         batch.definition_id.clone(),
@@ -2457,7 +2513,7 @@ async fn publish_stream_batch_terminal_event(
             failed_items: batch.failed_items,
             cancelled_items: batch.cancelled_items,
             chunk_count: batch.chunk_count,
-            reducer_output: None,
+            reducer_output,
         },
         WorkflowBulkBatchStatus::Failed => WorkflowEvent::BulkActivityBatchFailed {
             batch_id: batch.batch_id.clone(),
@@ -2534,7 +2590,12 @@ async fn finalize_grouped_stream_batch(
 
     publish_projection_event(
         state,
-        grouped_batch_terminal_projection_record(identity, projected).event,
+        grouped_batch_terminal_projection_record(
+            identity,
+            projected,
+            reduce_stream_batch_output(state, identity, existing_batch.reducer.as_deref(), None)?,
+        )
+        .event,
         throughput_partition_key(&identity.batch_id, 0),
     )
     .await?;
@@ -2601,10 +2662,12 @@ async fn finalize_grouped_stream_batch(
             max_attempts: 0,
             retry_delay_ms: 0,
             error: projected.error.clone(),
+            reducer_output: None,
             scheduled_at: existing_batch.updated_at,
             terminal_at: Some(projected.terminal_at),
             updated_at: projected.terminal_at,
         },
+        None,
     )
     .await?;
     let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
@@ -2676,10 +2739,12 @@ async fn publish_grouped_batch_terminal_event(
             max_attempts: 0,
             retry_delay_ms: 0,
             error: projected.error.clone(),
+            reducer_output: None,
             scheduled_at: projected_apply.terminal_at.unwrap_or(projected.terminal_at),
             terminal_at: Some(projected.terminal_at),
             updated_at: projected.terminal_at,
         },
+        Some(report),
     )
     .await
 }
@@ -2785,6 +2850,7 @@ fn record_group_terminal_published(state: &AppState, projected: &ProjectedGroupT
 fn grouped_batch_terminal_projection_event(
     identity: &ThroughputBatchIdentity,
     projected: &ProjectedBatchTerminal,
+    reducer_output: Option<Value>,
 ) -> ThroughputProjectionEvent {
     ThroughputProjectionEvent::UpdateBatchState {
         update: ThroughputProjectionBatchStateUpdate {
@@ -2797,6 +2863,7 @@ fn grouped_batch_terminal_projection_event(
             failed_items: projected.failed_items,
             cancelled_items: projected.cancelled_items,
             error: projected.error.clone(),
+            reducer_output,
             terminal_at: Some(projected.terminal_at),
             updated_at: projected.terminal_at,
         },
@@ -2806,10 +2873,11 @@ fn grouped_batch_terminal_projection_event(
 fn grouped_batch_terminal_projection_record(
     identity: &ThroughputBatchIdentity,
     projected: &ProjectedBatchTerminal,
+    reducer_output: Option<Value>,
 ) -> StreamProjectionRecord {
     StreamProjectionRecord {
         key: throughput_partition_key(&identity.batch_id, 0),
-        event: grouped_batch_terminal_projection_event(identity, projected),
+        event: grouped_batch_terminal_projection_event(identity, projected, reducer_output),
     }
 }
 
@@ -3227,9 +3295,10 @@ fn projected_apply_projection_records(
     report: &ThroughputChunkReport,
     projected: &ProjectedTerminalApply,
     artifacts: &ChunkTerminalArtifacts,
+    reducer_output: Option<Value>,
 ) -> Vec<StreamProjectionRecord> {
     let mut records = Vec::with_capacity(2);
-    for event in projected_apply_projection_events(report, projected, artifacts) {
+    for event in projected_apply_projection_events(report, projected, artifacts, reducer_output) {
         records.push(StreamProjectionRecord {
             key: throughput_partition_key(&report.batch_id, report.group_id),
             event,
@@ -3243,6 +3312,7 @@ fn append_projected_apply_projection_events(
     report: &ThroughputChunkReport,
     projected: &ProjectedTerminalApply,
     artifacts: &ChunkTerminalArtifacts,
+    reducer_output: Option<Value>,
 ) {
     if projected.batch_terminal {
         events.push(ThroughputProjectionEvent::UpdateBatchState {
@@ -3256,6 +3326,7 @@ fn append_projected_apply_projection_events(
                 failed_items: projected.batch_failed_items,
                 cancelled_items: projected.batch_cancelled_items,
                 error: projected.batch_error.clone(),
+                reducer_output,
                 terminal_at: projected.terminal_at,
                 updated_at: report.occurred_at,
             },
@@ -3271,9 +3342,16 @@ fn projected_apply_projection_events(
     report: &ThroughputChunkReport,
     projected: &ProjectedTerminalApply,
     artifacts: &ChunkTerminalArtifacts,
+    reducer_output: Option<Value>,
 ) -> Vec<ThroughputProjectionEvent> {
     let mut events = Vec::with_capacity(2);
-    append_projected_apply_projection_events(&mut events, report, projected, artifacts);
+    append_projected_apply_projection_events(
+        &mut events,
+        report,
+        projected,
+        artifacts,
+        reducer_output,
+    );
     events
 }
 
@@ -3593,7 +3671,7 @@ mod tests {
             cancellation_metadata: None,
         };
 
-        let records = projected_apply_projection_records(&report, &projected, &artifacts);
+        let records = projected_apply_projection_records(&report, &projected, &artifacts, None);
 
         assert_eq!(records.len(), 1);
         let ThroughputProjectionEvent::UpdateChunkState { update } = &records[0].event else {
@@ -3685,6 +3763,7 @@ mod tests {
         fs::remove_dir_all(payload_root).ok();
         Ok(())
     }
+
 
     #[test]
     fn throughput_report_from_result_accepts_elided_completed_payloads() {
@@ -3970,6 +4049,7 @@ fn running_batch_projection_record(
                 failed_items: batch.failed_items,
                 cancelled_items: batch.cancelled_items,
                 error: batch.error.clone(),
+                reducer_output: batch.reducer_output.clone(),
                 terminal_at: batch.terminal_at,
                 updated_at: batch.updated_at,
             },
@@ -3980,6 +4060,7 @@ fn running_batch_projection_record(
 fn grouped_batch_summary_projection_event(
     identity: &ThroughputBatchIdentity,
     summary: &ProjectedBatchGroupSummary,
+    reducer_output: Option<Value>,
 ) -> ThroughputProjectionEvent {
     ThroughputProjectionEvent::UpdateBatchState {
         update: ThroughputProjectionBatchStateUpdate {
@@ -3992,6 +4073,7 @@ fn grouped_batch_summary_projection_event(
             failed_items: summary.failed_items,
             cancelled_items: summary.cancelled_items,
             error: summary.error.clone(),
+            reducer_output,
             terminal_at: None,
             updated_at: summary.updated_at,
         },
@@ -4001,10 +4083,11 @@ fn grouped_batch_summary_projection_event(
 fn grouped_batch_summary_projection_record(
     identity: &ThroughputBatchIdentity,
     summary: &ProjectedBatchGroupSummary,
+    reducer_output: Option<Value>,
 ) -> StreamProjectionRecord {
     StreamProjectionRecord {
         key: throughput_partition_key(&identity.batch_id, 0),
-        event: grouped_batch_summary_projection_event(identity, summary),
+        event: grouped_batch_summary_projection_event(identity, summary, reducer_output),
     }
 }
 
@@ -4173,6 +4256,7 @@ async fn cancel_stream_batches_for_run(
                     failed_items: cancelled_batch.failed_items,
                     cancelled_items: cancelled_batch.cancelled_items,
                     error: cancelled_batch.error.clone(),
+                    reducer_output: cancelled_batch.reducer_output.clone(),
                     terminal_at: cancelled_batch.terminal_at,
                     updated_at: cancelled_batch.updated_at,
                 },
@@ -4200,7 +4284,7 @@ async fn cancel_stream_batches_for_run(
             throughput_partition_key(&cancelled_batch.batch_id, 0),
         )
         .await;
-        publish_stream_batch_terminal_event(state, &cancelled_batch).await?;
+        publish_stream_batch_terminal_event(state, &cancelled_batch, None).await?;
         state.bulk_notify.notify_waiters();
     }
     Ok(())

@@ -119,7 +119,13 @@ pub fn bulk_reducer_requires_success_outputs(reducer: Option<&str>) -> bool {
 pub fn bulk_reducer_supports_stream_v2(reducer: Option<&str>) -> bool {
     matches!(
         bulk_reducer_name(reducer),
-        BULK_REDUCER_ALL_SUCCEEDED | BULK_REDUCER_ALL_SETTLED | BULK_REDUCER_COUNT
+        BULK_REDUCER_ALL_SUCCEEDED
+            | BULK_REDUCER_ALL_SETTLED
+            | BULK_REDUCER_COUNT
+            | BULK_REDUCER_SUM
+            | BULK_REDUCER_MIN
+            | BULK_REDUCER_MAX
+            | BULK_REDUCER_AVG
     )
 }
 
@@ -1092,7 +1098,7 @@ mod tests {
     fn reducer_support_flags_distinguish_streaming_capability_from_output_requirements() {
         assert!(bulk_reducer_is_mergeable(Some(BULK_REDUCER_SUM)));
         assert!(bulk_reducer_requires_success_outputs(Some(BULK_REDUCER_SUM)));
-        assert!(!bulk_reducer_supports_stream_v2(Some(BULK_REDUCER_SUM)));
+        assert!(bulk_reducer_supports_stream_v2(Some(BULK_REDUCER_SUM)));
         assert!(bulk_reducer_supports_stream_v2(Some(BULK_REDUCER_COUNT)));
     }
 

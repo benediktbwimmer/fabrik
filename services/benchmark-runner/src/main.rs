@@ -607,9 +607,10 @@ fn parse_args() -> Result<Args> {
             "--bulk-reducer" => {
                 bulk_reducer_explicit = true;
                 bulk_reducer = match value.as_str() {
-                    "all_succeeded" | "all_settled" | "count" | "collect_results" => value,
+                    "all_succeeded" | "all_settled" | "count" | "collect_results" | "sum"
+                    | "min" | "max" | "avg" => value,
                     other => bail!(
-                        "unknown --bulk-reducer {other}; expected all_succeeded, all_settled, count, or collect_results"
+                        "unknown --bulk-reducer {other}; expected all_succeeded, all_settled, count, collect_results, sum, min, max, or avg"
                     ),
                 }
             }
@@ -1106,12 +1107,22 @@ fn benchmark_input(
         Value::Array(
             (0..activities_per_workflow)
                 .map(|index| {
-                    json!({
-                        "index": index,
-                        "payload": payload,
-                        "fail_until_attempt": if index < retry_count { 1 } else { 0 },
-                        "cancel": index >= retry_count && index < retry_count + cancel_count,
-                    })
+                    let mut item = serde_json::Map::from_iter([
+                        ("index".to_owned(), json!(index)),
+                        ("payload".to_owned(), Value::String(payload.clone())),
+                        (
+                            "fail_until_attempt".to_owned(),
+                            json!(if index < retry_count { 1 } else { 0 }),
+                        ),
+                        (
+                            "cancel".to_owned(),
+                            json!(index >= retry_count && index < retry_count + cancel_count),
+                        ),
+                    ]);
+                    if benchmark_reducer_uses_numeric_outputs(&args.bulk_reducer) {
+                        item.insert("reducer_value".to_owned(), json!(index + 1));
+                    }
+                    Value::Object(item)
                 })
                 .collect(),
         ),
@@ -1302,10 +1313,41 @@ fn benchmark_suite_scenarios(args: &Args, suite_name: &str) -> Result<Vec<Args>>
 
             Ok(vec![auto_small, auto_large, auto_materialized])
         }
+        "streaming-reducers" => {
+            let reducers = ["sum", "min", "max", "avg"];
+            let mut scenarios = Vec::with_capacity(reducers.len() * 2);
+            for reducer in reducers {
+                let mut pg = args.clone();
+                pg.suite_name = None;
+                pg.execution_mode = ExecutionMode::Throughput;
+                pg.throughput_backend = Some(PG_V1_BACKEND.to_owned());
+                pg.bulk_reducer = reducer.to_owned();
+                pg.chunk_size = pg.chunk_size.min(64);
+                pg.profile.activities_per_workflow = pg.profile.activities_per_workflow.max(1_024);
+                pg.scenario_tag = Some(format!("{reducer}-pg-v1"));
+                scenarios.push(pg);
+
+                let mut stream = args.clone();
+                stream.suite_name = None;
+                stream.execution_mode = ExecutionMode::Throughput;
+                stream.throughput_backend = Some(STREAM_V2_BACKEND.to_owned());
+                stream.bulk_reducer = reducer.to_owned();
+                stream.chunk_size = stream.chunk_size.min(64);
+                stream.profile.activities_per_workflow =
+                    stream.profile.activities_per_workflow.max(1_024);
+                stream.scenario_tag = Some(format!("{reducer}-stream-v2"));
+                scenarios.push(stream);
+            }
+            Ok(scenarios)
+        }
         other => bail!(
-            "unknown suite {other}; expected streaming, stream-v2-robustness, stream-v2-fast-lane, or streaming-admission"
+            "unknown suite {other}; expected streaming, stream-v2-robustness, stream-v2-fast-lane, streaming-admission, or streaming-reducers"
         ),
     }
+}
+
+fn benchmark_reducer_uses_numeric_outputs(reducer: &str) -> bool {
+    matches!(reducer, "sum" | "min" | "max" | "avg")
 }
 
 fn scenario_name(args: &Args) -> String {
@@ -2354,6 +2396,52 @@ mod tests {
         assert_eq!(scenarios[1].scenario_tag.as_deref(), Some("auto-large"));
         assert_eq!(scenarios[2].scenario_tag.as_deref(), Some("auto-materialized"));
         assert_eq!(scenario_name(&scenarios[1]), "throughput-auto-auto-large-all-settled");
+    }
+
+    #[test]
+    fn streaming_reducers_suite_emits_backend_pairs_for_numeric_reducers() {
+        let scenarios =
+            benchmark_suite_scenarios(&demo_args(), "streaming-reducers").expect("suite");
+        assert_eq!(scenarios.len(), 8);
+        assert_eq!(scenarios[0].bulk_reducer, "sum");
+        assert_eq!(scenarios[0].throughput_backend.as_deref(), Some(PG_V1_BACKEND));
+        assert_eq!(scenarios[1].bulk_reducer, "sum");
+        assert_eq!(scenarios[1].throughput_backend.as_deref(), Some(STREAM_V2_BACKEND));
+        assert_eq!(scenarios[6].bulk_reducer, "avg");
+        assert_eq!(scenarios[7].throughput_backend.as_deref(), Some(STREAM_V2_BACKEND));
+        assert!(
+            scenarios
+                .iter()
+                .all(|scenario| scenario.profile.activities_per_workflow >= 1_024)
+        );
+    }
+
+    #[test]
+    fn numeric_reducer_inputs_include_numeric_reducer_value() {
+        let mut args = demo_args();
+        args.bulk_reducer = "sum".to_owned();
+
+        let input = benchmark_input(&args, 3, 8, 0.0, 0.0, "instance-1");
+        let items = input
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items array");
+
+        assert_eq!(items[0].get("reducer_value"), Some(&json!(1)));
+        assert_eq!(items[2].get("reducer_value"), Some(&json!(3)));
+    }
+
+    #[test]
+    fn non_numeric_reducer_inputs_preserve_object_outputs() {
+        let args = demo_args();
+
+        let input = benchmark_input(&args, 2, 8, 0.0, 0.0, "instance-1");
+        let items = input
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items array");
+
+        assert_eq!(items[0].get("reducer_value"), None);
     }
 
     #[test]

@@ -5,6 +5,7 @@ import ts from "typescript";
 
 const WORKFLOW_SUPPORTED_IMPORTS = new Set([
   "ActivityCancellationType",
+  "ActivityFailure",
   "ApplicationFailure",
   "CancellationScope",
   "condition",
@@ -19,17 +20,15 @@ const WORKFLOW_SUPPORTED_IMPORTS = new Set([
   "ParentClosePolicy",
   "patched",
   "proxyActivities",
+  "SearchAttributes",
   "deprecatePatch",
   "setWorkflowOptions",
   "setHandler",
   "sleep",
   "startChild",
+  "upsertSearchAttributes",
   "uuid4",
   "workflowInfo",
-]);
-
-const BLOCKED_WORKFLOW_IMPORTS = new Map([
-  ["upsertSearchAttributes", "search attributes are not migration-ready yet in Fabrik"],
 ]);
 
 const BLOCKED_PAYLOAD_IMPORTS = new Set([
@@ -497,6 +496,23 @@ function evaluateStaticValue(node, bindings, checker = null, seen = new Set()) {
     const value = evaluateStaticValue(node.arguments[0], bindings, checker, seen);
     return typeof value === "string" ? value : undefined;
   }
+  if (
+    ts.isNewExpression(node) &&
+    ts.isIdentifier(node.expression) &&
+    node.expression.text === "Date"
+  ) {
+    if ((node.arguments?.length ?? 0) === 0) {
+      return new Date(0);
+    }
+    if ((node.arguments?.length ?? 0) === 1) {
+      const value = evaluateStaticValue(node.arguments[0], bindings, checker, seen);
+      if (typeof value === "string" || typeof value === "number") {
+        const date = new Date(value);
+        return Number.isNaN(date.getTime()) ? undefined : date;
+      }
+    }
+    return undefined;
+  }
   return undefined;
 }
 
@@ -519,14 +535,19 @@ function isSupportedSearchAttributesObject(node, bindings, checker = null) {
   if (value == null || Array.isArray(value) || typeof value !== "object") {
     return false;
   }
+  const isSupportedEntry = (entry) =>
+    typeof entry === "string" ||
+    typeof entry === "number" ||
+    typeof entry === "boolean" ||
+    entry instanceof Date;
   return Object.values(value).every((entry) => {
-    if (typeof entry === "string") {
+    if (isSupportedEntry(entry)) {
       return true;
     }
     if (!Array.isArray(entry)) {
       return false;
     }
-    return entry.every((element) => typeof element === "string");
+    return entry.every(isSupportedEntry);
   });
 }
 
@@ -899,27 +920,15 @@ async function main() {
         if (["executeChild", "startChild"].includes(importedName)) fileUses.add("child_workflows");
         if (importedName === "getExternalWorkflowHandle") fileUses.add("external_workflow_handles");
         if (importedName === "continueAsNew") fileUses.add("continue_as_new");
+        if (["SearchAttributes", "upsertSearchAttributes", "workflowInfo"].includes(importedName)) {
+          fileUses.add("search_attributes_memo");
+        }
         if (["patched", "deprecatePatch", "setWorkflowOptions"].includes(importedName)) {
           fileUses.add("ctx_version_workflow_evolution");
           if (importedName === "setWorkflowOptions") {
             fileUses.add("worker_build_ids_and_routing");
           }
         }
-        continue;
-      }
-      if (BLOCKED_WORKFLOW_IMPORTS.has(importedName)) {
-        findings.push(
-          createFinding(
-            projectRoot,
-            "hard_block",
-            "blocked_temporal_workflow_import",
-            importedName === "upsertSearchAttributes" ? "visibility_search_usage" : "unsupported_temporal_api",
-            sourceFile,
-            `Temporal workflow import ${importedName} is not supported by the migration pipeline`,
-            BLOCKED_WORKFLOW_IMPORTS.get(importedName),
-            importedName,
-          ),
-        );
         continue;
       }
       findings.push(
@@ -1199,7 +1208,7 @@ async function main() {
                 `Temporal ${propertyName} usage is outside Fabrik's alpha visibility/search subset`,
                 propertyName === "memo"
                   ? "use a static top-level memo object with primitive literal values only"
-                  : "use static top-level search attributes with string values or arrays of string literals only",
+                  : "use static top-level search attributes with primitive or Date values, or arrays of primitive or Date values",
                 propertyName,
               ),
             );

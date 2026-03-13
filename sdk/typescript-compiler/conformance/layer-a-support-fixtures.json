@@ -63,6 +63,21 @@
       }
     },
     {
+      "id": "analyzer-activity-failure-qualified",
+      "kind": "analyzer",
+      "project": "crates/fabrik-cli/test-fixtures/temporal-activity-failure-qualified",
+      "expect": {
+        "summary": {
+          "workflow_count": 1,
+          "worker_count": 1,
+          "hard_block_count": 0
+        },
+        "workflow_exports_include": ["activityFailureWorkflow"],
+        "worker_task_queues_include": ["activity-failure-qualified"],
+        "finding_features_exclude": ["unsupported_temporal_api"]
+      }
+    },
+    {
       "id": "analyzer-patching-qualified",
       "kind": "analyzer",
       "project": "crates/fabrik-cli/test-fixtures/temporal-patching-qualified",
@@ -90,6 +105,21 @@
         "workflow_exports_include": ["autoUpgradeWorkflow", "pinnedWorkflow"],
         "worker_task_queues_include": ["worker-versioning-qualified"],
         "finding_features_exclude": ["unsupported_temporal_api"]
+      }
+    },
+    {
+      "id": "analyzer-search-attributes-qualified",
+      "kind": "analyzer",
+      "project": "crates/fabrik-cli/test-fixtures/temporal-search-attributes-qualified",
+      "expect": {
+        "summary": {
+          "workflow_count": 1,
+          "worker_count": 1,
+          "hard_block_count": 0
+        },
+        "workflow_exports_include": ["searchAttributesWorkflow"],
+        "worker_task_queues_include": ["search-attributes-qualified"],
+        "finding_features_exclude": ["visibility_search_usage", "unsupported_temporal_api"]
       }
     },
     {

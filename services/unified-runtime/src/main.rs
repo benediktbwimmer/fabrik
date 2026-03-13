@@ -34,8 +34,8 @@ use fabrik_store::{
 use fabrik_throughput::{
     ADMISSION_POLICY_VERSION, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
     ThroughputBackend, bulk_reducer_class, bulk_reducer_is_mergeable,
-    bulk_reducer_materializes_results, bulk_reducer_supports_stream_v2, decode_cbor, encode_cbor,
-    planned_reduction_tree_depth, stream_v2_fast_lane_enabled,
+    bulk_reducer_materializes_results, decode_cbor, encode_cbor, planned_reduction_tree_depth,
+    stream_v2_fast_lane_enabled,
 };
 use fabrik_worker_protocol::activity_worker::{
     Ack, ActivityTask, ActivityTaskCancelledResult, ActivityTaskCompletedResult,
@@ -4695,38 +4695,18 @@ fn choose_bulk_admission_backend(
     item_count: usize,
     chunk_count: u32,
 ) -> BulkAdmissionDecision {
-    let mergeable_but_unsupported =
-        bulk_reducer_is_mergeable(reducer) && !bulk_reducer_supports_stream_v2(reducer);
     if let Some(backend) =
         task_queue_backend.filter(|backend| is_supported_throughput_backend(backend))
     {
-        if backend == ThroughputBackend::StreamV2.as_str() && mergeable_but_unsupported {
-            return bulk_admission_decision(
-                ThroughputBackend::PgV1.as_str(),
-                "mergeable_reducer_unsupported",
-            );
-        }
         return bulk_admission_decision(backend, "task_queue_policy_override");
     }
     if let Some(backend) =
         requested_backend.filter(|backend| is_supported_throughput_backend(backend))
     {
-        if backend == ThroughputBackend::StreamV2.as_str() && mergeable_but_unsupported {
-            return bulk_admission_decision(
-                ThroughputBackend::PgV1.as_str(),
-                "mergeable_reducer_unsupported",
-            );
-        }
         return bulk_admission_decision(backend, "workflow_backend_hint");
     }
     if bulk_reducer_materializes_results(reducer) {
         return bulk_admission_decision(ThroughputBackend::PgV1.as_str(), "materialized_results");
-    }
-    if mergeable_but_unsupported {
-        return bulk_admission_decision(
-            ThroughputBackend::PgV1.as_str(),
-            "mergeable_reducer_unsupported",
-        );
     }
     if bulk_reducer_is_mergeable(reducer)
         && (item_count >= config.stream_v2_min_items || chunk_count >= config.stream_v2_min_chunks)
@@ -7612,7 +7592,7 @@ mod tests {
     }
 
     #[test]
-    fn admission_falls_back_when_mergeable_reducer_is_not_stream_v2_capable() {
+    fn admission_routes_numeric_mergeable_reducer_to_stream_v2() {
         let decision = choose_bulk_admission_backend(
             &BulkAdmissionConfig {
                 default_backend: ThroughputBackend::PgV1.as_str().to_owned(),
@@ -7629,8 +7609,8 @@ mod tests {
             512,
             32,
         );
-        assert_eq!(decision.selected_backend, ThroughputBackend::PgV1.as_str());
-        assert_eq!(decision.routing_reason, "mergeable_reducer_unsupported");
+        assert_eq!(decision.selected_backend, ThroughputBackend::StreamV2.as_str());
+        assert_eq!(decision.routing_reason, "task_queue_policy_override");
     }
 
     #[test]

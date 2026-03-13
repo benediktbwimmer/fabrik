@@ -18,9 +18,10 @@ use fabrik_throughput::{
 };
 use fabrik_throughput::{
     ThroughputBatchIdentity, ThroughputChangelogEntry, ThroughputChangelogPayload,
-    ThroughputChunkReport, ThroughputChunkReportPayload, reduction_tree_child_group_ids,
-    reduction_tree_level_counts, reduction_tree_node_id, reduction_tree_node_level,
-    reduction_tree_parent_group_id,
+    ThroughputChunkReport, ThroughputChunkReportPayload, bulk_reducer_reduce_values,
+    bulk_reducer_requires_success_outputs, bulk_reducer_summary_field_name,
+    reduction_tree_child_group_ids, reduction_tree_level_counts, reduction_tree_node_id,
+    reduction_tree_node_level, reduction_tree_parent_group_id,
 };
 use rocksdb::{DB, IteratorMode, Options, WriteBatch};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -145,6 +146,7 @@ struct LocalBatchState {
     status: String,
     last_report_id: Option<String>,
     error: Option<String>,
+    reducer_output: Option<Value>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     terminal_at: Option<DateTime<Utc>>,
@@ -152,10 +154,6 @@ struct LocalBatchState {
 
 fn default_reducer_class() -> String {
     "legacy".to_owned()
-}
-
-fn batch_reducer_materializes_results(reducer: Option<&str>) -> bool {
-    matches!(reducer.unwrap_or("collect_results"), "collect_results" | "collect_settled_results")
 }
 
 fn default_aggregation_tree_depth() -> u32 {
@@ -319,6 +317,7 @@ pub struct LocalBatchSnapshot {
     pub cancelled_items: u32,
     pub status: String,
     pub error: Option<String>,
+    pub reducer_output: Option<Value>,
     pub updated_at: DateTime<Utc>,
     pub terminal_at: Option<DateTime<Utc>>,
 }
@@ -642,6 +641,7 @@ impl LocalThroughputState {
             status: batch.status.as_str().to_owned(),
             last_report_id: None,
             error: batch.error.clone(),
+            reducer_output: batch.reducer_output.clone(),
             created_at: batch.scheduled_at,
             updated_at: batch.updated_at,
             terminal_at: batch.terminal_at,
@@ -782,6 +782,7 @@ impl LocalThroughputState {
                 cancelled_items: batch.cancelled_items,
                 status: batch.status,
                 error: batch.error,
+                reducer_output: batch.reducer_output,
                 updated_at: batch.updated_at,
                 terminal_at: batch.terminal_at,
             })
@@ -822,6 +823,7 @@ impl LocalThroughputState {
             cancelled_items: batch.cancelled_items,
             status: batch.status,
             error: batch.error,
+            reducer_output: batch.reducer_output,
             updated_at: batch.updated_at,
             terminal_at: batch.terminal_at,
         }))
@@ -873,6 +875,58 @@ impl LocalThroughputState {
                 })
                 .collect()
         })
+    }
+
+    pub fn reduce_batch_success_outputs_after_report(
+        &self,
+        identity: &ThroughputBatchIdentity,
+        pending_report: Option<&ThroughputChunkReport>,
+    ) -> Result<Option<Value>> {
+        let Some(batch) = self.load_batch_state(identity)? else {
+            return Ok(None);
+        };
+        let reducer = batch.reducer.as_deref();
+        if !bulk_reducer_requires_success_outputs(reducer)
+            || bulk_reducer_summary_field_name(reducer).is_none()
+        {
+            return Ok(None);
+        }
+
+        let mut values = Vec::new();
+        for chunk in self.load_chunks_for_batch(identity)? {
+            if let Some(report) = pending_report.filter(|report| report.chunk_id == chunk.chunk_id)
+            {
+                if let ThroughputChunkReportPayload::ChunkCompleted { output, .. } = &report.payload
+                {
+                    let output = output.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "throughput batch {} reducer {} requires output for chunk {}",
+                            identity.batch_id,
+                            reducer.unwrap_or_default(),
+                            chunk.chunk_id
+                        )
+                    })?;
+                    values.extend(output.iter().cloned());
+                }
+                continue;
+            }
+
+            if chunk.status != WorkflowBulkChunkStatus::Completed.as_str() {
+                continue;
+            }
+            let output = chunk.output.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "throughput batch {} reducer {} missing completed output for chunk {}",
+                    identity.batch_id,
+                    reducer.unwrap_or_default(),
+                    chunk.chunk_id
+                )
+            })?;
+            values.extend(output.iter().cloned());
+        }
+
+        bulk_reducer_reduce_values(reducer, &values)
+            .context("failed to reduce throughput batch success outputs")
     }
 
     pub fn count_started_chunks(
@@ -1070,7 +1124,9 @@ impl LocalThroughputState {
                 retry_delay_ms: leased_chunk.retry_delay_ms,
                 items: leased_chunk.items.clone(),
                 input_handle: leased_chunk.input_handle.clone(),
-                omit_success_output: !batch_reducer_materializes_results(batch.reducer.as_deref()),
+                omit_success_output: !bulk_reducer_requires_success_outputs(
+                    batch.reducer.as_deref(),
+                ),
                 cancellation_requested: leased_chunk.cancellation_requested,
                 lease_epoch: leased_chunk.lease_epoch,
                 owner_epoch: leased_chunk.owner_epoch,
@@ -2255,6 +2311,7 @@ impl LocalThroughputState {
                         status: "scheduled".to_owned(),
                         last_report_id: None,
                         error: None,
+                        reducer_output: None,
                         created_at: entry.occurred_at,
                         updated_at: entry.occurred_at,
                         terminal_at: None,
@@ -2309,6 +2366,7 @@ impl LocalThroughputState {
                         status: "scheduled".to_owned(),
                         last_report_id: None,
                         error: None,
+                        reducer_output: None,
                         created_at: entry.occurred_at,
                         updated_at: entry.occurred_at,
                         terminal_at: None,
@@ -2484,6 +2542,7 @@ impl LocalThroughputState {
                         status: "running".to_owned(),
                         last_report_id: None,
                         error: None,
+                        reducer_output: None,
                         created_at: entry.occurred_at,
                         updated_at: entry.occurred_at,
                         terminal_at: None,
@@ -2637,6 +2696,7 @@ impl LocalThroughputState {
                         status: "running".to_owned(),
                         last_report_id: None,
                         error: None,
+                        reducer_output: None,
                         created_at: entry.occurred_at,
                         updated_at: entry.occurred_at,
                         terminal_at: None,
@@ -2684,6 +2744,7 @@ impl LocalThroughputState {
                         status: status.clone(),
                         last_report_id: Some(report_id.clone()),
                         error: error.clone(),
+                        reducer_output: None,
                         created_at: entry.occurred_at,
                         updated_at: entry.occurred_at,
                         terminal_at: Some(*terminal_at),
@@ -3456,6 +3517,7 @@ fn derive_batch_state_from_chunk_states(
         status: status.as_str().to_owned(),
         last_report_id: None,
         error,
+        reducer_output: batch.reducer_output.clone(),
         created_at: batch.scheduled_at,
         updated_at,
         terminal_at,
@@ -3589,6 +3651,7 @@ mod tests {
         ThroughputChangelogEntry, ThroughputChangelogPayload, group_id_for_chunk_index,
         reduction_tree_node_id, reduction_tree_parent_group_id,
     };
+    use serde_json::json;
     use uuid::Uuid;
 
     const TEST_LEASE_TOKEN: &str = "lease-token-a";
@@ -3691,6 +3754,7 @@ mod tests {
             max_attempts: 3,
             retry_delay_ms: 1000,
             error: None,
+            reducer_output: None,
             scheduled_at,
             terminal_at: None,
             updated_at: scheduled_at,
@@ -3925,6 +3989,7 @@ mod tests {
             status: WorkflowBulkBatchStatus::Running.as_str().to_owned(),
             last_report_id: None,
             error: None,
+            reducer_output: None,
             created_at: occurred_at,
             updated_at: occurred_at,
             terminal_at: None,
@@ -4854,6 +4919,109 @@ mod tests {
         assert_eq!(completed_batch.failed_items, 0);
         assert_eq!(completed_batch.cancelled_items, 0);
         assert_eq!(completed_batch.terminal_at, Some(terminal_at));
+
+        let _ = fs::remove_dir_all(&db_path);
+        let _ = fs::remove_dir_all(&checkpoint_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn lease_keeps_success_output_for_numeric_stream_reducer() -> Result<()> {
+        let db_path = temp_path("throughput-state-sum-lease-db");
+        let checkpoint_dir = temp_path("throughput-state-sum-lease-checkpoints");
+        let state = LocalThroughputState::open(&db_path, &checkpoint_dir, 3)?;
+        let now = Utc::now();
+        let mut batch = store_batch(WorkflowBulkBatchStatus::Scheduled, 1, 1, 1, now);
+        batch.reducer = Some("sum".to_owned());
+        batch.reducer_kind = bulk_reducer_name(Some("sum")).to_owned();
+        batch.reducer_version = throughput_reducer_version(Some("sum")).to_owned();
+        batch.reducer_execution_path =
+            throughput_reducer_execution_path("stream-v2", Some("eager"), Some("sum")).to_owned();
+        state.upsert_batch_record(&batch)?;
+        state.upsert_chunk_record(&store_chunk(
+            &batch,
+            "chunk-sum",
+            0,
+            WorkflowBulkChunkStatus::Scheduled,
+            1,
+            now,
+        ))?;
+
+        let leased = state
+            .lease_next_ready_chunk(
+                &batch.tenant_id,
+                &batch.task_queue,
+                "worker-a",
+                now,
+                chrono::Duration::seconds(30),
+                None,
+                None,
+                1,
+            )?
+            .expect("sum reducer chunk should lease");
+        assert!(!leased.omit_success_output);
+
+        let _ = fs::remove_dir_all(&db_path);
+        let _ = fs::remove_dir_all(&checkpoint_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn reduce_batch_success_outputs_after_report_includes_pending_chunk_output() -> Result<()> {
+        let db_path = temp_path("throughput-state-sum-output-db");
+        let checkpoint_dir = temp_path("throughput-state-sum-output-checkpoints");
+        let state = LocalThroughputState::open(&db_path, &checkpoint_dir, 3)?;
+        let now = Utc::now();
+        let mut batch = store_batch(WorkflowBulkBatchStatus::Running, 2, 2, 2, now);
+        batch.reducer = Some("sum".to_owned());
+        batch.reducer_kind = bulk_reducer_name(Some("sum")).to_owned();
+        batch.reducer_version = throughput_reducer_version(Some("sum")).to_owned();
+        batch.reducer_execution_path =
+            throughput_reducer_execution_path("stream-v2", Some("eager"), Some("sum")).to_owned();
+        state.upsert_batch_record(&batch)?;
+
+        let mut completed =
+            store_chunk(&batch, "chunk-completed", 0, WorkflowBulkChunkStatus::Completed, 1, now);
+        completed.output = Some(vec![json!(10)]);
+        completed.completed_at = Some(now);
+        state.upsert_chunk_record(&completed)?;
+
+        let mut started =
+            store_chunk(&batch, "chunk-pending", 1, WorkflowBulkChunkStatus::Started, 1, now);
+        started.started_at = Some(now);
+        started.lease_token = Some(Uuid::now_v7());
+        state.upsert_chunk_record(&started)?;
+
+        let reduced = state.reduce_batch_success_outputs_after_report(
+            &ThroughputBatchIdentity {
+                tenant_id: batch.tenant_id.clone(),
+                instance_id: batch.instance_id.clone(),
+                run_id: batch.run_id.clone(),
+                batch_id: batch.batch_id.clone(),
+            },
+            Some(&ThroughputChunkReport {
+                report_id: "report-sum".to_owned(),
+                tenant_id: batch.tenant_id.clone(),
+                instance_id: batch.instance_id.clone(),
+                run_id: batch.run_id.clone(),
+                batch_id: batch.batch_id.clone(),
+                chunk_id: "chunk-pending".to_owned(),
+                chunk_index: 1,
+                group_id: group_id_for_chunk_index(1, batch.aggregation_group_count),
+                attempt: 1,
+                lease_epoch: 1,
+                owner_epoch: 1,
+                worker_id: "worker-a".to_owned(),
+                worker_build_id: "build-a".to_owned(),
+                lease_token: TEST_LEASE_TOKEN.to_owned(),
+                occurred_at: now,
+                payload: ThroughputChunkReportPayload::ChunkCompleted {
+                    result_handle: Value::Null,
+                    output: Some(vec![json!(30)]),
+                },
+            }),
+        )?;
+        assert_eq!(reduced, Some(json!(40.0)));
 
         let _ = fs::remove_dir_all(&db_path);
         let _ = fs::remove_dir_all(&checkpoint_dir);
@@ -6021,6 +6189,7 @@ mod tests {
             status: "running".to_owned(),
             last_report_id: None,
             error: None,
+            reducer_output: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             terminal_at: None,

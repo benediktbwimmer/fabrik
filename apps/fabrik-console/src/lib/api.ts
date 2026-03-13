@@ -177,6 +177,7 @@ export type WorkflowBulkBatch = {
   max_attempts: number;
   retry_delay_ms: number;
   error: string | null;
+  reducer_output: unknown | null;
   scheduled_at: string;
   terminal_at: string | null;
   updated_at: string;

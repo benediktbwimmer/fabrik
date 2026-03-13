@@ -323,6 +323,7 @@ pub struct WorkflowBulkBatchRecord {
     pub max_attempts: u32,
     pub retry_delay_ms: u64,
     pub error: Option<String>,
+    pub reducer_output: Option<Value>,
     pub scheduled_at: DateTime<Utc>,
     pub terminal_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
@@ -427,6 +428,7 @@ pub struct ThroughputProjectionBatchStateUpdate {
     pub failed_items: u32,
     pub cancelled_items: u32,
     pub error: Option<String>,
+    pub reducer_output: Option<Value>,
     pub terminal_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1389,6 +1391,7 @@ impl WorkflowStore {
                 max_attempts INTEGER NOT NULL,
                 retry_delay_ms BIGINT NOT NULL DEFAULT 0,
                 error TEXT,
+                reducer_output JSONB,
                 scheduled_at TIMESTAMPTZ NOT NULL,
                 terminal_at TIMESTAMPTZ,
                 updated_at TIMESTAMPTZ NOT NULL,
@@ -1414,7 +1417,8 @@ impl WorkflowStore {
             ADD COLUMN IF NOT EXISTS reducer_class TEXT NOT NULL DEFAULT 'legacy',
             ADD COLUMN IF NOT EXISTS aggregation_tree_depth INTEGER NOT NULL DEFAULT 1,
             ADD COLUMN IF NOT EXISTS fast_lane_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-            ADD COLUMN IF NOT EXISTS aggregation_group_count INTEGER NOT NULL DEFAULT 1
+            ADD COLUMN IF NOT EXISTS aggregation_group_count INTEGER NOT NULL DEFAULT 1,
+            ADD COLUMN IF NOT EXISTS reducer_output JSONB
             "#,
         )
         .execute(&self.pool)
@@ -1585,6 +1589,7 @@ impl WorkflowStore {
                 max_attempts INTEGER NOT NULL,
                 retry_delay_ms BIGINT NOT NULL DEFAULT 0,
                 error TEXT,
+                reducer_output JSONB,
                 scheduled_at TIMESTAMPTZ NOT NULL,
                 terminal_at TIMESTAMPTZ,
                 updated_at TIMESTAMPTZ NOT NULL,
@@ -1605,7 +1610,8 @@ impl WorkflowStore {
             ADD COLUMN IF NOT EXISTS reducer TEXT,
             ADD COLUMN IF NOT EXISTS reducer_class TEXT NOT NULL DEFAULT 'legacy',
             ADD COLUMN IF NOT EXISTS aggregation_tree_depth INTEGER NOT NULL DEFAULT 1,
-            ADD COLUMN IF NOT EXISTS fast_lane_enabled BOOLEAN NOT NULL DEFAULT FALSE
+            ADD COLUMN IF NOT EXISTS fast_lane_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+            ADD COLUMN IF NOT EXISTS reducer_output JSONB
             "#,
         )
         .execute(&self.pool)
@@ -9308,12 +9314,13 @@ impl WorkflowStore {
                 chunk_count,
                 max_attempts,
                 retry_delay_ms,
+                reducer_output,
                 scheduled_at,
                 updated_at
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                $18, $19, $20, 'scheduled', $21, $22, $23, $24, $25, $26, $26
+                $18, $19, $20, 'scheduled', $21, $22, $23, $24, $25, NULL, $26, $26
             )
             ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id) DO NOTHING
             "#,
@@ -9549,12 +9556,13 @@ impl WorkflowStore {
                 chunk_count,
                 max_attempts,
                 retry_delay_ms,
+                reducer_output,
                 scheduled_at,
                 updated_at
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-                $19, $20, $21, $22, 'scheduled', $23, $24, $25, $26, $27, $28, $28
+                $19, $20, $21, $22, 'scheduled', $23, $24, $25, $26, $27, NULL, $28, $28
             )
             ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id) DO NOTHING
             "#,
@@ -10371,6 +10379,7 @@ impl WorkflowStore {
                         batch.terminal_at = Some(update.occurred_at);
                         let reducer_output =
                             Self::reduce_bulk_batch_success_outputs(tx.as_mut(), &batch).await?;
+                        batch.reducer_output = reducer_output.clone();
                         terminal_event = Some(Self::bulk_terminal_event(
                             &batch,
                             WorkflowEvent::BulkActivityBatchCompleted {
@@ -10531,8 +10540,9 @@ impl WorkflowStore {
                     failed_items = $7,
                     cancelled_items = $8,
                     error = $9,
-                    terminal_at = $10,
-                    updated_at = $11
+                    reducer_output = $10,
+                    terminal_at = $11,
+                    updated_at = $12
                 WHERE tenant_id = $1
                   AND workflow_instance_id = $2
                   AND run_id = $3
@@ -10554,6 +10564,7 @@ impl WorkflowStore {
                     .context("bulk batch cancelled_items exceeds i32")?,
             )
             .bind(&batch.error)
+            .bind(batch.reducer_output.as_ref().map(|value| Json(value.clone())))
             .bind(batch.terminal_at)
             .bind(update.occurred_at)
             .execute(tx.as_mut())
@@ -10818,6 +10829,7 @@ impl WorkflowStore {
                 max_attempts,
                 retry_delay_ms,
                 error,
+                reducer_output,
                 scheduled_at,
                 terminal_at,
                 updated_at
@@ -10825,7 +10837,7 @@ impl WorkflowStore {
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                 $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33,
-                $34, $35
+                $34, $35, $36
             )
             ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id) DO UPDATE
             SET activity_type = EXCLUDED.activity_type,
@@ -10853,6 +10865,7 @@ impl WorkflowStore {
                 max_attempts = EXCLUDED.max_attempts,
                 retry_delay_ms = EXCLUDED.retry_delay_ms,
                 error = EXCLUDED.error,
+                reducer_output = EXCLUDED.reducer_output,
                 scheduled_at = EXCLUDED.scheduled_at,
                 terminal_at = EXCLUDED.terminal_at,
                 updated_at = EXCLUDED.updated_at
@@ -10911,6 +10924,7 @@ impl WorkflowStore {
                 .context("projection batch retry_delay_ms exceeds i64")?,
         )
         .bind(&batch.error)
+        .bind(batch.reducer_output.as_ref().map(|value| Json(value.clone())))
         .bind(batch.scheduled_at)
         .bind(batch.terminal_at)
         .bind(batch.updated_at)
@@ -11246,6 +11260,7 @@ impl WorkflowStore {
                         .expect("projection batch state cancelled_items exceeds i32"),
                 )
                 .push_bind(&update.error)
+                .push_bind(update.reducer_output.as_ref().map(|value| Json(value.clone())))
                 .push_bind(update.terminal_at)
                 .push_bind(update.updated_at);
         });
@@ -11274,6 +11289,7 @@ impl WorkflowStore {
                     failed_items,
                     cancelled_items,
                     error,
+                    reducer_output,
                     terminal_at,
                     updated_at
                 ) AS (
@@ -11307,6 +11323,15 @@ impl WorkflowStore {
                             AND updates.terminal_at::timestamptz IS NULL
                             THEN throughput_projection_batches.error
                         ELSE updates.error::text
+                    END,
+                    reducer_output = CASE
+                        WHEN throughput_projection_batches.terminal_at IS NOT NULL
+                            AND updates.terminal_at::timestamptz IS NULL
+                            THEN throughput_projection_batches.reducer_output
+                        ELSE COALESCE(
+                            updates.reducer_output::jsonb,
+                            throughput_projection_batches.reducer_output
+                        )
                     END,
                     terminal_at = COALESCE(
                         throughput_projection_batches.terminal_at,
@@ -11808,6 +11833,7 @@ impl WorkflowStore {
                 max_attempts,
                 retry_delay_ms,
                 error,
+                reducer_output,
                 scheduled_at,
                 terminal_at,
                 updated_at
@@ -11843,6 +11869,7 @@ impl WorkflowStore {
                     max_attempts,
                     retry_delay_ms,
                     error,
+                    reducer_output,
                     scheduled_at,
                     terminal_at,
                     updated_at
@@ -11883,6 +11910,7 @@ impl WorkflowStore {
                     max_attempts,
                     retry_delay_ms,
                     error,
+                    reducer_output,
                     scheduled_at,
                     terminal_at,
                     updated_at
@@ -11946,6 +11974,7 @@ impl WorkflowStore {
                 max_attempts,
                 retry_delay_ms,
                 error,
+                reducer_output,
                 scheduled_at,
                 terminal_at,
                 updated_at
@@ -11981,6 +12010,7 @@ impl WorkflowStore {
                     max_attempts,
                     retry_delay_ms,
                     error,
+                    reducer_output,
                     scheduled_at,
                     terminal_at,
                     updated_at
@@ -12022,6 +12052,7 @@ impl WorkflowStore {
                     max_attempts,
                     retry_delay_ms,
                     error,
+                    reducer_output,
                     scheduled_at,
                     terminal_at,
                     updated_at
@@ -13838,6 +13869,10 @@ impl WorkflowStore {
                 .try_get::<i64, _>("retry_delay_ms")
                 .context("bulk batch retry_delay_ms missing")? as u64,
             error: row.try_get("error").context("bulk batch error missing")?,
+            reducer_output: row
+                .try_get::<Option<Json<Value>>, _>("reducer_output")
+                .map(|value| value.map(|json| json.0))
+                .context("bulk batch reducer_output missing")?,
             scheduled_at: row.try_get("scheduled_at").context("bulk batch scheduled_at missing")?,
             terminal_at: row.try_get("terminal_at").context("bulk batch terminal_at missing")?,
             updated_at: row.try_get("updated_at").context("bulk batch updated_at missing")?,
@@ -15815,6 +15850,7 @@ mod tests {
                 failed_items: 0,
                 cancelled_items: 0,
                 error: None,
+                reducer_output: None,
                 terminal_at: None,
                 updated_at: patch_time,
             })
@@ -16036,6 +16072,7 @@ mod tests {
                 failed_items: 0,
                 cancelled_items: 0,
                 error: None,
+                reducer_output: Some(json!(3.0)),
                 terminal_at: Some(terminal_at),
                 updated_at: terminal_at,
             })
@@ -16053,6 +16090,7 @@ mod tests {
                 failed_items: 0,
                 cancelled_items: 0,
                 error: None,
+                reducer_output: None,
                 terminal_at: None,
                 updated_at: stale_running_at,
             })
@@ -16070,6 +16108,7 @@ mod tests {
 
         assert_eq!(projected.status, WorkflowBulkBatchStatus::Completed);
         assert_eq!(projected.succeeded_items, 2);
+        assert_eq!(projected.reducer_output, Some(json!(3.0)));
         assert_eq!(projected.terminal_at, Some(terminal_at));
 
         Ok(())
@@ -16158,6 +16197,7 @@ mod tests {
                     failed_items: 0,
                     cancelled_items: 0,
                     error: None,
+                    reducer_output: Some(json!(1.0)),
                     terminal_at: None,
                     updated_at: patch_time,
                 },
@@ -16171,6 +16211,7 @@ mod tests {
                     failed_items: 0,
                     cancelled_items: 0,
                     error: None,
+                    reducer_output: Some(json!(1.0)),
                     terminal_at: Some(patch_time),
                     updated_at: patch_time,
                 },
@@ -16188,6 +16229,7 @@ mod tests {
             .context("running stream batch missing from query view")?;
         assert_eq!(running_projected.status, WorkflowBulkBatchStatus::Running);
         assert_eq!(running_projected.succeeded_items, 1);
+        assert_eq!(running_projected.reducer_output, Some(json!(1.0)));
         assert_eq!(running_projected.terminal_at, None);
 
         let terminal_projected = store
@@ -16201,6 +16243,7 @@ mod tests {
             .context("terminal stream batch missing from query view")?;
         assert_eq!(terminal_projected.status, WorkflowBulkBatchStatus::Completed);
         assert_eq!(terminal_projected.succeeded_items, 1);
+        assert_eq!(terminal_projected.reducer_output, Some(json!(1.0)));
         assert_eq!(terminal_projected.terminal_at, Some(patch_time));
 
         Ok(())

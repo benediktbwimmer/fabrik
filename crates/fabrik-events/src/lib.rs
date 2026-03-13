@@ -114,6 +114,9 @@ pub enum WorkflowEvent {
         change_id: String,
         version: u32,
     },
+    SearchAttributesUpserted {
+        search_attributes: Value,
+    },
     ActivityTaskScheduled {
         activity_id: String,
         activity_type: String,
@@ -351,6 +354,7 @@ impl WorkflowEvent {
             Self::WorkflowArtifactPinned => "WorkflowArtifactPinned",
             Self::MarkerRecorded { .. } => "MarkerRecorded",
             Self::VersionMarkerRecorded { .. } => "VersionMarkerRecorded",
+            Self::SearchAttributesUpserted { .. } => "SearchAttributesUpserted",
             Self::ActivityTaskScheduled { .. } => "ActivityTaskScheduled",
             Self::ActivityTaskStarted { .. } => "ActivityTaskStarted",
             Self::ActivityTaskHeartbeatRecorded { .. } => "ActivityTaskHeartbeatRecorded",
