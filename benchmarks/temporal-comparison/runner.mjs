@@ -387,45 +387,65 @@ function buildWorkflowInput(activitiesPerWorkflow, payloadSize, retryRate, cance
 
 async function runFabrikWorkload({ outputDir, profile, repoRoot, repetition, workload }) {
   const workloadKey = sanitizeIdentifier(workload.name);
-  const namespace = `temporal-compare-${workloadKey}-r${repetition}-${Date.now()}`;
-  const outputPath = path.join(outputDir, `${workloadKey}-fabrik-r${repetition}.json`);
   const scriptPath = path.join(repoRoot, "scripts", "run-isolated-benchmark.sh");
-  const args = [
-    "--suite",
-    "streaming",
-    "--profile",
-    profile,
-    "--workflow-count",
-    String(workload.workflowCount),
-    "--activities-per-workflow",
-    String(workload.activitiesPerWorkflow),
-    "--payload-size",
-    String(workload.payloadSize),
-    "--worker-count",
-    String(workload.workerCount),
-    "--retry-rate",
-    String(workload.retryRate),
-    "--cancel-rate",
-    String(workload.cancelRate),
-    "--timeout-secs",
-    String(workload.timeoutSecs),
-    "--output",
-    outputPath,
-  ];
-  await runCommand(scriptPath, args, {
-    cwd: repoRoot,
-    env: {
-      ...process.env,
-      ACTIVITY_WORKER_CONCURRENCY: String(workload.workerCount),
-      BENCHMARK_NAMESPACE: namespace,
-      BUILD_RELEASE_BINARIES: "0",
-      STREAM_ACTIVITY_WORKER_CONCURRENCY: String(workload.workerCount),
+  const scenarios = [
+    {
+      name: "durable",
+      args: ["--execution-mode", "durable"],
     },
-  });
-  const suiteReport = JSON.parse(await fs.readFile(outputPath, "utf8"));
+    {
+      name: "throughput-pg-v1",
+      args: ["--execution-mode", "throughput", "--throughput-backend", "pg-v1"],
+    },
+    {
+      name: "throughput-stream-v2",
+      args: ["--execution-mode", "throughput", "--throughput-backend", "stream-v2"],
+    },
+  ];
+  const reports = [];
+
+  for (const scenario of scenarios) {
+    const namespace = `temporal-compare-${workloadKey}-${scenario.name}-r${repetition}-${Date.now()}`;
+    const outputPath = path.join(
+      outputDir,
+      `${workloadKey}-fabrik-r${repetition}-${scenario.name}.json`,
+    );
+    const args = [
+      ...scenario.args,
+      "--profile",
+      profile,
+      "--workflow-count",
+      String(workload.workflowCount),
+      "--activities-per-workflow",
+      String(workload.activitiesPerWorkflow),
+      "--payload-size",
+      String(workload.payloadSize),
+      "--worker-count",
+      String(workload.workerCount),
+      "--retry-rate",
+      String(workload.retryRate),
+      "--cancel-rate",
+      String(workload.cancelRate),
+      "--timeout-secs",
+      String(workload.timeoutSecs),
+      "--output",
+      outputPath,
+    ];
+    await runCommand(scriptPath, args, {
+      cwd: repoRoot,
+      env: {
+        ...process.env,
+        ACTIVITY_WORKER_CONCURRENCY: String(workload.workerCount),
+        BENCHMARK_NAMESPACE: namespace,
+        BUILD_RELEASE_BINARIES: "0",
+        STREAM_ACTIVITY_WORKER_CONCURRENCY: String(workload.workerCount),
+      },
+    });
+    reports.push(JSON.parse(await fs.readFile(outputPath, "utf8")));
+  }
+
   return {
-    suiteReportPath: outputPath,
-    scenarios: suiteReport.scenarios.map(normalizeFabrikScenario),
+    scenarios: reports.map(normalizeFabrikScenario),
   };
 }
 

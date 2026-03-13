@@ -93,6 +93,7 @@ async fn main() -> Result<()> {
             bulk_endpoint.clone(),
             format!("bulk-result-flusher-{flusher_index}"),
             payload_store.clone(),
+            bulk_endpoint != endpoint,
             bulk_result_rx,
         ));
         bulk_result_txs.push(bulk_result_tx);
@@ -231,6 +232,7 @@ async fn flush_bulk_results(
     worker: &mut ActivityWorkerApiClient<tonic::transport::Channel>,
     payload_store: &PayloadStore,
     flusher_id: &str,
+    externalize_outputs: bool,
     pending_results: &mut Vec<BulkActivityTaskResult>,
     pending_result_bytes: &mut usize,
     first_pending_at: &mut Option<std::time::Instant>,
@@ -238,7 +240,9 @@ async fn flush_bulk_results(
     if pending_results.is_empty() {
         return Ok(());
     }
-    externalize_bulk_result_outputs(payload_store, flusher_id, pending_results).await?;
+    if externalize_outputs {
+        externalize_bulk_result_outputs(payload_store, flusher_id, pending_results).await?;
+    }
     worker
         .report_bulk_activity_task_results(ReportBulkActivityTaskResultsRequest {
             results: std::mem::take(pending_results),
@@ -321,6 +325,7 @@ async fn run_bulk_result_flusher(
     endpoint: String,
     flusher_id: String,
     payload_store: Arc<PayloadStore>,
+    externalize_outputs: bool,
     mut result_rx: UnboundedReceiver<BulkActivityTaskResult>,
 ) -> Result<()> {
     let mut worker = connect_activity_worker_with_retry(&endpoint, &flusher_id).await;
@@ -350,6 +355,7 @@ async fn run_bulk_result_flusher(
                 &mut worker,
                 payload_store.as_ref(),
                 &flusher_id,
+                externalize_outputs,
                 &mut pending_results,
                 &mut pending_result_bytes,
                 &mut first_pending_at,
@@ -376,6 +382,7 @@ async fn run_bulk_result_flusher(
                     &mut worker,
                     payload_store.as_ref(),
                     &flusher_id,
+                    externalize_outputs,
                     &mut pending_results,
                     &mut pending_result_bytes,
                     &mut first_pending_at,
@@ -388,6 +395,7 @@ async fn run_bulk_result_flusher(
                     &mut worker,
                     payload_store.as_ref(),
                     &flusher_id,
+                    externalize_outputs,
                     &mut pending_results,
                     &mut pending_result_bytes,
                     &mut first_pending_at,
@@ -855,7 +863,11 @@ fn task_input_handle(
     task: &fabrik_worker_protocol::activity_worker::BulkActivityTask,
 ) -> Result<Option<PayloadHandle>> {
     if !task.input_handle_cbor.is_empty() {
-        return Ok(Some(decode_cbor(&task.input_handle_cbor, "bulk task input handle")?));
+        let value = decode_cbor::<Value>(&task.input_handle_cbor, "bulk task input handle")?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        return Ok(Some(serde_json::from_value(value)?));
     }
     if task.input_handle_json.trim().is_empty() {
         return Ok(None);
@@ -1026,4 +1038,22 @@ async fn response_body(response: Response) -> Result<Value> {
     }
 
     Ok(Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fabrik_worker_protocol::activity_worker::BulkActivityTask;
+
+    #[test]
+    fn cbor_null_input_handle_is_treated_as_absent() {
+        let task = BulkActivityTask {
+            input_handle_cbor: encode_cbor(&Value::Null, "bulk task input handle")
+                .expect("encode null handle"),
+            ..BulkActivityTask::default()
+        };
+
+        let handle = task_input_handle(&task).expect("decode null handle");
+        assert_eq!(handle, None);
+    }
 }

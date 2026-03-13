@@ -26,6 +26,7 @@ TEMPORAL_PROJECT="${TEMPORAL_BENCHMARK_PROJECT:-fabrik-temporal-benchmark}"
 TEMPORAL_HOST_PORT="${TEMPORAL_HOST_PORT:-7233}"
 TEMPORAL_NAMESPACE="${TEMPORAL_NAMESPACE:-default}"
 KEEP_TEMPORAL_STACK="${KEEP_TEMPORAL_STACK:-0}"
+TEMPORAL_CONTAINER=""
 
 while (($#)); do
   case "$1" in
@@ -113,14 +114,54 @@ sys.exit(1)
 PY
 }
 
+wait_for_temporal_namespace() {
+  local namespace=$1
+  local timeout=${2:-120}
+  local deadline=$((SECONDS + timeout))
+  while (( SECONDS < deadline )); do
+    if docker exec "$TEMPORAL_CONTAINER" \
+      temporal operator namespace describe \
+      --address temporal:7233 \
+      --namespace "$namespace" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 2
+  done
+  echo "timed out waiting for Temporal namespace $namespace" >&2
+  return 1
+}
+
+ensure_temporal_namespace() {
+  local namespace=$1
+  if [[ "$namespace" == "default" ]]; then
+    wait_for_temporal_namespace "$namespace" 120
+    return 0
+  fi
+
+  if ! docker exec "$TEMPORAL_CONTAINER" \
+    temporal operator namespace describe \
+    --address temporal:7233 \
+    --namespace "$namespace" >/dev/null 2>&1; then
+    docker exec "$TEMPORAL_CONTAINER" \
+      temporal operator namespace create \
+      --address temporal:7233 \
+      --namespace "$namespace" >/dev/null
+  fi
+
+  wait_for_temporal_namespace "$namespace" 120
+}
+
 echo "[temporal-comparison] starting Temporal stack"
 TEMPORAL_HOST_PORT="$TEMPORAL_HOST_PORT" docker compose \
   -p "$TEMPORAL_PROJECT" \
   -f docker/temporal/docker-compose.yml \
   up -d >/dev/null
+TEMPORAL_CONTAINER="${TEMPORAL_PROJECT}-temporal-1"
 
 echo "[temporal-comparison] waiting for Temporal frontend"
 wait_for_port 127.0.0.1 "$TEMPORAL_HOST_PORT" "temporal-frontend"
+echo "[temporal-comparison] waiting for Temporal namespace ${TEMPORAL_NAMESPACE}"
+ensure_temporal_namespace "$TEMPORAL_NAMESPACE"
 
 echo "[temporal-comparison] building Fabrik release binaries"
 cargo build --release \

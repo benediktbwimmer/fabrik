@@ -232,8 +232,8 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
     let throughput_projector_base =
         env::var("THROUGHPUT_PROJECTOR_URL").unwrap_or_else(|_| "http://127.0.0.1:3007".to_owned());
 
-    let definition_id = format!("fanout-benchmark-{}", args.profile_name);
     let scenario_name = scenario_name(args);
+    let definition_id = benchmark_definition_id(args, &scenario_name);
     let instance_prefix =
         format!("fanout-{}-{}-{}", args.profile_name, scenario_name, Uuid::now_v7());
     let started_at = Utc::now();
@@ -259,6 +259,7 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
             args.retry_rate > 0.0,
             args.execution_mode,
             &args.bulk_reducer,
+            args.throughput_backend.as_deref(),
             args.chunk_size,
         ),
     )
@@ -565,6 +566,7 @@ fn benchmark_artifact(
     enable_retry: bool,
     execution_mode: ExecutionMode,
     bulk_reducer: &str,
+    throughput_backend: Option<&str>,
     chunk_size: u32,
 ) -> CompiledWorkflowArtifact {
     let mut states = BTreeMap::new();
@@ -615,9 +617,10 @@ fn benchmark_artifact(
                     task_queue: Some(Expression::Literal {
                         value: Value::String(task_queue.to_owned()),
                     }),
-                    execution_policy: Some("eager".to_owned()),
+                    execution_policy: (throughput_backend == Some(STREAM_V2_BACKEND))
+                        .then(|| "eager".to_owned()),
                     reducer: Some(bulk_reducer.to_owned()),
-                    throughput_backend: None,
+                    throughput_backend: throughput_backend.map(str::to_owned),
                     chunk_size: Some(chunk_size),
                     retry: enable_retry
                         .then_some(RetryPolicy { max_attempts: 2, delay: "1s".to_owned() }),
@@ -838,6 +841,10 @@ fn scenario_name(args: &Args) -> String {
         scenario.push_str(&suffix);
     }
     scenario
+}
+
+fn benchmark_definition_id(args: &Args, scenario_name: &str) -> String {
+    format!("fanout-benchmark-{}-{}", args.profile_name, scenario_name)
 }
 
 fn scenario_rate_suffix(label: &str, rate: f64) -> Option<String> {
@@ -1442,6 +1449,73 @@ mod tests {
             scenario_name(&args),
             "throughput-stream-v2-all-settled-retry-100bp-cancel-100bp"
         );
+    }
+
+    #[test]
+    fn benchmark_definition_id_distinguishes_suite_variants() {
+        let durable = Args {
+            execution_mode: ExecutionMode::Durable,
+            throughput_backend: None,
+            ..demo_args()
+        };
+        let stream = demo_args();
+
+        let durable_id = benchmark_definition_id(&durable, &scenario_name(&durable));
+        let stream_id = benchmark_definition_id(&stream, &scenario_name(&stream));
+
+        assert_ne!(durable_id, stream_id);
+        assert_eq!(durable_id, "fanout-benchmark-target-durable");
+        assert_eq!(stream_id, "fanout-benchmark-target-throughput-stream-v2");
+    }
+
+    #[test]
+    fn throughput_artifact_uses_backend_specific_execution_policy() {
+        let pg_artifact = benchmark_artifact(
+            "fanout-benchmark-target-throughput-pg-v1",
+            "default",
+            false,
+            ExecutionMode::Throughput,
+            "collect_results",
+            Some(PG_V1_BACKEND),
+            100,
+        );
+        let stream_artifact = benchmark_artifact(
+            "fanout-benchmark-target-throughput-stream-v2",
+            "default",
+            false,
+            ExecutionMode::Throughput,
+            "collect_results",
+            Some(STREAM_V2_BACKEND),
+            100,
+        );
+
+        let pg_dispatch = pg_artifact.workflow.states.get("dispatch").expect("pg dispatch state");
+        let stream_dispatch =
+            stream_artifact.workflow.states.get("dispatch").expect("stream dispatch state");
+
+        match pg_dispatch {
+            CompiledStateNode::StartBulkActivity {
+                execution_policy,
+                throughput_backend,
+                ..
+            } => {
+                assert_eq!(execution_policy.as_deref(), None);
+                assert_eq!(throughput_backend.as_deref(), Some(PG_V1_BACKEND));
+            }
+            other => panic!("expected bulk dispatch state, got {other:?}"),
+        }
+
+        match stream_dispatch {
+            CompiledStateNode::StartBulkActivity {
+                execution_policy,
+                throughput_backend,
+                ..
+            } => {
+                assert_eq!(execution_policy.as_deref(), Some("eager"));
+                assert_eq!(throughput_backend.as_deref(), Some(STREAM_V2_BACKEND));
+            }
+            other => panic!("expected bulk dispatch state, got {other:?}"),
+        }
     }
 
     #[test]

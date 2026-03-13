@@ -7,6 +7,12 @@ const FABRIK_SCENARIO_LABELS = {
   "throughput-stream-v2": "fabrik_throughput_stream_v2",
 };
 
+function fabrikScenarioLabel(name) {
+  return Object.entries(FABRIK_SCENARIO_LABELS).find(([prefix]) => {
+    return name === prefix || name.startsWith(`${prefix}-`);
+  })?.[1] ?? null;
+}
+
 export function sanitizeIdentifier(value) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }
@@ -94,7 +100,7 @@ function collectPlatformRuns(runs) {
   for (const run of runs) {
     platforms.temporal.push(run.temporal);
     for (const fabrikScenario of run.fabrik.scenarios) {
-      const label = FABRIK_SCENARIO_LABELS[fabrikScenario.scenario];
+      const label = fabrikScenarioLabel(fabrikScenario.scenario);
       if (label) {
         platforms[label].push(fabrikScenario);
       }

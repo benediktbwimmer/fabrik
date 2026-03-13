@@ -84,14 +84,40 @@ STREAM_ACTIVITY_WORKER_SERVICE_PORT="${STREAM_ACTIVITY_WORKER_SERVICE_PORT:-${PO
 PIDS=()
 REPORT_PATH=""
 
-cleanup() {
-  local exit_code=$?
+stop_services() {
+  local pid
   for pid in "${PIDS[@]:-}"; do
     if kill -0 "$pid" >/dev/null 2>&1; then
       kill "$pid" >/dev/null 2>&1 || true
-      wait "$pid" >/dev/null 2>&1 || true
     fi
   done
+
+  local deadline=$((SECONDS + 5))
+  while (( SECONDS < deadline )); do
+    local any_running=0
+    for pid in "${PIDS[@]:-}"; do
+      if kill -0 "$pid" >/dev/null 2>&1; then
+        any_running=1
+        break
+      fi
+    done
+    if [[ "$any_running" == "0" ]]; then
+      break
+    fi
+    sleep 1
+  done
+
+  for pid in "${PIDS[@]:-}"; do
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      kill -9 "$pid" >/dev/null 2>&1 || true
+    fi
+    wait "$pid" >/dev/null 2>&1 || true
+  done
+}
+
+cleanup() {
+  local exit_code=$?
+  stop_services
 
   if [[ $exit_code -ne 0 ]]; then
     echo >&2
@@ -180,7 +206,17 @@ wait_for_topic_partitions() {
     local actual
     actual="$(
       docker exec fabrik-redpanda-1 rpk topic list 2>/dev/null \
-        | awk -v topic="$topic" '$1 == topic {print $2; exit}'
+        | awk -v topic="$topic" '
+            $1 == topic {
+              print $2
+              found = 1
+            }
+            END {
+              if (!found) {
+                exit 1
+              }
+            }
+          '
     )"
     if [[ -n "${actual:-}" && "$actual" == "$expected_partitions" ]]; then
       return 0
@@ -480,6 +516,8 @@ env \
   "THROUGHPUT_DEBUG_URL=http://127.0.0.1:$THROUGHPUT_DEBUG_PORT" \
   "THROUGHPUT_PROJECTOR_URL=http://127.0.0.1:$THROUGHPUT_PROJECTOR_PORT" \
   target/release/benchmark-runner "${RUNNER_ARGS[@]}"
+
+stop_services
 
 if [[ "$KEEP_DATABASE" != "1" ]]; then
   docker exec fabrik-postgres-1 psql -U postgres -c "DROP DATABASE IF EXISTS $DB_NAME WITH (FORCE);" >/dev/null || true

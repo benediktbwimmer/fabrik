@@ -60,6 +60,43 @@ test("buildComparisonReport aggregates platform metrics", () => {
   );
 });
 
+test("buildComparisonReport groups suffixed Fabrik scenarios under their base platform", () => {
+  const report = buildComparisonReport({
+    generatedAt: "2026-03-13T00:00:00.000Z",
+    profile: "smoke",
+    manifestPath: "/tmp/workloads.json",
+    repetitions: 1,
+    temporalAddress: "127.0.0.1:7233",
+    temporalNamespace: "default",
+    workloads: [
+      {
+        workload: {
+          name: "fanout-retry",
+          description: "retry workload",
+        },
+        runs: [
+          {
+            repetition: 1,
+            temporal: demoTemporalRun(100, 2000),
+            fabrik: {
+              scenarios: [
+                demoFabrikRun("durable-retry-500bp", 120, 1000),
+                demoFabrikRun("throughput-pg-v1-retry-500bp", 50, 4000),
+                demoFabrikRun("throughput-stream-v2-retry-500bp", 70, 3000),
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  const workload = report.workloads[0];
+  assert.equal(workload.summary.platforms.fabrik_durable.meanDurationMs, 120);
+  assert.equal(workload.summary.platforms.fabrik_throughput_pg_v1.meanDurationMs, 50);
+  assert.equal(workload.summary.platforms.fabrik_throughput_stream_v2.meanDurationMs, 70);
+});
+
 test("formatComparisonSummary renders workload summaries", () => {
   const report = buildComparisonReport({
     generatedAt: "2026-03-13T00:00:00.000Z",
