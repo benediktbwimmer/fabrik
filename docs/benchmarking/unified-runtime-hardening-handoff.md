@@ -27,6 +27,45 @@ The unified runtime currently supports a narrow subset aimed at the benchmark-cr
 
 It is intentionally not feature-complete. It is not yet a general replacement for the existing durable engine.
 
+## Hardening Status
+The unified runtime is no longer just a fast prototype. The following hardening slices are already implemented in the branch:
+
+- late and duplicate activity results are explicitly rejected for:
+  - missing instance
+  - terminal instance
+  - missing activity
+  - stale attempt
+  - missing lease
+  - worker mismatch
+- per-lease `lease_epoch` fencing is carried through poll and report paths
+- per-owner `owner_epoch` fencing is enforced on activity result apply
+- startup requires a shared Postgres ownership lease before serving work
+- ownership renewal is continuous, and ownership loss fail-stops the process
+- local restore requeues lost leased work and promotes due retries immediately
+- shared Postgres snapshots are written for unified runtime instances
+- restore can recover from shared store snapshots plus `workflow_activities`
+- restore replays shared broker tail on top of shared snapshots
+- startup reconciles local checkpoint state against shared recovery and prefers the fresher per-run state
+- stale local ready, leased, and delayed-retry work is removed when shared recovery wins
+
+The branch also has targeted tests for these behaviors in [/Users/bene/code/fabrik/services/unified-runtime/src/main.rs](/Users/bene/code/fabrik/services/unified-runtime/src/main.rs), including:
+
+- stale and duplicate result filtering
+- restore requeue of leased and due-retry work
+- owner and lease epoch stamping
+- restore preferring newer log state over snapshot state
+- shared snapshot plus broker-tail handoff recovery
+- stale-local vs fresher-shared reconciliation
+- fresher-local vs older-shared non-downgrade
+
+Latest isolated regression check after the recovery-reconciliation pass:
+
+- [/Users/bene/code/fabrik/target/benchmark-reports/unified-baseline-final-hardening-check.json](/Users/bene/code/fabrik/target/benchmark-reports/unified-baseline-final-hardening-check.json)
+- `execution_duration_ms=378`
+- `throughput_activities_per_second=2645.50`
+- `completed=10`
+- `failed=0`
+
 ## What Changed the Throughput Curve
 The experiment only became truly fast after the following changes:
 
@@ -106,11 +145,91 @@ The design center is now clear:
 The experiment is fast, but several production properties remain under-specified or weak:
 
 - local file persistence instead of a production-grade replicated log/snapshot design
-- no strong ownership handoff story
+- no live ownership handoff story
 - no proven exactly-once or at-least-once external effect boundary model
 - no feature parity with broader workflow semantics
 - no mature replay validation strategy
 - no robust crash injection test suite
+
+## Future Hardening Milestone
+The next milestone should be treated as a dedicated hardening project, not a side quest during performance work.
+
+Goal:
+
+- turn the unified runtime from “fast and partially hardened” into “architecturally credible under owner loss, replay, and duplicate delivery”
+
+Exit criteria:
+
+- no ambiguous source of truth during recovery
+- fenced owner transitions across real handoff, not just fail-stop
+- deterministic replay for the benchmark subset from shared state alone
+- crash-injection coverage for the major transition windows
+- explicit duplicate-delivery contract for trigger, start, and completion paths
+
+Scope for the milestone:
+
+### 1. Shared Source Of Truth
+- choose one authoritative recovery model and document it rigorously
+- likely direction: shard log plus snapshots as authority, with Postgres rows treated as projections
+- remove any remaining ambiguity between:
+  - local checkpoint files
+  - shared snapshots
+  - broker tail
+  - `workflow_activities`
+  - `workflow_instances`
+
+### 2. Live Ownership Handoff
+- replace fail-stop-only ownership loss with a real takeover story
+- define the persisted fencing contract for:
+  - schedule
+  - start
+  - completion apply
+  - snapshot/log write
+- make a new owner resume from a precise replay point without relying on local files from the old owner
+
+### 3. Recovery Correctness Under Crash Windows
+- cover the crash windows that still matter to the benchmark subset:
+  - crash after DB schedule success but before ready-queue exposure
+  - crash after completion terminal write but before join-state persistence
+  - crash after retry scheduling but before retry persistence
+  - crash during snapshot/log flush
+- prove whether each case yields:
+  - replay and reschedule
+  - replay and ignore duplicate
+  - or terminal no-op
+
+### 4. Duplicate And Stale Delivery Contract
+- specify the runtime contract for:
+  - duplicate trigger
+  - duplicate completion
+  - stale completion from superseded attempt
+  - late completion after workflow terminal
+  - stale worker from prior owner epoch
+- make the contract explicit in code and tests rather than inferred from guards
+
+### 5. Failure Injection And Load Validation
+- add restart and ownership-loss tests that run under load, not just unit-style recovery tests
+- include:
+  - owner crash during fan-out scheduling
+  - owner crash during completion drain
+  - owner replacement after expired lease
+  - recovery from shared snapshot plus broker tail with missing local files
+- collect both correctness and throughput deltas so hardening regressions are visible
+
+### 6. Productization Readiness Boundary
+- decide what remains benchmark-only behavior versus what is part of the intended production contract
+- explicitly defer non-goals until the above invariants are closed:
+  - broad workflow feature parity
+  - migration compatibility with the legacy durable runtime
+  - full query/history fidelity beyond the benchmark subset
+
+Suggested implementation order:
+
+1. formalize shared source of truth
+2. implement real live owner handoff and persisted fencing
+3. close duplicate/stale delivery semantics
+4. build crash-injection and load recovery coverage
+5. only then expand feature surface
 
 ## Primary Hardening Questions
 The analysis agent should focus on these questions, in this order.

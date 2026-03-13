@@ -876,6 +876,8 @@ impl ActivityWorkerApi for ActivityApi {
                 attempt: request.attempt,
                 worker_id: request.worker_id,
                 worker_build_id: request.worker_build_id,
+                lease_epoch: request.lease_epoch,
+                owner_epoch: request.owner_epoch,
                 result: Some(activity_task_result::Result::Completed(
                     fabrik_worker_protocol::activity_worker::ActivityTaskCompletedResult {
                         output_json: request.output_json,
@@ -902,6 +904,8 @@ impl ActivityWorkerApi for ActivityApi {
                 attempt: request.attempt,
                 worker_id: request.worker_id,
                 worker_build_id: request.worker_build_id,
+                lease_epoch: request.lease_epoch,
+                owner_epoch: request.owner_epoch,
                 result: Some(activity_task_result::Result::Failed(
                     fabrik_worker_protocol::activity_worker::ActivityTaskFailedResult {
                         error: request.error,
@@ -1019,6 +1023,8 @@ impl ActivityWorkerApi for ActivityApi {
                 attempt: request.attempt,
                 worker_id: request.worker_id,
                 worker_build_id: request.worker_build_id,
+                lease_epoch: request.lease_epoch,
+                owner_epoch: request.owner_epoch,
                 result: Some(activity_task_result::Result::Cancelled(
                     fabrik_worker_protocol::activity_worker::ActivityTaskCancelledResult {
                         reason: request.reason,
@@ -2099,6 +2105,8 @@ fn record_to_proto(record: &WorkflowActivityRecord) -> ActivityTask {
         heartbeat_timeout_ms: record.heartbeat_timeout_ms.unwrap_or_default(),
         cancellation_requested: record.cancellation_requested,
         schedule_to_start_timeout_ms: record.schedule_to_start_timeout_ms.unwrap_or_default(),
+        lease_epoch: 0,
+        owner_epoch: 0,
     }
 }
 

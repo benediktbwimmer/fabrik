@@ -193,7 +193,8 @@ fn estimate_result_size(result: &ActivityTaskResult) -> usize {
         + result.activity_id.len()
         + result.worker_id.len()
         + result.worker_build_id.len()
-        + std::mem::size_of::<u32>();
+        + std::mem::size_of::<u32>()
+        + std::mem::size_of::<u64>() * 2;
     size += match result.result.as_ref() {
         Some(activity_task_result::Result::Completed(completed)) => completed.output_json.len(),
         Some(activity_task_result::Result::Failed(failed)) => failed.error.len(),
@@ -626,6 +627,8 @@ async fn execute_activity_task(
             attempt: task.attempt,
             worker_id,
             worker_build_id,
+            lease_epoch: task.lease_epoch,
+            owner_epoch: task.owner_epoch,
             result: Some(activity_task_result::Result::Completed(ActivityTaskCompletedResult {
                 output_json: serde_json::to_string(&output)?,
             })),
@@ -638,6 +641,8 @@ async fn execute_activity_task(
             attempt: task.attempt,
             worker_id,
             worker_build_id,
+            lease_epoch: task.lease_epoch,
+            owner_epoch: task.owner_epoch,
             result: Some(activity_task_result::Result::Cancelled(ActivityTaskCancelledResult {
                 reason: "activity cancelled".to_owned(),
                 metadata_json: String::new(),
@@ -651,6 +656,8 @@ async fn execute_activity_task(
             attempt: task.attempt,
             worker_id,
             worker_build_id,
+            lease_epoch: task.lease_epoch,
+            owner_epoch: task.owner_epoch,
             result: Some(activity_task_result::Result::Failed(ActivityTaskFailedResult {
                 error: error.to_string(),
             })),

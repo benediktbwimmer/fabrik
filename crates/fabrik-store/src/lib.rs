@@ -6615,6 +6615,38 @@ impl WorkflowStore {
         row.map(Self::decode_snapshot_row).transpose()
     }
 
+    pub async fn list_nonterminal_snapshots(&self) -> Result<Vec<WorkflowStateSnapshot>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                snapshots.tenant_id,
+                snapshots.workflow_instance_id,
+                snapshots.run_id,
+                snapshots.workflow_id,
+                snapshots.definition_version,
+                snapshots.artifact_hash,
+                snapshots.snapshot_schema_version,
+                snapshots.event_count,
+                snapshots.last_event_id,
+                snapshots.last_event_type,
+                snapshots.updated_at,
+                snapshots.state
+            FROM workflow_state_snapshots snapshots
+            INNER JOIN workflow_instances instances
+                ON instances.tenant_id = snapshots.tenant_id
+               AND instances.workflow_instance_id = snapshots.workflow_instance_id
+               AND instances.run_id = snapshots.run_id
+            WHERE instances.status = 'running'
+            ORDER BY snapshots.updated_at ASC, snapshots.workflow_instance_id ASC, snapshots.run_id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list nonterminal workflow snapshots")?;
+
+        rows.into_iter().map(Self::decode_snapshot_row).collect()
+    }
+
     pub async fn mark_event_processed(&self, event: &EventEnvelope<WorkflowEvent>) -> Result<bool> {
         let result = sqlx::query(
             r#"

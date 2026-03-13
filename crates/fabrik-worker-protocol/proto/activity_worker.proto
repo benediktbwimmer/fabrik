@@ -39,6 +39,8 @@ message ActivityTask {
   uint64 heartbeat_timeout_ms = 17;
   bool cancellation_requested = 18;
   uint64 schedule_to_start_timeout_ms = 19;
+  uint64 lease_epoch = 20;
+  uint64 owner_epoch = 21;
 }
 
 message PollActivityTaskResponse {
@@ -142,6 +144,8 @@ message CompleteActivityTaskRequest {
   string worker_id = 6;
   string worker_build_id = 7;
   string output_json = 8;
+  uint64 lease_epoch = 9;
+  uint64 owner_epoch = 10;
 }
 
 message FailActivityTaskRequest {
@@ -153,6 +157,8 @@ message FailActivityTaskRequest {
   string worker_id = 6;
   string worker_build_id = 7;
   string error = 8;
+  uint64 lease_epoch = 9;
+  uint64 owner_epoch = 10;
 }
 
 message RecordActivityHeartbeatRequest {
@@ -164,6 +170,8 @@ message RecordActivityHeartbeatRequest {
   string worker_id = 6;
   string worker_build_id = 7;
   string details_json = 8;
+  uint64 lease_epoch = 9;
+  uint64 owner_epoch = 10;
 }
 
 message RecordActivityHeartbeatResponse {
@@ -180,6 +188,8 @@ message ReportActivityTaskCancelledRequest {
   string worker_build_id = 7;
   string reason = 8;
   string metadata_json = 9;
+  uint64 lease_epoch = 10;
+  uint64 owner_epoch = 11;
 }
 
 message ActivityTaskCompletedResult {
@@ -203,6 +213,8 @@ message ActivityTaskResult {
   uint32 attempt = 5;
   string worker_id = 6;
   string worker_build_id = 7;
+  uint64 lease_epoch = 11;
+  uint64 owner_epoch = 12;
 
   oneof result {
     ActivityTaskCompletedResult completed = 8;

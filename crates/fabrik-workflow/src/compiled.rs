@@ -26,6 +26,8 @@ pub struct CompiledWorkflowArtifact {
     #[serde(default)]
     pub queries: BTreeMap<String, CompiledQueryHandler>,
     #[serde(default)]
+    pub signals: BTreeMap<String, CompiledSignalHandler>,
+    #[serde(default)]
     pub updates: BTreeMap<String, CompiledUpdateHandler>,
     pub workflow: CompiledWorkflow,
     pub artifact_hash: String,
@@ -58,6 +60,14 @@ pub struct CompiledQueryHandler {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompiledSignalHandler {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_name: Option<String>,
+    pub initial_state: String,
+    pub states: BTreeMap<String, CompiledStateNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompiledUpdateHandler {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arg_name: Option<String>,
@@ -83,9 +93,17 @@ pub enum CompiledStateNode {
         #[serde(skip_serializing_if = "Option::is_none")]
         next: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_queue: Option<Expression>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         retry: Option<RetryPolicy>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         config: Option<StepConfig>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schedule_to_start_timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_to_close_timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        heartbeat_timeout_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_var: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -104,6 +122,12 @@ pub enum CompiledStateNode {
         retry: Option<RetryPolicy>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         config: Option<StepConfig>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schedule_to_start_timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_to_close_timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        heartbeat_timeout_ms: Option<u64>,
     },
     StartBulkActivity {
         activity_type: String,
@@ -233,6 +257,16 @@ pub enum Expression {
     Array {
         items: Vec<Expression>,
     },
+    ArrayFind {
+        array: Box<Expression>,
+        item_name: String,
+        predicate: Box<Expression>,
+    },
+    ArrayMap {
+        array: Box<Expression>,
+        item_name: String,
+        expr: Box<Expression>,
+    },
     Object {
         fields: BTreeMap<String, Expression>,
     },
@@ -293,6 +327,8 @@ pub struct ArtifactExecutionState {
     #[serde(default)]
     pub markers: BTreeMap<String, Value>,
     #[serde(default)]
+    pub active_signal: Option<ActiveSignalState>,
+    #[serde(default)]
     pub active_update: Option<ActiveUpdateState>,
     #[serde(skip)]
     pub turn_context: Option<ExecutionTurnContext>,
@@ -304,6 +340,13 @@ pub struct ArtifactExecutionState {
 pub struct ActiveUpdateState {
     pub update_id: String,
     pub update_name: String,
+    pub return_state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveSignalState {
+    pub signal_id: String,
+    pub signal_name: String,
     pub return_state: String,
 }
 
@@ -404,6 +447,7 @@ impl CompiledWorkflowArtifact {
             source_map: BTreeMap::new(),
             helpers: BTreeMap::new(),
             queries: BTreeMap::new(),
+            signals: BTreeMap::new(),
             updates: BTreeMap::new(),
             workflow,
             artifact_hash: String::new(),
@@ -431,9 +475,7 @@ impl CompiledWorkflowArtifact {
         state_id: &str,
     ) -> Result<Option<&str>, CompiledWorkflowError> {
         let state = self
-            .workflow
-            .states
-            .get(state_id)
+            .state_by_id(state_id)
             .ok_or_else(|| CompiledWorkflowError::UnknownState(state_id.to_owned()))?;
         Ok(match state {
             CompiledStateNode::WaitForEvent { event_type, .. } => Some(event_type.as_str()),
@@ -443,6 +485,10 @@ impl CompiledWorkflowArtifact {
 
     pub fn has_query(&self, query_name: &str) -> bool {
         self.queries.contains_key(query_name)
+    }
+
+    pub fn has_signal_handler(&self, signal_name: &str) -> bool {
+        self.signals.contains_key(signal_name)
     }
 
     pub fn has_update(&self, update_name: &str) -> bool {
@@ -481,6 +527,7 @@ impl CompiledWorkflowArtifact {
         self.workflow
             .states
             .get(state_id)
+            .or_else(|| self.signals.values().find_map(|handler| handler.states.get(state_id)))
             .or_else(|| self.updates.values().find_map(|handler| handler.states.get(state_id)))
     }
 
@@ -489,6 +536,13 @@ impl CompiledWorkflowArtifact {
         state_id: &str,
         execution_state: &ArtifactExecutionState,
     ) -> Option<&'a BTreeMap<String, CompiledStateNode>> {
+        if let Some(active_signal) = &execution_state.active_signal {
+            if let Some(handler) = self.signals.get(&active_signal.signal_name) {
+                if handler.states.contains_key(state_id) {
+                    return Some(&handler.states);
+                }
+            }
+        }
         if let Some(active_update) = &execution_state.active_update {
             if let Some(handler) = self.updates.get(&active_update.update_name) {
                 if handler.states.contains_key(state_id) {
@@ -531,6 +585,22 @@ impl CompiledWorkflowArtifact {
                     if !handler.states.contains_key(next) {
                         return Err(CompiledWorkflowError::UnknownUpdateTransition {
                             update: name.clone(),
+                            state: state_name.clone(),
+                            next: next.to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+        for (name, handler) in &self.signals {
+            if !handler.states.contains_key(&handler.initial_state) {
+                return Err(CompiledWorkflowError::UnknownSignalInitialState(name.clone()));
+            }
+            for (state_name, state) in &handler.states {
+                for next in state.next_states() {
+                    if !handler.states.contains_key(next) {
+                        return Err(CompiledWorkflowError::UnknownSignalTransition {
+                            signal: name.clone(),
                             state: state_name.clone(),
                             next: next.to_owned(),
                         });
@@ -610,6 +680,44 @@ impl CompiledWorkflowArtifact {
             }
             _ => Err(CompiledWorkflowError::NotWaitingOnSignal(wait_state.to_owned())),
         }
+    }
+
+    pub fn execute_signal_handler_with_turn(
+        &self,
+        current_state: &str,
+        signal_id: &str,
+        signal_name: &str,
+        payload: &Value,
+        mut execution_state: ArtifactExecutionState,
+        turn_context: ExecutionTurnContext,
+    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
+        if execution_state.active_signal.is_some() {
+            return Err(CompiledWorkflowError::SignalAlreadyActive(signal_name.to_owned()));
+        }
+        if execution_state.active_update.is_some() {
+            return Err(CompiledWorkflowError::UpdateAlreadyActive(signal_name.to_owned()));
+        }
+        let handler = self
+            .signals
+            .get(signal_name)
+            .ok_or_else(|| CompiledWorkflowError::UnknownSignalHandler(signal_name.to_owned()))?;
+        execution_state.turn_context = Some(turn_context);
+        execution_state.active_signal = Some(ActiveSignalState {
+            signal_id: signal_id.to_owned(),
+            signal_name: signal_name.to_owned(),
+            return_state: current_state.to_owned(),
+        });
+        if let Some(arg_name) = &handler.arg_name {
+            execution_state.bindings.insert(arg_name.clone(), payload.clone());
+        } else {
+            execution_state.bindings.insert("args".to_owned(), payload.clone());
+        }
+        self.execute_from_state_in_graph(
+            &handler.states,
+            &handler.initial_state,
+            execution_state,
+            false,
+        )
     }
 
     pub fn execute_update_with_turn(
@@ -775,6 +883,7 @@ impl CompiledWorkflowArtifact {
                         output: Some(Value::String(error.to_owned())),
                     });
                 }
+                execution_state.active_signal = None;
                 Ok(CompiledExecutionPlan {
                     workflow_version: self.definition_version,
                     final_state: wait_state.to_owned(),
@@ -899,6 +1008,7 @@ impl CompiledWorkflowArtifact {
                         output: Some(error.clone()),
                     });
                 }
+                execution_state.active_signal = None;
                 Ok(CompiledExecutionPlan {
                     workflow_version: self.definition_version,
                     final_state: wait_state.to_owned(),
@@ -1201,6 +1311,7 @@ impl CompiledWorkflowArtifact {
                         output: Some(Value::String(error.to_owned())),
                     });
                 }
+                execution_state.active_signal = None;
                 Ok(CompiledExecutionPlan {
                     workflow_version: self.definition_version,
                     final_state: step_state.to_owned(),
@@ -1300,6 +1411,7 @@ impl CompiledWorkflowArtifact {
                         output: Some(Value::String(error.to_owned())),
                     });
                 }
+                execution_state.active_signal = None;
                 Ok(CompiledExecutionPlan {
                     workflow_version: self.definition_version,
                     final_state: step_state.to_owned(),
@@ -1521,26 +1633,40 @@ impl CompiledWorkflowArtifact {
                     current_state =
                         if truthy(&value) { then_next.clone() } else { else_next.clone() };
                 }
-                CompiledStateNode::Step { input: step_input, .. } => {
+                CompiledStateNode::Step {
+                    input: step_input,
+                    task_queue,
+                    config,
+                    schedule_to_start_timeout_ms,
+                    start_to_close_timeout_ms,
+                    heartbeat_timeout_ms,
+                    ..
+                } => {
                     let input =
                         evaluate_expression(step_input, &mut execution_state, &self.helpers)?;
                     context = Some(input.clone());
                     emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
-                    let (activity_type, config) = self.step_descriptor(&current_state)?;
+                    let activity_type = self.step_descriptor(&current_state)?.0;
+                    let task_queue = task_queue
+                        .as_ref()
+                        .map(|expr| evaluate_expression(expr, &mut execution_state, &self.helpers))
+                        .transpose()?
+                        .and_then(|value| stringify_value(&value))
+                        .unwrap_or_else(|| "default".to_owned());
                     emissions.push(ExecutionEmission {
                         event: WorkflowEvent::ActivityTaskScheduled {
                             activity_id: current_state.clone(),
                             activity_type,
-                            task_queue: "default".to_owned(),
+                            task_queue,
                             attempt: 1,
                             input,
-                            config: config.map(|config| {
+                            config: config.as_ref().map(|config| {
                                 serde_json::to_value(config).expect("step config serializes")
                             }),
                             state: Some(current_state.clone()),
-                            schedule_to_start_timeout_ms: None,
-                            start_to_close_timeout_ms: None,
-                            heartbeat_timeout_ms: None,
+                            schedule_to_start_timeout_ms: *schedule_to_start_timeout_ms,
+                            start_to_close_timeout_ms: *start_to_close_timeout_ms,
+                            heartbeat_timeout_ms: *heartbeat_timeout_ms,
                         },
                         state: Some(current_state.clone()),
                     });
@@ -1561,6 +1687,9 @@ impl CompiledWorkflowArtifact {
                     task_queue,
                     reducer,
                     config,
+                    schedule_to_start_timeout_ms,
+                    start_to_close_timeout_ms,
+                    heartbeat_timeout_ms,
                     ..
                 } => {
                     let items = evaluate_expression(items, &mut execution_state, &self.helpers)?;
@@ -1602,7 +1731,8 @@ impl CompiledWorkflowArtifact {
                     }
 
                     let reducer_name = reducer.as_deref().unwrap_or("collect_results");
-                    let uses_materialized_results = reducer_name == "collect_results";
+                    let uses_materialized_results =
+                        matches!(reducer_name, "collect_results" | "collect_settled_results");
                     let mut results = uses_materialized_results
                         .then(|| Vec::with_capacity(items.len()))
                         .unwrap_or_default();
@@ -1623,9 +1753,9 @@ impl CompiledWorkflowArtifact {
                                         .expect("fanout activity config serializes")
                                 }),
                                 state: Some(next.clone()),
-                                schedule_to_start_timeout_ms: None,
-                                start_to_close_timeout_ms: None,
-                                heartbeat_timeout_ms: None,
+                                schedule_to_start_timeout_ms: *schedule_to_start_timeout_ms,
+                                start_to_close_timeout_ms: *start_to_close_timeout_ms,
+                                heartbeat_timeout_ms: *heartbeat_timeout_ms,
                             },
                             state: Some(next.clone()),
                         });
@@ -1944,6 +2074,8 @@ impl CompiledWorkflowArtifact {
                             state: Some(return_state.clone()),
                         });
                         current_state = return_state;
+                    } else if let Some(active_signal) = execution_state.active_signal.take() {
+                        current_state = active_signal.return_state;
                     } else {
                         emissions.push(ExecutionEmission {
                             event: WorkflowEvent::WorkflowCompleted { output: value },
@@ -1983,6 +2115,7 @@ impl CompiledWorkflowArtifact {
                         });
                         current_state = return_state;
                     } else {
+                        execution_state.active_signal = None;
                         emissions.push(ExecutionEmission {
                             event: WorkflowEvent::WorkflowFailed { reason },
                             state: Some(current_state.clone()),
@@ -2126,7 +2259,10 @@ fn fanout_reducer<'a>(fanout: &'a FanOutExecutionState) -> &'a str {
 }
 
 fn fanout_reducer_settles(fanout: &FanOutExecutionState) -> bool {
-    matches!(fanout_reducer(fanout), "all_settled" | "count")
+    matches!(
+        fanout_reducer(fanout),
+        "all_settled" | "count" | "collect_settled_results"
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2153,6 +2289,23 @@ fn fanout_uses_counter_state(fanout: &FanOutExecutionState) -> bool {
     !fanout.settlement_bitmap.is_empty()
 }
 
+fn fanout_materializes_settled_results(fanout: &FanOutExecutionState) -> bool {
+    fanout_reducer(fanout) == "collect_settled_results"
+}
+
+fn fanout_settled_result_value(completion: CompletionKind, value: Value) -> Value {
+    match completion {
+        CompletionKind::Succeeded => serde_json::json!({
+            "status": "fulfilled",
+            "value": value,
+        }),
+        CompletionKind::Failed | CompletionKind::Cancelled => serde_json::json!({
+            "status": "rejected",
+            "reason": value,
+        }),
+    }
+}
+
 fn fanout_bitmap_contains(fanout: &FanOutExecutionState, index: usize) -> bool {
     let Some(word) = fanout.settlement_bitmap.get(index / 64) else {
         return false;
@@ -2168,6 +2321,21 @@ fn fanout_bitmap_mark(fanout: &mut FanOutExecutionState, index: usize) {
 }
 
 fn fanout_legacy_summary_counts(fanout: &FanOutExecutionState) -> (usize, usize, usize) {
+    if fanout_materializes_settled_results(fanout) {
+        return fanout.results.iter().fold((0usize, 0usize, 0usize), |mut counts, value| {
+            match value
+                .as_ref()
+                .and_then(Value::as_object)
+                .and_then(|entry| entry.get("status"))
+                .and_then(Value::as_str)
+            {
+                Some("fulfilled") => counts.0 += 1,
+                Some("rejected") => counts.1 += 1,
+                _ => {}
+            }
+            counts
+        });
+    }
     let succeeded = fanout.results.iter().filter(|value| value.is_some()).count();
     let failed = fanout.failed_activity_errors.len();
     (succeeded, failed, 0)
@@ -2211,15 +2379,18 @@ fn fanout_mark_completed(
         }
     } else {
         if index < fanout.results.len() {
-            fanout.results[index] =
-                matches!(completion, CompletionKind::Succeeded).then_some(value);
+            fanout.results[index] = if fanout_materializes_settled_results(fanout) {
+                Some(fanout_settled_result_value(completion, value.clone()))
+            } else {
+                matches!(completion, CompletionKind::Succeeded).then_some(value)
+            };
         }
     }
     if matches!(completion, CompletionKind::Succeeded) {
         fanout.failed_activity_errors.remove(&index);
     } else {
         let error_message = error_message.expect("error message is present for failures");
-        if !fanout_uses_counter_state(fanout) {
+        if !fanout_uses_counter_state(fanout) && !fanout_materializes_settled_results(fanout) {
             fanout.failed_activity_errors.insert(index, error_message);
         }
     }
@@ -2265,6 +2436,9 @@ fn reduce_fanout_terminal_payload(fanout: &FanOutExecutionState) -> Value {
         "collect_results" => Value::Array(
             fanout.results.iter().cloned().map(|value| value.unwrap_or(Value::Null)).collect(),
         ),
+        "collect_settled_results" => Value::Array(
+            fanout.results.iter().cloned().map(|value| value.unwrap_or(Value::Null)).collect(),
+        ),
         reducer => {
             let (succeeded, failed, cancelled) = fanout_summary_counts(fanout);
             let terminal_status = if failed > 0 {
@@ -2295,7 +2469,7 @@ fn reduce_fanout_terminal_payload(fanout: &FanOutExecutionState) -> Value {
 
 fn empty_fanout_terminal_payload(reducer: Option<&str>) -> Value {
     let reducer = reducer.unwrap_or("collect_results");
-    if reducer == "collect_results" {
+    if matches!(reducer, "collect_results" | "collect_settled_results") {
         return Value::Array(Vec::new());
     }
     let mut summary = serde_json::json!({
@@ -2524,6 +2698,57 @@ pub fn evaluate_expression(
             .map(|item| evaluate_expression(item, execution_state, helpers))
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array),
+        Expression::ArrayFind { array, item_name, predicate } => {
+            let array = evaluate_expression(array, execution_state, helpers)?;
+            let Value::Array(items) = array else {
+                return Ok(Value::Null);
+            };
+            let previous = execution_state.bindings.get(item_name).cloned();
+            for item in items {
+                execution_state.bindings.insert(item_name.clone(), item.clone());
+                if truthy(&evaluate_expression(predicate, execution_state, helpers)?) {
+                    match previous {
+                        Some(ref value) => {
+                            execution_state.bindings.insert(item_name.clone(), value.clone());
+                        }
+                        None => {
+                            execution_state.bindings.remove(item_name);
+                        }
+                    }
+                    return Ok(item);
+                }
+            }
+            match previous {
+                Some(value) => {
+                    execution_state.bindings.insert(item_name.clone(), value);
+                }
+                None => {
+                    execution_state.bindings.remove(item_name);
+                }
+            }
+            Ok(Value::Null)
+        }
+        Expression::ArrayMap { array, item_name, expr } => {
+            let array = evaluate_expression(array, execution_state, helpers)?;
+            let Value::Array(items) = array else {
+                return Ok(Value::Array(Vec::new()));
+            };
+            let previous = execution_state.bindings.get(item_name).cloned();
+            let mut mapped = Vec::with_capacity(items.len());
+            for item in items {
+                execution_state.bindings.insert(item_name.clone(), item);
+                mapped.push(evaluate_expression(expr, execution_state, helpers)?);
+            }
+            match previous {
+                Some(value) => {
+                    execution_state.bindings.insert(item_name.clone(), value);
+                }
+                None => {
+                    execution_state.bindings.remove(item_name);
+                }
+            }
+            Ok(Value::Array(mapped))
+        }
         Expression::Object { fields } => {
             let mut object = Map::new();
             for (key, value) in fields {
@@ -2699,6 +2924,10 @@ pub enum CompiledWorkflowError {
     UnknownUpdateInitialState(String),
     #[error("compiled update handler {update} state {state} references missing next state {next}")]
     UnknownUpdateTransition { update: String, state: String, next: String },
+    #[error("compiled signal handler {0} is missing an initial state")]
+    UnknownSignalInitialState(String),
+    #[error("compiled signal handler {signal} state {state} references missing next state {next}")]
+    UnknownSignalTransition { signal: String, state: String, next: String },
     #[error("compiled artifact hash does not match its contents")]
     ArtifactHashMismatch,
     #[error("compiled workflow loop detected while executing state {0}")]
@@ -2765,6 +2994,10 @@ pub enum CompiledWorkflowError {
     UnknownQuery(String),
     #[error("unknown update handler {0}")]
     UnknownUpdate(String),
+    #[error("unknown signal handler {0}")]
+    UnknownSignalHandler(String),
+    #[error("signal {0} cannot start while another signal is active")]
+    SignalAlreadyActive(String),
     #[error("update {0} cannot start while another update is active")]
     UpdateAlreadyActive(String),
     #[error("unknown child workflow reference binding {0}")]
@@ -2809,8 +3042,12 @@ mod tests {
                             )]),
                         },
                         next: Some("done".to_owned()),
+                        task_queue: None,
                         retry: None,
                         config: None,
+                        schedule_to_start_timeout_ms: None,
+                        start_to_close_timeout_ms: None,
+                        heartbeat_timeout_ms: None,
                         output_var: Some("result".to_owned()),
                         on_error: Some(ErrorTransition {
                             next: "fail".to_owned(),
@@ -2909,6 +3146,49 @@ mod tests {
         artifact
     }
 
+    fn signal_handler_artifact() -> CompiledWorkflowArtifact {
+        let workflow = CompiledWorkflow {
+            initial_state: "idle".to_owned(),
+            states: BTreeMap::from([(
+                "idle".to_owned(),
+                CompiledStateNode::WaitForTimer {
+                    timer_ref: "1s".to_owned(),
+                    next: "done".to_owned(),
+                },
+            )]),
+        };
+        let signals = BTreeMap::from([(
+            "approved".to_owned(),
+            CompiledSignalHandler {
+                arg_name: Some("payload".to_owned()),
+                initial_state: "assign".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "assign".to_owned(),
+                        CompiledStateNode::Assign {
+                            actions: vec![Assignment {
+                                target: "approvedValue".to_owned(),
+                                expr: Expression::Identifier { name: "payload".to_owned() },
+                            }],
+                            next: "finish".to_owned(),
+                        },
+                    ),
+                    ("finish".to_owned(), CompiledStateNode::Succeed { output: None }),
+                ]),
+            },
+        )]);
+        let mut artifact = CompiledWorkflowArtifact::new(
+            "demo-signal-handler",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            workflow,
+        );
+        artifact.signals = signals;
+        artifact.artifact_hash = artifact.hash();
+        artifact
+    }
+
     fn fanout_artifact_with_reducer(
         enable_retry: bool,
         reducer: Option<&str>,
@@ -2931,6 +3211,9 @@ mod tests {
                         retry: enable_retry
                             .then_some(RetryPolicy { max_attempts: 2, delay: "1s".to_owned() }),
                         config: None,
+                        schedule_to_start_timeout_ms: None,
+                        start_to_close_timeout_ms: None,
+                        heartbeat_timeout_ms: None,
                     },
                 ),
                 (
@@ -3124,6 +3407,7 @@ mod tests {
         let mut state = ArtifactExecutionState {
             bindings: BTreeMap::new(),
             markers: BTreeMap::new(),
+            active_signal: None,
             active_update: None,
             turn_context: Some(turn_context.clone()),
             pending_markers: Vec::new(),
@@ -3159,6 +3443,7 @@ mod tests {
         let mut state = ArtifactExecutionState {
             bindings: BTreeMap::new(),
             markers: BTreeMap::new(),
+            active_signal: None,
             active_update: None,
             turn_context: Some(turn_context),
             pending_markers: Vec::new(),
@@ -3250,6 +3535,32 @@ mod tests {
                 state,
             }) if state.as_deref() == Some("wait_signal")
         ));
+    }
+
+    #[test]
+    fn signal_handler_executes_and_returns_to_workflow_state() {
+        let artifact = signal_handler_artifact();
+        let plan = artifact
+            .execute_signal_handler_with_turn(
+                "idle",
+                "sig-1",
+                "approved",
+                &json!({"ok": true}),
+                ArtifactExecutionState::default(),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: Utc::now(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(plan.final_state, "idle");
+        assert!(plan.emissions.is_empty());
+        assert_eq!(
+            plan.execution_state.bindings.get("approvedValue"),
+            Some(&json!({"ok": true}))
+        );
+        assert!(plan.execution_state.active_signal.is_none());
     }
 
     #[test]
@@ -3655,6 +3966,123 @@ mod tests {
             artifact.reschedule_state_for_activity("dispatch::1", &plan.execution_state).as_deref(),
             Some("join")
         );
+    }
+
+    #[test]
+    fn fanout_collect_settled_results_emits_ordered_settled_array() {
+        let artifact = fanout_artifact_with_reducer(false, Some("collect_settled_results"));
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"items": [{"value": 1}, {"value": 2}, {"value": 3}]}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        let waiting = artifact
+            .execute_after_step_completion_with_turn(
+                "join",
+                "dispatch::2",
+                &json!({"value": 30}),
+                plan.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_100).unwrap(),
+                },
+            )
+            .unwrap();
+        let waiting = artifact
+            .execute_after_step_failure_with_turn(
+                "join",
+                "dispatch::0",
+                "boom",
+                waiting.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_200).unwrap(),
+                },
+            )
+            .unwrap();
+        let settled = artifact
+            .execute_after_step_completion_with_turn(
+                "join",
+                "dispatch::1",
+                &json!({"value": 20}),
+                waiting.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_300).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            settled.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output == &json!([
+                {"status": "rejected", "reason": "boom"},
+                {"status": "fulfilled", "value": {"value": 20}},
+                {"status": "fulfilled", "value": {"value": 30}}
+            ])
+        ));
+    }
+
+    #[test]
+    fn fanout_schedule_emits_task_queue_timeout_and_retry_metadata() {
+        let mut artifact = fanout_artifact_with_reducer(true, Some("collect_results"));
+        if let Some(CompiledStateNode::FanOut {
+            task_queue,
+            start_to_close_timeout_ms,
+            heartbeat_timeout_ms,
+            schedule_to_start_timeout_ms,
+            ..
+        }) = artifact.workflow.states.get_mut("dispatch")
+        {
+            *task_queue = Some(Expression::Literal { value: json!("payments") });
+            *schedule_to_start_timeout_ms = Some(1_000);
+            *start_to_close_timeout_ms = Some(30_000);
+            *heartbeat_timeout_ms = Some(5_000);
+        } else {
+            panic!("dispatch should be fanout");
+        }
+        artifact.artifact_hash = artifact.hash();
+
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"items": [{"value": 1}, {"value": 2}]}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert!(plan.emissions.iter().any(|emission| {
+            matches!(
+                emission,
+                ExecutionEmission {
+                    event: WorkflowEvent::ActivityTaskScheduled {
+                        task_queue,
+                        schedule_to_start_timeout_ms,
+                        start_to_close_timeout_ms,
+                        heartbeat_timeout_ms,
+                        ..
+                    },
+                    ..
+                } if task_queue == "payments"
+                    && schedule_to_start_timeout_ms == &Some(1_000)
+                    && start_to_close_timeout_ms == &Some(30_000)
+                    && heartbeat_timeout_ms == &Some(5_000)
+            )
+        }));
+
+        let retry = artifact.step_retry("join", &plan.execution_state).unwrap().unwrap();
+        assert_eq!(retry.max_attempts, 2);
+        assert_eq!(retry.delay, "1s");
     }
 
     #[test]

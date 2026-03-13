@@ -232,8 +232,8 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         env::var("THROUGHPUT_DEBUG_URL").unwrap_or_else(|_| "http://127.0.0.1:3006".to_owned());
     let throughput_projector_base =
         env::var("THROUGHPUT_PROJECTOR_URL").unwrap_or_else(|_| "http://127.0.0.1:3007".to_owned());
-    let unified_runtime_debug_base =
-        env::var("UNIFIED_RUNTIME_DEBUG_URL").unwrap_or_else(|_| "http://127.0.0.1:3008".to_owned());
+    let unified_runtime_debug_base = env::var("UNIFIED_RUNTIME_DEBUG_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:3008".to_owned());
 
     let scenario_name = scenario_name(args);
     let definition_id = benchmark_definition_id(args, &scenario_name);
@@ -496,7 +496,9 @@ fn parse_args() -> Result<Args> {
                     "throughput" => ExecutionMode::Throughput,
                     "unified" => ExecutionMode::Unified,
                     other => {
-                        bail!("unknown --execution-mode {other}; expected durable, throughput, or unified")
+                        bail!(
+                            "unknown --execution-mode {other}; expected durable, throughput, or unified"
+                        )
                     }
                 }
             }
@@ -596,6 +598,9 @@ fn benchmark_artifact(
                     retry: enable_retry
                         .then_some(RetryPolicy { max_attempts: 2, delay: "1s".to_owned() }),
                     config: None,
+                    schedule_to_start_timeout_ms: None,
+                    start_to_close_timeout_ms: None,
+                    heartbeat_timeout_ms: None,
                 },
             );
             states.insert(

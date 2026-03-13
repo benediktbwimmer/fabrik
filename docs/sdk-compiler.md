@@ -65,6 +65,61 @@ Required workflow primitives include:
 - `ctx.complete(output?)`
 - `ctx.fail(reason)`
 
+## Temporal Compatibility Progress
+
+The long-term goal is source compatibility with Temporal workflow code, starting with the TypeScript SDK surface.
+
+Current implemented compatibility slice in the compiler:
+
+- top-level `proxyActivities(...)` declarations imported from `@temporalio/workflow`
+- awaited calls to destructured proxy activity functions
+- awaited calls to proxy activity object members
+- multi-argument Temporal activity calls, lowered as array payloads when more than one argument is passed
+- static `proxyActivities({...})` options for:
+  - `taskQueue`
+  - `scheduleToStartTimeout`
+  - `startToCloseTimeout`
+  - `heartbeatTimeout`
+  - `retry.maximumAttempts`
+  - `retry.initialInterval`
+- awaited `sleep("...")` imported from `@temporalio/workflow`
+- awaited `Promise.all(items.map((item) => activity(item)))` over proxy activities
+- awaited `Promise.allSettled(items.map((item) => activity(item)))` over proxy activities
+- array `.find(...)` and `.map(...)` transforms over compiler-known workflow arrays such as settled fan-out results
+- top-level `defineQuery(...)` / `defineUpdate(...)` plus `setHandler(...)` registrations
+- compiled Temporal signal handlers via `defineSignal(...)` plus `setHandler(...)`
+  - handler bodies lower into dedicated signal subgraphs in the artifact
+  - async signal handlers can await the same supported workflow primitives as other compiled handler bodies
+- a narrow Temporal `condition(...)` subset:
+  - top-level `defineSignal(...)`
+  - sync `setHandler(signal, ...)` bodies containing only simple identifier assignments
+  - awaited `condition(() => predicate)` loops driven by that registered signal handler
+- a narrow Temporal child-workflow subset:
+  - `await startChild(workflow, { args, workflowId, taskQueue, parentClosePolicy })`
+  - `await childHandle.result()`
+  - `await executeChild(workflow, { args, workflowId, taskQueue, parentClosePolicy })`
+- plain `return value` as workflow completion
+- `return continueAsNew(...)` imported from `@temporalio/workflow`, including multi-argument payload packing
+
+That means a narrow class of Temporal-style workflows can now compile without being rewritten to the Fabrik `ctx.*` shape first.
+
+Current non-goals for this slice:
+
+- general `Promise.all(...)` lowering beyond the proxy-activity map pattern
+- general `Promise.allSettled(...)` lowering beyond the proxy-activity map pattern
+- broad Temporal `condition(...)` and signal-handler parity beyond the current single-signal, assignment-driven condition lowering
+- Temporal cancellation scopes
+- broad Temporal child workflow handles and signal APIs beyond the narrow start/result and execute forms
+- full proxy activity option parity
+  - `retry.nonRetryableErrorTypes` is accepted syntactically today but not yet enforced by Fabrik retry semantics
+- wire-level or server-level Temporal compatibility
+
+The intended development pattern is incremental:
+
+1. support a Temporal TS source subset directly in the compiler
+2. validate it with Temporal-style fixtures and benchmarks
+3. expand the subset until common Temporal workflows compile unchanged
+
 ## Activity SDK Shape
 
 Activities are not compiled into workflow IR.

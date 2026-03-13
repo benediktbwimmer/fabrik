@@ -979,8 +979,12 @@ fn activity_benchmark_artifact() -> CompiledWorkflowArtifact {
                     handler: "core.echo".to_owned(),
                     input: Expression::Literal { value: Value::Null },
                     next: Some("step".to_owned()),
+                    task_queue: None,
                     retry: None,
                     config: None,
+                    schedule_to_start_timeout_ms: None,
+                    start_to_close_timeout_ms: None,
+                    heartbeat_timeout_ms: None,
                     output_var: None,
                     on_error: None,
                 },
@@ -2365,20 +2369,30 @@ async fn dispatch_mailbox_item(
             else {
                 return Ok(MailboxDispatchOutcome::ConsumedNoop);
             };
-            let Some(wait_state) = instance.current_state.as_deref() else {
+            let signal_name = item.message_name.clone().unwrap_or_default();
+            let execution_state = instance.artifact_execution.clone().unwrap_or_default();
+            if execution_state.active_update.is_some() || execution_state.active_signal.is_some() {
                 return Ok(MailboxDispatchOutcome::Blocked);
-            };
-            let expected_signal_type = if let Some(artifact) =
+            }
+            let can_dispatch = if let Some(artifact) =
                 load_pinned_artifact(store, &item.source_event, &instance, lookup_cache).await?
             {
-                artifact.expected_signal_type(wait_state)?.map(str::to_owned)
-            } else {
+                let matches_wait = instance
+                    .current_state
+                    .as_deref()
+                    .and_then(|wait_state| artifact.expected_signal_type(wait_state).transpose())
+                    .transpose()?
+                    .is_some_and(|expected| expected == signal_name);
+                matches_wait || artifact.has_signal_handler(&signal_name)
+            } else if let Some(wait_state) = instance.current_state.as_deref() {
                 let definition =
                     load_pinned_definition(store, &item.source_event, &instance, lookup_cache)
                         .await?;
-                definition.expected_signal_type(wait_state)?.map(str::to_owned)
+                definition.expected_signal_type(wait_state)?.is_some_and(|expected| expected == signal_name)
+            } else {
+                false
             };
-            if expected_signal_type.as_deref() != item.message_name.as_deref() {
+            if !can_dispatch {
                 return Ok(MailboxDispatchOutcome::Blocked);
             }
 
@@ -2386,7 +2400,7 @@ async fn dispatch_mailbox_item(
             let mut event = EventEnvelope::new(
                 WorkflowEvent::SignalReceived {
                     signal_id: message_id.to_owned(),
-                    signal_type: item.message_name.clone().unwrap_or_default(),
+                    signal_type: signal_name.clone(),
                     payload: payload.clone(),
                 }
                 .event_type(),
@@ -2401,7 +2415,7 @@ async fn dispatch_mailbox_item(
                 ),
                 WorkflowEvent::SignalReceived {
                     signal_id: message_id.to_owned(),
-                    signal_type: item.message_name.clone().unwrap_or_default(),
+                    signal_type: signal_name,
                     payload,
                 },
             );
@@ -3711,31 +3725,48 @@ async fn process_event_with_mark_mode(
                 }
             }
         }
-        WorkflowEvent::SignalReceived { signal_id: _, signal_type, payload } => {
+        WorkflowEvent::SignalReceived { signal_id, signal_type, payload } => {
             if let Some(artifact) =
                 load_pinned_artifact(store, &event, &state, lookup_cache).await?
             {
-                let wait_state = match state.current_state.clone() {
-                    Some(wait_state) => wait_state,
-                    None => {
-                        warn!(
-                            workflow_instance_id = %event.instance_id,
-                            signal_type = %signal_type,
-                            "signal received without current_state"
-                        );
-                        return Ok(());
-                    }
+                let current_state = state
+                    .current_state
+                    .clone()
+                    .unwrap_or_else(|| artifact.workflow.initial_state.clone());
+                let plan = if artifact
+                    .expected_signal_type(&current_state)?
+                    .is_some_and(|expected| expected == signal_type)
+                {
+                    artifact.execute_after_signal_with_turn(
+                        &current_state,
+                        signal_type,
+                        payload,
+                        state.artifact_execution.take().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?
+                } else if artifact.has_signal_handler(signal_type) {
+                    artifact.execute_signal_handler_with_turn(
+                        &current_state,
+                        signal_id,
+                        signal_type,
+                        payload,
+                        state.artifact_execution.take().unwrap_or_default(),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?
+                } else {
+                    warn!(
+                        workflow_instance_id = %event.instance_id,
+                        signal_type = %signal_type,
+                        "signal received without matching wait state or registered handler"
+                    );
+                    return Ok(());
                 };
-                let plan = artifact.execute_after_signal_with_turn(
-                    &wait_state,
-                    signal_type,
-                    payload,
-                    state.artifact_execution.take().unwrap_or_default(),
-                    ExecutionTurnContext {
-                        event_id: event.event_id,
-                        occurred_at: event.occurred_at,
-                    },
-                )?;
                 apply_compiled_plan(&mut state, &plan);
                 persist_state_with_mode(
                     store,
@@ -6536,6 +6567,7 @@ mod tests {
                 }),
             )]),
             markers: BTreeMap::new(),
+            active_signal: None,
             active_update: None,
             turn_context: None,
             pending_markers: Vec::new(),

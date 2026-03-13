@@ -122,7 +122,200 @@ function createProgram(entry) {
   return ts.createProgram([entry], options);
 }
 
+function collectTemporalWorkflowApi(sourceFile) {
+  const api = {
+    proxyActivities: new Set(),
+    sleep: new Set(),
+    continueAsNew: new Set(),
+    condition: new Set(),
+    executeChild: new Set(),
+    startChild: new Set(),
+    defineQuery: new Set(),
+    defineUpdate: new Set(),
+    defineSignal: new Set(),
+    setHandler: new Set(),
+  };
+  for (const statement of sourceFile.statements) {
+    if (!ts.isImportDeclaration(statement) || !statement.importClause) {
+      continue;
+    }
+    if (statement.moduleSpecifier.text !== "@temporalio/workflow") {
+      continue;
+    }
+    const namedBindings = statement.importClause.namedBindings;
+    if (!namedBindings || !ts.isNamedImports(namedBindings)) {
+      continue;
+    }
+    for (const element of namedBindings.elements) {
+      const importedName = element.propertyName?.text ?? element.name.text;
+      const localName = element.name.text;
+      if (importedName === "proxyActivities") api.proxyActivities.add(localName);
+      if (importedName === "sleep") api.sleep.add(localName);
+      if (importedName === "continueAsNew") api.continueAsNew.add(localName);
+      if (importedName === "condition") api.condition.add(localName);
+      if (importedName === "executeChild") api.executeChild.add(localName);
+      if (importedName === "startChild") api.startChild.add(localName);
+      if (importedName === "defineQuery") api.defineQuery.add(localName);
+      if (importedName === "defineUpdate") api.defineUpdate.add(localName);
+      if (importedName === "defineSignal") api.defineSignal.add(localName);
+      if (importedName === "setHandler") api.setHandler.add(localName);
+    }
+  }
+  return api;
+}
+
+function isTemporalProxyDeclaration(declaration, temporalApi) {
+  if (!declaration.initializer || !ts.isCallExpression(declaration.initializer)) {
+    return false;
+  }
+  if (
+    !ts.isIdentifier(declaration.initializer.expression) ||
+    !temporalApi.proxyActivities.has(declaration.initializer.expression.text)
+  ) {
+    return false;
+  }
+  if (ts.isIdentifier(declaration.name)) {
+    return true;
+  }
+  if (!ts.isObjectBindingPattern(declaration.name)) {
+    return false;
+  }
+  return declaration.name.elements.every(
+    (element) => !element.propertyName && ts.isIdentifier(element.name) && !element.initializer,
+  );
+}
+
+function temporalDefinitionKind(declaration, temporalApi) {
+  if (!declaration.initializer || !ts.isCallExpression(declaration.initializer)) {
+    return null;
+  }
+  if (!ts.isIdentifier(declaration.initializer.expression)) {
+    return null;
+  }
+  const callee = declaration.initializer.expression.text;
+  if (temporalApi.defineQuery.has(callee)) return "query";
+  if (temporalApi.defineUpdate.has(callee)) return "update";
+  if (temporalApi.defineSignal.has(callee)) return "signal";
+  return null;
+}
+
+function parseTemporalDurationMs(expression, label) {
+  if (ts.isNumericLiteral(expression)) {
+    return Number(expression.text);
+  }
+  if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) {
+    const match = /^(\d+)(ms|s|m|h)$/.exec(expression.text.trim());
+    if (!match) {
+      throw compilerError(`${label} must be a static duration like "500ms", "30s", "5m", or "1h"`, expression);
+    }
+    const value = Number(match[1]);
+    const unit = match[2];
+    const multiplier =
+      unit === "ms" ? 1
+      : unit === "s" ? 1_000
+      : unit === "m" ? 60_000
+      : 3_600_000;
+    return value * multiplier;
+  }
+  throw compilerError(`${label} must be a numeric literal or static duration string`, expression);
+}
+
+function parseTemporalRetryOptions(expression) {
+  if (!ts.isObjectLiteralExpression(expression)) {
+    throw compilerError(`proxyActivities retry must be a static object`, expression);
+  }
+  const retry = {};
+  for (const property of expression.properties) {
+    if (!ts.isPropertyAssignment(property)) {
+      throw compilerError(`unsupported proxyActivities retry option ${property.getText()}`, property);
+    }
+    const key = property.name.getText().replaceAll(/^["']|["']$/g, "");
+    if (key === "maximumAttempts") {
+      if (!ts.isNumericLiteral(property.initializer)) {
+        throw compilerError(`proxyActivities retry.maximumAttempts must be a numeric literal`, property.initializer);
+      }
+      retry.max_attempts = Number(property.initializer.text);
+      continue;
+    }
+    if (key === "initialInterval") {
+      retry.delay = literalString(property.initializer, "proxyActivities retry.initialInterval");
+      continue;
+    }
+    if (key === "nonRetryableErrorTypes") {
+      if (
+        !ts.isArrayLiteralExpression(property.initializer) ||
+        property.initializer.elements.some(
+          (element) =>
+            !ts.isStringLiteral(element) && !ts.isNoSubstitutionTemplateLiteral(element),
+        )
+      ) {
+        throw compilerError(
+          `proxyActivities retry.nonRetryableErrorTypes must be a static string array`,
+          property.initializer,
+        );
+      }
+      continue;
+    }
+    throw compilerError(`unsupported proxyActivities retry option ${key}`, property);
+  }
+  return Object.keys(retry).length > 0 ? retry : null;
+}
+
+function parseTemporalProxyActivityOptions(callExpression) {
+  const optionsExpression = callExpression.arguments[0];
+  if (!optionsExpression) {
+    return {};
+  }
+  if (!ts.isObjectLiteralExpression(optionsExpression)) {
+    throw compilerError(`proxyActivities options must be a static object`, optionsExpression);
+  }
+  const options = {};
+  for (const property of optionsExpression.properties) {
+    if (!ts.isPropertyAssignment(property)) {
+      throw compilerError(`unsupported proxyActivities option ${property.getText()}`, property);
+    }
+    const key = property.name.getText().replaceAll(/^["']|["']$/g, "");
+    if (key === "taskQueue") {
+      options.task_queue = compileExpression(property.initializer);
+      continue;
+    }
+    if (key === "scheduleToStartTimeout") {
+      options.schedule_to_start_timeout_ms = parseTemporalDurationMs(
+        property.initializer,
+        "proxyActivities scheduleToStartTimeout",
+      );
+      continue;
+    }
+    if (key === "startToCloseTimeout") {
+      options.start_to_close_timeout_ms = parseTemporalDurationMs(
+        property.initializer,
+        "proxyActivities startToCloseTimeout",
+      );
+      continue;
+    }
+    if (key === "heartbeatTimeout") {
+      options.heartbeat_timeout_ms = parseTemporalDurationMs(
+        property.initializer,
+        "proxyActivities heartbeatTimeout",
+      );
+      continue;
+    }
+    if (key === "retry") {
+      const retry = parseTemporalRetryOptions(property.initializer);
+      if (retry) options.retry = retry;
+      continue;
+    }
+    throw compilerError(`unsupported proxyActivities option ${key}`, property);
+  }
+  return options;
+}
+
+function isTemporalDefinitionDeclaration(declaration, temporalApi) {
+  return ts.isIdentifier(declaration.name) && temporalDefinitionKind(declaration, temporalApi) != null;
+}
+
 function assertNoTopLevelSideEffects(sourceFile) {
+  const temporalApi = collectTemporalWorkflowApi(sourceFile);
   for (const statement of sourceFile.statements) {
     if (
       ts.isImportDeclaration(statement) ||
@@ -135,10 +328,14 @@ function assertNoTopLevelSideEffects(sourceFile) {
       continue;
     }
     if (ts.isVariableStatement(statement)) {
-      throw compilerError(
-        `top-level variables are not allowed in workflow modules (${sourceFile.fileName})`,
-        statement,
-      );
+      if (
+        statement.declarationList.declarations.every((declaration) =>
+          isTemporalProxyDeclaration(declaration, temporalApi) ||
+          isTemporalDefinitionDeclaration(declaration, temporalApi),
+        )
+      ) {
+        continue;
+      }
     }
     if (!ts.isEmptyStatement(statement)) {
       throw compilerError(
@@ -196,13 +393,7 @@ function buildHelperRegistry(program, workflowDeclaration) {
         const resolvedSymbol =
           symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol;
         const declaration = resolvedSymbol.valueDeclaration ?? resolvedSymbol.declarations?.[0];
-        if (
-          declaration &&
-          declaration !== workflowDeclaration &&
-          (ts.isFunctionDeclaration(declaration) ||
-            ts.isFunctionExpression(declaration) ||
-            ts.isArrowFunction(declaration))
-        ) {
+        if (hasCompilableHelperBody(declaration) && declaration !== workflowDeclaration) {
           helpers.set(node.expression.text, compileHelperFunction(node.expression.text, declaration));
         }
       }
@@ -221,6 +412,9 @@ function collectImportedHelpers(program, sourceFile) {
       continue;
     }
     const moduleName = statement.moduleSpecifier.text;
+    if (moduleName === "@temporalio/workflow") {
+      continue;
+    }
     const resolved = ts.resolveModuleName(
       moduleName,
       sourceFile.fileName,
@@ -236,7 +430,7 @@ function collectImportedHelpers(program, sourceFile) {
     }
     for (const binding of extractImportedBindings(statement.importClause)) {
       const declaration = findExportedFunctionDeclaration(importedSource, binding.exportName);
-      if (declaration) {
+      if (hasCompilableHelperBody(declaration)) {
         helpers.set(binding.localName, compileHelperFunction(binding.localName, declaration));
       }
     }
@@ -284,6 +478,16 @@ function findExportedFunctionDeclaration(sourceFile, exportName) {
   return null;
 }
 
+function hasCompilableHelperBody(declaration) {
+  return (
+    !!declaration &&
+    (ts.isFunctionDeclaration(declaration) ||
+      ts.isFunctionExpression(declaration) ||
+      ts.isArrowFunction(declaration)) &&
+    declaration.body != null
+  );
+}
+
 function compileHelperFunction(name, declaration) {
   if (declaration.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) {
     throw compilerError(`helper ${name} must not be async`, declaration);
@@ -300,6 +504,87 @@ function compileHelperFunction(name, declaration) {
     return { params, body: compileExpression(declaration.body.statements[0].expression) };
   }
   return { params, body: compileExpression(declaration.body) };
+}
+
+function functionBodyExpression(body) {
+  if (!ts.isBlock(body)) {
+    return body;
+  }
+  if (
+    body.statements.length === 1 &&
+    ts.isReturnStatement(body.statements[0]) &&
+    body.statements[0].expression
+  ) {
+    return body.statements[0].expression;
+  }
+  return null;
+}
+
+function compileArrayMethodHandler(method, handler) {
+  if (!ts.isArrowFunction(handler) && !ts.isFunctionExpression(handler)) {
+    throw compilerError(`${method} requires an inline function handler`, handler);
+  }
+  if (handler.parameters.length !== 1 || !ts.isIdentifier(handler.parameters[0].name)) {
+    throw compilerError(`${method} handlers must declare exactly one identifier parameter`, handler);
+  }
+  const expression = functionBodyExpression(handler.body);
+  if (!expression) {
+    throw compilerError(`${method} handlers must be a single return expression`, handler.body);
+  }
+  return {
+    itemName: handler.parameters[0].name.text,
+    expr: compileExpression(expression),
+  };
+}
+
+function compileSignalHandlerActions(handler) {
+  if (!ts.isArrowFunction(handler) && !ts.isFunctionExpression(handler)) {
+    throw compilerError(`Temporal signal setHandler requires an inline function handler`, handler);
+  }
+  if (handler.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) {
+    throw compilerError(`Temporal signal handlers must not be async`, handler);
+  }
+  const argName =
+    handler.parameters[0] && ts.isIdentifier(handler.parameters[0].name)
+      ? handler.parameters[0].name.text
+      : null;
+  const statements = ts.isBlock(handler.body)
+    ? handler.body.statements
+    : [ts.factory.createExpressionStatement(handler.body)];
+  const actions = [];
+  for (const statement of statements) {
+    if (ts.isEmptyStatement(statement)) {
+      continue;
+    }
+    if (
+      ts.isExpressionStatement(statement) &&
+      ts.isBinaryExpression(statement.expression) &&
+      statement.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isIdentifier(statement.expression.left)
+    ) {
+      actions.push({
+        target: statement.expression.left.text,
+        expr: compileExpression(statement.expression.right),
+      });
+      continue;
+    }
+    throw compilerError(
+      `Temporal signal handlers currently support only simple identifier assignments`,
+      statement,
+    );
+  }
+  return { argName, actions };
+}
+
+function tryCompileSignalHandlerActions(handler) {
+  try {
+    return compileSignalHandlerActions(handler);
+  } catch (error) {
+    if (error instanceof CompilerError) {
+      return null;
+    }
+    throw error;
+  }
 }
 
 function compileExpression(expression) {
@@ -413,6 +698,30 @@ function compileExpression(expression) {
     };
   }
   if (ts.isCallExpression(expression)) {
+    if (ts.isPropertyAccessExpression(expression.expression)) {
+      const method = expression.expression.name.text;
+      if (method === "find" || method === "map") {
+        const handler = expression.arguments[0];
+        if (!handler) {
+          throw compilerError(`${method} requires a function handler`, expression);
+        }
+        const compiled = compileArrayMethodHandler(method, handler);
+        if (method === "find") {
+          return {
+            kind: "array_find",
+            array: compileExpression(expression.expression.expression),
+            item_name: compiled.itemName,
+            predicate: compiled.expr,
+          };
+        }
+        return {
+          kind: "array_map",
+          array: compileExpression(expression.expression.expression),
+          item_name: compiled.itemName,
+          expr: compiled.expr,
+        };
+      }
+    }
     if (
       ts.isPropertyAccessExpression(expression.expression) &&
       expression.expression.expression.getText() === "ctx"
@@ -458,19 +767,188 @@ function compileExpression(expression) {
 }
 
 class WorkflowLowerer {
-  constructor(definitionId, version, workflowDeclaration, statePrefix = "") {
+  constructor(
+    definitionId,
+    version,
+    workflowDeclaration,
+    temporalApi = {
+      proxyActivities: new Set(),
+      sleep: new Set(),
+      continueAsNew: new Set(),
+      condition: new Set(),
+      executeChild: new Set(),
+      startChild: new Set(),
+      defineQuery: new Set(),
+      defineUpdate: new Set(),
+      defineSignal: new Set(),
+      setHandler: new Set(),
+    },
+    statePrefix = "",
+  ) {
     this.definitionId = definitionId;
     this.version = version;
     this.workflowDeclaration = workflowDeclaration;
+    this.temporalApi = temporalApi;
     this.statePrefix = statePrefix;
     this.states = {};
     this.sourceMap = {};
     this.syntheticCounts = new Map();
     this.queries = {};
+    this.signals = {};
     this.updates = {};
     this.childHandleVars = new Set();
     this.bulkHandleVars = new Set();
+    this.temporalSignalHandlers = new Map();
+    const sourceFile =
+      workflowDeclaration && typeof workflowDeclaration.getSourceFile === "function"
+        ? workflowDeclaration.getSourceFile()
+        : null;
+    this.temporalDefinitions = sourceFile
+      ? this.discoverTemporalDefinitions(sourceFile)
+      : { query: new Map(), update: new Map(), signal: new Map() };
+    this.temporalActivityBindings = sourceFile
+      ? this.discoverTemporalActivityBindings(sourceFile)
+      : { direct: new Map(), objects: new Set() };
     this.discoverHandleDeclarations(workflowDeclaration.body);
+  }
+
+  discoverTemporalDefinitions(sourceFile) {
+    const definitions = {
+      query: new Map(),
+      update: new Map(),
+      signal: new Map(),
+    };
+    for (const statement of sourceFile.statements) {
+      if (!ts.isVariableStatement(statement)) {
+        continue;
+      }
+      for (const declaration of statement.declarationList.declarations) {
+        if (!isTemporalDefinitionDeclaration(declaration, this.temporalApi)) {
+          continue;
+        }
+        const kind = temporalDefinitionKind(declaration, this.temporalApi);
+        const name =
+          declaration.initializer.arguments[0] != null
+            ? literalString(
+                declaration.initializer.arguments[0],
+                `Temporal ${kind} definition name`,
+              )
+            : declaration.name.text;
+        definitions[kind].set(declaration.name.text, name);
+      }
+    }
+    return definitions;
+  }
+
+  discoverTemporalActivityBindings(sourceFile) {
+    const bindings = {
+      direct: new Map(),
+      objects: new Set(),
+      objectOptions: new Map(),
+    };
+    for (const statement of sourceFile.statements) {
+      if (!ts.isVariableStatement(statement)) {
+        continue;
+      }
+      for (const declaration of statement.declarationList.declarations) {
+        if (!isTemporalProxyDeclaration(declaration, this.temporalApi)) {
+          continue;
+        }
+        const options = parseTemporalProxyActivityOptions(declaration.initializer);
+        if (ts.isIdentifier(declaration.name)) {
+          bindings.objects.add(declaration.name.text);
+          bindings.objectOptions.set(declaration.name.text, options);
+          continue;
+        }
+        for (const element of declaration.name.elements) {
+          bindings.direct.set(element.name.text, {
+            activityType: element.name.text,
+            options,
+          });
+        }
+      }
+    }
+    return bindings;
+  }
+
+  resolveTemporalActivityCall(expression) {
+    if (ts.isIdentifier(expression)) {
+      const activity = this.temporalActivityBindings.direct.get(expression.text);
+      return activity ? { activityType: activity.activityType, options: activity.options } : null;
+    }
+    if (
+      ts.isPropertyAccessExpression(expression) &&
+      ts.isIdentifier(expression.expression) &&
+      this.temporalActivityBindings.objects.has(expression.expression.text)
+    ) {
+      return {
+        activityType: expression.name.text,
+        options: this.temporalActivityBindings.objectOptions.get(expression.expression.text) ?? {},
+      };
+    }
+    return null;
+  }
+
+  resolveTemporalPromiseFanout(call) {
+    if (
+      !ts.isPropertyAccessExpression(call.expression) ||
+      !ts.isIdentifier(call.expression.expression) ||
+      call.expression.expression.text !== "Promise" ||
+      call.arguments.length !== 1
+    ) {
+    return null;
+  }
+    const reducer = call.expression.name.text === "all"
+      ? "collect_results"
+      : call.expression.name.text === "allSettled"
+        ? "collect_settled_results"
+        : null;
+    if (!reducer) {
+      return null;
+    }
+    const mapCall = call.arguments[0];
+    if (
+      !ts.isCallExpression(mapCall) ||
+      !ts.isPropertyAccessExpression(mapCall.expression) ||
+      mapCall.expression.name.text !== "map" ||
+      mapCall.arguments.length !== 1
+    ) {
+      return null;
+    }
+    const mapper = mapCall.arguments[0];
+    if (!ts.isArrowFunction(mapper) && !ts.isFunctionExpression(mapper)) {
+      return null;
+    }
+    if (mapper.parameters.length !== 1 || !ts.isIdentifier(mapper.parameters[0].name)) {
+      return null;
+    }
+    const mapperArg = mapper.parameters[0].name.text;
+    const mappedExpression = functionBodyExpression(mapper.body);
+    if (!mappedExpression) {
+      return null;
+    }
+    const activityCall =
+      ts.isAwaitExpression(mappedExpression) ? mappedExpression.expression : mappedExpression;
+    if (!ts.isCallExpression(activityCall)) {
+      return null;
+    }
+    const temporalActivity = this.resolveTemporalActivityCall(activityCall.expression);
+    if (!temporalActivity) {
+      return null;
+    }
+    if (
+      activityCall.arguments.length !== 1 ||
+      !ts.isIdentifier(activityCall.arguments[0]) ||
+      activityCall.arguments[0].text !== mapperArg
+    ) {
+      return null;
+    }
+    return {
+      activityType: temporalActivity.activityType,
+      itemsExpr: compileExpression(mapCall.expression.expression),
+      reducer,
+      options: temporalActivity.options ?? {},
+    };
   }
 
   discoverHandleDeclarations(node) {
@@ -480,17 +958,181 @@ class WorkflowLowerer {
         ts.isIdentifier(current.name) &&
         current.initializer &&
         ts.isAwaitExpression(current.initializer) &&
-        ts.isCallExpression(current.initializer.expression) &&
-        ts.isPropertyAccessExpression(current.initializer.expression.expression) &&
-        current.initializer.expression.expression.expression.getText() === "ctx"
+        ts.isCallExpression(current.initializer.expression)
       ) {
-        const method = current.initializer.expression.expression.name.text;
-        if (method === "startChild") this.childHandleVars.add(current.name.text);
-        if (method === "bulkActivity") this.bulkHandleVars.add(current.name.text);
+        const awaitedCall = current.initializer.expression;
+        if (
+          ts.isPropertyAccessExpression(awaitedCall.expression) &&
+          awaitedCall.expression.expression.getText() === "ctx"
+        ) {
+          const method = awaitedCall.expression.name.text;
+          if (method === "startChild") this.childHandleVars.add(current.name.text);
+          if (method === "bulkActivity") this.bulkHandleVars.add(current.name.text);
+        }
+        if (
+          ts.isIdentifier(awaitedCall.expression) &&
+          this.temporalApi.startChild.has(awaitedCall.expression.text)
+        ) {
+          this.childHandleVars.add(current.name.text);
+        }
       }
       ts.forEachChild(current, visit);
     };
     visit(node);
+  }
+
+  registerTemporalNamedHandler(callExpression) {
+    const definition = callExpression.arguments[0];
+    const handler = callExpression.arguments[1];
+    if (!definition || !ts.isIdentifier(definition)) {
+      throw compilerError(`setHandler requires a named Temporal definition`, callExpression);
+    }
+    if (this.temporalDefinitions.query.has(definition.text)) {
+      const queryName = this.temporalDefinitions.query.get(definition.text);
+      if (!handler || (!ts.isArrowFunction(handler) && !ts.isFunctionExpression(handler))) {
+        throw compilerError(`Temporal query setHandler requires an inline function handler`, callExpression);
+      }
+      if (handler.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) {
+        throw compilerError(`Temporal query handlers must not be async`, handler);
+      }
+      const body = compilePureHandlerExpression(handler, "setHandler(query)");
+      this.queries[queryName] = {
+        arg_name: handler.parameters[0] ? handler.parameters[0].name.getText() : undefined,
+        expr: body,
+      };
+      return;
+    }
+    if (this.temporalDefinitions.update.has(definition.text)) {
+      const updateName = this.temporalDefinitions.update.get(definition.text);
+      if (!handler || (!ts.isArrowFunction(handler) && !ts.isFunctionExpression(handler))) {
+        throw compilerError(`Temporal update setHandler requires an inline function handler`, callExpression);
+      }
+      const lowered = new WorkflowLowerer(
+        this.definitionId,
+        this.version,
+        {
+          body: ts.isBlock(handler.body)
+            ? handler.body
+            : ts.factory.createBlock([ts.factory.createReturnStatement(handler.body)], true),
+        },
+        this.temporalApi,
+        `update_${shortHash(updateName)}_`,
+      );
+      lowered.temporalDefinitions = this.temporalDefinitions;
+      lowered.temporalActivityBindings = this.temporalActivityBindings;
+      const bodyBlock = ts.isBlock(handler.body)
+        ? handler.body
+        : ts.factory.createBlock([ts.factory.createReturnStatement(handler.body)], true);
+      const terminalFail = lowered.addState("fail_terminal", {
+        type: "fail",
+        reason: { kind: "literal", value: `update ${updateName} terminated without explicit completion` },
+      });
+      const initialState = lowered.lowerBlock(bodyBlock.statements, terminalFail, null, null, null);
+      this.updates[updateName] = {
+        arg_name: handler.parameters[0] ? handler.parameters[0].name.getText() : undefined,
+        initial_state: initialState,
+        states: lowered.states,
+      };
+      return;
+    }
+    if (this.temporalDefinitions.signal.has(definition.text)) {
+      const signalName = this.temporalDefinitions.signal.get(definition.text);
+      if (!handler || (!ts.isArrowFunction(handler) && !ts.isFunctionExpression(handler))) {
+        throw compilerError(`Temporal signal setHandler requires an inline function handler`, callExpression);
+      }
+      const lowered = new WorkflowLowerer(
+        this.definitionId,
+        this.version,
+        {
+          body: ts.isBlock(handler.body)
+            ? handler.body
+            : ts.factory.createBlock([ts.factory.createReturnStatement(handler.body)], true),
+        },
+        this.temporalApi,
+        `signal_${shortHash(signalName)}_`,
+      );
+      lowered.temporalDefinitions = this.temporalDefinitions;
+      lowered.temporalActivityBindings = this.temporalActivityBindings;
+      const bodyBlock = ts.isBlock(handler.body)
+        ? handler.body
+        : ts.factory.createBlock([ts.factory.createReturnStatement(handler.body)], true);
+      const terminalComplete = lowered.addState("signal_complete", {
+        type: "succeed",
+      });
+      const initialState = lowered.lowerBlock(bodyBlock.statements, terminalComplete, null, null, null);
+      this.signals[signalName] = {
+        arg_name: handler.parameters[0] ? handler.parameters[0].name.getText() : undefined,
+        initial_state: initialState,
+        states: lowered.states,
+      };
+      const conditionSignalHandler = tryCompileSignalHandlerActions(handler);
+      if (conditionSignalHandler) {
+        this.temporalSignalHandlers.set(definition.text, {
+          signalName,
+          ...conditionSignalHandler,
+        });
+      } else {
+        this.temporalSignalHandlers.set(definition.text, {
+          signalName,
+          argName: handler.parameters[0] ? handler.parameters[0].name.getText() : null,
+          actions: null,
+        });
+      }
+      return;
+    }
+    throw compilerError(`setHandler requires a Temporal query/update/signal definition`, definition);
+  }
+
+  lowerTemporalCondition(callExpression, targetVar, nextState) {
+    const predicate = callExpression.arguments[0];
+    if (!predicate || (!ts.isArrowFunction(predicate) && !ts.isFunctionExpression(predicate))) {
+      throw compilerError(`condition requires an inline function predicate`, callExpression);
+    }
+    const predicateExpr = compilePureHandlerExpression(predicate, "condition");
+    const signalHandlers = [...this.temporalSignalHandlers.values()];
+    if (signalHandlers.length !== 1) {
+      throw compilerError(
+        `condition currently requires exactly one registered Temporal signal handler`,
+        callExpression,
+      );
+    }
+    const signalHandler = signalHandlers[0];
+    if (!signalHandler.actions) {
+      throw compilerError(
+        `condition currently requires an assignment-only Temporal signal handler`,
+        callExpression,
+      );
+    }
+    let continueState = nextState;
+    if (targetVar) {
+      continueState = this.addState("assign", {
+        type: "assign",
+        actions: [{ target: targetVar, expr: { kind: "literal", value: true } }],
+        next: nextState,
+      }, callExpression);
+    }
+    const choiceState = this.addState("choice", {
+      type: "choice",
+      condition: predicateExpr,
+      then_next: continueState,
+      else_next: "__wait_signal_placeholder__",
+    }, callExpression);
+    let afterSignalState = choiceState;
+    if (signalHandler.actions.length > 0) {
+      afterSignalState = this.addState("assign", {
+        type: "assign",
+        actions: signalHandler.actions,
+        next: choiceState,
+      }, callExpression);
+    }
+    const waitState = this.addState("wait_signal", {
+      type: "wait_for_event",
+      event_type: signalHandler.signalName,
+      next: afterSignalState,
+      output_var: signalHandler.argName ?? undefined,
+    }, callExpression);
+    this.states[choiceState].else_next = waitState;
+    return choiceState;
   }
 
   nextId(prefix, node = null) {
@@ -525,6 +1167,7 @@ class WorkflowLowerer {
       states: this.states,
       sourceMap: this.sourceMap,
       queries: this.queries,
+      signals: this.signals,
       updates: this.updates,
     };
   }
@@ -539,6 +1182,16 @@ class WorkflowLowerer {
   }
 
   lowerBlock(statements, nextState, breakTarget, continueTarget, errorTarget) {
+    for (const statement of statements) {
+      if (
+        ts.isExpressionStatement(statement) &&
+        ts.isCallExpression(statement.expression) &&
+        ts.isIdentifier(statement.expression.expression) &&
+        this.temporalApi.setHandler.has(statement.expression.expression.text)
+      ) {
+        this.registerTemporalNamedHandler(statement.expression);
+      }
+    }
     let cursor = nextState;
     for (let index = statements.length - 1; index >= 0; index -= 1) {
       cursor = this.lowerStatement(
@@ -554,6 +1207,13 @@ class WorkflowLowerer {
 
   lowerStatement(statement, nextState, breakTarget, continueTarget, errorTarget) {
     if (ts.isExpressionStatement(statement) && ts.isCallExpression(statement.expression)) {
+      if (
+        ts.isIdentifier(statement.expression.expression) &&
+        this.temporalApi.setHandler.has(statement.expression.expression.text)
+      ) {
+        this.registerTemporalNamedHandler(statement.expression);
+        return nextState;
+      }
       if (
         ts.isPropertyAccessExpression(statement.expression.expression) &&
         statement.expression.expression.expression.getText() === "ctx"
@@ -803,10 +1463,42 @@ class WorkflowLowerer {
     }
 
     if (ts.isReturnStatement(statement)) {
-      if (!statement.expression || !ts.isCallExpression(statement.expression)) {
-        throw compilerError(`return statements must be ctx terminal calls`, statement);
+      if (!statement.expression) {
+        return this.addState("complete", { type: "succeed" }, statement);
       }
-      return this.lowerTerminalCall(statement.expression);
+      if (ts.isAwaitExpression(statement.expression)) {
+        const returnVar = this.nextId("return_value", statement.expression);
+        const completeState = this.addState("complete", {
+          type: "succeed",
+          output: { kind: "identifier", name: returnVar },
+        }, statement);
+        return this.lowerAwait(statement.expression, returnVar, completeState, errorTarget);
+      }
+      if (!ts.isCallExpression(statement.expression)) {
+        return this.addState("complete", {
+          type: "succeed",
+          output: compileExpression(statement.expression),
+        }, statement);
+      }
+      if (
+        ts.isIdentifier(statement.expression.expression) &&
+        this.temporalApi.continueAsNew.has(statement.expression.expression.text)
+      ) {
+        return this.addState("continue_as_new", {
+          type: "continue_as_new",
+          input: compileCallArgumentsAsInput(statement.expression.arguments),
+        }, statement.expression);
+      }
+      if (
+        ts.isPropertyAccessExpression(statement.expression.expression) &&
+        statement.expression.expression.expression.getText() === "ctx"
+      ) {
+        return this.lowerTerminalCall(statement.expression);
+      }
+      return this.addState("complete", {
+        type: "succeed",
+        output: compileExpression(statement.expression),
+      }, statement);
     }
 
     if (ts.isThrowStatement(statement)) {
@@ -938,9 +1630,102 @@ class WorkflowLowerer {
       }
       throw compilerError(`unknown handle ${handleName}.result()`, awaitExpression);
     }
+    const temporalFanout = this.resolveTemporalPromiseFanout(call);
+    if (temporalFanout) {
+      const fanoutRef = this.nextId("fanout_handle", awaitExpression);
+      const waitState = this.addState("wait_all", {
+        type: "wait_for_all_activities",
+        fanout_ref_var: fanoutRef,
+        next: nextState,
+        output_var: targetVar ?? undefined,
+        on_error: errorTarget ?? undefined,
+      }, awaitExpression);
+      return this.addState("fanout", {
+        type: "fan_out",
+        activity_type: temporalFanout.activityType,
+        items: temporalFanout.itemsExpr,
+        next: waitState,
+        handle_var: fanoutRef,
+        task_queue: temporalFanout.options.task_queue,
+        reducer: temporalFanout.reducer,
+        retry: temporalFanout.options.retry,
+        schedule_to_start_timeout_ms: temporalFanout.options.schedule_to_start_timeout_ms,
+        start_to_close_timeout_ms: temporalFanout.options.start_to_close_timeout_ms,
+        heartbeat_timeout_ms: temporalFanout.options.heartbeat_timeout_ms,
+      }, awaitExpression);
+    }
     if (!ts.isPropertyAccessExpression(call.expression) || call.expression.expression.getText() !== "ctx") {
+      const temporalActivity = this.resolveTemporalActivityCall(call.expression);
+      if (temporalActivity) {
+        return this.addState("step", {
+          type: "step",
+          handler: temporalActivity.activityType,
+          input: compileCallArgumentsAsInput(call.arguments),
+          next: nextState,
+          task_queue: temporalActivity.options.task_queue,
+          retry: temporalActivity.options.retry,
+          schedule_to_start_timeout_ms: temporalActivity.options.schedule_to_start_timeout_ms,
+          start_to_close_timeout_ms: temporalActivity.options.start_to_close_timeout_ms,
+          heartbeat_timeout_ms: temporalActivity.options.heartbeat_timeout_ms,
+          output_var: targetVar ?? undefined,
+          on_error: errorTarget ?? undefined,
+        }, awaitExpression);
+      }
+      if (ts.isIdentifier(call.expression) && this.temporalApi.sleep.has(call.expression.text)) {
+        return this.addState("wait_timer", {
+          type: "wait_for_timer",
+          timer_ref: literalString(call.arguments[0], "sleep duration"),
+          next: nextState,
+        }, awaitExpression);
+      }
+      if (ts.isIdentifier(call.expression) && this.temporalApi.condition.has(call.expression.text)) {
+        return this.lowerTemporalCondition(call, targetVar, nextState);
+      }
+      if (ts.isIdentifier(call.expression) && this.temporalApi.executeChild.has(call.expression.text)) {
+        const childDefinition = call.arguments[0];
+        const options = call.arguments[1]
+          ? compileTemporalChildOptions(call.arguments[1], "executeChild")
+          : { input: { kind: "literal", value: null } };
+        const handleVar = this.nextId("child_handle", awaitExpression);
+        const waitState = this.addState("wait_child", {
+          type: "wait_for_child",
+          child_ref_var: handleVar,
+          next: nextState,
+          output_var: targetVar ?? undefined,
+        }, awaitExpression);
+        return this.addState("start_child", {
+          type: "start_child",
+          child_definition_id: literalIdentifierOrString(childDefinition, "executeChild workflow"),
+          input: options.input,
+          next: waitState,
+          handle_var: handleVar,
+          workflow_id: options.workflow_id,
+          task_queue: options.task_queue,
+          parent_close_policy: options.parent_close_policy ?? "TERMINATE",
+        }, awaitExpression);
+      }
+      if (ts.isIdentifier(call.expression) && this.temporalApi.startChild.has(call.expression.text)) {
+        if (!targetVar) {
+          throw compilerError(`await startChild(...) must be assigned to a handle variable`, awaitExpression);
+        }
+        const childDefinition = call.arguments[0];
+        const options = call.arguments[1]
+          ? compileTemporalChildOptions(call.arguments[1], "startChild")
+          : { input: { kind: "literal", value: null } };
+        this.childHandleVars.add(targetVar);
+        return this.addState("start_child", {
+          type: "start_child",
+          child_definition_id: literalIdentifierOrString(childDefinition, "startChild workflow"),
+          input: options.input,
+          next: nextState,
+          handle_var: targetVar,
+          workflow_id: options.workflow_id,
+          task_queue: options.task_queue,
+          parent_close_policy: options.parent_close_policy ?? "TERMINATE",
+        }, awaitExpression);
+      }
       throw compilerError(
-        `non-deterministic await detected; only await ctx.* calls are allowed in workflows`,
+        `non-deterministic await detected; only await ctx.* calls or supported Temporal workflow primitives are allowed in workflows`,
         call.expression,
       );
     }
@@ -1080,6 +1865,7 @@ class WorkflowLowerer {
       this.definitionId,
       this.version,
       { body: ts.isBlock(handler.body) ? handler.body : ts.factory.createBlock([ts.factory.createReturnStatement(handler.body)], true) },
+      this.temporalApi,
       `update_${shortHash(updateName)}_`,
     );
     const bodyBlock = ts.isBlock(handler.body)
@@ -1183,6 +1969,71 @@ function compileChildOptions(expression) {
     }
   }
   return options;
+}
+
+function literalIdentifierOrString(expression, label) {
+  if (ts.isIdentifier(expression)) {
+    return expression.text;
+  }
+  return literalString(expression, label);
+}
+
+function compileTemporalChildOptions(expression, label) {
+  if (!ts.isObjectLiteralExpression(expression)) {
+    throw compilerError(`${label} options must be a static object`, expression);
+  }
+  const compiled = {
+    input: { kind: "literal", value: null },
+  };
+  for (const property of expression.properties) {
+    if (!ts.isPropertyAssignment(property)) {
+      throw compilerError(`unsupported ${label} option ${property.getText()}`, property);
+    }
+    const key = property.name.getText().replaceAll(/^["']|["']$/g, "");
+    if (key === "args") {
+      if (!ts.isArrayLiteralExpression(property.initializer)) {
+        throw compilerError(`${label} args must be a static array literal`, property.initializer);
+      }
+      if (property.initializer.elements.length === 0) {
+        compiled.input = { kind: "literal", value: null };
+      } else if (property.initializer.elements.length === 1) {
+        compiled.input = compileExpression(property.initializer.elements[0]);
+      } else {
+        compiled.input = {
+          kind: "array",
+          items: property.initializer.elements.map(compileExpression),
+        };
+      }
+      continue;
+    }
+    if (key === "workflowId") {
+      compiled.workflow_id = compileExpression(property.initializer);
+      continue;
+    }
+    if (key === "taskQueue") {
+      compiled.task_queue = compileExpression(property.initializer);
+      continue;
+    }
+    if (key === "parentClosePolicy") {
+      compiled.parent_close_policy = literalString(property.initializer, `${label} parentClosePolicy`);
+      continue;
+    }
+    throw compilerError(`unsupported ${label} option ${key}`, property);
+  }
+  return compiled;
+}
+
+function compileCallArgumentsAsInput(argumentsList) {
+  if (argumentsList.length === 0) {
+    return { kind: "literal", value: null };
+  }
+  if (argumentsList.length === 1) {
+    return compileExpression(argumentsList[0]);
+  }
+  return {
+    kind: "array",
+    items: argumentsList.map(compileExpression),
+  };
 }
 
 function compileBulkOptions(expression) {
@@ -1339,6 +2190,14 @@ function walkExpression(expression, visitor) {
     case "array":
       expression.items.forEach((item) => walkExpression(item, visitor));
       break;
+    case "array_find":
+      walkExpression(expression.array, visitor);
+      walkExpression(expression.predicate, visitor);
+      break;
+    case "array_map":
+      walkExpression(expression.array, visitor);
+      walkExpression(expression.expr, visitor);
+      break;
     case "object":
       Object.values(expression.fields).forEach((field) => walkExpression(field, visitor));
       break;
@@ -1367,6 +2226,9 @@ function validateArtifactCalls(artifact) {
 
   Object.values(artifact.helpers).forEach((helper) => validateExpression(helper.body));
   Object.values(artifact.workflow.states).forEach((state) => validateCompiledState(state, validateExpression));
+  Object.values(artifact.signals ?? {}).forEach((signal) => {
+    Object.values(signal.states).forEach((state) => validateCompiledState(state, validateExpression));
+  });
   Object.values(artifact.updates ?? {}).forEach((update) => {
     Object.values(update.states).forEach((state) => validateCompiledState(state, validateExpression));
   });
@@ -1383,6 +2245,11 @@ function validateCompiledState(state, validateExpression) {
       break;
     case "step":
       validateExpression(state.input);
+      if (state.task_queue) validateExpression(state.task_queue);
+      break;
+    case "fan_out":
+      validateExpression(state.items);
+      if (state.task_queue) validateExpression(state.task_queue);
       break;
     case "start_child":
       validateExpression(state.input);
@@ -1411,9 +2278,10 @@ async function main() {
   const args = parseArgs(process.argv.slice(2));
   const program = createProgram(args.entry);
   const workflow = findExportedFunction(program, args.exportName);
+  const temporalApi = collectTemporalWorkflowApi(workflow.getSourceFile());
   const helpers = buildHelperRegistry(program, workflow);
-  const lowerer = new WorkflowLowerer(args.definitionId, args.version, workflow);
-  const { initialState, states, sourceMap, queries, updates } = lowerer.lower();
+  const lowerer = new WorkflowLowerer(args.definitionId, args.version, workflow, temporalApi);
+  const { initialState, states, sourceMap, queries, signals, updates } = lowerer.lower();
 
   const artifact = {
     definition_id: args.definitionId,
@@ -1430,6 +2298,7 @@ async function main() {
     source_map: sourceMap,
     helpers,
     queries,
+    signals,
     updates,
     workflow: {
       initial_state: initialState,
