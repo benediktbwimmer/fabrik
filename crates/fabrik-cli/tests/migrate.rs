@@ -47,7 +47,7 @@ fn supported_project_compiles_and_packages() {
     assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
     assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
     assert!(report["worker_packages"][0]["resolved_activity_module_path"].is_string());
-    assert_eq!(report["trust"]["support_summary"]["headline_trusted_feature_count"], 9);
+    assert_eq!(report["trust"]["support_summary"]["headline_trusted_feature_count"], 10);
     let generated = report["generated_artifacts"].as_array().expect("generated artifacts");
     assert!(generated.iter().any(|artifact| artifact["kind"] == "alpha_qualification"));
     assert!(generated.iter().any(|artifact| artifact["kind"] == "equivalence_contract"));
@@ -66,7 +66,23 @@ fn analyze_only_supported_project_stops_before_compile() {
 }
 
 #[test]
-fn payload_converter_usage_blocks_migration() {
+fn default_compatible_payload_converter_usage_is_qualified_for_alpha() {
+    let output_dir = temp_output_dir("payload-qualified");
+    let (status, report) = run_cli(&fixture("temporal-payload-qualified"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["validation"]["payload_data_converter_validation"]["status"], "passed");
+    assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
+    assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
+    assert_eq!(
+        report["worker_packages"][0]["data_converter_mode"],
+        "default_temporal"
+    );
+}
+
+#[test]
+fn custom_payload_converter_usage_blocks_migration() {
     let output_dir = temp_output_dir("payload");
     let (status, report) = run_cli(&fixture("temporal-payload-blocked"), &output_dir, &[]);
     assert_eq!(status.code(), Some(2));
@@ -90,20 +106,32 @@ fn payload_converter_usage_blocks_migration() {
 }
 
 #[test]
-fn visibility_usage_blocks_migration() {
+fn static_visibility_usage_is_qualified_for_alpha() {
     let output_dir = temp_output_dir("visibility");
     let (status, report) = run_cli(&fixture("temporal-visibility-blocked"), &output_dir, &[]);
-    assert_eq!(status.code(), Some(2));
-    assert_eq!(report["status"], "incompatible_blocked");
-    assert_eq!(report["alpha_qualification"]["verdict"], "blocked");
-    assert_eq!(report["validation"]["visibility_search_validation"]["status"], "blocked");
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["validation"]["visibility_search_validation"]["status"], "passed");
     assert!(
-        report["alpha_qualification"]["blocker_categories"]
+        report["findings"]
             .as_array()
-            .expect("blocker categories")
+            .expect("findings")
             .iter()
-            .any(|group| group["category"] == "unsupported_visibility_search_usage")
+            .all(|finding| finding["feature"] != "visibility_search_usage")
     );
+}
+
+#[test]
+fn shadow_project_with_static_evaluable_visibility_qualifies() {
+    let output_dir = temp_output_dir("shadow-qualified");
+    let (status, report) = run_cli(&fixture("temporal-shadow-qualified"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["validation"]["visibility_search_validation"]["status"], "passed");
+    assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
+    assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
 }
 
 #[test]

@@ -29,14 +29,15 @@ The alpha claim is:
 - version markers and workflow evolution
 - worker build registration and compatibility routing
 - static `Worker.create({ ... })` bootstrap packaging
-- start-time `memo` objects with static top-level primitive literal values
-- start-time `searchAttributes` objects with static top-level string or string-array literal values
+- start-time `memo` objects with static-evaluable top-level primitive values
+- start-time `searchAttributes` objects with static-evaluable top-level string or string-array values
 - exact-match visibility filtering over the supported `memo` and `searchAttributes` slice
+- static default-compatible `dataConverter` declarations on `Worker.create({ ... })`
 - workflow task queue preservation through replay, snapshot restore, and owner handoff for the supported alpha slice
 
 ## Blocked in Alpha
 
-- payload/data converter customization
+- custom payload/data converter customization beyond the default-compatible adapter subset
 - worker or workflow interceptors
 - dynamic worker bootstrap shapes
 - arbitrary workflow inspection APIs outside the supported subset
@@ -47,8 +48,8 @@ The alpha claim is:
 
 The current alpha slice is intentionally narrow:
 
-- start-time `memo` is supported only for static top-level objects with primitive literal values
-- start-time `searchAttributes` is supported only for static top-level string or string-array literal values
+- start-time `memo` is supported only for static-evaluable top-level objects with primitive values
+- start-time `searchAttributes` is supported only for static-evaluable top-level string or string-array values
 - query/list filtering is supported only for exact-match key/value checks
 - replay and handoff evidence for the alpha slice require the workflow task queue to remain stable across restore
 - anything dynamic, computed, nested, or outside those operators remains blocked by the analyzer

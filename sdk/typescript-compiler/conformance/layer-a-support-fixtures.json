@@ -20,6 +20,20 @@
       }
     },
     {
+      "id": "analyzer-payload-qualified",
+      "kind": "analyzer",
+      "project": "crates/fabrik-cli/test-fixtures/temporal-payload-qualified",
+      "expect": {
+        "summary": {
+          "workflow_count": 1,
+          "worker_count": 1,
+          "hard_block_count": 0
+        },
+        "worker_task_queues_include": ["orders"],
+        "finding_features_exclude": ["payload_data_converter_usage"]
+      }
+    },
+    {
       "id": "analyzer-payload-blocked",
       "kind": "analyzer",
       "project": "crates/fabrik-cli/test-fixtures/temporal-payload-blocked",
@@ -36,9 +50,9 @@
       "project": "crates/fabrik-cli/test-fixtures/temporal-visibility-blocked",
       "expect": {
         "summary": {
-          "hard_block_count": 2
+          "hard_block_count": 0
         },
-        "finding_features_include": ["visibility_search_usage"]
+        "finding_features_exclude": ["visibility_search_usage"]
       }
     },
     {

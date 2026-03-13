@@ -212,17 +212,17 @@
     {
       "feature": "payload_data_converter_usage",
       "label": "Payload and data converter usage",
-      "milestone_status": "blocked",
-      "support_level": "blocked",
-      "confidence_class": "blocked",
+      "milestone_status": "supported",
+      "support_level": "adapter",
+      "confidence_class": "supported",
       "replay_validation": false,
-      "deploy_validation": false,
+      "deploy_validation": true,
       "support_fixtures": true,
       "semantic_fixtures": false,
       "trust_fixtures": false,
       "upgrade_fixtures": false,
-      "semantic_caveats": ["custom payload conversion and codec behavior are blocked by default"],
-      "blocking_severity": "hard_block"
+      "semantic_caveats": ["alpha support is limited to static default-compatible dataConverter declarations; custom payloadCodecs, payloadConverterPath, failureConverterPath, and codec servers remain blocked"],
+      "blocking_severity": "warning"
     },
     {
       "feature": "interceptors_middleware",

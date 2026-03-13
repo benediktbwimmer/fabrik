@@ -59,3 +59,21 @@ Review these files first:
   Must package, deploy, and run one representative workflow path on Fabrik.
 - Shadow qualification repo:
   Must analyze cleanly and produce a trustworthy blocker/remediation report, even if it is not deployed.
+
+The current workspace defaults are:
+
+- Primary repo: [`crates/fabrik-cli/test-fixtures/temporal-supported`](/Users/bene/code/fabrik/crates/fabrik-cli/test-fixtures/temporal-supported)
+- Shadow repo: [`crates/fabrik-cli/test-fixtures/temporal-shadow-qualified`](/Users/bene/code/fabrik/crates/fabrik-cli/test-fixtures/temporal-shadow-qualified)
+- Payload adapter fixture: [`crates/fabrik-cli/test-fixtures/temporal-payload-qualified`](/Users/bene/code/fabrik/crates/fabrik-cli/test-fixtures/temporal-payload-qualified)
+
+## Current Workspace Shadow Set
+
+The current workspace shadow-qualification decisions are recorded in:
+
+- [`docs/alpha-shadow-qualification.md`](/Users/bene/code/fabrik/docs/alpha-shadow-qualification.md)
+
+Refresh the generated fixture reports with:
+
+```bash
+scripts/run-shadow-qualification.sh
+```

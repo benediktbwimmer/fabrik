@@ -28,7 +28,6 @@ const BLOCKED_WORKFLOW_IMPORTS = new Map([
 
 const BLOCKED_PAYLOAD_IMPORTS = new Set([
   "CompositePayloadConverter",
-  "DataConverter",
   "DefaultFailureConverter",
   "DefaultPayloadConverterWithProtobufs",
   "LoadedDataConverter",
@@ -37,8 +36,19 @@ const BLOCKED_PAYLOAD_IMPORTS = new Set([
   "PayloadConverterWithEncoding",
 ]);
 
+const SUPPORTED_DATA_CONVERTER_IMPORTS = new Set([
+  "defaultDataConverter",
+]);
+
+const SUPPORTED_PAYLOAD_CONVERTER_IMPORTS = new Set([
+  "defaultPayloadConverter",
+]);
+
+const SUPPORTED_PAYLOAD_CONVERTER_CONSTRUCTORS = new Set([
+  "DefaultPayloadConverter",
+]);
+
 const WORKER_BLOCKING_PROPERTIES = new Map([
-  ["dataConverter", "custom data converters are not supported by the migration pipeline"],
   ["payloadCodec", "custom payload codecs are not supported by the migration pipeline"],
   ["payloadConverterPath", "custom payload converters are not supported by the migration pipeline"],
   ["codecServer", "codec servers are not supported by the migration pipeline"],
@@ -203,39 +213,155 @@ function isStaticPrimitiveLiteral(node) {
   return node.kind === ts.SyntaxKind.TrueKeyword || node.kind === ts.SyntaxKind.FalseKeyword || node.kind === ts.SyntaxKind.NullKeyword;
 }
 
-function isSupportedMemoObject(node) {
-  if (!ts.isObjectLiteralExpression(node)) {
-    return false;
-  }
-  return node.properties.every((property) => {
-    if (!ts.isPropertyAssignment(property) || property.name == null) {
-      return false;
+function createScopeBindings(parentBindings, node) {
+  const bindings = new Map(parentBindings);
+  const statements = node.statements ?? [];
+  for (const statement of statements) {
+    if (!ts.isVariableStatement(statement) || !(statement.declarationList.flags & ts.NodeFlags.Const)) {
+      continue;
     }
-    return isStaticPrimitiveLiteral(property.initializer);
-  });
+    for (const declaration of statement.declarationList.declarations) {
+      if (ts.isIdentifier(declaration.name) && declaration.initializer) {
+        bindings.set(declaration.name.text, declaration.initializer);
+      }
+    }
+  }
+  return bindings;
 }
 
-function isSupportedSearchAttributesObject(node) {
-  if (!ts.isObjectLiteralExpression(node)) {
+function evaluateStaticValue(node, bindings, seen = new Set()) {
+  if (
+    ts.isStringLiteral(node) ||
+    ts.isNoSubstitutionTemplateLiteral(node)
+  ) {
+    return node.text;
+  }
+  if (ts.isNumericLiteral(node)) {
+    return Number(node.text);
+  }
+  if (node.kind === ts.SyntaxKind.TrueKeyword) {
+    return true;
+  }
+  if (node.kind === ts.SyntaxKind.FalseKeyword) {
     return false;
   }
-  return node.properties.every((property) => {
-    if (!ts.isPropertyAssignment(property) || property.name == null) {
-      return false;
+  if (node.kind === ts.SyntaxKind.NullKeyword) {
+    return null;
+  }
+  if (ts.isParenthesizedExpression(node)) {
+    return evaluateStaticValue(node.expression, bindings, seen);
+  }
+  if (ts.isIdentifier(node)) {
+    if (seen.has(node.text) || !bindings.has(node.text)) {
+      return undefined;
     }
-    const value = property.initializer;
-    if (
-      ts.isStringLiteral(value) ||
-      ts.isNoSubstitutionTemplateLiteral(value)
-    ) {
+    seen.add(node.text);
+    const resolved = evaluateStaticValue(bindings.get(node.text), bindings, seen);
+    seen.delete(node.text);
+    return resolved;
+  }
+  if (ts.isObjectLiteralExpression(node)) {
+    const value = {};
+    for (const property of node.properties) {
+      if (ts.isPropertyAssignment(property)) {
+        if (property.name == null) {
+          return undefined;
+        }
+        const key =
+          ts.isIdentifier(property.name) ? property.name.text :
+          ts.isStringLiteral(property.name) ? property.name.text :
+          null;
+        if (key == null) {
+          return undefined;
+        }
+        const resolved = evaluateStaticValue(property.initializer, bindings, seen);
+        if (resolved === undefined) {
+          return undefined;
+        }
+        value[key] = resolved;
+        continue;
+      }
+      if (ts.isShorthandPropertyAssignment(property)) {
+        const resolved = evaluateStaticValue(property.name, bindings, seen);
+        if (resolved === undefined) {
+          return undefined;
+        }
+        value[property.name.text] = resolved;
+        continue;
+      }
+      return undefined;
+    }
+    return value;
+  }
+  if (ts.isArrayLiteralExpression(node)) {
+    const value = [];
+    for (const element of node.elements) {
+      const resolved = evaluateStaticValue(element, bindings, seen);
+      if (resolved === undefined) {
+        return undefined;
+      }
+      value.push(resolved);
+    }
+    return value;
+  }
+  if (ts.isConditionalExpression(node)) {
+    const condition = evaluateStaticValue(node.condition, bindings, seen);
+    if (typeof condition !== "boolean") {
+      return undefined;
+    }
+    return evaluateStaticValue(condition ? node.whenTrue : node.whenFalse, bindings, seen);
+  }
+  if (ts.isBinaryExpression(node)) {
+    const left = evaluateStaticValue(node.left, bindings, seen);
+    const right = evaluateStaticValue(node.right, bindings, seen);
+    if (left === undefined || right === undefined) {
+      return undefined;
+    }
+    switch (node.operatorToken.kind) {
+      case ts.SyntaxKind.EqualsEqualsEqualsToken:
+      case ts.SyntaxKind.EqualsEqualsToken:
+        return left === right;
+      case ts.SyntaxKind.ExclamationEqualsEqualsToken:
+      case ts.SyntaxKind.ExclamationEqualsToken:
+        return left !== right;
+      default:
+        return undefined;
+    }
+  }
+  if (ts.isPrefixUnaryExpression(node) && node.operator === ts.SyntaxKind.ExclamationToken) {
+    const value = evaluateStaticValue(node.operand, bindings, seen);
+    return typeof value === "boolean" ? !value : undefined;
+  }
+  return undefined;
+}
+
+function isSupportedMemoObject(node, bindings) {
+  const value = evaluateStaticValue(node, bindings);
+  if (value == null || Array.isArray(value) || typeof value !== "object") {
+    return false;
+  }
+  return Object.values(value).every(
+    (entry) =>
+      entry == null ||
+      typeof entry === "string" ||
+      typeof entry === "number" ||
+      typeof entry === "boolean",
+  );
+}
+
+function isSupportedSearchAttributesObject(node, bindings) {
+  const value = evaluateStaticValue(node, bindings);
+  if (value == null || Array.isArray(value) || typeof value !== "object") {
+    return false;
+  }
+  return Object.values(value).every((entry) => {
+    if (typeof entry === "string") {
       return true;
     }
-    if (!ts.isArrayLiteralExpression(value)) {
+    if (!Array.isArray(entry)) {
       return false;
     }
-    return value.elements.every(
-      (element) => ts.isStringLiteral(element) || ts.isNoSubstitutionTemplateLiteral(element),
-    );
+    return entry.every((element) => typeof element === "string");
   });
 }
 
@@ -261,6 +387,99 @@ function maybeImportedModulePath(sourceFile, localName) {
     }
   }
   return null;
+}
+
+function combinedTemporalImports(...maps) {
+  const combined = new Map();
+  for (const map of maps) {
+    for (const [localName, importedName] of map.entries()) {
+      combined.set(localName, importedName);
+    }
+  }
+  return combined;
+}
+
+function resolveStaticExpression(node, bindings, seen = new Set()) {
+  if (ts.isParenthesizedExpression(node)) {
+    return resolveStaticExpression(node.expression, bindings, seen);
+  }
+  if (ts.isIdentifier(node)) {
+    if (seen.has(node.text) || !bindings.has(node.text)) {
+      return node;
+    }
+    seen.add(node.text);
+    const resolved = resolveStaticExpression(bindings.get(node.text), bindings, seen);
+    seen.delete(node.text);
+    return resolved;
+  }
+  return node;
+}
+
+function importedTemporalName(node, bindings, temporalImports) {
+  const resolved = resolveStaticExpression(node, bindings);
+  return ts.isIdentifier(resolved) ? temporalImports.get(resolved.text) ?? null : null;
+}
+
+function isSupportedPayloadConverterExpression(node, bindings, temporalImports) {
+  const resolved = resolveStaticExpression(node, bindings);
+  const importedName = importedTemporalName(resolved, bindings, temporalImports);
+  if (importedName != null && SUPPORTED_PAYLOAD_CONVERTER_IMPORTS.has(importedName)) {
+    return true;
+  }
+  if (!ts.isNewExpression(resolved)) {
+    return false;
+  }
+  const constructorName = importedTemporalName(resolved.expression, bindings, temporalImports);
+  return (
+    constructorName != null &&
+    SUPPORTED_PAYLOAD_CONVERTER_CONSTRUCTORS.has(constructorName) &&
+    (resolved.arguments == null || resolved.arguments.length === 0)
+  );
+}
+
+function isSupportedEmptyCodecList(node, bindings) {
+  const value = evaluateStaticValue(node, bindings);
+  return Array.isArray(value) && value.length === 0;
+}
+
+function analyzeSupportedDataConverter(node, bindings, temporalImports) {
+  const resolved = resolveStaticExpression(node, bindings);
+  const importedName = importedTemporalName(resolved, bindings, temporalImports);
+  if (importedName != null && SUPPORTED_DATA_CONVERTER_IMPORTS.has(importedName)) {
+    return { supported: true, mode: "default_temporal" };
+  }
+  if (!ts.isObjectLiteralExpression(resolved)) {
+    return { supported: false, mode: null };
+  }
+
+  for (const property of resolved.properties) {
+    if ((!ts.isPropertyAssignment(property) && !ts.isShorthandPropertyAssignment(property)) || property.name == null) {
+      return { supported: false, mode: null };
+    }
+    const propertyName =
+      ts.isIdentifier(property.name) ? property.name.text :
+      ts.isStringLiteral(property.name) ? property.name.text :
+      null;
+    if (propertyName == null) {
+      return { supported: false, mode: null };
+    }
+    const initializer = ts.isPropertyAssignment(property) ? property.initializer : property.name;
+    if (propertyName === "payloadConverter") {
+      if (!isSupportedPayloadConverterExpression(initializer, bindings, temporalImports)) {
+        return { supported: false, mode: null };
+      }
+      continue;
+    }
+    if (propertyName === "payloadCodecs") {
+      if (!isSupportedEmptyCodecList(initializer, bindings)) {
+        return { supported: false, mode: null };
+      }
+      continue;
+    }
+    return { supported: false, mode: null };
+  }
+
+  return { supported: true, mode: "default_temporal" };
 }
 
 function extractExportedAsyncWorkflows(projectRoot, program, sourceFile, fileUses) {
@@ -336,6 +555,8 @@ async function main() {
 
     const relativeFile = relativeProjectPath(projectRoot, sourceFile.fileName);
     const { workflowImports, workerImports, clientImports, commonImports } = collectImportInfo(sourceFile);
+    const temporalImportAliases =
+      combinedTemporalImports(workflowImports, workerImports, clientImports, commonImports);
     const temporalImports = [];
     const fileUses = new Set();
 
@@ -409,7 +630,11 @@ async function main() {
       }
     }
 
-    function visit(node) {
+    function visit(node, scopeBindings = new Map()) {
+      const currentBindings =
+        ts.isSourceFile(node) || ts.isBlock(node) || ts.isModuleBlock(node)
+          ? createScopeBindings(scopeBindings, node)
+          : scopeBindings;
       if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
         const importedWorkflowName = workflowImports.get(node.expression.text);
         if (importedWorkflowName === "proxyActivities") {
@@ -463,6 +688,7 @@ async function main() {
           const workflowsPathProperty = findObjectProperty(firstArg, "workflowsPath");
           const activitiesProperty = findObjectProperty(firstArg, "activities");
           const buildIdProperty = findObjectProperty(firstArg, "buildId");
+          const dataConverterProperty = findObjectProperty(firstArg, "dataConverter");
 
           const taskQueue =
             taskQueueProperty && ts.isPropertyAssignment(taskQueueProperty)
@@ -504,6 +730,33 @@ async function main() {
                 "workflowsPath",
               ),
             );
+          }
+
+          let dataConverterMode = null;
+          if (dataConverterProperty) {
+            fileUses.add("payload_data_converter_usage");
+            const initializer =
+              ts.isPropertyAssignment(dataConverterProperty)
+                ? dataConverterProperty.initializer
+                : dataConverterProperty.name;
+            const converterSupport =
+              analyzeSupportedDataConverter(initializer, currentBindings, temporalImportAliases);
+            if (!converterSupport.supported) {
+              findings.push(
+                createFinding(
+                  projectRoot,
+                  "hard_block",
+                  "blocked_data_converter_usage",
+                  "payload_data_converter_usage",
+                  dataConverterProperty,
+                  "Worker dataConverter must stay within Fabrik's default-compatible adapter subset",
+                  "use defaultDataConverter or a static object literal with defaultPayloadConverter and an empty payloadCodecs list",
+                  "dataConverter",
+                ),
+              );
+            } else {
+              dataConverterMode = converterSupport.mode;
+            }
           }
 
           for (const [propertyName, remediation] of WORKER_BLOCKING_PROPERTIES.entries()) {
@@ -569,6 +822,7 @@ async function main() {
             workflows_path: workflowsPath,
             activities_reference: activitiesReference,
             activity_module: activityModule,
+            data_converter_mode: dataConverterMode,
             bootstrap_pattern: "worker_create_static",
             uses: [...fileUses].sort(),
           });
@@ -582,8 +836,8 @@ async function main() {
           fileUses.add("search_attributes_memo");
           const supported =
             propertyName === "memo"
-              ? isSupportedMemoObject(node.initializer)
-              : isSupportedSearchAttributesObject(node.initializer);
+              ? isSupportedMemoObject(node.initializer, currentBindings)
+              : isSupportedSearchAttributesObject(node.initializer, currentBindings);
           if (!supported) {
             findings.push(
               createFinding(
@@ -602,7 +856,6 @@ async function main() {
           }
         }
         if (
-          propertyName === "dataConverter" ||
           propertyName === "payloadCodec" ||
           propertyName === "payloadConverterPath" ||
           propertyName === "codecServer"
@@ -629,10 +882,10 @@ async function main() {
         }
       }
 
-      ts.forEachChild(node, visit);
+      ts.forEachChild(node, (child) => visit(child, currentBindings));
     }
 
-    visit(sourceFile);
+    visit(sourceFile, new Map());
 
     const exportedWorkflows = workflowImports.size > 0
       ? extractExportedAsyncWorkflows(projectRoot, program, sourceFile, fileUses)

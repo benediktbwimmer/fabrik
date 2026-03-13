@@ -154,6 +154,7 @@ struct DiscoveredWorker {
     workflows_path: Option<String>,
     activities_reference: Option<String>,
     activity_module: Option<String>,
+    data_converter_mode: Option<String>,
     bootstrap_pattern: String,
     uses: Vec<String>,
 }
@@ -218,6 +219,7 @@ struct WorkerPackageRecord {
     manifest_path: String,
     bootstrap_path: String,
     resolved_activity_module_path: Option<String>,
+    data_converter_mode: Option<String>,
     log_path: String,
     pid_path: String,
     package_status: String,
@@ -616,10 +618,10 @@ async fn try_main() -> Result<i32> {
         payload_data_converter_validation: GateResult {
             status: if payload_blocks { "blocked".to_owned() } else { "passed".to_owned() },
             message: if payload_blocks {
-                "custom payload/data converter usage must be removed or adapter-backed before migration"
+                "payload/data converter usage exceeded the default-compatible adapter subset"
                     .to_owned()
             } else {
-                "no payload/data converter blockers detected".to_owned()
+                "no unsupported payload/data converter blockers detected".to_owned()
             },
         },
         visibility_search_validation: GateResult {
@@ -1189,7 +1191,11 @@ fn build_worker_packages(
             };
         fs::write(
             &bootstrap_path,
-            render_worker_bootstrap(worker, &build_id, resolved_activity_module_path.as_deref()),
+            render_worker_bootstrap(
+                worker,
+                &build_id,
+                resolved_activity_module_path.as_deref(),
+            ),
         )
         .with_context(|| format!("failed to write {}", bootstrap_path.display()))?;
         write_json(
@@ -1203,6 +1209,7 @@ fn build_worker_packages(
                 "workflows_path": worker.workflows_path,
                 "activities_reference": worker.activities_reference,
                 "activity_module": worker.activity_module,
+                "data_converter_mode": worker.data_converter_mode,
                 "project_root": project_root.display().to_string(),
                 "dist_dir": dist_dir.display().to_string(),
                 "resolved_activity_module_path": resolved_activity_module_path,
@@ -1220,6 +1227,7 @@ fn build_worker_packages(
             manifest_path: manifest_path.display().to_string(),
             bootstrap_path: bootstrap_path.display().to_string(),
             resolved_activity_module_path,
+            data_converter_mode: worker.data_converter_mode.clone(),
             log_path: log_path.display().to_string(),
             pid_path: pid_path.display().to_string(),
             package_status,
@@ -1763,11 +1771,13 @@ fn render_worker_bootstrap(
         serde_json::to_string(&worker.activity_module).expect("activity module serializes");
     let resolved_activity_module_path = serde_json::to_string(&resolved_activity_module_path)
         .expect("resolved activity module path serializes");
+    let data_converter_mode = serde_json::to_string(&worker.data_converter_mode)
+        .expect("data converter mode serializes");
     let bootstrap_pattern =
         serde_json::to_string(&worker.bootstrap_pattern).expect("bootstrap pattern serializes");
     format!(
         "import {{ pathToFileURL }} from 'node:url';\n\
-         export const fabrikMigratedWorker = {{\n  sourceWorker: {source_worker},\n  taskQueue: {task_queue},\n  buildId: {build_id},\n  workflowsPath: {workflows_path},\n  activitiesReference: {activities_reference},\n  activityModule: {activity_module},\n  resolvedActivityModulePath: {resolved_activity_module_path},\n  bootstrapPattern: {bootstrap_pattern}\n}};\n\
+         export const fabrikMigratedWorker = {{\n  sourceWorker: {source_worker},\n  taskQueue: {task_queue},\n  buildId: {build_id},\n  workflowsPath: {workflows_path},\n  activitiesReference: {activities_reference},\n  activityModule: {activity_module},\n  resolvedActivityModulePath: {resolved_activity_module_path},\n  dataConverterMode: {data_converter_mode},\n  bootstrapPattern: {bootstrap_pattern}\n}};\n\
          async function invoke(request) {{\n\
            if (!fabrikMigratedWorker.resolvedActivityModulePath) {{\n\
              throw new Error('worker package is missing a resolved activity module path');\n\
@@ -1801,6 +1811,7 @@ fn render_worker_bootstrap(
         activities_reference = activities_reference,
         activity_module = activity_module,
         resolved_activity_module_path = resolved_activity_module_path,
+        data_converter_mode = data_converter_mode,
         bootstrap_pattern = bootstrap_pattern,
     )
 }

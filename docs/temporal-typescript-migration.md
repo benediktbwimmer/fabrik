@@ -38,7 +38,7 @@ Current headline policy:
 
 - `proxyActivities`, signals, queries, updates, conditions, child workflows, cancellation scopes, continue-as-new, and workflow evolution markers are in scope for migration
 - worker bootstraps are adapter-backed only when they are static `Worker.create({ ... })` calls
-- payload/data converter usage is blocked by default
+- payload/data converter usage is supported only for static default-compatible `dataConverter` declarations; custom codecs and path-based converters remain blocked
 - search attributes and memo are supported only for the alpha slice of static start-time values plus exact-match visibility filters
 - interceptors and middleware are blocked by default
 - unsupported Temporal APIs are blocked by default

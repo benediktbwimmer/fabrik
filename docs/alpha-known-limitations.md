@@ -5,9 +5,11 @@ This document lists the highest-signal limitations for the current design-partne
 ## Current Hard Limits
 
 - Search attributes and memo are only supported in the alpha slice for static start-time values plus exact-match visibility filters.
-- Custom payload/data converter behavior is still blocked.
+- Static-evaluable start-time memo/search-attribute shapes are supported, but dynamic runtime-shaped visibility writes are still blocked.
+- Payload/data converter support is limited to static default-compatible `dataConverter` declarations; custom payload codecs, path-based converters, and codec servers are still blocked.
 - Interceptors and middleware are still blocked.
 - Dynamic `Worker.create(...)` bootstraps are still blocked.
+- Unsupported Temporal workflow APIs remain blocked until they are explicitly implemented and trusted.
 - The migration path targets the compiled Temporal TypeScript subset, not the full Temporal SDK surface.
 
 ## Trust Limits

@@ -16,8 +16,8 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use fabrik_broker::{
-    BrokerConfig, WorkflowHistoryFilter, build_workflow_consumer, decode_consumed_workflow_event,
-    partition_for_instance, read_workflow_history, WorkflowPublisher,
+    BrokerConfig, WorkflowHistoryFilter, WorkflowPublisher, build_workflow_consumer,
+    decode_consumed_workflow_event, partition_for_instance, read_workflow_history,
 };
 use fabrik_config::{GrpcServiceConfig, HttpServiceConfig, PostgresConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
@@ -38,8 +38,8 @@ use fabrik_worker_protocol::activity_worker::{
     activity_worker_api_server::{ActivityWorkerApi, ActivityWorkerApiServer},
 };
 use fabrik_workflow::{
-    ArtifactExecutionState, CompiledExecutionPlan, CompiledWorkflowArtifact, ExecutionTurnContext,
-    RetryPolicy, WorkflowInstanceState, WorkflowStatus, parse_timer_ref,
+    ArtifactExecutionState, CompiledExecutionPlan, CompiledStateNode, CompiledWorkflowArtifact,
+    ExecutionTurnContext, RetryPolicy, WorkflowInstanceState, WorkflowStatus, parse_timer_ref,
     replay_compiled_history_trace, replay_compiled_history_trace_from_snapshot,
     replay_history_trace_from_snapshot, retry_policy_allows_failure_retry,
 };
@@ -95,6 +95,7 @@ struct UnifiedDebugState {
     restore_records_applied: u64,
     workflow_triggers_applied: u64,
     duplicate_triggers_ignored: u64,
+    unsupported_triggers_ignored: u64,
     ignored_missing_instance_reports: u64,
     ignored_terminal_instance_reports: u64,
     ignored_missing_activity_reports: u64,
@@ -1127,6 +1128,9 @@ async fn run_trigger_consumer(
 }
 
 async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEvent>) -> Result<()> {
+    let WorkflowEvent::WorkflowTriggered { input } = &event.payload else {
+        return Ok(());
+    };
     let run_key = RunKey {
         tenant_id: event.tenant_id.clone(),
         instance_id: event.instance_id.clone(),
@@ -1158,9 +1162,19 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
                 event.tenant_id
             )
         })?;
-    let WorkflowEvent::WorkflowTriggered { input } = &event.payload else {
+    if artifact_contains_unsupported_bulk_states(&artifact) {
+        warn!(
+            tenant_id = %event.tenant_id,
+            definition_id = %event.definition_id,
+            definition_version = event.definition_version,
+            instance_id = %event.instance_id,
+            run_id = %event.run_id,
+            "unified-runtime ignoring trigger for unsupported bulk activity artifact"
+        );
+        let mut debug = state.debug.lock().expect("unified debug lock poisoned");
+        debug.unsupported_triggers_ignored = debug.unsupported_triggers_ignored.saturating_add(1);
         return Ok(());
-    };
+    }
     let plan = artifact.execute_trigger_with_turn(
         input,
         ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at },
@@ -4603,7 +4617,8 @@ fn apply_activity_result_plan(
     let occurred_at = runtime.instance.updated_at;
     let scheduled_tasks =
         schedule_activities_from_plan(&runtime.artifact, &runtime.instance, &plan, occurred_at)?;
-    let terminal_instance = runtime.instance.status.is_terminal().then_some(runtime.instance.clone());
+    let terminal_instance =
+        runtime.instance.status.is_terminal().then_some(runtime.instance.clone());
     Ok(AppliedActivityResultPlan {
         post_plan: PostPlanEffect {
             run_key: run_key.clone(),
@@ -4846,10 +4861,10 @@ fn prepare_result_application(
                 let Some(wait_state) = runtime.instance.current_state.clone() else {
                     break;
                 };
-                let execution_state = runtime.instance.artifact_execution.clone().unwrap_or_default();
-                if let Some((plan, applied)) = runtime
-                    .artifact
-                    .try_execute_after_step_terminal_batch_with_turn(
+                let execution_state =
+                    runtime.instance.artifact_execution.clone().unwrap_or_default();
+                if let Some((plan, applied)) =
+                    runtime.artifact.try_execute_after_step_terminal_batch_with_turn(
                         &wait_state,
                         &events[index..],
                         execution_state,
@@ -4885,35 +4900,36 @@ fn prepare_result_application(
                         event_id: event.event_id,
                         occurred_at: event.occurred_at,
                     };
-                    let current_state = runtime.instance.current_state.as_deref().unwrap_or_default();
+                    let current_state =
+                        runtime.instance.current_state.as_deref().unwrap_or_default();
                     let plan = match &event.payload {
-                        WorkflowEvent::ActivityTaskCompleted { activity_id, output, .. } => Some(
-                            runtime.artifact.execute_after_step_completion_with_turn(
+                        WorkflowEvent::ActivityTaskCompleted { activity_id, output, .. } => {
+                            Some(runtime.artifact.execute_after_step_completion_with_turn(
                                 current_state,
                                 activity_id,
                                 output,
                                 execution_state,
                                 turn_context,
-                            )?,
-                        ),
-                        WorkflowEvent::ActivityTaskFailed { activity_id, error, .. } => Some(
-                            runtime.artifact.execute_after_step_failure_with_turn(
+                            )?)
+                        }
+                        WorkflowEvent::ActivityTaskFailed { activity_id, error, .. } => {
+                            Some(runtime.artifact.execute_after_step_failure_with_turn(
                                 current_state,
                                 activity_id,
                                 error,
                                 execution_state,
                                 turn_context,
-                            )?,
-                        ),
-                        WorkflowEvent::ActivityTaskCancelled { activity_id, reason, .. } => Some(
-                            runtime.artifact.execute_after_step_cancellation_with_turn(
+                            )?)
+                        }
+                        WorkflowEvent::ActivityTaskCancelled { activity_id, reason, .. } => {
+                            Some(runtime.artifact.execute_after_step_cancellation_with_turn(
                                 current_state,
                                 activity_id,
                                 reason,
                                 execution_state,
                                 turn_context,
-                            )?,
-                        ),
+                            )?)
+                        }
                         _ => None,
                     };
                     if let Some(plan) = plan {
@@ -5454,6 +5470,27 @@ fn schedule_activities_from_plan(
         }
     }
     Ok(tasks)
+}
+
+fn artifact_contains_unsupported_bulk_states(artifact: &CompiledWorkflowArtifact) -> bool {
+    artifact.workflow.states.values().any(is_unsupported_unified_state)
+        || artifact
+            .signals
+            .values()
+            .flat_map(|handler| handler.states.values())
+            .any(is_unsupported_unified_state)
+        || artifact
+            .updates
+            .values()
+            .flat_map(|handler| handler.states.values())
+            .any(is_unsupported_unified_state)
+}
+
+fn is_unsupported_unified_state(state: &CompiledStateNode) -> bool {
+    matches!(
+        state,
+        CompiledStateNode::StartBulkActivity { .. } | CompiledStateNode::WaitForBulkActivity { .. }
+    )
 }
 
 fn resolve_activity_task_queue(workflow_task_queue: &str, scheduled_task_queue: &str) -> String {
@@ -6306,6 +6343,58 @@ mod tests {
 
         CompiledWorkflowArtifact::new(
             "unified-handoff-demo".to_owned(),
+            1,
+            "unified-runtime-test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "dispatch".to_owned(),
+                states,
+                params: Vec::new(),
+                non_cancellable_states: std::collections::BTreeSet::new(),
+            },
+        )
+    }
+
+    fn throughput_artifact(task_queue: &str) -> CompiledWorkflowArtifact {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "dispatch".to_owned(),
+            CompiledStateNode::StartBulkActivity {
+                activity_type: "benchmark.echo".to_owned(),
+                items: Expression::Member {
+                    object: Box::new(Expression::Identifier { name: "input".to_owned() }),
+                    property: "items".to_owned(),
+                },
+                next: "join".to_owned(),
+                handle_var: "fanout".to_owned(),
+                task_queue: Some(Expression::Literal {
+                    value: Value::String(task_queue.to_owned()),
+                }),
+                execution_policy: None,
+                reducer: Some("all_settled".to_owned()),
+                throughput_backend: Some("pg-v1".to_owned()),
+                chunk_size: Some(16),
+                retry: None,
+            },
+        );
+        states.insert(
+            "join".to_owned(),
+            CompiledStateNode::WaitForBulkActivity {
+                bulk_ref_var: "fanout".to_owned(),
+                next: "done".to_owned(),
+                output_var: Some("results".to_owned()),
+                on_error: None,
+            },
+        );
+        states.insert(
+            "done".to_owned(),
+            CompiledStateNode::Succeed {
+                output: Some(Expression::Identifier { name: "results".to_owned() }),
+            },
+        );
+
+        CompiledWorkflowArtifact::new(
+            "throughput-handoff-demo".to_owned(),
             1,
             "unified-runtime-test",
             ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
@@ -7665,6 +7754,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trigger_ignores_throughput_bulk_artifacts() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = throughput_artifact("default");
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-throughput-ignore-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-throughput-ignore",
+            "run-throughput-ignore",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({"items": [json!({"value": "x"})]}) },
+            Utc::now(),
+        );
+
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let stored = store.get_instance("tenant", "instance-throughput-ignore").await?;
+        assert!(stored.is_none());
+        let inner = app_state.inner.lock().expect("unified runtime lock poisoned");
+        assert!(!inner.instances.contains_key(&RunKey {
+            tenant_id: "tenant".to_owned(),
+            instance_id: "instance-throughput-ignore".to_owned(),
+            run_id: "run-throughput-ignore".to_owned(),
+        }));
+        drop(inner);
+        let debug = app_state.debug.lock().expect("unified debug lock poisoned");
+        assert_eq!(debug.unsupported_triggers_ignored, 1);
+        assert_eq!(debug.workflow_triggers_applied, 0);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn update_mailbox_item_can_start_child_and_complete_update() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
@@ -8495,8 +8630,8 @@ mod tests {
         let publisher = redpanda.connect_publisher().await?;
         let artifact = signal_then_step_artifact();
         store.put_artifact("tenant", &artifact).await?;
-        let state_dir = std::env::temp_dir()
-            .join(format!("unified-runtime-signal-history-{}", Uuid::now_v7()));
+        let state_dir =
+            std::env::temp_dir().join(format!("unified-runtime-signal-history-{}", Uuid::now_v7()));
         let app_state = test_app_state_with_publisher(
             store.clone(),
             publisher.clone(),
@@ -8593,19 +8728,26 @@ mod tests {
             let history = read_workflow_history(
                 &redpanda.broker,
                 "unified-runtime-history-test",
-                &WorkflowHistoryFilter::new("tenant", "instance-signal-history", "run-signal-history-1"),
+                &WorkflowHistoryFilter::new(
+                    "tenant",
+                    "instance-signal-history",
+                    "run-signal-history-1",
+                ),
                 StdDuration::from_millis(500),
                 StdDuration::from_secs(2),
             )
             .await?;
-            let event_types = history.iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>();
+            let event_types =
+                history.iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>();
             if event_types.contains(&"SignalReceived")
                 && event_types.contains(&"ActivityTaskCompleted")
             {
                 break history;
             }
             if Instant::now() >= history_deadline {
-                anyhow::bail!("broker history did not contain hot runtime signal/completion events");
+                anyhow::bail!(
+                    "broker history did not contain hot runtime signal/completion events"
+                );
             }
             sleep(StdDuration::from_millis(100)).await;
         };

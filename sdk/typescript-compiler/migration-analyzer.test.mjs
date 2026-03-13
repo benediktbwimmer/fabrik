@@ -34,14 +34,23 @@ test("migration analyzer discovers supported workflows and workers", async () =>
   );
 });
 
-test("migration analyzer blocks payload and visibility landmines", async () => {
+test("migration analyzer supports default-compatible payload converters and blocks custom payload landmines", async () => {
+  const payloadQualifiedFixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-payload-qualified",
+  );
   const payloadFixture = path.join(root, "crates/fabrik-cli/test-fixtures/temporal-payload-blocked");
+  const payloadQualified = await analyze(payloadQualifiedFixture);
   const visibilityFixture = path.join(
     root,
     "crates/fabrik-cli/test-fixtures/temporal-visibility-blocked",
   );
   const payload = await analyze(payloadFixture);
   const visibility = await analyze(visibilityFixture);
+  assert.equal(payloadQualified.summary.hard_block_count, 0);
+  assert.equal(payloadQualified.workers[0].data_converter_mode, "default_temporal");
   assert.ok(payload.findings.some((finding) => finding.feature === "payload_data_converter_usage"));
-  assert.ok(visibility.findings.some((finding) => finding.feature === "visibility_search_usage"));
+  assert.ok(!visibility.findings.some((finding) => finding.feature === "visibility_search_usage"));
+  assert.equal(visibility.summary.hard_block_count, 0);
+  assert.ok(visibility.files.some((file) => file.uses.includes("search_attributes_memo")));
 });

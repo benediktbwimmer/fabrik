@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
   "milestone_scope": "temporal_ts_subset_trust",
-  "generated_at": "2026-03-13T17:20:16.626Z",
+  "generated_at": "2026-03-13T18:31:00.499Z",
   "reports": [
     {
       "layer_id": "layer_a_support",
       "status": "passing",
-      "case_count": 7,
+      "case_count": 8,
       "failed_count": 0
     },
     {
@@ -349,20 +349,20 @@
     {
       "feature": "payload_data_converter_usage",
       "label": "Payload and data converter usage",
-      "milestone_status": "blocked",
-      "support_level": "blocked",
-      "confidence_class": "blocked",
+      "milestone_status": "supported",
+      "support_level": "adapter",
+      "confidence_class": "supported",
       "replay_validation": false,
-      "deploy_validation": false,
+      "deploy_validation": true,
       "support_fixtures": true,
       "semantic_fixtures": false,
       "trust_fixtures": false,
       "upgrade_fixtures": false,
       "semantic_caveats": [
-        "custom payload conversion and codec behavior are blocked by default"
+        "alpha support is limited to static default-compatible dataConverter declarations; custom payloadCodecs, payloadConverterPath, failureConverterPath, and codec servers remain blocked"
       ],
-      "blocking_severity": "hard_block",
-      "declared_confidence_class": "blocked",
+      "blocking_severity": "warning",
+      "declared_confidence_class": "supported",
       "confidence_status": "declared_confirmed",
       "evidence": {
         "support_layer_status": "passing",
