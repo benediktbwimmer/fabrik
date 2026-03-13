@@ -710,6 +710,35 @@ test("compiler lowers multi-argument Temporal activity and continueAsNew calls",
   assert.match(continueSerialized, /"attempt"/);
 });
 
+test("compiler emits workflow parameter metadata for Temporal workflow entrypoints", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-workflow-params.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalWorkflowParamsWorkflow",
+    "--definition-id",
+    "temporal-workflow-params",
+    "--version",
+    "1",
+  ]);
+
+  const artifact = JSON.parse(stdout);
+  assert.deepEqual(artifact.workflow.params, [
+    { name: "name" },
+    { name: "punctuation", default: { kind: "literal", value: "!" } },
+  ]);
+
+  const serialized = JSON.stringify(artifact.workflow.states);
+  assert.match(serialized, /"handler":"greet"/);
+  assert.match(serialized, /"input":\{"kind":"array"/);
+  assert.match(serialized, /"name":"name"/);
+  assert.match(serialized, /"name":"punctuation"/);
+});
+
 test("compiler rejects forbidden global access with source location", async () => {
   const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/invalid-global.ts");
   await assert.rejects(

@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "layer_id": "layer_b_semantic",
+  "title": "Layer B: semantic parity fixtures",
+  "purpose": "Compiled semantic artifact cases for the supported Temporal TS subset.",
+  "case_count": 9,
+  "passed_count": 9,
+  "failed_count": 0,
+  "results": [
+    {
+      "id": "proxy-activities-and-retries",
+      "title": "proxy-activities-and-retries",
+      "kind": "compiler",
+      "status": "passed",
+      "duration_ms": 1194,
+      "summary": "definition=temporal-compatible-workflow source_files=1",
+      "observed": {
+        "definition_id": "temporal-compatible-workflow",
+        "source_file_count": 1
+      },
+      "evidence": {
+        "source_files": [
+          "sdk/typescript-compiler/test-fixtures/temporal-compatible-workflow.ts"
+        ],
+        "state_count": 4
+      }
+    },
+    {
+      "id": "continue-as-new",
+      "title": "continue-as-new",
+      "kind": "compiler",
+      "status": "passed",
+      "duration_ms": 1168,
+      "summary": "definition=temporal-continue-as-new-workflow source_files=1",
+      "observed": {
+        "definition_id": "temporal-continue-as-new-workflow",
+        "source_file_count": 1
+      },
+      "evidence": {
+        "source_files": [
+          "sdk/typescript-compiler/test-fixtures/temporal-compatible-workflow.ts"
+        ],
+        "state_count": 5
+      }
+    },
+    {
+      "id": "queries-updates-and-handlers",
+      "title": "queries-updates-and-handlers",
+      "kind": "compiler",
+      "status": "passed",
+      "duration_ms": 1226,
+      "summary": "definition=temporal-query-update-workflow source_files=1",
+      "observed": {
+        "definition_id": "temporal-query-update-workflow",
+        "source_file_count": 1
+      },
+      "evidence": {
+        "source_files": [
+          "sdk/typescript-compiler/test-fixtures/temporal-query-update-workflow.ts"
+        ],
+        "state_count": 3
+      }
+    },
+    {
+      "id": "signals-and-conditions",
+      "title": "signals-and-conditions",
+      "kind": "compiler",
+      "status": "passed",
+      "duration_ms": 1158,
+      "summary": "definition=temporal-signal-condition-workflow source_files=1",
+      "observed": {
+        "definition_id": "temporal-signal-condition-workflow",
+        "source_file_count": 1
+      },
+      "evidence": {
+        "source_files": [
+          "sdk/typescript-compiler/test-fixtures/temporal-signal-condition-workflow.ts"
+        ],
+        "state_count": 5
+      }
+    },
+    {
+      "id": "async-signal-handler",
+      "title": "async-signal-handler",
+      "kind": "compiler",
+      "status": "passed",
+      "duration_ms": 1118,
+      "summary": "definition=temporal-async-signal-workflow source_files=1",
+      "observed": {
+        "definition_id": "temporal-async-signal-workflow",
+        "source_file_count": 1
+      },
+      "evidence": {
+        "source_files": [
+          "sdk/typescript-compiler/test-fixtures/temporal-async-signal-workflow.ts"
+        ],
+        "state_count": 4
+      }
+    },
+    {
+      "id": "child-workflows",
+      "title": "child-workflows",
+      "kind": "compiler",
+      "status": "passed",
+      "duration_ms": 1094,
+      "summary": "definition=temporal-child-workflow source_files=1",
+      "observed": {
+        "definition_id": "temporal-child-workflow",
+        "source_file_count": 1
+      },
+      "evidence": {
+        "source_files": [
+          "sdk/typescript-compiler/test-fixtures/temporal-child-workflow.ts"
+        ],
+        "state_count": 6
+      }
+    },
+    {
+      "id": "external-workflow-handles",
+      "title": "external-workflow-handles",
+      "kind": "compiler",
+      "status": "passed",
+      "duration_ms": 1090,
+      "summary": "definition=temporal-external-workflow-handle-workflow source_files=1",
+      "observed": {
+        "definition_id": "temporal-external-workflow-handle-workflow",
+        "source_file_count": 1
+      },
+      "evidence": {
+        "source_files": [
+          "sdk/typescript-compiler/test-fixtures/temporal-external-workflow-handle-workflow.ts"
+        ],
+        "state_count": 4
+      }
+    },
+    {
+      "id": "cancellation-scopes",
+      "title": "cancellation-scopes",
+      "kind": "compiler",
+      "status": "passed",
+      "duration_ms": 1079,
+      "summary": "definition=temporal-cancellation-scope-workflow source_files=1",
+      "observed": {
+        "definition_id": "temporal-cancellation-scope-workflow",
+        "source_file_count": 1
+      },
+      "evidence": {
+        "source_files": [
+          "sdk/typescript-compiler/test-fixtures/temporal-cancellation-scope-workflow.ts"
+        ],
+        "state_count": 7
+      }
+    },
+    {
+      "id": "version-markers",
+      "title": "version-markers",
+      "kind": "compiler",
+      "status": "passed",
+      "duration_ms": 825,
+      "summary": "definition=version-workflow source_files=1",
+      "observed": {
+        "definition_id": "version-workflow",
+        "source_file_count": 1
+      },
+      "evidence": {
+        "source_files": [
+          "sdk/typescript-compiler/test-fixtures/version-workflow.ts"
+        ],
+        "state_count": 4
+      }
+    }
+  ]
+}

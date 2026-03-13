@@ -481,6 +481,8 @@ pub struct WorkflowRunRecord {
     pub definition_version: Option<u32>,
     pub artifact_hash: Option<String>,
     pub workflow_task_queue: String,
+    pub memo: Option<Value>,
+    pub search_attributes: Option<Value>,
     pub sticky_workflow_build_id: Option<String>,
     pub sticky_workflow_poller_id: Option<String>,
     pub sticky_updated_at: Option<DateTime<Utc>>,
@@ -504,6 +506,8 @@ pub struct WorkflowRunSummaryRecord {
     pub definition_version: Option<u32>,
     pub artifact_hash: Option<String>,
     pub workflow_task_queue: String,
+    pub memo: Option<Value>,
+    pub search_attributes: Option<Value>,
     pub sticky_workflow_build_id: Option<String>,
     pub sticky_workflow_poller_id: Option<String>,
     pub sticky_updated_at: Option<DateTime<Utc>>,
@@ -825,6 +829,10 @@ pub struct WorkflowInstanceFilters {
     pub task_queue: Option<String>,
     pub updated_after: Option<DateTime<Utc>>,
     pub query: Option<String>,
+    pub memo_key: Option<String>,
+    pub memo_value: Option<String>,
+    pub search_attribute_key: Option<String>,
+    pub search_attribute_value: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -835,6 +843,10 @@ pub struct WorkflowRunFilters {
     pub run_id: Option<String>,
     pub task_queue: Option<String>,
     pub query: Option<String>,
+    pub memo_key: Option<String>,
+    pub memo_value: Option<String>,
+    pub search_attribute_key: Option<String>,
+    pub search_attribute_value: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -1717,6 +1729,14 @@ impl WorkflowStore {
             .execute(&self.pool)
             .await
             .context("failed to add workflow_runs.sticky_updated_at")?;
+        sqlx::query("ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS memo JSONB")
+            .execute(&self.pool)
+            .await
+            .context("failed to add workflow_runs.memo")?;
+        sqlx::query("ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS search_attributes JSONB")
+            .execute(&self.pool)
+            .await
+            .context("failed to add workflow_runs.search_attributes")?;
 
         sqlx::query(
             r#"
@@ -3338,6 +3358,20 @@ impl WorkflowStore {
                 OR COALESCE(last_event_type, '') ILIKE '%' || $6 || '%'
                 OR COALESCE(state->>'current_state', '') ILIKE '%' || $6 || '%'
               )
+              AND (
+                $7::text IS NULL
+                OR $8::text IS NULL
+                OR state->'memo'->>$7 = $8
+              )
+              AND (
+                $9::text IS NULL
+                OR $10::text IS NULL
+                OR state->'search_attributes'->>$9 = $10
+                OR (
+                    jsonb_typeof(state->'search_attributes'->$9) = 'array'
+                    AND (state->'search_attributes'->$9) ? $10
+                )
+              )
             "#,
         )
         .bind(tenant_id)
@@ -3346,6 +3380,10 @@ impl WorkflowStore {
         .bind(filters.task_queue.as_deref())
         .bind(filters.updated_after)
         .bind(filters.query.as_deref())
+        .bind(filters.memo_key.as_deref())
+        .bind(filters.memo_value.as_deref())
+        .bind(filters.search_attribute_key.as_deref())
+        .bind(filters.search_attribute_value.as_deref())
         .fetch_one(&self.pool)
         .await
         .context("failed to count workflow instances with filters")?;
@@ -3377,8 +3415,22 @@ impl WorkflowStore {
                 OR COALESCE(last_event_type, '') ILIKE '%' || $6 || '%'
                 OR COALESCE(state->>'current_state', '') ILIKE '%' || $6 || '%'
               )
+              AND (
+                $7::text IS NULL
+                OR $8::text IS NULL
+                OR state->'memo'->>$7 = $8
+              )
+              AND (
+                $9::text IS NULL
+                OR $10::text IS NULL
+                OR state->'search_attributes'->>$9 = $10
+                OR (
+                    jsonb_typeof(state->'search_attributes'->$9) = 'array'
+                    AND (state->'search_attributes'->$9) ? $10
+                )
+              )
             ORDER BY updated_at DESC, workflow_instance_id ASC
-            LIMIT $7 OFFSET $8
+            LIMIT $11 OFFSET $12
             "#,
         )
         .bind(tenant_id)
@@ -3387,6 +3439,10 @@ impl WorkflowStore {
         .bind(filters.task_queue.as_deref())
         .bind(filters.updated_after)
         .bind(filters.query.as_deref())
+        .bind(filters.memo_key.as_deref())
+        .bind(filters.memo_value.as_deref())
+        .bind(filters.search_attribute_key.as_deref())
+        .bind(filters.search_attribute_value.as_deref())
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -3681,6 +3737,8 @@ impl WorkflowStore {
         definition_version: Option<u32>,
         artifact_hash: Option<&str>,
         workflow_task_queue: &str,
+        memo: Option<&Value>,
+        search_attributes: Option<&Value>,
         trigger_event_id: Uuid,
         started_at: DateTime<Utc>,
         previous_run_id: Option<&str>,
@@ -3696,6 +3754,8 @@ impl WorkflowStore {
                 definition_version,
                 artifact_hash,
                 workflow_task_queue,
+                memo,
+                search_attributes,
                 sticky_workflow_build_id,
                 sticky_workflow_poller_id,
                 sticky_updated_at,
@@ -3710,7 +3770,7 @@ impl WorkflowStore {
                 updated_at
             )
             VALUES (
-                $1, $2, $3, $4, $5, $6, $7, NULL, NULL, NULL, $8, NULL, NULL, $9, NULL, $10, $11, NULL, $11
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, NULL, $10, NULL, NULL, $11, NULL, $12, $13, NULL, $13
             )
             ON CONFLICT (tenant_id, workflow_instance_id, run_id)
             DO UPDATE SET
@@ -3718,6 +3778,8 @@ impl WorkflowStore {
                 definition_version = EXCLUDED.definition_version,
                 artifact_hash = EXCLUDED.artifact_hash,
                 workflow_task_queue = EXCLUDED.workflow_task_queue,
+                memo = EXCLUDED.memo,
+                search_attributes = EXCLUDED.search_attributes,
                 previous_run_id = EXCLUDED.previous_run_id,
                 trigger_event_id = EXCLUDED.trigger_event_id,
                 triggered_by_run_id = EXCLUDED.triggered_by_run_id,
@@ -3732,6 +3794,8 @@ impl WorkflowStore {
         .bind(definition_version.map(|version| version as i32))
         .bind(artifact_hash)
         .bind(workflow_task_queue)
+        .bind(memo.map(|value| Json(value.clone())))
+        .bind(search_attributes.map(|value| Json(value.clone())))
         .bind(previous_run_id)
         .bind(trigger_event_id)
         .bind(triggered_by_run_id)
@@ -3859,6 +3923,8 @@ impl WorkflowStore {
                     runs.run_id,
                     runs.workflow_id,
                     runs.workflow_task_queue,
+                    runs.memo,
+                    runs.search_attributes,
                     COALESCE(
                         instances.status,
                         snapshots.state->>'status',
@@ -3904,6 +3970,20 @@ impl WorkflowStore {
                 OR COALESCE(last_event_type, '') ILIKE '%' || $7 || '%'
                 OR COALESCE(current_state, '') ILIKE '%' || $7 || '%'
               )
+              AND (
+                $8::text IS NULL
+                OR $9::text IS NULL
+                OR memo->>$8 = $9
+              )
+              AND (
+                $10::text IS NULL
+                OR $11::text IS NULL
+                OR search_attributes->>$10 = $11
+                OR (
+                    jsonb_typeof(search_attributes->$10) = 'array'
+                    AND (search_attributes->$10) ? $11
+                )
+              )
             "#,
         )
         .bind(tenant_id)
@@ -3913,6 +3993,10 @@ impl WorkflowStore {
         .bind(filters.run_id.as_deref())
         .bind(filters.task_queue.as_deref())
         .bind(filters.query.as_deref())
+        .bind(filters.memo_key.as_deref())
+        .bind(filters.memo_value.as_deref())
+        .bind(filters.search_attribute_key.as_deref())
+        .bind(filters.search_attribute_value.as_deref())
         .fetch_one(&self.pool)
         .await
         .context("failed to count workflow runs with filters")?;
@@ -3937,6 +4021,8 @@ impl WorkflowStore {
                 definition_version,
                 artifact_hash,
                 workflow_task_queue,
+                memo,
+                search_attributes,
                 sticky_workflow_build_id,
                 sticky_workflow_poller_id,
                 sticky_updated_at,
@@ -3984,6 +4070,8 @@ impl WorkflowStore {
                     runs.definition_version,
                     runs.artifact_hash,
                     runs.workflow_task_queue,
+                    runs.memo,
+                    runs.search_attributes,
                     runs.sticky_workflow_build_id,
                     runs.sticky_workflow_poller_id,
                     runs.sticky_updated_at,
@@ -4033,6 +4121,8 @@ impl WorkflowStore {
                 definition_version,
                 artifact_hash,
                 workflow_task_queue,
+                memo,
+                search_attributes,
                 sticky_workflow_build_id,
                 sticky_workflow_poller_id,
                 sticky_updated_at,
@@ -4061,8 +4151,22 @@ impl WorkflowStore {
                 OR COALESCE(last_event_type, '') ILIKE '%' || $7 || '%'
                 OR COALESCE(current_state, '') ILIKE '%' || $7 || '%'
               )
+              AND (
+                $8::text IS NULL
+                OR $9::text IS NULL
+                OR memo->>$8 = $9
+              )
+              AND (
+                $10::text IS NULL
+                OR $11::text IS NULL
+                OR search_attributes->>$10 = $11
+                OR (
+                    jsonb_typeof(search_attributes->$10) = 'array'
+                    AND (search_attributes->$10) ? $11
+                )
+              )
             ORDER BY last_transition_at DESC, workflow_instance_id ASC, run_id DESC
-            LIMIT $8 OFFSET $9
+            LIMIT $12 OFFSET $13
             "#,
         )
         .bind(tenant_id)
@@ -4072,6 +4176,10 @@ impl WorkflowStore {
         .bind(filters.run_id.as_deref())
         .bind(filters.task_queue.as_deref())
         .bind(filters.query.as_deref())
+        .bind(filters.memo_key.as_deref())
+        .bind(filters.memo_value.as_deref())
+        .bind(filters.search_attribute_key.as_deref())
+        .bind(filters.search_attribute_value.as_deref())
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -4097,6 +4205,8 @@ impl WorkflowStore {
                 definition_version,
                 artifact_hash,
                 workflow_task_queue,
+                memo,
+                search_attributes,
                 sticky_workflow_build_id,
                 sticky_workflow_poller_id,
                 sticky_updated_at,
@@ -4621,6 +4731,40 @@ impl WorkflowStore {
         };
         Ok(record.artifact_hashes.is_empty()
             || record.artifact_hashes.iter().any(|candidate| candidate == artifact_hash))
+    }
+
+    pub async fn infer_workflow_task_queue_for_artifact(
+        &self,
+        tenant_id: &str,
+        artifact_hash: &str,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query(
+            r#"
+            SELECT builds.task_queue
+            FROM task_queue_builds builds
+            LEFT JOIN task_queue_compatibility_sets sets
+              ON sets.tenant_id = builds.tenant_id
+             AND sets.queue_kind = builds.queue_kind
+             AND sets.task_queue = builds.task_queue
+             AND sets.is_default = TRUE
+            WHERE builds.tenant_id = $1
+              AND builds.queue_kind = 'workflow'
+              AND builds.artifact_hashes ? $2
+            ORDER BY
+              CASE WHEN sets.set_id IS NULL THEN 1 ELSE 0 END ASC,
+              builds.updated_at DESC,
+              builds.task_queue ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(artifact_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to infer workflow task queue for artifact")?;
+
+        row.map(|row| row.try_get("task_queue").context("inferred workflow task_queue missing"))
+            .transpose()
     }
 
     pub async fn upsert_queue_poller(
@@ -12088,6 +12232,10 @@ impl WorkflowStore {
             workflow_task_queue: row
                 .try_get("workflow_task_queue")
                 .context("run workflow_task_queue missing")?,
+            memo: row.try_get("memo").context("run memo missing")?,
+            search_attributes: row
+                .try_get("search_attributes")
+                .context("run search_attributes missing")?,
             sticky_workflow_build_id: row
                 .try_get("sticky_workflow_build_id")
                 .context("run sticky_workflow_build_id missing")?,
@@ -12137,6 +12285,10 @@ impl WorkflowStore {
             workflow_task_queue: row
                 .try_get("workflow_task_queue")
                 .context("run summary workflow_task_queue missing")?,
+            memo: row.try_get("memo").context("run summary memo missing")?,
+            search_attributes: row
+                .try_get("search_attributes")
+                .context("run summary search_attributes missing")?,
             sticky_workflow_build_id: row
                 .try_get("sticky_workflow_build_id")
                 .context("run summary sticky_workflow_build_id missing")?,
@@ -13581,6 +13733,52 @@ mod tests {
         assert_eq!(updated.lease_poller_id.as_deref(), Some("poller-a"));
         assert_eq!(updated.lease_build_id.as_deref(), Some("build-a"));
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn infer_workflow_task_queue_prefers_default_compatible_queue_for_artifact() -> Result<()>
+    {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+
+        store
+            .register_task_queue_build(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "fallback",
+                "build-fallback",
+                &["artifact-a".to_owned()],
+                None,
+            )
+            .await?;
+        store
+            .register_task_queue_build(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "orders",
+                "build-orders",
+                &["artifact-a".to_owned()],
+                None,
+            )
+            .await?;
+        store
+            .upsert_compatibility_set(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "orders",
+                "stable",
+                &["build-orders".to_owned()],
+                true,
+            )
+            .await?;
+
+        let inferred =
+            store.infer_workflow_task_queue_for_artifact("tenant-a", "artifact-a").await?;
+
+        assert_eq!(inferred.as_deref(), Some("orders"));
         Ok(())
     }
 

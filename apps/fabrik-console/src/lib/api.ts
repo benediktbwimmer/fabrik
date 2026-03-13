@@ -15,6 +15,8 @@ export type WorkflowListItem = {
   definition_version: number | null;
   artifact_hash: string | null;
   workflow_task_queue: string;
+  memo: unknown;
+  search_attributes: unknown;
   sticky_workflow_build_id: string | null;
   sticky_workflow_poller_id: string | null;
   routing_status: string;
@@ -79,6 +81,8 @@ export type WorkflowInstance = {
   context: unknown;
   status: string;
   input: unknown;
+  memo: unknown;
+  search_attributes: unknown;
   output: unknown;
   event_count: number;
   last_event_id: string;
@@ -158,6 +162,8 @@ export type WorkflowRun = {
   next_run_id: string | null;
   continue_reason: string | null;
   workflow_task_queue: string;
+  memo: unknown;
+  search_attributes: unknown;
   sticky_workflow_build_id: string | null;
   sticky_workflow_poller_id: string | null;
   started_at: string;
@@ -181,6 +187,8 @@ export type RunListItem = {
   definition_version: number | null;
   artifact_hash: string | null;
   workflow_task_queue: string;
+  memo: unknown;
+  search_attributes: unknown;
   sticky_workflow_build_id: string | null;
   sticky_workflow_poller_id: string | null;
   routing_status: string;
@@ -221,6 +229,21 @@ export type WorkflowReplayResponse = {
   transition_count: number;
   replay_source: unknown;
   projection_matches_store: boolean | null;
+  snapshot?: {
+    run_id: string;
+    snapshot_schema_version: number;
+    event_count: number;
+    last_event_id: string;
+    last_event_type: string;
+    updated_at: string;
+  } | null;
+  replayed_state?: {
+    workflow_task_queue?: string;
+    memo?: unknown;
+    search_attributes?: unknown;
+    status?: string;
+    current_state?: string | null;
+  };
 };
 
 export type WorkflowRoutingResponse = {
@@ -362,6 +385,96 @@ export type ValidateWorkflowArtifactResponse = {
     failed_run_count: number;
     failures: ArtifactValidationFailure[];
   };
+};
+
+export type TrustSummaryReport = {
+  layer_id: string;
+  title: string;
+  purpose: string;
+  case_count: number;
+  passed_count: number;
+  failed_count: number;
+  report_path: string;
+  public_report_path: string;
+  failed_cases: Array<{
+    id: string;
+    title: string;
+    summary: string;
+    href: string;
+  }>;
+};
+
+export type TrustSummary = {
+  schema_version: number;
+  milestone_scope: string;
+  title: string;
+  goal: string;
+  generated_at: string;
+  status: string;
+  trusted_confidence_floor: string;
+  upgrade_confidence_floor: string;
+  reports: TrustSummaryReport[];
+  confidence_bands: Array<{
+    confidence_class: string;
+    count: number;
+    features: string[];
+  }>;
+  confidence_deltas?: Array<{
+    feature: string;
+    label: string;
+    declared_confidence_class: string;
+    derived_confidence_class: string;
+    confidence_status: string;
+  }>;
+  features?: Array<{
+    feature: string;
+    label: string;
+    milestone_status: string;
+    confidence_class: string;
+    declared_confidence_class?: string;
+    confidence_status?: string;
+    evidence?: {
+      support_layer_status?: string;
+      semantic_layer_status?: string;
+      trust_layer_status?: string;
+      upgrade_layer_status?: string;
+    };
+  }>;
+  headline_trusted_features: string[];
+  blocked_features: string[];
+  promotion_requirements: string[];
+  support_matrix_public_path?: string;
+};
+
+export type ConformanceCaseResult = {
+  id: string;
+  title: string;
+  kind: string;
+  status: string;
+  duration_ms: number;
+  summary?: string;
+  error?: string;
+  observed?: Record<string, unknown>;
+  evidence?: {
+    stdout_excerpt?: string | null;
+    stderr_excerpt?: string | null;
+    combined_excerpt?: string | null;
+    source_files?: string[];
+    state_count?: number;
+    finding_count?: number;
+    finding_features?: string[];
+  };
+};
+
+export type ConformanceReport = {
+  schema_version: number;
+  layer_id: string;
+  title: string;
+  purpose: string;
+  case_count: number;
+  passed_count: number;
+  failed_count: number;
+  results: ConformanceCaseResult[];
 };
 
 export type WorkflowGraphSourceAnchor = {
@@ -587,8 +700,12 @@ export const api = {
         ? `/tenants/${tenantId}/workflows/${instanceId}/runs/${runId}/signals`
         : `/tenants/${tenantId}/workflows/${instanceId}/signals`
     ),
-  getWorkflowReplay: (tenantId: string, instanceId: string) =>
-    request<WorkflowReplayResponse>(`/tenants/${tenantId}/workflows/${instanceId}/replay`),
+  getWorkflowReplay: (tenantId: string, instanceId: string, runId?: string) =>
+    request<WorkflowReplayResponse>(
+      runId
+        ? `/tenants/${tenantId}/workflows/${instanceId}/runs/${runId}/replay`
+        : `/tenants/${tenantId}/workflows/${instanceId}/replay`
+    ),
   getWorkflowRouting: (tenantId: string, instanceId: string) =>
     request<WorkflowRoutingResponse>(`/tenants/${tenantId}/workflows/${instanceId}/routing`),
   getExecutionGraph: (tenantId: string, instanceId: string) =>
@@ -596,6 +713,8 @@ export const api = {
   listTaskQueues: (tenantId: string) => request<TaskQueueListResponse>(`/admin/tenants/${tenantId}/task-queues`),
   getTaskQueue: (tenantId: string, queueKind: string, taskQueue: string) =>
     request<TaskQueueInspection>(`/admin/tenants/${tenantId}/task-queues/${queueKind}/${taskQueue}`),
+  getTrustSummary: () => request<TrustSummary>("/conformance-reports/trust-summary.json"),
+  getConformanceReport: (publicPath: string) => request<ConformanceReport>(publicPath),
   search: (tenantId: string, q: string, limit = 20) =>
     request<SearchResponse>(`/search?tenant_id=${tenantId}&q=${encodeURIComponent(q)}&limit=${limit}`),
   listDefinitionSummaries: (tenantId: string, q = "") =>

@@ -57,8 +57,9 @@ async fn main() -> Result<()> {
         GrpcServiceConfig::from_env("ACTIVITY_WORKER_SERVICE", "activity-worker-service", 50052)?;
     fabrik_service::init_tracing(&config.log_filter);
 
-    let endpoint = env::var("MATCHING_SERVICE_ENDPOINT")
-        .unwrap_or_else(|_| "http://127.0.0.1:50051".to_owned());
+    let endpoint = env::var("UNIFIED_RUNTIME_ENDPOINT")
+        .or_else(|_| env::var("MATCHING_SERVICE_ENDPOINT"))
+        .unwrap_or_else(|_| "http://127.0.0.1:50054".to_owned());
     let bulk_endpoint = env::var("BULK_ACTIVITY_ENDPOINT").unwrap_or_else(|_| endpoint.clone());
     let task_queue = env::var("ACTIVITY_TASK_QUEUE").unwrap_or_else(|_| "default".to_owned());
     let tenant_id = env::var("ACTIVITY_WORKER_TENANT_ID").unwrap_or_default();
@@ -105,7 +106,7 @@ async fn main() -> Result<()> {
     let payload_store = Arc::new(PayloadStore::from_config(build_payload_store_config()).await?);
 
     info!(
-        matching_endpoint = %endpoint,
+        runtime_endpoint = %endpoint,
         bulk_endpoint = %bulk_endpoint,
         task_queue = %task_queue,
         tenant_id = %tenant_id,

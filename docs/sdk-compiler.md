@@ -135,6 +135,15 @@ The intended development pattern is incremental:
 2. validate it with Temporal-style fixtures and benchmarks
 3. expand the subset until common Temporal workflows compile unchanged
 
+The trust milestone now has manifest-driven conformance entry points:
+
+- Layer A support fixtures: `sdk/typescript-compiler/conformance/layer-a-support-fixtures.json`
+- Layer B semantic fixtures: `sdk/typescript-compiler/conformance/layer-b-semantic-fixtures.json`
+- Runner: `node sdk/typescript-compiler/conformance-runner.mjs --layer <layer_id>`
+- Test entry point: `npm run test:conformance`
+
+The runner can also write machine-readable reports under `target/conformance-reports/`.
+
 ## Activity SDK Shape
 
 Activities are not compiled into workflow IR.

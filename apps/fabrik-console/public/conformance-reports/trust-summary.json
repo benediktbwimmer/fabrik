@@ -1,0 +1,521 @@
+{
+  "schema_version": 1,
+  "milestone_scope": "temporal_ts_subset_trust",
+  "title": "Temporal TS subset trust",
+  "goal": "Freeze and validate the Temporal TypeScript subset Fabrik can trust under replay, failover, and upgrade conditions.",
+  "generated_at": "2026-03-13T17:20:16.627Z",
+  "status": "passing",
+  "trusted_confidence_floor": "supported_failover_validated",
+  "upgrade_confidence_floor": "supported_upgrade_validated",
+  "reports": [
+    {
+      "layer_id": "layer_a_support",
+      "title": "Layer A: support fixtures",
+      "purpose": "Analyzer, compiler, import, and packaging correctness for the frozen Temporal TS subset.",
+      "case_count": 7,
+      "passed_count": 7,
+      "failed_count": 0,
+      "report_path": "target/conformance-reports/layer-a-support.json",
+      "public_report_path": "/conformance-reports/layer-a-support.json",
+      "failed_cases": []
+    },
+    {
+      "layer_id": "layer_b_semantic",
+      "title": "Layer B: semantic parity fixtures",
+      "purpose": "Compiled semantic artifact cases for the supported Temporal TS subset.",
+      "case_count": 9,
+      "passed_count": 9,
+      "failed_count": 0,
+      "report_path": "target/conformance-reports/layer-b-semantic.json",
+      "public_report_path": "/conformance-reports/layer-b-semantic.json",
+      "failed_cases": []
+    },
+    {
+      "layer_id": "layer_c_trust",
+      "title": "Layer C: trust and failure fixtures",
+      "purpose": "Restart, failover, replay, upgrade, and routing trust checks for the frozen Temporal TS subset.",
+      "case_count": 17,
+      "passed_count": 17,
+      "failed_count": 0,
+      "report_path": "target/conformance-reports/layer-c-trust.json",
+      "public_report_path": "/conformance-reports/layer-c-trust.json",
+      "failed_cases": []
+    }
+  ],
+  "confidence_bands": [
+    {
+      "confidence_class": "supported_failover_validated",
+      "count": 8,
+      "features": [
+        "Activity options and retries",
+        "Cancellation scopes",
+        "Child workflows",
+        "Conditions and timer waits",
+        "Continue-as-new",
+        "Proxy activities",
+        "Search attributes and memo",
+        "Signals, queries, and updates"
+      ]
+    },
+    {
+      "confidence_class": "supported_replay_validated",
+      "count": 2,
+      "features": [
+        "Async handlers",
+        "External workflow handles"
+      ]
+    },
+    {
+      "confidence_class": "supported_upgrade_validated",
+      "count": 2,
+      "features": [
+        "Version markers and workflow evolution",
+        "Worker builds and routing"
+      ]
+    },
+    {
+      "confidence_class": "supported",
+      "count": 1,
+      "features": [
+        "Worker bootstrap packaging"
+      ]
+    },
+    {
+      "confidence_class": "blocked",
+      "count": 3,
+      "features": [
+        "Interceptors and middleware",
+        "Payload and data converter usage",
+        "Unsupported Temporal APIs"
+      ]
+    }
+  ],
+  "headline_trusted_features": [
+    "Activity options and retries",
+    "Cancellation scopes",
+    "Child workflows",
+    "Conditions and timer waits",
+    "Continue-as-new",
+    "Proxy activities",
+    "Search attributes and memo",
+    "Signals, queries, and updates",
+    "Version markers and workflow evolution",
+    "Worker builds and routing"
+  ],
+  "blocked_features": [
+    "Interceptors and middleware",
+    "Payload and data converter usage",
+    "Unsupported Temporal APIs"
+  ],
+  "promotion_requirements": [
+    "analyzer support exists",
+    "support fixtures exist",
+    "semantic parity fixtures exist",
+    "replay validation exists",
+    "restart and failover coverage exists where relevant",
+    "migration report classification exists",
+    "operator evidence surfaces can explain the feature and its failure modes"
+  ],
+  "confidence_deltas": [],
+  "features": [
+    {
+      "feature": "proxy_activities",
+      "label": "Proxy activities",
+      "milestone_status": "supported",
+      "support_level": "native",
+      "confidence_class": "supported_failover_validated",
+      "replay_validation": true,
+      "deploy_validation": true,
+      "support_fixtures": true,
+      "semantic_fixtures": true,
+      "trust_fixtures": true,
+      "upgrade_fixtures": false,
+      "semantic_caveats": [
+        "static proxyActivities options only"
+      ],
+      "blocking_severity": "warning",
+      "declared_confidence_class": "supported_failover_validated",
+      "confidence_status": "declared_confirmed",
+      "evidence": {
+        "support_layer_status": "passing",
+        "semantic_layer_status": "passing",
+        "trust_layer_status": "passing",
+        "upgrade_layer_status": "passing"
+      }
+    },
+    {
+      "feature": "activity_options_and_retries",
+      "label": "Activity options and retries",
+      "milestone_status": "supported",
+      "support_level": "native",
+      "confidence_class": "supported_failover_validated",
+      "replay_validation": true,
+      "deploy_validation": true,
+      "support_fixtures": true,
+      "semantic_fixtures": true,
+      "trust_fixtures": true,
+      "upgrade_fixtures": false,
+      "semantic_caveats": [
+        "static retry and timeout literals only"
+      ],
+      "blocking_severity": "warning",
+      "declared_confidence_class": "supported_failover_validated",
+      "confidence_status": "declared_confirmed",
+      "evidence": {
+        "support_layer_status": "passing",
+        "semantic_layer_status": "passing",
+        "trust_layer_status": "passing",
+        "upgrade_layer_status": "passing"
+      }
+    },
+    {
+      "feature": "signals_queries_updates",
+      "label": "Signals, queries, and updates",
+      "milestone_status": "supported",
+      "support_level": "native",
+      "confidence_class": "supported_failover_validated",
+      "replay_validation": true,
+      "deploy_validation": true,
+      "support_fixtures": true,
+      "semantic_fixtures": true,
+      "trust_fixtures": true,
+      "upgrade_fixtures": false,
+      "semantic_caveats": [
+        "handler bodies must stay within the compiler subset"
+      ],
+      "blocking_severity": "warning",
+      "declared_confidence_class": "supported_failover_validated",
+      "confidence_status": "declared_confirmed",
+      "evidence": {
+        "support_layer_status": "passing",
+        "semantic_layer_status": "passing",
+        "trust_layer_status": "passing",
+        "upgrade_layer_status": "passing"
+      }
+    },
+    {
+      "feature": "async_handlers",
+      "label": "Async handlers",
+      "milestone_status": "supported",
+      "support_level": "native",
+      "confidence_class": "supported_replay_validated",
+      "replay_validation": true,
+      "deploy_validation": true,
+      "support_fixtures": true,
+      "semantic_fixtures": true,
+      "trust_fixtures": false,
+      "upgrade_fixtures": false,
+      "semantic_caveats": [
+        "async handlers must stay within the supported control-flow subset"
+      ],
+      "blocking_severity": "warning",
+      "declared_confidence_class": "supported_replay_validated",
+      "confidence_status": "declared_confirmed",
+      "evidence": {
+        "support_layer_status": "passing",
+        "semantic_layer_status": "passing",
+        "trust_layer_status": "passing",
+        "upgrade_layer_status": "passing"
+      }
+    },
+    {
+      "feature": "condition_waits",
+      "label": "Conditions and timer waits",
+      "milestone_status": "supported",
+      "support_level": "native",
+      "confidence_class": "supported_failover_validated",
+      "replay_validation": true,
+      "deploy_validation": true,
+      "support_fixtures": true,
+      "semantic_fixtures": true,
+      "trust_fixtures": true,
+      "upgrade_fixtures": false,
+      "semantic_caveats": [
+        "timeout arguments must remain static literals"
+      ],
+      "blocking_severity": "warning",
+      "declared_confidence_class": "supported_failover_validated",
+      "confidence_status": "declared_confirmed",
+      "evidence": {
+        "support_layer_status": "passing",
+        "semantic_layer_status": "passing",
+        "trust_layer_status": "passing",
+        "upgrade_layer_status": "passing"
+      }
+    },
+    {
+      "feature": "child_workflows",
+      "label": "Child workflows",
+      "milestone_status": "supported",
+      "support_level": "native",
+      "confidence_class": "supported_failover_validated",
+      "replay_validation": true,
+      "deploy_validation": true,
+      "support_fixtures": true,
+      "semantic_fixtures": true,
+      "trust_fixtures": true,
+      "upgrade_fixtures": false,
+      "semantic_caveats": [
+        "current support targets the existing compiler subset"
+      ],
+      "blocking_severity": "warning",
+      "declared_confidence_class": "supported_failover_validated",
+      "confidence_status": "declared_confirmed",
+      "evidence": {
+        "support_layer_status": "passing",
+        "semantic_layer_status": "passing",
+        "trust_layer_status": "passing",
+        "upgrade_layer_status": "passing"
+      }
+    },
+    {
+      "feature": "external_workflow_handles",
+      "label": "External workflow handles",
+      "milestone_status": "supported",
+      "support_level": "native",
+      "confidence_class": "supported_replay_validated",
+      "replay_validation": true,
+      "deploy_validation": false,
+      "support_fixtures": true,
+      "semantic_fixtures": true,
+      "trust_fixtures": false,
+      "upgrade_fixtures": false,
+      "semantic_caveats": [
+        "external-handle support is limited to the currently compiled subset"
+      ],
+      "blocking_severity": "warning",
+      "declared_confidence_class": "supported_replay_validated",
+      "confidence_status": "declared_confirmed",
+      "evidence": {
+        "support_layer_status": "passing",
+        "semantic_layer_status": "passing",
+        "trust_layer_status": "passing",
+        "upgrade_layer_status": "passing"
+      }
+    },
+    {
+      "feature": "cancellation_scopes",
+      "label": "Cancellation scopes",
+      "milestone_status": "supported",
+      "support_level": "native",
+      "confidence_class": "supported_failover_validated",
+      "replay_validation": true,
+      "deploy_validation": true,
+      "support_fixtures": true,
+      "semantic_fixtures": true,
+      "trust_fixtures": true,
+      "upgrade_fixtures": false,
+      "semantic_caveats": [
+        "current support covers the narrow Temporal-style patterns already compiled"
+      ],
+      "blocking_severity": "warning",
+      "declared_confidence_class": "supported_failover_validated",
+      "confidence_status": "declared_confirmed",
+      "evidence": {
+        "support_layer_status": "passing",
+        "semantic_layer_status": "passing",
+        "trust_layer_status": "passing",
+        "upgrade_layer_status": "passing"
+      }
+    },
+    {
+      "feature": "continue_as_new",
+      "label": "Continue-as-new",
+      "milestone_status": "supported",
+      "support_level": "native",
+      "confidence_class": "supported_failover_validated",
+      "replay_validation": true,
+      "deploy_validation": true,
+      "support_fixtures": true,
+      "semantic_fixtures": true,
+      "trust_fixtures": true,
+      "upgrade_fixtures": false,
+      "semantic_caveats": [],
+      "blocking_severity": "warning",
+      "declared_confidence_class": "supported_failover_validated",
+      "confidence_status": "declared_confirmed",
+      "evidence": {
+        "support_layer_status": "passing",
+        "semantic_layer_status": "passing",
+        "trust_layer_status": "passing",
+        "upgrade_layer_status": "passing"
+      }
+    },
+    {
+      "feature": "ctx_version_workflow_evolution",
+      "label": "Version markers and workflow evolution",
+      "milestone_status": "supported",
+      "support_level": "native",
+      "confidence_class": "supported_upgrade_validated",
+      "replay_validation": true,
+      "deploy_validation": true,
+      "support_fixtures": true,
+      "semantic_fixtures": true,
+      "trust_fixtures": true,
+      "upgrade_fixtures": true,
+      "semantic_caveats": [
+        "migration should map Temporal versioning patterns onto Fabrik version markers"
+      ],
+      "blocking_severity": "warning",
+      "declared_confidence_class": "supported_upgrade_validated",
+      "confidence_status": "declared_confirmed",
+      "evidence": {
+        "support_layer_status": "passing",
+        "semantic_layer_status": "passing",
+        "trust_layer_status": "passing",
+        "upgrade_layer_status": "passing"
+      }
+    },
+    {
+      "feature": "worker_build_ids_and_routing",
+      "label": "Worker builds and routing",
+      "milestone_status": "supported",
+      "support_level": "adapter",
+      "confidence_class": "supported_upgrade_validated",
+      "replay_validation": false,
+      "deploy_validation": true,
+      "support_fixtures": true,
+      "semantic_fixtures": false,
+      "trust_fixtures": true,
+      "upgrade_fixtures": true,
+      "semantic_caveats": [
+        "compiled workflows run on Fabrik runtime; activity builds are packaged separately"
+      ],
+      "blocking_severity": "warning",
+      "declared_confidence_class": "supported_upgrade_validated",
+      "confidence_status": "declared_confirmed",
+      "evidence": {
+        "support_layer_status": "passing",
+        "semantic_layer_status": "passing",
+        "trust_layer_status": "passing",
+        "upgrade_layer_status": "passing"
+      }
+    },
+    {
+      "feature": "worker_bootstrap_patterns",
+      "label": "Worker bootstrap packaging",
+      "milestone_status": "supported",
+      "support_level": "adapter",
+      "confidence_class": "supported",
+      "replay_validation": false,
+      "deploy_validation": true,
+      "support_fixtures": true,
+      "semantic_fixtures": false,
+      "trust_fixtures": false,
+      "upgrade_fixtures": false,
+      "semantic_caveats": [
+        "static Worker.create bootstraps are packaged; dynamic bootstraps are blocked"
+      ],
+      "blocking_severity": "warning",
+      "declared_confidence_class": "supported",
+      "confidence_status": "declared_confirmed",
+      "evidence": {
+        "support_layer_status": "passing",
+        "semantic_layer_status": "passing",
+        "trust_layer_status": "passing",
+        "upgrade_layer_status": "passing"
+      }
+    },
+    {
+      "feature": "search_attributes_memo",
+      "label": "Search attributes and memo",
+      "milestone_status": "supported",
+      "support_level": "adapter",
+      "confidence_class": "supported_failover_validated",
+      "replay_validation": true,
+      "deploy_validation": true,
+      "support_fixtures": true,
+      "semantic_fixtures": false,
+      "trust_fixtures": true,
+      "upgrade_fixtures": false,
+      "semantic_caveats": [
+        "alpha support is limited to start-time memo objects and top-level search attributes with static string or string-array values plus exact-match visibility filters"
+      ],
+      "blocking_severity": "warning",
+      "declared_confidence_class": "supported_failover_validated",
+      "confidence_status": "declared_confirmed",
+      "evidence": {
+        "support_layer_status": "passing",
+        "semantic_layer_status": "passing",
+        "trust_layer_status": "passing",
+        "upgrade_layer_status": "passing"
+      }
+    },
+    {
+      "feature": "payload_data_converter_usage",
+      "label": "Payload and data converter usage",
+      "milestone_status": "blocked",
+      "support_level": "blocked",
+      "confidence_class": "blocked",
+      "replay_validation": false,
+      "deploy_validation": false,
+      "support_fixtures": true,
+      "semantic_fixtures": false,
+      "trust_fixtures": false,
+      "upgrade_fixtures": false,
+      "semantic_caveats": [
+        "custom payload conversion and codec behavior are blocked by default"
+      ],
+      "blocking_severity": "hard_block",
+      "declared_confidence_class": "blocked",
+      "confidence_status": "declared_confirmed",
+      "evidence": {
+        "support_layer_status": "passing",
+        "semantic_layer_status": "passing",
+        "trust_layer_status": "passing",
+        "upgrade_layer_status": "passing"
+      }
+    },
+    {
+      "feature": "interceptors_middleware",
+      "label": "Interceptors and middleware",
+      "milestone_status": "blocked",
+      "support_level": "blocked",
+      "confidence_class": "blocked",
+      "replay_validation": false,
+      "deploy_validation": false,
+      "support_fixtures": true,
+      "semantic_fixtures": false,
+      "trust_fixtures": false,
+      "upgrade_fixtures": false,
+      "semantic_caveats": [
+        "interceptor behavior is not migration-ready yet"
+      ],
+      "blocking_severity": "hard_block",
+      "declared_confidence_class": "blocked",
+      "confidence_status": "declared_confirmed",
+      "evidence": {
+        "support_layer_status": "passing",
+        "semantic_layer_status": "passing",
+        "trust_layer_status": "passing",
+        "upgrade_layer_status": "passing"
+      }
+    },
+    {
+      "feature": "unsupported_temporal_api",
+      "label": "Unsupported Temporal APIs",
+      "milestone_status": "blocked",
+      "support_level": "blocked",
+      "confidence_class": "blocked",
+      "replay_validation": false,
+      "deploy_validation": false,
+      "support_fixtures": true,
+      "semantic_fixtures": false,
+      "trust_fixtures": false,
+      "upgrade_fixtures": false,
+      "semantic_caveats": [
+        "unsupported Temporal APIs block migration until explicitly implemented"
+      ],
+      "blocking_severity": "hard_block",
+      "declared_confidence_class": "blocked",
+      "confidence_status": "declared_confirmed",
+      "evidence": {
+        "support_layer_status": "passing",
+        "semantic_layer_status": "passing",
+        "trust_layer_status": "passing",
+        "upgrade_layer_status": "passing"
+      }
+    }
+  ],
+  "support_matrix_public_path": "/conformance-reports/support-matrix-derived.json"
+}

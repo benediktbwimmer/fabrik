@@ -126,7 +126,6 @@ pub struct QueryRuntimeConfig {
     pub max_page_size: usize,
     pub throughput_payload_store: ThroughputPayloadStoreConfig,
     pub strong_query_unified_url: Option<String>,
-    pub strong_query_executor_url: Option<String>,
     pub history_retention_days: Option<u64>,
     pub run_retention_days: Option<u64>,
     pub activity_retention_days: Option<u64>,
@@ -348,7 +347,7 @@ impl ThroughputOwnershipConfig {
             )?,
             partition_id_offset: read_i32_with_default(
                 "THROUGHPUT_OWNERSHIP_PARTITION_ID_OFFSET",
-                1_000_000,
+                2_000_000,
             )?,
         })
     }
@@ -393,10 +392,6 @@ impl QueryRuntimeConfig {
             strong_query_unified_url: Some(read_string_with_default(
                 "QUERY_STRONG_QUERY_UNIFIED_URL",
                 "http://127.0.0.1:3008",
-            )?),
-            strong_query_executor_url: Some(read_string_with_default(
-                "QUERY_STRONG_QUERY_EXECUTOR_URL",
-                "http://127.0.0.1:3002",
             )?),
             history_retention_days: read_optional_u64("QUERY_HISTORY_RETENTION_DAYS")?,
             run_retention_days: read_optional_u64("QUERY_RUN_RETENTION_DAYS")?,
@@ -744,12 +739,21 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use super::HttpServiceConfig;
+    use super::{HttpServiceConfig, ThroughputOwnershipConfig};
 
     #[test]
     fn falls_back_to_default_port() {
         let config = HttpServiceConfig::from_env("FABRIK_TEST", "test-service", 4100).unwrap();
         assert_eq!(config.port, 4100);
         assert_eq!(config.name, "test-service");
+    }
+
+    #[test]
+    fn throughput_ownership_uses_non_overlapping_default_offset() {
+        unsafe {
+            std::env::remove_var("THROUGHPUT_OWNERSHIP_PARTITION_ID_OFFSET");
+        }
+        let config = ThroughputOwnershipConfig::from_env().unwrap();
+        assert_eq!(config.partition_id_offset, 2_000_000);
     }
 }

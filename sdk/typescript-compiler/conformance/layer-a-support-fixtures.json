@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "layer_id": "layer_a_support",
+  "title": "Layer A: support fixtures",
+  "purpose": "Analyzer, compiler, import, and packaging correctness for the frozen Temporal TS subset.",
+  "cases": [
+    {
+      "id": "analyzer-supported-project",
+      "kind": "analyzer",
+      "project": "crates/fabrik-cli/test-fixtures/temporal-supported",
+      "expect": {
+        "summary": {
+          "workflow_count": 1,
+          "worker_count": 1,
+          "hard_block_count": 0
+        },
+        "workflow_exports_include": ["orderWorkflow"],
+        "worker_task_queues_include": ["orders"],
+        "finding_features_exclude": ["payload_data_converter_usage", "visibility_search_usage", "unsupported_temporal_api"]
+      }
+    },
+    {
+      "id": "analyzer-payload-blocked",
+      "kind": "analyzer",
+      "project": "crates/fabrik-cli/test-fixtures/temporal-payload-blocked",
+      "expect": {
+        "summary": {
+          "hard_block_count": 2
+        },
+        "finding_features_include": ["payload_data_converter_usage"]
+      }
+    },
+    {
+      "id": "analyzer-visibility-blocked",
+      "kind": "analyzer",
+      "project": "crates/fabrik-cli/test-fixtures/temporal-visibility-blocked",
+      "expect": {
+        "summary": {
+          "hard_block_count": 2
+        },
+        "finding_features_include": ["visibility_search_usage"]
+      }
+    },
+    {
+      "id": "analyzer-dynamic-bootstrap-blocked",
+      "kind": "analyzer",
+      "project": "crates/fabrik-cli/test-fixtures/temporal-dynamic-bootstrap-blocked",
+      "expect": {
+        "summary": {
+          "hard_block_count": 1
+        },
+        "finding_codes_include": ["dynamic_worker_bootstrap"]
+      }
+    },
+    {
+      "id": "analyzer-unsupported-api-blocked",
+      "kind": "analyzer",
+      "project": "crates/fabrik-cli/test-fixtures/temporal-unsupported-api-blocked",
+      "expect": {
+        "summary": {
+          "hard_block_count": 1
+        },
+        "finding_features_include": ["unsupported_temporal_api"]
+      }
+    },
+    {
+      "id": "compiler-valid-source-map",
+      "kind": "compiler",
+      "entry": "sdk/typescript-compiler/test-fixtures/valid-workflow.ts",
+      "export_name": "validWorkflow",
+      "definition_id": "valid-workflow",
+      "version": 1,
+      "expect": {
+        "artifact_equals": {
+          "definition_id": "valid-workflow"
+        },
+        "source_files_include": ["valid-helper.ts"],
+        "serialized_matches": ["\"source_map\"", "\"source_files\""]
+      }
+    },
+    {
+      "id": "compiler-invalid-global-blocked",
+      "kind": "compiler_error",
+      "entry": "sdk/typescript-compiler/test-fixtures/invalid-global.ts",
+      "export_name": "invalidGlobalWorkflow",
+      "definition_id": "invalid-global",
+      "version": 1,
+      "expect": {
+        "error_matches": ["unsupported global access", "invalid-global\\.ts:\\d+:\\d+"]
+      }
+    }
+  ]
+}

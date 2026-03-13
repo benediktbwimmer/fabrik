@@ -40,11 +40,19 @@ fn supported_project_compiles_and_packages() {
     let (status, report) = run_cli(&fixture("temporal-supported"), &output_dir, &[]);
     assert!(status.success(), "stderr: {:?}", report);
     assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["milestone_scope"], "temporal_ts_subset_trust");
     assert_eq!(report["validation"]["source_compatibility_preflight"]["status"], "passed");
     assert_eq!(report["validation"]["workflow_compile_validation"]["status"], "passed");
     assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
     assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
     assert!(report["worker_packages"][0]["resolved_activity_module_path"].is_string());
+    assert_eq!(report["trust"]["support_summary"]["headline_trusted_feature_count"], 9);
+    let generated = report["generated_artifacts"].as_array().expect("generated artifacts");
+    assert!(generated.iter().any(|artifact| artifact["kind"] == "alpha_qualification"));
+    assert!(generated.iter().any(|artifact| artifact["kind"] == "equivalence_contract"));
+    assert!(generated.iter().any(|artifact| artifact["kind"] == "conformance_manifest"));
+    assert!(generated.iter().any(|artifact| artifact["kind"] == "trust_summary"));
 }
 
 #[test]
@@ -63,7 +71,22 @@ fn payload_converter_usage_blocks_migration() {
     let (status, report) = run_cli(&fixture("temporal-payload-blocked"), &output_dir, &[]);
     assert_eq!(status.code(), Some(2));
     assert_eq!(report["status"], "incompatible_blocked");
+    assert_eq!(report["alpha_qualification"]["verdict"], "blocked");
     assert_eq!(report["validation"]["payload_data_converter_validation"]["status"], "blocked");
+    assert!(
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .any(|finding| finding["feature"] == "payload_data_converter_usage")
+    );
+    assert!(
+        report["alpha_qualification"]["blocker_categories"]
+            .as_array()
+            .expect("blocker categories")
+            .iter()
+            .any(|group| group["category"] == "unsupported_api")
+    );
 }
 
 #[test]
@@ -72,7 +95,15 @@ fn visibility_usage_blocks_migration() {
     let (status, report) = run_cli(&fixture("temporal-visibility-blocked"), &output_dir, &[]);
     assert_eq!(status.code(), Some(2));
     assert_eq!(report["status"], "incompatible_blocked");
+    assert_eq!(report["alpha_qualification"]["verdict"], "blocked");
     assert_eq!(report["validation"]["visibility_search_validation"]["status"], "blocked");
+    assert!(
+        report["alpha_qualification"]["blocker_categories"]
+            .as_array()
+            .expect("blocker categories")
+            .iter()
+            .any(|group| group["category"] == "unsupported_visibility_search_usage")
+    );
 }
 
 #[test]
@@ -83,6 +114,13 @@ fn dynamic_worker_bootstrap_blocks_migration() {
     assert_eq!(status.code(), Some(2));
     assert_eq!(report["status"], "incompatible_blocked");
     assert_eq!(report["validation"]["source_compatibility_preflight"]["status"], "blocked");
+    assert!(
+        report["alpha_qualification"]["blocker_categories"]
+            .as_array()
+            .expect("blocker categories")
+            .iter()
+            .any(|group| group["category"] == "unsupported_packaging_bootstrap")
+    );
 }
 
 #[test]
@@ -93,4 +131,11 @@ fn unsupported_temporal_api_blocks_migration() {
     assert_eq!(report["status"], "incompatible_blocked");
     let findings = report["findings"].as_array().expect("findings array");
     assert!(findings.iter().any(|finding| finding["feature"] == "unsupported_temporal_api"));
+    assert!(
+        report["alpha_qualification"]["blocker_categories"]
+            .as_array()
+            .expect("blocker categories")
+            .iter()
+            .any(|group| group["category"] == "unsupported_api")
+    );
 }

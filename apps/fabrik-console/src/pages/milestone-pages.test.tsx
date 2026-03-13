@@ -8,6 +8,195 @@ import { AppProviders } from "../providers";
 
 const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
   const url = String(input);
+  if (url.includes("/conformance-reports/trust-summary.json")) {
+    return new Response(
+      JSON.stringify({
+        schema_version: 1,
+        milestone_scope: "temporal_ts_subset_trust",
+        title: "Temporal TS subset trust",
+        goal: "Prove the frozen Temporal TypeScript subset is deterministic, replay-safe, and operationally trustworthy in the lab.",
+        generated_at: "2026-03-13T12:00:00Z",
+        status: "failing",
+        trusted_confidence_floor: "supported_failover_validated",
+        upgrade_confidence_floor: "supported_upgrade_validated",
+        reports: [
+          {
+            layer_id: "layer_a_support",
+            title: "Layer A: support fixtures",
+            purpose: "Analyzer, compiler, import, and packaging correctness for the frozen Temporal TS subset.",
+            case_count: 7,
+            passed_count: 7,
+            failed_count: 0,
+            report_path: "target/conformance-reports/layer-a-support.json",
+            public_report_path: "/conformance-reports/layer-a-support.json",
+            failed_cases: []
+          },
+          {
+            layer_id: "layer_b_semantic",
+            title: "Layer B: semantic parity fixtures",
+            purpose: "Compiled semantic artifact cases for the supported Temporal TS subset.",
+            case_count: 9,
+            passed_count: 9,
+            failed_count: 0,
+            report_path: "target/conformance-reports/layer-b-semantic.json",
+            public_report_path: "/conformance-reports/layer-b-semantic.json",
+            failed_cases: []
+          },
+          {
+            layer_id: "layer_c_trust",
+            title: "Layer C: trust and failure fixtures",
+            purpose: "Restart, failover, replay, upgrade, and routing trust checks for the frozen Temporal TS subset.",
+            case_count: 8,
+            passed_count: 7,
+            failed_count: 1,
+            report_path: "target/conformance-reports/layer-c-trust.json",
+            public_report_path: "/conformance-reports/layer-c-trust.json",
+            failed_cases: [
+              {
+                id: "store-reconciles-stale-resume-backlog",
+                title: "Store reconciles stale resume backlog",
+                summary: "duplicate delivery reconciliation regressed during the trust drill",
+                href: "/conformance?layer=layer_c_trust&case=store-reconciles-stale-resume-backlog"
+              }
+            ]
+          }
+        ],
+        confidence_bands: [
+          {
+            confidence_class: "supported_failover_validated",
+            count: 6,
+            features: ["Proxy activities", "Signals, queries, and updates"]
+          },
+          {
+            confidence_class: "supported_upgrade_validated",
+            count: 2,
+            features: ["Version markers and workflow evolution", "Worker builds and routing"]
+          }
+        ],
+        headline_trusted_features: ["Version markers and workflow evolution", "Worker builds and routing"],
+        blocked_features: ["Payload and data converter usage"],
+        promotion_requirements: ["analyzer support exists", "support fixtures exist"]
+      }),
+      { status: 200 }
+    );
+  }
+  if (url.includes("/conformance-reports/layer-a-support.json")) {
+    return new Response(
+      JSON.stringify({
+        schema_version: 1,
+        layer_id: "layer_a_support",
+        title: "Layer A: support fixtures",
+        purpose: "Analyzer, compiler, import, and packaging correctness for the frozen Temporal TS subset.",
+        case_count: 2,
+        passed_count: 2,
+        failed_count: 0,
+        results: [
+          {
+            id: "proxy-activities-supported",
+            title: "Proxy activities supported",
+            kind: "analyzer",
+            status: "passed",
+            duration_ms: 12,
+            summary: "workflows=1 workers=1 hard_blocks=0",
+            observed: { workflow_count: 1 },
+            evidence: { finding_count: 0, finding_features: [] }
+          },
+          {
+            id: "payload-converter-blocked",
+            title: "Payload converter blocked",
+            kind: "analyzer",
+            status: "passed",
+            duration_ms: 16,
+            summary: "workflows=1 workers=0 hard_blocks=1",
+            observed: { hard_block_count: 1 },
+            evidence: { finding_count: 1, finding_features: ["payload_converter"] }
+          }
+        ]
+      }),
+      { status: 200 }
+    );
+  }
+  if (url.includes("/conformance-reports/layer-b-semantic.json")) {
+    return new Response(
+      JSON.stringify({
+        schema_version: 1,
+        layer_id: "layer_b_semantic",
+        title: "Layer B: semantic parity fixtures",
+        purpose: "Compiled semantic artifact cases for the supported Temporal TS subset.",
+        case_count: 2,
+        passed_count: 2,
+        failed_count: 0,
+        results: [
+          {
+            id: "signals-queries-updates",
+            title: "Signals, queries, and updates",
+            kind: "compiler",
+            status: "passed",
+            duration_ms: 22,
+            summary: "definition=payments source_files=1",
+            observed: { definition_id: "payments" },
+            evidence: { source_files: ["workflows/payments.ts"], state_count: 4 }
+          },
+          {
+            id: "continue-as-new",
+            title: "Continue-as-new",
+            kind: "compiler",
+            status: "passed",
+            duration_ms: 19,
+            summary: "definition=handoff source_files=1",
+            observed: { definition_id: "handoff" },
+            evidence: { source_files: ["workflows/handoff.ts"], state_count: 3 }
+          }
+        ]
+      }),
+      { status: 200 }
+    );
+  }
+  if (url.includes("/conformance-reports/layer-c-trust.json")) {
+    return new Response(
+      JSON.stringify({
+        schema_version: 1,
+        layer_id: "layer_c_trust",
+        title: "Layer C: trust and failure fixtures",
+        purpose: "Restart, failover, replay, upgrade, and routing trust checks for the frozen Temporal TS subset.",
+        case_count: 2,
+        passed_count: 1,
+        failed_count: 1,
+        results: [
+          {
+            id: "workflow-compatibility-accepts-version-guarded-change",
+            title: "Workflow compatibility accepts version-guarded change",
+            kind: "command",
+            status: "passed",
+            duration_ms: 242,
+            summary: "test result: ok. 1 passed; 0 failed",
+            observed: {
+              command: "cargo test -p fabrik-workflow compiled_artifact_compatibility_accepts_version_marker_guarded_change -- --exact"
+            },
+            evidence: {
+              combined_excerpt: "test result: ok. 1 passed; 0 failed"
+            }
+          },
+          {
+            id: "store-reconciles-stale-resume-backlog",
+            title: "Store reconciles stale resume backlog",
+            kind: "command",
+            status: "failed",
+            duration_ms: 8718,
+            summary: "test result: FAILED. 0 passed; 1 failed",
+            error: "Command failed: cargo test -p fabrik-store complete_workflow_task_reconciles_stale_resume_backlog -- --exact",
+            observed: {
+              command: "cargo test -p fabrik-store complete_workflow_task_reconciles_stale_resume_backlog -- --exact"
+            },
+            evidence: {
+              combined_excerpt: "running 1 test\nstore reconciliation backlog assertion failed\ntest result: FAILED. 0 passed; 1 failed"
+            }
+          }
+        ]
+      }),
+      { status: 200 }
+    );
+  }
   if (url.includes("/tenants/tenant-a/workflow-definitions/payments/graph")) {
     return new Response(
       JSON.stringify({
@@ -720,8 +909,12 @@ test("shows routing status on overview recent failures", async () => {
   renderApp("/");
 
   await waitFor(() => expect(screen.getByText("sticky_incompatible_fallback_required")).toBeInTheDocument());
+  await waitFor(() => expect(screen.getByText("Layer A: support fixtures")).toBeInTheDocument());
   expect(screen.getByText("sticky_incompatible_fallback_required")).toBeInTheDocument();
   expect(screen.getByRole("link", { name: "Inspect" })).toHaveAttribute("href", "/runs/instance-failed/run-failed");
+  expect(screen.getByText("Temporal TS subset trust")).toBeInTheDocument();
+  expect(screen.getByText("Layer A: support fixtures")).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: /Workflow definitions/ })).toHaveAttribute("href", "/workflows");
 });
 
 test("disables safe actions for a historical run detail", async () => {
@@ -747,6 +940,36 @@ test("keeps task queue inspection read-only", async () => {
   expect(screen.getAllByText("payments").length).toBeGreaterThan(0);
   expect(screen.queryByText("Promote default")).not.toBeInTheDocument();
   expect(screen.queryByText("stream-v2")).not.toBeInTheDocument();
+});
+
+test("keeps build routing surfaces read-only", async () => {
+  renderApp("/builds?queue_kind=workflow&task_queue=payments");
+
+  await waitFor(() => expect(screen.getByRole("heading", { name: "Builds & Routing" })).toBeInTheDocument());
+  await waitFor(() => expect(screen.getByText("Layer C: trust and failure fixtures")).toBeInTheDocument());
+  expect(screen.getByText("Trust evidence")).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Register build" })).not.toBeInTheDocument();
+  expect(screen.getByText("Upgrade-sensitive features")).toBeInTheDocument();
+  expect(screen.getByText(/Version markers and workflow evolution/)).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: /Store reconciles stale resume backlog/ })).toHaveAttribute(
+    "href",
+    "/conformance?layer=layer_c_trust&case=store-reconciles-stale-resume-backlog"
+  );
+});
+
+test("renders conformance drill-down evidence", async () => {
+  renderApp("/conformance?layer=layer_c_trust&case=store-reconciles-stale-resume-backlog");
+
+  await waitFor(() => expect(screen.getByRole("heading", { name: "Conformance" })).toBeInTheDocument());
+  await waitFor(() => expect(screen.getByRole("heading", { name: "Store reconciles stale resume backlog" })).toBeInTheDocument());
+  expect(screen.getByRole("link", { name: /Layer C: trust and failure fixtures/ })).toHaveAttribute(
+    "href",
+    "/conformance?layer=layer_c_trust"
+  );
+  expect(screen.getAllByText("test result: FAILED. 0 passed; 1 failed").length).toBeGreaterThan(0);
+  expect(screen.getByText(/running 1 test/)).toBeInTheDocument();
+  expect(screen.getAllByText(/complete_workflow_task_reconciles_stale_resume_backlog/).length).toBeGreaterThan(0);
+  expect(screen.getByRole("link", { name: "Raw JSON" })).toHaveAttribute("href", "/conformance-reports/layer-c-trust.json");
 });
 
 test("renders workflow definition graph explorer", async () => {

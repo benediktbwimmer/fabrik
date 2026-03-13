@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "layer_id": "layer_b_semantic",
+  "title": "Layer B: semantic parity fixtures",
+  "purpose": "Compiled semantic artifact cases for the supported Temporal TS subset.",
+  "cases": [
+    {
+      "id": "proxy-activities-and-retries",
+      "kind": "compiler",
+      "entry": "sdk/typescript-compiler/test-fixtures/temporal-compatible-workflow.ts",
+      "export_name": "temporalCompatibleWorkflow",
+      "definition_id": "temporal-compatible-workflow",
+      "version": 1,
+      "expect": {
+        "serialized_matches": [
+          "\"type\":\"wait_for_timer\"",
+          "\"handler\":\"benchmarkEcho\"",
+          "\"max_attempts\":3",
+          "\"non_retryable_error_types\"",
+          "\"ValidationError\"",
+          "\"FatalError\""
+        ]
+      }
+    },
+    {
+      "id": "continue-as-new",
+      "kind": "compiler",
+      "entry": "sdk/typescript-compiler/test-fixtures/temporal-compatible-workflow.ts",
+      "export_name": "temporalContinueAsNewWorkflow",
+      "definition_id": "temporal-continue-as-new-workflow",
+      "version": 1,
+      "expect": {
+        "serialized_matches": [
+          "\"type\":\"continue_as_new\"",
+          "\"handler\":\"benchmarkEcho\""
+        ]
+      }
+    },
+    {
+      "id": "queries-updates-and-handlers",
+      "kind": "compiler",
+      "entry": "sdk/typescript-compiler/test-fixtures/temporal-query-update-workflow.ts",
+      "export_name": "temporalQueryUpdateWorkflow",
+      "definition_id": "temporal-query-update-workflow",
+      "version": 1,
+      "expect": {
+        "serialized_matches": [
+          "\"queries\"",
+          "\"updates\"",
+          "\"approve\"",
+          "\"summary\"",
+          "\"type\":\"start_child\"",
+          "\"type\":\"wait_for_child\""
+        ]
+      }
+    },
+    {
+      "id": "signals-and-conditions",
+      "kind": "compiler",
+      "entry": "sdk/typescript-compiler/test-fixtures/temporal-signal-condition-workflow.ts",
+      "export_name": "temporalSignalConditionWorkflow",
+      "definition_id": "temporal-signal-condition-workflow",
+      "version": 1,
+      "expect": {
+        "serialized_matches": [
+          "\"signals\"",
+          "\"approved\"",
+          "\"type\":\"wait_for_condition\""
+        ]
+      }
+    },
+    {
+      "id": "async-signal-handler",
+      "kind": "compiler",
+      "entry": "sdk/typescript-compiler/test-fixtures/temporal-async-signal-workflow.ts",
+      "export_name": "temporalAsyncSignalWorkflow",
+      "definition_id": "temporal-async-signal-workflow",
+      "version": 1,
+      "expect": {
+        "serialized_matches": [
+          "\"signals\"",
+          "\"type\":\"step\"",
+          "\"type\":\"succeed\""
+        ]
+      }
+    },
+    {
+      "id": "child-workflows",
+      "kind": "compiler",
+      "entry": "sdk/typescript-compiler/test-fixtures/temporal-child-workflow.ts",
+      "export_name": "temporalChildWorkflow",
+      "definition_id": "temporal-child-workflow",
+      "version": 1,
+      "expect": {
+        "serialized_matches": [
+          "\"type\":\"start_child\"",
+          "\"type\":\"wait_for_child\""
+        ]
+      }
+    },
+    {
+      "id": "external-workflow-handles",
+      "kind": "compiler",
+      "entry": "sdk/typescript-compiler/test-fixtures/temporal-external-workflow-handle-workflow.ts",
+      "export_name": "temporalExternalWorkflowHandleWorkflow",
+      "definition_id": "temporal-external-workflow-handle-workflow",
+      "version": 1,
+      "expect": {
+        "serialized_matches": [
+          "\"type\":\"signal_external\"",
+          "\"type\":\"cancel_external\"",
+          "\"target_instance_id\"",
+          "\"target_run_id\""
+        ]
+      }
+    },
+    {
+      "id": "cancellation-scopes",
+      "kind": "compiler",
+      "entry": "sdk/typescript-compiler/test-fixtures/temporal-cancellation-scope-workflow.ts",
+      "export_name": "temporalCancellationScopeWorkflow",
+      "definition_id": "temporal-cancellation-scope-workflow",
+      "version": 1,
+      "expect": {
+        "serialized_matches": [
+          "\"handler\":\"benchmarkEcho\"",
+          "\"on_error\"",
+          "\"__temporal_is_cancellation\""
+        ]
+      }
+    },
+    {
+      "id": "version-markers",
+      "kind": "compiler",
+      "entry": "sdk/typescript-compiler/test-fixtures/version-workflow.ts",
+      "export_name": "versionWorkflow",
+      "definition_id": "version-workflow",
+      "version": 1,
+      "expect": {
+        "serialized_matches": [
+          "\"kind\":\"version\"",
+          "\"change_id\":\"feature-x\"",
+          "\"min_supported\":1",
+          "\"max_supported\":3"
+        ]
+      }
+    }
+  ]
+}

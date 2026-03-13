@@ -50,8 +50,17 @@ pub struct SourceLocation {
 pub struct CompiledWorkflow {
     pub initial_state: String,
     pub states: BTreeMap<String, CompiledStateNode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<CompiledWorkflowParam>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub non_cancellable_states: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompiledWorkflowParam {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Expression>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -695,8 +704,7 @@ impl CompiledWorkflowArtifact {
         turn_context: ExecutionTurnContext,
     ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
         let mut execution_state = ArtifactExecutionState::default();
-        execution_state.bindings.insert("input".to_owned(), input.clone());
-        execution_state.turn_context = Some(turn_context);
+        self.bind_workflow_input(input, &mut execution_state, turn_context)?;
         self.execute_from_state(&self.workflow.initial_state, execution_state, true)
     }
 
@@ -706,9 +714,34 @@ impl CompiledWorkflowArtifact {
         mut execution_state: ArtifactExecutionState,
         turn_context: ExecutionTurnContext,
     ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
+        self.bind_workflow_input(input, &mut execution_state, turn_context)?;
+        self.execute_from_state(&self.workflow.initial_state, execution_state, true)
+    }
+
+    fn bind_workflow_input(
+        &self,
+        input: &Value,
+        execution_state: &mut ArtifactExecutionState,
+        turn_context: ExecutionTurnContext,
+    ) -> Result<(), CompiledWorkflowError> {
         execution_state.bindings.insert("input".to_owned(), input.clone());
         execution_state.turn_context = Some(turn_context);
-        self.execute_from_state(&self.workflow.initial_state, execution_state, true)
+
+        let args = match input {
+            Value::Array(items) => items.clone(),
+            value => vec![value.clone()],
+        };
+        for (index, param) in self.workflow.params.iter().enumerate() {
+            let value = match args.get(index) {
+                Some(value) => value.clone(),
+                None => match &param.default {
+                    Some(default) => evaluate_expression(default, execution_state, &self.helpers)?,
+                    None => Value::Null,
+                },
+            };
+            execution_state.bindings.insert(param.name.clone(), value);
+        }
+        Ok(())
     }
 
     pub fn execute_after_signal(
@@ -3582,6 +3615,7 @@ mod tests {
                     },
                 ),
             ]),
+            params: Vec::new(),
             non_cancellable_states: BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -3613,6 +3647,7 @@ mod tests {
                     output_var: None,
                 },
             )]),
+            params: Vec::new(),
             non_cancellable_states: BTreeSet::new(),
         };
         let updates = BTreeMap::from([(
@@ -3673,6 +3708,7 @@ mod tests {
                     next: "done".to_owned(),
                 },
             )]),
+            params: Vec::new(),
             non_cancellable_states: BTreeSet::new(),
         };
         let signals = BTreeMap::from([(
@@ -3727,6 +3763,7 @@ mod tests {
                     },
                 ),
             ]),
+            params: Vec::new(),
             non_cancellable_states: BTreeSet::new(),
         };
         let signals = BTreeMap::from([(
@@ -3822,6 +3859,7 @@ mod tests {
                     },
                 ),
             ]),
+            params: Vec::new(),
             non_cancellable_states: BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -3912,6 +3950,7 @@ mod tests {
                     },
                 ),
             ]),
+            params: Vec::new(),
             non_cancellable_states: BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -3945,6 +3984,62 @@ mod tests {
             plan.emissions.last(),
             Some(ExecutionEmission { event: WorkflowEvent::ActivityTaskScheduled { activity_id, .. }, .. })
             if activity_id == "step"
+        ));
+    }
+
+    #[test]
+    fn execute_trigger_binds_workflow_params_and_defaults() {
+        let artifact = CompiledWorkflowArtifact::new(
+            "workflow-params",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "done".to_owned(),
+                states: BTreeMap::from([(
+                    "done".to_owned(),
+                    CompiledStateNode::Succeed {
+                        output: Some(Expression::Object {
+                            fields: BTreeMap::from([
+                                (
+                                    "name".to_owned(),
+                                    Expression::Identifier { name: "name".to_owned() },
+                                ),
+                                (
+                                    "punctuation".to_owned(),
+                                    Expression::Identifier { name: "punctuation".to_owned() },
+                                ),
+                                (
+                                    "input".to_owned(),
+                                    Expression::Identifier { name: "input".to_owned() },
+                                ),
+                            ]),
+                        }),
+                    },
+                )]),
+                params: vec![
+                    CompiledWorkflowParam { name: "name".to_owned(), default: None },
+                    CompiledWorkflowParam {
+                        name: "punctuation".to_owned(),
+                        default: Some(Expression::Literal { value: json!("!") }),
+                    },
+                ],
+                non_cancellable_states: BTreeSet::new(),
+            },
+        );
+
+        let plan = artifact.execute_trigger(&json!(["fiona"])).unwrap();
+
+        assert!(matches!(
+            plan.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output == &json!({
+                "name": "fiona",
+                "punctuation": "!",
+                "input": ["fiona"],
+            })
         ));
     }
 
@@ -4191,6 +4286,7 @@ mod tests {
                     ),
                     ("done".to_owned(), CompiledStateNode::Succeed { output: None }),
                 ]),
+                params: Vec::new(),
                 non_cancellable_states: BTreeSet::new(),
             },
         );
@@ -5150,6 +5246,7 @@ mod tests {
                     ),
                     ("finish".to_owned(), CompiledStateNode::Succeed { output: None }),
                 ]),
+                params: Vec::new(),
                 non_cancellable_states: BTreeSet::from(["shielded_step".to_owned()]),
             },
         );
@@ -5226,6 +5323,7 @@ mod tests {
                         },
                     ),
                 ]),
+                params: Vec::new(),
                 non_cancellable_states: BTreeSet::new(),
             },
         );

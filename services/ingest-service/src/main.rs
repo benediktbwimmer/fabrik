@@ -42,6 +42,10 @@ struct TriggerWorkflowRequest {
     workflow_task_queue: Option<String>,
     input: Value,
     #[serde(default)]
+    memo: Option<Value>,
+    #[serde(default, alias = "searchAttributes")]
+    search_attributes: Option<Value>,
+    #[serde(default)]
     request_id: Option<String>,
 }
 
@@ -504,8 +508,15 @@ async fn trigger_workflow(
     let instance_id =
         request.instance_id.clone().unwrap_or_else(|| format!("wf-{}", Uuid::now_v7()));
     let run_id = format!("run-{}", Uuid::now_v7());
-    let workflow_task_queue =
-        request.workflow_task_queue.clone().unwrap_or_else(|| "default".to_owned());
+    let workflow_task_queue = match request.workflow_task_queue.clone() {
+        Some(task_queue) => task_queue,
+        None => state
+            .store
+            .infer_workflow_task_queue_for_artifact(&request.tenant_id, &artifact_hash)
+            .await
+            .map_err(internal_error)?
+            .unwrap_or_else(|| "default".to_owned()),
+    };
     let payload = WorkflowEvent::WorkflowTriggered { input: request.input.clone() };
     let mut envelope = EventEnvelope::new(
         payload.event_type(),
@@ -521,6 +532,14 @@ async fn trigger_workflow(
         payload,
     );
     envelope.metadata.insert("workflow_task_queue".to_owned(), workflow_task_queue.clone());
+    if let Some(memo) = request.memo.as_ref() {
+        envelope.metadata.insert("memo_json".to_owned(), memo.to_string());
+    }
+    if let Some(search_attributes) = request.search_attributes.as_ref() {
+        envelope
+            .metadata
+            .insert("search_attributes_json".to_owned(), search_attributes.to_string());
+    }
 
     state.publisher.publish(&envelope, &envelope.partition_key).await.map_err(internal_error)?;
     state
@@ -533,6 +552,8 @@ async fn trigger_workflow(
             Some(envelope.definition_version),
             Some(&envelope.artifact_hash),
             &workflow_task_queue,
+            request.memo.as_ref(),
+            request.search_attributes.as_ref(),
             envelope.event_id,
             envelope.occurred_at,
             None,
@@ -807,6 +828,14 @@ async fn continue_as_new(
     trigger.causation_id = Some(continued.event_id);
     trigger.correlation_id = continued.correlation_id;
     trigger.metadata.insert("workflow_task_queue".to_owned(), workflow_task_queue.clone());
+    if let Some(memo) = instance.memo.as_ref() {
+        trigger.metadata.insert("memo_json".to_owned(), memo.to_string());
+    }
+    if let Some(search_attributes) = instance.search_attributes.as_ref() {
+        trigger
+            .metadata
+            .insert("search_attributes_json".to_owned(), search_attributes.to_string());
+    }
 
     state.publisher.publish(&trigger, &trigger.partition_key).await.map_err(internal_error)?;
     state
@@ -819,6 +848,8 @@ async fn continue_as_new(
             Some(trigger.definition_version),
             Some(&trigger.artifact_hash),
             &workflow_task_queue,
+            instance.memo.as_ref(),
+            instance.search_attributes.as_ref(),
             trigger.event_id,
             trigger.occurred_at,
             Some(&instance.run_id),

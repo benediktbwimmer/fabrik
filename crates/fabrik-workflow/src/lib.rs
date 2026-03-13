@@ -660,6 +660,10 @@ pub struct WorkflowInstanceState {
     pub artifact_execution: Option<ArtifactExecutionState>,
     pub status: WorkflowStatus,
     pub input: Option<Value>,
+    #[serde(default)]
+    pub memo: Option<Value>,
+    #[serde(default)]
+    pub search_attributes: Option<Value>,
     pub output: Option<Value>,
     pub event_count: i64,
     pub last_event_id: Uuid,
@@ -678,8 +682,16 @@ impl WorkflowInstanceState {
         self.run_id = event.run_id.clone();
         self.definition_version = Some(event.definition_version);
         self.artifact_hash = Some(event.artifact_hash.clone());
-        if let Some(task_queue) = event.metadata.get("workflow_task_queue") {
-            self.workflow_task_queue = task_queue.clone();
+        if matches!(event.payload, WorkflowEvent::WorkflowTriggered { .. }) {
+            if let Some(task_queue) = event.metadata.get("workflow_task_queue") {
+                self.workflow_task_queue = task_queue.clone();
+            }
+        }
+        if let Some(memo) = event.metadata.get("memo_json") {
+            self.memo = serde_json::from_str(memo).ok();
+        }
+        if let Some(search_attributes) = event.metadata.get("search_attributes_json") {
+            self.search_attributes = serde_json::from_str(search_attributes).ok();
         }
         if let Some(build_id) = event.metadata.get("workflow_build_id") {
             self.sticky_workflow_build_id = Some(build_id.clone());
@@ -888,6 +900,8 @@ impl TryFrom<&EventEnvelope<WorkflowEvent>> for WorkflowInstanceState {
             artifact_execution: None,
             status: WorkflowStatus::Triggered,
             input: None,
+            memo: None,
+            search_attributes: None,
             output: None,
             event_count: 0,
             last_event_id: event.event_id,
@@ -1894,6 +1908,7 @@ mod tests {
             CompiledWorkflow {
                 initial_state: "wait_signal".to_owned(),
                 states,
+                params: Vec::new(),
                 non_cancellable_states: std::collections::BTreeSet::new(),
             },
         )
@@ -1942,6 +1957,7 @@ mod tests {
                     },
                 ),
             ]),
+            params: Vec::new(),
             non_cancellable_states: BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -1964,6 +1980,7 @@ mod tests {
                     output: Some(Expression::Literal { value: json!({"mode": "modern"}) }),
                 },
             )]),
+            params: Vec::new(),
             non_cancellable_states: BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -2177,6 +2194,45 @@ mod tests {
         assert!(matches!(trace.source, ReplaySource::SnapshotTail { .. }));
         assert_eq!(trace.transitions.len(), 1);
         assert_eq!(trace.final_state.current_state, Some("done".to_owned()));
+        assert_eq!(trace.final_state.status, WorkflowStatus::Completed);
+    }
+
+    #[test]
+    fn replay_trace_preserves_alpha_queue_memo_and_search_attributes() {
+        let triggered = test_event(
+            "WorkflowTriggered",
+            "run-1",
+            WorkflowEvent::WorkflowTriggered { input: json!({"approved": true}) },
+            &[
+                ("workflow_task_queue", "orders"),
+                ("memo_json", "{\"region\":\"eu\",\"priority\":1}"),
+                (
+                    "search_attributes_json",
+                    "{\"CustomKeywordField\":[\"vip\",\"alpha\"],\"Region\":\"eu\"}",
+                ),
+            ],
+        );
+        let started = test_event(
+            "WorkflowStarted",
+            "run-1",
+            WorkflowEvent::WorkflowStarted,
+            &[("workflow_task_queue", "default")],
+        );
+        let completed = test_event(
+            "WorkflowCompleted",
+            "run-1",
+            WorkflowEvent::WorkflowCompleted { output: json!({"ok": true}) },
+            &[("state", "done"), ("workflow_task_queue", "default")],
+        );
+
+        let trace = replay_history_trace(&[triggered, started, completed]).unwrap();
+
+        assert_eq!(trace.final_state.workflow_task_queue, "orders");
+        assert_eq!(trace.final_state.memo, Some(json!({"region": "eu", "priority": 1})));
+        assert_eq!(
+            trace.final_state.search_attributes,
+            Some(json!({"CustomKeywordField": ["vip", "alpha"], "Region": "eu"}))
+        );
         assert_eq!(trace.final_state.status, WorkflowStatus::Completed);
     }
 

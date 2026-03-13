@@ -8,9 +8,38 @@ import { useTenant } from "../lib/tenant-context";
 
 const PAGE_SIZE = 25;
 
+function metadataPreview(value: unknown) {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) return "-";
+  const entries = Object.entries(value as Record<string, unknown>).slice(0, 2);
+  if (entries.length === 0) return "-";
+  return entries
+    .map(([key, entryValue]) =>
+      `${key}=${
+        Array.isArray(entryValue)
+          ? entryValue.join("|")
+          : typeof entryValue === "object"
+            ? JSON.stringify(entryValue)
+            : String(entryValue)
+      }`
+    )
+    .join(" · ");
+}
+
 function buildParams(searchParams: URLSearchParams) {
   const params = new URLSearchParams();
-  for (const key of ["status", "routing_status", "definition_id", "instance_id", "run_id", "task_queue", "q"]) {
+  for (const key of [
+    "status",
+    "routing_status",
+    "definition_id",
+    "instance_id",
+    "run_id",
+    "task_queue",
+    "q",
+    "memo_key",
+    "memo_value",
+    "search_attribute_key",
+    "search_attribute_value",
+  ]) {
     const value = searchParams.get(key)?.trim();
     if (value) params.set(key, value);
   }
@@ -100,6 +129,54 @@ export function RunsPage() {
               const next = new URLSearchParams(searchParams);
               const value = event.target.value.trimStart();
               value ? next.set("task_queue", value) : next.delete("task_queue");
+              next.delete("offset");
+              setSearchParams(next);
+            }}
+          />
+          <input
+            className="input"
+            placeholder="Memo key"
+            value={searchParams.get("memo_key") ?? ""}
+            onChange={(event) => {
+              const next = new URLSearchParams(searchParams);
+              const value = event.target.value.trimStart();
+              value ? next.set("memo_key", value) : next.delete("memo_key");
+              next.delete("offset");
+              setSearchParams(next);
+            }}
+          />
+          <input
+            className="input"
+            placeholder="Memo value"
+            value={searchParams.get("memo_value") ?? ""}
+            onChange={(event) => {
+              const next = new URLSearchParams(searchParams);
+              const value = event.target.value.trimStart();
+              value ? next.set("memo_value", value) : next.delete("memo_value");
+              next.delete("offset");
+              setSearchParams(next);
+            }}
+          />
+          <input
+            className="input"
+            placeholder="Search attribute key"
+            value={searchParams.get("search_attribute_key") ?? ""}
+            onChange={(event) => {
+              const next = new URLSearchParams(searchParams);
+              const value = event.target.value.trimStart();
+              value ? next.set("search_attribute_key", value) : next.delete("search_attribute_key");
+              next.delete("offset");
+              setSearchParams(next);
+            }}
+          />
+          <input
+            className="input"
+            placeholder="Search attribute value"
+            value={searchParams.get("search_attribute_value") ?? ""}
+            onChange={(event) => {
+              const next = new URLSearchParams(searchParams);
+              const value = event.target.value.trimStart();
+              value ? next.set("search_attribute_value", value) : next.delete("search_attribute_value");
               next.delete("offset");
               setSearchParams(next);
             }}
@@ -200,6 +277,8 @@ export function RunsPage() {
                   <strong>{item.definition_id}</strong>
                   <div className="muted">{item.instance_id}</div>
                   <div className="muted">{item.run_id}</div>
+                  <div className="muted">memo {metadataPreview(item.memo)}</div>
+                  <div className="muted">search {metadataPreview(item.search_attributes)}</div>
                 </td>
                 <td>
                   <Badge value={item.status} />

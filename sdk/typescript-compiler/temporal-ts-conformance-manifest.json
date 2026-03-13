@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "title": "Temporal TypeScript subset conformance program",
+  "layers": [
+    {
+      "id": "layer_a_support",
+      "name": "Layer A: support fixtures",
+      "purpose": "Analyzer, compiler, import, and packaging correctness for the frozen subset.",
+      "fixture_manifest": "sdk/typescript-compiler/conformance/layer-a-support-fixtures.json",
+      "runner_command": "node sdk/typescript-compiler/conformance-runner.mjs --layer layer_a_support",
+      "cases": [
+        "supported constructs compile and package correctly",
+        "blocked constructs are always rejected",
+        "diagnostics are stable and actionable",
+        "migration classification remains stable"
+      ],
+      "acceptance": [
+        "no accidental acceptance of blocked features",
+        "stable blocker codes and messages",
+        "stable support-class output in migration artifacts"
+      ]
+    },
+    {
+      "id": "layer_b_semantic",
+      "name": "Layer B: semantic parity fixtures",
+      "purpose": "Runtime behavior parity for the supported subset.",
+      "fixture_manifest": "sdk/typescript-compiler/conformance/layer-b-semantic-fixtures.json",
+      "runner_command": "node sdk/typescript-compiler/conformance-runner.mjs --layer layer_b_semantic",
+      "cases": [
+        "activities, retries, and cancellation scopes",
+        "signals, queries, and updates",
+        "timers and conditions",
+        "child workflows",
+        "continue-as-new",
+        "version markers and upgrade-safe evolution"
+      ],
+      "acceptance": [
+        "terminal outcome matches the equivalence contract",
+        "value and failure shape match the equivalence contract",
+        "replay on the pinned artifact succeeds without divergence"
+      ]
+    },
+    {
+      "id": "layer_c_trust",
+      "name": "Layer C: trust and failure fixtures",
+      "purpose": "Restart, failover, replay, backup, restore, and upgrade trust for the supported subset.",
+      "fixture_manifest": "sdk/typescript-compiler/conformance/layer-c-trust-fixtures.json",
+      "runner_command": "node sdk/typescript-compiler/conformance-runner.mjs --layer layer_c_trust",
+      "cases": [
+        "restart during active execution",
+        "owner loss and takeover",
+        "replay from snapshot plus tail",
+        "backup and restore",
+        "disaster recovery drill",
+        "mixed worker builds during rolling restart",
+        "pinned run plus new deployment coexistence",
+        "stale owner plus new build interaction",
+        "duplicate and stale delivery paths"
+      ],
+      "acceptance": [
+        "no undefined source-of-truth behavior",
+        "fencing rules hold under takeover and duplicate delivery",
+        "replay and recovery outcomes are deterministic",
+        "mixed-version and mixed-build routing behave per contract"
+      ]
+    }
+  ]
+}

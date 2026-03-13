@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "title": "Temporal TypeScript subset equivalence contract",
+  "same_behavior_axes": [
+    "terminal outcome class",
+    "return value shape",
+    "failure class equivalence",
+    "failure propagation location",
+    "retry behavior",
+    "handler ordering and visibility rules",
+    "history-level replay outcome",
+    "upgrade and versioning compatibility outcome"
+  ],
+  "not_required_for_parity": [
+    "exact error string text",
+    "exact stack trace text",
+    "exact internal history event identifiers",
+    "incidental internal timing differences that do not change the semantic outcome"
+  ],
+  "same_replay_outcome_definition": "A replayed history must reach the same semantic terminal class and deterministic workflow-visible state for the supported subset.",
+  "same_failure_shape_definition": "Failures must remain in the same semantic class and workflow-visible propagation point even when Fabrik uses different internal diagnostics."
+}

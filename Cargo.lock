@@ -1194,30 +1194,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "executor-service"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum 0.8.8",
- "chrono",
- "fabrik-broker",
- "fabrik-config",
- "fabrik-events",
- "fabrik-service",
- "fabrik-store",
- "fabrik-worker-protocol",
- "fabrik-workflow",
- "futures-util",
- "rskafka",
- "serde",
- "serde_json",
- "tokio",
- "tonic",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "fabrik-broker"
 version = "0.1.0"
 dependencies = [
@@ -1238,6 +1214,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "fabrik-workflow",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

@@ -1,10 +1,14 @@
 use std::{
     collections::BTreeSet,
     env,
+    ffi::OsString,
     fs::{self, File},
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
 use fabrik_workflow::CompiledWorkflowArtifact;
@@ -15,6 +19,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::{Duration, sleep};
 
 const MIGRATION_REPORT_SCHEMA_VERSION: u32 = 1;
+const REPO_ROOT: &str = "/Users/bene/code/fabrik";
 
 #[derive(Debug, Clone)]
 struct CliArgs {
@@ -34,6 +39,40 @@ enum MigrationStatus {
     CompatibleReadyNotDeployed,
     IncompatibleBlocked,
     AnalysisFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AlphaQualificationVerdict {
+    Qualified,
+    QualifiedWithCaveats,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum QualificationBlockerCategory {
+    UnsupportedApi,
+    UnsupportedPackagingBootstrap,
+    UnsupportedVisibilitySearchUsage,
+    ReplayTrustBlocker,
+    OperationalBlocker,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QualificationBlockerGroup {
+    category: QualificationBlockerCategory,
+    count: usize,
+    reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AlphaQualificationReport {
+    verdict: AlphaQualificationVerdict,
+    summary: String,
+    blocker_categories: Vec<QualificationBlockerGroup>,
+    caveats: Vec<String>,
+    next_steps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -65,6 +104,7 @@ enum SupportLevel {
 struct AnalyzerOutput {
     schema_version: u32,
     project_root: String,
+    support_matrix_meta: Value,
     support_matrix: Vec<SupportMatrixEntry>,
     files: Vec<AnalyzedFile>,
     workflows: Vec<DiscoveredWorkflow>,
@@ -76,9 +116,16 @@ struct AnalyzerOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SupportMatrixEntry {
     feature: String,
+    label: String,
+    milestone_status: String,
     support_level: SupportLevel,
+    confidence_class: String,
     replay_validation: bool,
     deploy_validation: bool,
+    support_fixtures: bool,
+    semantic_fixtures: bool,
+    trust_fixtures: bool,
+    upgrade_fixtures: bool,
     semantic_caveats: Vec<String>,
     blocking_severity: FindingSeverity,
 }
@@ -264,10 +311,12 @@ struct DeploymentSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MigrationReport {
     schema_version: u32,
+    milestone_scope: String,
     source_path: String,
     repo_fingerprint: String,
     sdk_target: String,
     status: MigrationStatus,
+    alpha_qualification: AlphaQualificationReport,
     discovered: Value,
     support_matrix: Vec<SupportMatrixEntry>,
     findings: Vec<AnalyzerFinding>,
@@ -276,6 +325,7 @@ struct MigrationReport {
     worker_packages: Vec<WorkerPackageRecord>,
     validation: ValidationSummary,
     deployment: DeploymentSummary,
+    trust: Value,
 }
 
 #[tokio::main]
@@ -306,15 +356,43 @@ async fn try_main() -> Result<i32> {
 
     let analyzer = run_analyzer(&args.project_root)?;
     let fingerprint = repo_fingerprint(&args.project_root, &analyzer.files)?;
+    let equivalence_contract =
+        load_repo_json("sdk/typescript-compiler/temporal-ts-equivalence-contract.json")?;
+    let conformance_manifest =
+        load_repo_json("sdk/typescript-compiler/temporal-ts-conformance-manifest.json")?;
+    let support_summary = build_support_summary(&analyzer.support_matrix);
+    let trust_contracts = json!([
+        {
+            "name": "Temporal TypeScript equivalence contract",
+            "path": format!("{REPO_ROOT}/docs/temporal-typescript-equivalence-contract.md"),
+            "summary": "Defines the required and non-required axes for same behavior and same replay outcome."
+        },
+        {
+            "name": "Durability and replay contract",
+            "path": format!("{REPO_ROOT}/docs/durability-and-replay-contract.md"),
+            "summary": "Defines the authoritative recovery model, replay inputs, and backup/restore expectations."
+        },
+        {
+            "name": "Ownership and fencing contract",
+            "path": format!("{REPO_ROOT}/docs/ownership-and-fencing-contract.md"),
+            "summary": "Defines owner transition, duplicate delivery, stale delivery, and mixed-build fencing rules."
+        }
+    ]);
 
     write_json(
         &workspace_dir.join("support-matrix.json"),
-        &json!({ "support_matrix": analyzer.support_matrix }),
+        &json!({
+            "support_matrix_meta": &analyzer.support_matrix_meta,
+            "support_matrix": &analyzer.support_matrix,
+        }),
     )?;
     write_json(
         &workspace_dir.join("analysis.json"),
         &serde_json::to_value(&analyzer).expect("analysis serializes"),
     )?;
+    write_json(&workspace_dir.join("equivalence-contract.json"), &equivalence_contract)?;
+    write_json(&workspace_dir.join("conformance-manifest.json"), &conformance_manifest)?;
+    write_json(&workspace_dir.join("trust-summary.json"), &support_summary)?;
 
     let hard_blocks = analyzer
         .findings
@@ -333,6 +411,9 @@ async fn try_main() -> Result<i32> {
     let mut generated_artifacts = vec![
         json!({ "kind": "analysis", "path": workspace_dir.join("analysis.json").display().to_string() }),
         json!({ "kind": "support_matrix", "path": workspace_dir.join("support-matrix.json").display().to_string() }),
+        json!({ "kind": "equivalence_contract", "path": workspace_dir.join("equivalence-contract.json").display().to_string() }),
+        json!({ "kind": "conformance_manifest", "path": workspace_dir.join("conformance-manifest.json").display().to_string() }),
+        json!({ "kind": "trust_summary", "path": workspace_dir.join("trust-summary.json").display().to_string() }),
     ];
 
     let mut workflow_records = Vec::new();
@@ -578,12 +659,37 @@ async fn try_main() -> Result<i32> {
         replay_artifacts,
     };
 
+    let alpha_qualification = build_alpha_qualification(
+        &analyzer.support_matrix,
+        &analyzer.findings,
+        &workflow_records,
+        &worker_packages,
+        &validation,
+        &deployment,
+        args.deploy,
+    );
+    write_json(
+        &workspace_dir.join("alpha-qualification.json"),
+        &serde_json::to_value(&alpha_qualification).expect("alpha qualification serializes"),
+    )?;
+    generated_artifacts.push(json!({
+        "kind": "alpha_qualification",
+        "path": workspace_dir.join("alpha-qualification.json").display().to_string(),
+    }));
+
     let report = MigrationReport {
         schema_version: MIGRATION_REPORT_SCHEMA_VERSION,
+        milestone_scope: analyzer
+            .support_matrix_meta
+            .get("milestone_scope")
+            .and_then(Value::as_str)
+            .unwrap_or("temporal_ts_subset_trust")
+            .to_owned(),
         source_path: args.project_root.display().to_string(),
         repo_fingerprint: fingerprint,
         sdk_target: "temporal_typescript".to_owned(),
         status,
+        alpha_qualification,
         discovered: json!({
             "files": analyzer.files,
             "workflows": analyzer.workflows,
@@ -596,6 +702,16 @@ async fn try_main() -> Result<i32> {
         worker_packages,
         validation,
         deployment,
+        trust: json!({
+            "goal": analyzer.support_matrix_meta.get("goal").cloned().unwrap_or(Value::Null),
+            "trusted_confidence_floor": analyzer.support_matrix_meta.get("trusted_confidence_floor").cloned().unwrap_or(Value::Null),
+            "upgrade_confidence_floor": analyzer.support_matrix_meta.get("upgrade_confidence_floor").cloned().unwrap_or(Value::Null),
+            "promotion_requirements": analyzer.support_matrix_meta.get("promotion_requirements").cloned().unwrap_or(Value::Array(Vec::new())),
+            "support_summary": support_summary,
+            "equivalence_contract": equivalence_contract,
+            "conformance_manifest": conformance_manifest,
+            "contract_documents": trust_contracts,
+        }),
     };
 
     write_json(
@@ -680,7 +796,7 @@ fn run_analyzer(project_root: &Path) -> Result<AnalyzerOutput> {
         .arg("sdk/typescript-compiler/migration-analyzer.mjs")
         .arg("--project")
         .arg(project_root)
-        .current_dir("/Users/bene/code/fabrik")
+        .current_dir(REPO_ROOT)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -689,6 +805,242 @@ fn run_analyzer(project_root: &Path) -> Result<AnalyzerOutput> {
         bail!("temporal analyzer failed: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
     serde_json::from_slice(&output.stdout).context("failed to decode analyzer output")
+}
+
+fn load_repo_json(relative_path: &str) -> Result<Value> {
+    let path = Path::new(REPO_ROOT).join(relative_path);
+    let payload =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&payload).with_context(|| format!("failed to decode {}", path.display()))
+}
+
+fn build_support_summary(support_matrix: &[SupportMatrixEntry]) -> Value {
+    let mut by_confidence = BTreeSet::new();
+    let mut confidence_counts = serde_json::Map::new();
+    let mut supported_feature_count = 0_u64;
+    let mut blocked_feature_count = 0_u64;
+    let mut headline_trusted_feature_count = 0_u64;
+    let mut upgrade_validated_feature_count = 0_u64;
+
+    for entry in support_matrix {
+        by_confidence.insert(entry.confidence_class.clone());
+        if entry.milestone_status == "supported" {
+            supported_feature_count += 1;
+        } else if entry.milestone_status == "blocked" {
+            blocked_feature_count += 1;
+        }
+        if matches!(
+            entry.confidence_class.as_str(),
+            "supported_failover_validated" | "supported_upgrade_validated"
+        ) {
+            headline_trusted_feature_count += 1;
+        }
+        if entry.confidence_class == "supported_upgrade_validated" {
+            upgrade_validated_feature_count += 1;
+        }
+    }
+
+    for confidence in by_confidence {
+        let count =
+            support_matrix.iter().filter(|entry| entry.confidence_class == confidence).count();
+        confidence_counts.insert(confidence, json!(count));
+    }
+
+    json!({
+        "supported_feature_count": supported_feature_count,
+        "blocked_feature_count": blocked_feature_count,
+        "headline_trusted_feature_count": headline_trusted_feature_count,
+        "upgrade_validated_feature_count": upgrade_validated_feature_count,
+        "by_confidence": Value::Object(confidence_counts),
+    })
+}
+
+fn build_alpha_qualification(
+    support_matrix: &[SupportMatrixEntry],
+    findings: &[AnalyzerFinding],
+    workflow_records: &[WorkflowMigrationRecord],
+    worker_packages: &[WorkerPackageRecord],
+    validation: &ValidationSummary,
+    deployment: &DeploymentSummary,
+    deploy_requested: bool,
+) -> AlphaQualificationReport {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut grouped = BTreeMap::<QualificationBlockerCategory, BTreeSet<String>>::new();
+    let label_by_feature = support_matrix
+        .iter()
+        .map(|entry| (entry.feature.as_str(), entry.label.as_str()))
+        .collect::<BTreeMap<_, _>>();
+
+    for finding in
+        findings.iter().filter(|finding| matches!(finding.severity, FindingSeverity::HardBlock))
+    {
+        let category = qualification_category_for_feature(&finding.feature);
+        let label = label_by_feature
+            .get(finding.feature.as_str())
+            .copied()
+            .unwrap_or(finding.feature.as_str());
+        grouped.entry(category).or_default().insert(format!("{label}: {}", finding.message));
+    }
+
+    if workflow_records.iter().any(|record| record.status == "compile_failed") {
+        grouped.entry(QualificationBlockerCategory::UnsupportedApi).or_default().insert(
+            "One or more workflows failed to compile into the currently supported Fabrik subset."
+                .to_owned(),
+        );
+    }
+
+    if worker_packages.iter().any(|record| record.package_status != "packaged") {
+        grouped
+            .entry(QualificationBlockerCategory::UnsupportedPackagingBootstrap)
+            .or_default()
+            .insert(
+                "One or more worker packages could not be prepared from the discovered bootstrap shape."
+                    .to_owned(),
+            );
+    }
+
+    if validation.replay_rollout_validation.status == "blocked" {
+        grouped
+            .entry(QualificationBlockerCategory::ReplayTrustBlocker)
+            .or_default()
+            .insert(validation.replay_rollout_validation.message.clone());
+    }
+
+    if deployment.status == "failed" {
+        grouped
+            .entry(QualificationBlockerCategory::OperationalBlocker)
+            .or_default()
+            .insert(deployment.message.clone());
+    }
+
+    let blocker_categories = grouped
+        .into_iter()
+        .map(|(category, reasons)| QualificationBlockerGroup {
+            category,
+            count: reasons.len(),
+            reasons: reasons.into_iter().collect(),
+        })
+        .collect::<Vec<_>>();
+
+    let warning_count = findings
+        .iter()
+        .filter(|finding| matches!(finding.severity, FindingSeverity::Warning))
+        .count();
+    let info_count =
+        findings.iter().filter(|finding| matches!(finding.severity, FindingSeverity::Info)).count();
+
+    let mut caveats = Vec::new();
+    if validation.replay_rollout_validation.status != "passed" {
+        caveats.push(validation.replay_rollout_validation.message.clone());
+    }
+    if !deploy_requested && deployment.status == "not_requested" {
+        caveats.push("Deployment was not requested, so poller registration and runtime health remain unproven.".to_owned());
+    }
+    if warning_count > 0 {
+        caveats.push(format!("{warning_count} warning finding(s) remain and should be reviewed before design-partner rollout."));
+    }
+    if info_count > 0 {
+        caveats.push(format!(
+            "{info_count} informational finding(s) were emitted for operator review."
+        ));
+    }
+
+    let verdict = if !blocker_categories.is_empty() {
+        AlphaQualificationVerdict::Blocked
+    } else if !caveats.is_empty() {
+        AlphaQualificationVerdict::QualifiedWithCaveats
+    } else {
+        AlphaQualificationVerdict::Qualified
+    };
+
+    let summary = match verdict {
+        AlphaQualificationVerdict::Qualified => {
+            "This repo fits the currently supported alpha subset and passed the available migration gates."
+                .to_owned()
+        }
+        AlphaQualificationVerdict::QualifiedWithCaveats => {
+            "This repo fits the current alpha subset, but additional trust or deployment evidence is still required."
+                .to_owned()
+        }
+        AlphaQualificationVerdict::Blocked => {
+            "This repo is blocked for the current alpha subset until the grouped blockers below are addressed."
+                .to_owned()
+        }
+    };
+
+    let mut next_steps = Vec::new();
+    match verdict {
+        AlphaQualificationVerdict::Qualified => {
+            next_steps.push(
+                "Run package/deploy validation against the target Fabrik environment and capture operator evidence."
+                    .to_owned(),
+            );
+            next_steps.push(
+                "Record this repo as a candidate primary or shadow alpha workload and keep the generated artifacts with the engagement."
+                    .to_owned(),
+            );
+        }
+        AlphaQualificationVerdict::QualifiedWithCaveats => {
+            if validation.replay_rollout_validation.status != "passed" {
+                next_steps.push(
+                    "Capture Fabrik-side histories for the migrated workflow and rerun replay/rollout validation."
+                        .to_owned(),
+                );
+            }
+            if !deploy_requested {
+                next_steps.push(
+                    "Run the migration with --deploy (or equivalent internal deployment flow) to prove poller presence and runtime health."
+                        .to_owned(),
+                );
+            }
+            next_steps.push(
+                "Review warning findings and decide whether each one is acceptable for the design-partner alpha boundary."
+                    .to_owned(),
+            );
+        }
+        AlphaQualificationVerdict::Blocked => {
+            for group in &blocker_categories {
+                next_steps.push(match group.category {
+                    QualificationBlockerCategory::UnsupportedApi => {
+                        "Reduce unsupported workflow/runtime API usage or extend the supported compiler and migration subset before re-running qualification."
+                            .to_owned()
+                    }
+                    QualificationBlockerCategory::UnsupportedPackagingBootstrap => {
+                        "Rewrite worker bootstrap and packaging inputs to the supported static shape before re-running qualification."
+                            .to_owned()
+                    }
+                    QualificationBlockerCategory::UnsupportedVisibilitySearchUsage => {
+                        "Remove or defer search/memo-dependent behavior until the alpha visibility slice is implemented."
+                            .to_owned()
+                    }
+                    QualificationBlockerCategory::ReplayTrustBlocker => {
+                        "Resolve replay divergence or rollout incompatibility before promoting this repo into the trusted alpha subset."
+                            .to_owned()
+                    }
+                    QualificationBlockerCategory::OperationalBlocker => {
+                        "Fix deployment or operator-surface issues before treating this repo as alpha-ready."
+                            .to_owned()
+                    }
+                });
+            }
+            next_steps.sort();
+            next_steps.dedup();
+        }
+    }
+
+    AlphaQualificationReport { verdict, summary, blocker_categories, caveats, next_steps }
+}
+
+fn qualification_category_for_feature(feature: &str) -> QualificationBlockerCategory {
+    match feature {
+        "visibility_search_usage" => QualificationBlockerCategory::UnsupportedVisibilitySearchUsage,
+        "worker_bootstrap_patterns" => QualificationBlockerCategory::UnsupportedPackagingBootstrap,
+        "unsupported_temporal_api" | "payload_data_converter_usage" | "interceptors_middleware" => {
+            QualificationBlockerCategory::UnsupportedApi
+        }
+        _ => QualificationBlockerCategory::UnsupportedApi,
+    }
 }
 
 fn repo_fingerprint(project_root: &Path, files: &[AnalyzedFile]) -> Result<String> {
@@ -955,7 +1307,40 @@ fn transpiled_output_path(
         Some("cts") => "cjs",
         _ => "js",
     });
+    if output.exists() {
+        return Ok(output);
+    }
+    let file_name = output
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!("unable to determine transpiled file name for {}", output.display())
+        })?
+        .to_owned();
+    if let Some(fallback) = find_file_by_name(dist_dir, &file_name)? {
+        return Ok(fallback);
+    }
     Ok(output)
+}
+
+fn find_file_by_name(root: &Path, file_name: &str) -> Result<Option<PathBuf>> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)
+            .with_context(|| format!("failed to read directory {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.file_name().and_then(|value| value.to_str()) == Some(file_name) {
+                return Ok(Some(path));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn write_deploy_manifest(
@@ -1106,7 +1491,10 @@ async fn deploy_bundle(
             .send()
             .await
             .with_context(|| {
-                format!("failed to register workflow build {} for {}", workflow_build_id, task_queue)
+                format!(
+                    "failed to register workflow build {} for {}",
+                    workflow_build_id, task_queue
+                )
             })?;
         if !response.status().is_success() {
             return Ok(DeploymentSummary {
@@ -1126,8 +1514,9 @@ async fn deploy_bundle(
         }
     }
     let mut deployed_workers = Vec::new();
-    let matching_endpoint = env::var("FABRIK_MATCHING_ENDPOINT")
-        .unwrap_or_else(|_| "http://127.0.0.1:50051".to_owned());
+    let matching_endpoint = env::var("FABRIK_UNIFIED_RUNTIME_ENDPOINT")
+        .or_else(|_| env::var("FABRIK_MATCHING_ENDPOINT"))
+        .unwrap_or_else(|_| "http://127.0.0.1:50054".to_owned());
     let poller_wait_ms = env::var("FABRIK_ACTIVITY_POLLER_WAIT_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -1242,6 +1631,46 @@ struct ManagedWorkerProcess {
     pid: u32,
 }
 
+struct ManagedWorkerCommand {
+    program: OsString,
+    args: Vec<OsString>,
+    current_dir: Option<PathBuf>,
+}
+
+fn resolve_managed_activity_worker_command() -> Result<ManagedWorkerCommand> {
+    if let Ok(bin) = env::var("FABRIK_ACTIVITY_WORKER_BIN") {
+        return Ok(ManagedWorkerCommand {
+            program: OsString::from(bin),
+            args: Vec::new(),
+            current_dir: None,
+        });
+    }
+
+    if let Ok(current_exe) = env::current_exe() {
+        if let Some(bin_dir) = current_exe.parent() {
+            let sibling = bin_dir.join("activity-worker-service");
+            if sibling.is_file() {
+                return Ok(ManagedWorkerCommand {
+                    program: sibling.into_os_string(),
+                    args: Vec::new(),
+                    current_dir: None,
+                });
+            }
+        }
+    }
+
+    Ok(ManagedWorkerCommand {
+        program: OsString::from("cargo"),
+        args: vec![
+            OsString::from("run"),
+            OsString::from("-p"),
+            OsString::from("activity-worker-service"),
+            OsString::from("--quiet"),
+        ],
+        current_dir: Some(PathBuf::from(REPO_ROOT)),
+    })
+}
+
 fn spawn_managed_activity_worker(
     tenant_id: &str,
     matching_endpoint: &str,
@@ -1252,19 +1681,23 @@ fn spawn_managed_activity_worker(
         .with_context(|| format!("failed to open {}", worker.log_path))?;
     let stderr =
         stdout.try_clone().with_context(|| format!("failed to clone {}", worker.log_path))?;
-    let mut command = if let Ok(bin) = env::var("FABRIK_ACTIVITY_WORKER_BIN") {
-        Command::new(bin)
-    } else {
-        let mut command = Command::new("cargo");
-        command
-            .arg("run")
-            .arg("-p")
-            .arg("activity-worker-service")
-            .arg("--quiet")
-            .current_dir("/Users/bene/code/fabrik");
-        command
-    };
+    let resolved = resolve_managed_activity_worker_command()?;
+    let mut command = Command::new(&resolved.program);
+    command.args(&resolved.args);
+    if let Some(current_dir) = &resolved.current_dir {
+        command.current_dir(current_dir);
+    }
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let child = command
+        .env("ACTIVITY_WORKER_SERVICE_PORT", "0")
         .env("MATCHING_SERVICE_ENDPOINT", matching_endpoint)
         .env("ACTIVITY_TASK_QUEUE", task_queue)
         .env("ACTIVITY_WORKER_TENANT_ID", tenant_id)
@@ -1319,10 +1752,22 @@ fn render_worker_bootstrap(
     build_id: &str,
     resolved_activity_module_path: Option<&str>,
 ) -> String {
-    let module_path = resolved_activity_module_path.unwrap_or("");
+    let source_worker = serde_json::to_string(&worker.file).expect("worker file serializes");
+    let task_queue = serde_json::to_string(&worker.task_queue).expect("task queue serializes");
+    let build_id = serde_json::to_string(build_id).expect("build id serializes");
+    let workflows_path =
+        serde_json::to_string(&worker.workflows_path).expect("workflows path serializes");
+    let activities_reference = serde_json::to_string(&worker.activities_reference)
+        .expect("activities reference serializes");
+    let activity_module =
+        serde_json::to_string(&worker.activity_module).expect("activity module serializes");
+    let resolved_activity_module_path = serde_json::to_string(&resolved_activity_module_path)
+        .expect("resolved activity module path serializes");
+    let bootstrap_pattern =
+        serde_json::to_string(&worker.bootstrap_pattern).expect("bootstrap pattern serializes");
     format!(
         "import {{ pathToFileURL }} from 'node:url';\n\
-         export const fabrikMigratedWorker = {{\n  sourceWorker: {source_worker:?},\n  taskQueue: {task_queue:?},\n  buildId: {build_id:?},\n  workflowsPath: {workflows_path:?},\n  activitiesReference: {activities_reference:?},\n  activityModule: {activity_module:?},\n  resolvedActivityModulePath: {resolved_activity_module_path:?},\n  bootstrapPattern: {bootstrap_pattern:?}\n}};\n\
+         export const fabrikMigratedWorker = {{\n  sourceWorker: {source_worker},\n  taskQueue: {task_queue},\n  buildId: {build_id},\n  workflowsPath: {workflows_path},\n  activitiesReference: {activities_reference},\n  activityModule: {activity_module},\n  resolvedActivityModulePath: {resolved_activity_module_path},\n  bootstrapPattern: {bootstrap_pattern}\n}};\n\
          async function invoke(request) {{\n\
            if (!fabrikMigratedWorker.resolvedActivityModulePath) {{\n\
              throw new Error('worker package is missing a resolved activity module path');\n\
@@ -1348,17 +1793,15 @@ fn render_worker_bootstrap(
              process.exitCode = 1;\n\
            }}\n\
          }}\n\
-         if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {{\n\
-           await main();\n\
-         }}\n",
-        source_worker = worker.file,
-        task_queue = worker.task_queue,
+         await main();\n",
+        source_worker = source_worker,
+        task_queue = task_queue,
         build_id = build_id,
-        workflows_path = worker.workflows_path,
-        activities_reference = worker.activities_reference,
-        activity_module = worker.activity_module,
-        resolved_activity_module_path = module_path,
-        bootstrap_pattern = worker.bootstrap_pattern,
+        workflows_path = workflows_path,
+        activities_reference = activities_reference,
+        activity_module = activity_module,
+        resolved_activity_module_path = resolved_activity_module_path,
+        bootstrap_pattern = bootstrap_pattern,
     )
 }
 
@@ -1367,6 +1810,8 @@ fn render_markdown_report(report: &MigrationReport) -> String {
     lines.push("# Temporal TypeScript Migration Report".to_owned());
     lines.push(String::new());
     lines.push(format!("- Status: `{:?}`", report.status));
+    lines.push(format!("- Alpha qualification: `{}`", report.alpha_qualification.verdict.as_str()));
+    lines.push(format!("- Milestone scope: `{}`", report.milestone_scope));
     lines.push(format!("- Source path: `{}`", report.source_path));
     lines.push(format!("- Repo fingerprint: `{}`", report.repo_fingerprint));
     lines.push(format!("- SDK target: `{}`", report.sdk_target));
@@ -1382,6 +1827,106 @@ fn render_markdown_report(report: &MigrationReport) -> String {
         report.discovered.get("workers").and_then(Value::as_array).map_or(0, Vec::len)
     ));
     lines.push(format!("- Findings: `{}`", report.findings.len()));
+    lines.push(format!(
+        "- Qualification blockers: `{}`",
+        report.alpha_qualification.blocker_categories.len()
+    ));
+    lines.push(format!(
+        "- Supported features in frozen subset: `{}`",
+        report
+            .trust
+            .get("support_summary")
+            .and_then(|value| value.get("supported_feature_count"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    ));
+    lines.push(format!(
+        "- Headline trusted features: `{}`",
+        report
+            .trust
+            .get("support_summary")
+            .and_then(|value| value.get("headline_trusted_feature_count"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    ));
+    lines.push(format!(
+        "- Upgrade-validated features: `{}`",
+        report
+            .trust
+            .get("support_summary")
+            .and_then(|value| value.get("upgrade_validated_feature_count"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    ));
+    lines.push(String::new());
+    lines.push("## Alpha Qualification".to_owned());
+    lines.push(String::new());
+    lines.push(format!(
+        "- Verdict: `{}` {}",
+        report.alpha_qualification.verdict.as_str(),
+        report.alpha_qualification.summary
+    ));
+    if !report.alpha_qualification.blocker_categories.is_empty() {
+        lines.push("- Blocker categories:".to_owned());
+        for group in &report.alpha_qualification.blocker_categories {
+            lines.push(format!("- `{}` count=`{}`", group.category.as_str(), group.count));
+            for reason in &group.reasons {
+                lines.push(format!("  - {}", reason));
+            }
+        }
+    }
+    if !report.alpha_qualification.caveats.is_empty() {
+        lines.push("- Caveats:".to_owned());
+        for caveat in &report.alpha_qualification.caveats {
+            lines.push(format!("  - {}", caveat));
+        }
+    }
+    if !report.alpha_qualification.next_steps.is_empty() {
+        lines.push("- Next steps:".to_owned());
+        for step in &report.alpha_qualification.next_steps {
+            lines.push(format!("  - {}", step));
+        }
+    }
+    lines.push(String::new());
+    lines.push("## Trust Contracts".to_owned());
+    lines.push(String::new());
+    if let Some(goal) = report.trust.get("goal").and_then(Value::as_str) {
+        lines.push(format!("- Goal: {}", goal));
+    }
+    if let Some(items) = report.trust.get("contract_documents").and_then(Value::as_array) {
+        for item in items {
+            lines.push(format!(
+                "- {}: `{}` {}",
+                item.get("name").and_then(Value::as_str).unwrap_or("Contract"),
+                item.get("path").and_then(Value::as_str).unwrap_or("-"),
+                item.get("summary").and_then(Value::as_str).unwrap_or("")
+            ));
+        }
+    }
+    if let Some(requirements) = report.trust.get("promotion_requirements").and_then(Value::as_array)
+    {
+        lines.push("- Promotion rule:".to_owned());
+        for requirement in requirements {
+            lines.push(format!("- {}", requirement.as_str().unwrap_or("unknown")));
+        }
+    }
+    lines.push(String::new());
+    lines.push("## Conformance Program".to_owned());
+    lines.push(String::new());
+    if let Some(layers) = report
+        .trust
+        .get("conformance_manifest")
+        .and_then(|value| value.get("layers"))
+        .and_then(Value::as_array)
+    {
+        for layer in layers {
+            lines.push(format!(
+                "- {}: {}",
+                layer.get("name").and_then(Value::as_str).unwrap_or("Layer"),
+                layer.get("purpose").and_then(Value::as_str).unwrap_or("")
+            ));
+        }
+    }
     lines.push(String::new());
     lines.push("## Validation".to_owned());
     lines.push(String::new());
@@ -1395,6 +1940,18 @@ fn render_markdown_report(report: &MigrationReport) -> String {
         ("Deploy validation", &report.validation.deploy_validation),
     ] {
         lines.push(format!("- {}: `{}` {}", label, gate.status, gate.message));
+    }
+    lines.push(String::new());
+    lines.push("## Support Matrix".to_owned());
+    lines.push(String::new());
+    for feature in &report.support_matrix {
+        lines.push(format!(
+            "- `{}` status=`{}` confidence=`{}` support=`{:?}`",
+            feature.label,
+            feature.milestone_status,
+            feature.confidence_class,
+            feature.support_level
+        ));
     }
     lines.push(String::new());
     lines.push("## Workflows".to_owned());
@@ -1459,6 +2016,28 @@ impl AnalyzerFinding {
     }
 }
 
+impl AlphaQualificationVerdict {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Qualified => "qualified",
+            Self::QualifiedWithCaveats => "qualified_with_caveats",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+impl QualificationBlockerCategory {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::UnsupportedApi => "unsupported_api",
+            Self::UnsupportedPackagingBootstrap => "unsupported_packaging_bootstrap",
+            Self::UnsupportedVisibilitySearchUsage => "unsupported_visibility_search_usage",
+            Self::ReplayTrustBlocker => "replay_trust_blocker",
+            Self::OperationalBlocker => "operational_blocker",
+        }
+    }
+}
+
 fn sanitize_segment(value: &str) -> String {
     value
         .chars()
@@ -1497,10 +2076,18 @@ mod tests {
     fn render_report_contains_status() {
         let report = MigrationReport {
             schema_version: 1,
+            milestone_scope: "temporal_ts_subset_trust".to_owned(),
             source_path: "/tmp/app".to_owned(),
             repo_fingerprint: "abc".to_owned(),
             sdk_target: "temporal_typescript".to_owned(),
             status: MigrationStatus::CompatibleReadyNotDeployed,
+            alpha_qualification: AlphaQualificationReport {
+                verdict: AlphaQualificationVerdict::QualifiedWithCaveats,
+                summary: "summary".to_owned(),
+                blocker_categories: Vec::new(),
+                caveats: vec!["caveat".to_owned()],
+                next_steps: vec!["step".to_owned()],
+            },
             discovered: json!({ "workflows": [], "workers": [] }),
             support_matrix: Vec::new(),
             findings: Vec::new(),
@@ -1547,9 +2134,35 @@ mod tests {
                 status: "not_requested".to_owned(),
                 message: "none".to_owned(),
             },
+            trust: json!({
+                "goal": "goal",
+                "support_summary": {
+                    "supported_feature_count": 1,
+                    "headline_trusted_feature_count": 1,
+                    "upgrade_validated_feature_count": 0
+                },
+                "promotion_requirements": ["analyzer support exists"],
+                "conformance_manifest": {
+                    "layers": [
+                        {
+                            "name": "Layer A: support fixtures",
+                            "purpose": "support"
+                        }
+                    ]
+                },
+                "contract_documents": [
+                    {
+                        "name": "Durability and replay contract",
+                        "path": "/tmp/contract.md",
+                        "summary": "summary"
+                    }
+                ]
+            }),
         };
         let markdown = render_markdown_report(&report);
         assert!(markdown.contains("Temporal TypeScript Migration Report"));
         assert!(markdown.contains("CompatibleReadyNotDeployed"));
+        assert!(markdown.contains("qualified_with_caveats"));
+        assert!(markdown.contains("temporal_ts_subset_trust"));
     }
 }

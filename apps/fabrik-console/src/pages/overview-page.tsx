@@ -6,6 +6,34 @@ import { api } from "../lib/api";
 import { formatDate, formatNumber } from "../lib/format";
 import { useTenant } from "../lib/tenant-context";
 
+const evidenceSurfaces = [
+  {
+    title: "Workflow definitions",
+    href: "/workflows",
+    summary: "Pinned artifacts, rollout validation, and graph-level causality."
+  },
+  {
+    title: "Builds and routing",
+    href: "/builds",
+    summary: "Read-only compatibility inventory for rolling restart and mixed-build trust."
+  },
+  {
+    title: "Conformance evidence",
+    href: "/conformance",
+    summary: "Layer-by-layer fixture results, replay evidence, and trust-case drill-down."
+  },
+  {
+    title: "Replay workbench",
+    href: "/replay",
+    summary: "Run-scoped replay output, queue preservation, snapshot boundaries, and divergence details."
+  },
+  {
+    title: "Task queues",
+    href: "/task-queues",
+    summary: "Queue health, pollers, and compatibility-set visibility."
+  }
+];
+
 export function OverviewPage() {
   const { tenantId } = useTenant();
   const overviewQuery = useQuery({
@@ -13,8 +41,13 @@ export function OverviewPage() {
     enabled: tenantId !== "",
     queryFn: () => api.getOverview(tenantId)
   });
+  const trustQuery = useQuery({
+    queryKey: ["trust-summary"],
+    queryFn: () => api.getTrustSummary()
+  });
 
   const overview = overviewQuery.data;
+  const trustSummary = trustQuery.data;
 
   return (
     <div className="page">
@@ -133,9 +166,64 @@ export function OverviewPage() {
           </Panel>
 
           <Panel>
-            <h2>Unavailable in milestone 1</h2>
+            <h2>{trustSummary?.title ?? "Temporal TS subset trust"}</h2>
             <div className="stack">
-              <div className="muted">Runtime overview, incidents, deploy impact, and migration surfaces are intentionally deferred until they have real backing data.</div>
+              <div className="muted">
+                {trustSummary?.goal ?? "No conformance trust snapshot has been generated yet."}
+              </div>
+              {(trustSummary?.confidence_bands ?? []).map((band) => (
+                <div key={band.confidence_class} className="subtle-block">
+                  <div className="row space-between">
+                    <strong>{band.confidence_class}</strong>
+                    <Badge value={band.confidence_class} />
+                  </div>
+                  <div className="muted">{formatNumber(band.count)} feature(s)</div>
+                  <div className="muted">{band.features.join(", ")}</div>
+                </div>
+              ))}
+              {trustSummary ? (
+                <div className="muted">
+                  Generated {formatDate(trustSummary.generated_at)} · status {trustSummary.status}
+                </div>
+              ) : null}
+            </div>
+          </Panel>
+
+          <Panel>
+            <h2>Conformance Program</h2>
+            <div className="stack">
+              {(trustSummary?.reports ?? []).map((layer) => (
+                <Link
+                  key={layer.layer_id}
+                  className="subtle-block"
+                  to={`/conformance?layer=${encodeURIComponent(layer.layer_id)}`}
+                >
+                  <div className="row space-between">
+                    <strong>{layer.title}</strong>
+                    <Badge value={layer.failed_count === 0 ? "passing" : "failing"} />
+                  </div>
+                  <div className="muted">{layer.purpose}</div>
+                  <div className="muted">
+                    Cases {formatNumber(layer.case_count)} · passed {formatNumber(layer.passed_count)} · failed {formatNumber(layer.failed_count)}
+                  </div>
+                </Link>
+              ))}
+              {trustSummary == null ? <div className="muted">No conformance report snapshot loaded.</div> : null}
+            </div>
+          </Panel>
+
+          <Panel>
+            <h2>Evidence Surfaces</h2>
+            <div className="stack">
+              {evidenceSurfaces.map((surface) => (
+                <Link key={surface.href} className="panel nested-panel" to={surface.href}>
+                  <div className="row space-between">
+                    <strong>{surface.title}</strong>
+                    <span className="muted">Read-only</span>
+                  </div>
+                  <div className="muted">{surface.summary}</div>
+                </Link>
+              ))}
             </div>
           </Panel>
         </div>

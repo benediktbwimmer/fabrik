@@ -14,6 +14,24 @@ type Tab = (typeof TABS)[number];
 
 type TimelineLane = "lifecycle" | "activities" | "messages" | "timers" | "infra" | "other";
 
+function metadataPreview(value: unknown) {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) return "-";
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length === 0) return "-";
+  return entries
+    .slice(0, 4)
+    .map(([key, entryValue]) =>
+      `${key}=${
+        Array.isArray(entryValue)
+          ? entryValue.join("|")
+          : typeof entryValue === "object"
+            ? JSON.stringify(entryValue)
+            : String(entryValue)
+      }`
+    )
+    .join(" · ");
+}
+
 function eventLane(eventType: string): TimelineLane {
   const lower = eventType.toLowerCase();
   if (lower.includes("activity")) return "activities";
@@ -69,6 +87,11 @@ export function WorkflowDetailPage() {
     queryKey: ["workflow-routing", tenantId, instanceId],
     enabled: tenantId !== "" && instanceId !== "",
     queryFn: () => api.getWorkflowRouting(tenantId, instanceId)
+  });
+  const replayQuery = useQuery({
+    queryKey: ["workflow-replay", tenantId, instanceId, resolvedRunId],
+    enabled: tenantId !== "" && instanceId !== "" && resolvedRunId !== "",
+    queryFn: () => api.getWorkflowReplay(tenantId, instanceId, resolvedRunId)
   });
 
   const runs = useMemo(
@@ -145,6 +168,11 @@ export function WorkflowDetailPage() {
     ["failed", "cancelled", "timed_out"].includes(activity.status)
   );
   const routing = routingQuery.data;
+  const replay = replayQuery.data;
+  const expectedQueue = selectedRun?.workflow_task_queue ?? workflowQuery.data?.workflow_task_queue ?? null;
+  const replayQueue = replay?.replayed_state?.workflow_task_queue ?? null;
+  const replayQueuePreserved =
+    expectedQueue != null && replayQueue != null ? replayQueue === expectedQueue : null;
   const routingQueueHref =
     routing?.workflow_task_queue != null
       ? `/task-queues?queue_kind=workflow&task_queue=${encodeURIComponent(routing.workflow_task_queue)}`
@@ -243,6 +271,47 @@ export function WorkflowDetailPage() {
                         Inspect workflow queue
                       </Link>
                     ) : null}
+                  </div>
+                </Panel>
+              </div>
+
+              <div className="grid two">
+                <Panel className="nested-panel">
+                  <h3>Alpha metadata evidence</h3>
+                  <div className="stack">
+                    <div>Memo {metadataPreview(selectedRun?.memo ?? workflowQuery.data?.memo)}</div>
+                    <div>
+                      Search attributes{" "}
+                      {metadataPreview(selectedRun?.search_attributes ?? workflowQuery.data?.search_attributes)}
+                    </div>
+                    <div className="muted">
+                      Supported slice: static start-time values plus exact-match visibility filters.
+                    </div>
+                  </div>
+                </Panel>
+                <Panel className="nested-panel">
+                  <h3>Replay and failover</h3>
+                  <div className="stack">
+                    <div>Replay source {formatInlineValue(replay?.replay_source)}</div>
+                    <div>Divergences {formatNumber(replay?.divergence_count)}</div>
+                    <div>Projection matches store {formatInlineValue(replay?.projection_matches_store)}</div>
+                    <div>Snapshot boundary {formatInlineValue(replay?.snapshot?.last_event_type)}</div>
+                    <div>Snapshot updated {formatDate(replay?.snapshot?.updated_at)}</div>
+                    <div>Expected queue {formatInlineValue(expectedQueue)}</div>
+                    <div>
+                      Replayed queue {formatInlineValue(replay?.replayed_state?.workflow_task_queue)}
+                    </div>
+                    <div>Queue preserved across replay/handoff {formatInlineValue(replayQueuePreserved)}</div>
+                    <div>Replayed memo {metadataPreview(replay?.replayed_state?.memo)}</div>
+                    <div>
+                      Replayed search {metadataPreview(replay?.replayed_state?.search_attributes)}
+                    </div>
+                    <Link
+                      className="button ghost"
+                      to={`/replay?instance=${encodeURIComponent(instanceId)}&run=${encodeURIComponent(resolvedRunId)}`}
+                    >
+                      Open replay workbench
+                    </Link>
                   </div>
                 </Panel>
               </div>

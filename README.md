@@ -77,7 +77,7 @@ The target platform must support:
 
 ## Repository Status
 
-This repository is still in an early implementation phase. The runtime is centered on compiled workflow execution, durable activity-task history, and external activity workers polled through `matching-service`.
+This repository is still in an early implementation phase. The default runtime path is now centered on `unified-runtime`, with compiled workflow execution, durable activity-task history, and external activity workers polling that unified runtime surface.
 
 The documentation under `docs/` now reflects the new target architecture:
 
@@ -124,6 +124,7 @@ cargo check
 cargo test
 npm install
 npm run test:compiler
+npm run test:conformance
 npm run test:benchmarks
 ```
 
@@ -167,6 +168,13 @@ cargo run -p fabrik-cli -- \
 Migration policy and generated output contract:
 
 - [Temporal TypeScript Migration Policy](/Users/bene/code/fabrik/docs/temporal-typescript-migration.md)
+- [Alpha Support Matrix](/Users/bene/code/fabrik/docs/alpha-support-matrix.md)
+- [Alpha Known Limitations](/Users/bene/code/fabrik/docs/alpha-known-limitations.md)
+- [Alpha Qualification Guide](/Users/bene/code/fabrik/docs/alpha-qualification-guide.md)
+- [Operator Runbook Alpha](/Users/bene/code/fabrik/docs/operator-runbook-alpha.md)
+- [Temporal TypeScript Equivalence Contract](/Users/bene/code/fabrik/docs/temporal-typescript-equivalence-contract.md)
+- [Durability and Replay Contract](/Users/bene/code/fabrik/docs/durability-and-replay-contract.md)
+- [Ownership and Fencing Contract](/Users/bene/code/fabrik/docs/ownership-and-fencing-contract.md)
 
 ## Near-Term Documentation Priorities
 
@@ -186,4 +194,7 @@ Migration policy and generated output contract:
 - [Architecture Decision Record 0003](/Users/bene/code/fabrik/docs/adr/0003-execution-invariants.md)
 - [Architecture Decision Record 0004](/Users/bene/code/fabrik/docs/adr/0004-temporal-parity-pivot.md)
 - [SDK + Compiler Direction](/Users/bene/code/fabrik/docs/sdk-compiler.md)
+- [Temporal TypeScript Equivalence Contract](/Users/bene/code/fabrik/docs/temporal-typescript-equivalence-contract.md)
+- [Durability and Replay Contract](/Users/bene/code/fabrik/docs/durability-and-replay-contract.md)
+- [Ownership and Fencing Contract](/Users/bene/code/fabrik/docs/ownership-and-fencing-contract.md)
 - [Semantic Specs Index](/Users/bene/code/fabrik/docs/spec/README.md)

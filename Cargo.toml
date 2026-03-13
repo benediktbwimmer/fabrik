@@ -11,7 +11,6 @@ members = [
     "crates/fabrik-workflow",
     "services/activity-worker-service",
     "services/api-gateway",
-    "services/executor-service",
     "services/ingest-service",
     "services/matching-service",
     "services/benchmark-runner",

@@ -220,7 +220,6 @@ Scope for the milestone:
 - decide what remains benchmark-only behavior versus what is part of the intended production contract
 - explicitly defer non-goals until the above invariants are closed:
   - broad workflow feature parity
-  - migration compatibility with the legacy durable runtime
   - full query/history fidelity beyond the benchmark subset
 
 Suggested implementation order:

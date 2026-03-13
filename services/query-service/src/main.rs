@@ -225,6 +225,8 @@ struct WorkflowListItem {
     definition_version: Option<u32>,
     artifact_hash: Option<String>,
     workflow_task_queue: String,
+    memo: Option<Value>,
+    search_attributes: Option<Value>,
     sticky_workflow_build_id: Option<String>,
     sticky_workflow_poller_id: Option<String>,
     routing_status: String,
@@ -257,6 +259,8 @@ struct RunListItem {
     definition_version: Option<u32>,
     artifact_hash: Option<String>,
     workflow_task_queue: String,
+    memo: Option<Value>,
+    search_attributes: Option<Value>,
     sticky_workflow_build_id: Option<String>,
     sticky_workflow_poller_id: Option<String>,
     routing_status: String,
@@ -566,6 +570,10 @@ struct WorkflowListQuery {
     routing_status: Option<String>,
     updated_after: Option<DateTime<Utc>>,
     q: Option<String>,
+    memo_key: Option<String>,
+    memo_value: Option<String>,
+    search_attribute_key: Option<String>,
+    search_attribute_value: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -579,6 +587,10 @@ struct RunListQuery {
     task_queue: Option<String>,
     routing_status: Option<String>,
     q: Option<String>,
+    memo_key: Option<String>,
+    memo_value: Option<String>,
+    search_attribute_key: Option<String>,
+    search_attribute_value: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -973,6 +985,10 @@ async fn list_workflows(
         task_queue: query.task_queue.and_then(non_empty),
         updated_after: query.updated_after,
         query: query.q.and_then(non_empty),
+        memo_key: query.memo_key.and_then(non_empty),
+        memo_value: query.memo_value.and_then(non_empty),
+        search_attribute_key: query.search_attribute_key.and_then(non_empty),
+        search_attribute_value: query.search_attribute_value.and_then(non_empty),
     };
     let total = state
         .store
@@ -1039,6 +1055,10 @@ async fn list_runs(
         run_id: query.run_id.and_then(non_empty),
         task_queue: query.task_queue.and_then(non_empty),
         query: query.q.and_then(non_empty),
+        memo_key: query.memo_key.and_then(non_empty),
+        memo_value: query.memo_value.and_then(non_empty),
+        search_attribute_key: query.search_attribute_key.and_then(non_empty),
+        search_attribute_value: query.search_attribute_value.and_then(non_empty),
     };
     let total =
         state.store.count_runs_with_filters(&tenant_id, &filters).await.map_err(internal_error)?
@@ -1335,9 +1355,6 @@ async fn try_owner_strong_query_endpoint(
 fn owner_query_endpoints(config: &QueryRuntimeConfig) -> Vec<String> {
     let mut endpoints = Vec::new();
     if let Some(url) = config.strong_query_unified_url.as_ref() {
-        endpoints.push(url.clone());
-    }
-    if let Some(url) = config.strong_query_executor_url.as_ref() {
         endpoints.push(url.clone());
     }
     endpoints
@@ -3313,6 +3330,8 @@ async fn workflow_list_item_from_state(
         definition_version: state.definition_version,
         artifact_hash: state.artifact_hash,
         workflow_task_queue: state.workflow_task_queue,
+        memo: state.memo,
+        search_attributes: state.search_attributes,
         sticky_workflow_build_id: state.sticky_workflow_build_id,
         sticky_workflow_poller_id: state.sticky_workflow_poller_id,
         routing_status,
@@ -3347,6 +3366,8 @@ async fn run_list_item_from_record(
         definition_version: record.definition_version,
         artifact_hash: record.artifact_hash,
         workflow_task_queue: record.workflow_task_queue,
+        memo: record.memo,
+        search_attributes: record.search_attributes,
         sticky_workflow_build_id: record.sticky_workflow_build_id,
         sticky_workflow_poller_id: record.sticky_workflow_poller_id,
         routing_status,
@@ -4723,7 +4744,6 @@ mod tests {
                 s3_key_prefix: String::new(),
             },
             strong_query_unified_url: None,
-            strong_query_executor_url: None,
             history_retention_days: None,
             run_retention_days: None,
             activity_retention_days: None,
@@ -4744,7 +4764,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_query_endpoints_prefers_unified_then_executor() {
+    fn owner_query_endpoints_uses_unified_only_by_default() {
         let config = QueryRuntimeConfig {
             default_page_size: 100,
             max_page_size: 500,
@@ -4760,7 +4780,6 @@ mod tests {
                 s3_key_prefix: String::new(),
             },
             strong_query_unified_url: Some("http://unified".to_owned()),
-            strong_query_executor_url: Some("http://executor".to_owned()),
             history_retention_days: None,
             run_retention_days: None,
             activity_retention_days: None,
@@ -4769,10 +4788,7 @@ mod tests {
             retention_sweep_interval_seconds: 300,
         };
 
-        assert_eq!(
-            owner_query_endpoints(&config),
-            vec!["http://unified".to_owned(), "http://executor".to_owned()]
-        );
+        assert_eq!(owner_query_endpoints(&config), vec!["http://unified".to_owned()]);
     }
 
     #[tokio::test]
@@ -4905,6 +4921,7 @@ mod tests {
                         },
                     ),
                 ]),
+                params: Vec::new(),
                 non_cancellable_states: BTreeSet::new(),
             },
         );
@@ -5151,6 +5168,8 @@ mod tests {
                 Some(1),
                 Some("artifact-a"),
                 "payments",
+                None,
+                None,
                 Uuid::now_v7(),
                 historical_updated_at - chrono::Duration::minutes(2),
                 None,
@@ -5174,6 +5193,8 @@ mod tests {
                 artifact_execution: None,
                 status: WorkflowStatus::Completed,
                 input: Some(json!({"orderId": 1})),
+                memo: None,
+                search_attributes: None,
                 output: Some(json!({"ok": true})),
                 event_count: 8,
                 last_event_id: Uuid::now_v7(),
@@ -5190,6 +5211,8 @@ mod tests {
                 Some(2),
                 Some("artifact-b"),
                 "payments",
+                None,
+                None,
                 Uuid::now_v7(),
                 Utc::now() - chrono::Duration::minutes(1),
                 Some("run-1"),
@@ -5224,6 +5247,8 @@ mod tests {
                 artifact_execution: None,
                 status: WorkflowStatus::Running,
                 input: Some(json!({"orderId": 2})),
+                memo: None,
+                search_attributes: None,
                 output: None,
                 event_count: 12,
                 last_event_id: Uuid::now_v7(),
@@ -5295,6 +5320,8 @@ mod tests {
                 Some(1),
                 Some("artifact-a"),
                 "payments",
+                None,
+                None,
                 Uuid::now_v7(),
                 Utc::now(),
                 None,
@@ -5317,6 +5344,8 @@ mod tests {
                 artifact_execution: None,
                 status: WorkflowStatus::Running,
                 input: Some(json!({"orderId": 2})),
+                memo: None,
+                search_attributes: None,
                 output: None,
                 event_count: 12,
                 last_event_id: Uuid::now_v7(),
@@ -5397,6 +5426,8 @@ mod tests {
                     Some(1),
                     Some("artifact-a"),
                     "payments",
+                    None,
+                    None,
                     Uuid::now_v7(),
                     Utc::now(),
                     None,
@@ -5419,6 +5450,8 @@ mod tests {
                     artifact_execution: None,
                     status: WorkflowStatus::Running,
                     input: Some(json!({"instance": instance_id})),
+                    memo: None,
+                    search_attributes: None,
                     output: None,
                     event_count: 4,
                     last_event_id: Uuid::now_v7(),
@@ -5503,6 +5536,8 @@ mod tests {
                 artifact_execution: None,
                 status: WorkflowStatus::Running,
                 input: Some(json!({"instance": "a"})),
+                memo: None,
+                search_attributes: None,
                 output: None,
                 event_count: 4,
                 last_event_id: Uuid::now_v7(),
@@ -5526,6 +5561,8 @@ mod tests {
                 artifact_execution: None,
                 status: WorkflowStatus::Running,
                 input: Some(json!({"instance": "b"})),
+                memo: None,
+                search_attributes: None,
                 output: None,
                 event_count: 4,
                 last_event_id: Uuid::now_v7(),
@@ -5548,6 +5585,100 @@ mod tests {
         assert_eq!(response.workflow_count, 1);
         assert_eq!(response.items[0].instance_id, "instance-b");
         assert_eq!(response.items[0].routing_status, "sticky_incompatible_fallback_required");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_endpoints_support_alpha_memo_and_search_attribute_filters() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state = test_state(store.clone()).await?;
+
+        let memo = json!({"region": "eu", "priority": 1});
+        let search_attributes = json!({"CustomKeywordField": ["vip", "alpha"], "Region": "eu"});
+        let now = Utc::now();
+
+        store
+            .put_run_start(
+                "tenant-a",
+                "instance-1",
+                "run-1",
+                "payments",
+                Some(1),
+                Some("artifact-a"),
+                "payments",
+                Some(&memo),
+                Some(&search_attributes),
+                Uuid::now_v7(),
+                now,
+                None,
+                None,
+            )
+            .await?;
+        store
+            .upsert_instance(&WorkflowInstanceState {
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "instance-1".to_owned(),
+                run_id: "run-1".to_owned(),
+                definition_id: "payments".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                workflow_task_queue: "payments".to_owned(),
+                sticky_workflow_build_id: None,
+                sticky_workflow_poller_id: None,
+                current_state: Some("charge-card".to_owned()),
+                context: None,
+                artifact_execution: None,
+                status: WorkflowStatus::Running,
+                input: Some(json!({"orderId": 1})),
+                memo: Some(memo.clone()),
+                search_attributes: Some(search_attributes.clone()),
+                output: None,
+                event_count: 3,
+                last_event_id: Uuid::now_v7(),
+                last_event_type: "ActivityScheduled".to_owned(),
+                updated_at: now,
+            })
+            .await?;
+
+        let Json(workflows) = list_workflows(
+            Path("tenant-a".to_owned()),
+            Query(WorkflowListQuery {
+                memo_key: Some("region".to_owned()),
+                memo_value: Some("eu".to_owned()),
+                search_attribute_key: Some("CustomKeywordField".to_owned()),
+                search_attribute_value: Some("vip".to_owned()),
+                ..WorkflowListQuery::default()
+            }),
+            State(state.clone()),
+        )
+        .await
+        .expect("workflow filter response");
+        assert_eq!(workflows.workflow_count, 1);
+        assert_eq!(workflows.items[0].memo.as_ref(), Some(&memo));
+        assert_eq!(
+            workflows.items[0].search_attributes.as_ref(),
+            Some(&search_attributes)
+        );
+
+        let Json(runs) = list_runs(
+            Path("tenant-a".to_owned()),
+            Query(RunListQuery {
+                memo_key: Some("region".to_owned()),
+                memo_value: Some("eu".to_owned()),
+                search_attribute_key: Some("Region".to_owned()),
+                search_attribute_value: Some("eu".to_owned()),
+                ..RunListQuery::default()
+            }),
+            State(state),
+        )
+        .await
+        .expect("run filter response");
+        assert_eq!(runs.run_count, 1);
+        assert_eq!(runs.items[0].memo.as_ref(), Some(&memo));
+        assert_eq!(runs.items[0].search_attributes.as_ref(), Some(&search_attributes));
         Ok(())
     }
 }

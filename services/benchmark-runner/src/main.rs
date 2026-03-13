@@ -279,8 +279,6 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
 
     let ingest_base =
         env::var("INGEST_SERVICE_URL").unwrap_or_else(|_| "http://127.0.0.1:3001".to_owned());
-    let executor_base =
-        env::var("EXECUTOR_SERVICE_URL").unwrap_or_else(|_| "http://127.0.0.1:3002".to_owned());
     let throughput_runtime_debug_base =
         env::var("THROUGHPUT_DEBUG_URL").unwrap_or_else(|_| "http://127.0.0.1:3006".to_owned());
     let throughput_projector_base =
@@ -294,11 +292,8 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         format!("fanout-{}-{}-{}", args.profile_name, scenario_name, Uuid::now_v7());
     let started_at = Utc::now();
     let started = Instant::now();
-    let executor_debug_url = match args.execution_mode {
-        ExecutionMode::Unified => format!("{unified_runtime_debug_base}/debug/unified"),
-        _ => format!("{executor_base}/debug/hybrid-routing"),
-    };
-    let executor_debug_before = (args.execution_mode == ExecutionMode::Unified)
+    let executor_debug_url = format!("{unified_runtime_debug_base}/debug/unified");
+    let executor_debug_before = (args.execution_mode != ExecutionMode::Throughput)
         .then(|| async { fetch_optional_debug(&client, &executor_debug_url).await });
     let executor_debug_before = match executor_debug_before {
         Some(fetch) => Some(fetch.await),
@@ -448,7 +443,7 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         .await
         .context("failed to decode benchmark control-plane debug summary")?;
     let executor_debug_after =
-        (args.execution_mode == ExecutionMode::Unified).then_some(executor_debug.clone());
+        (args.execution_mode != ExecutionMode::Throughput).then_some(executor_debug.clone());
     let executor_debug_delta = executor_debug_before
         .as_ref()
         .zip(executor_debug_after.as_ref())
@@ -758,6 +753,7 @@ fn benchmark_artifact(
                 CompiledWorkflow {
                     initial_state: "init".to_owned(),
                     states,
+                    params: Vec::new(),
                     non_cancellable_states: Default::default(),
                 },
             );
@@ -821,6 +817,7 @@ fn benchmark_artifact(
                 CompiledWorkflow {
                     initial_state: "init".to_owned(),
                     states,
+                    params: Vec::new(),
                     non_cancellable_states: Default::default(),
                 },
             );
@@ -940,7 +937,12 @@ fn benchmark_artifact(
         1,
         "benchmark-runner",
         ArtifactEntrypoint { module: "benchmark.ts".to_owned(), export: "workflow".to_owned() },
-        CompiledWorkflow { initial_state, states, non_cancellable_states: Default::default() },
+        CompiledWorkflow {
+            initial_state,
+            states,
+            params: Vec::new(),
+            non_cancellable_states: Default::default(),
+        },
     )
 }
 
@@ -1067,6 +1069,7 @@ fn benchmark_child_artifact(definition_id: &str) -> CompiledWorkflowArtifact {
                     output: Some(Expression::Literal { value: json!({ "ok": true }) }),
                 },
             )]),
+            params: Vec::new(),
             non_cancellable_states: Default::default(),
         },
     )

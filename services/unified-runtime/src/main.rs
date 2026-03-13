@@ -25,7 +25,7 @@ use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
     ActivityScheduleUpdate, ActivityStartUpdate, ActivityTerminalPayload, ActivityTerminalUpdate,
     ConsumedSignalRecord, TaskQueueKind, WorkflowActivityStatus, WorkflowMailboxKind,
-    WorkflowMailboxRecord, WorkflowMailboxStatus, WorkflowStore, WorkflowUpdateStatus,
+    WorkflowMailboxRecord, WorkflowStore,
 };
 use fabrik_throughput::{decode_cbor, encode_cbor};
 use fabrik_worker_protocol::activity_worker::{
@@ -243,6 +243,8 @@ enum PreparedDbAction {
         definition_version: Option<u32>,
         artifact_hash: Option<String>,
         workflow_task_queue: String,
+        memo: Option<Value>,
+        search_attributes: Option<Value>,
         trigger_event_id: Uuid,
         started_at: DateTime<Utc>,
         previous_run_id: Option<String>,
@@ -1168,6 +1170,8 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
         artifact_execution: Some(plan.execution_state.clone()),
         status: WorkflowStatus::Running,
         input: Some(input.clone()),
+        memo: None,
+        search_attributes: None,
         output: plan.output.clone(),
         event_count: 1,
         last_event_id: event.event_id,
@@ -1214,22 +1218,7 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
         queued.iter().cloned().map(PreparedDbAction::Schedule).collect::<Vec<_>>();
     apply_db_actions(
         state,
-        vec![
-            PreparedDbAction::PutRunStart {
-                tenant_id: instance.tenant_id.clone(),
-                instance_id: instance.instance_id.clone(),
-                run_id: instance.run_id.clone(),
-                definition_id: instance.definition_id.clone(),
-                definition_version: instance.definition_version,
-                artifact_hash: instance.artifact_hash.clone(),
-                workflow_task_queue: instance.workflow_task_queue.clone(),
-                trigger_event_id: event.event_id,
-                started_at: event.occurred_at,
-                previous_run_id: None,
-                triggered_by_run_id: None,
-            },
-            PreparedDbAction::UpsertInstance(instance.clone()),
-        ],
+        vec![PreparedDbAction::UpsertInstance(instance.clone())],
         schedule_actions,
     )
     .await?;
@@ -3226,6 +3215,8 @@ async fn materialize_child_workflows_from_plan(
             definition_version: child_instance.definition_version,
             artifact_hash: child_instance.artifact_hash.clone(),
             workflow_task_queue: workflow_task_queue.clone(),
+            memo: child_instance.memo.clone(),
+            search_attributes: child_instance.search_attributes.clone(),
             trigger_event_id: child_trigger.event_id,
             started_at: child_trigger.occurred_at,
             previous_run_id: None,
@@ -3708,6 +3699,8 @@ async fn materialize_continue_as_new_from_plan(
                 definition_version: new_instance.definition_version,
                 artifact_hash: new_instance.artifact_hash.clone(),
                 workflow_task_queue: new_instance.workflow_task_queue.clone(),
+                memo: new_instance.memo.clone(),
+                search_attributes: new_instance.search_attributes.clone(),
                 trigger_event_id: triggered_event_id,
                 started_at: trigger_event.occurred_at,
                 previous_run_id: Some(effect.run_key.run_id.clone()),
@@ -3761,6 +3754,7 @@ async fn apply_post_plan_effects(state: &AppState, effect: PostPlanEffect) -> Re
             effect.source_event_id,
         )
         .await?;
+    general.push(PreparedDbAction::UpsertInstance(effect.instance.clone()));
     general.extend(prepared_timer_actions_from_plan(state, &effect));
     if !general.is_empty() || !schedules.is_empty() {
         apply_db_actions(state, general, schedules).await?;
@@ -4569,6 +4563,36 @@ struct PreparedActions {
     ignored_worker_mismatches: u64,
 }
 
+struct AppliedActivityResultPlan {
+    post_plan: PostPlanEffect,
+    scheduled_tasks: Vec<QueuedActivity>,
+    terminal_instance: Option<WorkflowInstanceState>,
+}
+
+fn apply_activity_result_plan(
+    run_key: &RunKey,
+    runtime: &mut RuntimeWorkflowState,
+    plan: CompiledExecutionPlan,
+) -> Result<AppliedActivityResultPlan> {
+    apply_compiled_plan(&mut runtime.instance, &plan);
+    let occurred_at = runtime.instance.updated_at;
+    let scheduled_tasks =
+        schedule_activities_from_plan(&runtime.artifact, &runtime.instance, &plan, occurred_at)?;
+    let terminal_instance = runtime.instance.status.is_terminal().then_some(runtime.instance.clone());
+    Ok(AppliedActivityResultPlan {
+        post_plan: PostPlanEffect {
+            run_key: run_key.clone(),
+            artifact: runtime.artifact.clone(),
+            instance: runtime.instance.clone(),
+            plan,
+            source_event_id: runtime.instance.last_event_id,
+            occurred_at,
+        },
+        scheduled_tasks,
+        terminal_instance,
+    })
+}
+
 fn prepare_result_application(
     state: &AppState,
     results: Vec<ActivityTaskResult>,
@@ -4783,48 +4807,115 @@ fn prepare_result_application(
     }
 
     for (run_key, events) in grouped {
-        let Some(runtime) = inner.instances.get_mut(&run_key) else {
-            continue;
-        };
-        let Some(wait_state) = runtime.instance.current_state.clone() else {
-            continue;
-        };
-        let execution_state = runtime.instance.artifact_execution.clone().unwrap_or_default();
-        if let Some((plan, _)) = runtime.artifact.try_execute_after_step_terminal_batch_with_turn(
-            &wait_state,
-            &events,
-            execution_state,
-        )? {
-            apply_compiled_plan(&mut runtime.instance, &plan);
-            runtime.instance.updated_at = now;
-            post_plans.push(PostPlanEffect {
-                run_key: run_key.clone(),
-                artifact: runtime.artifact.clone(),
-                instance: runtime.instance.clone(),
-                plan: plan.clone(),
-                source_event_id: runtime.instance.last_event_id,
-                occurred_at: now,
-            });
-            let scheduled_tasks =
-                schedule_activities_from_plan(&runtime.artifact, &runtime.instance, &plan, now)?;
+        let mut index = 0usize;
+        while index < events.len() {
+            let mut applied_post_plan = None;
+            let mut scheduled_tasks = Vec::new();
             let mut terminal_instance = None;
-            for task in &scheduled_tasks {
-                schedules.push(PreparedDbAction::Schedule(task.clone()));
-                runtime.active_activities.insert(
-                    task.activity_id.clone(),
-                    ActiveActivityMeta {
-                        attempt: task.attempt,
-                        task_queue: task.task_queue.clone(),
-                        activity_type: task.activity_type.clone(),
-                        wait_state: task.state.clone(),
-                        omit_success_output: task.omit_success_output,
-                    },
-                );
+            let workflow_terminal = {
+                let Some(runtime) = inner.instances.get_mut(&run_key) else {
+                    break;
+                };
+                let Some(wait_state) = runtime.instance.current_state.clone() else {
+                    break;
+                };
+                let execution_state = runtime.instance.artifact_execution.clone().unwrap_or_default();
+                if let Some((plan, applied)) = runtime
+                    .artifact
+                    .try_execute_after_step_terminal_batch_with_turn(
+                        &wait_state,
+                        &events[index..],
+                        execution_state,
+                    )?
+                {
+                    for event in &events[index..index + applied] {
+                        runtime.instance.apply_event(event);
+                    }
+                    let applied_plan = apply_activity_result_plan(&run_key, runtime, plan)?;
+                    for task in &applied_plan.scheduled_tasks {
+                        schedules.push(PreparedDbAction::Schedule(task.clone()));
+                        runtime.active_activities.insert(
+                            task.activity_id.clone(),
+                            ActiveActivityMeta {
+                                attempt: task.attempt,
+                                task_queue: task.task_queue.clone(),
+                                activity_type: task.activity_type.clone(),
+                                wait_state: task.state.clone(),
+                                omit_success_output: task.omit_success_output,
+                            },
+                        );
+                    }
+                    scheduled_tasks = applied_plan.scheduled_tasks;
+                    terminal_instance = applied_plan.terminal_instance;
+                    applied_post_plan = Some(applied_plan.post_plan);
+                    index += applied;
+                } else {
+                    let event = &events[index];
+                    runtime.instance.apply_event(event);
+                    let execution_state =
+                        runtime.instance.artifact_execution.clone().unwrap_or_default();
+                    let turn_context = ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    };
+                    let current_state = runtime.instance.current_state.as_deref().unwrap_or_default();
+                    let plan = match &event.payload {
+                        WorkflowEvent::ActivityTaskCompleted { activity_id, output, .. } => Some(
+                            runtime.artifact.execute_after_step_completion_with_turn(
+                                current_state,
+                                activity_id,
+                                output,
+                                execution_state,
+                                turn_context,
+                            )?,
+                        ),
+                        WorkflowEvent::ActivityTaskFailed { activity_id, error, .. } => Some(
+                            runtime.artifact.execute_after_step_failure_with_turn(
+                                current_state,
+                                activity_id,
+                                error,
+                                execution_state,
+                                turn_context,
+                            )?,
+                        ),
+                        WorkflowEvent::ActivityTaskCancelled { activity_id, reason, .. } => Some(
+                            runtime.artifact.execute_after_step_cancellation_with_turn(
+                                current_state,
+                                activity_id,
+                                reason,
+                                execution_state,
+                                turn_context,
+                            )?,
+                        ),
+                        _ => None,
+                    };
+                    if let Some(plan) = plan {
+                        let applied_plan = apply_activity_result_plan(&run_key, runtime, plan)?;
+                        for task in &applied_plan.scheduled_tasks {
+                            schedules.push(PreparedDbAction::Schedule(task.clone()));
+                            runtime.active_activities.insert(
+                                task.activity_id.clone(),
+                                ActiveActivityMeta {
+                                    attempt: task.attempt,
+                                    task_queue: task.task_queue.clone(),
+                                    activity_type: task.activity_type.clone(),
+                                    wait_state: task.state.clone(),
+                                    omit_success_output: task.omit_success_output,
+                                },
+                            );
+                        }
+                        scheduled_tasks = applied_plan.scheduled_tasks;
+                        terminal_instance = applied_plan.terminal_instance;
+                        applied_post_plan = Some(applied_plan.post_plan);
+                    }
+                    index += 1;
+                }
+                runtime.instance.status.is_terminal()
+            };
+
+            if let Some(post_plan) = applied_post_plan {
+                post_plans.push(post_plan);
             }
-            if runtime.instance.status.is_terminal() {
-                terminal_instance = Some(runtime.instance.clone());
-            }
-            let _ = runtime;
             for task in scheduled_tasks {
                 inner
                     .ready
@@ -4837,9 +4928,12 @@ fn prepare_result_application(
                 notifies = true;
             }
             if let Some(instance) = terminal_instance {
-                general.push(PreparedDbAction::UpsertInstance(instance));
-                general.push(PreparedDbAction::CloseRun(run_key.clone(), now));
+                general.push(PreparedDbAction::UpsertInstance(instance.clone()));
+                general.push(PreparedDbAction::CloseRun(run_key.clone(), instance.updated_at));
                 instance_terminals = instance_terminals.saturating_add(1);
+            }
+            if workflow_terminal {
+                break;
             }
         }
     }
@@ -4912,6 +5006,8 @@ async fn apply_db_actions(
                 definition_version,
                 artifact_hash,
                 workflow_task_queue,
+                memo,
+                search_attributes,
                 trigger_event_id,
                 started_at,
                 previous_run_id,
@@ -4927,6 +5023,8 @@ async fn apply_db_actions(
                         definition_version,
                         artifact_hash.as_deref(),
                         &workflow_task_queue,
+                        memo.as_ref(),
+                        search_attributes.as_ref(),
                         trigger_event_id,
                         started_at,
                         previous_run_id.as_deref(),
@@ -5291,6 +5389,8 @@ fn schedule_activities_from_plan(
                 .clone()
                 .or_else(|| emission.state.clone())
                 .unwrap_or_else(|| instance.current_state.clone().unwrap_or_default());
+            let task_queue =
+                resolve_activity_task_queue(&instance.workflow_task_queue, task_queue.as_str());
             tasks.push(QueuedActivity {
                 tenant_id: instance.tenant_id.clone(),
                 definition_id: instance.definition_id.clone(),
@@ -5300,7 +5400,7 @@ fn schedule_activities_from_plan(
                 run_id: instance.run_id.clone(),
                 activity_id: activity_id.clone(),
                 activity_type: activity_type.clone(),
-                task_queue: task_queue.clone(),
+                task_queue,
                 attempt: *attempt,
                 input: input.clone(),
                 config: config.clone(),
@@ -5316,6 +5416,14 @@ fn schedule_activities_from_plan(
         }
     }
     Ok(tasks)
+}
+
+fn resolve_activity_task_queue(workflow_task_queue: &str, scheduled_task_queue: &str) -> String {
+    if scheduled_task_queue.is_empty() || scheduled_task_queue == "default" {
+        workflow_task_queue.to_owned()
+    } else {
+        scheduled_task_queue.to_owned()
+    }
 }
 
 fn build_retry_task(
@@ -5777,13 +5885,14 @@ mod tests {
     use chrono::Duration as ChronoDuration;
     use fabrik_broker::WorkflowPublisher;
     use fabrik_events::WorkflowIdentity;
+    use fabrik_store::{WorkflowMailboxStatus, WorkflowUpdateStatus};
     use fabrik_workflow::{
         ArtifactEntrypoint, CompiledStateNode, CompiledUpdateHandler, CompiledWorkflow,
         ErrorTransition, Expression, ParentClosePolicy,
     };
     use serde_json::json;
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         net::TcpListener,
         process::Command,
         time::{Duration as StdDuration, Instant},
@@ -5886,6 +5995,7 @@ mod tests {
                         },
                     ),
                 ]),
+                params: Vec::new(),
                 non_cancellable_states: std::collections::BTreeSet::new(),
             },
         )
@@ -5914,6 +6024,7 @@ mod tests {
                         },
                     ),
                 ]),
+                params: Vec::new(),
                 non_cancellable_states: std::collections::BTreeSet::new(),
             },
         )
@@ -5965,6 +6076,7 @@ mod tests {
                         },
                     ),
                 ]),
+                params: Vec::new(),
                 non_cancellable_states: std::collections::BTreeSet::new(),
             },
         )
@@ -5995,6 +6107,8 @@ mod tests {
             artifact_execution: None,
             status,
             input: None,
+            memo: None,
+            search_attributes: None,
             output: None,
             event_count,
             last_event_id: Uuid::now_v7(),
@@ -6154,6 +6268,7 @@ mod tests {
             CompiledWorkflow {
                 initial_state: "dispatch".to_owned(),
                 states,
+                params: Vec::new(),
                 non_cancellable_states: std::collections::BTreeSet::new(),
             },
         )
@@ -6193,6 +6308,7 @@ mod tests {
                     },
                 ),
             ]),
+            params: Vec::new(),
             non_cancellable_states: std::collections::BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -6218,6 +6334,7 @@ mod tests {
                     }),
                 },
             )]),
+            params: Vec::new(),
             non_cancellable_states: std::collections::BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -6250,6 +6367,7 @@ mod tests {
                     },
                 ),
             ]),
+            params: Vec::new(),
             non_cancellable_states: std::collections::BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -6258,6 +6376,60 @@ mod tests {
             "unified-runtime-test",
             ArtifactEntrypoint {
                 module: "child-signal.ts".to_owned(),
+                export: "workflow".to_owned(),
+            },
+            workflow,
+        );
+        artifact.artifact_hash = artifact.hash();
+        artifact
+    }
+
+    fn signal_then_step_artifact() -> CompiledWorkflowArtifact {
+        let workflow = CompiledWorkflow {
+            initial_state: "wait_approve".to_owned(),
+            states: BTreeMap::from([
+                (
+                    "wait_approve".to_owned(),
+                    CompiledStateNode::WaitForEvent {
+                        event_type: "approve".to_owned(),
+                        next: "step_greet".to_owned(),
+                        output_var: Some("approved".to_owned()),
+                    },
+                ),
+                (
+                    "step_greet".to_owned(),
+                    CompiledStateNode::Step {
+                        handler: "greet".to_owned(),
+                        input: Expression::Identifier { name: "approved".to_owned() },
+                        next: Some("done".to_owned()),
+                        task_queue: Some(Expression::Literal {
+                            value: Value::String("orders".to_owned()),
+                        }),
+                        retry: None,
+                        output_var: Some("greeted".to_owned()),
+                        on_error: None,
+                        config: None,
+                        schedule_to_start_timeout_ms: None,
+                        start_to_close_timeout_ms: Some(30_000),
+                        heartbeat_timeout_ms: None,
+                    },
+                ),
+                (
+                    "done".to_owned(),
+                    CompiledStateNode::Succeed {
+                        output: Some(Expression::Identifier { name: "greeted".to_owned() }),
+                    },
+                ),
+            ]),
+            params: Vec::new(),
+            non_cancellable_states: BTreeSet::new(),
+        };
+        let mut artifact = CompiledWorkflowArtifact::new(
+            "unified-signal-step".to_owned(),
+            1,
+            "unified-runtime-test",
+            ArtifactEntrypoint {
+                module: "signal-step.ts".to_owned(),
                 export: "workflow".to_owned(),
             },
             workflow,
@@ -6311,6 +6483,7 @@ mod tests {
                     },
                 ),
             ]),
+            params: Vec::new(),
             non_cancellable_states: std::collections::BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -6374,6 +6547,7 @@ mod tests {
                     },
                 ),
             ]),
+            params: Vec::new(),
             non_cancellable_states: std::collections::BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -6401,6 +6575,7 @@ mod tests {
                     output_var: None,
                 },
             )]),
+            params: Vec::new(),
             non_cancellable_states: std::collections::BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -6471,6 +6646,7 @@ mod tests {
                 ),
                 ("done".to_owned(), CompiledStateNode::Succeed { output: None }),
             ]),
+            params: Vec::new(),
             non_cancellable_states: std::collections::BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -7464,6 +7640,8 @@ mod tests {
             artifact_execution: Some(ArtifactExecutionState::default()),
             status: WorkflowStatus::Running,
             input: Some(json!({"seed": true})),
+            memo: None,
+            search_attributes: None,
             output: None,
             event_count: 1,
             last_event_id: Uuid::now_v7(),
@@ -8144,6 +8322,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn activity_completion_after_signal_advances_single_step_workflow() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = signal_then_step_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+        let state_dir =
+            std::env::temp_dir().join(format!("unified-runtime-signal-step-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        apply_ownership_record(
+            &app_state,
+            1,
+            "test-owner",
+            3,
+            Utc::now() + ChronoDuration::seconds(30),
+        );
+        let worker = WorkerApi { state: app_state.clone() };
+
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-signal-step",
+            "run-signal-step-1",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: Value::Null },
+            Utc::now(),
+        );
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let signal_event = test_event(
+            &identity,
+            WorkflowEvent::SignalQueued {
+                signal_id: "sig-approve".to_owned(),
+                signal_type: "approve".to_owned(),
+                payload: Value::String("fiona".to_owned()),
+            },
+            Utc::now(),
+        );
+        store
+            .queue_signal(
+                "tenant",
+                "instance-signal-step",
+                "run-signal-step-1",
+                "sig-approve",
+                "approve",
+                None,
+                &Value::String("fiona".to_owned()),
+                signal_event.event_id,
+                signal_event.occurred_at,
+            )
+            .await?;
+        handle_mailbox_queue_event(&app_state, signal_event).await?;
+
+        let task = worker
+            .poll_activity_tasks(Request::new(PollActivityTasksRequest {
+                tenant_id: "tenant".to_owned(),
+                task_queue: "orders".to_owned(),
+                worker_id: "worker-a".to_owned(),
+                worker_build_id: "build-a".to_owned(),
+                poll_timeout_ms: 10,
+                max_tasks: 1,
+                supports_cbor: false,
+            }))
+            .await?
+            .into_inner()
+            .tasks
+            .into_iter()
+            .next()
+            .context("activity task should be available after signal")?;
+
+        worker
+            .complete_activity_task(Request::new(
+                fabrik_worker_protocol::activity_worker::CompleteActivityTaskRequest {
+                    tenant_id: task.tenant_id.clone(),
+                    instance_id: task.instance_id.clone(),
+                    run_id: task.run_id.clone(),
+                    activity_id: task.activity_id.clone(),
+                    attempt: task.attempt,
+                    worker_id: "worker-a".to_owned(),
+                    worker_build_id: "build-a".to_owned(),
+                    lease_epoch: task.lease_epoch,
+                    owner_epoch: task.owner_epoch,
+                    output_json: "\"hello fiona\"".to_owned(),
+                },
+            ))
+            .await?;
+
+        let current = store
+            .get_instance("tenant", "instance-signal-step")
+            .await?
+            .context("completed instance")?;
+        assert_eq!(current.status, WorkflowStatus::Completed);
+        assert_eq!(current.output, Some(Value::String("hello fiona".to_owned())));
+        assert_eq!(current.last_event_type, "ActivityTaskCompleted");
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[test]
+    fn schedule_activities_inherits_workflow_queue_when_step_uses_default() -> Result<()> {
+        let artifact = CompiledWorkflowArtifact::new(
+            "queue-inheritance".to_owned(),
+            1,
+            "unified-runtime-test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "start".to_owned(),
+                states: BTreeMap::from([(
+                    "start".to_owned(),
+                    CompiledStateNode::Step {
+                        handler: "greet".to_owned(),
+                        input: Expression::Literal { value: Value::String("fiona".to_owned()) },
+                        next: Some("done".to_owned()),
+                        task_queue: None,
+                        retry: None,
+                        output_var: None,
+                        on_error: None,
+                        config: None,
+                        schedule_to_start_timeout_ms: None,
+                        start_to_close_timeout_ms: Some(30_000),
+                        heartbeat_timeout_ms: None,
+                    },
+                )]),
+                params: Vec::new(),
+                non_cancellable_states: BTreeSet::new(),
+            },
+        );
+        let instance = WorkflowInstanceState {
+            tenant_id: "tenant".to_owned(),
+            definition_id: "definition".to_owned(),
+            definition_version: Some(1),
+            artifact_hash: Some("artifact".to_owned()),
+            instance_id: "instance".to_owned(),
+            run_id: "run".to_owned(),
+            workflow_task_queue: "orders".to_owned(),
+            sticky_workflow_build_id: None,
+            sticky_workflow_poller_id: None,
+            current_state: Some("start".to_owned()),
+            context: None,
+            artifact_execution: Some(ArtifactExecutionState::default()),
+            status: WorkflowStatus::Running,
+            input: Some(Value::Null),
+            memo: None,
+            search_attributes: None,
+            output: None,
+            event_count: 1,
+            last_event_id: Uuid::now_v7(),
+            last_event_type: "WorkflowTriggered".to_owned(),
+            updated_at: Utc::now(),
+        };
+        let plan = CompiledExecutionPlan {
+            workflow_version: 1,
+            final_state: "start".to_owned(),
+            emissions: vec![fabrik_workflow::ExecutionEmission {
+                event: WorkflowEvent::ActivityTaskScheduled {
+                    activity_id: "start".to_owned(),
+                    activity_type: "greet".to_owned(),
+                    task_queue: "default".to_owned(),
+                    attempt: 1,
+                    input: Value::String("fiona".to_owned()),
+                    config: None,
+                    state: Some("start".to_owned()),
+                    schedule_to_start_timeout_ms: None,
+                    start_to_close_timeout_ms: Some(30_000),
+                    heartbeat_timeout_ms: None,
+                },
+                state: Some("start".to_owned()),
+            }],
+            execution_state: ArtifactExecutionState::default(),
+            context: Some(Value::String("fiona".to_owned())),
+            output: None,
+        };
+
+        let scheduled = schedule_activities_from_plan(&artifact, &instance, &plan, Utc::now())?;
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].task_queue, "orders");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn poll_activity_tasks_respects_activity_build_compatibility() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
@@ -8410,6 +8775,182 @@ mod tests {
         let debug_snapshot = debug.lock().expect("unified debug lock poisoned").clone();
         assert!(debug_snapshot.restored_from_snapshot);
         assert_eq!(debug_snapshot.restore_records_applied, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn store_snapshot_restore_preserves_alpha_queue_memo_and_search_attributes_after_handoff()
+    -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let broker = redpanda.broker.clone();
+
+        let artifact = test_artifact("default");
+        store.put_artifact("tenant-a", &artifact).await?;
+
+        let identity = WorkflowIdentity::new(
+            "tenant-a",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-alpha-metadata",
+            "run-alpha-metadata",
+            "unified-runtime-test",
+        );
+        let partition_id = publisher.partition_for_key(&identity.partition_key);
+        let trigger_time = Utc::now();
+        let mut trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({"items": [json!({"ok": true})]}) },
+            trigger_time,
+        );
+        trigger.metadata.insert("workflow_task_queue".to_owned(), "alpha-orders".to_owned());
+        trigger
+            .metadata
+            .insert("memo_json".to_owned(), "{\"region\":\"eu\",\"priority\":1}".to_owned());
+        trigger.metadata.insert(
+            "search_attributes_json".to_owned(),
+            "{\"CustomKeywordField\":[\"vip\",\"alpha\"],\"Region\":\"eu\"}".to_owned(),
+        );
+        publisher.publish(&trigger, &trigger.partition_key).await?;
+
+        let plan = artifact.execute_trigger_with_turn(
+            match &trigger.payload {
+                WorkflowEvent::WorkflowTriggered { input } => input,
+                _ => unreachable!("trigger payload"),
+            },
+            ExecutionTurnContext { event_id: trigger.event_id, occurred_at: trigger.occurred_at },
+        )?;
+        let mut instance = WorkflowInstanceState::try_from(&trigger)?;
+        apply_compiled_plan(&mut instance, &plan);
+
+        let emitted_at = trigger_time + ChronoDuration::milliseconds(1);
+        let emitted_events = plan
+            .emissions
+            .iter()
+            .map(|emission| test_event(&identity, emission.event.clone(), emitted_at))
+            .collect::<Vec<_>>();
+        publisher.publish_all(&emitted_events).await?;
+
+        instance.event_count = 1 + i64::try_from(emitted_events.len()).unwrap_or_default();
+        if let Some(last) = emitted_events.last() {
+            instance.last_event_id = last.event_id;
+            instance.last_event_type = last.event_type.clone();
+            instance.updated_at = last.occurred_at;
+        }
+        store.upsert_instance(&instance).await?;
+        store.put_snapshot(&instance).await?;
+
+        let scheduled = schedule_activities_from_plan(&artifact, &instance, &plan, emitted_at)?;
+        let scheduled_updates = scheduled.iter().map(activity_schedule_update).collect::<Vec<_>>();
+        store.upsert_activities_scheduled_batch(&scheduled_updates).await?;
+
+        let completion_time = emitted_at + ChronoDuration::milliseconds(1);
+        let completion = test_event(
+            &identity,
+            WorkflowEvent::ActivityTaskCompleted {
+                activity_id: scheduled[0].activity_id.clone(),
+                attempt: scheduled[0].attempt,
+                output: json!({"ok": true}),
+                worker_id: "worker-a".to_owned(),
+                worker_build_id: "build-a".to_owned(),
+            },
+            completion_time,
+        );
+        publisher.publish(&completion, &completion.partition_key).await?;
+        store
+            .apply_activity_terminal_batch(&[ActivityTerminalUpdate {
+                tenant_id: identity.tenant_id.clone(),
+                instance_id: identity.instance_id.clone(),
+                run_id: identity.run_id.clone(),
+                activity_id: scheduled[0].activity_id.clone(),
+                attempt: scheduled[0].attempt,
+                worker_id: "worker-a".to_owned(),
+                worker_build_id: "build-a".to_owned(),
+                payload: ActivityTerminalPayload::Completed { output: json!({"ok": true}) },
+                event_id: completion.event_id,
+                event_type: completion.event_type.clone(),
+                occurred_at: completion.occurred_at,
+            }])
+            .await?;
+
+        let history_deadline = Instant::now() + StdDuration::from_secs(10);
+        loop {
+            let history = read_workflow_history(
+                &broker,
+                "unified-runtime-alpha-metadata-test",
+                &WorkflowHistoryFilter::new(
+                    &identity.tenant_id,
+                    &identity.instance_id,
+                    &identity.run_id,
+                ),
+                StdDuration::from_millis(500),
+                StdDuration::from_secs(2),
+            )
+            .await?;
+            if history.iter().any(|event| event.event_id == completion.event_id) {
+                break;
+            }
+            if Instant::now() >= history_deadline {
+                anyhow::bail!("completion event did not appear in broker history before restore");
+            }
+            sleep(StdDuration::from_millis(100)).await;
+        }
+
+        let owner_a = store
+            .claim_partition_ownership(
+                partition_id,
+                "unified-owner-alpha-a",
+                StdDuration::from_millis(200),
+            )
+            .await?
+            .context("owner a should claim partition")?;
+        assert_eq!(owner_a.owner_epoch, 1);
+
+        sleep(StdDuration::from_millis(250)).await;
+
+        let owner_b = store
+            .claim_partition_ownership(
+                partition_id,
+                "unified-owner-alpha-b",
+                StdDuration::from_secs(5),
+            )
+            .await?
+            .context("owner b should claim expired partition")?;
+        assert_eq!(owner_b.owner_epoch, 2);
+
+        let debug = Arc::new(StdMutex::new(UnifiedDebugState::default()));
+        let restored = restore_runtime_state_from_store(&store, &broker, &debug).await?;
+        let runtime = restored
+            .instances
+            .get(&RunKey {
+                tenant_id: identity.tenant_id.clone(),
+                instance_id: identity.instance_id.clone(),
+                run_id: identity.run_id.clone(),
+            })
+            .context("restored runtime state should contain the alpha metadata workflow")?;
+
+        assert_eq!(runtime.instance.workflow_task_queue, "alpha-orders");
+        assert_eq!(runtime.instance.memo, Some(json!({"region": "eu", "priority": 1})));
+        assert_eq!(
+            runtime.instance.search_attributes,
+            Some(json!({"CustomKeywordField": ["vip", "alpha"], "Region": "eu"}))
+        );
+        assert_eq!(runtime.instance.status, WorkflowStatus::Completed);
+        assert_eq!(runtime.instance.last_event_id, completion.event_id);
+        assert!(runtime.active_activities.is_empty());
+        assert!(restored.ready.values().all(VecDeque::is_empty));
+        assert!(
+            debug.lock().expect("unified debug lock poisoned").restored_from_snapshot,
+            "restore should still come from snapshot-backed handoff"
+        );
 
         Ok(())
     }

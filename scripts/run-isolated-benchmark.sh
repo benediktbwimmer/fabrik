@@ -54,6 +54,7 @@ configure_redpanda_limits() {
 
 WORKFLOW_PARTITIONS="${WORKFLOW_PARTITIONS:-$(partition_csv "$WORKFLOW_EVENTS_PARTITION_COUNT")}"
 THROUGHPUT_PARTITIONS="${THROUGHPUT_OWNERSHIP_PARTITIONS:-$(partition_csv "$THROUGHPUT_TOPIC_PARTITION_COUNT")}"
+THROUGHPUT_OWNERSHIP_PARTITION_ID_OFFSET="${THROUGHPUT_OWNERSHIP_PARTITION_ID_OFFSET:-2000000}"
 POSTGRES_URL="postgres://fabrik:fabrik@127.0.0.1:${POSTGRES_HOST_PORT:-55433}/${DB_NAME}"
 WORKFLOW_EVENTS_TOPIC="${WORKFLOW_EVENTS_TOPIC:-workflow-events-$NAMESPACE}"
 THROUGHPUT_COMMANDS_TOPIC="${THROUGHPUT_COMMANDS_TOPIC:-throughput-commands-$NAMESPACE}"
@@ -88,23 +89,22 @@ def reserve():
     s.close()
     return port
 
-for _ in range(12):
+for _ in range(11):
     print(reserve())
 PY
 )
 
 INGEST_PORT="${INGEST_SERVICE_PORT:-${PORTS[0]}}"
-EXECUTOR_PORT="${EXECUTOR_SERVICE_PORT:-${PORTS[1]}}"
-MATCHING_PORT="${MATCHING_SERVICE_PORT:-${PORTS[2]}}"
-MATCHING_DEBUG_PORT="${MATCHING_DEBUG_PORT:-${PORTS[3]}}"
-THROUGHPUT_RUNTIME_PORT="${THROUGHPUT_RUNTIME_PORT:-${PORTS[4]}}"
-THROUGHPUT_DEBUG_PORT="${THROUGHPUT_DEBUG_PORT:-${PORTS[5]}}"
-THROUGHPUT_PROJECTOR_PORT="${THROUGHPUT_PROJECTOR_PORT:-${PORTS[6]}}"
-ACTIVITY_WORKER_SERVICE_PORT="${ACTIVITY_WORKER_SERVICE_PORT:-${PORTS[7]}}"
-STREAM_ACTIVITY_WORKER_SERVICE_PORT="${STREAM_ACTIVITY_WORKER_SERVICE_PORT:-${PORTS[8]}}"
-TIMER_SERVICE_PORT="${TIMER_SERVICE_PORT:-${PORTS[9]}}"
-UNIFIED_RUNTIME_PORT="${UNIFIED_RUNTIME_PORT:-${PORTS[10]}}"
-UNIFIED_DEBUG_PORT="${UNIFIED_DEBUG_PORT:-${PORTS[11]}}"
+MATCHING_PORT="${MATCHING_SERVICE_PORT:-${PORTS[1]}}"
+MATCHING_DEBUG_PORT="${MATCHING_DEBUG_PORT:-${PORTS[2]}}"
+THROUGHPUT_RUNTIME_PORT="${THROUGHPUT_RUNTIME_PORT:-${PORTS[3]}}"
+THROUGHPUT_DEBUG_PORT="${THROUGHPUT_DEBUG_PORT:-${PORTS[4]}}"
+THROUGHPUT_PROJECTOR_PORT="${THROUGHPUT_PROJECTOR_PORT:-${PORTS[5]}}"
+ACTIVITY_WORKER_SERVICE_PORT="${ACTIVITY_WORKER_SERVICE_PORT:-${PORTS[6]}}"
+STREAM_ACTIVITY_WORKER_SERVICE_PORT="${STREAM_ACTIVITY_WORKER_SERVICE_PORT:-${PORTS[7]}}"
+TIMER_SERVICE_PORT="${TIMER_SERVICE_PORT:-${PORTS[8]}}"
+UNIFIED_RUNTIME_PORT="${UNIFIED_RUNTIME_PORT:-${PORTS[9]}}"
+UNIFIED_DEBUG_PORT="${UNIFIED_DEBUG_PORT:-${PORTS[10]}}"
 
 PIDS=()
 REPORT_PATH=""
@@ -345,7 +345,6 @@ stop_existing_local_services() {
   fi
   local patterns=(
     'target/release/matching-service'
-    'target/release/executor-service'
     'target/release/ingest-service'
     'target/release/throughput-runtime'
     'target/release/throughput-projector'
@@ -432,7 +431,6 @@ if [[ "$BUILD_RELEASE" == "1" ]]; then
     -p benchmark-runner \
     -p ingest-service \
     -p matching-service \
-    -p executor-service \
     -p unified-runtime \
     -p throughput-runtime \
     -p throughput-projector \
@@ -464,6 +462,7 @@ COMMON_ENV=(
   "UNIFIED_RUNTIME_STATE_DIR=$RUN_DIR/unified-runtime-state"
   "WORKFLOW_PARTITIONS=$WORKFLOW_PARTITIONS"
   "THROUGHPUT_OWNERSHIP_PARTITIONS=$THROUGHPUT_PARTITIONS"
+  "THROUGHPUT_OWNERSHIP_PARTITION_ID_OFFSET=$THROUGHPUT_OWNERSHIP_PARTITION_ID_OFFSET"
   "THROUGHPUT_MAX_AGGREGATION_GROUPS=${THROUGHPUT_MAX_AGGREGATION_GROUPS:-32}"
   "THROUGHPUT_POLL_MAX_TASKS=${THROUGHPUT_POLL_MAX_TASKS:-32}"
   "THROUGHPUT_REPORT_APPLY_BATCH_SIZE=${THROUGHPUT_REPORT_APPLY_BATCH_SIZE:-64}"
@@ -496,29 +495,30 @@ for ((i = 0; i < ${#RUNNER_ARGS[@]}; i++)); do
   fi
 done
 
+echo "[isolated-benchmark] starting unified-runtime"
+start_service unified-runtime "$LOG_DIR/unified-runtime.log" \
+  "${COMMON_ENV[@]}" \
+  "UNIFIED_RUNTIME_PORT=$UNIFIED_RUNTIME_PORT" \
+  "UNIFIED_DEBUG_PORT=$UNIFIED_DEBUG_PORT" \
+  -- \
+  target/release/unified-runtime
+wait_for_port 127.0.0.1 "$UNIFIED_RUNTIME_PORT" "unified-runtime"
+wait_for_port 127.0.0.1 "$UNIFIED_DEBUG_PORT" "unified-runtime-debug"
+
+echo "[isolated-benchmark] starting timer-service"
+start_service timer-service "$LOG_DIR/timer-service.log" \
+  "${COMMON_ENV[@]}" \
+  "TIMER_SERVICE_PORT=$TIMER_SERVICE_PORT" \
+  -- \
+  target/release/timer-service
+wait_for_port 127.0.0.1 "$TIMER_SERVICE_PORT" "timer-service"
+
 if [[ "$EXECUTION_MODE" == "unified" ]]; then
-  echo "[isolated-benchmark] starting unified-runtime"
-  start_service unified-runtime "$LOG_DIR/unified-runtime.log" \
-    "${COMMON_ENV[@]}" \
-    "UNIFIED_RUNTIME_PORT=$UNIFIED_RUNTIME_PORT" \
-    "UNIFIED_DEBUG_PORT=$UNIFIED_DEBUG_PORT" \
-    -- \
-    target/release/unified-runtime
-  wait_for_port 127.0.0.1 "$UNIFIED_RUNTIME_PORT" "unified-runtime"
-  wait_for_port 127.0.0.1 "$UNIFIED_DEBUG_PORT" "unified-runtime-debug"
-
-  echo "[isolated-benchmark] starting timer-service"
-  start_service timer-service "$LOG_DIR/timer-service.log" \
-    "${COMMON_ENV[@]}" \
-    "TIMER_SERVICE_PORT=$TIMER_SERVICE_PORT" \
-    -- \
-    target/release/timer-service
-  wait_for_port 127.0.0.1 "$TIMER_SERVICE_PORT" "timer-service"
-
   echo "[isolated-benchmark] starting activity-worker-service (unified)"
   start_service activity-worker-service-unified "$LOG_DIR/activity-worker-service-unified.log" \
     "${COMMON_ENV[@]}" \
     "ACTIVITY_WORKER_SERVICE_PORT=$ACTIVITY_WORKER_SERVICE_PORT" \
+    "UNIFIED_RUNTIME_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
     "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
     "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
     "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
@@ -539,15 +539,6 @@ else
     target/release/matching-service
   wait_for_port 127.0.0.1 "$MATCHING_PORT" "matching-service"
 
-  echo "[isolated-benchmark] starting executor-service"
-  start_service executor-service "$LOG_DIR/executor-service.log" \
-    "${COMMON_ENV[@]}" \
-    "EXECUTOR_SERVICE_PORT=$EXECUTOR_PORT" \
-    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
-    -- \
-    target/release/executor-service
-  wait_for_port 127.0.0.1 "$EXECUTOR_PORT" "executor-service"
-
   echo "[isolated-benchmark] starting throughput-runtime"
   start_service throughput-runtime "$LOG_DIR/throughput-runtime.log" \
     "${COMMON_ENV[@]}" \
@@ -566,19 +557,12 @@ else
     target/release/throughput-projector
   wait_for_port 127.0.0.1 "$THROUGHPUT_PROJECTOR_PORT" "throughput-projector"
 
-  echo "[isolated-benchmark] starting timer-service"
-  start_service timer-service "$LOG_DIR/timer-service.log" \
-    "${COMMON_ENV[@]}" \
-    "TIMER_SERVICE_PORT=$TIMER_SERVICE_PORT" \
-    -- \
-    target/release/timer-service
-  wait_for_port 127.0.0.1 "$TIMER_SERVICE_PORT" "timer-service"
-
   echo "[isolated-benchmark] starting activity-worker-service (pg-v1/matching)"
   start_service activity-worker-service "$LOG_DIR/activity-worker-service-pg-v1.log" \
     "${COMMON_ENV[@]}" \
     "ACTIVITY_WORKER_SERVICE_PORT=$ACTIVITY_WORKER_SERVICE_PORT" \
-    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
+    "UNIFIED_RUNTIME_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
+    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
     "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
     "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
     "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \
@@ -591,7 +575,8 @@ else
   start_service activity-worker-service-stream-v2 "$LOG_DIR/activity-worker-service-stream-v2.log" \
     "${COMMON_ENV[@]}" \
     "ACTIVITY_WORKER_SERVICE_PORT=$STREAM_ACTIVITY_WORKER_SERVICE_PORT" \
-    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
+    "UNIFIED_RUNTIME_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
+    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
     "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$THROUGHPUT_RUNTIME_PORT" \
     "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
     "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \
@@ -634,7 +619,6 @@ THROUGHPUT_REPORTS_TOPIC=$THROUGHPUT_REPORTS_TOPIC
 THROUGHPUT_CHANGELOG_TOPIC=$THROUGHPUT_CHANGELOG_TOPIC
 THROUGHPUT_PROJECTIONS_TOPIC=$THROUGHPUT_PROJECTIONS_TOPIC
 INGEST_SERVICE_URL=http://127.0.0.1:$INGEST_PORT
-EXECUTOR_SERVICE_URL=http://127.0.0.1:$EXECUTOR_PORT
 THROUGHPUT_DEBUG_URL=http://127.0.0.1:$THROUGHPUT_DEBUG_PORT
 THROUGHPUT_PROJECTOR_URL=http://127.0.0.1:$THROUGHPUT_PROJECTOR_PORT
 TIMER_SERVICE_URL=http://127.0.0.1:$TIMER_SERVICE_PORT
@@ -645,7 +629,6 @@ echo "[isolated-benchmark] running benchmark-runner"
 env \
   "${COMMON_ENV[@]}" \
   "INGEST_SERVICE_URL=http://127.0.0.1:$INGEST_PORT" \
-  "EXECUTOR_SERVICE_URL=http://127.0.0.1:$EXECUTOR_PORT" \
   "THROUGHPUT_DEBUG_URL=http://127.0.0.1:$THROUGHPUT_DEBUG_PORT" \
   "THROUGHPUT_PROJECTOR_URL=http://127.0.0.1:$THROUGHPUT_PROJECTOR_PORT" \
   "UNIFIED_RUNTIME_DEBUG_URL=http://127.0.0.1:$UNIFIED_DEBUG_PORT" \

@@ -47,140 +47,15 @@ const WORKER_BLOCKING_PROPERTIES = new Map([
   ["workflowInterceptorModules", "workflow interceptors are not migration-ready yet"],
 ]);
 
-const SUPPORT_MATRIX = [
-  {
-    feature: "proxy_activities",
-    support_level: "native",
-    replay_validation: true,
-    deploy_validation: true,
-    semantic_caveats: ["static proxyActivities options only"],
-    blocking_severity: "warning",
-  },
-  {
-    feature: "activity_options_and_retries",
-    support_level: "native",
-    replay_validation: true,
-    deploy_validation: true,
-    semantic_caveats: ["static retry and timeout literals only"],
-    blocking_severity: "warning",
-  },
-  {
-    feature: "signals_queries_updates",
-    support_level: "native",
-    replay_validation: true,
-    deploy_validation: true,
-    semantic_caveats: ["handler bodies must stay within the compiler subset"],
-    blocking_severity: "warning",
-  },
-  {
-    feature: "async_handlers",
-    support_level: "native",
-    replay_validation: true,
-    deploy_validation: true,
-    semantic_caveats: ["async handlers must stay within the supported control-flow subset"],
-    blocking_severity: "warning",
-  },
-  {
-    feature: "condition_waits",
-    support_level: "native",
-    replay_validation: true,
-    deploy_validation: true,
-    semantic_caveats: ["timeout arguments must remain static literals"],
-    blocking_severity: "warning",
-  },
-  {
-    feature: "child_workflows",
-    support_level: "native",
-    replay_validation: true,
-    deploy_validation: true,
-    semantic_caveats: ["current support targets the existing compiler subset"],
-    blocking_severity: "warning",
-  },
-  {
-    feature: "external_workflow_handles",
-    support_level: "native",
-    replay_validation: true,
-    deploy_validation: false,
-    semantic_caveats: ["external-handle support is limited to the currently compiled subset"],
-    blocking_severity: "warning",
-  },
-  {
-    feature: "cancellation_scopes",
-    support_level: "native",
-    replay_validation: true,
-    deploy_validation: true,
-    semantic_caveats: ["current support covers the narrow Temporal-style patterns already compiled"],
-    blocking_severity: "warning",
-  },
-  {
-    feature: "continue_as_new",
-    support_level: "native",
-    replay_validation: true,
-    deploy_validation: true,
-    semantic_caveats: [],
-    blocking_severity: "warning",
-  },
-  {
-    feature: "ctx_version_workflow_evolution",
-    support_level: "native",
-    replay_validation: true,
-    deploy_validation: true,
-    semantic_caveats: ["migration should map Temporal versioning patterns onto Fabrik version markers"],
-    blocking_severity: "warning",
-  },
-  {
-    feature: "worker_build_ids_and_routing",
-    support_level: "adapter",
-    replay_validation: false,
-    deploy_validation: true,
-    semantic_caveats: ["compiled workflows run on Fabrik runtime; activity builds are packaged separately"],
-    blocking_severity: "warning",
-  },
-  {
-    feature: "search_attributes_memo",
-    support_level: "blocked",
-    replay_validation: false,
-    deploy_validation: false,
-    semantic_caveats: ["apps that rely on search or memo semantics are blocked until the visibility surface is complete"],
-    blocking_severity: "hard_block",
-  },
-  {
-    feature: "payload_data_converter_usage",
-    support_level: "blocked",
-    replay_validation: false,
-    deploy_validation: false,
-    semantic_caveats: ["custom payload conversion and codec behavior are blocked by default"],
-    blocking_severity: "hard_block",
-  },
-  {
-    feature: "worker_bootstrap_patterns",
-    support_level: "adapter",
-    replay_validation: false,
-    deploy_validation: true,
-    semantic_caveats: ["static Worker.create bootstraps are packaged; dynamic bootstraps are blocked"],
-    blocking_severity: "warning",
-  },
-  {
-    feature: "interceptors_middleware",
-    support_level: "blocked",
-    replay_validation: false,
-    deploy_validation: false,
-    semantic_caveats: ["interceptor behavior is not migration-ready yet"],
-    blocking_severity: "hard_block",
-  },
-  {
-    feature: "unsupported_temporal_api",
-    support_level: "blocked",
-    replay_validation: false,
-    deploy_validation: false,
-    semantic_caveats: ["unsupported Temporal APIs block migration until explicitly implemented"],
-    blocking_severity: "hard_block",
-  },
-];
+const SUPPORT_MATRIX_URL = new URL("./temporal-ts-subset-support-matrix.json", import.meta.url);
 
 function usage() {
   console.error("usage: node sdk/typescript-compiler/migration-analyzer.mjs --project <dir>");
   process.exit(1);
+}
+
+async function loadSupportMatrixDocument() {
+  return JSON.parse(await fs.readFile(SUPPORT_MATRIX_URL, "utf8"));
 }
 
 function parseArgs(argv) {
@@ -317,6 +192,53 @@ function findObjectProperty(objectLiteral, propertyName) {
   });
 }
 
+function isStaticPrimitiveLiteral(node) {
+  if (
+    ts.isStringLiteral(node) ||
+    ts.isNoSubstitutionTemplateLiteral(node) ||
+    ts.isNumericLiteral(node)
+  ) {
+    return true;
+  }
+  return node.kind === ts.SyntaxKind.TrueKeyword || node.kind === ts.SyntaxKind.FalseKeyword || node.kind === ts.SyntaxKind.NullKeyword;
+}
+
+function isSupportedMemoObject(node) {
+  if (!ts.isObjectLiteralExpression(node)) {
+    return false;
+  }
+  return node.properties.every((property) => {
+    if (!ts.isPropertyAssignment(property) || property.name == null) {
+      return false;
+    }
+    return isStaticPrimitiveLiteral(property.initializer);
+  });
+}
+
+function isSupportedSearchAttributesObject(node) {
+  if (!ts.isObjectLiteralExpression(node)) {
+    return false;
+  }
+  return node.properties.every((property) => {
+    if (!ts.isPropertyAssignment(property) || property.name == null) {
+      return false;
+    }
+    const value = property.initializer;
+    if (
+      ts.isStringLiteral(value) ||
+      ts.isNoSubstitutionTemplateLiteral(value)
+    ) {
+      return true;
+    }
+    if (!ts.isArrayLiteralExpression(value)) {
+      return false;
+    }
+    return value.elements.every(
+      (element) => ts.isStringLiteral(element) || ts.isNoSubstitutionTemplateLiteral(element),
+    );
+  });
+}
+
 function maybeImportedModulePath(sourceFile, localName) {
   for (const statement of sourceFile.statements) {
     if (!ts.isImportDeclaration(statement) || !statement.importClause) {
@@ -398,6 +320,7 @@ function dedupeFindings(findings) {
 
 async function main() {
   const { projectRoot } = parseArgs(process.argv.slice(2));
+  const supportMatrixDocument = await loadSupportMatrixDocument();
   const files = await collectProjectFiles(projectRoot);
   const program = createProgram(projectRoot, files);
 
@@ -657,18 +580,26 @@ async function main() {
           ts.isIdentifier(node.name) ? node.name.text : ts.isStringLiteral(node.name) ? node.name.text : null;
         if (propertyName === "searchAttributes" || propertyName === "memo") {
           fileUses.add("search_attributes_memo");
-          findings.push(
-            createFinding(
-              projectRoot,
-              "hard_block",
-              `blocked_${propertyName}_usage`,
-              "visibility_search_usage",
-              node,
-              `Temporal ${propertyName} usage is not migration-ready yet`,
-              "remove or replace visibility-dependent semantics before migration",
-              propertyName,
-            ),
-          );
+          const supported =
+            propertyName === "memo"
+              ? isSupportedMemoObject(node.initializer)
+              : isSupportedSearchAttributesObject(node.initializer);
+          if (!supported) {
+            findings.push(
+              createFinding(
+                projectRoot,
+                "hard_block",
+                `blocked_${propertyName}_usage`,
+                "visibility_search_usage",
+                node,
+                `Temporal ${propertyName} usage is outside Fabrik's alpha visibility/search subset`,
+                propertyName === "memo"
+                  ? "use a static top-level memo object with primitive literal values only"
+                  : "use static top-level search attributes with string values or arrays of string literals only",
+                propertyName,
+              ),
+            );
+          }
         }
         if (
           propertyName === "dataConverter" ||
@@ -726,7 +657,15 @@ async function main() {
       {
         schema_version: 1,
         project_root: projectRoot,
-        support_matrix: SUPPORT_MATRIX,
+        support_matrix_meta: {
+          schema_version: supportMatrixDocument.schema_version,
+          milestone_scope: supportMatrixDocument.milestone_scope,
+          goal: supportMatrixDocument.goal,
+          trusted_confidence_floor: supportMatrixDocument.trusted_confidence_floor,
+          upgrade_confidence_floor: supportMatrixDocument.upgrade_confidence_floor,
+          promotion_requirements: supportMatrixDocument.promotion_requirements,
+        },
+        support_matrix: supportMatrixDocument.features,
         files: analyzedFiles.sort((left, right) => left.path.localeCompare(right.path)),
         workflows: workflows.sort((left, right) =>
           `${left.file}:${left.export_name}`.localeCompare(`${right.file}:${right.export_name}`),

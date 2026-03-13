@@ -41,7 +41,7 @@ Every workflow event must carry:
 
 - `api-gateway`
 - `matching-service`
-- `executor-service`
+- `unified-runtime`
 - `activity-worker`
 - `timer-service`
 - `visibility-projector`

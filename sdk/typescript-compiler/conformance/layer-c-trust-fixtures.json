@@ -1,0 +1,212 @@
+{
+  "schema_version": 1,
+  "layer_id": "layer_c_trust",
+  "title": "Layer C: trust and failure fixtures",
+  "purpose": "Restart, failover, replay, upgrade, and routing trust checks for the frozen Temporal TS subset.",
+  "cases": [
+    {
+      "id": "unified-runtime-rejects-stale-and-duplicate-results",
+      "title": "Unified runtime rejects stale and duplicate results",
+      "kind": "command",
+      "command": "cargo",
+      "args": ["test", "-p", "unified-runtime", "--bin", "unified-runtime", "tests::result_matching_rejects_stale_duplicate_and_terminal_reports", "--", "--exact"],
+      "expect": {
+        "exit_code": 0,
+        "executed_tests_exact": 1,
+        "running_tests_exact": 1
+      }
+    },
+    {
+      "id": "unified-runtime-restore-prefers-fresher-shared-run",
+      "title": "Unified runtime restore prefers fresher shared run",
+      "kind": "command",
+      "command": "cargo",
+      "args": ["test", "-p", "unified-runtime", "--bin", "unified-runtime", "tests::restore_reconciliation_prefers_fresher_shared_run_and_removes_stale_local_work", "--", "--exact"],
+      "expect": {
+        "exit_code": 0,
+        "executed_tests_exact": 1,
+        "running_tests_exact": 1
+      }
+    },
+    {
+      "id": "workflow-replay-skips-duplicate-timer-fires",
+      "title": "Workflow replay skips duplicate timer fires",
+      "kind": "command",
+      "command": "cargo",
+      "args": ["test", "-p", "fabrik-workflow", "tests::compiled_replay_skips_duplicate_timer_fires_by_dedupe_key", "--", "--exact"],
+      "expect": {
+        "exit_code": 0,
+        "executed_tests_exact": 1,
+        "running_tests_exact": 1
+      }
+    },
+    {
+      "id": "workflow-compatibility-accepts-version-guarded-change",
+      "title": "Workflow compatibility accepts version-guarded change",
+      "kind": "command",
+      "command": "cargo",
+      "args": ["test", "-p", "fabrik-workflow", "tests::compiled_artifact_compatibility_accepts_version_marker_guarded_change", "--", "--exact"],
+      "expect": {
+        "exit_code": 0,
+        "executed_tests_exact": 1,
+        "running_tests_exact": 1
+      }
+    },
+    {
+      "id": "workflow-compatibility-rejects-unversioned-change",
+      "title": "Workflow compatibility rejects unversioned change",
+      "kind": "command",
+      "command": "cargo",
+      "args": ["test", "-p", "fabrik-workflow", "tests::compiled_artifact_compatibility_rejects_unversioned_change", "--", "--exact"],
+      "expect": {
+        "exit_code": 0,
+        "executed_tests_exact": 1,
+        "running_tests_exact": 1
+      }
+    },
+    {
+      "id": "query-owner-endpoints-default-to-unified",
+      "title": "Owner query endpoints default to unified runtime",
+      "kind": "command",
+      "command": "cargo",
+      "args": ["test", "-p", "query-service", "--bin", "query-service", "tests::owner_query_endpoints_uses_unified_only_by_default", "--", "--exact"],
+      "expect": {
+        "exit_code": 0,
+        "executed_tests_exact": 1,
+        "running_tests_exact": 1
+      }
+    },
+    {
+      "id": "query-owner-endpoint-round-trip",
+      "title": "Owner query endpoint round-trips payloads",
+      "kind": "command",
+      "command": "cargo",
+      "args": ["test", "-p", "query-service", "--bin", "query-service", "tests::owner_query_endpoint_round_trip_returns_payload", "--", "--exact"],
+      "expect": {
+        "exit_code": 0,
+        "executed_tests_exact": 1,
+        "running_tests_exact": 1
+      }
+    },
+    {
+      "id": "store-reconciles-stale-resume-backlog",
+      "title": "Store reconciles stale resume backlog",
+      "kind": "command",
+      "command": "cargo",
+      "args": ["test", "-p", "fabrik-store", "tests::complete_workflow_task_reconciles_stale_resume_backlog", "--", "--exact"],
+      "expect": {
+        "exit_code": 0,
+        "executed_tests_exact": 1,
+        "running_tests_exact": 1
+      }
+    },
+    {
+      "id": "workflow-replay-from-snapshot-tail",
+      "title": "Workflow replay from snapshot only replays tail events",
+      "kind": "command",
+      "command": "cargo",
+      "args": ["test", "-p", "fabrik-workflow", "tests::replay_trace_from_snapshot_replays_only_tail", "--", "--exact"],
+      "expect": {
+        "exit_code": 0,
+        "executed_tests_exact": 1,
+        "running_tests_exact": 1
+      }
+    },
+    {
+      "id": "workflow-replay-preserves-alpha-queue-memo-search-attributes",
+      "title": "Workflow replay preserves alpha queue, memo, and search attributes",
+      "kind": "command",
+      "command": "cargo",
+      "args": ["test", "-p", "fabrik-workflow", "tests::replay_trace_preserves_alpha_queue_memo_and_search_attributes", "--", "--exact"],
+      "expect": {
+        "exit_code": 0,
+        "executed_tests_exact": 1,
+        "running_tests_exact": 1
+      }
+    },
+    {
+      "id": "unified-runtime-restore-replays-broker-tail-after-handoff",
+      "title": "Unified runtime restore replays broker tail after handoff",
+      "kind": "command",
+      "command": "cargo",
+      "args": ["test", "-p", "unified-runtime", "--bin", "unified-runtime", "tests::store_snapshot_restore_replays_broker_tail_after_handoff", "--", "--exact"],
+      "expect": {
+        "exit_code": 0,
+        "executed_tests_exact": 1,
+        "running_tests_exact": 1
+      }
+    },
+    {
+      "id": "unified-runtime-handoff-preserves-alpha-queue-memo-search-attributes",
+      "title": "Unified runtime handoff preserves alpha queue, memo, and search attributes",
+      "kind": "command",
+      "command": "cargo",
+      "args": ["test", "-p", "unified-runtime", "--bin", "unified-runtime", "tests::store_snapshot_restore_preserves_alpha_queue_memo_and_search_attributes_after_handoff", "--", "--exact"],
+      "expect": {
+        "exit_code": 0,
+        "executed_tests_exact": 1,
+        "running_tests_exact": 1
+      }
+    },
+    {
+      "id": "store-partition-ownership-handoff-after-lease-expiry",
+      "title": "Store partition ownership hands off after lease expiry",
+      "kind": "command",
+      "command": "cargo",
+      "args": ["test", "-p", "fabrik-store", "tests::partition_ownership_handoffs_after_lease_expiry", "--", "--exact"],
+      "expect": {
+        "exit_code": 0,
+        "executed_tests_exact": 1,
+        "running_tests_exact": 1
+      }
+    },
+    {
+      "id": "store-throughput-partition-handoff-on-owner-loss",
+      "title": "Throughput partition handoff does not wait for owner expiry after membership loss",
+      "kind": "command",
+      "command": "cargo",
+      "args": ["test", "-p", "fabrik-store", "tests::throughput_partition_handoff_does_not_wait_for_lease_expiry_when_owner_membership_is_gone", "--", "--exact"],
+      "expect": {
+        "exit_code": 0,
+        "executed_tests_exact": 1,
+        "running_tests_exact": 1
+      }
+    },
+    {
+      "id": "store-sticky-build-fallback-after-expiry",
+      "title": "Workflow task leasing falls back after sticky build expiry",
+      "kind": "command",
+      "command": "cargo",
+      "args": ["test", "-p", "fabrik-store", "tests::workflow_task_lease_falls_back_after_expired_sticky_build", "--", "--exact"],
+      "expect": {
+        "exit_code": 0,
+        "executed_tests_exact": 1,
+        "running_tests_exact": 1
+      }
+    },
+    {
+      "id": "store-incompatible-build-cannot-lease-workflow-task",
+      "title": "Incompatible build cannot lease workflow task",
+      "kind": "command",
+      "command": "cargo",
+      "args": ["test", "-p", "fabrik-store", "tests::incompatible_build_cannot_lease_workflow_task", "--", "--exact"],
+      "expect": {
+        "exit_code": 0,
+        "executed_tests_exact": 1,
+        "running_tests_exact": 1
+      }
+    },
+    {
+      "id": "query-routing-detects-sticky-build-mismatch",
+      "title": "Query layer reports sticky build mismatch routing status",
+      "kind": "command",
+      "command": "cargo",
+      "args": ["test", "-p", "query-service", "--bin", "query-service", "tests::list_runs_includes_routing_status_when_sticky_build_is_incompatible", "--", "--exact"],
+      "expect": {
+        "exit_code": 0,
+        "executed_tests_exact": 1,
+        "running_tests_exact": 1
+      }
+    }
+  ]
+}

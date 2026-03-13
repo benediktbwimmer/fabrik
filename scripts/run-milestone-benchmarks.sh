@@ -3,11 +3,6 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-items="${BENCHMARK_ITEMS:-25}"
-iterations="${BENCHMARK_ITERATIONS:-3}"
-
-cargo run -p executor-service --release -- benchmark-milestone --items "$items" --iterations "$iterations"
-
 mkdir -p target/benchmark-reports
 
 cargo run -p benchmark-runner -- --profile smoke --output target/benchmark-reports/smoke.json

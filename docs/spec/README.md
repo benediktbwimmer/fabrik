@@ -18,7 +18,10 @@ Read in this order:
 12. [Failure, Retry, and Compensation](/Users/bene/code/fabrik/docs/spec/failure-retry-compensation.md)
 13. [Visibility and Query Model](/Users/bene/code/fabrik/docs/spec/query-model.md)
 14. [Replay and Testing](/Users/bene/code/fabrik/docs/spec/replay-and-testing.md)
-15. [Observability](/Users/bene/code/fabrik/docs/spec/observability.md)
-16. [Security and Tenancy](/Users/bene/code/fabrik/docs/spec/security-and-tenancy.md)
+15. [Temporal TypeScript Equivalence Contract](/Users/bene/code/fabrik/docs/temporal-typescript-equivalence-contract.md)
+16. [Durability and Replay Contract](/Users/bene/code/fabrik/docs/durability-and-replay-contract.md)
+17. [Ownership and Fencing Contract](/Users/bene/code/fabrik/docs/ownership-and-fencing-contract.md)
+18. [Observability](/Users/bene/code/fabrik/docs/spec/observability.md)
+19. [Security and Tenancy](/Users/bene/code/fabrik/docs/spec/security-and-tenancy.md)
 
 If a high-level document and a spec conflict, the spec wins.

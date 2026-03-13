@@ -21,8 +21,17 @@ test("migration analyzer discovers supported workflows and workers", async () =>
   assert.equal(payload.summary.workflow_count, 1);
   assert.equal(payload.summary.worker_count, 1);
   assert.equal(payload.summary.hard_block_count, 0);
+  assert.equal(payload.support_matrix_meta.milestone_scope, "temporal_ts_subset_trust");
   assert.equal(payload.workflows[0].export_name, "orderWorkflow");
   assert.equal(payload.workers[0].task_queue, "orders");
+  assert.ok(payload.files.some((file) => file.uses.includes("search_attributes_memo")));
+  assert.ok(
+    payload.support_matrix.some(
+      (entry) =>
+        entry.feature === "ctx_version_workflow_evolution" &&
+        entry.confidence_class === "supported_upgrade_validated",
+    ),
+  );
 });
 
 test("migration analyzer blocks payload and visibility landmines", async () => {

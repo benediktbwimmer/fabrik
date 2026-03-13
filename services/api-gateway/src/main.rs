@@ -22,7 +22,6 @@ struct AppState {
     client: Client,
     ingest_base: String,
     query_base: String,
-    executor_base: String,
     matching_base: String,
     store: WorkflowStore,
 }
@@ -101,8 +100,6 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|_| "http://127.0.0.1:3001".to_owned()),
         query_base: env::var("QUERY_SERVICE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:3005".to_owned()),
-        executor_base: env::var("EXECUTOR_SERVICE_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:3002".to_owned()),
         matching_base: env::var("MATCHING_DEBUG_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:3004".to_owned()),
         store,
@@ -284,7 +281,6 @@ fn build_app(state: AppState, service_name: String) -> Router {
         get(get_task_queue_inspection),
     )
     .route("/admin/tenants/{tenant_id}/task-queues", get(list_task_queues))
-    .route("/admin/debug/executor/hybrid-routing", get(proxy_to_executor_get))
     .route("/admin/debug/matching/activity-results", get(proxy_to_matching_get))
     .with_state(state)
 }
@@ -310,13 +306,6 @@ async fn proxy_to_query_post(
     body: Bytes,
 ) -> Result<(StatusCode, Bytes), (StatusCode, String)> {
     proxy_request(state.client.clone(), state.query_base.clone(), uri, Some(body)).await
-}
-
-async fn proxy_to_executor_get(
-    State(state): State<AppState>,
-    _uri: OriginalUri,
-) -> Result<(StatusCode, Bytes), (StatusCode, String)> {
-    proxy_get_path(state.client.clone(), state.executor_base.clone(), "/debug/hybrid-routing").await
 }
 
 async fn proxy_to_matching_get(
@@ -957,7 +946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_proxies_workflow_and_executor_front_doors() -> Result<()> {
+    async fn gateway_proxies_workflow_front_door_and_matching_debug() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
         };
@@ -992,11 +981,6 @@ mod tests {
             get(|| async { Json(json!({"service": "query"})).into_response() }),
         ))
         .await?;
-        let executor = TestHttpServer::start(Router::new().route(
-            "/debug/hybrid-routing",
-            get(|| async { Json(json!({"matching_routed_turns": 4})).into_response() }),
-        ))
-        .await?;
         let matching = TestHttpServer::start(Router::new().route(
             "/debug/activity-results",
             get(|| async {
@@ -1010,7 +994,6 @@ mod tests {
                 client: Client::new(),
                 ingest_base: ingest.base_url.clone(),
                 query_base: query.base_url.clone(),
-                executor_base: executor.base_url.clone(),
                 matching_base: matching.base_url.clone(),
                 store,
             },
@@ -1057,18 +1040,6 @@ mod tests {
         assert_eq!(validate_json["service"], "ingest");
         assert_eq!(validate_json["status"], "incompatible");
 
-        let debug_response = app
-            .clone()
-            .oneshot(
-                Request::get("/admin/debug/executor/hybrid-routing")
-                    .body(Body::empty())
-                    .expect("debug request"),
-            )
-            .await?;
-        assert_eq!(debug_response.status(), StatusCode::OK);
-        let debug_body = to_bytes(debug_response.into_body(), usize::MAX).await?;
-        assert_eq!(serde_json::from_slice::<Value>(&debug_body)?["matching_routed_turns"], 4);
-
         let matching_debug_response = app
             .oneshot(
                 Request::get("/admin/debug/matching/activity-results")
@@ -1082,7 +1053,6 @@ mod tests {
 
         ingest.stop().await;
         query.stop().await;
-        executor.stop().await;
         matching.stop().await;
         Ok(())
     }
@@ -1098,7 +1068,6 @@ mod tests {
                 client: Client::new(),
                 ingest_base: "http://127.0.0.1:1".to_owned(),
                 query_base: "http://127.0.0.1:1".to_owned(),
-                executor_base: "http://127.0.0.1:1".to_owned(),
                 matching_base: "http://127.0.0.1:1".to_owned(),
                 store: store.clone(),
             },
@@ -1234,7 +1203,6 @@ mod tests {
                 client: Client::new(),
                 ingest_base: "http://127.0.0.1:1".to_owned(),
                 query_base: "http://127.0.0.1:1".to_owned(),
-                executor_base: "http://127.0.0.1:1".to_owned(),
                 matching_base: "http://127.0.0.1:1".to_owned(),
                 store: store.clone(),
             },
@@ -1417,7 +1385,6 @@ mod tests {
                 client: Client::new(),
                 ingest_base: "http://127.0.0.1:1".to_owned(),
                 query_base: "http://127.0.0.1:1".to_owned(),
-                executor_base: "http://127.0.0.1:1".to_owned(),
                 matching_base: "http://127.0.0.1:1".to_owned(),
                 store,
             }),

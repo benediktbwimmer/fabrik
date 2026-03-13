@@ -556,6 +556,19 @@ function compileHelperFunction(name, declaration) {
   return { params, body: compileExpression(declaration.body) };
 }
 
+function compileWorkflowParam(parameter) {
+  if (parameter.dotDotDotToken) {
+    throw compilerError(`workflow parameters must not use rest arguments`, parameter);
+  }
+  if (!ts.isIdentifier(parameter.name)) {
+    throw compilerError(`workflow parameters must be plain identifiers`, parameter.name);
+  }
+  return {
+    name: parameter.name.text,
+    default: parameter.initializer ? compileExpression(parameter.initializer) : undefined,
+  };
+}
+
 function functionBodyExpression(body) {
   if (!ts.isBlock(body)) {
     return body;
@@ -1251,8 +1264,16 @@ class WorkflowLowerer {
       queries: this.queries,
       signals: this.signals,
       updates: this.updates,
+      params: this.compileWorkflowParams(),
       nonCancellableStates: Array.from(this.nonCancellableStates),
     };
+  }
+
+  compileWorkflowParams() {
+    const parameters = Array.isArray(this.workflowDeclaration?.parameters)
+      ? this.workflowDeclaration.parameters
+      : [];
+    return parameters.map((parameter) => compileWorkflowParam(parameter));
   }
 
   addState(prefix, state, node = null) {
@@ -2659,7 +2680,8 @@ async function main() {
   const temporalApi = collectTemporalWorkflowApi(workflow.getSourceFile());
   const helpers = injectTemporalBuiltinHelpers(buildHelperRegistry(program, workflow), temporalApi);
   const lowerer = new WorkflowLowerer(args.definitionId, args.version, workflow, temporalApi);
-  const { initialState, states, sourceMap, queries, signals, updates, nonCancellableStates } = lowerer.lower();
+  const { initialState, states, sourceMap, queries, signals, updates, params, nonCancellableStates } =
+    lowerer.lower();
 
   const artifact = {
     definition_id: args.definitionId,
@@ -2681,6 +2703,7 @@ async function main() {
     workflow: {
       initial_state: initialState,
       states,
+      params,
       non_cancellable_states: nonCancellableStates,
     },
     artifact_hash: "",
