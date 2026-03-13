@@ -254,6 +254,7 @@ function parseTemporalRetryOptions(expression) {
           property.initializer,
         );
       }
+      retry.non_retryable_error_types = property.initializer.elements.map((element) => element.text);
       continue;
     }
     throw compilerError(`unsupported proxyActivities retry option ${key}`, property);
@@ -1089,17 +1090,9 @@ class WorkflowLowerer {
       throw compilerError(`condition requires an inline function predicate`, callExpression);
     }
     const predicateExpr = compilePureHandlerExpression(predicate, "condition");
-    const signalHandlers = [...this.temporalSignalHandlers.values()];
-    if (signalHandlers.length !== 1) {
+    if (Object.keys(this.signals).length === 0) {
       throw compilerError(
-        `condition currently requires exactly one registered Temporal signal handler`,
-        callExpression,
-      );
-    }
-    const signalHandler = signalHandlers[0];
-    if (!signalHandler.actions) {
-      throw compilerError(
-        `condition currently requires an assignment-only Temporal signal handler`,
+        `condition currently requires at least one registered Temporal signal handler`,
         callExpression,
       );
     }
@@ -1111,28 +1104,11 @@ class WorkflowLowerer {
         next: nextState,
       }, callExpression);
     }
-    const choiceState = this.addState("choice", {
-      type: "choice",
+    return this.addState("wait_condition", {
+      type: "wait_for_condition",
       condition: predicateExpr,
-      then_next: continueState,
-      else_next: "__wait_signal_placeholder__",
+      next: continueState,
     }, callExpression);
-    let afterSignalState = choiceState;
-    if (signalHandler.actions.length > 0) {
-      afterSignalState = this.addState("assign", {
-        type: "assign",
-        actions: signalHandler.actions,
-        next: choiceState,
-      }, callExpression);
-    }
-    const waitState = this.addState("wait_signal", {
-      type: "wait_for_event",
-      event_type: signalHandler.signalName,
-      next: afterSignalState,
-      output_var: signalHandler.argName ?? undefined,
-    }, callExpression);
-    this.states[choiceState].else_next = waitState;
-    return choiceState;
   }
 
   nextId(prefix, node = null) {
@@ -1271,6 +1247,14 @@ class WorkflowLowerer {
       ) {
         if (!ts.isIdentifier(statement.expression.left)) {
           throw compilerError(`unsupported assignment target: ${statement.getText()}`, statement);
+        }
+        if (ts.isAwaitExpression(statement.expression.right)) {
+          return this.lowerAwait(
+            statement.expression.right,
+            statement.expression.left.text,
+            nextState,
+            errorTarget,
+          );
         }
         return this.addState("assign", {
           type: "assign",
@@ -2241,6 +2225,9 @@ function validateCompiledState(state, validateExpression) {
       state.actions.forEach((action) => validateExpression(action.expr));
       break;
     case "choice":
+      validateExpression(state.condition);
+      break;
+    case "wait_for_condition":
       validateExpression(state.condition);
       break;
     case "step":

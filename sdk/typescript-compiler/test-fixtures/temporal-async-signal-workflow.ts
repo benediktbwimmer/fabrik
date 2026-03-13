@@ -7,8 +7,7 @@ export async function temporalAsyncSignalWorkflow() {
   let echoed = "";
 
   setHandler(approved, async (value) => {
-    const echoedValue = await benchmarkEcho(value);
-    echoed = echoedValue;
+    echoed = await benchmarkEcho(value);
   });
 
   await benchmarkEcho("ready");

@@ -7,7 +7,13 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use axum::{Json, routing::get};
+use axum::{
+    Json,
+    extract::Path as AxumPath,
+    extract::State as AxumState,
+    http::StatusCode,
+    routing::{get, post},
+};
 use chrono::{DateTime, Utc};
 use fabrik_broker::{
     BrokerConfig, WorkflowHistoryFilter, build_workflow_consumer, decode_consumed_workflow_event,
@@ -18,7 +24,8 @@ use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
     ActivityScheduleUpdate, ActivityStartUpdate, ActivityTerminalPayload, ActivityTerminalUpdate,
-    WorkflowActivityStatus, WorkflowStore,
+    ConsumedSignalRecord, WorkflowActivityStatus, WorkflowMailboxKind, WorkflowMailboxRecord,
+    WorkflowMailboxStatus, WorkflowStore, WorkflowUpdateStatus,
 };
 use fabrik_worker_protocol::activity_worker::{
     Ack, ActivityTask, ActivityTaskCancelledResult, ActivityTaskCompletedResult,
@@ -33,7 +40,7 @@ use fabrik_workflow::{
     ArtifactExecutionState, CompiledExecutionPlan, CompiledWorkflowArtifact, ExecutionTurnContext,
     RetryPolicy, WorkflowInstanceState, WorkflowStatus, parse_timer_ref,
     replay_compiled_history_trace, replay_compiled_history_trace_from_snapshot,
-    replay_history_trace_from_snapshot,
+    replay_history_trace_from_snapshot, retry_policy_allows_failure_retry,
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -216,6 +223,61 @@ enum PreparedDbAction {
     Terminal(ActivityTerminalUpdate),
     UpsertInstance(WorkflowInstanceState),
     CloseRun(RunKey, DateTime<Utc>),
+    PutRunStart {
+        tenant_id: String,
+        instance_id: String,
+        run_id: String,
+        definition_id: String,
+        definition_version: Option<u32>,
+        artifact_hash: Option<String>,
+        workflow_task_queue: String,
+        trigger_event_id: Uuid,
+        started_at: DateTime<Utc>,
+        previous_run_id: Option<String>,
+        triggered_by_run_id: Option<String>,
+    },
+    UpsertChildStartRequested {
+        tenant_id: String,
+        instance_id: String,
+        run_id: String,
+        child_id: String,
+        child_workflow_id: String,
+        child_definition_id: String,
+        parent_close_policy: String,
+        input: Value,
+        source_event_id: Uuid,
+        occurred_at: DateTime<Utc>,
+    },
+    MarkChildStarted {
+        tenant_id: String,
+        instance_id: String,
+        run_id: String,
+        child_id: String,
+        child_run_id: String,
+        started_event_id: Uuid,
+        occurred_at: DateTime<Utc>,
+    },
+    CompleteChild {
+        tenant_id: String,
+        instance_id: String,
+        run_id: String,
+        child_id: String,
+        status: String,
+        output: Option<Value>,
+        error: Option<String>,
+        terminal_event_id: Uuid,
+        occurred_at: DateTime<Utc>,
+    },
+    CompleteUpdate {
+        tenant_id: String,
+        instance_id: String,
+        run_id: String,
+        update_id: String,
+        output: Option<Value>,
+        error: Option<String>,
+        completed_event_id: Uuid,
+        completed_at: DateTime<Utc>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -226,6 +288,24 @@ struct UnifiedDebugResponse {
     ready_tasks: usize,
     leased_tasks: usize,
     delayed_retries: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct InternalQueryRequest {
+    #[serde(default)]
+    args: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct InternalQueryResponse {
+    result: Value,
+    consistency: &'static str,
+    source: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct UnifiedErrorResponse {
+    message: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -342,6 +422,10 @@ async fn main() -> Result<()> {
         "unified-runtime-debug",
         env!("CARGO_PKG_VERSION"),
     ))
+    .route(
+        "/internal/workflows/{tenant_id}/{instance_id}/queries/{query_name}",
+        post(execute_internal_query),
+    )
     .route(
         "/debug/unified",
         get(move || {
@@ -852,10 +936,20 @@ async fn run_trigger_consumer(
                 continue;
             }
         };
-        if let WorkflowEvent::WorkflowTriggered { .. } = event.payload {
-            if let Err(error) = handle_trigger_event(&state, event).await {
-                error!(error = %error, "unified-runtime failed to handle trigger");
+        match event.payload {
+            WorkflowEvent::WorkflowTriggered { .. } => {
+                if let Err(error) = handle_trigger_event(&state, event).await {
+                    error!(error = %error, "unified-runtime failed to handle trigger");
+                }
             }
+            WorkflowEvent::WorkflowUpdateRequested { .. }
+            | WorkflowEvent::WorkflowCancellationRequested { .. }
+            | WorkflowEvent::SignalQueued { .. } => {
+                if let Err(error) = handle_mailbox_queue_event(&state, event).await {
+                    error!(error = %error, "unified-runtime failed to handle mailbox queue");
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -925,14 +1019,6 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
     };
     apply_compiled_plan(&mut instance, &plan);
     let queued = schedule_activities_from_plan(&instance, &plan, event.occurred_at)?;
-    let schedule_actions =
-        queued.iter().cloned().map(PreparedDbAction::Schedule).collect::<Vec<_>>();
-    apply_db_actions(
-        state,
-        vec![PreparedDbAction::UpsertInstance(instance.clone())],
-        schedule_actions,
-    )
-    .await?;
     {
         let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
         let runtime = RuntimeWorkflowState {
@@ -966,10 +1052,1075 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
         }
         mark_runtime_dirty(&mut inner, "trigger", true);
     }
+    let schedule_actions =
+        queued.iter().cloned().map(PreparedDbAction::Schedule).collect::<Vec<_>>();
+    apply_db_actions(
+        state,
+        vec![PreparedDbAction::UpsertInstance(instance.clone())],
+        schedule_actions,
+    )
+    .await?;
+    apply_post_plan_child_effects(
+        state,
+        PostPlanEffect {
+            run_key: run_key.clone(),
+            instance: instance.clone(),
+            plan: plan.clone(),
+            source_event_id: event.event_id,
+            occurred_at: event.occurred_at,
+        },
+    )
+    .await?;
     state.notify.notify_waiters();
     state.persist_notify.notify_one();
+    drain_mailbox_for_run(state, &run_key.tenant_id, &run_key.instance_id, &run_key.run_id).await?;
     let mut debug = state.debug.lock().expect("unified debug lock poisoned");
     debug.workflow_triggers_applied = debug.workflow_triggers_applied.saturating_add(1);
+    Ok(())
+}
+
+async fn handle_mailbox_queue_event(
+    state: &AppState,
+    event: EventEnvelope<WorkflowEvent>,
+) -> Result<()> {
+    let run_key = RunKey {
+        tenant_id: event.tenant_id.clone(),
+        instance_id: event.instance_id.clone(),
+        run_id: event.run_id.clone(),
+    };
+    let should_drain = {
+        let inner = state.inner.lock().expect("unified runtime lock poisoned");
+        inner.instances.contains_key(&run_key)
+    };
+    if !should_drain {
+        return Ok(());
+    }
+    drain_mailbox_for_run(state, &run_key.tenant_id, &run_key.instance_id, &run_key.run_id).await
+}
+
+enum MailboxDrainOutcome {
+    Processed {
+        signal: Option<ConsumedSignalRecord>,
+        accepted_seq: u64,
+        general: Vec<PreparedDbAction>,
+        schedules: Vec<PreparedDbAction>,
+        notifies: bool,
+        post_plan: Option<PostPlanEffect>,
+    },
+    ConsumedNoop {
+        accepted_seq: u64,
+    },
+    Blocked,
+}
+
+#[derive(Debug, Clone)]
+struct PostPlanEffect {
+    run_key: RunKey,
+    instance: WorkflowInstanceState,
+    plan: CompiledExecutionPlan,
+    source_event_id: Uuid,
+    occurred_at: DateTime<Utc>,
+}
+
+async fn drain_mailbox_for_run(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+) -> Result<()> {
+    let mut consumed_signals = Vec::new();
+    let mut max_consumed_mailbox_seq = None;
+    loop {
+        let items = state
+            .store
+            .list_next_workflow_mailbox_items(tenant_id, instance_id, run_id, 32)
+            .await?;
+        if items.is_empty() {
+            break;
+        }
+        let mut blocked = false;
+        for item in items {
+            match dispatch_mailbox_item_unified(state, &item).await? {
+                MailboxDrainOutcome::Processed {
+                    signal,
+                    accepted_seq,
+                    general,
+                    schedules,
+                    notifies,
+                    post_plan,
+                } => {
+                    if let Some(signal) = signal {
+                        consumed_signals.push(signal);
+                    }
+                    apply_db_actions(state, general, schedules).await?;
+                    if let Some(post_plan) = post_plan {
+                        apply_post_plan_child_effects(state, post_plan).await?;
+                    }
+                    if notifies {
+                        state.notify.notify_waiters();
+                    }
+                    state.persist_notify.notify_one();
+                    max_consumed_mailbox_seq = Some(accepted_seq);
+                }
+                MailboxDrainOutcome::ConsumedNoop { accepted_seq } => {
+                    max_consumed_mailbox_seq = Some(accepted_seq);
+                }
+                MailboxDrainOutcome::Blocked => {
+                    blocked = true;
+                    break;
+                }
+            }
+        }
+        if !consumed_signals.is_empty() {
+            state
+                .store
+                .mark_signals_consumed(tenant_id, instance_id, run_id, &consumed_signals)
+                .await?;
+            consumed_signals.clear();
+        }
+        if let Some(max_mailbox_seq) = max_consumed_mailbox_seq.take() {
+            state
+                .store
+                .mark_workflow_mailbox_items_consumed_through(
+                    tenant_id,
+                    instance_id,
+                    run_id,
+                    max_mailbox_seq,
+                    Utc::now(),
+                )
+                .await?;
+        }
+        if blocked {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn dispatch_mailbox_item_unified(
+    state: &AppState,
+    item: &WorkflowMailboxRecord,
+) -> Result<MailboxDrainOutcome> {
+    match item.kind {
+        WorkflowMailboxKind::Trigger => {
+            Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq })
+        }
+        WorkflowMailboxKind::Signal => dispatch_signal_mailbox_item_unified(state, item).await,
+        WorkflowMailboxKind::Update => dispatch_update_mailbox_item_unified(state, item).await,
+        WorkflowMailboxKind::CancelRequest => {
+            dispatch_cancel_mailbox_item_unified(state, item).await
+        }
+    }
+}
+
+fn unified_signal_dispatch_event_id(source_event_id: Uuid) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("unified-signal-dispatch:{source_event_id}").as_bytes(),
+    )
+}
+
+async fn dispatch_signal_mailbox_item_unified(
+    state: &AppState,
+    item: &WorkflowMailboxRecord,
+) -> Result<MailboxDrainOutcome> {
+    let Some(message_id) = item.message_id.as_deref() else {
+        return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
+    };
+    let signal_name = item.message_name.clone().unwrap_or_default();
+    let payload = item.payload.clone().unwrap_or(Value::Null);
+    let run_key = RunKey {
+        tenant_id: item.tenant_id.clone(),
+        instance_id: item.instance_id.clone(),
+        run_id: item.run_id.clone(),
+    };
+
+    let (artifact, instance) = {
+        let inner = state.inner.lock().expect("unified runtime lock poisoned");
+        let Some(runtime) = inner.instances.get(&run_key) else {
+            return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
+        };
+        (runtime.artifact.clone(), runtime.instance.clone())
+    };
+    if instance.status.is_terminal() {
+        return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
+    }
+    let execution_state = instance.artifact_execution.clone().unwrap_or_default();
+    if execution_state.active_update.is_some() || execution_state.active_signal.is_some() {
+        return Ok(MailboxDrainOutcome::Blocked);
+    }
+
+    let current_state =
+        instance.current_state.clone().unwrap_or_else(|| artifact.workflow.initial_state.clone());
+    let now = Utc::now();
+    let signal_event = EventEnvelope::new(
+        WorkflowEvent::SignalReceived {
+            signal_id: message_id.to_owned(),
+            signal_type: signal_name.clone(),
+            payload: payload.clone(),
+        }
+        .event_type(),
+        WorkflowIdentity::new(
+            item.tenant_id.clone(),
+            item.source_event.definition_id.clone(),
+            item.source_event.definition_version,
+            item.source_event.artifact_hash.clone(),
+            item.instance_id.clone(),
+            item.run_id.clone(),
+            "unified-runtime",
+        ),
+        WorkflowEvent::SignalReceived {
+            signal_id: message_id.to_owned(),
+            signal_type: signal_name.clone(),
+            payload: payload.clone(),
+        },
+    )
+    .with_occurred_at(now);
+    let mut signal_event = signal_event;
+    signal_event.event_id = unified_signal_dispatch_event_id(item.source_event.event_id);
+    signal_event.causation_id = Some(item.source_event.event_id);
+    signal_event.correlation_id =
+        item.source_event.correlation_id.or(Some(item.source_event.event_id));
+    signal_event.dedupe_key = Some(format!("signal:{message_id}"));
+
+    let plan = if artifact
+        .expected_signal_type(&current_state)?
+        .is_some_and(|expected| expected == signal_name)
+    {
+        artifact.execute_after_signal_with_turn(
+            &current_state,
+            &signal_name,
+            &payload,
+            execution_state,
+            ExecutionTurnContext {
+                event_id: signal_event.event_id,
+                occurred_at: signal_event.occurred_at,
+            },
+        )?
+    } else if artifact.has_signal_handler(&signal_name) {
+        artifact.execute_signal_handler_with_turn(
+            &current_state,
+            message_id,
+            &signal_name,
+            &payload,
+            execution_state,
+            ExecutionTurnContext {
+                event_id: signal_event.event_id,
+                occurred_at: signal_event.occurred_at,
+            },
+        )?
+    } else {
+        return Ok(MailboxDrainOutcome::Blocked);
+    };
+
+    let mut general = Vec::new();
+    let mut schedules = Vec::new();
+    let mut notifies = false;
+    let mut final_instance = None;
+    {
+        let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
+        let Some(runtime) = inner.instances.get_mut(&run_key) else {
+            return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
+        };
+        runtime.instance.apply_event(&signal_event);
+        apply_compiled_plan(&mut runtime.instance, &plan);
+        let scheduled_tasks =
+            schedule_activities_from_plan(&runtime.instance, &plan, signal_event.occurred_at)?;
+        for task in &scheduled_tasks {
+            schedules.push(PreparedDbAction::Schedule(task.clone()));
+            runtime.active_activities.insert(
+                task.activity_id.clone(),
+                ActiveActivityMeta {
+                    attempt: task.attempt,
+                    task_queue: task.task_queue.clone(),
+                    activity_type: task.activity_type.clone(),
+                    wait_state: task.state.clone(),
+                },
+            );
+        }
+        let terminal_instance =
+            runtime.instance.status.is_terminal().then_some(runtime.instance.clone());
+        final_instance = Some(runtime.instance.clone());
+        let _ = runtime;
+        for task in scheduled_tasks {
+            inner
+                .ready
+                .entry(QueueKey {
+                    tenant_id: task.tenant_id.clone(),
+                    task_queue: task.task_queue.clone(),
+                })
+                .or_default()
+                .push_back(task);
+            notifies = true;
+        }
+        if let Some(instance) = terminal_instance {
+            general.push(PreparedDbAction::UpsertInstance(instance));
+            general.push(PreparedDbAction::CloseRun(run_key.clone(), signal_event.occurred_at));
+        }
+        mark_runtime_dirty(&mut inner, "mailbox_signal", false);
+    }
+
+    Ok(MailboxDrainOutcome::Processed {
+        signal: Some(ConsumedSignalRecord {
+            signal_id: message_id.to_owned(),
+            consumed_event_id: signal_event.event_id,
+            consumed_at: signal_event.occurred_at,
+        }),
+        accepted_seq: item.accepted_seq,
+        general,
+        schedules,
+        notifies,
+        post_plan: final_instance.map(|instance| PostPlanEffect {
+            run_key,
+            instance,
+            plan,
+            source_event_id: signal_event.event_id,
+            occurred_at: signal_event.occurred_at,
+        }),
+    })
+}
+
+fn unified_cancelled_event_id(source_event_id: Uuid) -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, format!("unified-cancelled:{source_event_id}").as_bytes())
+}
+
+async fn dispatch_cancel_mailbox_item_unified(
+    state: &AppState,
+    item: &WorkflowMailboxRecord,
+) -> Result<MailboxDrainOutcome> {
+    let run_key = RunKey {
+        tenant_id: item.tenant_id.clone(),
+        instance_id: item.instance_id.clone(),
+        run_id: item.run_id.clone(),
+    };
+    let reason = match &item.source_event.payload {
+        WorkflowEvent::WorkflowCancellationRequested { reason } => reason.clone(),
+        _ => {
+            item.payload.as_ref().and_then(Value::as_str).unwrap_or("workflow cancelled").to_owned()
+        }
+    };
+
+    let now = Utc::now();
+    let mut cancelled_event = EventEnvelope::new(
+        WorkflowEvent::WorkflowCancelled { reason: reason.clone() }.event_type(),
+        WorkflowIdentity::new(
+            item.tenant_id.clone(),
+            item.source_event.definition_id.clone(),
+            item.source_event.definition_version,
+            item.source_event.artifact_hash.clone(),
+            item.instance_id.clone(),
+            item.run_id.clone(),
+            "unified-runtime",
+        ),
+        WorkflowEvent::WorkflowCancelled { reason },
+    )
+    .with_occurred_at(now);
+    cancelled_event.event_id = unified_cancelled_event_id(item.source_event.event_id);
+    cancelled_event.causation_id = Some(item.source_event.event_id);
+    cancelled_event.correlation_id =
+        item.source_event.correlation_id.or(Some(item.source_event.event_id));
+    cancelled_event.dedupe_key = Some(format!("workflow-cancelled:{}", item.source_event.event_id));
+
+    let terminal_instance = {
+        let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
+        let Some(runtime) = inner.instances.get_mut(&run_key) else {
+            return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
+        };
+        if runtime.instance.status.is_terminal() {
+            return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
+        }
+        runtime.instance.apply_event(&item.source_event);
+        runtime.instance.apply_event(&cancelled_event);
+        if let Some(execution) = runtime.instance.artifact_execution.as_mut() {
+            execution.active_update = None;
+            execution.active_signal = None;
+        }
+        runtime.active_activities.clear();
+        let terminal_instance = runtime.instance.clone();
+        remove_run_work(&mut inner, &run_key);
+        mark_runtime_dirty(&mut inner, "mailbox_cancel", true);
+        terminal_instance
+    };
+
+    Ok(MailboxDrainOutcome::Processed {
+        signal: None,
+        accepted_seq: item.accepted_seq,
+        general: vec![
+            PreparedDbAction::UpsertInstance(terminal_instance),
+            PreparedDbAction::CloseRun(run_key, cancelled_event.occurred_at),
+        ],
+        schedules: Vec::new(),
+        notifies: true,
+        post_plan: None,
+    })
+}
+
+async fn dispatch_update_mailbox_item_unified(
+    state: &AppState,
+    item: &WorkflowMailboxRecord,
+) -> Result<MailboxDrainOutcome> {
+    let Some(message_id) = item.message_id.as_deref() else {
+        return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
+    };
+    let run_key = RunKey {
+        tenant_id: item.tenant_id.clone(),
+        instance_id: item.instance_id.clone(),
+        run_id: item.run_id.clone(),
+    };
+
+    let (artifact, instance) = {
+        let inner = state.inner.lock().expect("unified runtime lock poisoned");
+        let Some(runtime) = inner.instances.get(&run_key) else {
+            return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
+        };
+        (runtime.artifact.clone(), runtime.instance.clone())
+    };
+    let Some(update) = state
+        .store
+        .get_update(&item.tenant_id, &item.instance_id, &item.run_id, message_id)
+        .await?
+    else {
+        return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
+    };
+
+    if instance.status.is_terminal() {
+        let error = format!("workflow run {} is already {}", item.run_id, instance.status.as_str());
+        let completed_event_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("unified-update-terminal-reject:{}", update.update_id).as_bytes(),
+        );
+        state
+            .store
+            .complete_update(
+                &update.tenant_id,
+                &update.instance_id,
+                &update.run_id,
+                &update.update_id,
+                None,
+                Some(&error),
+                completed_event_id,
+                Utc::now(),
+            )
+            .await?;
+        return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
+    }
+
+    let execution_state = instance.artifact_execution.clone().unwrap_or_default();
+    if execution_state.active_update.is_some() || execution_state.active_signal.is_some() {
+        return Ok(MailboxDrainOutcome::Blocked);
+    }
+    if !artifact.has_update(&update.update_name) {
+        let error = format!("unknown update handler {}", update.update_name);
+        let completed_event_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("unified-update-unknown-reject:{}", update.update_id).as_bytes(),
+        );
+        state
+            .store
+            .complete_update(
+                &update.tenant_id,
+                &update.instance_id,
+                &update.run_id,
+                &update.update_id,
+                None,
+                Some(&error),
+                completed_event_id,
+                Utc::now(),
+            )
+            .await?;
+        return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
+    }
+
+    let accepted_event_id = Uuid::now_v7();
+    if !state
+        .store
+        .accept_update(
+            &update.tenant_id,
+            &update.instance_id,
+            &update.run_id,
+            &update.update_id,
+            accepted_event_id,
+            Utc::now(),
+        )
+        .await?
+    {
+        return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
+    }
+
+    let current_state =
+        instance.current_state.clone().unwrap_or_else(|| artifact.workflow.initial_state.clone());
+    let mut accepted_event = EventEnvelope::new(
+        WorkflowEvent::WorkflowUpdateAccepted {
+            update_id: update.update_id.clone(),
+            update_name: update.update_name.clone(),
+            payload: update.payload.clone(),
+        }
+        .event_type(),
+        WorkflowIdentity::new(
+            item.tenant_id.clone(),
+            item.source_event.definition_id.clone(),
+            item.source_event.definition_version,
+            item.source_event.artifact_hash.clone(),
+            item.instance_id.clone(),
+            item.run_id.clone(),
+            "unified-runtime",
+        ),
+        WorkflowEvent::WorkflowUpdateAccepted {
+            update_id: update.update_id.clone(),
+            update_name: update.update_name.clone(),
+            payload: update.payload.clone(),
+        },
+    )
+    .with_occurred_at(Utc::now());
+    accepted_event.event_id = accepted_event_id;
+    accepted_event.causation_id = Some(update.source_event_id);
+    accepted_event.correlation_id =
+        item.source_event.correlation_id.or(Some(update.source_event_id));
+    accepted_event.dedupe_key = Some(format!("update-accepted:{}", update.update_id));
+
+    let plan = artifact.execute_update_with_turn(
+        &current_state,
+        &update.update_id,
+        &update.update_name,
+        &update.payload,
+        execution_state,
+        ExecutionTurnContext {
+            event_id: accepted_event.event_id,
+            occurred_at: accepted_event.occurred_at,
+        },
+    )?;
+
+    let mut general = Vec::new();
+    let mut schedules = Vec::new();
+    let mut notifies = false;
+    let mut final_instance = None;
+    {
+        let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
+        let Some(runtime) = inner.instances.get_mut(&run_key) else {
+            return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
+        };
+        runtime.instance.apply_event(&accepted_event);
+        apply_compiled_plan(&mut runtime.instance, &plan);
+        let scheduled_tasks =
+            schedule_activities_from_plan(&runtime.instance, &plan, accepted_event.occurred_at)?;
+        for task in &scheduled_tasks {
+            schedules.push(PreparedDbAction::Schedule(task.clone()));
+            runtime.active_activities.insert(
+                task.activity_id.clone(),
+                ActiveActivityMeta {
+                    attempt: task.attempt,
+                    task_queue: task.task_queue.clone(),
+                    activity_type: task.activity_type.clone(),
+                    wait_state: task.state.clone(),
+                },
+            );
+        }
+        for emission in &plan.emissions {
+            match &emission.event {
+                WorkflowEvent::WorkflowUpdateCompleted { update_id, output, .. } => {
+                    general.push(PreparedDbAction::CompleteUpdate {
+                        tenant_id: run_key.tenant_id.clone(),
+                        instance_id: run_key.instance_id.clone(),
+                        run_id: run_key.run_id.clone(),
+                        update_id: update_id.clone(),
+                        output: Some(output.clone()),
+                        error: None,
+                        completed_event_id: accepted_event.event_id,
+                        completed_at: accepted_event.occurred_at,
+                    });
+                }
+                WorkflowEvent::WorkflowUpdateRejected { update_id, error, .. } => {
+                    general.push(PreparedDbAction::CompleteUpdate {
+                        tenant_id: run_key.tenant_id.clone(),
+                        instance_id: run_key.instance_id.clone(),
+                        run_id: run_key.run_id.clone(),
+                        update_id: update_id.clone(),
+                        output: None,
+                        error: Some(error.clone()),
+                        completed_event_id: accepted_event.event_id,
+                        completed_at: accepted_event.occurred_at,
+                    });
+                }
+                _ => {}
+            }
+        }
+        let terminal_instance =
+            runtime.instance.status.is_terminal().then_some(runtime.instance.clone());
+        final_instance = Some(runtime.instance.clone());
+        let _ = runtime;
+        for task in scheduled_tasks {
+            inner
+                .ready
+                .entry(QueueKey {
+                    tenant_id: task.tenant_id.clone(),
+                    task_queue: task.task_queue.clone(),
+                })
+                .or_default()
+                .push_back(task);
+            notifies = true;
+        }
+        if let Some(instance) = terminal_instance {
+            general.push(PreparedDbAction::UpsertInstance(instance));
+            general.push(PreparedDbAction::CloseRun(run_key.clone(), accepted_event.occurred_at));
+        }
+        mark_runtime_dirty(&mut inner, "mailbox_update", false);
+    }
+
+    Ok(MailboxDrainOutcome::Processed {
+        signal: None,
+        accepted_seq: item.accepted_seq,
+        general,
+        schedules,
+        notifies,
+        post_plan: final_instance.map(|instance| PostPlanEffect {
+            run_key,
+            instance,
+            plan,
+            source_event_id: accepted_event.event_id,
+            occurred_at: accepted_event.occurred_at,
+        }),
+    })
+}
+
+async fn materialize_child_workflows_from_plan(
+    state: &AppState,
+    parent_instance: &WorkflowInstanceState,
+    plan: &CompiledExecutionPlan,
+    occurred_at: DateTime<Utc>,
+    source_event_id: Uuid,
+) -> Result<(Vec<PreparedDbAction>, Vec<PreparedDbAction>, bool, Vec<(RunKey, WorkflowInstanceState)>)>
+{
+    let mut general = Vec::new();
+    let mut schedules = Vec::new();
+    let mut notifies = false;
+    let mut terminal_children = Vec::new();
+
+    for emission in &plan.emissions {
+        let WorkflowEvent::ChildWorkflowStartRequested {
+            child_id,
+            child_workflow_id,
+            child_definition_id,
+            input,
+            task_queue,
+            parent_close_policy,
+        } = &emission.event
+        else {
+            continue;
+        };
+
+        let artifact = state
+            .store
+            .get_latest_artifact(&parent_instance.tenant_id, child_definition_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("child workflow definition {child_definition_id} not found"))?;
+        let child_run_id = format!("run-{}", Uuid::now_v7());
+        let workflow_task_queue =
+            task_queue.clone().unwrap_or_else(|| parent_instance.workflow_task_queue.clone());
+        let mut child_trigger = EventEnvelope::new(
+            WorkflowEvent::WorkflowTriggered { input: input.clone() }.event_type(),
+            WorkflowIdentity::new(
+                parent_instance.tenant_id.clone(),
+                child_definition_id.clone(),
+                artifact.definition_version,
+                artifact.artifact_hash.clone(),
+                child_workflow_id.clone(),
+                child_run_id.clone(),
+                "unified-runtime",
+            ),
+            WorkflowEvent::WorkflowTriggered { input: input.clone() },
+        )
+        .with_occurred_at(occurred_at);
+        child_trigger.event_id = unified_child_trigger_event_id(source_event_id, child_id);
+        child_trigger.causation_id = Some(source_event_id);
+        child_trigger.correlation_id = Some(source_event_id);
+        child_trigger
+            .metadata
+            .insert("workflow_task_queue".to_owned(), workflow_task_queue.clone());
+        child_trigger
+            .metadata
+            .insert("parent_instance_id".to_owned(), parent_instance.instance_id.clone());
+        child_trigger.metadata.insert("parent_run_id".to_owned(), parent_instance.run_id.clone());
+        child_trigger.metadata.insert("parent_child_id".to_owned(), child_id.clone());
+
+        let child_plan = artifact.execute_trigger_with_turn(
+            input,
+            ExecutionTurnContext {
+                event_id: child_trigger.event_id,
+                occurred_at: child_trigger.occurred_at,
+            },
+        )?;
+        let mut child_instance = WorkflowInstanceState::try_from(&child_trigger)?;
+        apply_compiled_plan(&mut child_instance, &child_plan);
+        let child_tasks =
+            schedule_activities_from_plan(&child_instance, &child_plan, child_trigger.occurred_at)?;
+        let child_run_key = RunKey {
+            tenant_id: child_instance.tenant_id.clone(),
+            instance_id: child_instance.instance_id.clone(),
+            run_id: child_instance.run_id.clone(),
+        };
+
+        general.push(PreparedDbAction::PutRunStart {
+            tenant_id: child_instance.tenant_id.clone(),
+            instance_id: child_instance.instance_id.clone(),
+            run_id: child_instance.run_id.clone(),
+            definition_id: child_instance.definition_id.clone(),
+            definition_version: child_instance.definition_version,
+            artifact_hash: child_instance.artifact_hash.clone(),
+            workflow_task_queue: workflow_task_queue.clone(),
+            trigger_event_id: child_trigger.event_id,
+            started_at: child_trigger.occurred_at,
+            previous_run_id: None,
+            triggered_by_run_id: Some(parent_instance.run_id.clone()),
+        });
+        general.push(PreparedDbAction::UpsertChildStartRequested {
+            tenant_id: parent_instance.tenant_id.clone(),
+            instance_id: parent_instance.instance_id.clone(),
+            run_id: parent_instance.run_id.clone(),
+            child_id: child_id.clone(),
+            child_workflow_id: child_workflow_id.clone(),
+            child_definition_id: child_definition_id.clone(),
+            parent_close_policy: parent_close_policy.clone(),
+            input: input.clone(),
+            source_event_id,
+            occurred_at,
+        });
+        general.push(PreparedDbAction::MarkChildStarted {
+            tenant_id: parent_instance.tenant_id.clone(),
+            instance_id: parent_instance.instance_id.clone(),
+            run_id: parent_instance.run_id.clone(),
+            child_id: child_id.clone(),
+            child_run_id: child_run_id.clone(),
+            started_event_id: child_trigger.event_id,
+            occurred_at,
+        });
+        general.push(PreparedDbAction::UpsertInstance(child_instance.clone()));
+
+        {
+            let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
+            inner.instances.insert(
+                child_run_key.clone(),
+                RuntimeWorkflowState {
+                    artifact: artifact.clone(),
+                    instance: child_instance.clone(),
+                    active_activities: child_tasks
+                        .iter()
+                        .map(|task| {
+                            (
+                                task.activity_id.clone(),
+                                ActiveActivityMeta {
+                                    attempt: task.attempt,
+                                    task_queue: task.task_queue.clone(),
+                                    activity_type: task.activity_type.clone(),
+                                    wait_state: task.state.clone(),
+                                },
+                            )
+                        })
+                        .collect(),
+                },
+            );
+            for task in &child_tasks {
+                inner
+                    .ready
+                    .entry(QueueKey {
+                        tenant_id: task.tenant_id.clone(),
+                        task_queue: task.task_queue.clone(),
+                    })
+                    .or_default()
+                    .push_back(task.clone());
+                schedules.push(PreparedDbAction::Schedule(task.clone()));
+                notifies = true;
+            }
+            mark_runtime_dirty(&mut inner, "child_start", true);
+        }
+
+        if child_instance.status.is_terminal() {
+            terminal_children.push((child_run_key, child_instance));
+        }
+    }
+
+    Ok((general, schedules, notifies, terminal_children))
+}
+
+async fn reflect_terminal_children_to_parents(
+    state: &AppState,
+    initial_terminals: Vec<(RunKey, WorkflowInstanceState)>,
+) -> Result<(Vec<PreparedDbAction>, Vec<PreparedDbAction>, bool)> {
+    let mut pending = initial_terminals;
+    let mut general = Vec::new();
+    let mut schedules = Vec::new();
+    let mut notifies = false;
+
+    while let Some((child_run_key, child_instance)) = pending.pop() {
+        let Some(parent_child) = state
+            .store
+            .find_parent_for_child_run(&child_run_key.tenant_id, &child_run_key.run_id)
+            .await?
+        else {
+            continue;
+        };
+
+        let (status, output, error, payload_kind) = match child_instance.status {
+            WorkflowStatus::Completed => (
+                "completed".to_owned(),
+                child_instance.output.clone(),
+                None,
+                "completed",
+            ),
+            WorkflowStatus::Failed => (
+                "failed".to_owned(),
+                None,
+                child_instance
+                    .output
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        child_instance.context.as_ref().and_then(Value::as_str).map(str::to_owned)
+                    })
+                    .or_else(|| Some("child workflow failed".to_owned())),
+                "failed",
+            ),
+            WorkflowStatus::Cancelled => (
+                "cancelled".to_owned(),
+                None,
+                child_instance
+                    .output
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        child_instance.context.as_ref().and_then(Value::as_str).map(str::to_owned)
+                    })
+                    .or_else(|| Some("child workflow cancelled".to_owned())),
+                "cancelled",
+            ),
+            WorkflowStatus::Terminated => (
+                "terminated".to_owned(),
+                None,
+                child_instance
+                    .output
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        child_instance.context.as_ref().and_then(Value::as_str).map(str::to_owned)
+                    })
+                    .or_else(|| Some("child workflow terminated".to_owned())),
+                "terminated",
+            ),
+            _ => continue,
+        };
+
+        general.push(PreparedDbAction::CompleteChild {
+            tenant_id: parent_child.tenant_id.clone(),
+            instance_id: parent_child.instance_id.clone(),
+            run_id: parent_child.run_id.clone(),
+            child_id: parent_child.child_id.clone(),
+            status,
+            output: output.clone(),
+            error: error.clone(),
+            terminal_event_id: child_instance.last_event_id,
+            occurred_at: child_instance.updated_at,
+        });
+
+        let parent_run_key = RunKey {
+            tenant_id: parent_child.tenant_id.clone(),
+            instance_id: parent_child.instance_id.clone(),
+            run_id: parent_child.run_id.clone(),
+        };
+
+        let maybe_parent = {
+            let inner = state.inner.lock().expect("unified runtime lock poisoned");
+            inner
+                .instances
+                .get(&parent_run_key)
+                .map(|runtime| (runtime.artifact.clone(), runtime.instance.clone()))
+        };
+        let Some((artifact, parent_instance)) = maybe_parent else {
+            continue;
+        };
+        if parent_instance.status.is_terminal() {
+            continue;
+        }
+        let wait_state = parent_instance
+            .current_state
+            .clone()
+            .unwrap_or_else(|| artifact.workflow.initial_state.clone());
+        let reflection_event_id = unified_child_reflection_event_id(
+            child_instance.last_event_id,
+            &parent_run_key.run_id,
+            &parent_child.child_id,
+            payload_kind,
+        );
+        let reflection_payload = match payload_kind {
+            "completed" => WorkflowEvent::ChildWorkflowCompleted {
+                child_id: parent_child.child_id.clone(),
+                child_run_id: child_run_key.run_id.clone(),
+                output: output.clone().unwrap_or(Value::Null),
+            },
+            "failed" => WorkflowEvent::ChildWorkflowFailed {
+                child_id: parent_child.child_id.clone(),
+                child_run_id: child_run_key.run_id.clone(),
+                error: error.clone().unwrap_or_else(|| "child workflow failed".to_owned()),
+            },
+            "cancelled" => WorkflowEvent::ChildWorkflowCancelled {
+                child_id: parent_child.child_id.clone(),
+                child_run_id: child_run_key.run_id.clone(),
+                reason: error.clone().unwrap_or_else(|| "child workflow cancelled".to_owned()),
+            },
+            _ => WorkflowEvent::ChildWorkflowTerminated {
+                child_id: parent_child.child_id.clone(),
+                child_run_id: child_run_key.run_id.clone(),
+                reason: error.clone().unwrap_or_else(|| "child workflow terminated".to_owned()),
+            },
+        };
+        let reflection_event = EventEnvelope::new(
+            reflection_payload.event_type(),
+            WorkflowIdentity::new(
+                parent_run_key.tenant_id.clone(),
+                parent_instance.definition_id.clone(),
+                parent_instance.definition_version.unwrap_or(artifact.definition_version),
+                parent_instance
+                    .artifact_hash
+                    .clone()
+                    .unwrap_or_else(|| artifact.artifact_hash.clone()),
+                parent_run_key.instance_id.clone(),
+                parent_run_key.run_id.clone(),
+                "unified-runtime",
+            ),
+            reflection_payload,
+        )
+        .with_occurred_at(child_instance.updated_at);
+        let mut reflection_event = reflection_event;
+        reflection_event.event_id = reflection_event_id;
+        reflection_event.causation_id = Some(child_instance.last_event_id);
+        reflection_event.correlation_id = Some(child_instance.last_event_id);
+
+        let plan = if payload_kind == "completed" {
+            artifact.execute_after_child_completion_with_turn(
+                &wait_state,
+                &parent_child.child_id,
+                output.as_ref().unwrap_or(&Value::Null),
+                parent_instance.artifact_execution.clone().unwrap_or_default(),
+                ExecutionTurnContext {
+                    event_id: reflection_event.event_id,
+                    occurred_at: reflection_event.occurred_at,
+                },
+            )?
+        } else {
+            artifact.execute_after_child_failure_with_turn(
+                &wait_state,
+                &parent_child.child_id,
+                error.as_deref().unwrap_or("child workflow failed"),
+                parent_instance.artifact_execution.clone().unwrap_or_default(),
+                ExecutionTurnContext {
+                    event_id: reflection_event.event_id,
+                    occurred_at: reflection_event.occurred_at,
+                },
+            )?
+        };
+
+        {
+            let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
+            let Some(parent_runtime) = inner.instances.get_mut(&parent_run_key) else {
+                continue;
+            };
+            parent_runtime.instance.apply_event(&reflection_event);
+            apply_compiled_plan(&mut parent_runtime.instance, &plan);
+            let scheduled_tasks = schedule_activities_from_plan(
+                &parent_runtime.instance,
+                &plan,
+                reflection_event.occurred_at,
+            )?;
+            for task in &scheduled_tasks {
+                schedules.push(PreparedDbAction::Schedule(task.clone()));
+                parent_runtime.active_activities.insert(
+                    task.activity_id.clone(),
+                    ActiveActivityMeta {
+                        attempt: task.attempt,
+                        task_queue: task.task_queue.clone(),
+                        activity_type: task.activity_type.clone(),
+                        wait_state: task.state.clone(),
+                    },
+                );
+            }
+            let parent_snapshot = parent_runtime.instance.clone();
+            let parent_terminal = parent_snapshot.status.is_terminal();
+            let _ = parent_runtime;
+            for task in scheduled_tasks {
+                inner
+                    .ready
+                    .entry(QueueKey {
+                        tenant_id: task.tenant_id.clone(),
+                        task_queue: task.task_queue.clone(),
+                    })
+                    .or_default()
+                    .push_back(task);
+                notifies = true;
+            }
+            general.push(PreparedDbAction::UpsertInstance(parent_snapshot.clone()));
+            if parent_terminal {
+                general.push(PreparedDbAction::CloseRun(
+                    parent_run_key.clone(),
+                    reflection_event.occurred_at,
+                ));
+                pending.push((parent_run_key.clone(), parent_snapshot));
+            }
+            mark_runtime_dirty(&mut inner, "child_reflection", false);
+        }
+
+        let (child_general, child_schedules, child_notifies, terminal_children) =
+            materialize_child_workflows_from_plan(
+                state,
+                &parent_instance,
+                &plan,
+                reflection_event.occurred_at,
+                reflection_event.event_id,
+            )
+            .await?;
+        general.extend(child_general);
+        schedules.extend(child_schedules);
+        notifies |= child_notifies;
+        pending.extend(terminal_children);
+    }
+
+    Ok((general, schedules, notifies))
+}
+
+async fn apply_post_plan_child_effects(
+    state: &AppState,
+    effect: PostPlanEffect,
+) -> Result<()> {
+    let (general, schedules, mut notifies, terminal_children) = materialize_child_workflows_from_plan(
+        state,
+        &effect.instance,
+        &effect.plan,
+        effect.occurred_at,
+        effect.source_event_id,
+    )
+    .await?;
+    if !general.is_empty() || !schedules.is_empty() {
+        apply_db_actions(state, general, schedules).await?;
+        state.persist_notify.notify_one();
+    }
+
+    let mut pending_terminals = terminal_children;
+    if effect.instance.status.is_terminal() {
+        pending_terminals.push((effect.run_key, effect.instance));
+    }
+    if !pending_terminals.is_empty() {
+        let (general, schedules, child_notifies) =
+            reflect_terminal_children_to_parents(state, pending_terminals).await?;
+        if !general.is_empty() || !schedules.is_empty() {
+            apply_db_actions(state, general, schedules).await?;
+            state.persist_notify.notify_one();
+        }
+        notifies |= child_notifies;
+    }
+
+    if notifies {
+        state.notify.notify_waiters();
+    }
     Ok(())
 }
 
@@ -1102,6 +2253,87 @@ async fn run_persist_loop(state: AppState) {
             error!(error = %error, reason = %reason, "unified-runtime failed to persist state");
         }
     }
+}
+
+async fn execute_internal_query(
+    AxumPath((tenant_id, instance_id, query_name)): AxumPath<(String, String, String)>,
+    AxumState(state): AxumState<AppState>,
+    Json(request): Json<InternalQueryRequest>,
+) -> Result<Json<InternalQueryResponse>, (StatusCode, Json<UnifiedErrorResponse>)> {
+    let hot_instance = {
+        let inner = state.inner.lock().expect("unified runtime lock poisoned");
+        inner
+            .instances
+            .values()
+            .find(|runtime| {
+                runtime.instance.tenant_id == tenant_id
+                    && runtime.instance.instance_id == instance_id
+            })
+            .map(|runtime| (runtime.instance.clone(), runtime.artifact.clone()))
+    };
+
+    let (instance, artifact, source) = if let Some((instance, artifact)) = hot_instance {
+        (instance, artifact, "hot_owner")
+    } else {
+        let instance =
+            state.store.get_instance(&tenant_id, &instance_id).await.map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(UnifiedErrorResponse {
+                        message: format!("failed to load workflow instance: {error}"),
+                    }),
+                )
+            })?;
+        let Some(instance) = instance else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(UnifiedErrorResponse {
+                    message: format!("workflow instance {instance_id} not found"),
+                }),
+            ));
+        };
+        let Some(version) = instance.definition_version else {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(UnifiedErrorResponse {
+                    message: "workflow instance is missing a pinned artifact version".to_owned(),
+                }),
+            ));
+        };
+        let artifact = state
+            .store
+            .get_artifact_version(&tenant_id, &instance.definition_id, version)
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(UnifiedErrorResponse {
+                        message: format!("failed to load workflow artifact: {error}"),
+                    }),
+                )
+            })?
+            .ok_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(UnifiedErrorResponse {
+                        message: "workflow artifact not found".to_owned(),
+                    }),
+                )
+            })?;
+        (instance, artifact, "replay")
+    };
+
+    let result = artifact
+        .evaluate_query(
+            &query_name,
+            &request.args,
+            instance.artifact_execution.clone().unwrap_or_default(),
+        )
+        .map_err(|error| {
+            (StatusCode::BAD_REQUEST, Json(UnifiedErrorResponse { message: error.to_string() }))
+        })?;
+
+    Ok(Json(InternalQueryResponse { result, consistency: "strong", source }))
 }
 
 fn mark_runtime_dirty(inner: &mut RuntimeInner, reason: &str, force_snapshot: bool) {
@@ -1355,6 +2587,11 @@ impl ActivityWorkerApi for WorkerApi {
         apply_db_actions(&self.state, actions.general, actions.schedules)
             .await
             .map_err(internal_status)?;
+        for post_plan in actions.post_plans {
+            apply_post_plan_child_effects(&self.state, post_plan)
+                .await
+                .map_err(internal_status)?;
+        }
         if actions.notifies {
             self.state.notify.notify_waiters();
         }
@@ -1400,6 +2637,7 @@ struct PreparedActions {
     general: Vec<PreparedDbAction>,
     schedules: Vec<PreparedDbAction>,
     notifies: bool,
+    post_plans: Vec<PostPlanEffect>,
     retries_scheduled: u64,
     instance_terminals: u64,
     ignored_missing_instances: u64,
@@ -1430,6 +2668,7 @@ fn prepare_result_application(
     let mut ignored_owner_epoch_mismatches = 0_u64;
     let mut ignored_worker_mismatches = 0_u64;
     let mut notifies = false;
+    let mut post_plans = Vec::new();
     let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
     let mut grouped = HashMap::<RunKey, Vec<EventEnvelope<WorkflowEvent>>>::new();
 
@@ -1538,7 +2777,7 @@ fn prepare_result_application(
                     .artifact
                     .step_retry(&active.wait_state, runtime_execution_state(runtime))?
                 {
-                    if result.attempt < retry.max_attempts {
+                    if unified_failure_allows_retry(result.attempt, retry, &failed.error) {
                         if let Some(retry_task) = build_retry_task(
                             runtime,
                             &result.activity_id,
@@ -1633,6 +2872,13 @@ fn prepare_result_application(
         )? {
             apply_compiled_plan(&mut runtime.instance, &plan);
             runtime.instance.updated_at = now;
+            post_plans.push(PostPlanEffect {
+                run_key: run_key.clone(),
+                instance: runtime.instance.clone(),
+                plan: plan.clone(),
+                source_event_id: runtime.instance.last_event_id,
+                occurred_at: now,
+            });
             let scheduled_tasks = schedule_activities_from_plan(&runtime.instance, &plan, now)?;
             let mut terminal_instance = None;
             for task in &scheduled_tasks {
@@ -1675,6 +2921,7 @@ fn prepare_result_application(
         general,
         schedules,
         notifies,
+        post_plans,
         retries_scheduled,
         instance_terminals,
         ignored_missing_instances,
@@ -1727,6 +2974,30 @@ async fn apply_db_actions(
                 state
                     .store
                     .close_run(&run_key.tenant_id, &run_key.instance_id, &run_key.run_id, closed_at)
+                    .await?;
+            }
+            PreparedDbAction::CompleteUpdate {
+                tenant_id,
+                instance_id,
+                run_id,
+                update_id,
+                output,
+                error,
+                completed_event_id,
+                completed_at,
+            } => {
+                state
+                    .store
+                    .complete_update(
+                        &tenant_id,
+                        &instance_id,
+                        &run_id,
+                        &update_id,
+                        output.as_ref(),
+                        error.as_deref(),
+                        completed_event_id,
+                        completed_at,
+                    )
                     .await?;
             }
         }
@@ -2209,6 +3480,10 @@ fn internal_status(error: anyhow::Error) -> Status {
     Status::internal(error.to_string())
 }
 
+fn unified_failure_allows_retry(attempt: u32, retry: &RetryPolicy, error: &str) -> bool {
+    attempt < retry.max_attempts && retry_policy_allows_failure_retry(retry, error)
+}
+
 fn apply_compiled_plan(state: &mut WorkflowInstanceState, plan: &CompiledExecutionPlan) {
     state.current_state = Some(plan.final_state.clone());
     state.context = plan.context.clone();
@@ -2235,7 +3510,9 @@ mod tests {
     use chrono::Duration as ChronoDuration;
     use fabrik_broker::WorkflowPublisher;
     use fabrik_events::WorkflowIdentity;
-    use fabrik_workflow::{ArtifactEntrypoint, CompiledStateNode, CompiledWorkflow, Expression};
+    use fabrik_workflow::{
+        ArtifactEntrypoint, CompiledStateNode, CompiledUpdateHandler, CompiledWorkflow, Expression,
+    };
     use serde_json::json;
     use std::{
         collections::BTreeMap,
@@ -2362,6 +3639,9 @@ mod tests {
                 reducer: Some("all_settled".to_owned()),
                 retry: None,
                 config: None,
+                schedule_to_start_timeout_ms: None,
+                start_to_close_timeout_ms: None,
+                heartbeat_timeout_ms: None,
             },
         );
         states.insert(
@@ -2386,7 +3666,107 @@ mod tests {
             "unified-runtime-test",
             ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
             CompiledWorkflow { initial_state: "dispatch".to_owned(), states },
-        )
+    )
+}
+
+fn unified_child_trigger_event_id(parent_event_id: Uuid, child_id: &str) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("unified-child-trigger:{parent_event_id}:{child_id}").as_bytes(),
+    )
+}
+
+fn unified_child_reflection_event_id(
+    child_event_id: Uuid,
+    parent_run_id: &str,
+    child_id: &str,
+    kind: &str,
+) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("unified-child-reflection:{child_event_id}:{parent_run_id}:{child_id}:{kind}")
+            .as_bytes(),
+    )
+}
+
+    fn update_test_artifact() -> CompiledWorkflowArtifact {
+        let workflow = CompiledWorkflow {
+            initial_state: "wait".to_owned(),
+            states: BTreeMap::from([
+                (
+                    "wait".to_owned(),
+                    CompiledStateNode::WaitForEvent {
+                        event_type: "resume".to_owned(),
+                        next: "done".to_owned(),
+                        output_var: Some("signal".to_owned()),
+                    },
+                ),
+                ("done".to_owned(), CompiledStateNode::Succeed { output: None }),
+            ]),
+        };
+        let mut artifact = CompiledWorkflowArtifact::new(
+            "unified-update-demo".to_owned(),
+            1,
+            "unified-runtime-test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            workflow,
+        );
+        artifact.updates.insert(
+            "setValue".to_owned(),
+            CompiledUpdateHandler {
+                arg_name: Some("payload".to_owned()),
+                initial_state: "finish".to_owned(),
+                states: BTreeMap::from([(
+                    "finish".to_owned(),
+                    CompiledStateNode::Succeed {
+                        output: Some(Expression::Identifier { name: "payload".to_owned() }),
+                    },
+                )]),
+            },
+        );
+        artifact.artifact_hash = artifact.hash();
+        artifact
+    }
+
+    fn test_app_state(store: WorkflowStore, inner: RuntimeInner, state_dir: PathBuf) -> AppState {
+        fs::create_dir_all(&state_dir).expect("create app state dir");
+        AppState {
+            store,
+            inner: Arc::new(StdMutex::new(inner)),
+            ownership: Arc::new(StdMutex::new(UnifiedOwnershipState::inactive(1, "test-owner"))),
+            notify: Arc::new(Notify::new()),
+            persist_notify: Arc::new(Notify::new()),
+            persist_lock: Arc::new(Mutex::new(())),
+            persistence: persistence_config_for(state_dir),
+            debug: Arc::new(StdMutex::new(UnifiedDebugState::default())),
+        }
+    }
+
+    fn mailbox_record(
+        kind: WorkflowMailboxKind,
+        source_event: EventEnvelope<WorkflowEvent>,
+        message_id: Option<&str>,
+        message_name: Option<&str>,
+        payload: Option<Value>,
+    ) -> WorkflowMailboxRecord {
+        let now = source_event.occurred_at;
+        WorkflowMailboxRecord {
+            tenant_id: source_event.tenant_id.clone(),
+            instance_id: source_event.instance_id.clone(),
+            run_id: source_event.run_id.clone(),
+            accepted_seq: 1,
+            kind,
+            message_id: message_id.map(str::to_owned),
+            message_name: message_name.map(str::to_owned),
+            payload,
+            source_event_id: source_event.event_id,
+            source_event_type: source_event.event_type.clone(),
+            source_event,
+            status: WorkflowMailboxStatus::Queued,
+            consumed_at: None,
+            created_at: now,
+            updated_at: now,
+        }
     }
 
     fn test_event(
@@ -2713,6 +4093,189 @@ mod tests {
             ),
             LeaseResultMatch::WorkerMismatch
         );
+    }
+
+    #[test]
+    fn unified_failure_retry_filter_respects_non_retryable_types() {
+        let retry = RetryPolicy {
+            max_attempts: 3,
+            delay: "5s".to_owned(),
+            non_retryable_error_types: vec!["ValidationError".to_owned()],
+        };
+
+        assert!(unified_failure_allows_retry(1, &retry, "TransientError: retry me"));
+        assert!(!unified_failure_allows_retry(
+            1,
+            &retry,
+            r#"{"type":"ValidationError","message":"bad input"}"#
+        ));
+        assert!(!unified_failure_allows_retry(3, &retry, "TransientError: retry me"));
+    }
+
+    #[tokio::test]
+    async fn update_mailbox_item_executes_and_completes_update_record() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = update_test_artifact();
+        let now = Utc::now();
+        let run_key = run_key_for("update");
+        let mut instance = workflow_instance_for_run("update", WorkflowStatus::Running, 1, now);
+        instance.current_state = Some("wait".to_owned());
+        instance.definition_id = artifact.definition_id.clone();
+        instance.definition_version = Some(artifact.definition_version);
+        instance.artifact_hash = Some(artifact.artifact_hash.clone());
+        instance.artifact_execution = Some(ArtifactExecutionState::default());
+        store.upsert_instance(&instance).await?;
+        store
+            .queue_update(
+                "tenant",
+                "instance-update",
+                "update",
+                "update-1",
+                "setValue",
+                None,
+                &json!({"ok": true}),
+                Uuid::now_v7(),
+                now,
+            )
+            .await?;
+
+        let mut inner = RuntimeInner::default();
+        inner.instances.insert(
+            run_key.clone(),
+            RuntimeWorkflowState { artifact, instance, active_activities: BTreeMap::new() },
+        );
+        let state_dir =
+            std::env::temp_dir().join(format!("unified-runtime-update-test-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), inner, state_dir.clone());
+        let requested = test_event(
+            &WorkflowIdentity::new(
+                "tenant",
+                "definition",
+                1,
+                "artifact",
+                "instance-update",
+                "update",
+                "unified-runtime-test",
+            ),
+            WorkflowEvent::WorkflowUpdateRequested {
+                update_id: "update-1".to_owned(),
+                update_name: "setValue".to_owned(),
+                payload: json!({"ok": true}),
+            },
+            now,
+        );
+        let item = mailbox_record(
+            WorkflowMailboxKind::Update,
+            requested,
+            Some("update-1"),
+            Some("setValue"),
+            Some(json!({"ok": true})),
+        );
+
+        let outcome = dispatch_update_mailbox_item_unified(&app_state, &item).await?;
+        let MailboxDrainOutcome::Processed { general, schedules, .. } = outcome else {
+            anyhow::bail!("expected processed update outcome");
+        };
+        apply_db_actions(&app_state, general, schedules).await?;
+
+        let update = store
+            .get_update("tenant", "instance-update", "update", "update-1")
+            .await?
+            .context("update record should exist")?;
+        assert_eq!(update.status, WorkflowUpdateStatus::Completed);
+        assert_eq!(update.output, Some(json!({"ok": true})));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_mailbox_item_clears_run_work_and_marks_instance_terminal() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = test_artifact("default");
+        let now = Utc::now();
+        let run_key = run_key_for("cancel");
+        let mut instance = workflow_instance_for_run("cancel", WorkflowStatus::Running, 1, now);
+        instance.definition_id = artifact.definition_id.clone();
+        instance.definition_version = Some(artifact.definition_version);
+        instance.artifact_hash = Some(artifact.artifact_hash.clone());
+        instance.artifact_execution = Some(ArtifactExecutionState::default());
+        store.upsert_instance(&instance).await?;
+
+        let queued = queued_activity_for_run("cancel", "activity-cancel", 1, now);
+        let mut inner = RuntimeInner::default();
+        inner.instances.insert(
+            run_key.clone(),
+            RuntimeWorkflowState {
+                artifact,
+                instance,
+                active_activities: BTreeMap::from([(
+                    queued.activity_id.clone(),
+                    ActiveActivityMeta {
+                        attempt: queued.attempt,
+                        task_queue: queued.task_queue.clone(),
+                        activity_type: queued.activity_type.clone(),
+                        wait_state: queued.state.clone(),
+                    },
+                )]),
+            },
+        );
+        inner
+            .ready
+            .entry(QueueKey { tenant_id: "tenant".to_owned(), task_queue: "default".to_owned() })
+            .or_default()
+            .push_back(queued.clone());
+        inner.delayed_retries.push(DelayedRetryTask {
+            task: queued.clone(),
+            due_at: now + ChronoDuration::seconds(30),
+        });
+        let state_dir =
+            std::env::temp_dir().join(format!("unified-runtime-cancel-test-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), inner, state_dir.clone());
+        let cancel_requested = test_event(
+            &WorkflowIdentity::new(
+                "tenant",
+                "definition",
+                1,
+                "artifact",
+                "instance-cancel",
+                "cancel",
+                "unified-runtime-test",
+            ),
+            WorkflowEvent::WorkflowCancellationRequested { reason: "stop".to_owned() },
+            now,
+        );
+        let item =
+            mailbox_record(WorkflowMailboxKind::CancelRequest, cancel_requested, None, None, None);
+
+        let outcome = dispatch_cancel_mailbox_item_unified(&app_state, &item).await?;
+        let MailboxDrainOutcome::Processed { general, schedules, .. } = outcome else {
+            anyhow::bail!("expected processed cancel outcome");
+        };
+        apply_db_actions(&app_state, general, schedules).await?;
+
+        let inner = app_state.inner.lock().expect("unified runtime lock poisoned");
+        let runtime = inner.instances.get(&run_key).context("runtime should exist")?;
+        assert_eq!(runtime.instance.status, WorkflowStatus::Cancelled);
+        assert!(runtime.active_activities.is_empty());
+        assert!(inner.ready.values().all(VecDeque::is_empty));
+        assert!(inner.delayed_retries.is_empty());
+        drop(inner);
+
+        let stored = store
+            .get_instance("tenant", "instance-cancel")
+            .await?
+            .context("stored instance should exist")?;
+        assert_eq!(stored.status, WorkflowStatus::Cancelled);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
     }
 
     #[test]

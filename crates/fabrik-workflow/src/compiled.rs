@@ -187,6 +187,10 @@ pub enum CompiledStateNode {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_var: Option<String>,
     },
+    WaitForCondition {
+        condition: Expression,
+        next: String,
+    },
     WaitForTimer {
         timer_ref: String,
         next: String,
@@ -465,6 +469,7 @@ impl CompiledWorkflowArtifact {
         Ok(matches!(
             state,
             CompiledStateNode::WaitForEvent { .. }
+                | CompiledStateNode::WaitForCondition { .. }
                 | CompiledStateNode::WaitForTimer { .. }
                 | CompiledStateNode::WaitForAllActivities { .. }
         ))
@@ -671,6 +676,9 @@ impl CompiledWorkflowArtifact {
                     execution_state.bindings.insert(output_var.clone(), payload.clone());
                 }
                 self.execute_from_state_in_graph(states, next, execution_state, false)
+            }
+            CompiledStateNode::WaitForCondition { .. } => {
+                Err(CompiledWorkflowError::NotWaitingOnSignal(wait_state.to_owned()))
             }
             CompiledStateNode::WaitForEvent { event_type, .. } => {
                 Err(CompiledWorkflowError::UnexpectedSignal {
@@ -2025,6 +2033,25 @@ impl CompiledWorkflowArtifact {
                         output,
                     });
                 }
+                CompiledStateNode::WaitForCondition { condition, next } => {
+                    let ready = truthy(&evaluate_expression(
+                        condition,
+                        &mut execution_state,
+                        &self.helpers,
+                    )?);
+                    if ready {
+                        current_state = next.clone();
+                        continue;
+                    }
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: current_state,
+                        emissions,
+                        execution_state,
+                        context,
+                        output,
+                    });
+                }
                 CompiledStateNode::WaitForTimer { timer_ref, .. } => {
                     emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
                     let fire_at = Utc::now()
@@ -2065,17 +2092,44 @@ impl CompiledWorkflowArtifact {
                     context = Some(value.clone());
                     if let Some(active_update) = execution_state.active_update.take() {
                         let return_state = active_update.return_state;
-                        emissions.push(ExecutionEmission {
+                        let completion = ExecutionEmission {
                             event: WorkflowEvent::WorkflowUpdateCompleted {
                                 update_id: active_update.update_id,
                                 update_name: active_update.update_name,
                                 output: value.clone(),
                             },
                             state: Some(return_state.clone()),
-                        });
+                        };
+                        if matches!(
+                            self.workflow.states.get(&return_state),
+                            Some(CompiledStateNode::WaitForCondition { .. })
+                        ) {
+                            let mut resumed = self.execute_from_state_in_graph(
+                                &self.workflow.states,
+                                &return_state,
+                                execution_state,
+                                false,
+                            )?;
+                            let mut prefixed = vec![completion];
+                            prefixed.append(&mut resumed.emissions);
+                            resumed.emissions = prefixed;
+                            return Ok(resumed);
+                        }
+                        emissions.push(completion);
                         current_state = return_state;
                     } else if let Some(active_signal) = execution_state.active_signal.take() {
                         current_state = active_signal.return_state;
+                        if matches!(
+                            self.workflow.states.get(&current_state),
+                            Some(CompiledStateNode::WaitForCondition { .. })
+                        ) {
+                            return self.execute_from_state_in_graph(
+                                &self.workflow.states,
+                                &current_state,
+                                execution_state,
+                                false,
+                            );
+                        }
                     } else {
                         emissions.push(ExecutionEmission {
                             event: WorkflowEvent::WorkflowCompleted { output: value },
@@ -2184,6 +2238,7 @@ impl CompiledStateNode {
                 .collect(),
             Self::StartChild { next, .. }
             | Self::WaitForEvent { next, .. }
+            | Self::WaitForCondition { next, .. }
             | Self::WaitForTimer { next, .. }
             | Self::WaitForChild { next, .. } => {
                 vec![next.as_str()]
@@ -2259,10 +2314,7 @@ fn fanout_reducer<'a>(fanout: &'a FanOutExecutionState) -> &'a str {
 }
 
 fn fanout_reducer_settles(fanout: &FanOutExecutionState) -> bool {
-    matches!(
-        fanout_reducer(fanout),
-        "all_settled" | "count" | "collect_settled_results"
-    )
+    matches!(fanout_reducer(fanout), "all_settled" | "count" | "collect_settled_results")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3189,6 +3241,63 @@ mod tests {
         artifact
     }
 
+    fn signal_condition_artifact() -> CompiledWorkflowArtifact {
+        let workflow = CompiledWorkflow {
+            initial_state: "wait_ready".to_owned(),
+            states: BTreeMap::from([
+                (
+                    "wait_ready".to_owned(),
+                    CompiledStateNode::WaitForCondition {
+                        condition: Expression::Identifier { name: "ready".to_owned() },
+                        next: "done".to_owned(),
+                    },
+                ),
+                (
+                    "done".to_owned(),
+                    CompiledStateNode::Succeed {
+                        output: Some(Expression::Identifier { name: "payload".to_owned() }),
+                    },
+                ),
+            ]),
+        };
+        let signals = BTreeMap::from([(
+            "approved".to_owned(),
+            CompiledSignalHandler {
+                arg_name: Some("value".to_owned()),
+                initial_state: "apply".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "apply".to_owned(),
+                        CompiledStateNode::Assign {
+                            actions: vec![
+                                Assignment {
+                                    target: "ready".to_owned(),
+                                    expr: Expression::Literal { value: Value::Bool(true) },
+                                },
+                                Assignment {
+                                    target: "payload".to_owned(),
+                                    expr: Expression::Identifier { name: "value".to_owned() },
+                                },
+                            ],
+                            next: "finish".to_owned(),
+                        },
+                    ),
+                    ("finish".to_owned(), CompiledStateNode::Succeed { output: None }),
+                ]),
+            },
+        )]);
+        let mut artifact = CompiledWorkflowArtifact::new(
+            "demo-signal-condition",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            workflow,
+        );
+        artifact.signals = signals;
+        artifact.artifact_hash = artifact.hash();
+        artifact
+    }
+
     fn fanout_artifact_with_reducer(
         enable_retry: bool,
         reducer: Option<&str>,
@@ -3208,8 +3317,11 @@ mod tests {
                         handle_var: "fanout".to_owned(),
                         task_queue: None,
                         reducer: reducer.map(str::to_owned),
-                        retry: enable_retry
-                            .then_some(RetryPolicy { max_attempts: 2, delay: "1s".to_owned() }),
+                        retry: enable_retry.then_some(RetryPolicy {
+                            max_attempts: 2,
+                            delay: "1s".to_owned(),
+                            non_retryable_error_types: Vec::new(),
+                        }),
                         config: None,
                         schedule_to_start_timeout_ms: None,
                         start_to_close_timeout_ms: None,
@@ -3298,7 +3410,11 @@ mod tests {
                         reducer: Some(reducer.to_owned()),
                         throughput_backend: None,
                         chunk_size: Some(2),
-                        retry: Some(RetryPolicy { max_attempts: 2, delay: "1s".to_owned() }),
+                        retry: Some(RetryPolicy {
+                            max_attempts: 2,
+                            delay: "1s".to_owned(),
+                            non_retryable_error_types: Vec::new(),
+                        }),
                     },
                 ),
                 (
@@ -3547,19 +3663,38 @@ mod tests {
                 "approved",
                 &json!({"ok": true}),
                 ArtifactExecutionState::default(),
-                ExecutionTurnContext {
-                    event_id: uuid::Uuid::now_v7(),
-                    occurred_at: Utc::now(),
-                },
+                ExecutionTurnContext { event_id: uuid::Uuid::now_v7(), occurred_at: Utc::now() },
             )
             .unwrap();
 
         assert_eq!(plan.final_state, "idle");
         assert!(plan.emissions.is_empty());
-        assert_eq!(
-            plan.execution_state.bindings.get("approvedValue"),
-            Some(&json!({"ok": true}))
-        );
+        assert_eq!(plan.execution_state.bindings.get("approvedValue"), Some(&json!({"ok": true})));
+        assert!(plan.execution_state.active_signal.is_none());
+    }
+
+    #[test]
+    fn signal_handler_re_evaluates_wait_for_condition() {
+        let artifact = signal_condition_artifact();
+        let plan = artifact
+            .execute_signal_handler_with_turn(
+                "wait_ready",
+                "sig-1",
+                "approved",
+                &json!({"ok": true}),
+                ArtifactExecutionState::default(),
+                ExecutionTurnContext { event_id: uuid::Uuid::now_v7(), occurred_at: Utc::now() },
+            )
+            .unwrap();
+
+        assert_eq!(plan.final_state, "done");
+        assert!(matches!(
+            plan.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output == &json!({"ok": true})
+        ));
         assert!(plan.execution_state.active_signal.is_none());
     }
 

@@ -453,6 +453,42 @@ impl StateNode {
 pub struct RetryPolicy {
     pub max_attempts: u32,
     pub delay: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub non_retryable_error_types: Vec<String>,
+}
+
+pub fn retry_policy_allows_failure_retry(policy: &RetryPolicy, error: &str) -> bool {
+    if policy.non_retryable_error_types.is_empty() {
+        return true;
+    }
+    let Some(error_type) = extract_retry_error_type(error) else {
+        return true;
+    };
+    !policy.non_retryable_error_types.iter().any(|candidate| candidate == &error_type)
+}
+
+fn extract_retry_error_type(error: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<Value>(error) {
+        if let Some(error_type) = structured_retry_error_type(&value) {
+            return Some(error_type.to_owned());
+        }
+    }
+
+    let (candidate, _) = error.split_once(':')?;
+    let candidate = candidate.trim();
+    if candidate.is_empty() || candidate.contains(char::is_whitespace) {
+        return None;
+    }
+    candidate
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '$'))
+        .then(|| candidate.to_owned())
+}
+
+fn structured_retry_error_type<'a>(value: &'a Value) -> Option<&'a str> {
+    ["type", "errorType", "name"]
+        .into_iter()
+        .find_map(|field| value.get(field).and_then(Value::as_str))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2550,7 +2586,11 @@ mod tests {
             StateNode::Step {
                 handler: "core.echo".to_owned(),
                 next: Some("done".to_owned()),
-                retry: Some(RetryPolicy { max_attempts: 3, delay: "5s".to_owned() }),
+                retry: Some(RetryPolicy {
+                    max_attempts: 3,
+                    delay: "5s".to_owned(),
+                    non_retryable_error_types: Vec::new(),
+                }),
                 config: None,
             },
         );
@@ -2575,7 +2615,11 @@ mod tests {
             StateNode::Step {
                 handler: "core.echo".to_owned(),
                 next: Some("done".to_owned()),
-                retry: Some(RetryPolicy { max_attempts: 0, delay: "5s".to_owned() }),
+                retry: Some(RetryPolicy {
+                    max_attempts: 0,
+                    delay: "5s".to_owned(),
+                    non_retryable_error_types: Vec::new(),
+                }),
                 config: None,
             },
         );
@@ -2589,6 +2633,26 @@ mod tests {
         };
 
         assert_eq!(workflow.validate(), Err(WorkflowValidationError::InvalidRetryAttempts));
+    }
+
+    #[test]
+    fn retry_policy_blocks_non_retryable_error_types() {
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            delay: "5s".to_owned(),
+            non_retryable_error_types: vec!["ValidationError".to_owned(), "FatalError".to_owned()],
+        };
+
+        assert!(crate::retry_policy_allows_failure_retry(&policy, "transient network error"));
+        assert!(crate::retry_policy_allows_failure_retry(
+            &policy,
+            r#"{"type":"OtherError","message":"try again"}"#
+        ));
+        assert!(!crate::retry_policy_allows_failure_retry(
+            &policy,
+            r#"{"type":"ValidationError","message":"bad input"}"#
+        ));
+        assert!(!crate::retry_policy_allows_failure_retry(&policy, "FatalError: do not retry"));
     }
 
     #[test]

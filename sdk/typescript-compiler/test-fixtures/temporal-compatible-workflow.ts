@@ -5,6 +5,7 @@ const { benchmarkEcho } = proxyActivities({
   retry: {
     maximumAttempts: 3,
     initialInterval: "5s",
+    nonRetryableErrorTypes: ["ValidationError", "FatalError"],
   },
 });
 

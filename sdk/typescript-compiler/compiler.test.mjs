@@ -211,6 +211,7 @@ test("compiler lowers Temporal-style proxyActivities, sleep, and plain return", 
   assert.match(serialized, /"start_to_close_timeout_ms":30000/);
   assert.match(serialized, /"max_attempts":3/);
   assert.match(serialized, /"delay":"5s"/);
+  assert.match(serialized, /"non_retryable_error_types":\["ValidationError","FatalError"\]/);
   assert.match(serialized, /"type":"succeed"/);
   assert.ok(!serialized.includes("ctx.activity"));
 });
@@ -378,13 +379,12 @@ test("compiler lowers narrow Temporal signal handlers plus condition waits", asy
   const serialized = JSON.stringify(artifact.workflow.states);
 
   assert.ok(artifact.signals.approved);
-  assert.match(serialized, /"type":"wait_for_event"/);
-  assert.match(serialized, /"event_type":"approved"/);
-  assert.match(serialized, /"output_var":"value"/);
-  assert.match(serialized, /"type":"assign"/);
-  assert.match(serialized, /"target":"ready"/);
-  assert.match(serialized, /"target":"payload"/);
-  assert.match(serialized, /"type":"choice"/);
+  assert.match(serialized, /"type":"wait_for_condition"/);
+  assert.match(serialized, /"condition":\{"kind":"identifier","name":"ready"\}/);
+  const signalSerialized = JSON.stringify(artifact.signals);
+  assert.match(signalSerialized, /"type":"assign"/);
+  assert.match(signalSerialized, /"target":"ready"/);
+  assert.match(signalSerialized, /"target":"payload"/);
 });
 
 test("compiler emits real compiled signal handler graphs for async Temporal signal handlers", async () => {
@@ -409,6 +409,30 @@ test("compiler emits real compiled signal handler graphs for async Temporal sign
   assert.match(serializedSignals, /"initial_state"/);
   assert.match(serializedSignals, /"type":"step"/);
   assert.match(serializedSignals, /"handler":"benchmarkEcho"/);
+  assert.match(serializedSignals, /"output_var":"echoed"/);
+});
+
+test("compiler lowers awaited reassignment statements", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-await-assignment-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalAwaitAssignmentWorkflow",
+    "--definition-id",
+    "temporal-await-assignment-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"step"/);
+  assert.match(serialized, /"handler":"benchmarkEcho"/);
+  assert.match(serialized, /"output_var":"echoed"/);
 });
 
 test("compiler lowers narrow Temporal child workflow APIs", async () => {

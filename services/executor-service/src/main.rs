@@ -27,7 +27,7 @@ use fabrik_workflow::{
     ArtifactEntrypoint, CompiledExecutionPlan, CompiledStateNode, CompiledWorkflow,
     CompiledWorkflowArtifact, ExecutionEmission, ExecutionTurnContext, Expression,
     WorkflowInstanceState, replay_compiled_history_trace_from_snapshot,
-    replay_history_trace_from_snapshot,
+    replay_history_trace_from_snapshot, retry_policy_allows_failure_retry,
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -2388,7 +2388,9 @@ async fn dispatch_mailbox_item(
                 let definition =
                     load_pinned_definition(store, &item.source_event, &instance, lookup_cache)
                         .await?;
-                definition.expected_signal_type(wait_state)?.is_some_and(|expected| expected == signal_name)
+                definition
+                    .expected_signal_type(wait_state)?
+                    .is_some_and(|expected| expected == signal_name)
             } else {
                 false
             };
@@ -3407,7 +3409,13 @@ async fn process_event_with_mark_mode(
                     &step_state,
                     &state.artifact_execution.clone().unwrap_or_default(),
                 )? {
-                    Some(retry_policy) if *attempt < retry_policy.max_attempts => {
+                    Some(retry_policy)
+                        if *attempt < retry_policy.max_attempts
+                            && activity_terminal_event_allows_retry(
+                                &event.payload,
+                                retry_policy,
+                            ) =>
+                    {
                         let retry = chrono::Utc::now()
                             + fabrik_workflow::parse_timer_ref(&retry_policy.delay)?;
                         let retry_timer_id =
@@ -5806,6 +5814,18 @@ fn parse_retry_timer_id(timer_id: &str) -> Option<(RetryTargetKind, String, u32)
     Some((kind, target_id.to_owned(), attempt))
 }
 
+fn activity_terminal_event_allows_retry(
+    payload: &WorkflowEvent,
+    retry_policy: &fabrik_workflow::RetryPolicy,
+) -> bool {
+    match payload {
+        WorkflowEvent::ActivityTaskFailed { error, .. } => {
+            retry_policy_allows_failure_retry(retry_policy, error)
+        }
+        _ => true,
+    }
+}
+
 fn build_workflow_envelope(
     source: &EventEnvelope<WorkflowEvent>,
     causation_id: Uuid,
@@ -7793,5 +7813,44 @@ mod tests {
         let _ = poller_b.await;
         workflow_api.stop().await;
         Ok(())
+    }
+
+    #[test]
+    fn activity_terminal_event_retry_filter_respects_non_retryable_types() {
+        let retry_policy = fabrik_workflow::RetryPolicy {
+            max_attempts: 3,
+            delay: "5s".to_owned(),
+            non_retryable_error_types: vec!["ValidationError".to_owned()],
+        };
+
+        assert!(activity_terminal_event_allows_retry(
+            &WorkflowEvent::ActivityTaskFailed {
+                activity_id: "activity-1".to_owned(),
+                attempt: 1,
+                error: "TransientError: retry me".to_owned(),
+                worker_id: "worker".to_owned(),
+                worker_build_id: "build".to_owned(),
+            },
+            &retry_policy,
+        ));
+        assert!(!activity_terminal_event_allows_retry(
+            &WorkflowEvent::ActivityTaskFailed {
+                activity_id: "activity-1".to_owned(),
+                attempt: 1,
+                error: r#"{"type":"ValidationError","message":"bad input"}"#.to_owned(),
+                worker_id: "worker".to_owned(),
+                worker_build_id: "build".to_owned(),
+            },
+            &retry_policy,
+        ));
+        assert!(activity_terminal_event_allows_retry(
+            &WorkflowEvent::ActivityTaskTimedOut {
+                activity_id: "activity-1".to_owned(),
+                attempt: 1,
+                worker_id: "worker".to_owned(),
+                worker_build_id: "build".to_owned(),
+            },
+            &retry_policy,
+        ));
     }
 }

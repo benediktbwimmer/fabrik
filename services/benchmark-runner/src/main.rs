@@ -595,8 +595,11 @@ fn benchmark_artifact(
                         value: Value::String(task_queue.to_owned()),
                     }),
                     reducer: Some(bulk_reducer.to_owned()),
-                    retry: enable_retry
-                        .then_some(RetryPolicy { max_attempts: 2, delay: "1s".to_owned() }),
+                    retry: enable_retry.then_some(RetryPolicy {
+                        max_attempts: 2,
+                        delay: "1s".to_owned(),
+                        non_retryable_error_types: Vec::new(),
+                    }),
                     config: None,
                     schedule_to_start_timeout_ms: None,
                     start_to_close_timeout_ms: None,
@@ -635,8 +638,11 @@ fn benchmark_artifact(
                     reducer: Some(bulk_reducer.to_owned()),
                     throughput_backend: throughput_backend.map(str::to_owned),
                     chunk_size: Some(chunk_size),
-                    retry: enable_retry
-                        .then_some(RetryPolicy { max_attempts: 2, delay: "1s".to_owned() }),
+                    retry: enable_retry.then_some(RetryPolicy {
+                        max_attempts: 2,
+                        delay: "1s".to_owned(),
+                        non_retryable_error_types: Vec::new(),
+                    }),
                 },
             );
             states.insert(

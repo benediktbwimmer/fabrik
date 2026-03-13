@@ -75,6 +75,7 @@ Current implemented compatibility slice in the compiler:
 - awaited calls to destructured proxy activity functions
 - awaited calls to proxy activity object members
 - multi-argument Temporal activity calls, lowered as array payloads when more than one argument is passed
+- awaited reassignment statements like `value = await activity(...)`
 - static `proxyActivities({...})` options for:
   - `taskQueue`
   - `scheduleToStartTimeout`
@@ -90,10 +91,9 @@ Current implemented compatibility slice in the compiler:
 - compiled Temporal signal handlers via `defineSignal(...)` plus `setHandler(...)`
   - handler bodies lower into dedicated signal subgraphs in the artifact
   - async signal handlers can await the same supported workflow primitives as other compiled handler bodies
-- a narrow Temporal `condition(...)` subset:
-  - top-level `defineSignal(...)`
-  - sync `setHandler(signal, ...)` bodies containing only simple identifier assignments
-  - awaited `condition(() => predicate)` loops driven by that registered signal handler
+- a broader Temporal `condition(...)` subset:
+  - awaited `condition(() => predicate)` lowers into a first-class `wait_for_condition` state
+  - the condition is re-evaluated after registered compiled signal handlers run and mutate workflow state
 - a narrow Temporal child-workflow subset:
   - `await startChild(workflow, { args, workflowId, taskQueue, parentClosePolicy })`
   - `await childHandle.result()`
@@ -107,11 +107,11 @@ Current non-goals for this slice:
 
 - general `Promise.all(...)` lowering beyond the proxy-activity map pattern
 - general `Promise.allSettled(...)` lowering beyond the proxy-activity map pattern
-- broad Temporal `condition(...)` and signal-handler parity beyond the current single-signal, assignment-driven condition lowering
+- broad Temporal `condition(...)` parity beyond signal-handler-driven state changes
 - Temporal cancellation scopes
 - broad Temporal child workflow handles and signal APIs beyond the narrow start/result and execute forms
 - full proxy activity option parity
-  - `retry.nonRetryableErrorTypes` is accepted syntactically today but not yet enforced by Fabrik retry semantics
+  - dynamic or computed retry option values are still rejected; retry options must remain static literals
 - wire-level or server-level Temporal compatibility
 
 The intended development pattern is incremental:
