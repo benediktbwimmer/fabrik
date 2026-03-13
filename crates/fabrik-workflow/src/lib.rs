@@ -666,6 +666,8 @@ pub struct WorkflowInstanceState {
     pub status: WorkflowStatus,
     pub input: Option<Value>,
     #[serde(default)]
+    pub persisted_input_handle: Option<Value>,
+    #[serde(default)]
     pub memo: Option<Value>,
     #[serde(default)]
     pub search_attributes: Option<Value>,
@@ -712,6 +714,25 @@ impl WorkflowInstanceState {
         }
     }
 
+    pub fn compact_trigger_bulk_wait_for_external_input(&mut self, input_handle: Value) -> bool {
+        let Some(wait_state) = self.current_state.as_deref() else {
+            return false;
+        };
+        let Some(execution) = self.artifact_execution.as_ref() else {
+            return false;
+        };
+        if self.last_event_type != "WorkflowTriggered" || !execution.waits_on_bulk_activity(wait_state)
+        {
+            return false;
+        }
+
+        self.context = None;
+        self.input = None;
+        self.artifact_execution = None;
+        self.persisted_input_handle = Some(input_handle);
+        true
+    }
+
     pub fn expand_after_persistence(&mut self) {
         self.expand_after_persistence_with_artifact(None);
     }
@@ -741,6 +762,41 @@ impl WorkflowInstanceState {
         {
             self.context = artifact.rehydrate_bulk_wait_context(wait_state, execution);
         }
+    }
+
+    pub fn restore_trigger_bulk_wait_from_input(
+        &mut self,
+        artifact: &CompiledWorkflowArtifact,
+        input: &Value,
+    ) -> Result<()> {
+        let wait_state = self.current_state.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing current state for trigger bulk wait restore {}/{}",
+                self.tenant_id,
+                self.instance_id
+            )
+        })?;
+        let plan = artifact.execute_trigger_with_turn(
+            input,
+            ExecutionTurnContext { event_id: self.last_event_id, occurred_at: self.updated_at },
+        )?;
+        if plan.final_state != wait_state {
+            anyhow::bail!(
+                "trigger replay restored state {} but persisted state expected {}",
+                plan.final_state,
+                wait_state
+            );
+        }
+        if !artifact.waits_on_bulk_activity(&wait_state, &plan.execution_state) {
+            anyhow::bail!("trigger replay did not restore bulk wait execution state");
+        }
+
+        self.input = Some(input.clone());
+        self.context = plan.context;
+        self.artifact_execution = Some(plan.execution_state);
+        self.output = plan.output;
+        self.persisted_input_handle = None;
+        Ok(())
     }
 
     pub fn apply_event(&mut self, event: &EventEnvelope<WorkflowEvent>) {
@@ -971,6 +1027,7 @@ impl TryFrom<&EventEnvelope<WorkflowEvent>> for WorkflowInstanceState {
             artifact_execution: None,
             status: WorkflowStatus::Triggered,
             input: None,
+            persisted_input_handle: None,
             memo: None,
             search_attributes: None,
             output: None,
@@ -2218,6 +2275,7 @@ mod tests {
             ]),
             params: vec![crate::compiled::CompiledWorkflowParam {
                 name: "name".to_owned(),
+                rest: false,
                 default: None,
             }],
             non_cancellable_states: BTreeSet::new(),
@@ -3411,6 +3469,7 @@ mod tests {
             }),
             status: WorkflowStatus::Running,
             input: Some(input.clone()),
+            persisted_input_handle: None,
             memo: None,
             search_attributes: None,
             output: None,
@@ -3458,6 +3517,7 @@ mod tests {
             }),
             status: WorkflowStatus::Running,
             input: Some(input.clone()),
+            persisted_input_handle: None,
             memo: None,
             search_attributes: None,
             output: None,
@@ -3552,6 +3612,7 @@ mod tests {
             artifact_execution: Some(plan.execution_state),
             status: WorkflowStatus::Running,
             input: Some(input.clone()),
+            persisted_input_handle: None,
             memo: None,
             search_attributes: None,
             output: None,
@@ -3568,5 +3629,106 @@ mod tests {
         state.expand_after_persistence_with_artifact(Some(&artifact));
         assert_eq!(state.input.as_ref(), Some(&input));
         assert_eq!(state.context, expected_context);
+    }
+
+    #[test]
+    fn workflow_instance_restores_bulk_wait_execution_from_external_input() {
+        let artifact = CompiledWorkflowArtifact::new(
+            "workflow",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "test.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "dispatch".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "dispatch".to_owned(),
+                        CompiledStateNode::StartBulkActivity {
+                            activity_type: "demo.echo".to_owned(),
+                            items: Expression::Member {
+                                object: Box::new(Expression::Identifier {
+                                    name: "input".to_owned(),
+                                }),
+                                property: "items".to_owned(),
+                            },
+                            next: "join".to_owned(),
+                            handle_var: "fanout".to_owned(),
+                            task_queue: None,
+                            execution_policy: Some("eager".to_owned()),
+                            reducer: None,
+                            throughput_backend: Some("stream-v2".to_owned()),
+                            chunk_size: Some(16),
+                            retry: None,
+                        },
+                    ),
+                    (
+                        "join".to_owned(),
+                        CompiledStateNode::WaitForBulkActivity {
+                            bulk_ref_var: "fanout".to_owned(),
+                            next: "done".to_owned(),
+                            output_var: Some("results".to_owned()),
+                            on_error: None,
+                        },
+                    ),
+                    (
+                        "done".to_owned(),
+                        CompiledStateNode::Succeed {
+                            output: Some(Expression::Identifier { name: "results".to_owned() }),
+                        },
+                    ),
+                ]),
+                params: Vec::new(),
+                non_cancellable_states: Default::default(),
+            },
+        );
+        let input = serde_json::json!({"items": [{"value": "x"}, {"value": "y"}]});
+        let turn_context = CompiledWorkflowArtifact::synthetic_turn_context("bulk-wait-restore");
+        let plan =
+            artifact.execute_trigger_with_turn(&input, turn_context).expect("bulk trigger plan");
+        let last_event_id = Uuid::now_v7();
+        let updated_at = Utc::now();
+        let mut state = WorkflowInstanceState {
+            tenant_id: "tenant".to_owned(),
+            instance_id: "instance".to_owned(),
+            run_id: "run".to_owned(),
+            definition_id: artifact.definition_id.clone(),
+            definition_version: Some(artifact.definition_version),
+            artifact_hash: Some(artifact.artifact_hash.clone()),
+            workflow_task_queue: "default".to_owned(),
+            sticky_workflow_build_id: None,
+            sticky_workflow_poller_id: None,
+            current_state: Some(plan.final_state.clone()),
+            context: plan.context,
+            artifact_execution: Some(plan.execution_state),
+            status: WorkflowStatus::Running,
+            input: Some(input.clone()),
+            persisted_input_handle: None,
+            memo: None,
+            search_attributes: None,
+            output: None,
+            event_count: 1,
+            last_event_id,
+            last_event_type: "WorkflowTriggered".to_owned(),
+            updated_at,
+        };
+
+        assert!(state.compact_trigger_bulk_wait_for_external_input(serde_json::json!({
+            "kind": "manifest",
+            "key": "workflow-inputs/demo",
+            "store": "localfs"
+        })));
+        assert_eq!(state.input, None);
+        assert_eq!(state.context, None);
+        assert_eq!(state.artifact_execution, None);
+
+        state.restore_trigger_bulk_wait_from_input(&artifact, &input).expect("restore trigger");
+        assert_eq!(state.input.as_ref(), Some(&input));
+        assert!(state.persisted_input_handle.is_none());
+        assert_eq!(state.current_state.as_deref(), Some("join"));
+        assert_eq!(state.context, Some(serde_json::json!([{"value": "x"}, {"value": "y"}])));
+        assert!(state
+            .artifact_execution
+            .as_ref()
+            .is_some_and(|execution| execution.waits_on_bulk_activity("join")));
     }
 }

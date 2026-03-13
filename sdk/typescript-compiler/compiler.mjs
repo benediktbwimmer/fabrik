@@ -158,6 +158,8 @@ function collectTemporalWorkflowApi(sourceFile) {
     workflowInfo: new Set(),
     log: new Set(),
     uuid4: new Set(),
+    patched: new Set(),
+    deprecatePatch: new Set(),
     applicationFailure: new Set(),
     parentClosePolicy: new Set(),
     activityCancellationType: new Set(),
@@ -197,6 +199,8 @@ function collectTemporalWorkflowApi(sourceFile) {
       if (importedName === "workflowInfo") api.workflowInfo.add(localName);
       if (importedName === "log") api.log.add(localName);
       if (importedName === "uuid4") api.uuid4.add(localName);
+      if (importedName === "patched") api.patched.add(localName);
+      if (importedName === "deprecatePatch") api.deprecatePatch.add(localName);
       if (importedName === "ApplicationFailure") api.applicationFailure.add(localName);
       if (importedName === "ParentClosePolicy") api.parentClosePolicy.add(localName);
       if (importedName === "ActivityCancellationType") api.activityCancellationType.add(localName);
@@ -333,6 +337,26 @@ function compileTemporalTimer(expression, label) {
     return { timer_ref: parseTemporalDurationRef(expression, label) };
   }
   return { timer_expr: compileExpression(expression) };
+}
+
+function compileTemporalPatchedExpression(expression, temporalApi = currentTemporalApi) {
+  if (!temporalImportedCallMatches(expression, temporalApi.patched, "patched", temporalApi)) {
+    return null;
+  }
+  if (expression.arguments.length !== 1) {
+    throw compilerError(`patched() requires exactly one change id`, expression);
+  }
+  return {
+    kind: "binary",
+    op: "greater_than",
+    left: {
+      kind: "version",
+      change_id: literalString(expression.arguments[0], "patched changeId"),
+      min_supported: 0,
+      max_supported: 1,
+    },
+    right: { kind: "literal", value: 0 },
+  };
 }
 
 function literalTemporalEnumMember(expression, label, aliases, importedName) {
@@ -496,6 +520,28 @@ function isTemporalDefinitionDeclaration(declaration, temporalApi) {
   return ts.isIdentifier(declaration.name) && temporalDefinitionKind(declaration, temporalApi) != null;
 }
 
+function isStaticTopLevelInitializer(expression) {
+  if (
+    ts.isStringLiteral(expression) ||
+    ts.isNoSubstitutionTemplateLiteral(expression) ||
+    ts.isNumericLiteral(expression) ||
+    expression.kind === ts.SyntaxKind.TrueKeyword ||
+    expression.kind === ts.SyntaxKind.FalseKeyword ||
+    expression.kind === ts.SyntaxKind.NullKeyword
+  ) {
+    return true;
+  }
+  if (ts.isArrayLiteralExpression(expression)) {
+    return expression.elements.every((element) => isStaticTopLevelInitializer(element));
+  }
+  if (ts.isObjectLiteralExpression(expression)) {
+    return expression.properties.every((property) =>
+      ts.isPropertyAssignment(property) && isStaticTopLevelInitializer(property.initializer),
+    );
+  }
+  return false;
+}
+
 function assertNoTopLevelSideEffects(sourceFile) {
   const temporalApi = collectTemporalWorkflowApi(sourceFile);
   for (const statement of sourceFile.statements) {
@@ -515,6 +561,15 @@ function assertNoTopLevelSideEffects(sourceFile) {
         statement.declarationList.declarations.every((declaration) =>
           isTemporalProxyDeclaration(declaration, temporalApi) ||
           isTemporalDefinitionDeclaration(declaration, temporalApi),
+        )
+      ) {
+        continue;
+      }
+      if (
+        statement.declarationList.declarations.every((declaration) =>
+          ts.isIdentifier(declaration.name) &&
+          declaration.initializer &&
+          isStaticTopLevelInitializer(declaration.initializer),
         )
       ) {
         continue;
@@ -1219,6 +1274,10 @@ function compileExpression(expression) {
     };
   }
   if (ts.isCallExpression(expression)) {
+    const patchedExpression = compileTemporalPatchedExpression(expression);
+    if (patchedExpression) {
+      return patchedExpression;
+    }
     if (
       ts.isPropertyAccessExpression(expression.expression) &&
       ts.isIdentifier(expression.expression.expression) &&
@@ -1521,6 +1580,8 @@ class WorkflowLowerer {
       workflowInfo: new Set(),
       log: new Set(),
       uuid4: new Set(),
+      patched: new Set(),
+      deprecatePatch: new Set(),
       applicationFailure: new Set(),
       parentClosePolicy: new Set(),
       activityCancellationType: new Set(),
@@ -2011,6 +2072,12 @@ class WorkflowLowerer {
     if (ts.isExpressionStatement(statement) && ts.isCallExpression(statement.expression)) {
       if (temporalImportedCallMatches(statement.expression, this.temporalApi.setHandler, "setHandler", this.temporalApi)) {
         this.registerTemporalNamedHandler(statement.expression);
+        return nextState;
+      }
+      if (temporalImportedCallMatches(statement.expression, this.temporalApi.deprecatePatch, "deprecatePatch", this.temporalApi)) {
+        if (statement.expression.arguments.length !== 1) {
+          throw compilerError(`deprecatePatch() requires exactly one change id`, statement.expression);
+        }
         return nextState;
       }
       const pushedChildState = this.lowerTemporalChildPromisePush(statement.expression, nextState, statement);

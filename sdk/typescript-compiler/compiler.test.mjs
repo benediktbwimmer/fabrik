@@ -93,6 +93,29 @@ test("compiler lowers ctx.version expressions", async () => {
   assert.match(serialized, /"max_supported":3/);
 });
 
+test("compiler lowers Temporal patched APIs onto version markers", async () => {
+  const fixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-patching-qualified/src/workflows.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "patchedWorkflow",
+    "--definition-id",
+    "patched-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"kind":"version"/);
+  assert.match(serialized, /"change_id":"feature-x"/);
+  assert.match(serialized, /"max_supported":1/);
+});
+
 test("compiler lowers awaited ctx.activity calls into activity states", async () => {
   const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/activity-workflow.ts");
   const { stdout } = await runCompiler([

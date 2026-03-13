@@ -639,10 +639,11 @@ fn parse_args() -> Result<Args> {
     )?;
 
     let default_profile = match profile_name.as_str() {
+        "gate" => BenchmarkProfile { workflow_count: 6, activities_per_workflow: 64 },
         "smoke" => BenchmarkProfile { workflow_count: 10, activities_per_workflow: 100 },
         "target" => BenchmarkProfile { workflow_count: 100, activities_per_workflow: 1_000 },
         "stress" => BenchmarkProfile { workflow_count: 250, activities_per_workflow: 1_000 },
-        other => bail!("unknown profile {other}; expected smoke, target, or stress"),
+        other => bail!("unknown profile {other}; expected gate, smoke, target, or stress"),
     };
 
     let profile = BenchmarkProfile {

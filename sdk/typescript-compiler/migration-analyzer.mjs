@@ -17,7 +17,9 @@ const WORKFLOW_SUPPORTED_IMPORTS = new Set([
   "isCancellation",
   "log",
   "ParentClosePolicy",
+  "patched",
   "proxyActivities",
+  "deprecatePatch",
   "setHandler",
   "sleep",
   "startChild",
@@ -26,8 +28,6 @@ const WORKFLOW_SUPPORTED_IMPORTS = new Set([
 ]);
 
 const BLOCKED_WORKFLOW_IMPORTS = new Map([
-  ["patched", "use ctx.version(...) or version markers in Fabrik instead of Temporal patched APIs"],
-  ["deprecatePatch", "use ctx.version(...) or version markers in Fabrik instead of Temporal patched APIs"],
   ["upsertSearchAttributes", "search attributes are not migration-ready yet in Fabrik"],
 ]);
 

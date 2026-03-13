@@ -55,6 +55,10 @@ test("migration analyzer supports default-compatible payload converters and bloc
     root,
     "crates/fabrik-cli/test-fixtures/temporal-supported-api-qualified",
   );
+  const patchingQualifiedFixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-patching-qualified",
+  );
   const payloadPathQualifiedV2Fixture = path.join(
     root,
     "crates/fabrik-cli/test-fixtures/temporal-payload-path-qualified-v2",
@@ -65,6 +69,7 @@ test("migration analyzer supports default-compatible payload converters and bloc
   const bootstrapEsmQualified = await analyze(bootstrapEsmQualifiedFixture);
   const payloadPathQualified = await analyze(payloadPathQualifiedFixture);
   const supportedApiQualified = await analyze(supportedApiQualifiedFixture);
+  const patchingQualified = await analyze(patchingQualifiedFixture);
   const payloadPathQualifiedV2 = await analyze(payloadPathQualifiedV2Fixture);
   const visibilityFixture = path.join(
     root,
@@ -88,6 +93,8 @@ test("migration analyzer supports default-compatible payload converters and bloc
   );
   assert.equal(supportedApiQualified.summary.hard_block_count, 0);
   assert.equal(supportedApiQualified.workers[0].task_queue, "supported-api");
+  assert.equal(patchingQualified.summary.hard_block_count, 0);
+  assert.equal(patchingQualified.workers[0].task_queue, "patching-qualified");
   assert.equal(payloadPathQualifiedV2.summary.hard_block_count, 0);
   assert.equal(payloadPathQualifiedV2.workers[0].data_converter_mode, "path_default_temporal");
   assert.ok(payload.findings.some((finding) => finding.feature === "payload_data_converter_usage"));

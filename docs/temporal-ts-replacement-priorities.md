@@ -11,23 +11,25 @@ Current source snapshot:
 ## Current State
 
 - Samples analyzed: `48`
-- Qualified with caveats: `16`
-- Blocked: `32`
+- Qualified with caveats: `18`
+- Blocked: `30`
 - Status counts:
-  - `compatible_ready_not_deployed`: `16`
-  - `incompatible_blocked`: `23`
+  - `compatible_ready_not_deployed`: `18`
+  - `incompatible_blocked`: `21`
   - `source_environment_blocked`: `9`
 
 ## What Moved
 
 The latest compiler and packaging passes materially shifted the remaining replacement frontier:
 
-- `unsupported_api` blocker occurrences dropped from `51` to `28`
+- `unsupported_api` blocker occurrences dropped from `51` to `26`
 - `unsupported_temporal_api` hard blocks dropped from `34` to `10`
 - `unsupported_packaging_bootstrap` blocker occurrences dropped from `72` to `8`
-- qualified official samples rose from `4` to `16`
+- qualified official samples rose from `4` to `18`
 - `log`, `workflowInfo`, `uuid4`, `ApplicationFailure`, `ParentClosePolicy`, and `ActivityCancellationType` are no longer explicit hard-block imports in the official sample census
 - workflow-only workers no longer falsely block packaging, which moved `continue-as-new`, `nexus-hello`, and several other sample repos into the qualified set
+- `batch-sliding-window` and `cron-workflows` now compile cleanly in the official census after the recent compiler passes
+- post-census direct migration checks also moved `child-workflows` and `patching-api` onto the qualified side; the next full census should reflect that
 - The remaining explicit unsupported-import census is now dominated by:
   - `patched`: `2`
   - `deprecatePatch`: `1`
@@ -50,13 +52,14 @@ This means broad import coverage is no longer the main hard-blocker class. The n
 1. Unsupported Temporal workflow/runtime APIs
 - Hard-block findings: `10`
 - Affected samples: `7`
-- Blocker-category occurrences: `28`
+- Blocker-category occurrences: `26`
 - The explicit import backlog is now narrow. The bigger problem inside this category is generic compile-subset failure on otherwise-recognized APIs.
 - Remaining explicit import frontier:
   - patching/versioning APIs: `patched`, `deprecatePatch`, `setWorkflowOptions`
   - failure/interceptor shapes: `ActivityFailure`, `WorkflowInterceptors`
   - visibility/sinks APIs: `SearchAttributes`, `upsertSearchAttributes`, `Sinks`, `proxySinks`
 - Recommendation: stop chasing generic import coverage and instead burn down one real compile-subset cluster at a time, starting with the official samples still failing after import support landed: `batch-sliding-window`, `child-workflows`, `cron-workflows`, `timer-examples`.
+- Recommendation: stop chasing generic import coverage and instead burn down one real compile-subset cluster at a time, starting with the official samples still failing after import support landed: `timer-examples`, `query-subscriptions`, `worker-versioning`, and `search-attributes`.
 
 2. Remaining worker bootstrap edge cases
 - Hard-block findings: `9`
@@ -99,10 +102,10 @@ This means broad import coverage is no longer the main hard-blocker class. The n
 1. Burn down the next generic compile-subset cluster, not just import lists.
 - Use the official samples still failing with `One or more workflows failed to compile into the currently supported Fabrik subset.` as the next queue.
 - Best first targets:
-  - `batch-sliding-window`
-  - `custom-logger`
-  - `nexus-hello`
   - `timer-examples`
+  - `query-subscriptions`
+  - `worker-versioning`
+  - `search-attributes`
 - Success criterion: reduce `unsupported_api` occurrences again without increasing trust debt.
 
 2. Re-run the blocker census after every parity slice.
@@ -118,7 +121,9 @@ This means broad import coverage is no longer the main hard-blocker class. The n
 
 ## Current Qualified Official Samples
 
+- `batch-sliding-window`
 - `continue-as-new`
+- `cron-workflows`
 - `custom-logger`
 - `early-return`
 - `empty`

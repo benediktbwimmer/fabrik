@@ -10,7 +10,8 @@
     "test:conformance": "node --test sdk/typescript-compiler/conformance.test.mjs",
     "build:trust-summary": "node sdk/typescript-compiler/build-conformance-summary.mjs",
     "test:benchmarks": "node --test benchmarks/temporal-comparison/helpers.test.mjs",
-    "benchmark:compare-temporal": "bash scripts/run-temporal-comparison-benchmark.sh",
+    "benchmark:compare-temporal": "bash scripts/run-temporal-comparison-benchmark.sh --profile gate",
+    "benchmark:compare-temporal:target": "bash scripts/run-temporal-comparison-benchmark.sh --profile target",
     "ui:dev": "npm --prefix apps/fabrik-console run dev",
     "ui:build": "npm --prefix apps/fabrik-console run build",
     "ui:test": "npm --prefix apps/fabrik-console run test"

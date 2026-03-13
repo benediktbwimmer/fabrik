@@ -3353,6 +3353,10 @@ impl WorkflowStore {
     pub async fn upsert_instance(&self, state: &WorkflowInstanceState) -> Result<()> {
         let mut persisted_state = state.clone();
         persisted_state.compact_for_persistence();
+        self.upsert_persisted_instance(&persisted_state).await
+    }
+
+    pub async fn upsert_persisted_instance(&self, persisted_state: &WorkflowInstanceState) -> Result<()> {
         sqlx::query(
             r#"
             INSERT INTO workflow_instances (
@@ -14368,6 +14372,7 @@ mod tests {
             }),
             status: WorkflowStatus::Running,
             input: Some(input.clone()),
+            persisted_input_handle: None,
             memo: None,
             search_attributes: None,
             output: None,
@@ -14446,6 +14451,7 @@ mod tests {
             }),
             status: WorkflowStatus::Completed,
             input: Some(json!({"items": [1, 2, 3]})),
+            persisted_input_handle: None,
             memo: None,
             search_attributes: None,
             output: Some(json!({"ok": true})),

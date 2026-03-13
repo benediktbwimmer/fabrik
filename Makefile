@@ -1,4 +1,4 @@
-.PHONY: up down status smoke-eager-count benchmark-compare-temporal
+.PHONY: up down status smoke-eager-count benchmark-compare-temporal benchmark-compare-temporal-target
 
 up:
 	./scripts/dev-stack.sh up
@@ -13,4 +13,7 @@ smoke-eager-count:
 	./scripts/eager-count-smoke.sh
 
 benchmark-compare-temporal:
-	./scripts/run-temporal-comparison-benchmark.sh
+	./scripts/run-temporal-comparison-benchmark.sh --profile gate
+
+benchmark-compare-temporal-target:
+	./scripts/run-temporal-comparison-benchmark.sh --profile target

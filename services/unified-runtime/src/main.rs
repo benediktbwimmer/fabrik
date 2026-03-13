@@ -21,6 +21,7 @@ use fabrik_broker::{
 };
 use fabrik_config::{
     ExecutorRuntimeConfig, GrpcServiceConfig, HttpServiceConfig, PostgresConfig, RedpandaConfig,
+    ThroughputPayloadStoreKind, ThroughputRuntimeConfig,
 };
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{default_router, init_tracing, serve, ServiceInfo};
@@ -32,8 +33,8 @@ use fabrik_store::{
 };
 use fabrik_throughput::{
     bulk_reducer_class, bulk_reducer_is_mergeable, bulk_reducer_materializes_results, decode_cbor,
-    encode_cbor, planned_reduction_tree_depth, stream_v2_fast_lane_enabled, ThroughputBackend,
-    ADMISSION_POLICY_VERSION,
+    encode_cbor, planned_reduction_tree_depth, stream_v2_fast_lane_enabled, PayloadStore,
+    PayloadStoreConfig, PayloadStoreKind, ThroughputBackend, ADMISSION_POLICY_VERSION,
 };
 use fabrik_worker_protocol::activity_worker::{
     activity_task_result,
@@ -73,11 +74,13 @@ const BULK_EVENT_OUTBOX_LEASE_SECONDS: i64 = 30;
 const BULK_EVENT_OUTBOX_RETRY_MS: u64 = 250;
 const COMPILED_ARTIFACT_CACHE_CAPACITY: usize = 64;
 const TASK_QUEUE_POLICY_CACHE_TTL_MS: u64 = 1_000;
+const STREAM_V2_TRIGGER_INPUT_HANDLE_MIN_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
 struct AppState {
     store: WorkflowStore,
     publisher: Option<WorkflowPublisher>,
+    payload_store: PayloadStore,
     inner: Arc<StdMutex<RuntimeInner>>,
     ownership: Arc<StdMutex<UnifiedOwnershipState>>,
     workflow_partition_count: i32,
@@ -431,6 +434,7 @@ enum PreparedDbAction {
     Schedule(QueuedActivity),
     Terminal(ActivityTerminalUpdate),
     UpsertInstance(WorkflowInstanceState),
+    UpsertPersistedInstance(WorkflowInstanceState),
     CloseRun(RunKey, DateTime<Utc>),
     PutRunStart {
         tenant_id: String,
@@ -585,6 +589,7 @@ async fn main() -> Result<()> {
     let debug_config = HttpServiceConfig::from_env("UNIFIED_DEBUG", "unified-runtime-debug", 3008)?;
     let postgres = PostgresConfig::from_env()?;
     let redpanda = RedpandaConfig::from_env()?;
+    let throughput_runtime = ThroughputRuntimeConfig::from_env()?;
     let admission = BulkAdmissionConfig::from_env()?;
     init_tracing(&config.log_filter);
     let broker = BrokerConfig::new(
@@ -636,11 +641,15 @@ async fn main() -> Result<()> {
 
     let debug = Arc::new(StdMutex::new(UnifiedDebugState::default()));
     let local_restored = restore_runtime_state(&persistence, &debug)?;
-    let shared_restored = restore_runtime_state_from_store(&store, &broker, &debug).await?;
+    let payload_store = PayloadStore::from_config(build_payload_store_config(&throughput_runtime))
+        .await?;
+    let shared_restored =
+        restore_runtime_state_from_store(&store, &broker, &payload_store, &debug).await?;
     let inner = reconcile_restored_runtime(local_restored, shared_restored, &debug);
     let state = AppState {
         store,
         publisher: Some(WorkflowPublisher::new(&broker, "unified-runtime").await?),
+        payload_store,
         inner: Arc::new(StdMutex::new(inner)),
         ownership: Arc::new(StdMutex::new(UnifiedOwnershipState::inactive(
             ownership.partition_id,
@@ -718,6 +727,90 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn build_payload_store_config(runtime: &ThroughputRuntimeConfig) -> PayloadStoreConfig {
+    PayloadStoreConfig {
+        default_store: match runtime.payload_store.kind {
+            ThroughputPayloadStoreKind::LocalFilesystem => PayloadStoreKind::LocalFilesystem,
+            ThroughputPayloadStoreKind::S3 => PayloadStoreKind::S3,
+        },
+        local_dir: runtime.payload_store.local_dir.clone(),
+        s3_bucket: runtime.payload_store.s3_bucket.clone(),
+        s3_region: runtime.payload_store.s3_region.clone(),
+        s3_endpoint: runtime.payload_store.s3_endpoint.clone(),
+        s3_access_key_id: runtime.payload_store.s3_access_key_id.clone(),
+        s3_secret_access_key: runtime.payload_store.s3_secret_access_key.clone(),
+        s3_force_path_style: runtime.payload_store.s3_force_path_style,
+        s3_key_prefix: runtime.payload_store.s3_key_prefix.clone(),
+    }
+}
+
+async fn prepare_stream_v2_trigger_persisted_instance(
+    state: &AppState,
+    artifact: &CompiledWorkflowArtifact,
+    instance: &WorkflowInstanceState,
+    plan: &CompiledExecutionPlan,
+) -> Result<Option<WorkflowInstanceState>> {
+    if !trigger_uses_stream_v2_bulk_wait(plan, artifact, instance) {
+        return Ok(None);
+    }
+    let Some(input) = instance.input.as_ref() else {
+        return Ok(None);
+    };
+    let encoded_len = serde_json::to_vec(input)
+        .map(|bytes| bytes.len())
+        .context("failed to measure trigger input size")?;
+    if encoded_len < STREAM_V2_TRIGGER_INPUT_HANDLE_MIN_BYTES {
+        return Ok(None);
+    }
+
+    let key = format!(
+        "workflow-inputs/{}/{}/{}/{}",
+        instance.tenant_id, instance.instance_id, instance.run_id, instance.last_event_id
+    );
+    let input_handle = match state.payload_store.write_value(&key, input).await {
+        Ok(handle) => handle,
+        Err(error) => {
+            warn!(
+                error = %error,
+                tenant_id = %instance.tenant_id,
+                instance_id = %instance.instance_id,
+                run_id = %instance.run_id,
+                "failed to externalize stream-v2 trigger input; falling back to inline persistence"
+            );
+            return Ok(None);
+        }
+    };
+
+    let mut persisted = instance.clone();
+    let input_handle =
+        serde_json::to_value(input_handle).context("failed to serialize persisted input handle")?;
+    if !persisted.compact_trigger_bulk_wait_for_external_input(input_handle) {
+        return Ok(None);
+    }
+    Ok(Some(persisted))
+}
+
+fn trigger_uses_stream_v2_bulk_wait(
+    plan: &CompiledExecutionPlan,
+    artifact: &CompiledWorkflowArtifact,
+    instance: &WorkflowInstanceState,
+) -> bool {
+    let Some(wait_state) = instance.current_state.as_deref() else {
+        return false;
+    };
+    let Some(execution_state) = instance.artifact_execution.as_ref() else {
+        return false;
+    };
+    artifact.waits_on_bulk_activity(wait_state, execution_state)
+        && plan.emissions.iter().any(|emission| {
+            matches!(
+                &emission.event,
+                WorkflowEvent::BulkActivityBatchScheduled { throughput_backend, .. }
+                    if throughput_backend == ThroughputBackend::StreamV2.as_str()
+            )
+        })
+}
+
 async fn reconcile_restored_ready_queue(state: &AppState) -> Result<()> {
     let should_reconcile =
         { state.debug.lock().expect("unified debug lock poisoned").restored_from_snapshot };
@@ -747,6 +840,7 @@ async fn reconcile_restored_ready_queue(state: &AppState) -> Result<()> {
 async fn restore_runtime_state_from_store(
     store: &WorkflowStore,
     broker: &BrokerConfig,
+    payload_store: &PayloadStore,
     debug: &Arc<StdMutex<UnifiedDebugState>>,
 ) -> Result<RuntimeInner> {
     let mut inner = RuntimeInner::default();
@@ -776,7 +870,7 @@ async fn restore_runtime_state_from_store(
         let instance =
             restore_instance_from_store_snapshot_tail(store, broker, &snapshot, &artifact).await?;
         let (run_key, runtime, ready) =
-            restore_runtime_from_instance_row(store, instance, Some(artifact)).await?;
+            restore_runtime_from_instance_row(store, payload_store, instance, Some(artifact)).await?;
         for task in ready {
             inner
                 .ready
@@ -801,7 +895,7 @@ async fn restore_runtime_state_from_store(
             continue;
         }
         let (run_key, runtime, ready) =
-            restore_runtime_from_instance_row(store, instance, None).await?;
+            restore_runtime_from_instance_row(store, payload_store, instance, None).await?;
         for task in ready {
             inner
                 .ready
@@ -1395,6 +1489,7 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
         artifact_execution: Some(plan.execution_state.clone()),
         status: WorkflowStatus::Running,
         input: Some(input.clone()),
+        persisted_input_handle: None,
         memo: None,
         search_attributes: None,
         output: plan.output.clone(),
@@ -1405,6 +1500,8 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
     };
     apply_compiled_plan(&mut instance, &plan);
     let queued = schedule_activities_from_plan(&artifact, &instance, &plan, event.occurred_at)?;
+    let persisted_instance =
+        prepare_stream_v2_trigger_persisted_instance(state, &artifact, &instance, &plan).await?;
     let state_apply_started_at = Instant::now();
     {
         let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
@@ -1446,7 +1543,9 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
     let db_apply_started_at = Instant::now();
     apply_db_actions(
         state,
-        vec![PreparedDbAction::UpsertInstance(instance.clone())],
+        vec![persisted_instance
+            .map(PreparedDbAction::UpsertPersistedInstance)
+            .unwrap_or_else(|| PreparedDbAction::UpsertInstance(instance.clone()))],
         schedule_actions,
     )
     .await?;
@@ -5894,6 +5993,9 @@ async fn apply_db_actions(
     for action in general {
         match action {
             PreparedDbAction::Terminal(update) => terminal_updates.push(update),
+            PreparedDbAction::UpsertPersistedInstance(instance) => other_general.push(
+                PreparedDbAction::UpsertPersistedInstance(instance),
+            ),
             other => other_general.push(other),
         }
     }
@@ -5917,6 +6019,9 @@ async fn apply_db_actions(
             PreparedDbAction::Schedule(_) => unreachable!("schedule updates are batched"),
             PreparedDbAction::UpsertInstance(instance) => {
                 state.store.upsert_instance(&instance).await?;
+            }
+            PreparedDbAction::UpsertPersistedInstance(instance) => {
+                state.store.upsert_persisted_instance(&instance).await?;
             }
             PreparedDbAction::CloseRun(run_key, closed_at) => {
                 state
@@ -6845,6 +6950,7 @@ fn run_has_local_work(inner: &RuntimeInner, run_key: &RunKey) -> bool {
 
 async fn restore_runtime_from_instance_row(
     store: &WorkflowStore,
+    payload_store: &PayloadStore,
     mut instance: WorkflowInstanceState,
     artifact: Option<CompiledWorkflowArtifact>,
 ) -> Result<(RunKey, RuntimeWorkflowState, Vec<QueuedActivity>)> {
@@ -6871,6 +6977,7 @@ async fn restore_runtime_from_instance_row(
             })?,
     };
     instance.expand_after_persistence_with_artifact(Some(&artifact));
+    rehydrate_stream_v2_trigger_input_for_restore(payload_store, &mut instance, &artifact).await?;
     let activities = store
         .list_activities_for_run(&instance.tenant_id, &instance.instance_id, &instance.run_id)
         .await?;
@@ -6908,6 +7015,24 @@ async fn restore_runtime_from_instance_row(
         run_id: instance.run_id.clone(),
     };
     Ok((run_key, RuntimeWorkflowState { artifact, instance, active_activities }, ready))
+}
+
+async fn rehydrate_stream_v2_trigger_input_for_restore(
+    payload_store: &PayloadStore,
+    instance: &mut WorkflowInstanceState,
+    artifact: &CompiledWorkflowArtifact,
+) -> Result<()> {
+    let Some(handle_value) = instance.persisted_input_handle.clone() else {
+        return Ok(());
+    };
+    let handle = serde_json::from_value(handle_value)
+        .context("failed to decode persisted workflow input handle")?;
+    let input = payload_store.read_value(&handle).await.context(format!(
+        "failed to read persisted workflow input for {}/{}",
+        instance.tenant_id, instance.instance_id
+    ))?;
+    instance.restore_trigger_bulk_wait_from_input(artifact, &input)?;
+    Ok(())
 }
 
 fn runtime_snapshot_path(persistence: &PersistenceConfig) -> PathBuf {
@@ -7378,6 +7503,7 @@ mod tests {
             artifact_execution: None,
             status,
             input: None,
+            persisted_input_handle: None,
             memo: None,
             search_attributes: None,
             output: None,
@@ -8059,11 +8185,13 @@ mod tests {
         artifact
     }
 
-    fn test_app_state(store: WorkflowStore, inner: RuntimeInner, state_dir: PathBuf) -> AppState {
+    async fn test_app_state(store: WorkflowStore, inner: RuntimeInner, state_dir: PathBuf) -> AppState {
         fs::create_dir_all(&state_dir).expect("create app state dir");
+        let payload_store = test_payload_store(&state_dir).await;
         AppState {
             store,
             publisher: None,
+            payload_store,
             inner: Arc::new(StdMutex::new(inner)),
             ownership: Arc::new(StdMutex::new(UnifiedOwnershipState::inactive(1, "test-owner"))),
             workflow_partition_count: 8,
@@ -8088,15 +8216,31 @@ mod tests {
         }
     }
 
-    fn test_app_state_with_publisher(
+    async fn test_app_state_with_publisher(
         store: WorkflowStore,
         publisher: WorkflowPublisher,
         inner: RuntimeInner,
         state_dir: PathBuf,
     ) -> AppState {
-        let mut state = test_app_state(store, inner, state_dir);
+        let mut state = test_app_state(store, inner, state_dir).await;
         state.publisher = Some(publisher);
         state
+    }
+
+    async fn test_payload_store(root: &Path) -> PayloadStore {
+        PayloadStore::from_config(PayloadStoreConfig {
+            default_store: PayloadStoreKind::LocalFilesystem,
+            local_dir: root.join("payloads").display().to_string(),
+            s3_bucket: None,
+            s3_region: "us-east-1".to_owned(),
+            s3_endpoint: None,
+            s3_access_key_id: None,
+            s3_secret_access_key: None,
+            s3_force_path_style: false,
+            s3_key_prefix: "throughput".to_owned(),
+        })
+        .await
+        .expect("test payload store")
     }
 
     fn mailbox_record(
@@ -8609,7 +8753,7 @@ mod tests {
         );
         let state_dir =
             std::env::temp_dir().join(format!("unified-runtime-update-test-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), inner, state_dir.clone());
+        let app_state = test_app_state(store.clone(), inner, state_dir.clone()).await;
         let requested = test_event(
             &WorkflowIdentity::new(
                 "tenant",
@@ -8698,7 +8842,7 @@ mod tests {
         );
         let state_dir =
             std::env::temp_dir().join(format!("unified-runtime-cancel-test-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), inner, state_dir.clone());
+        let app_state = test_app_state(store.clone(), inner, state_dir.clone()).await;
         let cancel_requested = test_event(
             &WorkflowIdentity::new(
                 "tenant",
@@ -8751,7 +8895,8 @@ mod tests {
 
         let state_dir =
             std::env::temp_dir().join(format!("unified-runtime-cancel-unwind-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
         let identity = WorkflowIdentity::new(
             "tenant",
             &artifact.definition_id,
@@ -8840,7 +8985,7 @@ mod tests {
 
         let state_dir = std::env::temp_dir()
             .join(format!("unified-runtime-activity-cancel-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), inner, state_dir.clone());
+        let app_state = test_app_state(store.clone(), inner, state_dir.clone()).await;
         let identity = WorkflowIdentity::new(
             "tenant",
             "definition",
@@ -8936,7 +9081,7 @@ mod tests {
 
         let state_dir = std::env::temp_dir()
             .join(format!("unified-runtime-heartbeat-cancel-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), inner, state_dir.clone());
+        let app_state = test_app_state(store.clone(), inner, state_dir.clone()).await;
         apply_ownership_record(&app_state, 1, "test-owner", 7, now + ChronoDuration::seconds(30));
         let worker = WorkerApi { state: app_state.clone() };
         let response = worker
@@ -8974,7 +9119,8 @@ mod tests {
 
         let state_dir =
             std::env::temp_dir().join(format!("unified-runtime-child-test-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
         let identity = WorkflowIdentity::new(
             "tenant",
             &parent_artifact.definition_id,
@@ -9029,7 +9175,8 @@ mod tests {
 
         let state_dir = std::env::temp_dir()
             .join(format!("unified-runtime-throughput-batch-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
         let identity = WorkflowIdentity::new(
             "tenant",
             &artifact.definition_id,
@@ -9090,7 +9237,8 @@ mod tests {
 
         let state_dir = std::env::temp_dir()
             .join(format!("unified-runtime-throughput-routing-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
         let identity = WorkflowIdentity::new(
             "tenant",
             &artifact.definition_id,
@@ -9140,7 +9288,8 @@ mod tests {
 
         let state_dir = std::env::temp_dir()
             .join(format!("unified-runtime-throughput-complete-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
         let identity = WorkflowIdentity::new(
             "tenant",
             &artifact.definition_id,
@@ -9228,6 +9377,7 @@ mod tests {
             artifact_execution: Some(ArtifactExecutionState::default()),
             status: WorkflowStatus::Running,
             input: Some(json!({"seed": true})),
+            persisted_input_handle: None,
             memo: None,
             search_attributes: None,
             output: None,
@@ -9262,7 +9412,7 @@ mod tests {
         );
         let state_dir = std::env::temp_dir()
             .join(format!("unified-runtime-update-child-test-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), inner, state_dir.clone());
+        let app_state = test_app_state(store.clone(), inner, state_dir.clone()).await;
         let requested = test_event(
             &WorkflowIdentity::new(
                 &run_key.tenant_id,
@@ -9341,7 +9491,8 @@ mod tests {
 
         let state_dir = std::env::temp_dir()
             .join(format!("unified-runtime-child-signal-test-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
         let identity = WorkflowIdentity::new(
             "tenant",
             &parent_artifact.definition_id,
@@ -9390,7 +9541,8 @@ mod tests {
 
         let state_dir = std::env::temp_dir()
             .join(format!("unified-runtime-child-cancel-test-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
         let identity = WorkflowIdentity::new(
             "tenant",
             &parent_artifact.definition_id,
@@ -9751,7 +9903,7 @@ mod tests {
         store.put_artifact("tenant", &artifact).await?;
         let state_dir =
             std::env::temp_dir().join(format!("unified-runtime-continue-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir);
+        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir).await;
 
         let identity = WorkflowIdentity::new(
             "tenant",
@@ -9800,7 +9952,7 @@ mod tests {
         store.put_artifact("tenant", &artifact).await?;
         let state_dir =
             std::env::temp_dir().join(format!("unified-runtime-timer-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir);
+        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir).await;
         {
             let mut ownership =
                 app_state.ownership.lock().expect("unified ownership lock poisoned");
@@ -9867,7 +10019,7 @@ mod tests {
         store.put_artifact("tenant", &artifact).await?;
         let state_dir = std::env::temp_dir()
             .join(format!("unified-runtime-brokered-signal-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir);
+        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir).await;
 
         let identity = WorkflowIdentity::new(
             "tenant",
@@ -9925,7 +10077,8 @@ mod tests {
         let store = postgres.connect_store().await?;
         let state_dir =
             std::env::temp_dir().join(format!("unified-runtime-poller-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
         apply_ownership_record(
             &app_state,
             1,
@@ -9970,7 +10123,8 @@ mod tests {
         store.put_artifact("tenant", &artifact).await?;
         let state_dir =
             std::env::temp_dir().join(format!("unified-runtime-signal-step-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
         apply_ownership_record(
             &app_state,
             1,
@@ -10077,7 +10231,8 @@ mod tests {
 
         let state_dir =
             std::env::temp_dir().join(format!("unified-runtime-fanout-race-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
         apply_ownership_record(
             &app_state,
             1,
@@ -10218,7 +10373,8 @@ mod tests {
             publisher.clone(),
             RuntimeInner::default(),
             state_dir.clone(),
-        );
+        )
+        .await;
         apply_ownership_record(
             &app_state,
             1,
@@ -10387,6 +10543,7 @@ mod tests {
             artifact_execution: Some(ArtifactExecutionState::default()),
             status: WorkflowStatus::Running,
             input: Some(Value::Null),
+            persisted_input_handle: None,
             memo: None,
             search_attributes: None,
             output: None,
@@ -10474,7 +10631,7 @@ mod tests {
 
         let state_dir =
             std::env::temp_dir().join(format!("unified-runtime-compatibility-{}", Uuid::now_v7()));
-        let app_state = test_app_state(store.clone(), inner, state_dir.clone());
+        let app_state = test_app_state(store.clone(), inner, state_dir.clone()).await;
         apply_ownership_record(&app_state, 1, "test-owner", 4, now + ChronoDuration::seconds(30));
         let worker = WorkerApi { state: app_state.clone() };
 
@@ -10672,7 +10829,9 @@ mod tests {
         assert_eq!(owner_b.owner_epoch, 2);
 
         let debug = Arc::new(StdMutex::new(UnifiedDebugState::default()));
-        let restored = restore_runtime_state_from_store(&store, &broker, &debug).await?;
+        let payload_store = test_payload_store(&std::env::temp_dir()).await;
+        let restored =
+            restore_runtime_state_from_store(&store, &broker, &payload_store, &debug).await?;
         let runtime = restored
             .instances
             .get(&RunKey {
@@ -10734,9 +10893,11 @@ mod tests {
         store.upsert_instance(&instance).await?;
 
         let debug = Arc::new(StdMutex::new(UnifiedDebugState::default()));
+        let payload_store = test_payload_store(&std::env::temp_dir()).await;
         let restored = restore_runtime_state_from_store(
             &store,
             &BrokerConfig::new("127.0.0.1:9092", "workflow-events", 1),
+            &payload_store,
             &debug,
         )
         .await?;
@@ -10759,6 +10920,91 @@ mod tests {
         assert!(debug_snapshot.restored_from_snapshot);
         assert_eq!(debug_snapshot.restore_records_applied, 1);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn store_restore_rehydrates_stream_v2_trigger_input_from_payload_handle() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = throughput_artifact_with_options(
+            "default",
+            Some(ThroughputBackend::StreamV2.as_str()),
+            Some("all_settled"),
+            16,
+        );
+        store.put_artifact("tenant-a", &artifact).await?;
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-restore-payload-{}", Uuid::now_v7()));
+        let payload_store = test_payload_store(&state_dir).await;
+
+        let identity = WorkflowIdentity::new(
+            "tenant-a",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-input-handle-restore",
+            "run-input-handle-restore",
+            "unified-runtime-test",
+        );
+        let occurred_at = Utc::now();
+        let input = json!({"items": [json!({"ok": true}), json!({"ok": false})]});
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: input.clone() },
+            occurred_at,
+        );
+        let plan = artifact.execute_trigger_with_turn(
+            &input,
+            ExecutionTurnContext { event_id: trigger.event_id, occurred_at },
+        )?;
+        let mut instance = WorkflowInstanceState::try_from(&trigger)?;
+        apply_compiled_plan(&mut instance, &plan);
+
+        let input_handle = payload_store
+            .write_value(
+                &format!(
+                    "workflow-inputs/{}/{}/{}/{}",
+                    instance.tenant_id, instance.instance_id, instance.run_id, instance.last_event_id
+                ),
+                &input,
+            )
+            .await?;
+        let mut persisted = instance.clone();
+        assert!(persisted.compact_trigger_bulk_wait_for_external_input(
+            serde_json::to_value(input_handle)?
+        ));
+        store.upsert_persisted_instance(&persisted).await?;
+
+        let restored = restore_runtime_state_from_store(
+            &store,
+            &BrokerConfig::new("127.0.0.1:9092", "workflow-events", 1),
+            &payload_store,
+            &Arc::new(StdMutex::new(UnifiedDebugState::default())),
+        )
+        .await?;
+        let runtime = restored
+            .instances
+            .get(&RunKey {
+                tenant_id: identity.tenant_id.clone(),
+                instance_id: identity.instance_id.clone(),
+                run_id: identity.run_id.clone(),
+            })
+            .context("restored runtime state should contain payload-backed workflow")?;
+
+        assert_eq!(runtime.instance.input.as_ref(), Some(&input));
+        assert_eq!(
+            runtime.instance.context,
+            Some(json!([json!({"ok": true}), json!({"ok": false})]))
+        );
+        assert!(runtime
+            .instance
+            .artifact_execution
+            .as_ref()
+            .is_some_and(|execution| artifact.waits_on_bulk_activity("join", execution)));
+        fs::remove_dir_all(state_dir).ok();
         Ok(())
     }
 
@@ -10874,9 +11120,11 @@ mod tests {
             }])
             .await?;
 
+        let payload_store = test_payload_store(&std::env::temp_dir()).await;
         let restored = restore_runtime_state_from_store(
             &store,
             &broker,
+            &payload_store,
             &Arc::new(StdMutex::new(UnifiedDebugState::default())),
         )
         .await?;
@@ -11046,7 +11294,9 @@ mod tests {
         assert_eq!(owner_b.owner_epoch, 2);
 
         let debug = Arc::new(StdMutex::new(UnifiedDebugState::default()));
-        let restored = restore_runtime_state_from_store(&store, &broker, &debug).await?;
+        let payload_store = test_payload_store(&std::env::temp_dir()).await;
+        let restored =
+            restore_runtime_state_from_store(&store, &broker, &payload_store, &debug).await?;
         let runtime = restored
             .instances
             .get(&RunKey {
