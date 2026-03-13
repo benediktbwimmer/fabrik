@@ -48,6 +48,21 @@
       }
     },
     {
+      "id": "analyzer-supported-api-qualified",
+      "kind": "analyzer",
+      "project": "crates/fabrik-cli/test-fixtures/temporal-supported-api-qualified",
+      "expect": {
+        "summary": {
+          "workflow_count": 2,
+          "worker_count": 1,
+          "hard_block_count": 0
+        },
+        "workflow_exports_include": ["supportedApiWorkflow", "childWorkflow"],
+        "worker_task_queues_include": ["supported-api"],
+        "finding_features_exclude": ["unsupported_temporal_api"]
+      }
+    },
+    {
       "id": "analyzer-payload-blocked",
       "kind": "analyzer",
       "project": "crates/fabrik-cli/test-fixtures/temporal-payload-blocked",

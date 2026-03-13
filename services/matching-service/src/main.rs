@@ -1419,8 +1419,15 @@ fn prepare_activity_result(
 
     let payload = match outcome {
         activity_task_result::Result::Completed(completed) => {
-            let output = serde_json::from_str(&completed.output_json)
-                .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            let output = if !completed.output_cbor.is_empty() {
+                decode_cbor::<Value>(&completed.output_cbor, "activity result output")
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?
+            } else if completed.output_json.trim().is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_str(&completed.output_json)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?
+            };
             ActivityTerminalPayload::Completed { output }
         }
         activity_task_result::Result::Failed(failed) => {
@@ -3045,6 +3052,63 @@ mod tests {
         assert_eq!(batches[0].len(), 3);
         assert_eq!(batches[1].len(), 1);
         assert_eq!(batches[1][0].prepared.update.activity_id, "a3");
+    }
+
+    #[test]
+    fn prepare_activity_result_accepts_cbor_payloads() {
+        let result = ActivityTaskResult {
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "wf-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            activity_id: "activity-a".to_owned(),
+            attempt: 1,
+            worker_id: "worker-a".to_owned(),
+            worker_build_id: "build-a".to_owned(),
+            lease_epoch: 0,
+            owner_epoch: 0,
+            result: Some(activity_task_result::Result::Completed(
+                fabrik_worker_protocol::activity_worker::ActivityTaskCompletedResult {
+                    output_json: String::new(),
+                    output_cbor: encode_cbor(&json!({"ok": true}), "activity result output")
+                        .expect("CBOR output encodes"),
+                },
+            )),
+        };
+
+        let prepared = prepare_activity_result(result).expect("CBOR result should decode");
+
+        assert_eq!(
+            prepared.update.payload,
+            ActivityTerminalPayload::Completed { output: json!({"ok": true}) }
+        );
+    }
+
+    #[test]
+    fn prepare_activity_result_accepts_elided_completed_payloads() {
+        let result = ActivityTaskResult {
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "wf-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            activity_id: "activity-a".to_owned(),
+            attempt: 1,
+            worker_id: "worker-a".to_owned(),
+            worker_build_id: "build-a".to_owned(),
+            lease_epoch: 0,
+            owner_epoch: 0,
+            result: Some(activity_task_result::Result::Completed(
+                fabrik_worker_protocol::activity_worker::ActivityTaskCompletedResult {
+                    output_json: String::new(),
+                    output_cbor: Vec::new(),
+                },
+            )),
+        };
+
+        let prepared = prepare_activity_result(result).expect("elided result should decode");
+
+        assert_eq!(
+            prepared.update.payload,
+            ActivityTerminalPayload::Completed { output: Value::Null }
+        );
     }
 
     #[test]

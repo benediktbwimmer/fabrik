@@ -1,4 +1,4 @@
-use std::env;
+use std::{collections::BTreeMap, convert::Infallible, env, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -6,15 +6,20 @@ use axum::{
     body::Bytes,
     extract::{OriginalUri, Path, Query, State},
     http::StatusCode,
+    response::sse::{Event, Sse},
     routing::{get, post, put},
 };
 use chrono::Utc;
-use fabrik_config::{HttpServiceConfig, PostgresConfig};
+use fabrik_config::{
+    ExecutorRuntimeConfig, HttpServiceConfig, PostgresConfig, ThroughputRuntimeConfig,
+};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
-use fabrik_store::{TaskQueueKind, WorkflowRunFilters, WorkflowStore};
+use fabrik_store::{BulkBatchRoutingCount, TaskQueueKind, WorkflowRunFilters, WorkflowStore};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::{spawn, sync::mpsc};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
 
 #[derive(Clone)]
@@ -24,6 +29,30 @@ struct AppState {
     query_base: String,
     matching_base: String,
     store: WorkflowStore,
+    admission: AdmissionDebugConfig,
+}
+
+#[derive(Debug, Clone)]
+struct AdmissionDebugConfig {
+    default_backend: String,
+    task_queue_backends: BTreeMap<String, String>,
+    max_active_chunks_per_tenant: usize,
+    max_active_chunks_per_task_queue: usize,
+}
+
+impl AdmissionDebugConfig {
+    fn from_env() -> Result<Self> {
+        let executor = ExecutorRuntimeConfig::from_env()
+            .context("failed to load executor routing config for admission debug")?;
+        let throughput = ThroughputRuntimeConfig::from_env()
+            .context("failed to load throughput runtime config for admission debug")?;
+        Ok(Self {
+            default_backend: executor.throughput_default_backend,
+            task_queue_backends: executor.throughput_task_queue_backends,
+            max_active_chunks_per_tenant: throughput.max_active_chunks_per_tenant,
+            max_active_chunks_per_task_queue: throughput.max_active_chunks_per_task_queue,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +83,37 @@ struct DefaultSetRequest {
 #[derive(Debug, Deserialize)]
 struct ThroughputPolicyRequest {
     backend: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskQueueRuntimeControlRequest {
+    #[serde(default)]
+    is_paused: bool,
+    #[serde(default)]
+    is_draining: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BulkBatchRuntimeControlRequest {
+    #[serde(default)]
+    is_paused: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WatchEventEnvelope {
+    event_type: String,
+    occurred_at: chrono::DateTime<Utc>,
+    consistency: String,
+    authoritative_source: String,
+    projection_lag_ms: Option<i64>,
+    owner_id: Option<String>,
+    partition_id: Option<i32>,
+    cursor: String,
+    body: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -89,6 +149,7 @@ struct SearchQuery {
 async fn main() -> Result<()> {
     let config = HttpServiceConfig::from_env("API_GATEWAY", "api-gateway", 3000)?;
     let postgres = PostgresConfig::from_env()?;
+    let admission = AdmissionDebugConfig::from_env()?;
     init_tracing(&config.log_filter);
     info!(port = config.port, "starting api gateway");
 
@@ -103,6 +164,7 @@ async fn main() -> Result<()> {
         matching_base: env::var("MATCHING_DEBUG_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:3004".to_owned()),
         store,
+        admission,
     };
 
     let app = build_app(state, config.name);
@@ -199,6 +261,14 @@ fn build_app(state: AppState, service_name: String) -> Router {
         get(proxy_to_query_get),
     )
     .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs/{run_id}/bulk-batches/{batch_id}/watch",
+        get(watch_bulk_batch),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs/{run_id}/watch",
+        get(watch_workflow_run),
+    )
+    .route(
         "/tenants/{tenant_id}/workflows/{workflow_instance_id}/history",
         get(proxy_to_query_get),
     )
@@ -277,10 +347,22 @@ fn build_app(state: AppState, service_name: String) -> Router {
         put(upsert_throughput_policy),
     )
     .route(
+        "/admin/tenants/{tenant_id}/task-queues/{queue_kind}/{task_queue}/runtime-control",
+        put(upsert_task_queue_runtime_control),
+    )
+    .route(
         "/admin/tenants/{tenant_id}/task-queues/{queue_kind}/{task_queue}",
         get(get_task_queue_inspection),
     )
+    .route(
+        "/admin/tenants/{tenant_id}/task-queues/{queue_kind}/{task_queue}/watch",
+        get(watch_task_queue),
+    )
     .route("/admin/tenants/{tenant_id}/task-queues", get(list_task_queues))
+    .route(
+        "/admin/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs/{run_id}/bulk-batches/{batch_id}/runtime-control",
+        put(upsert_bulk_batch_runtime_control),
+    )
     .route("/admin/debug/matching/activity-results", get(proxy_to_matching_get))
     .with_state(state)
 }
@@ -409,6 +491,52 @@ async fn upsert_throughput_policy(
     Ok(Json(serde_json::to_value(record).expect("throughput policy serializes")))
 }
 
+async fn upsert_task_queue_runtime_control(
+    Path((tenant_id, queue_kind, task_queue)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<TaskQueueRuntimeControlRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let queue_kind = parse_queue_kind(&queue_kind)?;
+    let record = state
+        .store
+        .upsert_task_queue_runtime_control(
+            &tenant_id,
+            queue_kind,
+            &task_queue,
+            request.is_paused,
+            request.is_draining,
+            request.reason.as_deref(),
+        )
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(serde_json::to_value(record).expect("task queue runtime control serializes")))
+}
+
+async fn upsert_bulk_batch_runtime_control(
+    Path((tenant_id, workflow_instance_id, run_id, batch_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+    State(state): State<AppState>,
+    Json(request): Json<BulkBatchRuntimeControlRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let record = state
+        .store
+        .upsert_bulk_batch_runtime_control(
+            &tenant_id,
+            &workflow_instance_id,
+            &run_id,
+            &batch_id,
+            request.is_paused,
+            request.reason.as_deref(),
+        )
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(serde_json::to_value(record).expect("bulk batch runtime control serializes")))
+}
+
 async fn get_task_queue_inspection(
     Path((tenant_id, queue_kind, task_queue)): Path<(String, String, String)>,
     State(state): State<AppState>,
@@ -419,7 +547,20 @@ async fn get_task_queue_inspection(
         .inspect_task_queue(&tenant_id, queue_kind, &task_queue, Utc::now())
         .await
         .map_err(internal_error)?;
-    Ok(Json(serde_json::to_value(inspection).expect("inspection serializes")))
+    let persisted_backend =
+        inspection.throughput_policy.as_ref().map(|policy| policy.backend.clone());
+    let mut payload = serde_json::to_value(inspection).expect("inspection serializes");
+    let admission = task_queue_admission_snapshot(
+        &state,
+        &tenant_id,
+        &task_queue,
+        persisted_backend.as_deref(),
+    )
+    .await
+    .map_err(internal_error)?;
+    payload["admission"] = admission;
+    payload["watch_cursor"] = Value::String(Utc::now().to_rfc3339());
+    Ok(Json(payload))
 }
 
 async fn list_task_queues(
@@ -440,6 +581,14 @@ async fn list_task_queues(
             )
             .await
             .map_err(internal_error)?;
+        let admission = task_queue_admission_snapshot(
+            &state,
+            &tenant_id,
+            &inspection.task_queue,
+            inspection.throughput_policy.as_ref().map(|policy| policy.backend.as_str()),
+        )
+        .await
+        .map_err(internal_error)?;
         items.push(json!({
             "tenant_id": inspection.tenant_id,
             "queue_kind": queue_kind_label(&inspection.queue_kind),
@@ -450,6 +599,19 @@ async fn list_task_queues(
             "registered_build_count": inspection.registered_builds.len(),
             "default_set_id": inspection.default_set_id,
             "throughput_backend": inspection.throughput_policy.as_ref().map(|policy| policy.backend.clone()),
+            "effective_throughput_backend": admission.get("effective_preferred_backend").cloned().unwrap_or(Value::Null),
+            "is_paused": inspection.runtime_control.as_ref().map(|control| control.is_paused).unwrap_or(false),
+            "is_draining": inspection.runtime_control.as_ref().map(|control| control.is_draining).unwrap_or(false),
+            "stream_v2_capacity_state": admission
+                .get("stream_v2_capacity")
+                .and_then(|value| value.get("state"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            "active_stream_v2_chunks": admission
+                .get("stream_v2_active_chunks")
+                .and_then(|value| value.get("task_queue"))
+                .cloned()
+                .unwrap_or(Value::Null),
             "sticky_hit_rate": inspection.sticky_effectiveness.as_ref().map(|metrics| metrics.sticky_hit_rate),
             "consistency": "eventual",
             "source": "projection"
@@ -467,6 +629,455 @@ async fn list_task_queues(
         "queue_count": items.len(),
         "items": items
     })))
+}
+
+async fn watch_bulk_batch(
+    Path((tenant_id, workflow_instance_id, run_id, batch_id)): Path<(
+        String,
+        String,
+        String,
+        String,
+    )>,
+    State(state): State<AppState>,
+) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
+    let (tx, rx) = mpsc::channel(16);
+    spawn(async move {
+        let mut last_batch = None::<String>;
+        let mut last_lag = None::<i64>;
+        let mut last_terminal = None::<String>;
+        let mut last_routing = None::<String>;
+        let mut last_capacity = None::<String>;
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            let strong = query_json(
+                &state,
+                &format!(
+                    "/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs/{run_id}/bulk-batches/{batch_id}?consistency=strong"
+                ),
+            )
+            .await;
+            let eventual = query_json(
+                &state,
+                &format!(
+                    "/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs/{run_id}/bulk-batches/{batch_id}?consistency=eventual"
+                ),
+            )
+            .await;
+
+            if let Ok(strong_body) = strong {
+                if let Ok(encoded) = serde_json::to_string(&strong_body) {
+                    if last_batch.as_ref() != Some(&encoded) {
+                        let status = strong_body
+                            .get("batch")
+                            .and_then(|value| value.get("status"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_owned();
+                        let event_type =
+                            if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                                "batch_terminal"
+                            } else {
+                                "batch_progress"
+                            };
+                        if send_watch_event(
+                            &tx,
+                            event_type,
+                            strong_body
+                                .get("consistency")
+                                .and_then(Value::as_str)
+                                .unwrap_or("strong"),
+                            strong_body
+                                .get("authoritative_source")
+                                .and_then(Value::as_str)
+                                .unwrap_or("stream-v2-owner-state"),
+                            strong_body.get("projection_lag_ms").and_then(Value::as_i64),
+                            strong_body
+                                .get("watch_cursor")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| Utc::now().to_rfc3339()),
+                            strong_body.clone(),
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        let batch = strong_body.get("batch").cloned().unwrap_or(Value::Null);
+                        let routing_body = json!({
+                            "batch_id": batch_id,
+                            "task_queue": batch.get("task_queue").cloned().unwrap_or(Value::Null),
+                            "selected_backend": batch.get("selected_backend").cloned().unwrap_or(Value::Null),
+                            "routing_reason": batch.get("routing_reason").cloned().unwrap_or(Value::Null),
+                            "admission_policy_version": batch.get("admission_policy_version").cloned().unwrap_or(Value::Null),
+                            "status": batch.get("status").cloned().unwrap_or(Value::Null),
+                        });
+                        if let Ok(encoded_routing) = serde_json::to_string(&routing_body) {
+                            if last_routing.as_ref() != Some(&encoded_routing) {
+                                if send_watch_event(
+                                    &tx,
+                                    "routing_changed",
+                                    strong_body
+                                        .get("consistency")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("strong"),
+                                    strong_body
+                                        .get("authoritative_source")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("stream-v2-owner-state"),
+                                    strong_body.get("projection_lag_ms").and_then(Value::as_i64),
+                                    strong_body
+                                        .get("watch_cursor")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned)
+                                        .unwrap_or_else(|| Utc::now().to_rfc3339()),
+                                    routing_body,
+                                )
+                                .await
+                                {
+                                    break;
+                                }
+                                last_routing = Some(encoded_routing);
+                            }
+                        }
+                        last_batch = Some(encoded);
+                        if event_type == "batch_terminal" {
+                            last_terminal = Some(status);
+                        }
+                    }
+                }
+            }
+
+            if let Ok(eventual_body) = eventual {
+                let lag = eventual_body.get("projection_lag_ms").and_then(Value::as_i64);
+                if lag != last_lag {
+                    let consistency = eventual_body
+                        .get("consistency")
+                        .and_then(Value::as_str)
+                        .unwrap_or("eventual")
+                        .to_owned();
+                    let authoritative_source = eventual_body
+                        .get("authoritative_source")
+                        .and_then(Value::as_str)
+                        .unwrap_or("projection")
+                        .to_owned();
+                    let cursor = eventual_body
+                        .get("watch_cursor")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| Utc::now().to_rfc3339());
+                    if send_watch_event(
+                        &tx,
+                        "projection_lag",
+                        &consistency,
+                        &authoritative_source,
+                        lag,
+                        cursor,
+                        eventual_body,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    last_lag = lag;
+                }
+            }
+
+            if let Ok(strong_body) = query_json(
+                &state,
+                &format!(
+                    "/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs/{run_id}/bulk-batches/{batch_id}?consistency=strong"
+                ),
+            )
+            .await
+            {
+                if let Some(task_queue) = strong_body
+                    .get("batch")
+                    .and_then(|value| value.get("task_queue"))
+                    .and_then(Value::as_str)
+                {
+                    let admission = task_queue_admission_snapshot(
+                        &state,
+                        &tenant_id,
+                        task_queue,
+                        strong_body
+                            .get("batch")
+                            .and_then(|value| value.get("selected_backend"))
+                            .and_then(Value::as_str),
+                    )
+                    .await;
+                    if let Ok(admission) = admission {
+                        let capacity_body = json!({
+                            "batch_id": batch_id,
+                            "task_queue": task_queue,
+                            "selected_backend": strong_body
+                                .get("batch")
+                                .and_then(|value| value.get("selected_backend"))
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                            "routing_reason": strong_body
+                                .get("batch")
+                                .and_then(|value| value.get("routing_reason"))
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                            "admission": admission,
+                        });
+                        if let Ok(encoded_capacity) = serde_json::to_string(&capacity_body) {
+                            if last_capacity.as_ref() != Some(&encoded_capacity) {
+                                if send_watch_event(
+                                    &tx,
+                                    "capacity_pressure",
+                                    strong_body
+                                        .get("consistency")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("strong"),
+                                    "stream-v2-capacity",
+                                    strong_body.get("projection_lag_ms").and_then(Value::as_i64),
+                                    strong_body
+                                        .get("watch_cursor")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned)
+                                        .unwrap_or_else(|| Utc::now().to_rfc3339()),
+                                    capacity_body,
+                                )
+                                .await
+                                {
+                                    break;
+                                }
+                                last_capacity = Some(encoded_capacity);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if last_terminal.is_some() {
+                break;
+            }
+            interval.tick().await;
+        }
+    });
+    Sse::new(ReceiverStream::new(rx))
+}
+
+async fn watch_workflow_run(
+    Path((tenant_id, workflow_instance_id, run_id)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
+    let (tx, rx) = mpsc::channel(16);
+    spawn(async move {
+        let mut last_body = None::<String>;
+        let mut last_batches = None::<String>;
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            let run = query_json(
+                &state,
+                &format!(
+                    "/tenants/{tenant_id}/runs?instance_id={workflow_instance_id}&run_id={run_id}&limit=1"
+                ),
+            )
+            .await;
+            if let Ok(run_body) = run {
+                if let Ok(encoded) = serde_json::to_string(&run_body) {
+                    if last_body.as_ref() != Some(&encoded) {
+                        let consistency = run_body
+                            .get("consistency")
+                            .and_then(Value::as_str)
+                            .unwrap_or("eventual")
+                            .to_owned();
+                        let authoritative_source = run_body
+                            .get("authoritative_source")
+                            .and_then(Value::as_str)
+                            .unwrap_or("projection")
+                            .to_owned();
+                        let cursor = run_body
+                            .get("items")
+                            .and_then(Value::as_array)
+                            .and_then(|items| items.first())
+                            .and_then(|item| item.get("updated_at"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| Utc::now().to_rfc3339());
+                        if send_watch_event(
+                            &tx,
+                            "workflow_state_changed",
+                            &consistency,
+                            &authoritative_source,
+                            None,
+                            cursor,
+                            run_body,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        last_body = Some(encoded);
+                    }
+                }
+            }
+            let bulk_batches = query_json(
+                &state,
+                &format!(
+                    "/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs/{run_id}/bulk-batches?consistency=eventual"
+                ),
+            )
+            .await;
+            if let Ok(batch_body) = bulk_batches {
+                if let Ok(encoded) = serde_json::to_string(&batch_body) {
+                    if last_batches.as_ref() != Some(&encoded) {
+                        let consistency = batch_body
+                            .get("consistency")
+                            .and_then(Value::as_str)
+                            .unwrap_or("eventual")
+                            .to_owned();
+                        let authoritative_source = batch_body
+                            .get("authoritative_source")
+                            .and_then(Value::as_str)
+                            .unwrap_or("projection")
+                            .to_owned();
+                        let cursor = batch_body
+                            .get("watch_cursor")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| Utc::now().to_rfc3339());
+                        if send_watch_event(
+                            &tx,
+                            "throughput_batches_changed",
+                            &consistency,
+                            &authoritative_source,
+                            batch_body.get("projection_lag_ms").and_then(Value::as_i64),
+                            cursor,
+                            batch_body,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        last_batches = Some(encoded);
+                    }
+                }
+            }
+            interval.tick().await;
+        }
+    });
+    Sse::new(ReceiverStream::new(rx))
+}
+
+async fn watch_task_queue(
+    Path((tenant_id, queue_kind, task_queue)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
+    let (tx, rx) = mpsc::channel(16);
+    spawn(async move {
+        let Ok(queue_kind) = parse_queue_kind(&queue_kind) else {
+            return;
+        };
+        let mut last_body = None::<String>;
+        let mut last_throttle = None::<String>;
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            let inspection = state
+                .store
+                .inspect_task_queue(&tenant_id, queue_kind.clone(), &task_queue, Utc::now())
+                .await;
+            if let Ok(inspection) = inspection {
+                let mut body = serde_json::to_value(inspection).expect("inspection serializes");
+                let cursor = Utc::now().to_rfc3339();
+                body["watch_cursor"] = Value::String(cursor.clone());
+                if let Ok(encoded) = serde_json::to_string(&body) {
+                    if last_body.as_ref() != Some(&encoded) {
+                        if send_watch_event(
+                            &tx,
+                            "queue_health",
+                            "eventual",
+                            "projection",
+                            None,
+                            cursor.clone(),
+                            body.clone(),
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        last_body = Some(encoded);
+                    }
+                }
+
+                let throttle_key = body
+                    .get("runtime_control")
+                    .and_then(|value| value.get("is_paused"))
+                    .and_then(Value::as_bool)
+                    .map(|paused| {
+                        let draining = body
+                            .get("runtime_control")
+                            .and_then(|value| value.get("is_draining"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        format!("paused={paused};draining={draining}")
+                    });
+                if throttle_key != last_throttle
+                    && throttle_key.as_deref() != Some("paused=false;draining=false")
+                {
+                    if send_watch_event(
+                        &tx,
+                        "queue_throttle",
+                        "eventual",
+                        "projection",
+                        None,
+                        cursor,
+                        body,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    last_throttle = throttle_key;
+                }
+            }
+            interval.tick().await;
+        }
+    });
+    Sse::new(ReceiverStream::new(rx))
+}
+
+async fn send_watch_event(
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    event_type: &str,
+    consistency: &str,
+    authoritative_source: &str,
+    projection_lag_ms: Option<i64>,
+    cursor: String,
+    body: Value,
+) -> bool {
+    let payload = WatchEventEnvelope {
+        event_type: event_type.to_owned(),
+        occurred_at: Utc::now(),
+        consistency: consistency.to_owned(),
+        authoritative_source: authoritative_source.to_owned(),
+        projection_lag_ms,
+        owner_id: None,
+        partition_id: None,
+        cursor,
+        body,
+    };
+    let event = match Event::default().event(event_type).json_data(payload) {
+        Ok(event) => event,
+        Err(_) => Event::default().event("watch_error").data("failed to encode watch event"),
+    };
+    tx.send(Ok(event)).await.is_err()
+}
+
+async fn query_json(state: &AppState, path: &str) -> Result<Value> {
+    state
+        .client
+        .get(format!("{}{}", state.query_base.trim_end_matches('/'), path))
+        .send()
+        .await
+        .with_context(|| format!("failed to fetch {path}"))?
+        .error_for_status()
+        .with_context(|| format!("query request failed for {path}"))?
+        .json::<Value>()
+        .await
+        .with_context(|| format!("failed to decode query payload for {path}"))
 }
 
 async fn list_tenants(State(state): State<AppState>) -> Result<Json<Value>, (StatusCode, String)> {
@@ -739,6 +1350,97 @@ fn queue_kind_label(queue_kind: &TaskQueueKind) -> &'static str {
     }
 }
 
+async fn task_queue_admission_snapshot(
+    state: &AppState,
+    tenant_id: &str,
+    task_queue: &str,
+    persisted_backend: Option<&str>,
+) -> Result<Value> {
+    let configured_backend = state.admission.task_queue_backends.get(task_queue).cloned();
+    let effective_backend = persisted_backend
+        .map(str::to_owned)
+        .or(configured_backend.clone())
+        .unwrap_or_else(|| state.admission.default_backend.clone());
+    let tenant_active = state
+        .store
+        .count_started_bulk_chunks_for_backend_scope("stream-v2", Some(tenant_id), None, None)
+        .await?;
+    let task_queue_active = state
+        .store
+        .count_started_bulk_chunks_for_backend_scope(
+            "stream-v2",
+            Some(tenant_id),
+            Some(task_queue),
+            None,
+        )
+        .await?;
+    let routing_counts = state
+        .store
+        .list_nonterminal_bulk_batch_routing_counts_for_task_queue(tenant_id, task_queue)
+        .await?;
+    let capacity_state = if effective_backend != "stream-v2" {
+        "not_applicable"
+    } else if state.admission.max_active_chunks_per_tenant > 0
+        && tenant_active >= state.admission.max_active_chunks_per_tenant as u64
+    {
+        "tenant_saturated"
+    } else if state.admission.max_active_chunks_per_task_queue > 0
+        && task_queue_active >= state.admission.max_active_chunks_per_task_queue as u64
+    {
+        "task_queue_saturated"
+    } else {
+        "available"
+    };
+    Ok(json!({
+        "configured_default_backend": state.admission.default_backend,
+        "configured_task_queue_backend": configured_backend,
+        "persisted_task_queue_backend": persisted_backend,
+        "effective_preferred_backend": effective_backend,
+        "stream_v2_active_chunks": {
+            "tenant": tenant_active,
+            "task_queue": task_queue_active,
+        },
+        "stream_v2_capacity": {
+            "tenant_limit": state.admission.max_active_chunks_per_tenant,
+            "task_queue_limit": state.admission.max_active_chunks_per_task_queue,
+            "tenant_utilization": ratio_u64(tenant_active, state.admission.max_active_chunks_per_tenant),
+            "task_queue_utilization": ratio_u64(task_queue_active, state.admission.max_active_chunks_per_task_queue),
+            "state": capacity_state,
+        },
+        "nonterminal_backend_counts": counts_by_backend(&routing_counts),
+        "nonterminal_routing_reason_counts": counts_by_reason(&routing_counts),
+        "nonterminal_admission_policy_versions": counts_by_policy_version(&routing_counts),
+    }))
+}
+
+fn ratio_u64(value: u64, limit: usize) -> Option<f64> {
+    (limit > 0).then_some(value as f64 / limit as f64)
+}
+
+fn counts_by_backend(records: &[BulkBatchRoutingCount]) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    for record in records {
+        *counts.entry(record.selected_backend.clone()).or_default() += record.batch_count;
+    }
+    counts
+}
+
+fn counts_by_reason(records: &[BulkBatchRoutingCount]) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    for record in records {
+        *counts.entry(record.routing_reason.clone()).or_default() += record.batch_count;
+    }
+    counts
+}
+
+fn counts_by_policy_version(records: &[BulkBatchRoutingCount]) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    for record in records {
+        *counts.entry(record.admission_policy_version.clone()).or_default() += record.batch_count;
+    }
+    counts
+}
+
 fn internal_error(error: anyhow::Error) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
@@ -767,6 +1469,15 @@ mod tests {
     struct TestPostgres {
         container_name: String,
         database_url: String,
+    }
+
+    fn test_admission_config() -> AdmissionDebugConfig {
+        AdmissionDebugConfig {
+            default_backend: "pg-v1".to_owned(),
+            task_queue_backends: BTreeMap::new(),
+            max_active_chunks_per_tenant: 4_096,
+            max_active_chunks_per_task_queue: 2_048,
+        }
     }
 
     impl TestPostgres {
@@ -996,6 +1707,7 @@ mod tests {
                 query_base: query.base_url.clone(),
                 matching_base: matching.base_url.clone(),
                 store,
+                admission: test_admission_config(),
             },
             "api-gateway-test".to_owned(),
         );
@@ -1070,6 +1782,7 @@ mod tests {
                 query_base: "http://127.0.0.1:1".to_owned(),
                 matching_base: "http://127.0.0.1:1".to_owned(),
                 store: store.clone(),
+                admission: test_admission_config(),
             },
             "api-gateway-test".to_owned(),
         );
@@ -1188,6 +1901,9 @@ mod tests {
         assert_eq!(inspection["sticky_effectiveness"]["sticky_hit_count"], 1);
         assert_eq!(inspection["sticky_effectiveness"]["sticky_fallback_count"], 0);
         assert_eq!(inspection["throughput_policy"]["backend"], "stream-v2");
+        assert_eq!(inspection["admission"]["effective_preferred_backend"], "stream-v2");
+        assert_eq!(inspection["admission"]["stream_v2_capacity"]["state"], "available");
+        assert_eq!(inspection["admission"]["configured_default_backend"], "pg-v1");
 
         Ok(())
     }
@@ -1205,6 +1921,7 @@ mod tests {
                 query_base: "http://127.0.0.1:1".to_owned(),
                 matching_base: "http://127.0.0.1:1".to_owned(),
                 store: store.clone(),
+                admission: test_admission_config(),
             },
             "api-gateway-test".to_owned(),
         );
@@ -1248,6 +1965,8 @@ mod tests {
                 Some(1),
                 Some("artifact-a"),
                 "payments",
+                None,
+                None,
                 uuid::Uuid::now_v7(),
                 chrono::Utc::now(),
                 None,
@@ -1263,6 +1982,8 @@ mod tests {
                 definition_version: Some(1),
                 artifact_hash: Some("artifact-a".to_owned()),
                 workflow_task_queue: "payments".to_owned(),
+                memo: None,
+                search_attributes: None,
                 sticky_workflow_build_id: Some("build-a".to_owned()),
                 sticky_workflow_poller_id: Some("poller-a".to_owned()),
                 current_state: Some("charge-card".to_owned()),
@@ -1345,6 +2066,8 @@ mod tests {
                 Some(1),
                 Some("artifact-a"),
                 "payments",
+                None,
+                None,
                 uuid::Uuid::now_v7(),
                 chrono::Utc::now(),
                 None,
@@ -1360,6 +2083,8 @@ mod tests {
                 definition_version: Some(1),
                 artifact_hash: Some("artifact-a".to_owned()),
                 workflow_task_queue: "payments".to_owned(),
+                memo: None,
+                search_attributes: None,
                 sticky_workflow_build_id: Some("build-a".to_owned()),
                 sticky_workflow_poller_id: Some("poller-a".to_owned()),
                 current_state: Some("charge-card".to_owned()),
@@ -1387,6 +2112,7 @@ mod tests {
                 query_base: "http://127.0.0.1:1".to_owned(),
                 matching_base: "http://127.0.0.1:1".to_owned(),
                 store,
+                admission: test_admission_config(),
             }),
         )
         .await

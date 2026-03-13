@@ -1,5 +1,7 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
+import { toast } from "sonner";
 
 import { Badge, ConsistencyBadge, Panel } from "../components/ui";
 import { api } from "../lib/api";
@@ -8,9 +10,11 @@ import { useTenant } from "../lib/tenant-context";
 
 export function TaskQueuesPage() {
   const { tenantId } = useTenant();
+  const client = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const selectedKind = searchParams.get("queue_kind") ?? "";
   const selectedQueue = searchParams.get("task_queue") ?? "";
+  const [controlPending, setControlPending] = useState(false);
 
   const queuesQuery = useQuery({
     queryKey: ["task-queues", tenantId],
@@ -22,6 +26,42 @@ export function TaskQueuesPage() {
     enabled: tenantId !== "" && selectedKind !== "" && selectedQueue !== "",
     queryFn: () => api.getTaskQueue(tenantId, selectedKind, selectedQueue)
   });
+
+  useEffect(() => {
+    if (tenantId === "" || selectedKind === "" || selectedQueue === "") return;
+    if (typeof EventSource === "undefined") return;
+    const source = new EventSource(api.taskQueueWatchPath(tenantId, selectedKind, selectedQueue));
+    const refresh = () => {
+      void client.invalidateQueries({ queryKey: ["task-queues", tenantId] });
+      void client.invalidateQueries({
+        queryKey: ["task-queue-inspection", tenantId, selectedKind, selectedQueue]
+      });
+    };
+    source.addEventListener("queue_health", refresh);
+    source.addEventListener("queue_throttle", refresh);
+    return () => source.close();
+  }, [client, selectedKind, selectedQueue, tenantId]);
+
+  async function setRuntimeControl(isPaused: boolean, isDraining: boolean, reason: string) {
+    if (tenantId === "" || selectedKind === "" || selectedQueue === "") return;
+    setControlPending(true);
+    try {
+      await api.setTaskQueueRuntimeControl(tenantId, selectedKind, selectedQueue, {
+        is_paused: isPaused,
+        is_draining: isDraining,
+        reason
+      });
+      toast.success("Queue control updated");
+      await client.invalidateQueries({ queryKey: ["task-queues", tenantId] });
+      await client.invalidateQueries({
+        queryKey: ["task-queue-inspection", tenantId, selectedKind, selectedQueue]
+      });
+    } catch (error) {
+      toast.error(String(error));
+    } finally {
+      setControlPending(false);
+    }
+  }
 
   return (
     <div className="page">
@@ -57,6 +97,12 @@ export function TaskQueuesPage() {
                   <td>
                     <strong>{item.task_queue}</strong>
                     <div className="muted">{item.oldest_backlog_at ? `oldest ${formatDate(item.oldest_backlog_at)}` : "no backlog age"}</div>
+                    <div className="muted">
+                      backend {item.effective_throughput_backend ?? item.throughput_backend ?? "-"} / capacity{" "}
+                      {item.stream_v2_capacity_state ?? "-"}
+                    </div>
+                    {item.is_paused ? <div className="muted">paused</div> : null}
+                    {!item.is_paused && item.is_draining ? <div className="muted">draining</div> : null}
                   </td>
                   <td>
                     <Badge value={item.queue_kind} />
@@ -75,7 +121,13 @@ export function TaskQueuesPage() {
             <div className="stack">
               <div className="row space-between">
                 <h2>{inspectionQuery.data.task_queue}</h2>
-                <Badge value={inspectionQuery.data.queue_kind} />
+                <div className="row">
+                  {inspectionQuery.data.runtime_control?.is_paused ? <Badge value="paused" /> : null}
+                  {!inspectionQuery.data.runtime_control?.is_paused && inspectionQuery.data.runtime_control?.is_draining ? (
+                    <Badge value="draining" />
+                  ) : null}
+                  <Badge value={inspectionQuery.data.queue_kind} />
+                </div>
               </div>
 
               <div className="grid two">
@@ -86,6 +138,38 @@ export function TaskQueuesPage() {
                     <div>Oldest queued work {formatDate(inspectionQuery.data.oldest_backlog_at)}</div>
                     <div>Default compatibility set {inspectionQuery.data.default_set_id ?? "-"}</div>
                     <div>Throughput backend {inspectionQuery.data.throughput_policy?.backend ?? "-"}</div>
+                    <div>Effective backend {inspectionQuery.data.admission?.effective_preferred_backend ?? "-"}</div>
+                    <div>Paused {inspectionQuery.data.runtime_control?.is_paused ? "yes" : "no"}</div>
+                    <div>Draining {inspectionQuery.data.runtime_control?.is_draining ? "yes" : "no"}</div>
+                    <div>Control reason {inspectionQuery.data.runtime_control?.reason ?? "-"}</div>
+                    <div className="row">
+                      <button
+                        className="button ghost"
+                        disabled={controlPending}
+                        onClick={() =>
+                          void setRuntimeControl(
+                            !inspectionQuery.data.runtime_control?.is_paused,
+                            false,
+                            inspectionQuery.data.runtime_control?.is_paused ? "queue resumed by operator" : "queue paused by operator"
+                          )
+                        }
+                      >
+                        {inspectionQuery.data.runtime_control?.is_paused ? "Resume queue" : "Pause queue"}
+                      </button>
+                      <button
+                        className="button ghost"
+                        disabled={controlPending || inspectionQuery.data.runtime_control?.is_paused}
+                        onClick={() =>
+                          void setRuntimeControl(
+                            false,
+                            !inspectionQuery.data.runtime_control?.is_draining,
+                            inspectionQuery.data.runtime_control?.is_draining ? "queue drain cleared by operator" : "queue draining by operator"
+                          )
+                        }
+                      >
+                        {inspectionQuery.data.runtime_control?.is_draining ? "Stop draining" : "Drain queue"}
+                      </button>
+                    </div>
                   </div>
                 </Panel>
                 <Panel className="nested-panel">
@@ -98,6 +182,58 @@ export function TaskQueuesPage() {
                   </div>
                 </Panel>
               </div>
+
+              <Panel className="nested-panel">
+                <h3>Admission</h3>
+                <div className="grid two">
+                  <div className="stack">
+                    <div>Configured default backend {inspectionQuery.data.admission?.configured_default_backend ?? "-"}</div>
+                    <div>Configured queue override {inspectionQuery.data.admission?.configured_task_queue_backend ?? "-"}</div>
+                    <div>Persisted queue policy {inspectionQuery.data.admission?.persisted_task_queue_backend ?? "-"}</div>
+                    <div>Capacity state {inspectionQuery.data.admission?.stream_v2_capacity.state ?? "-"}</div>
+                    <div>
+                      Tenant stream-v2 active {formatNumber(inspectionQuery.data.admission?.stream_v2_active_chunks.tenant ?? 0)} /{" "}
+                      {formatNumber(inspectionQuery.data.admission?.stream_v2_capacity.tenant_limit ?? 0)}
+                    </div>
+                    <div>
+                      Queue stream-v2 active {formatNumber(inspectionQuery.data.admission?.stream_v2_active_chunks.task_queue ?? 0)} /{" "}
+                      {formatNumber(inspectionQuery.data.admission?.stream_v2_capacity.task_queue_limit ?? 0)}
+                    </div>
+                  </div>
+                  <div className="stack">
+                    <div>
+                      Tenant utilization{" "}
+                      {inspectionQuery.data.admission?.stream_v2_capacity.tenant_utilization != null
+                        ? `${((inspectionQuery.data.admission?.stream_v2_capacity.tenant_utilization ?? 0) * 100).toFixed(1)}%`
+                        : "-"}
+                    </div>
+                    <div>
+                      Queue utilization{" "}
+                      {inspectionQuery.data.admission?.stream_v2_capacity.task_queue_utilization != null
+                        ? `${((inspectionQuery.data.admission?.stream_v2_capacity.task_queue_utilization ?? 0) * 100).toFixed(1)}%`
+                        : "-"}
+                    </div>
+                    <div>
+                      Nonterminal backends{" "}
+                      {Object.entries(inspectionQuery.data.admission?.nonterminal_backend_counts ?? {})
+                        .map(([key, value]) => `${key}:${formatNumber(value)}`)
+                        .join(", ") || "-"}
+                    </div>
+                    <div>
+                      Routing reasons{" "}
+                      {Object.entries(inspectionQuery.data.admission?.nonterminal_routing_reason_counts ?? {})
+                        .map(([key, value]) => `${key}:${formatNumber(value)}`)
+                        .join(", ") || "-"}
+                    </div>
+                    <div>
+                      Policy versions{" "}
+                      {Object.entries(inspectionQuery.data.admission?.nonterminal_admission_policy_versions ?? {})
+                        .map(([key, value]) => `${key}:${formatNumber(value)}`)
+                        .join(", ") || "-"}
+                    </div>
+                  </div>
+                </div>
+              </Panel>
 
               <Panel className="nested-panel">
                 <h3>Compatibility sets</h3>

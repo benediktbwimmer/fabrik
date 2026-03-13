@@ -1176,26 +1176,25 @@ fn build_worker_packages(
         let manifest_path = package_dir.join("worker-package.json");
         let log_path = package_dir.join("worker.log");
         let pid_path = package_dir.join("worker.pid");
-        let mut package_status = "packaged".to_owned();
-        let requires_transpile = worker.activity_module.is_some() || worker.payload_converter_module.is_some();
+        let package_status = "packaged".to_owned();
+        let requires_transpile =
+            worker.activity_module.is_some() || worker.payload_converter_module.is_some();
         if requires_transpile {
             transpile_project_into(project_root, &dist_dir)?;
         }
         let resolved_activity_module_path =
             if let Some(activity_module) = worker.activity_module.as_deref() {
-                let resolved_source =
-                    resolve_module_specifier(
-                        project_root,
-                        &project_root.join(&worker.file),
-                        activity_module,
-                    )?;
+                let resolved_source = resolve_module_specifier(
+                    project_root,
+                    &project_root.join(&worker.file),
+                    activity_module,
+                )?;
                 Some(
                     transpiled_output_path(project_root, &dist_dir, &resolved_source)?
                         .display()
                         .to_string(),
                 )
             } else {
-                package_status = "blocked".to_owned();
                 None
             };
         let resolved_payload_converter_module_path =
@@ -1300,7 +1299,11 @@ fn transpile_project_into(project_root: &Path, dist_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn resolve_module_specifier(project_root: &Path, from_file: &Path, specifier: &str) -> Result<PathBuf> {
+fn resolve_module_specifier(
+    project_root: &Path,
+    from_file: &Path,
+    specifier: &str,
+) -> Result<PathBuf> {
     if specifier.starts_with('.') {
         let bases = [
             from_file.parent().unwrap_or_else(|| Path::new("")).join(specifier),
@@ -1810,8 +1813,8 @@ fn render_worker_bootstrap(
     let resolved_payload_converter_module_path =
         serde_json::to_string(&resolved_payload_converter_module_path)
             .expect("resolved payload converter module path serializes");
-    let data_converter_mode = serde_json::to_string(&worker.data_converter_mode)
-        .expect("data converter mode serializes");
+    let data_converter_mode =
+        serde_json::to_string(&worker.data_converter_mode).expect("data converter mode serializes");
     let bootstrap_pattern =
         serde_json::to_string(&worker.bootstrap_pattern).expect("bootstrap pattern serializes");
     format!(
@@ -1831,10 +1834,10 @@ fn render_worker_bootstrap(
            return converterMod.payloadConverter;\n\
          }}\n\
          async function invoke(request) {{\n\
-           if (!fabrikMigratedWorker.resolvedActivityModulePath) {{\n\
-             throw new Error('worker package is missing a resolved activity module path');\n\
-           }}\n\
            await loadPayloadConverterModule();\n\
+           if (!fabrikMigratedWorker.resolvedActivityModulePath) {{\n\
+             throw new Error(`worker ${{fabrikMigratedWorker.sourceWorker}} does not export activities for Fabrik dispatch`);\n\
+           }}\n\
            const mod = await import(pathToFileURL(fabrikMigratedWorker.resolvedActivityModulePath).href);\n\
            const fn = mod[request.activity_type];\n\
            if (typeof fn !== 'function') {{\n\

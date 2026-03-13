@@ -4,6 +4,8 @@ import process from "node:process";
 import ts from "typescript";
 
 const WORKFLOW_SUPPORTED_IMPORTS = new Set([
+  "ActivityCancellationType",
+  "ApplicationFailure",
   "CancellationScope",
   "condition",
   "continueAsNew",
@@ -13,17 +15,20 @@ const WORKFLOW_SUPPORTED_IMPORTS = new Set([
   "executeChild",
   "getExternalWorkflowHandle",
   "isCancellation",
+  "log",
+  "ParentClosePolicy",
   "proxyActivities",
   "setHandler",
   "sleep",
   "startChild",
+  "uuid4",
+  "workflowInfo",
 ]);
 
 const BLOCKED_WORKFLOW_IMPORTS = new Map([
   ["patched", "use ctx.version(...) or version markers in Fabrik instead of Temporal patched APIs"],
   ["deprecatePatch", "use ctx.version(...) or version markers in Fabrik instead of Temporal patched APIs"],
   ["upsertSearchAttributes", "search attributes are not migration-ready yet in Fabrik"],
-  ["workflowInfo", "workflow info inspection is not migration-ready yet in Fabrik"],
 ]);
 
 const BLOCKED_PAYLOAD_IMPORTS = new Set([
@@ -184,9 +189,13 @@ function collectImportInfo(sourceFile) {
   return { workflowImports, workerImports, clientImports, commonImports };
 }
 
-function findStaticString(expression) {
+function findStaticString(expression, bindings = null, checker = null) {
   if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) {
     return expression.text;
+  }
+  if (bindings != null) {
+    const value = evaluateStaticValue(expression, bindings, checker);
+    return typeof value === "string" ? value : null;
   }
   return null;
 }
@@ -229,7 +238,101 @@ function createScopeBindings(parentBindings, node) {
   return bindings;
 }
 
-function evaluateStaticValue(node, bindings, seen = new Set()) {
+function declarationKey(declaration) {
+  const sourceFile = declaration.getSourceFile?.();
+  return `${sourceFile?.fileName ?? "<unknown>"}:${declaration.pos}:${declaration.end}`;
+}
+
+function resolveIdentifierInitializer(node, bindings, checker, seen) {
+  if (!seen.has(`binding:${node.text}`) && bindings.has(node.text)) {
+    return bindings.get(node.text) ?? null;
+  }
+  if (!checker) {
+    return null;
+  }
+  if (ts.isShorthandPropertyAssignment(node.parent) && node.parent.name === node) {
+    let shorthandSymbol = checker.getShorthandAssignmentValueSymbol(node.parent);
+    if (shorthandSymbol) {
+      if (shorthandSymbol.flags & ts.SymbolFlags.Alias) {
+        shorthandSymbol = checker.getAliasedSymbol(shorthandSymbol);
+      }
+      for (const declaration of shorthandSymbol.declarations ?? []) {
+        if (!ts.isVariableDeclaration(declaration) || declaration.initializer == null) {
+          continue;
+        }
+        const key = declarationKey(declaration);
+        if (seen.has(key)) {
+          continue;
+        }
+        return declaration.initializer;
+      }
+    }
+  }
+  let symbol = checker.getSymbolAtLocation(node);
+  if (!symbol) {
+    return null;
+  }
+  if (symbol.flags & ts.SymbolFlags.Alias) {
+    symbol = checker.getAliasedSymbol(symbol);
+  }
+  for (const declaration of symbol.declarations ?? []) {
+    if (!ts.isVariableDeclaration(declaration) || declaration.initializer == null) {
+      continue;
+    }
+    const key = declarationKey(declaration);
+    if (seen.has(key)) {
+      continue;
+    }
+    return declaration.initializer;
+  }
+  return null;
+}
+
+function isImportMetaUrlExpression(node) {
+  return (
+    ts.isPropertyAccessExpression(node) &&
+    ts.isMetaProperty(node.expression) &&
+    node.expression.keywordToken === ts.SyntaxKind.ImportKeyword &&
+    node.expression.name.text === "meta" &&
+    node.name.text === "url"
+  );
+}
+
+function isRequireResolveCall(node) {
+  return (
+    ts.isCallExpression(node) &&
+    ts.isPropertyAccessExpression(node.expression) &&
+    ts.isIdentifier(node.expression.expression) &&
+    node.expression.expression.text === "require" &&
+    node.expression.name.text === "resolve"
+  );
+}
+
+function isPathExtnameImportMetaUrlCall(node) {
+  return (
+    ts.isCallExpression(node) &&
+    ts.isPropertyAccessExpression(node.expression) &&
+    node.expression.name.text === "extname" &&
+    node.arguments.length === 1 &&
+    isImportMetaUrlExpression(node.arguments[0])
+  );
+}
+
+function isFileUrlToPathCall(node) {
+  return ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "fileURLToPath";
+}
+
+function isUrlConstructorWithImportMetaBase(node) {
+  return (
+    ts.isNewExpression(node) &&
+    ts.isIdentifier(node.expression) &&
+    node.expression.text === "URL" &&
+    node.arguments?.length === 2 &&
+    isImportMetaUrlExpression(node.arguments[1])
+  );
+}
+
+function evaluateStaticValue(node, bindings, checker = null, seen = new Set()) {
   if (
     ts.isStringLiteral(node) ||
     ts.isNoSubstitutionTemplateLiteral(node)
@@ -249,16 +352,38 @@ function evaluateStaticValue(node, bindings, seen = new Set()) {
     return null;
   }
   if (ts.isParenthesizedExpression(node)) {
-    return evaluateStaticValue(node.expression, bindings, seen);
+    return evaluateStaticValue(node.expression, bindings, checker, seen);
   }
   if (ts.isIdentifier(node)) {
-    if (seen.has(node.text) || !bindings.has(node.text)) {
+    const initializer = resolveIdentifierInitializer(node, bindings, checker, seen);
+    if (initializer == null) {
       return undefined;
     }
-    seen.add(node.text);
-    const resolved = evaluateStaticValue(bindings.get(node.text), bindings, seen);
-    seen.delete(node.text);
+    const key = ts.isVariableDeclaration(initializer.parent)
+      ? declarationKey(initializer.parent)
+      : `binding:${node.text}`;
+    if (seen.has(key)) {
+      return undefined;
+    }
+    seen.add(key);
+    const resolved = evaluateStaticValue(initializer, bindings, checker, seen);
+    seen.delete(key);
     return resolved;
+  }
+  if (ts.isTemplateExpression(node)) {
+    let value = node.head.text;
+    for (const span of node.templateSpans) {
+      let resolved = evaluateStaticValue(span.expression, bindings, checker, seen);
+      if (resolved === undefined && isPathExtnameImportMetaUrlCall(span.expression)) {
+        resolved = path.extname(node.getSourceFile().fileName);
+      }
+      if (resolved === undefined || (typeof resolved !== "string" && typeof resolved !== "number")) {
+        return undefined;
+      }
+      value += String(resolved);
+      value += span.literal.text;
+    }
+    return value;
   }
   if (ts.isObjectLiteralExpression(node)) {
     const value = {};
@@ -274,7 +399,7 @@ function evaluateStaticValue(node, bindings, seen = new Set()) {
         if (key == null) {
           return undefined;
         }
-        const resolved = evaluateStaticValue(property.initializer, bindings, seen);
+        const resolved = evaluateStaticValue(property.initializer, bindings, checker, seen);
         if (resolved === undefined) {
           return undefined;
         }
@@ -282,7 +407,7 @@ function evaluateStaticValue(node, bindings, seen = new Set()) {
         continue;
       }
       if (ts.isShorthandPropertyAssignment(property)) {
-        const resolved = evaluateStaticValue(property.name, bindings, seen);
+        const resolved = evaluateStaticValue(property.name, bindings, checker, seen);
         if (resolved === undefined) {
           return undefined;
         }
@@ -296,7 +421,7 @@ function evaluateStaticValue(node, bindings, seen = new Set()) {
   if (ts.isArrayLiteralExpression(node)) {
     const value = [];
     for (const element of node.elements) {
-      const resolved = evaluateStaticValue(element, bindings, seen);
+      const resolved = evaluateStaticValue(element, bindings, checker, seen);
       if (resolved === undefined) {
         return undefined;
       }
@@ -305,38 +430,77 @@ function evaluateStaticValue(node, bindings, seen = new Set()) {
     return value;
   }
   if (ts.isConditionalExpression(node)) {
-    const condition = evaluateStaticValue(node.condition, bindings, seen);
+    const condition = evaluateStaticValue(node.condition, bindings, checker, seen);
     if (typeof condition !== "boolean") {
       return undefined;
     }
-    return evaluateStaticValue(condition ? node.whenTrue : node.whenFalse, bindings, seen);
+    return evaluateStaticValue(condition ? node.whenTrue : node.whenFalse, bindings, checker, seen);
   }
   if (ts.isBinaryExpression(node)) {
-    const left = evaluateStaticValue(node.left, bindings, seen);
-    const right = evaluateStaticValue(node.right, bindings, seen);
+    const left = evaluateStaticValue(node.left, bindings, checker, seen);
+    const right = evaluateStaticValue(node.right, bindings, checker, seen);
     if (left === undefined || right === undefined) {
+      if (
+        node.operatorToken.kind === ts.SyntaxKind.BarBarToken &&
+        (left === undefined || left === false || left === null || left === "")
+      ) {
+        return right;
+      }
+      if (
+        node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken &&
+        (left === undefined || left === null)
+      ) {
+        return right;
+      }
       return undefined;
     }
     switch (node.operatorToken.kind) {
+      case ts.SyntaxKind.PlusToken:
+        if (
+          (typeof left === "string" || typeof left === "number") &&
+          (typeof right === "string" || typeof right === "number")
+        ) {
+          return `${left}${right}`;
+        }
+        return undefined;
       case ts.SyntaxKind.EqualsEqualsEqualsToken:
       case ts.SyntaxKind.EqualsEqualsToken:
         return left === right;
       case ts.SyntaxKind.ExclamationEqualsEqualsToken:
       case ts.SyntaxKind.ExclamationEqualsToken:
         return left !== right;
+      case ts.SyntaxKind.BarBarToken:
+        return left || right;
+      case ts.SyntaxKind.QuestionQuestionToken:
+        return left ?? right;
       default:
         return undefined;
     }
   }
   if (ts.isPrefixUnaryExpression(node) && node.operator === ts.SyntaxKind.ExclamationToken) {
-    const value = evaluateStaticValue(node.operand, bindings, seen);
+    const value = evaluateStaticValue(node.operand, bindings, checker, seen);
     return typeof value === "boolean" ? !value : undefined;
+  }
+  if (isRequireResolveCall(node) && node.arguments.length === 1) {
+    const value = evaluateStaticValue(node.arguments[0], bindings, checker, seen);
+    return typeof value === "string" ? value : undefined;
+  }
+  if (isPathExtnameImportMetaUrlCall(node)) {
+    return path.extname(node.getSourceFile().fileName);
+  }
+  if (isUrlConstructorWithImportMetaBase(node)) {
+    const value = evaluateStaticValue(node.arguments[0], bindings, checker, seen);
+    return typeof value === "string" ? value : undefined;
+  }
+  if (isFileUrlToPathCall(node) && node.arguments.length === 1) {
+    const value = evaluateStaticValue(node.arguments[0], bindings, checker, seen);
+    return typeof value === "string" ? value : undefined;
   }
   return undefined;
 }
 
-function isSupportedMemoObject(node, bindings) {
-  const value = evaluateStaticValue(node, bindings);
+function isSupportedMemoObject(node, bindings, checker = null) {
+  const value = evaluateStaticValue(node, bindings, checker);
   if (value == null || Array.isArray(value) || typeof value !== "object") {
     return false;
   }
@@ -349,8 +513,8 @@ function isSupportedMemoObject(node, bindings) {
   );
 }
 
-function isSupportedSearchAttributesObject(node, bindings) {
-  const value = evaluateStaticValue(node, bindings);
+function isSupportedSearchAttributesObject(node, bindings, checker = null) {
+  const value = evaluateStaticValue(node, bindings, checker);
   if (value == null || Array.isArray(value) || typeof value !== "object") {
     return false;
   }
@@ -422,37 +586,44 @@ function combinedTemporalImports(...maps) {
   return combined;
 }
 
-function resolveStaticExpression(node, bindings, seen = new Set()) {
+function resolveStaticExpression(node, bindings, checker = null, seen = new Set()) {
   if (ts.isParenthesizedExpression(node)) {
-    return resolveStaticExpression(node.expression, bindings, seen);
+    return resolveStaticExpression(node.expression, bindings, checker, seen);
   }
   if (ts.isIdentifier(node)) {
-    if (seen.has(node.text) || !bindings.has(node.text)) {
+    const initializer = resolveIdentifierInitializer(node, bindings, checker, seen);
+    if (initializer == null) {
       return node;
     }
-    seen.add(node.text);
-    const resolved = resolveStaticExpression(bindings.get(node.text), bindings, seen);
-    seen.delete(node.text);
+    const key = ts.isVariableDeclaration(initializer.parent)
+      ? declarationKey(initializer.parent)
+      : `binding:${node.text}`;
+    if (seen.has(key)) {
+      return node;
+    }
+    seen.add(key);
+    const resolved = resolveStaticExpression(initializer, bindings, checker, seen);
+    seen.delete(key);
     return resolved;
   }
   return node;
 }
 
-function importedTemporalName(node, bindings, temporalImports) {
-  const resolved = resolveStaticExpression(node, bindings);
+function importedTemporalName(node, bindings, temporalImports, checker = null) {
+  const resolved = resolveStaticExpression(node, bindings, checker);
   return ts.isIdentifier(resolved) ? temporalImports.get(resolved.text) ?? null : null;
 }
 
-function isSupportedPayloadConverterExpression(node, bindings, temporalImports) {
-  const resolved = resolveStaticExpression(node, bindings);
-  const importedName = importedTemporalName(resolved, bindings, temporalImports);
+function isSupportedPayloadConverterExpression(node, bindings, temporalImports, checker = null) {
+  const resolved = resolveStaticExpression(node, bindings, checker);
+  const importedName = importedTemporalName(resolved, bindings, temporalImports, checker);
   if (importedName != null && SUPPORTED_PAYLOAD_CONVERTER_IMPORTS.has(importedName)) {
     return true;
   }
   if (!ts.isNewExpression(resolved)) {
     return false;
   }
-  const constructorName = importedTemporalName(resolved.expression, bindings, temporalImports);
+  const constructorName = importedTemporalName(resolved.expression, bindings, temporalImports, checker);
   return (
     constructorName != null &&
     SUPPORTED_PAYLOAD_CONVERTER_CONSTRUCTORS.has(constructorName) &&
@@ -460,14 +631,14 @@ function isSupportedPayloadConverterExpression(node, bindings, temporalImports) 
   );
 }
 
-function isSupportedEmptyCodecList(node, bindings) {
-  const value = evaluateStaticValue(node, bindings);
+function isSupportedEmptyCodecList(node, bindings, checker = null) {
+  const value = evaluateStaticValue(node, bindings, checker);
   return Array.isArray(value) && value.length === 0;
 }
 
-function analyzeSupportedDataConverter(node, bindings, temporalImports) {
-  const resolved = resolveStaticExpression(node, bindings);
-  const importedName = importedTemporalName(resolved, bindings, temporalImports);
+function analyzeSupportedDataConverter(node, bindings, temporalImports, checker = null) {
+  const resolved = resolveStaticExpression(node, bindings, checker);
+  const importedName = importedTemporalName(resolved, bindings, temporalImports, checker);
   if (importedName != null && SUPPORTED_DATA_CONVERTER_IMPORTS.has(importedName)) {
     return { supported: true, mode: "default_temporal" };
   }
@@ -488,13 +659,13 @@ function analyzeSupportedDataConverter(node, bindings, temporalImports) {
     }
     const initializer = ts.isPropertyAssignment(property) ? property.initializer : property.name;
     if (propertyName === "payloadConverter") {
-      if (!isSupportedPayloadConverterExpression(initializer, bindings, temporalImports)) {
+      if (!isSupportedPayloadConverterExpression(initializer, bindings, temporalImports, checker)) {
         return { supported: false, mode: null };
       }
       continue;
     }
     if (propertyName === "payloadCodecs") {
-      if (!isSupportedEmptyCodecList(initializer, bindings)) {
+      if (!isSupportedEmptyCodecList(initializer, bindings, checker)) {
         return { supported: false, mode: null };
       }
       continue;
@@ -555,18 +726,20 @@ function analyzePayloadConverterModule(program, projectRoot, sourceFile, specifi
   if (exportedPayloadConverter == null) {
     return { supported: false, mode: null, resolvedModulePath };
   }
-  if (!isSupportedPayloadConverterExpression(exportedPayloadConverter, moduleBindings, temporalImports)) {
+  const checker = program.getTypeChecker();
+  if (!isSupportedPayloadConverterExpression(exportedPayloadConverter, moduleBindings, temporalImports, checker)) {
     return { supported: false, mode: null, resolvedModulePath };
   }
   return { supported: true, mode: "path_default_temporal", resolvedModulePath };
 }
 
 function analyzeWorkerDataConverter(program, projectRoot, sourceFile, node, bindings, temporalImports) {
-  const directSupport = analyzeSupportedDataConverter(node, bindings, temporalImports);
+  const checker = program.getTypeChecker();
+  const directSupport = analyzeSupportedDataConverter(node, bindings, temporalImports, checker);
   if (directSupport.supported) {
     return directSupport;
   }
-  const resolved = resolveStaticExpression(node, bindings);
+  const resolved = resolveStaticExpression(node, bindings, checker);
   if (!ts.isObjectLiteralExpression(resolved)) {
     return { supported: false, mode: null, resolvedModulePath: null, payloadConverterPathProperty: null };
   }
@@ -577,7 +750,7 @@ function analyzeWorkerDataConverter(program, projectRoot, sourceFile, node, bind
   ) {
     return { supported: false, mode: null, resolvedModulePath: null, payloadConverterPathProperty: null };
   }
-  const payloadConverterPath = findStaticString(payloadConverterPathProperty.initializer);
+  const payloadConverterPath = findStaticString(payloadConverterPathProperty.initializer, bindings, checker);
   if (payloadConverterPath == null) {
     return { supported: false, mode: null, resolvedModulePath: null, payloadConverterPathProperty };
   }
@@ -787,7 +960,10 @@ async function main() {
         node.expression.name.text === "create"
       ) {
         fileUses.add("worker_bootstrap_patterns");
-        const firstArg = node.arguments[0];
+        const checker = program.getTypeChecker();
+        const firstArg = node.arguments[0]
+          ? resolveStaticExpression(node.arguments[0], currentBindings, checker)
+          : null;
         if (!firstArg || !ts.isObjectLiteralExpression(firstArg)) {
           findings.push(
             createFinding(
@@ -810,9 +986,9 @@ async function main() {
 
           const taskQueue =
             taskQueueProperty && ts.isPropertyAssignment(taskQueueProperty)
-              ? findStaticString(taskQueueProperty.initializer)
+              ? findStaticString(taskQueueProperty.initializer, currentBindings, checker)
               : taskQueueProperty && ts.isShorthandPropertyAssignment(taskQueueProperty)
-                ? null
+                ? findStaticString(taskQueueProperty.name, currentBindings, checker)
                 : null;
           if (taskQueueProperty && taskQueue == null) {
             findings.push(
@@ -831,9 +1007,9 @@ async function main() {
 
           const workflowsPath =
             workflowsPathProperty && ts.isPropertyAssignment(workflowsPathProperty)
-              ? findStaticString(workflowsPathProperty.initializer)
+              ? findStaticString(workflowsPathProperty.initializer, currentBindings, checker)
               : workflowsPathProperty && ts.isShorthandPropertyAssignment(workflowsPathProperty)
-                ? null
+                ? findStaticString(workflowsPathProperty.name, currentBindings, checker)
                 : null;
           if (workflowsPathProperty && workflowsPath == null) {
             findings.push(
@@ -948,7 +1124,7 @@ async function main() {
             task_queue: taskQueue,
             build_id:
               buildIdProperty && ts.isPropertyAssignment(buildIdProperty)
-                ? findStaticString(buildIdProperty.initializer)
+                ? findStaticString(buildIdProperty.initializer, currentBindings, checker)
                 : null,
             workflows_path: workflowsPath,
             activities_reference: activitiesReference,
@@ -968,8 +1144,8 @@ async function main() {
           fileUses.add("search_attributes_memo");
           const supported =
             propertyName === "memo"
-              ? isSupportedMemoObject(node.initializer, currentBindings)
-              : isSupportedSearchAttributesObject(node.initializer, currentBindings);
+              ? isSupportedMemoObject(node.initializer, currentBindings, program.getTypeChecker())
+              : isSupportedSearchAttributesObject(node.initializer, currentBindings, program.getTypeChecker());
           if (!supported) {
             findings.push(
               createFinding(

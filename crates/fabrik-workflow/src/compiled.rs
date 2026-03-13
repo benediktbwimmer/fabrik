@@ -236,7 +236,10 @@ pub enum CompiledStateNode {
         timeout_next: Option<String>,
     },
     WaitForTimer {
+        #[serde(default)]
         timer_ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timer_expr: Option<Expression>,
         next: String,
     },
     Succeed {
@@ -318,10 +321,15 @@ pub enum Expression {
     Object {
         fields: BTreeMap<String, Expression>,
     },
+    ObjectMerge {
+        left: Box<Expression>,
+        right: Box<Expression>,
+    },
     Call {
         callee: String,
         args: Vec<Expression>,
     },
+    WorkflowInfo,
     SideEffect {
         marker_id: String,
         expr: Box<Expression>,
@@ -365,6 +373,7 @@ pub enum UnaryOp {
 pub enum LogicalOp {
     And,
     Or,
+    Coalesce,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -377,6 +386,8 @@ pub struct HelperFunction {
 pub struct ArtifactExecutionState {
     #[serde(default)]
     pub bindings: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub workflow_info: Option<Value>,
     #[serde(default)]
     pub markers: BTreeMap<String, Value>,
     #[serde(default)]
@@ -395,6 +406,45 @@ pub struct ArtifactExecutionState {
     pub pending_markers: Vec<(String, Value)>,
     #[serde(skip)]
     pub pending_version_markers: Vec<(String, u32)>,
+}
+
+impl ArtifactExecutionState {
+    pub(crate) fn compact_for_persistence(
+        &mut self,
+        persisted_input: Option<&Value>,
+        keep_input_binding: bool,
+    ) {
+        if keep_input_binding {
+            return;
+        }
+        if self
+            .bindings
+            .get("input")
+            .zip(persisted_input)
+            .is_some_and(|(bound, input)| bound == input)
+        {
+            self.bindings.remove("input");
+        }
+    }
+
+    pub(crate) fn expand_after_persistence(&mut self, persisted_input: Option<&Value>) {
+        if !self.bindings.contains_key("input") {
+            if let Some(input) = persisted_input {
+                self.bindings.insert("input".to_owned(), input.clone());
+            }
+        }
+    }
+
+    pub(crate) fn waits_on_bulk_activity(&self, wait_state: &str) -> bool {
+        self.bulk_wait_binding(wait_state).is_some()
+    }
+
+    fn bulk_wait_binding(&self, wait_state: &str) -> Option<BulkActivityExecutionState> {
+        self.bindings.values().find_map(|value| {
+            let bulk = decode_bulk_state(value)?;
+            (bulk.wait_state == wait_state).then_some(bulk)
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1745,6 +1795,39 @@ impl CompiledWorkflowArtifact {
             .map(|(_, fanout)| fanout.wait_state)
     }
 
+    pub fn waits_on_bulk_activity(
+        &self,
+        wait_state: &str,
+        execution_state: &ArtifactExecutionState,
+    ) -> bool {
+        let Some(states) = self.states_for(wait_state, execution_state) else {
+            return false;
+        };
+        let Some(CompiledStateNode::WaitForBulkActivity { bulk_ref_var, .. }) =
+            states.get(wait_state)
+        else {
+            return false;
+        };
+        self.bulk_binding(wait_state, bulk_ref_var, execution_state)
+            .map(|bulk| bulk.wait_state == wait_state)
+            .unwrap_or(false)
+    }
+
+    pub fn rehydrate_bulk_wait_context(
+        &self,
+        wait_state: &str,
+        execution_state: &ArtifactExecutionState,
+    ) -> Option<Value> {
+        let states = self.states_for(wait_state, execution_state)?;
+        let bulk = execution_state.bulk_wait_binding(wait_state)?;
+        let CompiledStateNode::StartBulkActivity { items, .. } = states.get(&bulk.origin_state)?
+        else {
+            return None;
+        };
+        let mut execution_state = execution_state.clone();
+        evaluate_expression(items, &mut execution_state, &self.helpers).ok()
+    }
+
     fn execute_from_state(
         &self,
         start_state: &str,
@@ -2096,9 +2179,7 @@ impl CompiledWorkflowArtifact {
                         return Err(CompiledWorkflowError::NotWaitingOnBulk(next.clone()));
                     }
                     let total_items = items_len_to_u32(items.len())?;
-                    let throughput_backend = throughput_backend
-                        .clone()
-                        .unwrap_or_else(|| ThroughputBackend::PgV1.as_str().to_owned());
+                    let throughput_backend = throughput_backend.clone().unwrap_or_default();
                     let input_handle =
                         serde_json::to_value(PayloadHandle::inline_batch_input(&batch_id))
                             .expect("bulk input handle serializes");
@@ -2124,8 +2205,10 @@ impl CompiledWorkflowArtifact {
                                 == ThroughputBackend::StreamV2.as_str()
                             {
                                 ThroughputBackend::StreamV2.default_version().to_owned()
-                            } else {
+                            } else if throughput_backend == ThroughputBackend::PgV1.as_str() {
                                 ThroughputBackend::PgV1.default_version().to_owned()
+                            } else {
+                                String::new()
                             },
                             throughput_backend,
                             state: Some(next.clone()),
@@ -2446,16 +2529,16 @@ impl CompiledWorkflowArtifact {
                         output,
                     });
                 }
-                CompiledStateNode::WaitForTimer { timer_ref, .. } => {
+                CompiledStateNode::WaitForTimer { timer_ref, timer_expr, .. } => {
                     emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
-                    let fire_at = Utc::now()
-                        + crate::parse_timer_ref(timer_ref).map_err(|source| {
-                            CompiledWorkflowError::InvalidTimer {
-                                state: current_state.clone(),
-                                timer_ref: timer_ref.clone(),
-                                details: source.to_string(),
-                            }
-                        })?;
+                    let timer_delay = evaluate_timer_delay(
+                        timer_ref,
+                        timer_expr.as_ref(),
+                        &current_state,
+                        &mut execution_state,
+                        &self.helpers,
+                    )?;
+                    let fire_at = Utc::now() + timer_delay;
                     emissions.push(ExecutionEmission {
                         event: WorkflowEvent::TimerScheduled {
                             timer_id: current_state.clone(),
@@ -3154,6 +3237,7 @@ pub fn evaluate_expression(
             match op {
                 LogicalOp::And if !truthy(&left) => Ok(left),
                 LogicalOp::Or if truthy(&left) => Ok(left),
+                LogicalOp::Coalesce if !left.is_null() => Ok(left),
                 _ => evaluate_expression(right, execution_state, helpers),
             }
         }
@@ -3227,6 +3311,19 @@ pub fn evaluate_expression(
             }
             Ok(Value::Object(object))
         }
+        Expression::ObjectMerge { left, right } => {
+            let mut merged = match evaluate_expression(left, execution_state, helpers)? {
+                Value::Object(map) => map,
+                _ => Map::new(),
+            };
+            if let Value::Object(right_map) = evaluate_expression(right, execution_state, helpers)?
+            {
+                for (key, value) in right_map {
+                    merged.insert(key, value);
+                }
+            }
+            Ok(Value::Object(merged))
+        }
         Expression::Call { callee, args } => {
             if callee == "__temporal_is_cancellation" {
                 if args.len() != 1 {
@@ -3238,6 +3335,41 @@ pub fn evaluate_expression(
                 }
                 let value = evaluate_expression(&args[0], execution_state, helpers)?;
                 return Ok(Value::Bool(is_cancellation_value(&value)));
+            }
+            if callee == "__builtin_object_keys" {
+                if args.len() != 1 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 1,
+                        received: args.len(),
+                    });
+                }
+                return Ok(match evaluate_expression(&args[0], execution_state, helpers)? {
+                    Value::Object(map) => {
+                        Value::Array(map.keys().cloned().map(Value::String).collect::<Vec<_>>())
+                    }
+                    _ => Value::Array(Vec::new()),
+                });
+            }
+            if callee == "__builtin_array_join" {
+                if args.len() != 2 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 2,
+                        received: args.len(),
+                    });
+                }
+                let array = evaluate_expression(&args[0], execution_state, helpers)?;
+                let separator = evaluate_expression(&args[1], execution_state, helpers)?;
+                let separator = separator
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| join_stringify_value(&separator));
+                let Value::Array(items) = array else {
+                    return Ok(Value::String(String::new()));
+                };
+                let joined = items.iter().map(join_fragment).collect::<Vec<_>>().join(&separator);
+                return Ok(Value::String(joined));
             }
             let helper = helpers
                 .get(callee)
@@ -3261,6 +3393,9 @@ pub fn evaluate_expression(
             execution_state.pending_markers = scoped_state.pending_markers;
             execution_state.pending_version_markers = scoped_state.pending_version_markers;
             Ok(result)
+        }
+        Expression::WorkflowInfo => {
+            Ok(execution_state.workflow_info.clone().unwrap_or(Value::Null))
         }
         Expression::SideEffect { marker_id, expr } => {
             if let Some(existing) = execution_state.markers.get(marker_id) {
@@ -3307,6 +3442,67 @@ pub fn evaluate_expression(
             Ok(Value::String(value.to_string()))
         }
     }
+}
+
+fn join_fragment(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::Array(_) | Value::Object(_) => join_stringify_value(value),
+    }
+}
+
+fn join_stringify_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn evaluate_timer_delay(
+    timer_ref: &str,
+    timer_expr: Option<&Expression>,
+    state: &str,
+    execution_state: &mut ArtifactExecutionState,
+    helpers: &BTreeMap<String, HelperFunction>,
+) -> Result<chrono::TimeDelta, CompiledWorkflowError> {
+    let timer_text = if let Some(timer_expr) = timer_expr {
+        let value = evaluate_expression(timer_expr, execution_state, helpers)?;
+        match value {
+            Value::Number(number) => {
+                if let Some(ms) = number.as_i64() {
+                    format!("{ms}ms")
+                } else if let Some(ms) = number.as_u64() {
+                    format!("{ms}ms")
+                } else {
+                    return Err(CompiledWorkflowError::InvalidTimer {
+                        state: state.to_owned(),
+                        timer_ref: number.to_string(),
+                        details: "numeric timer value must be an integer millisecond duration"
+                            .to_owned(),
+                    });
+                }
+            }
+            Value::String(text) => text,
+            other => {
+                return Err(CompiledWorkflowError::InvalidTimer {
+                    state: state.to_owned(),
+                    timer_ref: other.to_string(),
+                    details: "timer expression must evaluate to a string or integer milliseconds"
+                        .to_owned(),
+                });
+            }
+        }
+    } else {
+        timer_ref.to_owned()
+    };
+    crate::parse_timer_ref(&timer_text).map_err(|source| CompiledWorkflowError::InvalidTimer {
+        state: state.to_owned(),
+        timer_ref: timer_text,
+        details: source.to_string(),
+    })
 }
 
 fn is_cancellation_value(value: &Value) -> bool {
@@ -3705,6 +3901,7 @@ mod tests {
                 "idle".to_owned(),
                 CompiledStateNode::WaitForTimer {
                     timer_ref: "1s".to_owned(),
+                    timer_expr: None,
                     next: "done".to_owned(),
                 },
             )]),
@@ -3741,6 +3938,65 @@ mod tests {
         artifact.signals = signals;
         artifact.artifact_hash = artifact.hash();
         artifact
+    }
+
+    #[test]
+    fn executes_dynamic_timer_expressions() {
+        let workflow = CompiledWorkflow {
+            initial_state: "idle".to_owned(),
+            states: BTreeMap::from([
+                (
+                    "idle".to_owned(),
+                    CompiledStateNode::WaitForTimer {
+                        timer_ref: String::new(),
+                        timer_expr: Some(Expression::Binary {
+                            op: BinaryOp::Multiply,
+                            left: Box::new(Expression::Identifier {
+                                name: "seconds".to_owned(),
+                            }),
+                            right: Box::new(Expression::Literal { value: json!(1000) }),
+                        }),
+                        next: "done".to_owned(),
+                    },
+                ),
+                (
+                    "done".to_owned(),
+                    CompiledStateNode::Succeed {
+                        output: Some(Expression::Literal { value: json!("done") }),
+                    },
+                ),
+            ]),
+            params: vec![CompiledWorkflowParam {
+                name: "seconds".to_owned(),
+                default: None,
+            }],
+            non_cancellable_states: BTreeSet::new(),
+        };
+        let artifact = CompiledWorkflowArtifact::new(
+            "dynamic-timer",
+            1,
+            "test",
+            ArtifactEntrypoint {
+                module: "workflow.ts".to_owned(),
+                export: "workflow".to_owned(),
+            },
+            workflow,
+        );
+
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!([2]),
+                CompiledWorkflowArtifact::synthetic_turn_context("dynamic-timer"),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            plan.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::TimerScheduled { .. },
+                ..
+            })
+        ));
     }
 
     fn signal_condition_artifact() -> CompiledWorkflowArtifact {
@@ -4088,6 +4344,7 @@ mod tests {
         };
         let mut state = ArtifactExecutionState {
             bindings: BTreeMap::new(),
+            workflow_info: None,
             markers: BTreeMap::new(),
             version_markers: BTreeMap::new(),
             active_signal: None,
@@ -4121,6 +4378,56 @@ mod tests {
     }
 
     #[test]
+    fn evaluates_builtin_object_keys_and_array_join() {
+        let mut state = ArtifactExecutionState::default();
+        let keys = evaluate_expression(
+            &Expression::Call {
+                callee: "__builtin_object_keys".to_owned(),
+                args: vec![Expression::Literal { value: json!({"alpha": 1, "beta": 2}) }],
+            },
+            &mut state,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let joined = evaluate_expression(
+            &Expression::Call {
+                callee: "__builtin_array_join".to_owned(),
+                args: vec![
+                    Expression::Literal { value: json!(["a", null, "c"]) },
+                    Expression::Literal { value: json!("\n") },
+                ],
+            },
+            &mut state,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(keys, json!(["alpha", "beta"]));
+        assert_eq!(joined, json!("a\n\nc"));
+    }
+
+    #[test]
+    fn evaluates_workflow_info_from_execution_state() {
+        let mut state = ArtifactExecutionState {
+            workflow_info: Some(json!({
+                "workflowId": "workflow-1",
+                "runId": "run-1",
+                "parent": { "workflowId": "parent-1", "runId": "parent-run-1" },
+                "historyLength": 3,
+                "continueAsNewSuggested": false
+            })),
+            ..ArtifactExecutionState::default()
+        };
+
+        let value =
+            evaluate_expression(&Expression::WorkflowInfo, &mut state, &BTreeMap::new()).unwrap();
+
+        assert_eq!(value["workflowId"], json!("workflow-1"));
+        assert_eq!(value["parent"]["workflowId"], json!("parent-1"));
+        assert_eq!(value["historyLength"], json!(3));
+    }
+
+    #[test]
     fn records_side_effect_markers_once_per_callsite() {
         let turn_context = ExecutionTurnContext {
             event_id: uuid::Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap(),
@@ -4128,6 +4435,7 @@ mod tests {
         };
         let mut state = ArtifactExecutionState {
             bindings: BTreeMap::new(),
+            workflow_info: None,
             markers: BTreeMap::new(),
             version_markers: BTreeMap::new(),
             active_signal: None,

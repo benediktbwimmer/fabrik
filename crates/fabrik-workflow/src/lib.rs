@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
@@ -583,7 +583,7 @@ pub enum StepExecutionError {
 pub enum TimerParseError {
     #[error("timer_ref must not be empty")]
     Empty,
-    #[error("timer_ref must end with s, m, or h, got {0}")]
+    #[error("timer_ref must end with ms, s, m, or h, got {0}")]
     InvalidUnit(String),
     #[error("timer_ref amount is invalid: {0}")]
     InvalidAmount(String),
@@ -628,11 +628,16 @@ pub fn parse_timer_ref(timer_ref: &str) -> Result<chrono::TimeDelta, TimerParseE
         return Err(TimerParseError::Empty);
     }
 
-    let (amount, unit) = timer_ref.split_at(timer_ref.len() - 1);
+    let (amount, unit) = if let Some(amount) = timer_ref.strip_suffix("ms") {
+        (amount, "ms")
+    } else {
+        timer_ref.split_at(timer_ref.len() - 1)
+    };
     let amount =
         amount.parse::<i64>().map_err(|_| TimerParseError::InvalidAmount(timer_ref.to_owned()))?;
 
     match unit {
+        "ms" => Ok(chrono::TimeDelta::milliseconds(amount)),
         "s" => Ok(chrono::TimeDelta::seconds(amount)),
         "m" => Ok(chrono::TimeDelta::minutes(amount)),
         "h" => Ok(chrono::TimeDelta::hours(amount)),
@@ -672,6 +677,72 @@ pub struct WorkflowInstanceState {
 }
 
 impl WorkflowInstanceState {
+    pub fn compact_for_persistence(&mut self) {
+        let elide_bulk_wait_context = self.last_event_type == "WorkflowTriggered"
+            && self.current_state.as_deref().is_some_and(|state| {
+                self.artifact_execution
+                    .as_ref()
+                    .is_some_and(|execution| execution.waits_on_bulk_activity(state))
+            });
+        let elide_input_to_context = self
+            .input
+            .as_ref()
+            .zip(self.context.as_ref())
+            .is_some_and(|(input, context)| !elide_bulk_wait_context && input == context);
+        let elide_input_to_binding = !elide_input_to_context
+            && self
+                .input
+                .as_ref()
+                .zip(
+                    self.artifact_execution
+                        .as_ref()
+                        .and_then(|execution| execution.bindings.get("input")),
+                )
+                .is_some_and(|(input, bound)| input == bound);
+        let persisted_input =
+            if elide_input_to_context { self.context.as_ref() } else { self.input.as_ref() };
+        if let Some(execution) = self.artifact_execution.as_mut() {
+            execution.compact_for_persistence(persisted_input, elide_input_to_binding);
+        }
+        if elide_bulk_wait_context {
+            self.context = None;
+        }
+        if elide_input_to_context || elide_input_to_binding {
+            self.input = None;
+        }
+    }
+
+    pub fn expand_after_persistence(&mut self) {
+        self.expand_after_persistence_with_artifact(None);
+    }
+
+    pub fn expand_after_persistence_with_artifact(
+        &mut self,
+        artifact: Option<&CompiledWorkflowArtifact>,
+    ) {
+        if self.input.is_none() {
+            self.input = self
+                .artifact_execution
+                .as_ref()
+                .and_then(|execution| execution.bindings.get("input"))
+                .cloned();
+        }
+        if self.input.is_none() && self.last_event_type == "WorkflowTriggered" {
+            self.input = self.context.clone();
+        }
+        if let Some(execution) = self.artifact_execution.as_mut() {
+            execution.expand_after_persistence(self.input.as_ref());
+        }
+        if self.context.is_none()
+            && self.last_event_type == "WorkflowTriggered"
+            && let (Some(artifact), Some(wait_state), Some(execution)) =
+                (artifact, self.current_state.as_deref(), self.artifact_execution.as_ref())
+            && execution.waits_on_bulk_activity(wait_state)
+        {
+            self.context = artifact.rehydrate_bulk_wait_context(wait_state, execution);
+        }
+    }
+
     pub fn apply_event(&mut self, event: &EventEnvelope<WorkflowEvent>) {
         let was_terminal = self.status.is_terminal();
         self.event_count += 1;
@@ -917,6 +988,69 @@ fn default_workflow_task_queue() -> String {
     "default".to_owned()
 }
 
+const CONTINUE_AS_NEW_SUGGESTED_HISTORY_LENGTH: i64 = 10_000;
+
+pub fn execution_state_for_event(
+    state: &WorkflowInstanceState,
+    event: Option<&EventEnvelope<WorkflowEvent>>,
+) -> ArtifactExecutionState {
+    let mut execution_state = state.artifact_execution.clone().unwrap_or_default();
+    hydrate_execution_state_workflow_info(&mut execution_state, state, event);
+    execution_state
+}
+
+pub fn hydrate_execution_state_workflow_info(
+    execution_state: &mut ArtifactExecutionState,
+    state: &WorkflowInstanceState,
+    event: Option<&EventEnvelope<WorkflowEvent>>,
+) {
+    let mut workflow_info = execution_state
+        .workflow_info
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    workflow_info.insert("workflowId".to_owned(), Value::String(state.instance_id.clone()));
+    workflow_info.insert("runId".to_owned(), Value::String(state.run_id.clone()));
+    workflow_info
+        .insert("historyLength".to_owned(), Value::Number(Number::from(state.event_count.max(0))));
+    workflow_info.insert(
+        "continueAsNewSuggested".to_owned(),
+        Value::Bool(state.event_count >= CONTINUE_AS_NEW_SUGGESTED_HISTORY_LENGTH),
+    );
+    if let Some(search_attributes) = state.search_attributes.clone() {
+        workflow_info.insert("searchAttributes".to_owned(), search_attributes);
+    } else {
+        workflow_info.remove("searchAttributes");
+    }
+    if let Some(memo) = state.memo.clone() {
+        workflow_info.insert("memo".to_owned(), memo);
+    } else {
+        workflow_info.remove("memo");
+    }
+
+    let existing_parent = workflow_info.get("parent").cloned();
+    let parent =
+        event.and_then(|event| build_workflow_parent_info(&event.metadata)).or(existing_parent);
+    if let Some(parent) = parent {
+        workflow_info.insert("parent".to_owned(), parent);
+    } else {
+        workflow_info.remove("parent");
+    }
+
+    execution_state.workflow_info = Some(Value::Object(workflow_info));
+}
+
+fn build_workflow_parent_info(metadata: &BTreeMap<String, String>) -> Option<Value> {
+    let workflow_id = metadata.get("parent_instance_id")?.clone();
+    let mut parent = Map::new();
+    parent.insert("workflowId".to_owned(), Value::String(workflow_id));
+    if let Some(run_id) = metadata.get("parent_run_id") {
+        parent.insert("runId".to_owned(), Value::String(run_id.clone()));
+    }
+    Some(Value::Object(parent))
+}
+
 pub fn replay_history(history: &[EventEnvelope<WorkflowEvent>]) -> Result<WorkflowInstanceState> {
     Ok(replay_history_trace(history)?.final_state)
 }
@@ -995,9 +1129,11 @@ pub fn replay_compiled_history_trace(
         })
         .context("compiled workflow history is missing WorkflowTriggered")?;
     let mut replayed = WorkflowInstanceState::try_from(trigger.0)?;
+    let mut trigger_execution_state = preload_recorded_markers(history);
+    hydrate_execution_state_workflow_info(&mut trigger_execution_state, &replayed, Some(trigger.0));
     let mut execution = artifact.execute_trigger_with_state_and_turn(
         &trigger.1,
-        preload_recorded_markers(history),
+        trigger_execution_state,
         ExecutionTurnContext { event_id: trigger.0.event_id, occurred_at: trigger.0.occurred_at },
     )?;
     apply_compiled_execution(&mut replayed, &execution);
@@ -1030,9 +1166,11 @@ pub fn replay_compiled_history_trace(
             match &event.payload {
                 WorkflowEvent::SignalReceived { signal_id, signal_type, payload } => {
                     let current_state = replayed.current_state.as_deref().unwrap_or_default();
-                    let turn_context =
-                        ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at };
-                    let execution_state = replayed.artifact_execution.clone().unwrap_or_default();
+                    let turn_context = ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    };
+                    let execution_state = execution_state_for_event(&replayed, Some(event));
                     execution = if artifact
                         .expected_signal_type(current_state)?
                         .is_some_and(|expected| expected == signal_type)
@@ -1070,7 +1208,7 @@ pub fn replay_compiled_history_trace(
                         update_id,
                         update_name,
                         payload,
-                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
@@ -1083,7 +1221,7 @@ pub fn replay_compiled_history_trace(
                         execution = artifact.execute_after_timer_with_turn(
                             replayed.current_state.as_deref().unwrap_or_default(),
                             timer_id,
-                            replayed.artifact_execution.clone().unwrap_or_default(),
+                            execution_state_for_event(&replayed, Some(event)),
                             ExecutionTurnContext {
                                 event_id: event.event_id,
                                 occurred_at: event.occurred_at,
@@ -1097,7 +1235,7 @@ pub fn replay_compiled_history_trace(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         activity_id,
                         output,
-                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
@@ -1110,7 +1248,7 @@ pub fn replay_compiled_history_trace(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         activity_id,
                         error,
-                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
@@ -1123,7 +1261,7 @@ pub fn replay_compiled_history_trace(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         activity_id,
                         "activity timed out",
-                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
@@ -1136,7 +1274,7 @@ pub fn replay_compiled_history_trace(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         activity_id,
                         reason,
-                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
@@ -1165,7 +1303,7 @@ pub fn replay_compiled_history_trace(
                             "chunkCount": chunk_count,
                             "resultHandle": { "batchId": batch_id },
                         }),
-                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
@@ -1208,7 +1346,7 @@ pub fn replay_compiled_history_trace(
                             "cancelledItems": cancelled_items,
                             "chunkCount": chunk_count,
                         }),
-                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
@@ -1221,7 +1359,7 @@ pub fn replay_compiled_history_trace(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         child_id,
                         output,
-                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
@@ -1236,7 +1374,7 @@ pub fn replay_compiled_history_trace(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         child_id,
                         error,
-                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
@@ -1294,9 +1432,11 @@ pub fn replay_compiled_history_trace_from_snapshot(
             match &event.payload {
                 WorkflowEvent::SignalReceived { signal_id, signal_type, payload } => {
                     let current_state = replayed.current_state.as_deref().unwrap_or_default();
-                    let turn_context =
-                        ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at };
-                    let execution_state = replayed.artifact_execution.clone().unwrap_or_default();
+                    let turn_context = ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    };
+                    let execution_state = execution_state_for_event(&replayed, Some(event));
                     let execution = if artifact
                         .expected_signal_type(current_state)?
                         .is_some_and(|expected| expected == signal_type)
@@ -1334,7 +1474,7 @@ pub fn replay_compiled_history_trace_from_snapshot(
                         update_id,
                         update_name,
                         payload,
-                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
@@ -1347,7 +1487,7 @@ pub fn replay_compiled_history_trace_from_snapshot(
                         let execution = artifact.execute_after_timer_with_turn(
                             replayed.current_state.as_deref().unwrap_or_default(),
                             timer_id,
-                            replayed.artifact_execution.clone().unwrap_or_default(),
+                            execution_state_for_event(&replayed, Some(event)),
                             ExecutionTurnContext {
                                 event_id: event.event_id,
                                 occurred_at: event.occurred_at,
@@ -1361,7 +1501,7 @@ pub fn replay_compiled_history_trace_from_snapshot(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         activity_id,
                         output,
-                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
@@ -1374,7 +1514,7 @@ pub fn replay_compiled_history_trace_from_snapshot(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         activity_id,
                         error,
-                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
@@ -1387,7 +1527,7 @@ pub fn replay_compiled_history_trace_from_snapshot(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         activity_id,
                         "activity timed out",
-                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
@@ -1400,7 +1540,7 @@ pub fn replay_compiled_history_trace_from_snapshot(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         activity_id,
                         reason,
-                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
@@ -1429,7 +1569,7 @@ pub fn replay_compiled_history_trace_from_snapshot(
                             "chunkCount": chunk_count,
                             "resultHandle": { "batchId": batch_id },
                         }),
-                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
@@ -1472,7 +1612,7 @@ pub fn replay_compiled_history_trace_from_snapshot(
                             "cancelledItems": cancelled_items,
                             "chunkCount": chunk_count,
                         }),
-                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
@@ -1485,7 +1625,7 @@ pub fn replay_compiled_history_trace_from_snapshot(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         child_id,
                         output,
-                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
@@ -1500,7 +1640,7 @@ pub fn replay_compiled_history_trace_from_snapshot(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         child_id,
                         error,
-                        replayed.artifact_execution.clone().unwrap_or_default(),
+                        execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
@@ -1547,7 +1687,9 @@ fn apply_compiled_execution(
             WorkflowEvent::WorkflowCompleted { .. } => replayed.status = WorkflowStatus::Completed,
             WorkflowEvent::WorkflowFailed { .. } => replayed.status = WorkflowStatus::Failed,
             WorkflowEvent::WorkflowCancelled { .. } => replayed.status = WorkflowStatus::Cancelled,
-            WorkflowEvent::WorkflowTerminated { .. } => replayed.status = WorkflowStatus::Terminated,
+            WorkflowEvent::WorkflowTerminated { .. } => {
+                replayed.status = WorkflowStatus::Terminated
+            }
             _ => {}
         }
     }
@@ -1846,8 +1988,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::compiled::{
-        ArtifactEntrypoint, BinaryOp, CompiledSignalHandler, CompiledStateNode,
-        CompiledWorkflow, CompiledWorkflowArtifact, Expression,
+        ArtifactEntrypoint, BinaryOp, CompiledSignalHandler, CompiledStateNode, CompiledWorkflow,
+        CompiledWorkflowArtifact, Expression,
     };
 
     use super::{
@@ -1915,7 +2057,11 @@ mod tests {
         );
         states.insert(
             "wait_timer".to_owned(),
-            CompiledStateNode::WaitForTimer { timer_ref: "5s".to_owned(), next: "echo".to_owned() },
+            CompiledStateNode::WaitForTimer {
+                timer_ref: "5s".to_owned(),
+                timer_expr: None,
+                next: "echo".to_owned(),
+            },
         );
         states.insert(
             "echo".to_owned(),
@@ -3242,5 +3388,185 @@ mod tests {
         };
 
         assert_eq!(workflow.validate(), Err(WorkflowValidationError::MissingHttpRequestConfig));
+    }
+
+    #[test]
+    fn workflow_instance_persistence_compaction_round_trips_trigger_input() {
+        let input = serde_json::json!({"items": [{"value": "x"}, {"value": "y"}]});
+        let mut state = WorkflowInstanceState {
+            tenant_id: "tenant".to_owned(),
+            instance_id: "instance".to_owned(),
+            run_id: "run".to_owned(),
+            definition_id: "workflow".to_owned(),
+            definition_version: Some(1),
+            artifact_hash: Some("hash".to_owned()),
+            workflow_task_queue: "default".to_owned(),
+            sticky_workflow_build_id: None,
+            sticky_workflow_poller_id: None,
+            current_state: Some("wait".to_owned()),
+            context: Some(input.clone()),
+            artifact_execution: Some(ArtifactExecutionState {
+                bindings: BTreeMap::from([("input".to_owned(), input.clone())]),
+                ..ArtifactExecutionState::default()
+            }),
+            status: WorkflowStatus::Running,
+            input: Some(input.clone()),
+            memo: None,
+            search_attributes: None,
+            output: None,
+            event_count: 1,
+            last_event_id: Uuid::now_v7(),
+            last_event_type: "WorkflowTriggered".to_owned(),
+            updated_at: Utc::now(),
+        };
+
+        state.compact_for_persistence();
+        assert_eq!(state.input, None);
+        assert_eq!(
+            state.artifact_execution.as_ref().and_then(|execution| execution.bindings.get("input")),
+            None
+        );
+
+        state.expand_after_persistence();
+        assert_eq!(state.input.as_ref(), Some(&input));
+        assert_eq!(state.context.as_ref(), Some(&input));
+        assert_eq!(
+            state.artifact_execution.as_ref().and_then(|execution| execution.bindings.get("input")),
+            Some(&input)
+        );
+    }
+
+    #[test]
+    fn workflow_instance_persistence_restores_input_from_execution_binding() {
+        let input = serde_json::json!({"items": [{"value": "x"}, {"value": "y"}]});
+        let context = serde_json::json!([{"value": "x"}, {"value": "y"}]);
+        let mut state = WorkflowInstanceState {
+            tenant_id: "tenant".to_owned(),
+            instance_id: "instance".to_owned(),
+            run_id: "run".to_owned(),
+            definition_id: "workflow".to_owned(),
+            definition_version: Some(1),
+            artifact_hash: Some("hash".to_owned()),
+            workflow_task_queue: "default".to_owned(),
+            sticky_workflow_build_id: None,
+            sticky_workflow_poller_id: None,
+            current_state: Some("wait".to_owned()),
+            context: Some(context),
+            artifact_execution: Some(ArtifactExecutionState {
+                bindings: BTreeMap::from([("input".to_owned(), input.clone())]),
+                ..ArtifactExecutionState::default()
+            }),
+            status: WorkflowStatus::Running,
+            input: Some(input.clone()),
+            memo: None,
+            search_attributes: None,
+            output: None,
+            event_count: 1,
+            last_event_id: Uuid::now_v7(),
+            last_event_type: "WorkflowTriggered".to_owned(),
+            updated_at: Utc::now(),
+        };
+
+        state.compact_for_persistence();
+        assert_eq!(state.input, None);
+        assert_eq!(
+            state.artifact_execution.as_ref().and_then(|execution| execution.bindings.get("input")),
+            Some(&input)
+        );
+
+        state.expand_after_persistence();
+        assert_eq!(state.input.as_ref(), Some(&input));
+        assert_eq!(
+            state.artifact_execution.as_ref().and_then(|execution| execution.bindings.get("input")),
+            Some(&input)
+        );
+    }
+
+    #[test]
+    fn workflow_instance_persistence_rehydrates_bulk_wait_context_from_artifact() {
+        let artifact = CompiledWorkflowArtifact::new(
+            "workflow",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "test.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "dispatch".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "dispatch".to_owned(),
+                        CompiledStateNode::StartBulkActivity {
+                            activity_type: "demo.echo".to_owned(),
+                            items: Expression::Member {
+                                object: Box::new(Expression::Identifier {
+                                    name: "input".to_owned(),
+                                }),
+                                property: "items".to_owned(),
+                            },
+                            next: "join".to_owned(),
+                            handle_var: "fanout".to_owned(),
+                            task_queue: None,
+                            execution_policy: None,
+                            reducer: None,
+                            throughput_backend: None,
+                            chunk_size: Some(16),
+                            retry: None,
+                        },
+                    ),
+                    (
+                        "join".to_owned(),
+                        CompiledStateNode::WaitForBulkActivity {
+                            bulk_ref_var: "fanout".to_owned(),
+                            next: "done".to_owned(),
+                            output_var: Some("results".to_owned()),
+                            on_error: None,
+                        },
+                    ),
+                    (
+                        "done".to_owned(),
+                        CompiledStateNode::Succeed {
+                            output: Some(Expression::Identifier { name: "results".to_owned() }),
+                        },
+                    ),
+                ]),
+                params: Vec::new(),
+                non_cancellable_states: Default::default(),
+            },
+        );
+        let input = serde_json::json!({"items": [{"value": "x"}, {"value": "y"}]});
+        let turn_context = CompiledWorkflowArtifact::synthetic_turn_context("bulk-wait-context");
+        let plan =
+            artifact.execute_trigger_with_turn(&input, turn_context).expect("bulk trigger plan");
+        let expected_context = plan.context.clone();
+        let mut state = WorkflowInstanceState {
+            tenant_id: "tenant".to_owned(),
+            instance_id: "instance".to_owned(),
+            run_id: "run".to_owned(),
+            definition_id: artifact.definition_id.clone(),
+            definition_version: Some(artifact.definition_version),
+            artifact_hash: Some(artifact.artifact_hash.clone()),
+            workflow_task_queue: "default".to_owned(),
+            sticky_workflow_build_id: None,
+            sticky_workflow_poller_id: None,
+            current_state: Some(plan.final_state.clone()),
+            context: plan.context,
+            artifact_execution: Some(plan.execution_state),
+            status: WorkflowStatus::Running,
+            input: Some(input.clone()),
+            memo: None,
+            search_attributes: None,
+            output: None,
+            event_count: 1,
+            last_event_id: Uuid::now_v7(),
+            last_event_type: "WorkflowTriggered".to_owned(),
+            updated_at: Utc::now(),
+        };
+
+        state.compact_for_persistence();
+        assert_eq!(state.context, None);
+        assert_eq!(state.input, None);
+
+        state.expand_after_persistence_with_artifact(Some(&artifact));
+        assert_eq!(state.input.as_ref(), Some(&input));
+        assert_eq!(state.context, expected_context);
     }
 }

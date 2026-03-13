@@ -75,10 +75,33 @@ fn default_compatible_payload_converter_usage_is_qualified_for_alpha() {
     assert_eq!(report["validation"]["payload_data_converter_validation"]["status"], "passed");
     assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
     assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
-    assert_eq!(
-        report["worker_packages"][0]["data_converter_mode"],
-        "default_temporal"
-    );
+    assert_eq!(report["worker_packages"][0]["data_converter_mode"], "default_temporal");
+}
+
+#[test]
+fn static_worker_bootstrap_patterns_from_real_temporal_samples_are_qualified() {
+    let output_dir = temp_output_dir("bootstrap-qualified");
+    let (status, report) = run_cli(&fixture("temporal-bootstrap-qualified"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
+    assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
+    assert_eq!(report["worker_packages"][0]["task_queue"], "bootstrap-qualified");
+    assert_eq!(report["discovered"]["workers"][0]["bootstrap_pattern"], "worker_create_static");
+}
+
+#[test]
+fn esm_workflows_path_bootstrap_pattern_is_qualified() {
+    let output_dir = temp_output_dir("bootstrap-esm-qualified");
+    let (status, report) = run_cli(&fixture("temporal-bootstrap-esm-qualified"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
+    assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
+    assert_eq!(report["worker_packages"][0]["task_queue"], "bootstrap-esm-qualified");
+    assert_eq!(report["discovered"]["workers"][0]["workflows_path"], "./workflows.ts");
 }
 
 #[test]
@@ -91,10 +114,7 @@ fn default_compatible_payload_converter_path_usage_is_qualified_for_alpha() {
     assert_eq!(report["validation"]["payload_data_converter_validation"]["status"], "passed");
     assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
     assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
-    assert_eq!(
-        report["worker_packages"][0]["data_converter_mode"],
-        "path_default_temporal"
-    );
+    assert_eq!(report["worker_packages"][0]["data_converter_mode"], "path_default_temporal");
     assert!(report["worker_packages"][0]["resolved_payload_converter_module_path"].is_string());
 }
 
@@ -108,10 +128,7 @@ fn mixed_build_payload_converter_path_upgrade_fixture_is_qualified_for_alpha() {
     assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
     assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
     assert_eq!(report["compiled_workflows"][0]["definition_version"], 1);
-    assert_eq!(
-        report["worker_packages"][0]["data_converter_mode"],
-        "path_default_temporal"
-    );
+    assert_eq!(report["worker_packages"][0]["data_converter_mode"], "path_default_temporal");
 }
 
 #[test]
@@ -165,6 +182,31 @@ fn shadow_project_with_static_evaluable_visibility_qualifies() {
     assert_eq!(report["validation"]["visibility_search_validation"]["status"], "passed");
     assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
     assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
+}
+
+#[test]
+fn supported_temporal_workflow_api_slice_qualifies_and_packages() {
+    let output_dir = temp_output_dir("supported-api-qualified");
+    let (status, report) = run_cli(&fixture("temporal-supported-api-qualified"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
+    assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
+    assert_eq!(report["worker_packages"][0]["task_queue"], "supported-api");
+}
+
+#[test]
+fn workflow_only_workers_package_without_activity_modules() {
+    let output_dir = temp_output_dir("workflow-only-qualified");
+    let (status, report) = run_cli(&fixture("temporal-workflow-only-qualified"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
+    assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
+    assert!(report["worker_packages"][0]["resolved_activity_module_path"].is_null());
+    assert_eq!(report["worker_packages"][0]["task_queue"], "workflow-only");
 }
 
 #[test]

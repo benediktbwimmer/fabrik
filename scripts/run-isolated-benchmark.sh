@@ -324,18 +324,39 @@ start_service() {
   local name=$1
   local log_file=$2
   shift 2
-  (
-    while (($#)); do
-      if [[ "$1" == "--" ]]; then
-        shift
-        break
-      fi
-      export "$1"
-      shift
-    done
-    exec "$@"
-  ) >"$log_file" 2>&1 &
-  local pid=$!
+  local args=("$log_file" "$@")
+  local pid
+  pid="$(
+    python3 - "${args[@]}" <<'PY'
+import os
+import subprocess
+import sys
+
+log_file = sys.argv[1]
+argv = sys.argv[2:]
+separator = argv.index("--")
+env_pairs = argv[:separator]
+command = argv[separator + 1 :]
+
+child_env = os.environ.copy()
+for pair in env_pairs:
+    key, value = pair.split("=", 1)
+    child_env[key] = value
+
+with open(log_file, "ab", buffering=0) as log:
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        env=child_env,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+print(proc.pid)
+PY
+  )"
   PIDS+=("$pid")
 }
 
@@ -363,6 +384,20 @@ has_runner_arg() {
   shift
   for arg in "$@"; do
     if [[ "$arg" == "$flag" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+runner_arg_value() {
+  local flag=$1
+  shift
+  local args=("$@")
+  local i
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    if [[ "${args[$i]}" == "$flag" ]] && (( i + 1 < ${#args[@]} )); then
+      printf '%s\n' "${args[$((i + 1))]}"
       return 0
     fi
   done
@@ -494,6 +529,10 @@ for ((i = 0; i < ${#RUNNER_ARGS[@]}; i++)); do
     break
   fi
 done
+WORKER_CONCURRENCY_DEFAULT="$(runner_arg_value --worker-count "${RUNNER_ARGS[@]}" || true)"
+if [[ -z "$WORKER_CONCURRENCY_DEFAULT" ]]; then
+  WORKER_CONCURRENCY_DEFAULT=8
+fi
 
 echo "[isolated-benchmark] starting unified-runtime"
 start_service unified-runtime "$LOG_DIR/unified-runtime.log" \
@@ -523,7 +562,7 @@ if [[ "$EXECUTION_MODE" == "unified" ]]; then
     "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
     "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
     "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \
-    "ACTIVITY_WORKER_CONCURRENCY=${ACTIVITY_WORKER_CONCURRENCY:-8}" \
+    "ACTIVITY_WORKER_CONCURRENCY=${ACTIVITY_WORKER_CONCURRENCY:-$WORKER_CONCURRENCY_DEFAULT}" \
     "ACTIVITY_POLL_MAX_TASKS=${ACTIVITY_POLL_MAX_TASKS:-32}" \
     "ACTIVITY_BULK_POLL_MAX_TASKS=${ACTIVITY_BULK_POLL_MAX_TASKS:-32}" \
     "ACTIVITY_ENABLE_BULK_LANES=${ACTIVITY_ENABLE_BULK_LANES:-false}" \
@@ -557,7 +596,7 @@ elif [[ "$EXECUTION_MODE" == "throughput" ]]; then
     "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
     "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
     "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \
-    "ACTIVITY_WORKER_CONCURRENCY=${ACTIVITY_WORKER_CONCURRENCY:-8}" \
+    "ACTIVITY_WORKER_CONCURRENCY=${ACTIVITY_WORKER_CONCURRENCY:-$WORKER_CONCURRENCY_DEFAULT}" \
     "ACTIVITY_BULK_POLL_MAX_TASKS=${ACTIVITY_BULK_POLL_MAX_TASKS:-32}" \
     -- \
     target/release/activity-worker-service
@@ -571,7 +610,7 @@ elif [[ "$EXECUTION_MODE" == "throughput" ]]; then
     "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$THROUGHPUT_RUNTIME_PORT" \
     "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
     "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \
-    "ACTIVITY_WORKER_CONCURRENCY=${STREAM_ACTIVITY_WORKER_CONCURRENCY:-8}" \
+    "ACTIVITY_WORKER_CONCURRENCY=${STREAM_ACTIVITY_WORKER_CONCURRENCY:-$WORKER_CONCURRENCY_DEFAULT}" \
     "ACTIVITY_BULK_POLL_MAX_TASKS=${STREAM_ACTIVITY_BULK_POLL_MAX_TASKS:-32}" \
     -- \
     target/release/activity-worker-service
@@ -607,12 +646,11 @@ else
   start_service activity-worker-service "$LOG_DIR/activity-worker-service-pg-v1.log" \
     "${COMMON_ENV[@]}" \
     "ACTIVITY_WORKER_SERVICE_PORT=$ACTIVITY_WORKER_SERVICE_PORT" \
-    "UNIFIED_RUNTIME_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
-    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
+    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
     "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
     "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
     "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \
-    "ACTIVITY_WORKER_CONCURRENCY=${ACTIVITY_WORKER_CONCURRENCY:-8}" \
+    "ACTIVITY_WORKER_CONCURRENCY=${ACTIVITY_WORKER_CONCURRENCY:-$WORKER_CONCURRENCY_DEFAULT}" \
     "ACTIVITY_BULK_POLL_MAX_TASKS=${ACTIVITY_BULK_POLL_MAX_TASKS:-32}" \
     -- \
     target/release/activity-worker-service
@@ -621,13 +659,12 @@ else
   start_service activity-worker-service-stream-v2 "$LOG_DIR/activity-worker-service-stream-v2.log" \
     "${COMMON_ENV[@]}" \
     "ACTIVITY_WORKER_SERVICE_PORT=$STREAM_ACTIVITY_WORKER_SERVICE_PORT" \
-    "UNIFIED_RUNTIME_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
-    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
     "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$THROUGHPUT_RUNTIME_PORT" \
     "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
     "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \
-    "ACTIVITY_WORKER_CONCURRENCY=${STREAM_ACTIVITY_WORKER_CONCURRENCY:-8}" \
+    "ACTIVITY_WORKER_CONCURRENCY=${STREAM_ACTIVITY_WORKER_CONCURRENCY:-$WORKER_CONCURRENCY_DEFAULT}" \
     "ACTIVITY_BULK_POLL_MAX_TASKS=${STREAM_ACTIVITY_BULK_POLL_MAX_TASKS:-32}" \
+    "ACTIVITY_ENABLE_NORMAL_LANES=false" \
     -- \
     target/release/activity-worker-service
 fi

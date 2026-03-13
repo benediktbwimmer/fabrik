@@ -26,16 +26,18 @@ use fabrik_config::{
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
-    PartitionOwnershipRecord, ThroughputProjectionBatchStateUpdate,
+    PartitionOwnershipRecord, TaskQueueKind, ThroughputProjectionBatchStateUpdate,
     ThroughputProjectionChunkStateUpdate, ThroughputProjectionEvent, WorkflowBulkBatchRecord,
     WorkflowBulkBatchStatus, WorkflowBulkChunkRecord, WorkflowBulkChunkStatus, WorkflowStore,
 };
 use fabrik_throughput::{
-    PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind, ThroughputBackend,
-    ThroughputBatchIdentity, ThroughputChangelogEntry, ThroughputChangelogPayload,
-    ThroughputChunkReport, ThroughputChunkReportPayload, bulk_reducer_class, decode_cbor,
-    effective_aggregation_group_count, encode_cbor, group_id_for_chunk_index,
-    planned_reduction_tree_depth, stream_v2_fast_lane_enabled, throughput_partition_key,
+    ADMISSION_POLICY_VERSION, PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
+    ThroughputBackend, ThroughputBatchIdentity, ThroughputChangelogEntry,
+    ThroughputChangelogPayload, ThroughputChunkReport, ThroughputChunkReportPayload,
+    bulk_reducer_class, bulk_reducer_name, decode_cbor, effective_aggregation_group_count,
+    encode_cbor, group_id_for_chunk_index, planned_reduction_tree_depth,
+    stream_v2_fast_lane_enabled, throughput_execution_mode, throughput_partition_key,
+    throughput_reducer_execution_path, throughput_reducer_version, throughput_routing_reason,
 };
 use fabrik_worker_protocol::activity_worker::{
     Ack, BulkActivityTask, BulkActivityTaskResult, PollBulkActivityTaskRequest,
@@ -706,7 +708,6 @@ async fn run_throughput_ownership_loop(
     store_recovery_enabled: bool,
 ) {
     let use_assignments = config.static_partition_ids.is_none();
-    let lease_ttl = Duration::from_secs(config.lease_ttl_seconds.max(1));
     let renew_interval = Duration::from_secs(config.renew_interval_seconds.max(1));
     let heartbeat_ttl = Duration::from_secs(config.member_heartbeat_ttl_seconds.max(1));
     let poll_interval = Duration::from_secs(config.assignment_poll_interval_seconds.max(1));
@@ -758,144 +759,162 @@ async fn run_throughput_ownership_loop(
         } else {
             managed_partitions.iter().copied().collect::<HashSet<_>>()
         };
-        for throughput_partition_id in &managed_partitions {
-            let snapshot = {
+        run_throughput_ownership_pass(
+            &store,
+            &ownership,
+            &local_state,
+            &managed_partitions,
+            &desired_partitions,
+            &debug,
+            &config,
+            store_recovery_enabled,
+            &mut store_seeded_this_loop,
+        )
+        .await;
+        tokio::time::sleep(if use_assignments { poll_interval } else { renew_interval }).await;
+    }
+}
+
+async fn run_throughput_ownership_pass(
+    store: &WorkflowStore,
+    ownership: &Arc<StdMutex<ThroughputOwnershipState>>,
+    local_state: &LocalThroughputState,
+    managed_partitions: &[i32],
+    desired_partitions: &HashSet<i32>,
+    debug: &Arc<StdMutex<ThroughputDebugState>>,
+    config: &ThroughputOwnershipConfig,
+    store_recovery_enabled: bool,
+    store_seeded_this_loop: &mut bool,
+) {
+    let use_assignments = config.static_partition_ids.is_none();
+    let lease_ttl = Duration::from_secs(config.lease_ttl_seconds.max(1));
+    for throughput_partition_id in managed_partitions {
+        let snapshot =
+            {
                 let state = ownership.lock().expect("throughput ownership lock poisoned");
                 state.leases.get(throughput_partition_id).cloned().unwrap_or_else(|| {
                     LeaseState::inactive(*throughput_partition_id, &state.owner_id)
                 })
             };
-            let should_own = desired_partitions.contains(throughput_partition_id);
-            let ownership_partition_id = throughput_ownership_partition_id(
+        let should_own = desired_partitions.contains(throughput_partition_id);
+        let ownership_partition_id =
+            throughput_ownership_partition_id(*throughput_partition_id, config.partition_id_offset);
+        if snapshot.active && !should_own {
+            if let Err(error) = store
+                .release_partition_ownership(
+                    ownership_partition_id,
+                    &snapshot.owner_id,
+                    snapshot.owner_epoch,
+                )
+                .await
+            {
+                warn!(
+                    error = %error,
+                    throughput_partition_id = *throughput_partition_id,
+                    "failed to release throughput partition ownership"
+                );
+            }
+            let mut state = ownership.lock().expect("throughput ownership lock poisoned");
+            state.leases.insert(
                 *throughput_partition_id,
-                config.partition_id_offset,
+                LeaseState::inactive(*throughput_partition_id, &snapshot.owner_id),
             );
-            if snapshot.active && !should_own {
-                if let Err(error) = store
-                    .release_partition_ownership(
-                        ownership_partition_id,
-                        &snapshot.owner_id,
-                        snapshot.owner_epoch,
-                    )
-                    .await
-                {
-                    warn!(
+            continue;
+        }
+        if !should_own {
+            continue;
+        }
+        if !snapshot.active {
+            if store_recovery_enabled && !*store_seeded_this_loop {
+                match seed_local_state_from_store_view(store, local_state).await {
+                    Ok(()) => *store_seeded_this_loop = true,
+                    Err(error) => warn!(
                         error = %error,
                         throughput_partition_id = *throughput_partition_id,
-                        "failed to release throughput partition ownership"
-                    );
+                        "failed to seed throughput local state from projection store"
+                    ),
                 }
-                let mut state = ownership.lock().expect("throughput ownership lock poisoned");
-                state.leases.insert(
-                    *throughput_partition_id,
-                    LeaseState::inactive(*throughput_partition_id, &snapshot.owner_id),
-                );
-                continue;
             }
-            if !should_own {
-                continue;
-            }
-            if !snapshot.active {
-                if store_recovery_enabled && !store_seeded_this_loop {
-                    match seed_local_state_from_store_view(&store, &local_state).await {
-                        Ok(()) => store_seeded_this_loop = true,
-                        Err(error) => warn!(
+            if !store_recovery_enabled {
+                match local_state.partition_is_caught_up(*throughput_partition_id) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let mut runtime_debug =
+                            debug.lock().expect("throughput debug lock poisoned");
+                        runtime_debug.ownership_catchup_waits =
+                            runtime_debug.ownership_catchup_waits.saturating_add(1);
+                        runtime_debug.last_catchup_wait_partition = Some(*throughput_partition_id);
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(
                             error = %error,
                             throughput_partition_id = *throughput_partition_id,
-                            "failed to seed throughput local state from projection store"
-                        ),
-                    }
-                }
-                if !store_recovery_enabled {
-                    match local_state.partition_is_caught_up(*throughput_partition_id) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            let mut runtime_debug =
-                                debug.lock().expect("throughput debug lock poisoned");
-                            runtime_debug.ownership_catchup_waits =
-                                runtime_debug.ownership_catchup_waits.saturating_add(1);
-                            runtime_debug.last_catchup_wait_partition =
-                                Some(*throughput_partition_id);
-                            continue;
-                        }
-                        Err(error) => {
-                            warn!(
-                                error = %error,
-                                throughput_partition_id = *throughput_partition_id,
-                                "failed to evaluate throughput partition catch-up state"
-                            );
-                            continue;
-                        }
-                    }
-                }
-            }
-            if snapshot.active {
-                match store
-                    .renew_partition_ownership(
-                        ownership_partition_id,
-                        &snapshot.owner_id,
-                        snapshot.owner_epoch,
-                        lease_ttl,
-                    )
-                    .await
-                {
-                    Ok(Some(record)) => {
-                        let mut state =
-                            ownership.lock().expect("throughput ownership lock poisoned");
-                        state
-                            .leases
-                            .insert(*throughput_partition_id, LeaseState::from_record(&record));
-                    }
-                    Ok(None) => {
-                        let mut state =
-                            ownership.lock().expect("throughput ownership lock poisoned");
-                        state.leases.insert(
-                            *throughput_partition_id,
-                            LeaseState::inactive(*throughput_partition_id, &snapshot.owner_id),
+                            "failed to evaluate throughput partition catch-up state"
                         );
+                        continue;
                     }
-                    Err(error) => warn!(
-                        error = %error,
-                        throughput_partition_id = *throughput_partition_id,
-                        "failed to renew throughput partition ownership"
-                    ),
-                }
-            } else {
-                let claim = if use_assignments {
-                    store
-                        .claim_throughput_partition_ownership(
-                            ownership_partition_id,
-                            &snapshot.owner_id,
-                            lease_ttl,
-                        )
-                        .await
-                } else {
-                    store
-                        .claim_partition_ownership(
-                            ownership_partition_id,
-                            &snapshot.owner_id,
-                            lease_ttl,
-                        )
-                        .await
-                };
-                match claim {
-                    Ok(Some(record)) => {
-                        let mut state =
-                            ownership.lock().expect("throughput ownership lock poisoned");
-                        state
-                            .leases
-                            .insert(*throughput_partition_id, LeaseState::from_record(&record));
-                    }
-                    Ok(None) => {}
-                    Err(error) => warn!(
-                        error = %error,
-                        throughput_partition_id = *throughput_partition_id,
-                        "failed to claim throughput partition ownership"
-                    ),
                 }
             }
         }
-        tokio::time::sleep(if use_assignments { poll_interval } else { renew_interval }).await;
+        if snapshot.active {
+            match store
+                .renew_partition_ownership(
+                    ownership_partition_id,
+                    &snapshot.owner_id,
+                    snapshot.owner_epoch,
+                    lease_ttl,
+                )
+                .await
+            {
+                Ok(Some(record)) => {
+                    let mut state = ownership.lock().expect("throughput ownership lock poisoned");
+                    state.leases.insert(*throughput_partition_id, LeaseState::from_record(&record));
+                }
+                Ok(None) => {
+                    let mut state = ownership.lock().expect("throughput ownership lock poisoned");
+                    state.leases.insert(
+                        *throughput_partition_id,
+                        LeaseState::inactive(*throughput_partition_id, &snapshot.owner_id),
+                    );
+                }
+                Err(error) => warn!(
+                    error = %error,
+                    throughput_partition_id = *throughput_partition_id,
+                    "failed to renew throughput partition ownership"
+                ),
+            }
+        } else {
+            let claim = if use_assignments {
+                store
+                    .claim_throughput_partition_ownership(
+                        ownership_partition_id,
+                        &snapshot.owner_id,
+                        lease_ttl,
+                    )
+                    .await
+            } else {
+                store
+                    .claim_partition_ownership(
+                        ownership_partition_id,
+                        &snapshot.owner_id,
+                        lease_ttl,
+                    )
+                    .await
+            };
+            match claim {
+                Ok(Some(record)) => {
+                    let mut state = ownership.lock().expect("throughput ownership lock poisoned");
+                    state.leases.insert(*throughput_partition_id, LeaseState::from_record(&record));
+                }
+                Ok(None) => {}
+                Err(error) => warn!(
+                    error = %error,
+                    throughput_partition_id = *throughput_partition_id,
+                    "failed to claim throughput partition ownership"
+                ),
+            }
+        }
     }
 }
 
@@ -1385,6 +1404,62 @@ impl ActivityWorkerApi for WorkerApi {
                 }
                 continue;
             }
+            let queue_control = self
+                .state
+                .store
+                .get_task_queue_runtime_control(
+                    &request.tenant_id,
+                    TaskQueueKind::Activity,
+                    &request.task_queue,
+                )
+                .await
+                .map_err(internal_status)?;
+            if let Some(control) = queue_control.as_ref() {
+                if control.is_paused {
+                    record_throttle(&self.state, "queue_paused");
+                    if tokio::time::Instant::now() >= deadline {
+                        return Ok(Response::new(PollBulkActivityTaskResponse {
+                            tasks: Vec::new(),
+                        }));
+                    }
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if tokio::time::timeout(remaining, self.state.bulk_notify.notified())
+                        .await
+                        .is_err()
+                    {
+                        return Ok(Response::new(PollBulkActivityTaskResponse {
+                            tasks: Vec::new(),
+                        }));
+                    }
+                    continue;
+                }
+                if control.is_draining {
+                    record_throttle(&self.state, "queue_draining");
+                    if tokio::time::Instant::now() >= deadline {
+                        return Ok(Response::new(PollBulkActivityTaskResponse {
+                            tasks: Vec::new(),
+                        }));
+                    }
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if tokio::time::timeout(remaining, self.state.bulk_notify.notified())
+                        .await
+                        .is_err()
+                    {
+                        return Ok(Response::new(PollBulkActivityTaskResponse {
+                            tasks: Vec::new(),
+                        }));
+                    }
+                    continue;
+                }
+            }
+            let paused_batch_ids = self
+                .state
+                .store
+                .list_paused_bulk_batch_ids_for_task_queue(&request.tenant_id, &request.task_queue)
+                .await
+                .map_err(internal_status)?
+                .into_iter()
+                .collect::<HashSet<_>>();
             let tenant_active = self
                 .state
                 .local_state
@@ -1450,6 +1525,7 @@ impl ActivityWorkerApi for WorkerApi {
                     now,
                     chrono::Duration::seconds(self.state.runtime.lease_ttl_seconds as i64),
                     batch_limit,
+                    &paused_batch_ids,
                     Some(&owned),
                     self.state.throughput_partitions,
                     max_tasks,
@@ -1540,6 +1616,7 @@ impl ActivityWorkerApi for WorkerApi {
                         &request.task_queue,
                         Utc::now(),
                         batch_limit,
+                        &paused_batch_ids,
                         Some(&owned),
                         self.state.throughput_partitions,
                     )
@@ -1551,6 +1628,12 @@ impl ActivityWorkerApi for WorkerApi {
                     debug.lease_misses_with_ready_chunks =
                         debug.lease_misses_with_ready_chunks.saturating_add(1);
                     debug.last_lease_miss_with_ready_chunks_at = Some(Utc::now());
+                    debug.last_lease_selection_debug =
+                        serde_json::to_value(lease_selection_debug).ok();
+                } else if lease_selection_debug.batch_paused > 0 {
+                    record_throttle(&self.state, "batch_paused");
+                    let mut debug =
+                        self.state.debug.lock().expect("throughput debug lock poisoned");
                     debug.last_lease_selection_debug =
                         serde_json::to_value(lease_selection_debug).ok();
                 } else {
@@ -1868,6 +1951,19 @@ async fn build_stream_projection_records(
         execution_policy.as_deref(),
         reducer.as_deref(),
     );
+    let routing_reason = event.metadata.get("routing_reason").cloned().unwrap_or_else(|| {
+        throughput_routing_reason(
+            throughput_backend,
+            execution_policy.as_deref(),
+            reducer.as_deref(),
+        )
+        .to_owned()
+    });
+    let admission_policy_version = event
+        .metadata
+        .get("admission_policy_version")
+        .cloned()
+        .unwrap_or_else(|| ADMISSION_POLICY_VERSION.to_owned());
     let reducer_class = bulk_reducer_class(reducer.as_deref());
     let effective_group_count = planned_aggregation_group_count(
         *aggregation_group_count,
@@ -1901,9 +1997,21 @@ async fn build_stream_projection_records(
         result_handle: batch_result_handle,
         throughput_backend: throughput_backend.clone(),
         throughput_backend_version: throughput_backend_version.clone(),
+        execution_mode: throughput_execution_mode(throughput_backend).to_owned(),
+        selected_backend: throughput_backend.clone(),
+        routing_reason,
+        admission_policy_version,
         execution_policy: execution_policy.clone(),
         reducer: reducer.clone(),
+        reducer_kind: bulk_reducer_name(reducer.as_deref()).to_owned(),
         reducer_class: reducer_class.as_str().to_owned(),
+        reducer_version: throughput_reducer_version(reducer.as_deref()).to_owned(),
+        reducer_execution_path: throughput_reducer_execution_path(
+            throughput_backend,
+            execution_policy.as_deref(),
+            reducer.as_deref(),
+        )
+        .to_owned(),
         aggregation_tree_depth,
         fast_lane_enabled,
         aggregation_group_count: effective_group_count,
@@ -2291,6 +2399,19 @@ async fn publish_stream_terminal_event(
         },
     };
     let mut envelope = EventEnvelope::new(payload.event_type(), identity, payload);
+    let terminal_at = projected.terminal_at.unwrap_or(report.occurred_at);
+    let dedupe_key = stream_batch_terminal_dedupe_key(
+        &report.tenant_id,
+        &report.instance_id,
+        &report.run_id,
+        &report.batch_id,
+        projected.batch_status.as_str(),
+        Some(&report.report_id),
+        terminal_at,
+    );
+    envelope.event_id = stream_batch_terminal_event_id(&dedupe_key);
+    envelope.occurred_at = terminal_at;
+    envelope.dedupe_key = Some(dedupe_key);
     envelope
         .metadata
         .insert("throughput_backend".to_owned(), ThroughputBackend::StreamV2.as_str().to_owned());
@@ -2340,10 +2461,41 @@ async fn publish_stream_batch_terminal_event(
         _ => anyhow::bail!("batch {} is not terminal", batch.batch_id),
     };
     let mut envelope = EventEnvelope::new(payload.event_type(), identity, payload);
+    let terminal_at = batch.terminal_at.unwrap_or(batch.updated_at);
+    let dedupe_key = stream_batch_terminal_dedupe_key(
+        &batch.tenant_id,
+        &batch.instance_id,
+        &batch.run_id,
+        &batch.batch_id,
+        batch.status.as_str(),
+        None,
+        terminal_at,
+    );
+    envelope.event_id = stream_batch_terminal_event_id(&dedupe_key);
+    envelope.occurred_at = terminal_at;
+    envelope.dedupe_key = Some(dedupe_key);
     envelope
         .metadata
         .insert("throughput_backend".to_owned(), ThroughputBackend::StreamV2.as_str().to_owned());
     state.workflow_publisher.publish(&envelope, &envelope.partition_key).await
+}
+
+fn stream_batch_terminal_dedupe_key(
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    batch_id: &str,
+    status: &str,
+    report_id: Option<&str>,
+    terminal_at: chrono::DateTime<Utc>,
+) -> String {
+    let source =
+        report_id.map(str::to_owned).unwrap_or_else(|| terminal_at.timestamp_millis().to_string());
+    format!("throughput-terminal:{tenant_id}:{instance_id}:{run_id}:{batch_id}:{status}:{source}")
+}
+
+fn stream_batch_terminal_event_id(dedupe_key: &str) -> Uuid {
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, format!("throughput-terminal-event:{dedupe_key}").as_bytes())
 }
 
 async fn finalize_grouped_stream_batch(
@@ -2390,9 +2542,28 @@ async fn finalize_grouped_stream_batch(
             result_handle: Value::Null,
             throughput_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
             throughput_backend_version: ThroughputBackend::StreamV2.default_version().to_owned(),
+            execution_mode: throughput_execution_mode(ThroughputBackend::StreamV2.as_str())
+                .to_owned(),
+            selected_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
+            routing_reason: throughput_routing_reason(
+                ThroughputBackend::StreamV2.as_str(),
+                existing_batch.execution_policy.as_deref(),
+                existing_batch.reducer.as_deref(),
+            )
+            .to_owned(),
+            admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
             execution_policy: existing_batch.execution_policy.clone(),
             reducer: existing_batch.reducer.clone(),
+            reducer_kind: bulk_reducer_name(existing_batch.reducer.as_deref()).to_owned(),
             reducer_class: existing_batch.reducer_class.clone(),
+            reducer_version: throughput_reducer_version(existing_batch.reducer.as_deref())
+                .to_owned(),
+            reducer_execution_path: throughput_reducer_execution_path(
+                ThroughputBackend::StreamV2.as_str(),
+                existing_batch.execution_policy.as_deref(),
+                existing_batch.reducer.as_deref(),
+            )
+            .to_owned(),
             aggregation_tree_depth: existing_batch.aggregation_tree_depth,
             fast_lane_enabled: existing_batch.fast_lane_enabled,
             aggregation_group_count: 1,
@@ -2446,9 +2617,28 @@ async fn publish_grouped_batch_terminal_event(
             result_handle: Value::Null,
             throughput_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
             throughput_backend_version: ThroughputBackend::StreamV2.default_version().to_owned(),
+            execution_mode: throughput_execution_mode(ThroughputBackend::StreamV2.as_str())
+                .to_owned(),
+            selected_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
+            routing_reason: throughput_routing_reason(
+                ThroughputBackend::StreamV2.as_str(),
+                projected_apply.batch_execution_policy.as_deref(),
+                projected_apply.batch_reducer.as_deref(),
+            )
+            .to_owned(),
+            admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
             execution_policy: projected_apply.batch_execution_policy.clone(),
             reducer: projected_apply.batch_reducer.clone(),
+            reducer_kind: bulk_reducer_name(projected_apply.batch_reducer.as_deref()).to_owned(),
             reducer_class: projected_apply.batch_reducer_class.clone(),
+            reducer_version: throughput_reducer_version(projected_apply.batch_reducer.as_deref())
+                .to_owned(),
+            reducer_execution_path: throughput_reducer_execution_path(
+                ThroughputBackend::StreamV2.as_str(),
+                projected_apply.batch_execution_policy.as_deref(),
+                projected_apply.batch_reducer.as_deref(),
+            )
+            .to_owned(),
             aggregation_tree_depth: projected_apply.batch_aggregation_tree_depth,
             fast_lane_enabled: projected_apply.batch_fast_lane_enabled,
             aggregation_group_count: 1,
@@ -3119,6 +3309,210 @@ fn projected_apply_chunk_state_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
+    use std::{
+        collections::HashMap,
+        fs,
+        path::PathBuf,
+        process::Command,
+        time::{Duration as StdDuration, Instant},
+    };
+    use tokio::time::sleep;
+
+    struct TestPostgres {
+        container_name: String,
+        database_url: String,
+    }
+
+    impl TestPostgres {
+        fn start() -> Result<Option<Self>> {
+            if !docker_available() {
+                eprintln!(
+                    "skipping throughput-runtime postgres-backed tests because docker is unavailable"
+                );
+                return Ok(None);
+            }
+
+            let container_name = format!("throughput-runtime-test-{}", Uuid::now_v7());
+            let image = std::env::var("FABRIK_TEST_POSTGRES_IMAGE")
+                .unwrap_or_else(|_| "postgres:16-alpine".to_owned());
+            let output = Command::new("docker")
+                .args([
+                    "run",
+                    "--detach",
+                    "--rm",
+                    "--name",
+                    &container_name,
+                    "--env",
+                    "POSTGRES_USER=fabrik",
+                    "--env",
+                    "POSTGRES_PASSWORD=fabrik",
+                    "--env",
+                    "POSTGRES_DB=fabrik_test",
+                    "--publish-all",
+                    &image,
+                ])
+                .output()
+                .with_context(|| format!("failed to start docker container {container_name}"))?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "docker failed to start postgres test container: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+
+            let host_port = match wait_for_host_port(&container_name) {
+                Ok(port) => port,
+                Err(error) => {
+                    let _ = cleanup_container(&container_name);
+                    return Err(error);
+                }
+            };
+            let database_url = format!(
+                "postgres://fabrik:fabrik@127.0.0.1:{host_port}/fabrik_test?sslmode=disable"
+            );
+            Ok(Some(Self { container_name, database_url }))
+        }
+
+        async fn connect_store(&self) -> Result<WorkflowStore> {
+            let deadline = Instant::now() + StdDuration::from_secs(30);
+            loop {
+                match WorkflowStore::connect(&self.database_url).await {
+                    Ok(store) => {
+                        store.init().await?;
+                        return Ok(store);
+                    }
+                    Err(error) if Instant::now() < deadline => {
+                        let _ = error;
+                        sleep(StdDuration::from_millis(250)).await;
+                    }
+                    Err(error) => {
+                        let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        return Err(error).with_context(|| {
+                            format!(
+                                "postgres test container {} did not become ready; logs:\n{}",
+                                self.container_name, logs
+                            )
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for TestPostgres {
+        fn drop(&mut self) {
+            let _ = cleanup_container(&self.container_name);
+        }
+    }
+
+    fn docker_available() -> bool {
+        Command::new("docker")
+            .args(["info", "--format", "{{.ServerVersion}}"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    fn wait_for_host_port(container_name: &str) -> Result<u16> {
+        let deadline = Instant::now() + StdDuration::from_secs(15);
+        loop {
+            let output = Command::new("docker")
+                .args([
+                    "inspect",
+                    "--format",
+                    "{{(index (index .NetworkSettings.Ports \"5432/tcp\") 0).HostPort}}",
+                    container_name,
+                ])
+                .output()
+                .with_context(|| format!("failed to inspect docker container {container_name}"))?;
+            if output.status.success() {
+                let host_port = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                if !host_port.is_empty() {
+                    return host_port
+                        .parse::<u16>()
+                        .with_context(|| format!("invalid postgres host port {host_port}"));
+                }
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("timed out waiting for postgres port mapping for {container_name}");
+            }
+            std::thread::sleep(StdDuration::from_millis(100));
+        }
+    }
+
+    fn docker_logs(container_name: &str) -> Result<String> {
+        let output = Command::new("docker")
+            .args(["logs", container_name])
+            .output()
+            .with_context(|| format!("failed to read docker logs for {container_name}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Ok(format!("{stdout}{stderr}"))
+    }
+
+    fn cleanup_container(container_name: &str) -> Result<()> {
+        let output = Command::new("docker")
+            .args(["rm", "--force", container_name])
+            .output()
+            .with_context(|| format!("failed to remove docker container {container_name}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "docker failed to remove container {container_name}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        }
+    }
+
+    fn temp_path(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{prefix}-{}", Uuid::now_v7()))
+    }
+
+    fn test_batch_identity() -> ThroughputBatchIdentity {
+        ThroughputBatchIdentity {
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "wf-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            batch_id: "batch-a".to_owned(),
+        }
+    }
+
+    fn test_batch_created_entry(identity: &ThroughputBatchIdentity) -> ThroughputChangelogEntry {
+        changelog_entry(
+            throughput_partition_key(&identity.batch_id, 0),
+            ThroughputChangelogPayload::BatchCreated {
+                identity: identity.clone(),
+                task_queue: "bulk".to_owned(),
+                execution_policy: Some("eager".to_owned()),
+                reducer: Some("count".to_owned()),
+                reducer_class: "mergeable".to_owned(),
+                aggregation_tree_depth: 2,
+                fast_lane_enabled: true,
+                aggregation_group_count: 1,
+                total_items: 1,
+                chunk_count: 0,
+            },
+        )
+    }
+
+    fn test_ownership_config(
+        static_partition_ids: Option<Vec<i32>>,
+        lease_ttl_seconds: u64,
+        partition_id_offset: i32,
+    ) -> ThroughputOwnershipConfig {
+        ThroughputOwnershipConfig {
+            static_partition_ids,
+            runtime_capacity: 1,
+            member_heartbeat_ttl_seconds: 15,
+            assignment_poll_interval_seconds: 1,
+            rebalance_interval_seconds: 1,
+            lease_ttl_seconds,
+            renew_interval_seconds: 1,
+            partition_id_offset,
+        }
+    }
 
     #[test]
     fn retry_projection_records_include_scheduled_chunk_state() {
@@ -3275,6 +3669,197 @@ mod tests {
 
         assert_eq!(result_handle, Value::Null);
         assert_eq!(output, None);
+    }
+
+    #[test]
+    fn stream_batch_terminal_identity_is_deterministic_for_report_terminals() {
+        let occurred_at = Utc::now();
+        let dedupe_key = stream_batch_terminal_dedupe_key(
+            "tenant-a",
+            "wf-a",
+            "run-a",
+            "batch-a",
+            "completed",
+            Some("report-a"),
+            occurred_at,
+        );
+        assert_eq!(
+            dedupe_key,
+            "throughput-terminal:tenant-a:wf-a:run-a:batch-a:completed:report-a"
+        );
+        assert_eq!(
+            stream_batch_terminal_event_id(&dedupe_key),
+            stream_batch_terminal_event_id(&dedupe_key)
+        );
+    }
+
+    #[test]
+    fn stream_batch_terminal_identity_changes_when_projected_terminal_changes() {
+        let occurred_at = Utc::now();
+        let completed = stream_batch_terminal_dedupe_key(
+            "tenant-a",
+            "wf-a",
+            "run-a",
+            "batch-a",
+            "completed",
+            None,
+            occurred_at,
+        );
+        let failed = stream_batch_terminal_dedupe_key(
+            "tenant-a",
+            "wf-a",
+            "run-a",
+            "batch-a",
+            "failed",
+            None,
+            occurred_at,
+        );
+        let shifted = stream_batch_terminal_dedupe_key(
+            "tenant-a",
+            "wf-a",
+            "run-a",
+            "batch-a",
+            "completed",
+            None,
+            occurred_at + chrono::Duration::milliseconds(1),
+        );
+
+        assert_ne!(completed, failed);
+        assert_ne!(completed, shifted);
+        assert_ne!(
+            stream_batch_terminal_event_id(&completed),
+            stream_batch_terminal_event_id(&shifted)
+        );
+    }
+
+    #[tokio::test]
+    async fn ownership_pass_claims_partition_after_checkpoint_restore_when_caught_up() -> Result<()>
+    {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let identity = test_batch_identity();
+
+        let db_path = temp_path("throughput-ownership-restore-db");
+        let checkpoint_dir = temp_path("throughput-ownership-restore-checkpoints");
+        let state = LocalThroughputState::open(&db_path, &checkpoint_dir, 3)?;
+        state.apply_changelog_entry(0, 1, &test_batch_created_entry(&identity))?;
+        let _checkpoint = state.write_checkpoint()?;
+
+        let restored_db_path = temp_path("throughput-ownership-restore-restored-db");
+        let restored = LocalThroughputState::open(&restored_db_path, &checkpoint_dir, 3)?;
+        assert!(restored.restore_from_latest_checkpoint_if_empty()?);
+        restored.record_observed_high_watermark(0, 2);
+
+        let ownership = Arc::new(StdMutex::new(ThroughputOwnershipState {
+            owner_id: "runtime-a".to_owned(),
+            partition_id_offset: 100,
+            leases: HashMap::new(),
+        }));
+        let debug = Arc::new(StdMutex::new(ThroughputDebugState::default()));
+        let mut store_seeded_this_loop = false;
+
+        run_throughput_ownership_pass(
+            &store,
+            &ownership,
+            &restored,
+            &[0],
+            &HashSet::from([0]),
+            &debug,
+            &test_ownership_config(Some(vec![0]), 1, 100),
+            false,
+            &mut store_seeded_this_loop,
+        )
+        .await;
+
+        let lease = ownership
+            .lock()
+            .expect("throughput ownership lock poisoned")
+            .leases
+            .get(&0)
+            .cloned()
+            .expect("restored runtime should claim caught-up partition");
+        assert!(lease.active);
+        assert_eq!(lease.owner_epoch, 1);
+        assert!(store.validate_partition_ownership(100, "runtime-a", 1).await?);
+
+        let _ = fs::remove_dir_all(&db_path);
+        let _ = fs::remove_dir_all(&restored_db_path);
+        let _ = fs::remove_dir_all(&checkpoint_dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ownership_pass_handoffs_partition_after_expired_lease() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let config = test_ownership_config(Some(vec![0]), 1, 200);
+
+        let runtime_a_state = LocalThroughputState::open(
+            temp_path("throughput-ownership-a-db"),
+            temp_path("throughput-ownership-a-checkpoints"),
+            3,
+        )?;
+        let ownership_a = Arc::new(StdMutex::new(ThroughputOwnershipState {
+            owner_id: "runtime-a".to_owned(),
+            partition_id_offset: config.partition_id_offset,
+            leases: HashMap::new(),
+        }));
+        let debug_a = Arc::new(StdMutex::new(ThroughputDebugState::default()));
+        let mut seeded_a = false;
+        run_throughput_ownership_pass(
+            &store,
+            &ownership_a,
+            &runtime_a_state,
+            &[0],
+            &HashSet::from([0]),
+            &debug_a,
+            &config,
+            false,
+            &mut seeded_a,
+        )
+        .await;
+        assert!(store.validate_partition_ownership(200, "runtime-a", 1).await?);
+
+        sleep(StdDuration::from_millis(1100)).await;
+
+        let runtime_b_state = LocalThroughputState::open(
+            temp_path("throughput-ownership-b-db"),
+            temp_path("throughput-ownership-b-checkpoints"),
+            3,
+        )?;
+        let ownership_b = Arc::new(StdMutex::new(ThroughputOwnershipState {
+            owner_id: "runtime-b".to_owned(),
+            partition_id_offset: config.partition_id_offset,
+            leases: HashMap::new(),
+        }));
+        let debug_b = Arc::new(StdMutex::new(ThroughputDebugState::default()));
+        let mut seeded_b = false;
+        run_throughput_ownership_pass(
+            &store,
+            &ownership_b,
+            &runtime_b_state,
+            &[0],
+            &HashSet::from([0]),
+            &debug_b,
+            &config,
+            false,
+            &mut seeded_b,
+        )
+        .await;
+
+        let handoff = store
+            .get_partition_ownership(200)
+            .await?
+            .context("handoff should persist partition ownership")?;
+        assert_eq!(handoff.owner_id, "runtime-b");
+        assert_eq!(handoff.owner_epoch, 2);
+        assert!(store.validate_partition_ownership(200, "runtime-b", 2).await?);
+        assert!(!store.validate_partition_ownership(200, "runtime-a", 1).await?);
+        Ok(())
     }
 }
 
@@ -3573,10 +4158,12 @@ fn record_throttle(state: &AppState, reason: &str) {
         "tenant_cap" => {
             debug.tenant_throttle_events = debug.tenant_throttle_events.saturating_add(1)
         }
-        "task_queue_cap" => {
+        "task_queue_cap" | "queue_paused" | "queue_draining" => {
             debug.task_queue_throttle_events = debug.task_queue_throttle_events.saturating_add(1)
         }
-        "batch_cap" => debug.batch_throttle_events = debug.batch_throttle_events.saturating_add(1),
+        "batch_cap" | "batch_paused" => {
+            debug.batch_throttle_events = debug.batch_throttle_events.saturating_add(1)
+        }
         _ => {}
     }
     debug.last_throttle_at = Some(Utc::now());

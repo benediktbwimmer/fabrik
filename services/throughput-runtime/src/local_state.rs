@@ -11,6 +11,11 @@ use fabrik_store::{
     WorkflowBulkBatchRecord, WorkflowBulkBatchStatus, WorkflowBulkChunkRecord,
     WorkflowBulkChunkStatus,
 };
+#[cfg(test)]
+use fabrik_throughput::{
+    ADMISSION_POLICY_VERSION, bulk_reducer_name, throughput_execution_mode,
+    throughput_reducer_execution_path, throughput_reducer_version, throughput_routing_reason,
+};
 use fabrik_throughput::{
     ThroughputBatchIdentity, ThroughputChangelogEntry, ThroughputChangelogPayload,
     ThroughputChunkReport, ThroughputChunkReportPayload, reduction_tree_child_group_ids,
@@ -83,6 +88,7 @@ pub struct LeaseSelectionDebug {
     pub missing_batch: u64,
     pub terminal_batch: u64,
     pub batch_failed_or_cancelled: u64,
+    pub batch_paused: u64,
     pub batch_cap_blocked: u64,
     pub missing_chunk: u64,
     pub chunk_not_scheduled: u64,
@@ -957,6 +963,7 @@ impl LocalThroughputState {
         owned_partitions: Option<&HashSet<i32>>,
         partition_count: i32,
     ) -> Result<Option<LeasedChunkSnapshot>> {
+        let paused_batch_ids = HashSet::new();
         Ok(self
             .lease_ready_chunks(
                 tenant_id,
@@ -965,6 +972,7 @@ impl LocalThroughputState {
                 now,
                 lease_ttl,
                 max_active_chunks_per_batch,
+                &paused_batch_ids,
                 owned_partitions,
                 partition_count,
                 1,
@@ -981,6 +989,7 @@ impl LocalThroughputState {
         now: DateTime<Utc>,
         lease_ttl: chrono::Duration,
         max_active_chunks_per_batch: Option<usize>,
+        paused_batch_ids: &HashSet<String>,
         owned_partitions: Option<&HashSet<i32>>,
         partition_count: i32,
         max_chunks: usize,
@@ -1014,6 +1023,9 @@ impl LocalThroughputState {
                 || batch.failed_items > 0
                 || batch.cancelled_items > 0
             {
+                continue;
+            }
+            if paused_batch_ids.contains(&candidate.identity.batch_id) {
                 continue;
             }
             if max_active_chunks_per_batch.is_some_and(|limit| {
@@ -1084,6 +1096,7 @@ impl LocalThroughputState {
         task_queue: &str,
         now: DateTime<Utc>,
         max_active_chunks_per_batch: Option<usize>,
+        paused_batch_ids: &HashSet<String>,
         owned_partitions: Option<&HashSet<i32>>,
         partition_count: i32,
     ) -> Result<LeaseSelectionDebug> {
@@ -1116,6 +1129,10 @@ impl LocalThroughputState {
             }
             if batch.failed_items > 0 || batch.cancelled_items > 0 {
                 debug.batch_failed_or_cancelled = debug.batch_failed_or_cancelled.saturating_add(1);
+                continue;
+            }
+            if paused_batch_ids.contains(&candidate.identity.batch_id) {
+                debug.batch_paused = debug.batch_paused.saturating_add(1);
                 continue;
             }
             if max_active_chunks_per_batch.is_some_and(|limit| {
@@ -3645,9 +3662,22 @@ mod tests {
             result_handle: Value::Null,
             throughput_backend: "stream-v2".to_owned(),
             throughput_backend_version: "2.0.0".to_owned(),
+            execution_mode: throughput_execution_mode("stream-v2").to_owned(),
+            selected_backend: "stream-v2".to_owned(),
+            routing_reason: throughput_routing_reason("stream-v2", Some("eager"), Some("count"))
+                .to_owned(),
+            admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
             execution_policy: Some("eager".to_owned()),
             reducer: Some("count".to_owned()),
+            reducer_kind: bulk_reducer_name(Some("count")).to_owned(),
             reducer_class: "mergeable".to_owned(),
+            reducer_version: throughput_reducer_version(Some("count")).to_owned(),
+            reducer_execution_path: throughput_reducer_execution_path(
+                "stream-v2",
+                Some("eager"),
+                Some("count"),
+            )
+            .to_owned(),
             aggregation_tree_depth: 2,
             fast_lane_enabled: true,
             aggregation_group_count,
@@ -4398,6 +4428,195 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&db_path);
+        let _ = fs::remove_dir_all(&checkpoint_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn local_state_restored_checkpoint_rejects_duplicate_report_after_restore() -> Result<()> {
+        let db_path = temp_path("throughput-state-duplicate-report-db");
+        let checkpoint_dir = temp_path("throughput-state-duplicate-report-checkpoints");
+        let state = LocalThroughputState::open(&db_path, &checkpoint_dir, 3)?;
+        let batch_identity = identity();
+
+        state.apply_changelog_entry(
+            0,
+            1,
+            &entry(ThroughputChangelogPayload::BatchCreated {
+                identity: batch_identity.clone(),
+                task_queue: "bulk".to_owned(),
+                execution_policy: Some("eager".to_owned()),
+                reducer: Some("count".to_owned()),
+                reducer_class: "mergeable".to_owned(),
+                aggregation_tree_depth: 2,
+                fast_lane_enabled: true,
+                aggregation_group_count: 1,
+                total_items: 2,
+                chunk_count: 2,
+            }),
+        )?;
+        state.apply_changelog_entry(
+            0,
+            2,
+            &entry(ThroughputChangelogPayload::ChunkLeased {
+                identity: batch_identity.clone(),
+                chunk_id: "chunk-report".to_owned(),
+                chunk_index: 0,
+                attempt: 1,
+                group_id: 0,
+                item_count: 1,
+                max_attempts: 2,
+                retry_delay_ms: 250,
+                lease_epoch: 1,
+                owner_epoch: 1,
+                worker_id: "worker-a".to_owned(),
+                lease_token: TEST_LEASE_TOKEN.to_owned(),
+                lease_expires_at: Utc::now() + chrono::Duration::seconds(30),
+            }),
+        )?;
+        state.apply_changelog_entry(
+            0,
+            3,
+            &entry(ThroughputChangelogPayload::ChunkApplied {
+                identity: batch_identity.clone(),
+                chunk_id: "chunk-report".to_owned(),
+                chunk_index: 0,
+                attempt: 1,
+                group_id: 0,
+                item_count: 1,
+                max_attempts: 2,
+                retry_delay_ms: 250,
+                lease_epoch: 1,
+                owner_epoch: 1,
+                report_id: "report-1".to_owned(),
+                status: "completed".to_owned(),
+                available_at: Utc::now(),
+                result_handle: None,
+                output: None,
+                error: None,
+                cancellation_reason: None,
+                cancellation_metadata: None,
+            }),
+        )?;
+        let _checkpoint = state.write_checkpoint()?;
+
+        let restored_db_path = temp_path("throughput-state-duplicate-report-restored-db");
+        let restored = LocalThroughputState::open(&restored_db_path, &checkpoint_dir, 3)?;
+        assert!(restored.restore_from_latest_checkpoint_if_empty()?);
+        assert_eq!(
+            restored.validate_report(
+                &batch_identity,
+                "chunk-report",
+                1,
+                1,
+                TEST_LEASE_TOKEN,
+                1,
+                "report-1",
+            )?,
+            ReportValidation::RejectAlreadyApplied
+        );
+
+        let _ = fs::remove_dir_all(&db_path);
+        let _ = fs::remove_dir_all(&restored_db_path);
+        let _ = fs::remove_dir_all(&checkpoint_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn local_state_restored_checkpoint_rejects_old_owner_after_handoff() -> Result<()> {
+        let db_path = temp_path("throughput-state-owner-handoff-db");
+        let checkpoint_dir = temp_path("throughput-state-owner-handoff-checkpoints");
+        let state = LocalThroughputState::open(&db_path, &checkpoint_dir, 3)?;
+        let batch_identity = identity();
+        let lease_expires_at = Utc::now() + chrono::Duration::seconds(30);
+
+        state.apply_changelog_entry(
+            0,
+            1,
+            &entry(ThroughputChangelogPayload::BatchCreated {
+                identity: batch_identity.clone(),
+                task_queue: "bulk".to_owned(),
+                execution_policy: Some("eager".to_owned()),
+                reducer: Some("count".to_owned()),
+                reducer_class: "mergeable".to_owned(),
+                aggregation_tree_depth: 2,
+                fast_lane_enabled: true,
+                aggregation_group_count: 1,
+                total_items: 1,
+                chunk_count: 1,
+            }),
+        )?;
+        state.apply_changelog_entry(
+            0,
+            2,
+            &entry(ThroughputChangelogPayload::ChunkLeased {
+                identity: batch_identity.clone(),
+                chunk_id: "chunk-report".to_owned(),
+                chunk_index: 0,
+                attempt: 1,
+                group_id: 0,
+                item_count: 1,
+                max_attempts: 2,
+                retry_delay_ms: 250,
+                lease_epoch: 1,
+                owner_epoch: 1,
+                worker_id: "worker-a".to_owned(),
+                lease_token: TEST_LEASE_TOKEN.to_owned(),
+                lease_expires_at,
+            }),
+        )?;
+        let _checkpoint = state.write_checkpoint()?;
+
+        let restored_db_path = temp_path("throughput-state-owner-handoff-restored-db");
+        let restored = LocalThroughputState::open(&restored_db_path, &checkpoint_dir, 3)?;
+        assert!(restored.restore_from_latest_checkpoint_if_empty()?);
+        restored.apply_changelog_entry(
+            0,
+            3,
+            &entry(ThroughputChangelogPayload::ChunkLeased {
+                identity: batch_identity.clone(),
+                chunk_id: "chunk-report".to_owned(),
+                chunk_index: 0,
+                attempt: 1,
+                group_id: 0,
+                item_count: 1,
+                max_attempts: 2,
+                retry_delay_ms: 250,
+                lease_epoch: 1,
+                owner_epoch: 2,
+                worker_id: "worker-b".to_owned(),
+                lease_token: TEST_LEASE_TOKEN.to_owned(),
+                lease_expires_at,
+            }),
+        )?;
+
+        assert_eq!(
+            restored.validate_report(
+                &batch_identity,
+                "chunk-report",
+                1,
+                1,
+                TEST_LEASE_TOKEN,
+                1,
+                "report-stale-owner",
+            )?,
+            ReportValidation::RejectOwnerEpochMismatch
+        );
+        assert_eq!(
+            restored.validate_report(
+                &batch_identity,
+                "chunk-report",
+                1,
+                1,
+                TEST_LEASE_TOKEN,
+                2,
+                "report-current-owner",
+            )?,
+            ReportValidation::Accept
+        );
+
+        let _ = fs::remove_dir_all(&db_path);
+        let _ = fs::remove_dir_all(&restored_db_path);
         let _ = fs::remove_dir_all(&checkpoint_dir);
         Ok(())
     }

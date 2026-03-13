@@ -260,6 +260,101 @@ test("compiler lowers Temporal continueAsNew and object proxy activity calls", a
   assert.match(serialized, /"handler":"benchmarkEcho"/);
 });
 
+test("compiler lowers supported Temporal workflow APIs and namespace imports", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-supported-api-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalSupportedApiWorkflow",
+    "--definition-id",
+    "temporal-supported-api-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"kind":"workflow_info"/);
+  assert.match(serialized, /"kind":"uuid"/);
+  assert.match(serialized, /"parent_close_policy":"ABANDON"/);
+  assert.match(serialized, /"type":"fail"/);
+  assert.ok(!serialized.includes("wf.log"));
+});
+
+test("compiler lowers switch statements and awaited Temporal continueAsNew", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-switch-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalSwitchWorkflow",
+    "--definition-id",
+    "temporal-switch-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"choice"/);
+  assert.match(serialized, /"op":"equal"/);
+  assert.match(serialized, /"type":"continue_as_new"/);
+  assert.match(serialized, /"ApplicationFailure"/);
+});
+
+test("compiler lowers Date.now, Object.keys, and array join expressions", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-expression-builtins-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalExpressionBuiltinsWorkflow",
+    "--definition-id",
+    "temporal-expression-builtins-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"kind":"now"/);
+  assert.match(serialized, /"callee":"__builtin_object_keys"/);
+  assert.match(serialized, /"callee":"__builtin_array_join"/);
+});
+
+test("compiler lowers dynamic Temporal sleep durations", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-dynamic-sleep-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalDynamicSleepWorkflow",
+    "--definition-id",
+    "temporal-dynamic-sleep-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"wait_for_timer"/);
+  assert.match(serialized, /"timer_expr"/);
+  assert.match(serialized, /"op":"coalesce"/);
+});
+
 test("compiler lowers Temporal Promise.all proxy activity maps into fan-out plus barrier", async () => {
   const fixture = path.join(
     root,
@@ -340,7 +435,7 @@ test("compiler lowers the real Temporal benchmark workflow module", async () => 
     "--entry",
     fixture,
     "--export",
-    "fanoutBenchmarkWorkflow",
+    "comparisonBenchmarkWorkflow",
     "--definition-id",
     "temporal-benchmark-workflow",
     "--version",

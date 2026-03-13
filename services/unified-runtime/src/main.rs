@@ -3,7 +3,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -19,7 +19,9 @@ use fabrik_broker::{
     BrokerConfig, WorkflowHistoryFilter, WorkflowPublisher, build_workflow_consumer,
     decode_consumed_workflow_event, partition_for_instance, read_workflow_history,
 };
-use fabrik_config::{GrpcServiceConfig, HttpServiceConfig, PostgresConfig, RedpandaConfig};
+use fabrik_config::{
+    ExecutorRuntimeConfig, GrpcServiceConfig, HttpServiceConfig, PostgresConfig, RedpandaConfig,
+};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
@@ -29,7 +31,8 @@ use fabrik_store::{
     WorkflowStore,
 };
 use fabrik_throughput::{
-    ThroughputBackend, bulk_reducer_class, decode_cbor, encode_cbor, planned_reduction_tree_depth,
+    ADMISSION_POLICY_VERSION, ThroughputBackend, bulk_reducer_class, bulk_reducer_is_mergeable,
+    bulk_reducer_materializes_results, decode_cbor, encode_cbor, planned_reduction_tree_depth,
     stream_v2_fast_lane_enabled,
 };
 use fabrik_worker_protocol::activity_worker::{
@@ -44,7 +47,7 @@ use fabrik_worker_protocol::activity_worker::{
 };
 use fabrik_workflow::{
     ArtifactExecutionState, CompiledExecutionPlan, CompiledWorkflowArtifact, ExecutionTurnContext,
-    RetryPolicy, WorkflowInstanceState, WorkflowStatus, parse_timer_ref,
+    RetryPolicy, WorkflowInstanceState, WorkflowStatus, execution_state_for_event, parse_timer_ref,
     replay_compiled_history_trace, replay_compiled_history_trace_from_snapshot,
     replay_history_trace_from_snapshot, retry_policy_allows_failure_retry,
 };
@@ -67,6 +70,7 @@ const BULK_EVENT_OUTBOX_BATCH_SIZE: usize = 128;
 const BULK_EVENT_OUTBOX_LEASE_SECONDS: i64 = 30;
 const BULK_EVENT_OUTBOX_RETRY_MS: u64 = 250;
 const COMPILED_ARTIFACT_CACHE_CAPACITY: usize = 64;
+const TASK_QUEUE_POLICY_CACHE_TTL_MS: u64 = 1_000;
 
 #[derive(Clone)]
 struct AppState {
@@ -82,8 +86,40 @@ struct AppState {
     persist_notify: Arc<Notify>,
     persist_lock: Arc<Mutex<()>>,
     persistence: PersistenceConfig,
+    admission: BulkAdmissionConfig,
+    task_queue_policy_cache: Arc<StdMutex<HashMap<TaskQueuePolicyCacheKey, CachedTaskQueuePolicy>>>,
     debug: Arc<StdMutex<UnifiedDebugState>>,
     outbox_publisher_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct BulkAdmissionConfig {
+    default_backend: String,
+    task_queue_backends: BTreeMap<String, String>,
+    stream_v2_min_items: usize,
+    stream_v2_min_chunks: u32,
+    max_active_chunks_per_tenant: usize,
+    max_active_chunks_per_task_queue: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BulkAdmissionDecision {
+    selected_backend: String,
+    selected_backend_version: String,
+    routing_reason: String,
+    admission_policy_version: String,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct TaskQueuePolicyCacheKey {
+    tenant_id: String,
+    task_queue: String,
+}
+
+#[derive(Debug, Clone)]
+struct CachedTaskQueuePolicy {
+    backend: Option<String>,
+    fetched_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +135,27 @@ struct OwnershipConfig {
     owner_id: String,
     lease_ttl: Duration,
     renew_interval_ms: u64,
+}
+
+impl BulkAdmissionConfig {
+    fn from_env() -> Result<Self> {
+        let executor = ExecutorRuntimeConfig::from_env()
+            .context("failed to load executor throughput backend routing config")?;
+        Ok(Self {
+            default_backend: executor.throughput_default_backend,
+            task_queue_backends: executor.throughput_task_queue_backends,
+            stream_v2_min_items: read_env_usize("UNIFIED_RUNTIME_STREAM_V2_MIN_ITEMS", 512)?,
+            stream_v2_min_chunks: read_env_u32("UNIFIED_RUNTIME_STREAM_V2_MIN_CHUNKS", 8)?,
+            max_active_chunks_per_tenant: read_env_usize(
+                "THROUGHPUT_MAX_ACTIVE_CHUNKS_PER_TENANT",
+                4_096,
+            )?,
+            max_active_chunks_per_task_queue: read_env_usize(
+                "THROUGHPUT_MAX_ACTIVE_CHUNKS_PER_TASK_QUEUE",
+                2_048,
+            )?,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -128,6 +185,18 @@ struct UnifiedDebugState {
     restored_from_snapshot: bool,
     restore_records_applied: u64,
     workflow_triggers_applied: u64,
+    trigger_total_micros: u64,
+    trigger_artifact_load_micros: u64,
+    trigger_plan_micros: u64,
+    trigger_state_apply_micros: u64,
+    trigger_db_apply_micros: u64,
+    trigger_post_plan_micros: u64,
+    trigger_bulk_admission_micros: u64,
+    trigger_bulk_pg_materialize_micros: u64,
+    trigger_bulk_publish_micros: u64,
+    trigger_bulk_events_published: u64,
+    trigger_cancel_check_micros: u64,
+    trigger_mailbox_drain_micros: u64,
     duplicate_triggers_ignored: u64,
     ignored_missing_instance_reports: u64,
     ignored_terminal_instance_reports: u64,
@@ -152,6 +221,10 @@ struct UnifiedDebugState {
     snapshot_writes: u64,
 }
 
+fn elapsed_micros(started_at: Instant) -> u64 {
+    started_at.elapsed().as_micros().try_into().unwrap_or(u64::MAX)
+}
+
 fn shared_compiled_artifact_cache() -> &'static StdMutex<SharedCompiledArtifactCache> {
     SHARED_COMPILED_ARTIFACT_CACHE
         .get_or_init(|| StdMutex::new(SharedCompiledArtifactCache::default()))
@@ -160,9 +233,8 @@ fn shared_compiled_artifact_cache() -> &'static StdMutex<SharedCompiledArtifactC
 fn get_cached_compiled_artifact(
     key: &CompiledArtifactCacheKey,
 ) -> Option<Option<CompiledWorkflowArtifact>> {
-    let mut cache = shared_compiled_artifact_cache()
-        .lock()
-        .expect("compiled artifact cache lock poisoned");
+    let mut cache =
+        shared_compiled_artifact_cache().lock().expect("compiled artifact cache lock poisoned");
     let access_epoch = cache.access_epoch.saturating_add(1);
     cache.access_epoch = access_epoch;
     let entry = cache.entries.get_mut(key)?;
@@ -174,9 +246,8 @@ fn cache_compiled_artifact(
     key: &CompiledArtifactCacheKey,
     artifact: Option<&CompiledWorkflowArtifact>,
 ) {
-    let mut cache = shared_compiled_artifact_cache()
-        .lock()
-        .expect("compiled artifact cache lock poisoned");
+    let mut cache =
+        shared_compiled_artifact_cache().lock().expect("compiled artifact cache lock poisoned");
     let access_epoch = cache.access_epoch.saturating_add(1);
     cache.access_epoch = access_epoch;
     cache.entries.insert(
@@ -199,6 +270,26 @@ fn evict_cached_compiled_artifacts(cache: &mut SharedCompiledArtifactCache) {
     let remove_count = cache.entries.len().saturating_sub(COMPILED_ARTIFACT_CACHE_CAPACITY);
     for (_, key) in lru.into_iter().take(remove_count) {
         cache.entries.remove(&key);
+    }
+}
+
+fn read_env_usize(key: &str, default: usize) -> Result<usize> {
+    match env::var(key) {
+        Ok(raw) => {
+            raw.parse::<usize>().with_context(|| format!("{key} must be a valid usize, got {raw}"))
+        }
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(source) => Err(anyhow::anyhow!("failed to read {key}: {source}")),
+    }
+}
+
+fn read_env_u32(key: &str, default: u32) -> Result<u32> {
+    match env::var(key) {
+        Ok(raw) => {
+            raw.parse::<u32>().with_context(|| format!("{key} must be a valid u32, got {raw}"))
+        }
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(source) => Err(anyhow::anyhow!("failed to read {key}: {source}")),
     }
 }
 
@@ -492,6 +583,7 @@ async fn main() -> Result<()> {
     let debug_config = HttpServiceConfig::from_env("UNIFIED_DEBUG", "unified-runtime-debug", 3008)?;
     let postgres = PostgresConfig::from_env()?;
     let redpanda = RedpandaConfig::from_env()?;
+    let admission = BulkAdmissionConfig::from_env()?;
     init_tracing(&config.log_filter);
     let broker = BrokerConfig::new(
         redpanda.brokers.clone(),
@@ -560,6 +652,8 @@ async fn main() -> Result<()> {
         persist_notify: Arc::new(Notify::new()),
         persist_lock: Arc::new(Mutex::new(())),
         persistence,
+        admission,
+        task_queue_policy_cache: Arc::new(StdMutex::new(HashMap::new())),
         debug: debug.clone(),
         outbox_publisher_id: format!("unified-runtime:{}", Uuid::now_v7()),
     };
@@ -653,12 +747,9 @@ async fn restore_runtime_state_from_store(
     broker: &BrokerConfig,
     debug: &Arc<StdMutex<UnifiedDebugState>>,
 ) -> Result<RuntimeInner> {
-    let snapshots = store.list_nonterminal_snapshots().await?;
-    if snapshots.is_empty() {
-        return Ok(RuntimeInner::default());
-    }
-
     let mut inner = RuntimeInner::default();
+    let mut restored_runs = HashSet::new();
+    let snapshots = store.list_nonterminal_snapshots().await?;
     for snapshot in snapshots {
         let definition_version =
             snapshot.state.definition_version.or(snapshot.definition_version).ok_or_else(|| {
@@ -682,33 +773,9 @@ async fn restore_runtime_state_from_store(
             })?;
         let instance =
             restore_instance_from_store_snapshot_tail(store, broker, &snapshot, &artifact).await?;
-        let activities = store
-            .list_activities_for_run(&snapshot.tenant_id, &snapshot.instance_id, &snapshot.run_id)
-            .await?;
-        let mut active_activities = BTreeMap::new();
-        for activity in activities {
-            if !matches!(
-                activity.status,
-                WorkflowActivityStatus::Scheduled | WorkflowActivityStatus::Started
-            ) {
-                continue;
-            }
-            let task = queued_activity_from_record(&activity);
-            let should_replace = active_activities
-                .get(&activity.activity_id)
-                .is_none_or(|active: &ActiveActivityMeta| active.attempt <= activity.attempt);
-            if should_replace {
-                active_activities.insert(
-                    activity.activity_id.clone(),
-                    ActiveActivityMeta {
-                        attempt: activity.attempt,
-                        task_queue: activity.task_queue.clone(),
-                        activity_type: activity.activity_type.clone(),
-                        wait_state: activity.state.clone().unwrap_or_default(),
-                        omit_success_output: false,
-                    },
-                );
-            }
+        let (run_key, runtime, ready) =
+            restore_runtime_from_instance_row(store, instance, Some(artifact)).await?;
+        for task in ready {
             inner
                 .ready
                 .entry(QueueKey {
@@ -718,15 +785,33 @@ async fn restore_runtime_state_from_store(
                 .or_default()
                 .push_back(task);
         }
+        restored_runs.insert(run_key.clone());
+        inner.instances.insert(run_key, runtime);
+    }
 
-        inner.instances.insert(
-            RunKey {
-                tenant_id: snapshot.tenant_id.clone(),
-                instance_id: snapshot.instance_id.clone(),
-                run_id: snapshot.run_id.clone(),
-            },
-            RuntimeWorkflowState { artifact, instance, active_activities },
-        );
+    for instance in store.list_nonterminal_instances().await? {
+        let run_key = RunKey {
+            tenant_id: instance.tenant_id.clone(),
+            instance_id: instance.instance_id.clone(),
+            run_id: instance.run_id.clone(),
+        };
+        if restored_runs.contains(&run_key) {
+            continue;
+        }
+        let (run_key, runtime, ready) =
+            restore_runtime_from_instance_row(store, instance, None).await?;
+        for task in ready {
+            inner
+                .ready
+                .entry(QueueKey {
+                    tenant_id: task.tenant_id.clone(),
+                    task_queue: task.task_queue.clone(),
+                })
+                .or_default()
+                .push_back(task);
+        }
+        restored_runs.insert(run_key.clone());
+        inner.instances.insert(run_key, runtime);
     }
 
     let mut debug = debug.lock().expect("unified debug lock poisoned");
@@ -964,7 +1049,7 @@ fn replay_unified_compiled_snapshot_tail(
         }
 
         let current_state = replayed.current_state.clone().unwrap_or_default();
-        let execution_state = replayed.artifact_execution.clone().unwrap_or_default();
+        let execution_state = execution_state_for_event(&replayed, history_tail.get(index));
         if let Some((plan, applied)) = artifact.try_execute_after_step_terminal_batch_with_turn(
             &current_state,
             &history_tail[index..],
@@ -980,7 +1065,7 @@ fn replay_unified_compiled_snapshot_tail(
 
         let event = &history_tail[index];
         replayed.apply_event(event);
-        let execution_state = replayed.artifact_execution.clone().unwrap_or_default();
+        let execution_state = execution_state_for_event(&replayed, Some(event));
         let turn_context =
             ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at };
         match &event.payload {
@@ -1241,6 +1326,7 @@ async fn run_trigger_consumer(
 }
 
 async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEvent>) -> Result<()> {
+    let total_started_at = Instant::now();
     let WorkflowEvent::WorkflowTriggered { input } = &event.payload else {
         return Ok(());
     };
@@ -1263,6 +1349,7 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
         }
     }
 
+    let artifact_started_at = Instant::now();
     let artifact = load_compiled_artifact_version(
         state,
         &event.tenant_id,
@@ -1271,17 +1358,23 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
     )
     .await?
     .ok_or_else(|| {
-            anyhow::anyhow!(
-                "missing artifact {} v{} for tenant {}",
-                event.definition_id,
-                event.definition_version,
-                event.tenant_id
-            )
-        })?;
-    let plan = artifact.execute_trigger_with_turn(
+        anyhow::anyhow!(
+            "missing artifact {} v{} for tenant {}",
+            event.definition_id,
+            event.definition_version,
+            event.tenant_id
+        )
+    })?;
+    let artifact_load_micros = elapsed_micros(artifact_started_at);
+    let plan_started_at = Instant::now();
+    let projected = WorkflowInstanceState::try_from(&event)
+        .context("trigger event did not project workflow state")?;
+    let plan = artifact.execute_trigger_with_state_and_turn(
         input,
+        execution_state_for_event(&projected, Some(&event)),
         ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at },
     )?;
+    let plan_micros = elapsed_micros(plan_started_at);
     let workflow_task_queue =
         event.metadata.get("workflow_task_queue").cloned().unwrap_or_else(|| "default".to_owned());
 
@@ -1310,6 +1403,7 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
     };
     apply_compiled_plan(&mut instance, &plan);
     let queued = schedule_activities_from_plan(&artifact, &instance, &plan, event.occurred_at)?;
+    let state_apply_started_at = Instant::now();
     {
         let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
         let runtime = RuntimeWorkflowState {
@@ -1344,14 +1438,18 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
         }
         mark_runtime_dirty(&mut inner, "trigger", true);
     }
+    let state_apply_micros = elapsed_micros(state_apply_started_at);
     let schedule_actions =
         queued.iter().cloned().map(PreparedDbAction::Schedule).collect::<Vec<_>>();
+    let db_apply_started_at = Instant::now();
     apply_db_actions(
         state,
         vec![PreparedDbAction::UpsertInstance(instance.clone())],
         schedule_actions,
     )
     .await?;
+    let db_apply_micros = elapsed_micros(db_apply_started_at);
+    let post_plan_started_at = Instant::now();
     apply_post_plan_effects_with_options(
         state,
         PostPlanEffect {
@@ -1365,6 +1463,8 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
         false,
     )
     .await?;
+    let post_plan_micros = elapsed_micros(post_plan_started_at);
+    let cancel_check_started_at = Instant::now();
     maybe_enact_pending_workflow_cancellation_unified(
         state,
         &run_key,
@@ -1372,11 +1472,28 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
         event.occurred_at,
     )
     .await?;
+    let cancel_check_micros = elapsed_micros(cancel_check_started_at);
     state.notify.notify_waiters();
     state.persist_notify.notify_one();
+    let mailbox_drain_started_at = Instant::now();
     drain_mailbox_for_run(state, &run_key.tenant_id, &run_key.instance_id, &run_key.run_id).await?;
+    let mailbox_drain_micros = elapsed_micros(mailbox_drain_started_at);
     let mut debug = state.debug.lock().expect("unified debug lock poisoned");
     debug.workflow_triggers_applied = debug.workflow_triggers_applied.saturating_add(1);
+    debug.trigger_total_micros =
+        debug.trigger_total_micros.saturating_add(elapsed_micros(total_started_at));
+    debug.trigger_artifact_load_micros =
+        debug.trigger_artifact_load_micros.saturating_add(artifact_load_micros);
+    debug.trigger_plan_micros = debug.trigger_plan_micros.saturating_add(plan_micros);
+    debug.trigger_state_apply_micros =
+        debug.trigger_state_apply_micros.saturating_add(state_apply_micros);
+    debug.trigger_db_apply_micros = debug.trigger_db_apply_micros.saturating_add(db_apply_micros);
+    debug.trigger_post_plan_micros =
+        debug.trigger_post_plan_micros.saturating_add(post_plan_micros);
+    debug.trigger_cancel_check_micros =
+        debug.trigger_cancel_check_micros.saturating_add(cancel_check_micros);
+    debug.trigger_mailbox_drain_micros =
+        debug.trigger_mailbox_drain_micros.saturating_add(mailbox_drain_micros);
     Ok(())
 }
 
@@ -1406,7 +1523,7 @@ async fn handle_bulk_batch_terminal_event(
             .current_state
             .clone()
             .unwrap_or_else(|| runtime.artifact.workflow.initial_state.clone());
-        let execution_state = runtime.instance.artifact_execution.clone().unwrap_or_default();
+        let execution_state = execution_state_for_event(&runtime.instance, Some(&event));
         let turn_context =
             ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at };
         let plan = match &event.payload {
@@ -1572,7 +1689,7 @@ async fn handle_timer_fired_event(
 
     let current_state =
         instance.current_state.clone().unwrap_or_else(|| artifact.workflow.initial_state.clone());
-    let execution_state = instance.artifact_execution.clone().unwrap_or_default();
+    let execution_state = execution_state_for_event(&instance, Some(&event));
     let plan = artifact.execute_after_timer_with_turn(
         &current_state,
         timer_id,
@@ -1795,7 +1912,7 @@ async fn handle_activity_cancellation_requested_event(
                 )
                 .with_occurred_at(event.occurred_at);
                 let execution_state =
-                    runtime.instance.artifact_execution.clone().unwrap_or_default();
+                    execution_state_for_event(&runtime.instance, Some(&cancelled_event));
                 if let Some((plan, _)) =
                     runtime.artifact.try_execute_after_step_terminal_batch_with_turn(
                         &wait_state,
@@ -2597,11 +2714,6 @@ async fn dispatch_signal_mailbox_item_unified(
     if instance.status.is_terminal() {
         return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
     }
-    let execution_state = instance.artifact_execution.clone().unwrap_or_default();
-    if execution_state.active_update.is_some() || execution_state.active_signal.is_some() {
-        return Ok(MailboxDrainOutcome::Blocked);
-    }
-
     let current_state =
         instance.current_state.clone().unwrap_or_else(|| artifact.workflow.initial_state.clone());
     let now = Utc::now();
@@ -2634,6 +2746,10 @@ async fn dispatch_signal_mailbox_item_unified(
     signal_event.correlation_id =
         item.source_event.correlation_id.or(Some(item.source_event.event_id));
     signal_event.dedupe_key = Some(format!("signal:{message_id}"));
+    let execution_state = execution_state_for_event(&instance, Some(&signal_event));
+    if execution_state.active_update.is_some() || execution_state.active_signal.is_some() {
+        return Ok(MailboxDrainOutcome::Blocked);
+    }
 
     let plan = if artifact
         .expected_signal_type(&current_state)?
@@ -3263,7 +3379,7 @@ async fn dispatch_update_mailbox_item_unified(
         return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
     }
 
-    let execution_state = instance.artifact_execution.clone().unwrap_or_default();
+    let execution_state = execution_state_for_event(&instance, None);
     if execution_state.active_update.is_some() || execution_state.active_signal.is_some() {
         return Ok(MailboxDrainOutcome::Blocked);
     }
@@ -3758,7 +3874,7 @@ async fn reflect_terminal_children_to_parents(
                 &wait_state,
                 &parent_child.child_id,
                 output.as_ref().unwrap_or(&Value::Null),
-                parent_instance.artifact_execution.clone().unwrap_or_default(),
+                execution_state_for_event(&parent_instance, Some(&reflection_event)),
                 ExecutionTurnContext {
                     event_id: reflection_event.event_id,
                     occurred_at: reflection_event.occurred_at,
@@ -3769,7 +3885,7 @@ async fn reflect_terminal_children_to_parents(
                 &wait_state,
                 &parent_child.child_id,
                 error.as_deref().unwrap_or("child workflow failed"),
-                parent_instance.artifact_execution.clone().unwrap_or_default(),
+                execution_state_for_event(&parent_instance, Some(&reflection_event)),
                 ExecutionTurnContext {
                     event_id: reflection_event.event_id,
                     occurred_at: reflection_event.occurred_at,
@@ -4267,17 +4383,40 @@ async fn materialize_bulk_batches_from_plan(
             execution_policy,
             reducer,
             throughput_backend,
-            throughput_backend_version,
+            throughput_backend_version: _,
             state: workflow_state,
         } = &emission.event
         else {
             continue;
         };
 
-        if throughput_backend == ThroughputBackend::PgV1.as_str() {
+        let admission_started_at = Instant::now();
+        let admission = admit_bulk_batch(
+            state,
+            &instance.tenant_id,
+            task_queue,
+            is_supported_throughput_backend(throughput_backend)
+                .then_some(throughput_backend.as_str()),
+            execution_policy.as_deref(),
+            reducer.as_deref(),
+            items.len(),
+            *chunk_size,
+        )
+        .await?;
+        {
+            let mut debug = state.debug.lock().expect("unified debug lock poisoned");
+            debug.trigger_bulk_admission_micros = debug
+                .trigger_bulk_admission_micros
+                .saturating_add(elapsed_micros(admission_started_at));
+        }
+        let selected_backend = admission.selected_backend.as_str();
+        let selected_backend_version = admission.selected_backend_version.as_str();
+
+        if selected_backend == ThroughputBackend::PgV1.as_str() {
+            let pg_materialize_started_at = Instant::now();
             let reducer_class = bulk_reducer_class(reducer.as_deref());
             let fast_lane_enabled = stream_v2_fast_lane_enabled(
-                throughput_backend,
+                selected_backend,
                 execution_policy.as_deref(),
                 reducer.as_deref(),
             );
@@ -4292,7 +4431,7 @@ async fn materialize_bulk_batches_from_plan(
             );
             let _ = state
                 .store
-                .upsert_bulk_batch(
+                .persist_bulk_batch_with_metadata(
                     &instance.tenant_id,
                     &instance.instance_id,
                     &instance.run_id,
@@ -4315,26 +4454,221 @@ async fn materialize_bulk_batches_from_plan(
                     aggregation_tree_depth,
                     fast_lane_enabled,
                     *aggregation_group_count,
-                    throughput_backend,
-                    throughput_backend_version,
+                    selected_backend,
+                    selected_backend_version,
+                    &admission.routing_reason,
+                    &admission.admission_policy_version,
                     occurred_at,
                 )
                 .await?;
+            let mut debug = state.debug.lock().expect("unified debug lock poisoned");
+            debug.trigger_bulk_pg_materialize_micros = debug
+                .trigger_bulk_pg_materialize_micros
+                .saturating_add(elapsed_micros(pg_materialize_started_at));
         }
 
         if let Some(publisher) = state.publisher.as_ref() {
+            let publish_started_at = Instant::now();
+            let scheduled_event = WorkflowEvent::BulkActivityBatchScheduled {
+                batch_id: batch_id.clone(),
+                activity_type: activity_type.clone(),
+                task_queue: task_queue.clone(),
+                items: items.clone(),
+                input_handle: input_handle.clone(),
+                result_handle: result_handle.clone(),
+                chunk_size: *chunk_size,
+                max_attempts: *max_attempts,
+                retry_delay_ms: *retry_delay_ms,
+                aggregation_group_count: *aggregation_group_count,
+                execution_policy: execution_policy.clone(),
+                reducer: reducer.clone(),
+                throughput_backend: selected_backend.to_owned(),
+                throughput_backend_version: selected_backend_version.to_owned(),
+                state: workflow_state.clone(),
+            };
             let envelope = emitted_bulk_batch_event(
                 instance,
-                &emission.event,
-                throughput_backend,
+                &scheduled_event,
+                selected_backend,
+                &admission.routing_reason,
+                &admission.admission_policy_version,
                 source_event_id,
                 occurred_at,
             );
             publisher.publish(&envelope, &envelope.partition_key).await?;
             published = published.saturating_add(1);
+            let mut debug = state.debug.lock().expect("unified debug lock poisoned");
+            debug.trigger_bulk_publish_micros = debug
+                .trigger_bulk_publish_micros
+                .saturating_add(elapsed_micros(publish_started_at));
+            debug.trigger_bulk_events_published =
+                debug.trigger_bulk_events_published.saturating_add(1);
         }
     }
     Ok(published)
+}
+
+async fn admit_bulk_batch(
+    state: &AppState,
+    tenant_id: &str,
+    task_queue: &str,
+    requested_backend: Option<&str>,
+    execution_policy: Option<&str>,
+    reducer: Option<&str>,
+    item_count: usize,
+    chunk_size: u32,
+) -> Result<BulkAdmissionDecision> {
+    let chunk_size = chunk_size.max(1) as usize;
+    let chunk_count = if item_count == 0 { 0 } else { item_count.div_ceil(chunk_size) as u32 };
+    let configured_task_queue_backend =
+        state.admission.task_queue_backends.get(task_queue).map(String::as_str);
+    let task_queue_backend = if configured_task_queue_backend.is_some() {
+        None
+    } else {
+        cached_task_queue_throughput_backend(state, tenant_id, task_queue).await?
+    };
+    let has_task_queue_override =
+        task_queue_backend.is_some() || configured_task_queue_backend.is_some();
+    let mut decision = choose_bulk_admission_backend(
+        &state.admission,
+        requested_backend,
+        task_queue_backend.as_deref().or(configured_task_queue_backend),
+        execution_policy,
+        reducer,
+        item_count,
+        chunk_count,
+    );
+
+    if decision.selected_backend == ThroughputBackend::StreamV2.as_str()
+        && !has_task_queue_override
+        && !matches!(requested_backend, Some(backend) if backend == ThroughputBackend::StreamV2.as_str())
+    {
+        let tenant_started = state
+            .store
+            .count_started_bulk_chunks_for_backend_scope(
+                ThroughputBackend::StreamV2.as_str(),
+                Some(tenant_id),
+                None,
+                None,
+            )
+            .await?;
+        if state.admission.max_active_chunks_per_tenant > 0
+            && tenant_started >= state.admission.max_active_chunks_per_tenant as u64
+        {
+            decision = bulk_admission_decision(
+                ThroughputBackend::PgV1.as_str(),
+                "tenant_capacity_fallback",
+            );
+        } else {
+            let task_queue_started = state
+                .store
+                .count_started_bulk_chunks_for_backend_scope(
+                    ThroughputBackend::StreamV2.as_str(),
+                    Some(tenant_id),
+                    Some(task_queue),
+                    None,
+                )
+                .await?;
+            if state.admission.max_active_chunks_per_task_queue > 0
+                && task_queue_started >= state.admission.max_active_chunks_per_task_queue as u64
+            {
+                decision = bulk_admission_decision(
+                    ThroughputBackend::PgV1.as_str(),
+                    "task_queue_capacity_fallback",
+                );
+            }
+        }
+    }
+
+    Ok(decision)
+}
+
+async fn cached_task_queue_throughput_backend(
+    state: &AppState,
+    tenant_id: &str,
+    task_queue: &str,
+) -> Result<Option<String>> {
+    let key = TaskQueuePolicyCacheKey {
+        tenant_id: tenant_id.to_owned(),
+        task_queue: task_queue.to_owned(),
+    };
+    {
+        let cache = state.task_queue_policy_cache.lock().expect("task queue policy cache poisoned");
+        if let Some(entry) = cache.get(&key) {
+            if entry.fetched_at.elapsed() < Duration::from_millis(TASK_QUEUE_POLICY_CACHE_TTL_MS) {
+                return Ok(entry.backend.clone());
+            }
+        }
+    }
+
+    let backend = state
+        .store
+        .get_task_queue_throughput_policy(tenant_id, TaskQueueKind::Activity, task_queue)
+        .await?
+        .map(|record| record.backend);
+    let mut cache = state.task_queue_policy_cache.lock().expect("task queue policy cache poisoned");
+    cache.insert(
+        key,
+        CachedTaskQueuePolicy { backend: backend.clone(), fetched_at: Instant::now() },
+    );
+    Ok(backend)
+}
+
+fn choose_bulk_admission_backend(
+    config: &BulkAdmissionConfig,
+    requested_backend: Option<&str>,
+    task_queue_backend: Option<&str>,
+    _execution_policy: Option<&str>,
+    reducer: Option<&str>,
+    item_count: usize,
+    chunk_count: u32,
+) -> BulkAdmissionDecision {
+    if let Some(backend) =
+        task_queue_backend.filter(|backend| is_supported_throughput_backend(backend))
+    {
+        return bulk_admission_decision(backend, "task_queue_policy_override");
+    }
+    if let Some(backend) =
+        requested_backend.filter(|backend| is_supported_throughput_backend(backend))
+    {
+        return bulk_admission_decision(backend, "workflow_backend_hint");
+    }
+    if bulk_reducer_materializes_results(reducer) {
+        return bulk_admission_decision(ThroughputBackend::PgV1.as_str(), "materialized_results");
+    }
+    if bulk_reducer_is_mergeable(reducer)
+        && (item_count >= config.stream_v2_min_items || chunk_count >= config.stream_v2_min_chunks)
+    {
+        return bulk_admission_decision(ThroughputBackend::StreamV2.as_str(), "mergeable_scale");
+    }
+    bulk_admission_decision(&config.default_backend, "default_backend")
+}
+
+fn bulk_admission_decision(backend: &str, routing_reason: &str) -> BulkAdmissionDecision {
+    let selected_backend = if backend == ThroughputBackend::StreamV2.as_str() {
+        ThroughputBackend::StreamV2.as_str().to_owned()
+    } else {
+        ThroughputBackend::PgV1.as_str().to_owned()
+    };
+    let selected_backend_version = if selected_backend == ThroughputBackend::StreamV2.as_str() {
+        ThroughputBackend::StreamV2.default_version().to_owned()
+    } else {
+        ThroughputBackend::PgV1.default_version().to_owned()
+    };
+    BulkAdmissionDecision {
+        selected_backend,
+        selected_backend_version,
+        routing_reason: routing_reason.to_owned(),
+        admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
+    }
+}
+
+fn is_supported_throughput_backend(backend: &str) -> bool {
+    matches!(
+        backend,
+        value if value == ThroughputBackend::PgV1.as_str()
+            || value == ThroughputBackend::StreamV2.as_str()
+    )
 }
 
 async fn run_workflow_event_outbox_publisher(state: AppState) {
@@ -4604,33 +4938,30 @@ async fn execute_internal_query(
                 }),
             ));
         };
-        let artifact = load_compiled_artifact_version(&state, &tenant_id, &instance.definition_id, version)
-            .await
-            .map_err(|error| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(UnifiedErrorResponse {
-                        message: format!("failed to load workflow artifact: {error}"),
-                    }),
-                )
-            })?
-            .ok_or_else(|| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(UnifiedErrorResponse {
-                        message: "workflow artifact not found".to_owned(),
-                    }),
-                )
-            })?;
+        let artifact =
+            load_compiled_artifact_version(&state, &tenant_id, &instance.definition_id, version)
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(UnifiedErrorResponse {
+                            message: format!("failed to load workflow artifact: {error}"),
+                        }),
+                    )
+                })?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(UnifiedErrorResponse {
+                            message: "workflow artifact not found".to_owned(),
+                        }),
+                    )
+                })?;
         (instance, artifact, "replay")
     };
 
     let result = artifact
-        .evaluate_query(
-            &query_name,
-            &request.args,
-            instance.artifact_execution.clone().unwrap_or_default(),
-        )
+        .evaluate_query(&query_name, &request.args, execution_state_for_event(&instance, None))
         .map_err(|error| {
             (StatusCode::BAD_REQUEST, Json(UnifiedErrorResponse { message: error.to_string() }))
         })?;
@@ -5412,7 +5743,7 @@ fn prepare_result_application(
                     break;
                 };
                 let execution_state =
-                    runtime.instance.artifact_execution.clone().unwrap_or_default();
+                    execution_state_for_event(&runtime.instance, events.get(index));
                 if let Some((plan, applied)) =
                     runtime.artifact.try_execute_after_step_terminal_batch_with_turn(
                         &wait_state,
@@ -5444,8 +5775,7 @@ fn prepare_result_application(
                 } else {
                     let event = &events[index];
                     runtime.instance.apply_event(event);
-                    let execution_state =
-                        runtime.instance.artifact_execution.clone().unwrap_or_default();
+                    let execution_state = execution_state_for_event(&runtime.instance, Some(event));
                     let turn_context = ExecutionTurnContext {
                         event_id: event.event_id,
                         occurred_at: event.occurred_at,
@@ -6318,7 +6648,18 @@ fn capture_persisted_state(inner: &mut RuntimeInner) -> PersistedRuntimeState {
     PersistedRuntimeState {
         seq: inner.next_seq,
         owner_epoch: inner.owner_epoch,
-        instances: inner.instances.values().cloned().collect(),
+        instances: inner
+            .instances
+            .iter()
+            .filter_map(|(run_key, runtime)| {
+                if runtime_can_skip_local_persistence(inner, run_key, runtime) {
+                    return None;
+                }
+                let mut runtime = runtime.clone();
+                runtime.instance.compact_for_persistence();
+                Some(runtime)
+            })
+            .collect(),
         ready: inner.ready.values().flat_map(|queue| queue.iter().cloned()).collect(),
         leased: inner.leased.values().cloned().collect(),
         delayed_retries: flatten_delayed_retries(&inner.delayed_retries),
@@ -6398,7 +6739,8 @@ fn runtime_inner_from_persisted(
         owner_epoch: restored.owner_epoch,
         ..RuntimeInner::default()
     };
-    for runtime in restored.instances {
+    for mut runtime in restored.instances {
+        runtime.instance.expand_after_persistence_with_artifact(Some(&runtime.artifact));
         inner.instances.insert(
             RunKey {
                 tenant_id: runtime.instance.tenant_id.clone(),
@@ -6460,6 +6802,110 @@ fn runtime_inner_from_persisted(
     debug.restored_from_snapshot = true;
     debug.restore_records_applied = inner.instances.len() as u64;
     inner
+}
+
+fn runtime_can_skip_local_persistence(
+    inner: &RuntimeInner,
+    run_key: &RunKey,
+    runtime: &RuntimeWorkflowState,
+) -> bool {
+    if !runtime.active_activities.is_empty() || run_has_local_work(inner, run_key) {
+        return false;
+    }
+    let Some(wait_state) = runtime.instance.current_state.as_deref() else {
+        return false;
+    };
+    let Some(execution_state) = runtime.instance.artifact_execution.as_ref() else {
+        return false;
+    };
+    runtime.artifact.waits_on_bulk_activity(wait_state, execution_state)
+}
+
+fn run_has_local_work(inner: &RuntimeInner, run_key: &RunKey) -> bool {
+    inner.ready.values().any(|queue| {
+        queue.iter().any(|task| {
+            task.tenant_id == run_key.tenant_id
+                && task.instance_id == run_key.instance_id
+                && task.run_id == run_key.run_id
+        })
+    }) || inner.leased.values().any(|leased| {
+        leased.task.tenant_id == run_key.tenant_id
+            && leased.task.instance_id == run_key.instance_id
+            && leased.task.run_id == run_key.run_id
+    }) || inner.delayed_retries.values().any(|retries| {
+        retries.iter().any(|retry| {
+            retry.task.tenant_id == run_key.tenant_id
+                && retry.task.instance_id == run_key.instance_id
+                && retry.task.run_id == run_key.run_id
+        })
+    })
+}
+
+async fn restore_runtime_from_instance_row(
+    store: &WorkflowStore,
+    mut instance: WorkflowInstanceState,
+    artifact: Option<CompiledWorkflowArtifact>,
+) -> Result<(RunKey, RuntimeWorkflowState, Vec<QueuedActivity>)> {
+    let definition_version = instance.definition_version.ok_or_else(|| {
+        anyhow::anyhow!(
+            "instance missing definition version for {}/{}",
+            instance.tenant_id,
+            instance.instance_id
+        )
+    })?;
+    let artifact = match artifact {
+        Some(artifact) => artifact,
+        None => store
+            .get_artifact_version(&instance.tenant_id, &instance.definition_id, definition_version)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing artifact {} v{} for instance {}/{}",
+                    instance.definition_id,
+                    definition_version,
+                    instance.tenant_id,
+                    instance.instance_id
+                )
+            })?,
+    };
+    instance.expand_after_persistence_with_artifact(Some(&artifact));
+    let activities = store
+        .list_activities_for_run(&instance.tenant_id, &instance.instance_id, &instance.run_id)
+        .await?;
+    let mut active_activities = BTreeMap::new();
+    let mut ready = Vec::new();
+    for activity in activities {
+        if !matches!(
+            activity.status,
+            WorkflowActivityStatus::Scheduled | WorkflowActivityStatus::Started
+        ) {
+            continue;
+        }
+        let task = queued_activity_from_record(&activity);
+        let should_replace = active_activities
+            .get(&activity.activity_id)
+            .is_none_or(|active: &ActiveActivityMeta| active.attempt <= activity.attempt);
+        if should_replace {
+            active_activities.insert(
+                activity.activity_id.clone(),
+                ActiveActivityMeta {
+                    attempt: activity.attempt,
+                    task_queue: activity.task_queue.clone(),
+                    activity_type: activity.activity_type.clone(),
+                    wait_state: activity.state.clone().unwrap_or_default(),
+                    omit_success_output: false,
+                },
+            );
+        }
+        ready.push(task);
+    }
+
+    let run_key = RunKey {
+        tenant_id: instance.tenant_id.clone(),
+        instance_id: instance.instance_id.clone(),
+        run_id: instance.run_id.clone(),
+    };
+    Ok((run_key, RuntimeWorkflowState { artifact, instance, active_activities }, ready))
 }
 
 fn runtime_snapshot_path(persistence: &PersistenceConfig) -> PathBuf {
@@ -6564,6 +7010,8 @@ fn emitted_bulk_batch_event(
     instance: &WorkflowInstanceState,
     payload: &WorkflowEvent,
     throughput_backend: &str,
+    routing_reason: &str,
+    admission_policy_version: &str,
     source_event_id: Uuid,
     occurred_at: DateTime<Utc>,
 ) -> EventEnvelope<WorkflowEvent> {
@@ -6588,6 +7036,10 @@ fn emitted_bulk_batch_event(
     envelope.causation_id = Some(source_event_id);
     envelope.correlation_id = Some(source_event_id);
     envelope.metadata.insert("throughput_backend".to_owned(), throughput_backend.to_owned());
+    envelope.metadata.insert("routing_reason".to_owned(), routing_reason.to_owned());
+    envelope
+        .metadata
+        .insert("admission_policy_version".to_owned(), admission_policy_version.to_owned());
     envelope
 }
 
@@ -6964,6 +7416,51 @@ mod tests {
     }
 
     #[test]
+    fn admission_prefers_stream_v2_for_large_mergeable_batches() {
+        let decision = choose_bulk_admission_backend(
+            &BulkAdmissionConfig {
+                default_backend: ThroughputBackend::PgV1.as_str().to_owned(),
+                task_queue_backends: BTreeMap::new(),
+                stream_v2_min_items: 64,
+                stream_v2_min_chunks: 8,
+                max_active_chunks_per_tenant: 4_096,
+                max_active_chunks_per_task_queue: 2_048,
+            },
+            None,
+            None,
+            None,
+            Some("all_settled"),
+            512,
+            32,
+        );
+        assert_eq!(decision.selected_backend, ThroughputBackend::StreamV2.as_str());
+        assert_eq!(decision.routing_reason, "mergeable_scale");
+        assert_eq!(decision.admission_policy_version, ADMISSION_POLICY_VERSION);
+    }
+
+    #[test]
+    fn admission_respects_task_queue_backend_override() {
+        let decision = choose_bulk_admission_backend(
+            &BulkAdmissionConfig {
+                default_backend: ThroughputBackend::PgV1.as_str().to_owned(),
+                task_queue_backends: BTreeMap::new(),
+                stream_v2_min_items: 512,
+                stream_v2_min_chunks: 8,
+                max_active_chunks_per_tenant: 4_096,
+                max_active_chunks_per_task_queue: 2_048,
+            },
+            None,
+            Some(ThroughputBackend::StreamV2.as_str()),
+            None,
+            Some("collect_results"),
+            8,
+            1,
+        );
+        assert_eq!(decision.selected_backend, ThroughputBackend::StreamV2.as_str());
+        assert_eq!(decision.routing_reason, "task_queue_policy_override");
+    }
+
+    #[test]
     fn prune_terminal_instances_removes_completed_runs_and_work() {
         let now = Utc::now();
         let terminal_run = run_key_for("terminal");
@@ -7091,6 +7588,20 @@ mod tests {
     }
 
     fn throughput_artifact(task_queue: &str) -> CompiledWorkflowArtifact {
+        throughput_artifact_with_options(
+            task_queue,
+            Some(ThroughputBackend::PgV1.as_str()),
+            Some("all_settled"),
+            16,
+        )
+    }
+
+    fn throughput_artifact_with_options(
+        task_queue: &str,
+        throughput_backend: Option<&str>,
+        reducer: Option<&str>,
+        chunk_size: u32,
+    ) -> CompiledWorkflowArtifact {
         let mut states = BTreeMap::new();
         states.insert(
             "dispatch".to_owned(),
@@ -7106,9 +7617,9 @@ mod tests {
                     value: Value::String(task_queue.to_owned()),
                 }),
                 execution_policy: None,
-                reducer: Some("all_settled".to_owned()),
-                throughput_backend: Some("pg-v1".to_owned()),
-                chunk_size: Some(16),
+                reducer: reducer.map(str::to_owned),
+                throughput_backend: throughput_backend.map(str::to_owned),
+                chunk_size: Some(chunk_size),
                 retry: None,
             },
         );
@@ -7556,6 +8067,15 @@ mod tests {
             persist_notify: Arc::new(Notify::new()),
             persist_lock: Arc::new(Mutex::new(())),
             persistence: persistence_config_for(state_dir),
+            admission: BulkAdmissionConfig {
+                default_backend: ThroughputBackend::PgV1.as_str().to_owned(),
+                task_queue_backends: BTreeMap::new(),
+                stream_v2_min_items: 512,
+                stream_v2_min_chunks: 8,
+                max_active_chunks_per_tenant: 4_096,
+                max_active_chunks_per_task_queue: 2_048,
+            },
+            task_queue_policy_cache: Arc::new(StdMutex::new(HashMap::new())),
             debug: Arc::new(StdMutex::new(UnifiedDebugState::default())),
             outbox_publisher_id: "unified-runtime-test-outbox".to_owned(),
         }
@@ -8552,6 +9072,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trigger_persists_bulk_batch_admission_reason() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact =
+            throughput_artifact_with_options("default", None, Some("collect_results"), 16);
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-throughput-routing-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-throughput-routing",
+            "run-throughput-routing",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered {
+                input: json!({"items": [json!({"value": "x"}), json!({"value": "y"})]}),
+            },
+            Utc::now(),
+        );
+
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let batches = store
+            .list_bulk_batches_for_run_page(
+                "tenant",
+                "instance-throughput-routing",
+                "run-throughput-routing",
+                10,
+                0,
+            )
+            .await?;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.throughput_backend, ThroughputBackend::PgV1.as_str());
+        assert_eq!(batch.routing_reason, "materialized_results");
+        assert_eq!(batch.admission_policy_version, ADMISSION_POLICY_VERSION);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn bulk_terminal_event_completes_throughput_run() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
@@ -8898,6 +9469,57 @@ mod tests {
             .and_then(|retries| retries.first())
             .expect("future retry task");
         assert_eq!(future_retry.task.activity_id, future_retry_task.activity_id);
+    }
+
+    #[test]
+    fn capture_persisted_state_skips_idle_bulk_wait_runs() {
+        let artifact = throughput_artifact_with_options(
+            "default",
+            Some(ThroughputBackend::StreamV2.as_str()),
+            Some("all_settled"),
+            16,
+        );
+        let identity = WorkflowIdentity::new(
+            "tenant".to_owned(),
+            artifact.definition_id.clone(),
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-bulk-persist".to_owned(),
+            "run-bulk-persist".to_owned(),
+            "unified-runtime-test",
+        );
+        let occurred_at = Utc::now();
+        let input = json!({"items": [json!({"value": "x"}), json!({"value": "y"})]});
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: input.clone() },
+            occurred_at,
+        );
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &input,
+                ExecutionTurnContext { event_id: trigger.event_id, occurred_at },
+            )
+            .expect("bulk trigger plan");
+        let mut instance =
+            WorkflowInstanceState::try_from(&trigger).expect("workflow instance from trigger");
+        apply_compiled_plan(&mut instance, &plan);
+        let run_key = RunKey {
+            tenant_id: identity.tenant_id.clone(),
+            instance_id: identity.instance_id.clone(),
+            run_id: identity.run_id.clone(),
+        };
+        let mut inner = RuntimeInner::default();
+        inner.instances.insert(
+            run_key,
+            RuntimeWorkflowState { artifact, instance, active_activities: BTreeMap::new() },
+        );
+
+        let persisted = capture_persisted_state(&mut inner);
+
+        assert!(persisted.instances.is_empty());
+        assert!(persisted.ready.is_empty());
+        assert!(persisted.leased.is_empty());
     }
 
     #[test]
@@ -9934,6 +10556,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_restore_includes_nonterminal_instance_rows_without_snapshots() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = throughput_artifact_with_options(
+            "default",
+            Some(ThroughputBackend::StreamV2.as_str()),
+            Some("all_settled"),
+            16,
+        );
+        store.put_artifact("tenant-a", &artifact).await?;
+
+        let identity = WorkflowIdentity::new(
+            "tenant-a",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-instance-restore",
+            "run-instance-restore",
+            "unified-runtime-test",
+        );
+        let occurred_at = Utc::now();
+        let input = json!({"items": [json!({"ok": true})]});
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: input.clone() },
+            occurred_at,
+        );
+        let plan = artifact.execute_trigger_with_turn(
+            &input,
+            ExecutionTurnContext { event_id: trigger.event_id, occurred_at },
+        )?;
+        let mut instance = WorkflowInstanceState::try_from(&trigger)?;
+        apply_compiled_plan(&mut instance, &plan);
+        store.upsert_instance(&instance).await?;
+
+        let debug = Arc::new(StdMutex::new(UnifiedDebugState::default()));
+        let restored = restore_runtime_state_from_store(
+            &store,
+            &BrokerConfig::new("127.0.0.1:9092", "workflow-events", 1),
+            &debug,
+        )
+        .await?;
+        let runtime = restored
+            .instances
+            .get(&RunKey {
+                tenant_id: identity.tenant_id.clone(),
+                instance_id: identity.instance_id.clone(),
+                run_id: identity.run_id.clone(),
+            })
+            .context("restored runtime state should contain workflow instance row")?;
+
+        assert_eq!(runtime.instance.current_state.as_deref(), Some("join"));
+        assert_eq!(runtime.instance.input.as_ref(), Some(&input));
+        assert_eq!(runtime.instance.context, plan.context);
+        assert!(!runtime.instance.status.is_terminal());
+        assert!(restored.ready.values().all(VecDeque::is_empty));
+
+        let debug_snapshot = debug.lock().expect("unified debug lock poisoned").clone();
+        assert!(debug_snapshot.restored_from_snapshot);
+        assert_eq!(debug_snapshot.restore_records_applied, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn store_snapshot_restore_falls_back_to_full_history_when_snapshot_tail_is_inconsistent()
     -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
@@ -9996,7 +10685,7 @@ mod tests {
             "wait_approve",
             "approve",
             &Value::String("approved".to_owned()),
-            stale_snapshot.artifact_execution.clone().unwrap_or_default(),
+            execution_state_for_event(&stale_snapshot, Some(&signal_received)),
             ExecutionTurnContext {
                 event_id: signal_received.event_id,
                 occurred_at: signal_received.occurred_at,

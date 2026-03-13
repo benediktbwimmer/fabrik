@@ -16,10 +16,10 @@ use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
     QueryRetentionCutoffs, QueryRetentionPruneResult, TaskQueueKind, WorkflowActivityRecord,
     WorkflowActivityStatus, WorkflowArtifactSummary, WorkflowBulkBatchRecord,
-    WorkflowBulkBatchStatus, WorkflowBulkChunkRecord, WorkflowChildRecord,
-    WorkflowDefinitionSummary, WorkflowInstanceFilters, WorkflowRunFilters, WorkflowRunRecord,
-    WorkflowRunSummaryRecord, WorkflowSignalRecord, WorkflowSignalStatus, WorkflowStateSnapshot,
-    WorkflowStore, WorkflowUpdateRecord, WorkflowUpdateStatus,
+    WorkflowBulkBatchRuntimeControlRecord, WorkflowBulkBatchStatus, WorkflowBulkChunkRecord,
+    WorkflowChildRecord, WorkflowDefinitionSummary, WorkflowInstanceFilters, WorkflowRunFilters,
+    WorkflowRunRecord, WorkflowRunSummaryRecord, WorkflowSignalRecord, WorkflowSignalStatus,
+    WorkflowStateSnapshot, WorkflowStore, WorkflowUpdateRecord, WorkflowUpdateStatus,
 };
 use fabrik_throughput::{
     PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind, ThroughputBackend,
@@ -134,6 +134,7 @@ struct WorkflowBulkBatchesResponse {
     consistency: &'static str,
     authoritative_source: &'static str,
     projection_lag_ms: Option<i64>,
+    watch_cursor: String,
     page: PageInfo,
     batch_count: usize,
     batches: Vec<WorkflowBulkBatchRecord>,
@@ -147,6 +148,8 @@ struct WorkflowBulkBatchResponse {
     consistency: &'static str,
     authoritative_source: &'static str,
     projection_lag_ms: Option<i64>,
+    watch_cursor: String,
+    runtime_control: Option<WorkflowBulkBatchRuntimeControlRecord>,
     batch: WorkflowBulkBatchRecord,
 }
 
@@ -159,6 +162,7 @@ struct WorkflowBulkChunksResponse {
     consistency: &'static str,
     authoritative_source: &'static str,
     projection_lag_ms: Option<i64>,
+    watch_cursor: String,
     page: PageInfo,
     chunk_count: usize,
     chunks: Vec<WorkflowBulkChunkRecord>,
@@ -173,6 +177,7 @@ struct WorkflowBulkResultsResponse {
     consistency: &'static str,
     authoritative_source: &'static str,
     projection_lag_ms: Option<i64>,
+    watch_cursor: String,
     page: PageInfo,
     chunk_count: usize,
     chunks: Vec<WorkflowBulkChunkRecord>,
@@ -3685,6 +3690,12 @@ async fn load_workflow_bulk_batches(
                 projection_lag_ms_from_times(batches.iter().map(|batch| Some(batch.updated_at)))
             })
             .flatten(),
+        watch_cursor: batches
+            .iter()
+            .map(|batch| batch.updated_at)
+            .max()
+            .unwrap_or_else(Utc::now)
+            .to_rfc3339(),
         page: build_page_info(&page, total, batches.len()),
         batch_count: total,
         batches,
@@ -3719,6 +3730,10 @@ async fn load_workflow_bulk_batch(
         }
     }
     .ok_or_else(|| anyhow::anyhow!("bulk batch {batch_id} not found"))?;
+    let runtime_control = state
+        .store
+        .get_bulk_batch_runtime_control(tenant_id, instance_id, run_id, batch_id)
+        .await?;
     Ok(WorkflowBulkBatchResponse {
         tenant_id: tenant_id.to_owned(),
         instance_id: instance_id.to_owned(),
@@ -3728,6 +3743,8 @@ async fn load_workflow_bulk_batch(
         projection_lag_ms: (consistency == ReadConsistency::Eventual)
             .then(|| projection_lag_ms_from_times([Some(batch.updated_at)]))
             .flatten(),
+        watch_cursor: batch.updated_at.to_rfc3339(),
+        runtime_control,
         batch,
     })
 }
@@ -3847,6 +3864,12 @@ async fn load_workflow_bulk_chunks(
                 )
             })
             .flatten(),
+        watch_cursor: resolved_chunks
+            .iter()
+            .map(|chunk| chunk.updated_at)
+            .max()
+            .unwrap_or(batch.updated_at)
+            .to_rfc3339(),
         page: build_page_info(&page, total, resolved_chunks.len()),
         chunk_count: total,
         chunks: resolved_chunks,
@@ -3953,6 +3976,12 @@ async fn load_workflow_bulk_results(
                 projection_lag_ms_from_times(chunks.iter().map(|chunk| Some(chunk.updated_at)))
             })
             .flatten(),
+        watch_cursor: chunks
+            .iter()
+            .map(|chunk| chunk.updated_at)
+            .max()
+            .unwrap_or(batch.updated_at)
+            .to_rfc3339(),
         page: build_page_info(&page, total, chunks.len()),
         chunk_count: total,
         chunks,
@@ -5658,10 +5687,7 @@ mod tests {
         .expect("workflow filter response");
         assert_eq!(workflows.workflow_count, 1);
         assert_eq!(workflows.items[0].memo.as_ref(), Some(&memo));
-        assert_eq!(
-            workflows.items[0].search_attributes.as_ref(),
-            Some(&search_attributes)
-        );
+        assert_eq!(workflows.items[0].search_attributes.as_ref(), Some(&search_attributes));
 
         let Json(runs) = list_runs(
             Path("tenant-a".to_owned()),

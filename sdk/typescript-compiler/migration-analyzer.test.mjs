@@ -35,6 +35,14 @@ test("migration analyzer discovers supported workflows and workers", async () =>
 });
 
 test("migration analyzer supports default-compatible payload converters and blocks custom payload landmines", async () => {
+  const bootstrapQualifiedFixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-bootstrap-qualified",
+  );
+  const bootstrapEsmQualifiedFixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-bootstrap-esm-qualified",
+  );
   const payloadQualifiedFixture = path.join(
     root,
     "crates/fabrik-cli/test-fixtures/temporal-payload-qualified",
@@ -43,13 +51,20 @@ test("migration analyzer supports default-compatible payload converters and bloc
     root,
     "crates/fabrik-cli/test-fixtures/temporal-payload-path-qualified",
   );
+  const supportedApiQualifiedFixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-supported-api-qualified",
+  );
   const payloadPathQualifiedV2Fixture = path.join(
     root,
     "crates/fabrik-cli/test-fixtures/temporal-payload-path-qualified-v2",
   );
   const payloadFixture = path.join(root, "crates/fabrik-cli/test-fixtures/temporal-payload-blocked");
   const payloadQualified = await analyze(payloadQualifiedFixture);
+  const bootstrapQualified = await analyze(bootstrapQualifiedFixture);
+  const bootstrapEsmQualified = await analyze(bootstrapEsmQualifiedFixture);
   const payloadPathQualified = await analyze(payloadPathQualifiedFixture);
+  const supportedApiQualified = await analyze(supportedApiQualifiedFixture);
   const payloadPathQualifiedV2 = await analyze(payloadPathQualifiedV2Fixture);
   const visibilityFixture = path.join(
     root,
@@ -57,6 +72,12 @@ test("migration analyzer supports default-compatible payload converters and bloc
   );
   const payload = await analyze(payloadFixture);
   const visibility = await analyze(visibilityFixture);
+  assert.equal(bootstrapQualified.summary.hard_block_count, 0);
+  assert.equal(bootstrapQualified.workers[0].task_queue, "bootstrap-qualified");
+  assert.equal(bootstrapQualified.workers[0].workflows_path, "./workflows");
+  assert.equal(bootstrapEsmQualified.summary.hard_block_count, 0);
+  assert.equal(bootstrapEsmQualified.workers[0].task_queue, "bootstrap-esm-qualified");
+  assert.equal(bootstrapEsmQualified.workers[0].workflows_path, "./workflows.ts");
   assert.equal(payloadQualified.summary.hard_block_count, 0);
   assert.equal(payloadQualified.workers[0].data_converter_mode, "default_temporal");
   assert.equal(payloadPathQualified.summary.hard_block_count, 0);
@@ -65,6 +86,8 @@ test("migration analyzer supports default-compatible payload converters and bloc
     payloadPathQualified.workers[0].payload_converter_module,
     "./src/custom-payload-converter.ts",
   );
+  assert.equal(supportedApiQualified.summary.hard_block_count, 0);
+  assert.equal(supportedApiQualified.workers[0].task_queue, "supported-api");
   assert.equal(payloadPathQualifiedV2.summary.hard_block_count, 0);
   assert.equal(payloadPathQualifiedV2.workers[0].data_converter_mode, "path_default_temporal");
   assert.ok(payload.findings.some((finding) => finding.feature === "payload_data_converter_usage"));

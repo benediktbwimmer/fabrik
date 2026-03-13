@@ -195,6 +195,7 @@ Migration policy and generated output contract:
 - [Architecture Decision Record 0004](/Users/bene/code/fabrik/docs/adr/0004-temporal-parity-pivot.md)
 - [SDK + Compiler Direction](/Users/bene/code/fabrik/docs/sdk-compiler.md)
 - [Temporal TypeScript Equivalence Contract](/Users/bene/code/fabrik/docs/temporal-typescript-equivalence-contract.md)
+- [Temporal TS Replacement Priorities](/Users/bene/code/fabrik/docs/temporal-ts-replacement-priorities.md)
 - [Durability and Replay Contract](/Users/bene/code/fabrik/docs/durability-and-replay-contract.md)
 - [Ownership and Fencing Contract](/Users/bene/code/fabrik/docs/ownership-and-fencing-contract.md)
 - [Semantic Specs Index](/Users/bene/code/fabrik/docs/spec/README.md)

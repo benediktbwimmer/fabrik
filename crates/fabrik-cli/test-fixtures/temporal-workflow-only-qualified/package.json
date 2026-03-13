@@ -1,0 +1,9 @@
+{
+  "name": "temporal-workflow-only-qualified",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@temporalio/workflow": "^1.15.0",
+    "@temporalio/worker": "^1.15.0"
+  }
+}

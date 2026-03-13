@@ -1,6 +1,10 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
+use fabrik_throughput::{
+    ADMISSION_POLICY_VERSION, bulk_reducer_name, throughput_execution_mode,
+    throughput_reducer_execution_path, throughput_reducer_version, throughput_routing_reason,
+};
 use fabrik_workflow::{CompiledWorkflowArtifact, WorkflowDefinition, WorkflowInstanceState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -295,9 +299,16 @@ pub struct WorkflowBulkBatchRecord {
     pub result_handle: Value,
     pub throughput_backend: String,
     pub throughput_backend_version: String,
+    pub execution_mode: String,
+    pub selected_backend: String,
+    pub routing_reason: String,
+    pub admission_policy_version: String,
     pub execution_policy: Option<String>,
     pub reducer: Option<String>,
+    pub reducer_kind: String,
     pub reducer_class: String,
+    pub reducer_version: String,
+    pub reducer_execution_path: String,
     pub aggregation_tree_depth: u32,
     pub fast_lane_enabled: bool,
     pub aggregation_group_count: u32,
@@ -313,6 +324,18 @@ pub struct WorkflowBulkBatchRecord {
     pub error: Option<String>,
     pub scheduled_at: DateTime<Utc>,
     pub terminal_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowBulkBatchRuntimeControlRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub batch_id: String,
+    pub is_paused: bool,
+    pub reason: Option<String>,
+    pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -816,10 +839,31 @@ pub struct TaskQueueInspection {
     pub activity_completion_metrics: Option<ActivityCompletionMetrics>,
     pub default_set_id: Option<String>,
     pub throughput_policy: Option<TaskQueueThroughputPolicyRecord>,
+    pub runtime_control: Option<TaskQueueRuntimeControlRecord>,
     pub compatible_build_ids: Vec<String>,
     pub registered_builds: Vec<TaskQueueBuildRecord>,
     pub compatibility_sets: Vec<CompatibilitySetRecord>,
     pub pollers: Vec<QueuePollerRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskQueueRuntimeControlRecord {
+    pub tenant_id: String,
+    pub queue_kind: TaskQueueKind,
+    pub task_queue: String,
+    pub is_paused: bool,
+    pub is_draining: bool,
+    pub reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BulkBatchRoutingCount {
+    pub selected_backend: String,
+    pub routing_reason: String,
+    pub admission_policy_version: String,
+    pub batch_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -1326,6 +1370,8 @@ impl WorkflowStore {
                 result_handle JSONB NOT NULL DEFAULT '{}'::jsonb,
                 throughput_backend TEXT NOT NULL DEFAULT 'pg-v1',
                 throughput_backend_version TEXT NOT NULL DEFAULT '1.0.0',
+                routing_reason TEXT NOT NULL DEFAULT '',
+                admission_policy_version TEXT NOT NULL DEFAULT '2026-03-13.1',
                 execution_policy TEXT,
                 reducer TEXT,
                 reducer_class TEXT NOT NULL DEFAULT 'legacy',
@@ -1360,6 +1406,8 @@ impl WorkflowStore {
             ADD COLUMN IF NOT EXISTS result_handle JSONB NOT NULL DEFAULT '{}'::jsonb,
             ADD COLUMN IF NOT EXISTS throughput_backend TEXT NOT NULL DEFAULT 'pg-v1',
             ADD COLUMN IF NOT EXISTS throughput_backend_version TEXT NOT NULL DEFAULT '1.0.0',
+            ADD COLUMN IF NOT EXISTS routing_reason TEXT NOT NULL DEFAULT '',
+            ADD COLUMN IF NOT EXISTS admission_policy_version TEXT NOT NULL DEFAULT '2026-03-13.1',
             ADD COLUMN IF NOT EXISTS execution_policy TEXT,
             ADD COLUMN IF NOT EXISTS reducer TEXT,
             ADD COLUMN IF NOT EXISTS reducer_class TEXT NOT NULL DEFAULT 'legacy',
@@ -1518,6 +1566,8 @@ impl WorkflowStore {
                 result_handle JSONB NOT NULL DEFAULT '{}'::jsonb,
                 throughput_backend TEXT NOT NULL,
                 throughput_backend_version TEXT NOT NULL,
+                routing_reason TEXT NOT NULL DEFAULT '',
+                admission_policy_version TEXT NOT NULL DEFAULT '2026-03-13.1',
                 execution_policy TEXT,
                 reducer TEXT,
                 reducer_class TEXT NOT NULL DEFAULT 'legacy',
@@ -1548,6 +1598,8 @@ impl WorkflowStore {
         sqlx::query(
             r#"
             ALTER TABLE throughput_projection_batches
+            ADD COLUMN IF NOT EXISTS routing_reason TEXT NOT NULL DEFAULT '',
+            ADD COLUMN IF NOT EXISTS admission_policy_version TEXT NOT NULL DEFAULT '2026-03-13.1',
             ADD COLUMN IF NOT EXISTS execution_policy TEXT,
             ADD COLUMN IF NOT EXISTS reducer TEXT,
             ADD COLUMN IF NOT EXISTS reducer_class TEXT NOT NULL DEFAULT 'legacy',
@@ -1841,6 +1893,44 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize task_queue_throughput_policies table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS task_queue_runtime_controls (
+                tenant_id TEXT NOT NULL,
+                queue_kind TEXT NOT NULL,
+                task_queue TEXT NOT NULL,
+                is_paused BOOLEAN NOT NULL DEFAULT FALSE,
+                is_draining BOOLEAN NOT NULL DEFAULT FALSE,
+                reason TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, queue_kind, task_queue)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize task_queue_runtime_controls table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS workflow_bulk_batch_runtime_controls (
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                batch_id TEXT NOT NULL,
+                is_paused BOOLEAN NOT NULL DEFAULT FALSE,
+                reason TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, workflow_instance_id, run_id, batch_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_bulk_batch_runtime_controls table")?;
 
         sqlx::query(
             r#"
@@ -3261,6 +3351,8 @@ impl WorkflowStore {
     }
 
     pub async fn upsert_instance(&self, state: &WorkflowInstanceState) -> Result<()> {
+        let mut persisted_state = state.clone();
+        persisted_state.compact_for_persistence();
         sqlx::query(
             r#"
             INSERT INTO workflow_instances (
@@ -3292,18 +3384,18 @@ impl WorkflowStore {
                 state = EXCLUDED.state
             "#,
         )
-        .bind(&state.tenant_id)
-        .bind(&state.instance_id)
-        .bind(&state.definition_id)
-        .bind(&state.run_id)
-        .bind(state.definition_version.map(|version| version as i32))
-        .bind(state.artifact_hash.as_deref())
-        .bind(state.status.as_str())
-        .bind(state.event_count)
-        .bind(state.last_event_id)
-        .bind(state.last_event_type.as_str())
-        .bind(state.updated_at)
-        .bind(Json(state))
+        .bind(&persisted_state.tenant_id)
+        .bind(&persisted_state.instance_id)
+        .bind(&persisted_state.definition_id)
+        .bind(&persisted_state.run_id)
+        .bind(persisted_state.definition_version.map(|version| version as i32))
+        .bind(persisted_state.artifact_hash.as_deref())
+        .bind(persisted_state.status.as_str())
+        .bind(persisted_state.event_count)
+        .bind(persisted_state.last_event_id)
+        .bind(persisted_state.last_event_type.as_str())
+        .bind(persisted_state.updated_at)
+        .bind(Json(&persisted_state))
         .execute(&self.pool)
         .await
         .context("failed to upsert workflow instance")?;
@@ -3331,7 +3423,11 @@ impl WorkflowStore {
 
         row.map(|row| {
             row.try_get::<Json<WorkflowInstanceState>, _>("state")
-                .map(|value| value.0)
+                .map(|value| {
+                    let mut state = value.0;
+                    state.expand_after_persistence();
+                    state
+                })
                 .context("failed to decode workflow instance state")
         })
         .transpose()
@@ -3485,7 +3581,11 @@ impl WorkflowStore {
         rows.into_iter()
             .map(|row| {
                 row.try_get::<Json<WorkflowInstanceState>, _>("state")
-                    .map(|value| value.0)
+                    .map(|value| {
+                        let mut state = value.0;
+                        state.expand_after_persistence();
+                        state
+                    })
                     .context("failed to decode workflow instance state")
             })
             .collect()
@@ -5020,6 +5120,221 @@ impl WorkflowStore {
         row.map(Self::decode_task_queue_throughput_policy_row).transpose()
     }
 
+    pub async fn upsert_task_queue_runtime_control(
+        &self,
+        tenant_id: &str,
+        queue_kind: TaskQueueKind,
+        task_queue: &str,
+        is_paused: bool,
+        is_draining: bool,
+        reason: Option<&str>,
+    ) -> Result<TaskQueueRuntimeControlRecord> {
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO task_queue_runtime_controls (
+                tenant_id,
+                queue_kind,
+                task_queue,
+                is_paused,
+                is_draining,
+                reason,
+                created_at,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+            ON CONFLICT (tenant_id, queue_kind, task_queue)
+            DO UPDATE SET
+                is_paused = EXCLUDED.is_paused,
+                is_draining = EXCLUDED.is_draining,
+                reason = EXCLUDED.reason,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(queue_kind.as_str())
+        .bind(task_queue)
+        .bind(is_paused)
+        .bind(is_draining)
+        .bind(reason)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert task queue runtime control")?;
+
+        Ok(TaskQueueRuntimeControlRecord {
+            tenant_id: tenant_id.to_owned(),
+            queue_kind,
+            task_queue: task_queue.to_owned(),
+            is_paused,
+            is_draining,
+            reason: reason.map(str::to_owned),
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub async fn get_task_queue_runtime_control(
+        &self,
+        tenant_id: &str,
+        queue_kind: TaskQueueKind,
+        task_queue: &str,
+    ) -> Result<Option<TaskQueueRuntimeControlRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT tenant_id, queue_kind, task_queue, is_paused, is_draining, reason, created_at, updated_at
+            FROM task_queue_runtime_controls
+            WHERE tenant_id = $1 AND queue_kind = $2 AND task_queue = $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(queue_kind.as_str())
+        .bind(task_queue)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load task queue runtime control")?;
+
+        row.map(Self::decode_task_queue_runtime_control_row).transpose()
+    }
+
+    pub async fn upsert_bulk_batch_runtime_control(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+        is_paused: bool,
+        reason: Option<&str>,
+    ) -> Result<WorkflowBulkBatchRuntimeControlRecord> {
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO workflow_bulk_batch_runtime_controls (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                batch_id,
+                is_paused,
+                reason,
+                created_at,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+            ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id)
+            DO UPDATE SET
+                is_paused = EXCLUDED.is_paused,
+                reason = EXCLUDED.reason,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .bind(is_paused)
+        .bind(reason)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert workflow bulk batch runtime control")?;
+
+        Ok(WorkflowBulkBatchRuntimeControlRecord {
+            tenant_id: tenant_id.to_owned(),
+            instance_id: instance_id.to_owned(),
+            run_id: run_id.to_owned(),
+            batch_id: batch_id.to_owned(),
+            is_paused,
+            reason: reason.map(str::to_owned),
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub async fn get_bulk_batch_runtime_control(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+    ) -> Result<Option<WorkflowBulkBatchRuntimeControlRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT tenant_id, workflow_instance_id, run_id, batch_id, is_paused, reason, created_at, updated_at
+            FROM workflow_bulk_batch_runtime_controls
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3 AND batch_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load workflow bulk batch runtime control")?;
+
+        row.map(Self::decode_bulk_batch_runtime_control_row).transpose()
+    }
+
+    pub async fn set_bulk_batch_admission_metadata(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+        routing_reason: &str,
+        admission_policy_version: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE workflow_bulk_batches
+            SET routing_reason = $5,
+                admission_policy_version = $6
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND batch_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .bind(routing_reason)
+        .bind(admission_policy_version)
+        .execute(&self.pool)
+        .await
+        .context("failed to update workflow bulk batch admission metadata")?;
+        Ok(())
+    }
+
+    pub async fn list_paused_bulk_batch_ids_for_task_queue(
+        &self,
+        tenant_id: &str,
+        task_queue: &str,
+    ) -> Result<Vec<String>> {
+        let rows = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT control.batch_id
+            FROM workflow_bulk_batch_runtime_controls control
+            JOIN throughput_projection_batches batches
+              ON batches.tenant_id = control.tenant_id
+             AND batches.workflow_instance_id = control.workflow_instance_id
+             AND batches.run_id = control.run_id
+             AND batches.batch_id = control.batch_id
+            WHERE control.tenant_id = $1
+              AND batches.task_queue = $2
+              AND control.is_paused = TRUE
+              AND batches.status NOT IN ('completed', 'failed', 'cancelled')
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(task_queue)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list paused workflow bulk batches for task queue")?;
+        Ok(rows)
+    }
+
     pub async fn enqueue_workflow_mailbox_message(
         &self,
         partition_id: i32,
@@ -6119,6 +6434,8 @@ impl WorkflowStore {
         let throughput_policy = self
             .get_task_queue_throughput_policy(tenant_id, queue_kind.clone(), task_queue)
             .await?;
+        let runtime_control =
+            self.get_task_queue_runtime_control(tenant_id, queue_kind.clone(), task_queue).await?;
 
         Ok(TaskQueueInspection {
             tenant_id: tenant_id.to_owned(),
@@ -6131,6 +6448,7 @@ impl WorkflowStore {
             activity_completion_metrics,
             default_set_id,
             throughput_policy,
+            runtime_control,
             compatible_build_ids,
             registered_builds,
             compatibility_sets,
@@ -7402,6 +7720,8 @@ impl WorkflowStore {
     }
 
     pub async fn put_snapshot(&self, state: &WorkflowInstanceState) -> Result<()> {
+        let mut persisted_state = state.clone();
+        persisted_state.compact_for_persistence();
         sqlx::query(
             r#"
             INSERT INTO workflow_state_snapshots (
@@ -7432,18 +7752,18 @@ impl WorkflowStore {
                 state = EXCLUDED.state
             "#,
         )
-        .bind(&state.tenant_id)
-        .bind(&state.instance_id)
-        .bind(&state.run_id)
-        .bind(&state.definition_id)
-        .bind(state.definition_version.map(|version| version as i32))
-        .bind(state.artifact_hash.as_deref())
+        .bind(&persisted_state.tenant_id)
+        .bind(&persisted_state.instance_id)
+        .bind(&persisted_state.run_id)
+        .bind(&persisted_state.definition_id)
+        .bind(persisted_state.definition_version.map(|version| version as i32))
+        .bind(persisted_state.artifact_hash.as_deref())
         .bind(i32::try_from(SNAPSHOT_SCHEMA_VERSION).expect("snapshot schema version fits in i32"))
-        .bind(state.event_count)
-        .bind(state.last_event_id)
-        .bind(state.last_event_type.as_str())
-        .bind(state.updated_at)
-        .bind(Json(state))
+        .bind(persisted_state.event_count)
+        .bind(persisted_state.last_event_id)
+        .bind(persisted_state.last_event_type.as_str())
+        .bind(persisted_state.updated_at)
+        .bind(Json(&persisted_state))
         .execute(&self.pool)
         .await
         .context("failed to persist workflow snapshot")?;
@@ -7552,6 +7872,32 @@ impl WorkflowStore {
         .context("failed to list nonterminal workflow snapshots")?;
 
         rows.into_iter().map(Self::decode_snapshot_row).collect()
+    }
+
+    pub async fn list_nonterminal_instances(&self) -> Result<Vec<WorkflowInstanceState>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT state
+            FROM workflow_instances
+            WHERE status NOT IN ('completed', 'failed', 'cancelled', 'terminated')
+            ORDER BY updated_at ASC, workflow_instance_id ASC, run_id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list nonterminal workflow instances")?;
+
+        rows.into_iter()
+            .map(|row| {
+                row.try_get::<Json<WorkflowInstanceState>, _>("state")
+                    .map(|value| {
+                        let mut state = value.0;
+                        state.expand_after_persistence();
+                        state
+                    })
+                    .context("failed to decode nonterminal workflow instance state")
+            })
+            .collect()
     }
 
     pub async fn mark_event_processed(&self, event: &EventEnvelope<WorkflowEvent>) -> Result<bool> {
@@ -9066,6 +9412,242 @@ impl WorkflowStore {
         Ok((batch, chunks))
     }
 
+    pub async fn persist_bulk_batch_with_metadata(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        definition_id: &str,
+        definition_version: Option<u32>,
+        artifact_hash: Option<&str>,
+        batch_id: &str,
+        activity_type: &str,
+        task_queue: &str,
+        state: Option<&str>,
+        input_handle: &Value,
+        result_handle: &Value,
+        items: &[Value],
+        chunk_size: u32,
+        max_attempts: u32,
+        retry_delay_ms: u64,
+        execution_policy: Option<&str>,
+        reducer: Option<&str>,
+        reducer_class: &str,
+        aggregation_tree_depth: u32,
+        fast_lane_enabled: bool,
+        aggregation_group_count: u32,
+        throughput_backend: &str,
+        throughput_backend_version: &str,
+        routing_reason: &str,
+        admission_policy_version: &str,
+        scheduled_at: DateTime<Utc>,
+    ) -> Result<()> {
+        if items.len() > MAX_BULK_ITEMS_PER_BATCH {
+            anyhow::bail!(
+                "bulk batch item count {} exceeds limit {}",
+                items.len(),
+                MAX_BULK_ITEMS_PER_BATCH
+            );
+        }
+        let chunk_size_usize = usize::try_from(chunk_size.max(1)).unwrap_or(1);
+        if chunk_size_usize > MAX_BULK_CHUNK_SIZE {
+            anyhow::bail!(
+                "bulk chunk size {} exceeds limit {}",
+                chunk_size_usize,
+                MAX_BULK_CHUNK_SIZE
+            );
+        }
+        let mut total_input_bytes = 0usize;
+        for (chunk_index, chunk_items) in items.chunks(chunk_size_usize).enumerate() {
+            let mut chunk_bytes = 0usize;
+            for item in chunk_items {
+                let item_bytes = serde_json::to_vec(item)
+                    .map(|bytes| bytes.len())
+                    .context("failed to serialize bulk batch item")?;
+                if item_bytes > MAX_BULK_ITEM_BYTES {
+                    anyhow::bail!(
+                        "bulk batch item exceeds per-item byte limit {}",
+                        MAX_BULK_ITEM_BYTES
+                    );
+                }
+                total_input_bytes = total_input_bytes.saturating_add(item_bytes);
+                chunk_bytes = chunk_bytes.saturating_add(item_bytes);
+            }
+            if chunk_bytes > MAX_BULK_CHUNK_INPUT_BYTES {
+                anyhow::bail!(
+                    "bulk chunk {} serialized to {} bytes, over limit {}",
+                    chunk_index,
+                    chunk_bytes,
+                    MAX_BULK_CHUNK_INPUT_BYTES
+                );
+            }
+        }
+        if total_input_bytes > MAX_BULK_TOTAL_INPUT_BYTES {
+            anyhow::bail!(
+                "bulk batch input serialized to {} bytes, over limit {}",
+                total_input_bytes,
+                MAX_BULK_TOTAL_INPUT_BYTES
+            );
+        }
+
+        let mut tx = self.pool.begin().await.context("failed to begin bulk batch transaction")?;
+        let total_items =
+            i32::try_from(items.len()).context("bulk batch item count exceeds i32")?;
+        let chunk_size_i32 =
+            i32::try_from(chunk_size).context("bulk batch chunk_size exceeds i32")?;
+        let chunk_count = if items.is_empty() {
+            0
+        } else {
+            ((items.len() + chunk_size_usize - 1) / chunk_size_usize) as i32
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO workflow_bulk_batches (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                workflow_id,
+                workflow_version,
+                artifact_hash,
+                batch_id,
+                activity_type,
+                task_queue,
+                state,
+                input_handle,
+                result_handle,
+                throughput_backend,
+                throughput_backend_version,
+                routing_reason,
+                admission_policy_version,
+                execution_policy,
+                reducer,
+                reducer_class,
+                aggregation_tree_depth,
+                fast_lane_enabled,
+                aggregation_group_count,
+                status,
+                total_items,
+                chunk_size,
+                chunk_count,
+                max_attempts,
+                retry_delay_ms,
+                scheduled_at,
+                updated_at
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                $19, $20, $21, $22, 'scheduled', $23, $24, $25, $26, $27, $28, $28
+            )
+            ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id) DO NOTHING
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(definition_id)
+        .bind(definition_version.map(|value| value as i32))
+        .bind(artifact_hash)
+        .bind(batch_id)
+        .bind(activity_type)
+        .bind(task_queue)
+        .bind(state)
+        .bind(Json(input_handle))
+        .bind(Json(result_handle))
+        .bind(throughput_backend)
+        .bind(throughput_backend_version)
+        .bind(routing_reason)
+        .bind(admission_policy_version)
+        .bind(execution_policy)
+        .bind(reducer)
+        .bind(reducer_class)
+        .bind(
+            i32::try_from(aggregation_tree_depth)
+                .context("bulk batch aggregation_tree_depth exceeds i32")?,
+        )
+        .bind(fast_lane_enabled)
+        .bind(
+            i32::try_from(aggregation_group_count)
+                .context("bulk batch aggregation_group_count exceeds i32")?,
+        )
+        .bind(total_items)
+        .bind(chunk_size_i32)
+        .bind(chunk_count)
+        .bind(i32::try_from(max_attempts).context("bulk batch max_attempts exceeds i32")?)
+        .bind(i64::try_from(retry_delay_ms).context("bulk batch retry_delay_ms exceeds i64")?)
+        .bind(scheduled_at)
+        .execute(tx.as_mut())
+        .await
+        .context("failed to upsert workflow bulk batch")?;
+
+        for (chunk_index, chunk_items) in items.chunks(chunk_size_usize).enumerate() {
+            let chunk_id = format!("{batch_id}::{chunk_index}");
+            sqlx::query(
+                r#"
+                INSERT INTO workflow_bulk_chunks (
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    workflow_id,
+                    workflow_version,
+                    artifact_hash,
+                    batch_id,
+                    chunk_id,
+                    chunk_index,
+                    group_id,
+                    item_count,
+                    activity_type,
+                    task_queue,
+                    state,
+                    status,
+                    attempt,
+                    owner_epoch,
+                    max_attempts,
+                    retry_delay_ms,
+                    input_handle,
+                    result_handle,
+                    items,
+                    scheduled_at,
+                    available_at,
+                    updated_at
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'scheduled', 1, $15,
+                    $16, $17, $18, $19, $20, $21, $21, $21
+                )
+                ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id, chunk_id)
+                DO NOTHING
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(instance_id)
+            .bind(run_id)
+            .bind(definition_id)
+            .bind(definition_version.map(|value| value as i32))
+            .bind(artifact_hash)
+            .bind(batch_id)
+            .bind(&chunk_id)
+            .bind(i32::try_from(chunk_index).context("bulk chunk index exceeds i32")?)
+            .bind(0_i32)
+            .bind(i32::try_from(chunk_items.len()).context("bulk chunk item_count exceeds i32")?)
+            .bind(activity_type)
+            .bind(task_queue)
+            .bind(state)
+            .bind(1_i64)
+            .bind(i32::try_from(max_attempts).context("bulk chunk max_attempts exceeds i32")?)
+            .bind(i64::try_from(retry_delay_ms).context("bulk chunk retry_delay_ms exceeds i64")?)
+            .bind(Json(Value::Null))
+            .bind(Json(Value::Null))
+            .bind(Json(chunk_items.to_vec()))
+            .bind(scheduled_at)
+            .execute(tx.as_mut())
+            .await
+            .context("failed to upsert workflow bulk chunk")?;
+        }
+
+        tx.commit().await.context("failed to commit workflow bulk batch transaction")?;
+        Ok(())
+    }
+
     pub async fn lease_next_bulk_chunks(
         &self,
         tenant_id: &str,
@@ -9348,6 +9930,63 @@ impl WorkflowStore {
         .await
         .context("failed to count started workflow bulk chunks")?;
         Ok(count as u64)
+    }
+
+    pub async fn list_nonterminal_bulk_batch_routing_counts_for_task_queue(
+        &self,
+        tenant_id: &str,
+        task_queue: &str,
+    ) -> Result<Vec<BulkBatchRoutingCount>> {
+        let rows = sqlx::query_as::<_, (String, String, String, i64)>(
+            r#"
+            SELECT
+                selected_backend,
+                routing_reason,
+                admission_policy_version,
+                SUM(batch_count)::bigint AS batch_count
+            FROM (
+                SELECT
+                    throughput_backend AS selected_backend,
+                    routing_reason,
+                    admission_policy_version,
+                    COUNT(*)::bigint AS batch_count
+                FROM workflow_bulk_batches
+                WHERE tenant_id = $1
+                  AND task_queue = $2
+                  AND status IN ('scheduled', 'running')
+                GROUP BY throughput_backend, routing_reason, admission_policy_version
+                UNION ALL
+                SELECT
+                    throughput_backend AS selected_backend,
+                    routing_reason,
+                    admission_policy_version,
+                    COUNT(*)::bigint AS batch_count
+                FROM throughput_projection_batches
+                WHERE tenant_id = $1
+                  AND task_queue = $2
+                  AND status IN ('scheduled', 'running')
+                GROUP BY throughput_backend, routing_reason, admission_policy_version
+            ) AS routing
+            GROUP BY selected_backend, routing_reason, admission_policy_version
+            ORDER BY batch_count DESC, selected_backend ASC, routing_reason ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(task_queue)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list nonterminal bulk batch routing counts")?;
+        Ok(rows
+            .into_iter()
+            .map(|(selected_backend, routing_reason, admission_policy_version, batch_count)| {
+                BulkBatchRoutingCount {
+                    selected_backend,
+                    routing_reason,
+                    admission_policy_version,
+                    batch_count: batch_count as u64,
+                }
+            })
+            .collect())
     }
 
     pub async fn has_ready_bulk_chunks_for_backend(
@@ -10114,6 +10753,8 @@ impl WorkflowStore {
                 result_handle,
                 throughput_backend,
                 throughput_backend_version,
+                routing_reason,
+                admission_policy_version,
                 execution_policy,
                 reducer,
                 reducer_class,
@@ -10136,7 +10777,8 @@ impl WorkflowStore {
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33
+                $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33,
+                $34, $35
             )
             ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id) DO UPDATE
             SET activity_type = EXCLUDED.activity_type,
@@ -10146,6 +10788,8 @@ impl WorkflowStore {
                 result_handle = EXCLUDED.result_handle,
                 throughput_backend = EXCLUDED.throughput_backend,
                 throughput_backend_version = EXCLUDED.throughput_backend_version,
+                routing_reason = EXCLUDED.routing_reason,
+                admission_policy_version = EXCLUDED.admission_policy_version,
                 execution_policy = EXCLUDED.execution_policy,
                 reducer = EXCLUDED.reducer,
                 reducer_class = EXCLUDED.reducer_class,
@@ -10181,6 +10825,8 @@ impl WorkflowStore {
         .bind(Json(&batch.result_handle))
         .bind(&batch.throughput_backend)
         .bind(&batch.throughput_backend_version)
+        .bind(&batch.routing_reason)
+        .bind(&batch.admission_policy_version)
         .bind(&batch.execution_policy)
         .bind(&batch.reducer)
         .bind(&batch.reducer_class)
@@ -12221,7 +12867,11 @@ impl WorkflowStore {
             updated_at: row.try_get("updated_at").context("snapshot updated_at missing")?,
             state: row
                 .try_get::<Json<WorkflowInstanceState>, _>("state")
-                .map(|value| value.0)
+                .map(|value| {
+                    let mut state = value.0;
+                    state.expand_after_persistence();
+                    state
+                })
                 .context("snapshot state missing")?,
         })
     }
@@ -12495,6 +13145,67 @@ impl WorkflowStore {
             updated_at: row
                 .try_get("updated_at")
                 .context("task queue throughput policy updated_at missing")?,
+        })
+    }
+
+    fn decode_task_queue_runtime_control_row(
+        row: sqlx::postgres::PgRow,
+    ) -> Result<TaskQueueRuntimeControlRecord> {
+        Ok(TaskQueueRuntimeControlRecord {
+            tenant_id: row
+                .try_get("tenant_id")
+                .context("task queue runtime control tenant_id missing")?,
+            queue_kind: TaskQueueKind::from_db(
+                &row.try_get::<String, _>("queue_kind")
+                    .context("task queue runtime control queue_kind missing")?,
+            )?,
+            task_queue: row
+                .try_get("task_queue")
+                .context("task queue runtime control task_queue missing")?,
+            is_paused: row
+                .try_get("is_paused")
+                .context("task queue runtime control is_paused missing")?,
+            is_draining: row
+                .try_get("is_draining")
+                .context("task queue runtime control is_draining missing")?,
+            reason: row.try_get("reason").context("task queue runtime control reason missing")?,
+            created_at: row
+                .try_get("created_at")
+                .context("task queue runtime control created_at missing")?,
+            updated_at: row
+                .try_get("updated_at")
+                .context("task queue runtime control updated_at missing")?,
+        })
+    }
+
+    fn decode_bulk_batch_runtime_control_row(
+        row: sqlx::postgres::PgRow,
+    ) -> Result<WorkflowBulkBatchRuntimeControlRecord> {
+        Ok(WorkflowBulkBatchRuntimeControlRecord {
+            tenant_id: row
+                .try_get("tenant_id")
+                .context("workflow bulk batch runtime control tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("workflow bulk batch runtime control workflow_instance_id missing")?,
+            run_id: row
+                .try_get("run_id")
+                .context("workflow bulk batch runtime control run_id missing")?,
+            batch_id: row
+                .try_get("batch_id")
+                .context("workflow bulk batch runtime control batch_id missing")?,
+            is_paused: row
+                .try_get("is_paused")
+                .context("workflow bulk batch runtime control is_paused missing")?,
+            reason: row
+                .try_get("reason")
+                .context("workflow bulk batch runtime control reason missing")?,
+            created_at: row
+                .try_get("created_at")
+                .context("workflow bulk batch runtime control created_at missing")?,
+            updated_at: row
+                .try_get("updated_at")
+                .context("workflow bulk batch runtime control updated_at missing")?,
         })
     }
 
@@ -12922,6 +13633,30 @@ impl WorkflowStore {
     }
 
     fn decode_bulk_batch_row(row: sqlx::postgres::PgRow) -> Result<WorkflowBulkBatchRecord> {
+        let throughput_backend = row
+            .try_get::<String, _>("throughput_backend")
+            .context("bulk batch throughput_backend missing")?;
+        let execution_policy = row
+            .try_get::<Option<String>, _>("execution_policy")
+            .context("bulk batch execution_policy missing")?;
+        let reducer =
+            row.try_get::<Option<String>, _>("reducer").context("bulk batch reducer missing")?;
+        let execution_mode = throughput_execution_mode(&throughput_backend).to_owned();
+        let derived_routing_reason = throughput_routing_reason(
+            &throughput_backend,
+            execution_policy.as_deref(),
+            reducer.as_deref(),
+        )
+        .to_owned();
+        let routing_reason = row.try_get::<String, _>("routing_reason").unwrap_or_default();
+        let reducer_kind = bulk_reducer_name(reducer.as_deref()).to_owned();
+        let reducer_version = throughput_reducer_version(reducer.as_deref()).to_owned();
+        let reducer_execution_path = throughput_reducer_execution_path(
+            &throughput_backend,
+            execution_policy.as_deref(),
+            reducer.as_deref(),
+        )
+        .to_owned();
         Ok(WorkflowBulkBatchRecord {
             tenant_id: row.try_get("tenant_id").context("bulk batch tenant_id missing")?,
             instance_id: row
@@ -12950,19 +13685,28 @@ impl WorkflowStore {
                 .try_get::<Json<Value>, _>("result_handle")
                 .map(|value| value.0)
                 .context("bulk batch result_handle missing")?,
-            throughput_backend: row
-                .try_get("throughput_backend")
-                .context("bulk batch throughput_backend missing")?,
+            throughput_backend: throughput_backend.clone(),
             throughput_backend_version: row
                 .try_get("throughput_backend_version")
                 .context("bulk batch throughput_backend_version missing")?,
-            execution_policy: row
-                .try_get("execution_policy")
-                .context("bulk batch execution_policy missing")?,
-            reducer: row.try_get("reducer").context("bulk batch reducer missing")?,
+            execution_mode,
+            selected_backend: throughput_backend.clone(),
+            routing_reason: if routing_reason.is_empty() {
+                derived_routing_reason
+            } else {
+                routing_reason
+            },
+            admission_policy_version: row
+                .try_get::<String, _>("admission_policy_version")
+                .unwrap_or_else(|_| ADMISSION_POLICY_VERSION.to_owned()),
+            execution_policy,
+            reducer_kind,
+            reducer: reducer.clone(),
             reducer_class: row
                 .try_get("reducer_class")
                 .context("bulk batch reducer_class missing")?,
+            reducer_version,
+            reducer_execution_path,
             aggregation_tree_depth: row
                 .try_get::<i32, _>("aggregation_tree_depth")
                 .context("bulk batch aggregation_tree_depth missing")?
@@ -13255,7 +13999,10 @@ mod tests {
     use super::*;
     use anyhow::Context;
     use fabrik_events::WorkflowIdentity;
-    use fabrik_workflow::{ArtifactEntrypoint, CompiledStateNode, CompiledWorkflow, Expression};
+    use fabrik_workflow::{
+        ArtifactEntrypoint, ArtifactExecutionState, CompiledStateNode, CompiledWorkflow,
+        Expression, WorkflowStatus,
+    };
     use serde_json::json;
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -13434,9 +14181,7 @@ mod tests {
         states.insert(
             "done".to_owned(),
             CompiledStateNode::Succeed {
-                output: Some(Expression::Literal {
-                    value: Value::String(output.to_owned()),
-                }),
+                output: Some(Expression::Literal { value: Value::String(output.to_owned()) }),
             },
         );
 
@@ -13580,6 +14325,76 @@ mod tests {
         assert_eq!(fallback_lease.task_id, task.task_id);
         assert_eq!(fallback_lease.lease_build_id.as_deref(), Some("build-b"));
         assert_eq!(fallback_lease.lease_poller_id.as_deref(), Some("poller-b"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workflow_instance_round_trips_compacted_store_state() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let input = json!({"items": [{"value": "x"}, {"value": "y"}]});
+        let context = json!([{"value": "x"}, {"value": "y"}]);
+        let expected = WorkflowInstanceState {
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "wf-store-roundtrip".to_owned(),
+            run_id: "run-store-roundtrip".to_owned(),
+            definition_id: "demo".to_owned(),
+            definition_version: Some(1),
+            artifact_hash: Some("artifact-a".to_owned()),
+            workflow_task_queue: "default".to_owned(),
+            sticky_workflow_build_id: None,
+            sticky_workflow_poller_id: None,
+            current_state: Some("join".to_owned()),
+            context: Some(context.clone()),
+            artifact_execution: Some(ArtifactExecutionState {
+                bindings: BTreeMap::from([
+                    ("input".to_owned(), input.clone()),
+                    ("results".to_owned(), json!({"batchId": "batch-1"})),
+                ]),
+                ..ArtifactExecutionState::default()
+            }),
+            status: WorkflowStatus::Running,
+            input: Some(input.clone()),
+            memo: None,
+            search_attributes: None,
+            output: None,
+            event_count: 1,
+            last_event_id: Uuid::now_v7(),
+            last_event_type: "WorkflowTriggered".to_owned(),
+            updated_at: Utc::now(),
+        };
+
+        store.upsert_instance(&expected).await?;
+
+        let persisted: Value = sqlx::query_scalar(
+            r#"
+            SELECT state
+            FROM workflow_instances
+            WHERE tenant_id = $1 AND workflow_instance_id = $2
+            "#,
+        )
+        .bind(&expected.tenant_id)
+        .bind(&expected.instance_id)
+        .fetch_one(&store.pool)
+        .await?;
+        assert_eq!(persisted.get("input"), Some(&Value::Null));
+        assert_eq!(persisted.get("context"), Some(&context));
+        assert_eq!(
+            persisted
+                .get("artifact_execution")
+                .and_then(|value| value.get("bindings"))
+                .and_then(|value| value.get("input")),
+            Some(&input)
+        );
+
+        let restored = store
+            .get_instance(&expected.tenant_id, &expected.instance_id)
+            .await?
+            .context("stored workflow instance should exist")?;
+        assert_eq!(restored, expected);
 
         Ok(())
     }
@@ -14149,6 +14964,52 @@ mod tests {
             inspection.throughput_policy.as_ref().map(|record| record.backend.as_str()),
             Some("stream-v2")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_queue_and_bulk_batch_runtime_controls_are_queryable() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+
+        let queue_control = store
+            .upsert_task_queue_runtime_control(
+                "tenant-a",
+                TaskQueueKind::Activity,
+                "bulk",
+                true,
+                false,
+                Some("queue paused by operator"),
+            )
+            .await?;
+        assert!(queue_control.is_paused);
+
+        let loaded_queue = store
+            .get_task_queue_runtime_control("tenant-a", TaskQueueKind::Activity, "bulk")
+            .await?
+            .context("queue control should exist")?;
+        assert_eq!(loaded_queue.reason.as_deref(), Some("queue paused by operator"));
+
+        let batch_control = store
+            .upsert_bulk_batch_runtime_control(
+                "tenant-a",
+                "wf-a",
+                "run-a",
+                "batch-a",
+                true,
+                Some("batch paused by operator"),
+            )
+            .await?;
+        assert!(batch_control.is_paused);
+
+        let loaded_batch = store
+            .get_bulk_batch_runtime_control("tenant-a", "wf-a", "run-a", "batch-a")
+            .await?
+            .context("batch control should exist")?;
+        assert_eq!(loaded_batch.reason.as_deref(), Some("batch paused by operator"));
 
         Ok(())
     }

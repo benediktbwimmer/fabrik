@@ -9,6 +9,10 @@ Build `fabrik` into a high-performance Temporal replacement with:
 - higher aggregate throughput
 - stronger scale characteristics for heavy fan-out / fan-in workloads
 
+Current Temporal TypeScript blocker ordering is tracked separately in
+[`temporal-ts-replacement-priorities.md`](/Users/bene/code/fabrik/docs/temporal-ts-replacement-priorities.md),
+which is generated from the official Temporal samples repo census and should guide the next parity slices.
+
 ## Phase 0: Product Realignment
 
 Goal: align the product model, docs, and architecture around Temporal parity.

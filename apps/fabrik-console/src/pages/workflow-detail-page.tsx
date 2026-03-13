@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { FormEvent, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { toast } from "sonner";
 
@@ -13,6 +13,38 @@ const TABS = ["summary", "graph", "timeline", "activities", "raw-history"] as co
 type Tab = (typeof TABS)[number];
 
 type TimelineLane = "lifecycle" | "activities" | "messages" | "timers" | "infra" | "other";
+
+type LiveBatchRoutingSignal = {
+  batch_id: string;
+  task_queue: string | null;
+  selected_backend: string | null;
+  routing_reason: string | null;
+  admission_policy_version: string | null;
+  status: string | null;
+};
+
+type LiveBatchCapacitySignal = {
+  batch_id: string;
+  task_queue: string | null;
+  selected_backend: string | null;
+  routing_reason: string | null;
+  admission: {
+    stream_v2_capacity?: {
+      state?: string | null;
+      tenant_utilization?: number | null;
+      task_queue_utilization?: number | null;
+    };
+  } | null;
+};
+
+function parseWatchBody<T>(event: MessageEvent<string>): T | null {
+  try {
+    const parsed = JSON.parse(event.data) as { body?: T };
+    return parsed.body ?? null;
+  } catch {
+    return null;
+  }
+}
 
 function metadataPreview(value: unknown) {
   if (value == null || typeof value !== "object" || Array.isArray(value)) return "-";
@@ -52,6 +84,10 @@ export function WorkflowDetailPage() {
   const [terminateReason, setTerminateReason] = useState("terminated by operator");
   const [laneFilter, setLaneFilter] = useState<"all" | TimelineLane>("all");
   const [windowPreset, setWindowPreset] = useState<"all" | "recent-50" | "recent-20">("all");
+  const [selectedBatchId, setSelectedBatchId] = useState("");
+  const [batchControlPending, setBatchControlPending] = useState(false);
+  const [liveBatchRouting, setLiveBatchRouting] = useState<LiveBatchRoutingSignal | null>(null);
+  const [liveBatchCapacity, setLiveBatchCapacity] = useState<LiveBatchCapacitySignal | null>(null);
 
   const workflowQuery = useQuery({
     queryKey: ["workflow", tenantId, instanceId],
@@ -77,6 +113,16 @@ export function WorkflowDetailPage() {
     queryKey: ["run-activities", tenantId, instanceId, resolvedRunId],
     enabled: tenantId !== "" && instanceId !== "" && resolvedRunId !== "",
     queryFn: () => api.getWorkflowActivities(tenantId, instanceId, resolvedRunId)
+  });
+  const bulkBatchesQuery = useQuery({
+    queryKey: ["run-bulk-batches", tenantId, instanceId, resolvedRunId],
+    enabled: tenantId !== "" && instanceId !== "" && resolvedRunId !== "",
+    queryFn: () => api.getWorkflowBulkBatches(tenantId, instanceId, resolvedRunId)
+  });
+  const bulkBatchDetailQuery = useQuery({
+    queryKey: ["run-bulk-batch", tenantId, instanceId, resolvedRunId, selectedBatchId],
+    enabled: tenantId !== "" && instanceId !== "" && resolvedRunId !== "" && selectedBatchId !== "",
+    queryFn: () => api.getWorkflowBulkBatch(tenantId, instanceId, resolvedRunId, selectedBatchId, "strong")
   });
   const graphQuery = useQuery({
     queryKey: ["run-graph", tenantId, instanceId, resolvedRunId],
@@ -111,6 +157,68 @@ export function WorkflowDetailPage() {
     () => (activitiesQuery.data?.activities ?? []).filter((activity) => ["scheduled", "started"].includes(activity.status)).map((activity) => activity.activity_id),
     [activitiesQuery.data?.activities]
   );
+
+  useEffect(() => {
+    const firstBatchId = bulkBatchesQuery.data?.batches?.[0]?.batch_id ?? "";
+    if (selectedBatchId === "" && firstBatchId !== "") {
+      setSelectedBatchId(firstBatchId);
+    }
+    if (
+      selectedBatchId !== "" &&
+      bulkBatchesQuery.data?.batches &&
+      !bulkBatchesQuery.data.batches.some((batch) => batch.batch_id === selectedBatchId)
+    ) {
+      setSelectedBatchId(firstBatchId);
+    }
+  }, [bulkBatchesQuery.data?.batches, selectedBatchId]);
+
+  useEffect(() => {
+    if (tenantId === "" || instanceId === "" || resolvedRunId === "") return;
+    if (typeof EventSource === "undefined") return;
+    const source = new EventSource(api.workflowRunWatchPath(tenantId, instanceId, resolvedRunId));
+    const refresh = () => {
+      void client.invalidateQueries({ queryKey: ["workflow", tenantId, instanceId] });
+      void client.invalidateQueries({ queryKey: ["run-detail-runs", tenantId, instanceId] });
+    };
+    const refreshBatches = () => {
+      void client.invalidateQueries({ queryKey: ["run-bulk-batches", tenantId, instanceId, resolvedRunId] });
+      if (selectedBatchId !== "") {
+        void client.invalidateQueries({
+          queryKey: ["run-bulk-batch", tenantId, instanceId, resolvedRunId, selectedBatchId]
+        });
+      }
+    };
+    source.addEventListener("workflow_state_changed", refresh);
+    source.addEventListener("throughput_batches_changed", refreshBatches);
+    return () => source.close();
+  }, [client, instanceId, resolvedRunId, selectedBatchId, tenantId]);
+
+  useEffect(() => {
+    if (tenantId === "" || instanceId === "" || resolvedRunId === "" || selectedBatchId === "") return;
+    if (typeof EventSource === "undefined") return;
+    setLiveBatchRouting(null);
+    setLiveBatchCapacity(null);
+    const source = new EventSource(api.bulkBatchWatchPath(tenantId, instanceId, resolvedRunId, selectedBatchId));
+    const refresh = () => {
+      void client.invalidateQueries({ queryKey: ["run-bulk-batches", tenantId, instanceId, resolvedRunId] });
+      void client.invalidateQueries({
+        queryKey: ["run-bulk-batch", tenantId, instanceId, resolvedRunId, selectedBatchId]
+      });
+    };
+    source.addEventListener("batch_progress", refresh);
+    source.addEventListener("batch_terminal", refresh);
+    source.addEventListener("projection_lag", refresh);
+    source.addEventListener("routing_changed", (event) => {
+      const body = parseWatchBody<LiveBatchRoutingSignal>(event as MessageEvent<string>);
+      if (body) setLiveBatchRouting(body);
+      refresh();
+    });
+    source.addEventListener("capacity_pressure", (event) => {
+      const body = parseWatchBody<LiveBatchCapacitySignal>(event as MessageEvent<string>);
+      if (body) setLiveBatchCapacity(body);
+    });
+    return () => source.close();
+  }, [client, instanceId, resolvedRunId, selectedBatchId, tenantId]);
 
   const timelineItems = useMemo(() => {
     const historyItems = (historyQuery.data?.events ?? []).map((event) => ({
@@ -189,6 +297,7 @@ export function WorkflowDetailPage() {
           .map((item) => `${item.run_id} · v${item.definition_version ?? "-"} · ${item.artifact_hash ?? "-"}`)
           .join(" | ")
       : "-";
+  const selectedBatch = bulkBatchDetailQuery.data?.batch ?? null;
 
   async function onSignal(event: FormEvent) {
     event.preventDefault();
@@ -219,6 +328,31 @@ export function WorkflowDetailPage() {
       void client.invalidateQueries({ queryKey: ["run-activities", tenantId, instanceId, resolvedRunId] });
     } catch (error) {
       toast.error(String(error));
+    }
+  }
+
+  async function toggleBatchPause() {
+    if (tenantId === "" || instanceId === "" || resolvedRunId === "" || selectedBatchId === "" || !selectedBatch) {
+      return;
+    }
+    setBatchControlPending(true);
+    try {
+      await api.setBulkBatchRuntimeControl(tenantId, instanceId, resolvedRunId, selectedBatchId, {
+        is_paused: !bulkBatchDetailQuery.data?.runtime_control?.is_paused,
+        reason:
+          bulkBatchDetailQuery.data?.runtime_control?.is_paused
+            ? "batch resumed by operator"
+            : "batch paused by operator"
+      });
+      toast.success("Batch control updated");
+      await client.invalidateQueries({ queryKey: ["run-bulk-batches", tenantId, instanceId, resolvedRunId] });
+      await client.invalidateQueries({
+        queryKey: ["run-bulk-batch", tenantId, instanceId, resolvedRunId, selectedBatchId]
+      });
+    } catch (error) {
+      toast.error(String(error));
+    } finally {
+      setBatchControlPending(false);
     }
   }
 
@@ -360,6 +494,92 @@ export function WorkflowDetailPage() {
                     </Link>
                   ))}
                 </div>
+              </Panel>
+
+              <Panel className="nested-panel">
+                <div className="row space-between">
+                  <h3>Throughput batches</h3>
+                  <ConsistencyBadge
+                    consistency={bulkBatchesQuery.data?.consistency ?? bulkBatchDetailQuery.data?.consistency}
+                    source={bulkBatchesQuery.data?.authoritative_source ?? bulkBatchDetailQuery.data?.authoritative_source}
+                  />
+                </div>
+                {bulkBatchesQuery.data && bulkBatchesQuery.data.batches.length > 0 ? (
+                  <div className="split">
+                    <div className="stack">
+                      {bulkBatchesQuery.data.batches.map((batch) => (
+                        <button
+                          key={batch.batch_id}
+                          className={`subtle-block ${batch.batch_id === selectedBatchId ? "current" : ""}`}
+                          onClick={() => setSelectedBatchId(batch.batch_id)}
+                          style={{ textAlign: "left" }}
+                        >
+                          <div className="row space-between">
+                            <strong>{batch.activity_type}</strong>
+                            <Badge value={batch.status} />
+                          </div>
+                          <div className="muted">
+                            {batch.batch_id} · {formatNumber(batch.total_items)} items · {batch.selected_backend}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+
+                    <div className="stack">
+                      {selectedBatch ? (
+                        <Panel className="nested-panel">
+                          <div className="row space-between">
+                            <h3>{selectedBatch.batch_id}</h3>
+                            <div className="row">
+                              {bulkBatchDetailQuery.data?.runtime_control?.is_paused ? <Badge value="paused" /> : null}
+                              <Badge value={selectedBatch.status} />
+                            </div>
+                          </div>
+                          <div className="stack">
+                            <div>Backend {selectedBatch.selected_backend}</div>
+                            <div>Execution mode {selectedBatch.execution_mode}</div>
+                            <div>Routing reason {selectedBatch.routing_reason}</div>
+                            <div>Admission policy {selectedBatch.admission_policy_version}</div>
+                            <div>
+                              Live routing signal{" "}
+                              {liveBatchRouting
+                                ? `${liveBatchRouting.selected_backend ?? "-"} · ${liveBatchRouting.routing_reason ?? "-"}`
+                                : "-"}
+                            </div>
+                            <div>
+                              Live capacity signal{" "}
+                              {liveBatchCapacity?.admission?.stream_v2_capacity?.state ?? "-"}
+                            </div>
+                            <div>
+                              Live queue utilization{" "}
+                              {liveBatchCapacity?.admission?.stream_v2_capacity?.task_queue_utilization != null
+                                ? `${((liveBatchCapacity.admission.stream_v2_capacity.task_queue_utilization ?? 0) * 100).toFixed(1)}%`
+                                : "-"}
+                            </div>
+                            <div>Reducer {selectedBatch.reducer_kind}</div>
+                            <div>Reducer path {selectedBatch.reducer_execution_path}</div>
+                            <div>Projection lag {formatInlineValue(bulkBatchDetailQuery.data?.projection_lag_ms)}</div>
+                            <div>Fast lane {formatInlineValue(selectedBatch.fast_lane_enabled)}</div>
+                            <div>Tree depth {formatInlineValue(selectedBatch.aggregation_tree_depth)}</div>
+                            <div>Group count {formatInlineValue(selectedBatch.aggregation_group_count)}</div>
+                            <div>
+                              Progress {formatNumber(selectedBatch.succeeded_items)} succeeded · {formatNumber(selectedBatch.failed_items)} failed
+                              {" "}· {formatNumber(selectedBatch.cancelled_items)} cancelled
+                            </div>
+                            <div>Control reason {bulkBatchDetailQuery.data?.runtime_control?.reason ?? "-"}</div>
+                            <button className="button ghost" disabled={batchControlPending} onClick={() => void toggleBatchPause()}>
+                              {bulkBatchDetailQuery.data?.runtime_control?.is_paused ? "Resume batch" : "Pause batch"}
+                            </button>
+                          </div>
+                        </Panel>
+                      ) : (
+                        <div className="empty">Select a throughput batch to inspect live routing and progress.</div>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="empty">No throughput batches recorded for this run.</div>
+                )}
               </Panel>
 
               <div className="grid two">

@@ -414,18 +414,39 @@ trap cleanup_failed_start EXIT
 start_service() {
   local log_file=$1
   shift
-  (
-    while (($#)); do
-      if [[ "$1" == "--" ]]; then
-        shift
-        break
-      fi
-      export "$1"
-      shift
-    done
-    exec nohup "$@"
-  ) >"$log_file" 2>&1 &
-  local pid=$!
+  local args=("$log_file" "$@")
+  local pid
+  pid="$(
+    python3 - "${args[@]}" <<'PY'
+import os
+import subprocess
+import sys
+
+log_file = sys.argv[1]
+argv = sys.argv[2:]
+separator = argv.index("--")
+env_pairs = argv[:separator]
+command = argv[separator + 1 :]
+
+child_env = os.environ.copy()
+for pair in env_pairs:
+    key, value = pair.split("=", 1)
+    child_env[key] = value
+
+with open(log_file, "ab", buffering=0) as log:
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        env=child_env,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+print(proc.pid)
+PY
+  )"
   PIDS+=("$pid")
   echo "$pid" >>"$PID_FILE"
 }

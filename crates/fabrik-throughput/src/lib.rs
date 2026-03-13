@@ -18,6 +18,7 @@ use uuid::Uuid;
 pub const PG_V1_BACKEND: &str = "pg-v1";
 pub const STREAM_V2_BACKEND: &str = "stream-v2";
 pub const STREAM_V2_BACKEND_VERSION: &str = "2.0.0";
+pub const ADMISSION_POLICY_VERSION: &str = "2026-03-13.1";
 pub const BULK_REDUCER_ALL_SUCCEEDED: &str = "all_succeeded";
 pub const BULK_REDUCER_ALL_SETTLED: &str = "all_settled";
 pub const BULK_REDUCER_COUNT: &str = "count";
@@ -82,6 +83,48 @@ pub fn bulk_reducer_class(reducer: Option<&str>) -> BulkReducerClass {
 
 pub fn bulk_reducer_is_mergeable(reducer: Option<&str>) -> bool {
     bulk_reducer_class(reducer) == BulkReducerClass::Mergeable
+}
+
+pub fn bulk_reducer_materializes_results(reducer: Option<&str>) -> bool {
+    matches!(bulk_reducer_name(reducer), BULK_REDUCER_COLLECT_RESULTS | "collect_settled_results")
+}
+
+pub fn throughput_execution_mode(_backend: &str) -> &'static str {
+    "throughput"
+}
+
+pub fn throughput_routing_reason(
+    backend: &str,
+    execution_policy: Option<&str>,
+    reducer: Option<&str>,
+) -> &'static str {
+    if stream_v2_fast_lane_enabled(backend, execution_policy, reducer) {
+        "stream_v2_fast_lane"
+    } else if backend == STREAM_V2_BACKEND {
+        "stream_v2_selected"
+    } else {
+        "pg_v1_selected"
+    }
+}
+
+pub fn throughput_reducer_version(_reducer: Option<&str>) -> &'static str {
+    "builtin/v1"
+}
+
+pub fn throughput_reducer_execution_path(
+    backend: &str,
+    execution_policy: Option<&str>,
+    reducer: Option<&str>,
+) -> &'static str {
+    if stream_v2_fast_lane_enabled(backend, execution_policy, reducer) {
+        "mergeable_fast_lane"
+    } else if bulk_reducer_is_mergeable(reducer) {
+        "mergeable_owner_apply"
+    } else if bulk_reducer_materializes_results(reducer) {
+        "materialized_results"
+    } else {
+        "summary_only"
+    }
 }
 
 pub fn stream_v2_fast_lane_enabled(

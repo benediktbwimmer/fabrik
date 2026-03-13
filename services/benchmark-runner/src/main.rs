@@ -77,6 +77,7 @@ impl BenchmarkWorkloadKind {
 #[derive(Debug, Clone)]
 struct Args {
     suite_name: Option<String>,
+    scenario_tag: Option<String>,
     profile_name: String,
     profile: BenchmarkProfile,
     output_path: PathBuf,
@@ -136,8 +137,16 @@ struct BenchmarkReport {
     executor_debug_delta: Option<Value>,
     throughput_runtime_debug: Option<Value>,
     throughput_projector_debug: Option<Value>,
+    batch_routing_metrics: BatchRoutingMetrics,
     control_plane_metrics: Option<ControlPlaneMetrics>,
     executor_debug_delta_metrics: Option<ExecutorDebugDeltaMetrics>,
+}
+
+#[derive(Debug, Serialize, Default)]
+struct BatchRoutingMetrics {
+    backend_counts: BTreeMap<String, u64>,
+    routing_reason_counts: BTreeMap<String, u64>,
+    admission_policy_version_counts: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -293,19 +302,14 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
     let started_at = Utc::now();
     let started = Instant::now();
     let executor_debug_url = format!("{unified_runtime_debug_base}/debug/unified");
-    let executor_debug_before = (args.execution_mode != ExecutionMode::Throughput)
-        .then(|| async { fetch_optional_debug(&client, &executor_debug_url).await });
-    let executor_debug_before = match executor_debug_before {
-        Some(fetch) => Some(fetch.await),
-        None => None,
-    };
+    let executor_debug_before = Some(fetch_optional_debug(&client, &executor_debug_url).await);
 
     if args.execution_mode == ExecutionMode::Throughput {
         apply_task_queue_throughput_policy(
             &pool,
             &args.tenant_id,
             &args.task_queue,
-            args.throughput_backend.as_deref().unwrap_or(PG_V1_BACKEND),
+            args.throughput_backend.as_deref(),
         )
         .await?;
     }
@@ -423,6 +427,8 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
     let coalescing_metrics =
         coalescing_metrics(&pool, &args.tenant_id, &instance_prefix, args.workload_kind).await?;
     let (_legacy_batch_rows, _legacy_chunk_rows) = (0_u64, 0_u64);
+    let batch_routing_metrics =
+        batch_routing_metrics(&pool, &args.tenant_id, &instance_prefix, args.workload_kind).await?;
     let (final_workflow_backlog, final_activity_backlog) = backlog_snapshot(
         &pool,
         &args.tenant_id,
@@ -442,8 +448,7 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         .json::<Value>()
         .await
         .context("failed to decode benchmark control-plane debug summary")?;
-    let executor_debug_after =
-        (args.execution_mode != ExecutionMode::Throughput).then_some(executor_debug.clone());
+    let executor_debug_after = Some(executor_debug.clone());
     let executor_debug_delta = executor_debug_before
         .as_ref()
         .zip(executor_debug_after.as_ref())
@@ -534,6 +539,7 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         executor_debug_delta,
         throughput_runtime_debug,
         throughput_projector_debug,
+        batch_routing_metrics,
         control_plane_metrics,
         executor_debug_delta_metrics,
     })
@@ -541,6 +547,7 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
 
 fn parse_args() -> Result<Args> {
     let mut suite_name = None;
+    let mut scenario_tag = None;
     let mut profile_name = "smoke".to_owned();
     let mut output_path = None;
     let mut worker_count = 1_usize;
@@ -566,6 +573,7 @@ fn parse_args() -> Result<Args> {
         let value = args.next().with_context(|| format!("missing value for argument {flag}"))?;
         match flag.as_str() {
             "--suite" => suite_name = Some(value),
+            "--scenario-tag" => scenario_tag = Some(value),
             "--profile" => profile_name = value,
             "--output" => output_path = Some(PathBuf::from(value)),
             "--worker-count" => worker_count = value.parse().context("invalid --worker-count")?,
@@ -648,6 +656,7 @@ fn parse_args() -> Result<Args> {
 
     Ok(Args {
         suite_name,
+        scenario_tag,
         profile_name,
         profile,
         output_path,
@@ -1119,8 +1128,29 @@ async fn apply_task_queue_throughput_policy(
     pool: &PgPool,
     tenant_id: &str,
     task_queue: &str,
-    backend: &str,
+    backend: Option<&str>,
 ) -> Result<()> {
+    if backend.is_none() {
+        sqlx::query(
+            r#"
+            DELETE FROM task_queue_throughput_policies
+            WHERE tenant_id = $1
+              AND queue_kind = 'activity'
+              AND task_queue = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(task_queue)
+        .execute(pool)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to clear throughput policy for tenant {tenant_id} task queue {task_queue}"
+            )
+        })?;
+        return Ok(());
+    }
+    let backend = backend.expect("backend presence already checked");
     sqlx::query(
         r#"
         INSERT INTO task_queue_throughput_policies (
@@ -1236,8 +1266,42 @@ fn benchmark_suite_scenarios(args: &Args, suite_name: &str) -> Result<Vec<Args>>
 
             Ok(vec![count, settled])
         }
+        "streaming-admission" => {
+            let mut auto_small = args.clone();
+            auto_small.suite_name = None;
+            auto_small.execution_mode = ExecutionMode::Throughput;
+            auto_small.throughput_backend = None;
+            auto_small.bulk_reducer = "all_settled".to_owned();
+            auto_small.chunk_size = 64;
+            auto_small.profile.activities_per_workflow =
+                auto_small.profile.activities_per_workflow.min(64);
+            auto_small.profile.workflow_count = auto_small.profile.workflow_count.min(16);
+            auto_small.scenario_tag = Some("auto-small".to_owned());
+
+            let mut auto_large = args.clone();
+            auto_large.suite_name = None;
+            auto_large.execution_mode = ExecutionMode::Throughput;
+            auto_large.throughput_backend = None;
+            auto_large.bulk_reducer = "all_settled".to_owned();
+            auto_large.chunk_size = 64;
+            auto_large.profile.activities_per_workflow =
+                auto_large.profile.activities_per_workflow.max(1_024);
+            auto_large.scenario_tag = Some("auto-large".to_owned());
+
+            let mut auto_materialized = args.clone();
+            auto_materialized.suite_name = None;
+            auto_materialized.execution_mode = ExecutionMode::Throughput;
+            auto_materialized.throughput_backend = None;
+            auto_materialized.bulk_reducer = "collect_results".to_owned();
+            auto_materialized.chunk_size = 64;
+            auto_materialized.profile.activities_per_workflow =
+                auto_materialized.profile.activities_per_workflow.max(1_024);
+            auto_materialized.scenario_tag = Some("auto-materialized".to_owned());
+
+            Ok(vec![auto_small, auto_large, auto_materialized])
+        }
         other => bail!(
-            "unknown suite {other}; expected streaming, stream-v2-robustness, or stream-v2-fast-lane"
+            "unknown suite {other}; expected streaming, stream-v2-robustness, stream-v2-fast-lane, or streaming-admission"
         ),
     }
 }
@@ -1246,10 +1310,14 @@ fn scenario_name(args: &Args) -> String {
     let mut scenario = match args.execution_mode {
         ExecutionMode::Durable => "durable".to_owned(),
         ExecutionMode::Throughput => {
-            format!("throughput-{}", args.throughput_backend.as_deref().unwrap_or(PG_V1_BACKEND))
+            format!("throughput-{}", args.throughput_backend.as_deref().unwrap_or("auto"))
         }
         ExecutionMode::Unified => "unified-experiment".to_owned(),
     };
+    if let Some(tag) = args.scenario_tag.as_deref() {
+        scenario.push('-');
+        scenario.push_str(tag);
+    }
     if args.bulk_reducer != "collect_results" {
         scenario.push('-');
         scenario.push_str(&args.bulk_reducer.replace('_', "-"));
@@ -1716,6 +1784,64 @@ async fn bulk_metrics(
     Ok((row.0 as u64, row.1 as u64, row.2 as u64, row.3 as u64, row.4 as u64, row.5 as u64))
 }
 
+async fn batch_routing_metrics(
+    pool: &PgPool,
+    tenant_id: &str,
+    instance_prefix: &str,
+    workload_kind: BenchmarkWorkloadKind,
+) -> Result<BatchRoutingMetrics> {
+    let excluded_child_pattern = instance_exclusion_pattern(workload_kind, instance_prefix);
+    let rows = sqlx::query_as::<_, (String, String, String, i64)>(
+        r#"
+        SELECT
+            selected_backend,
+            routing_reason,
+            admission_policy_version,
+            SUM(batch_count)::bigint AS batch_count
+        FROM (
+            SELECT
+                throughput_backend AS selected_backend,
+                routing_reason,
+                admission_policy_version,
+                COUNT(*)::bigint AS batch_count
+            FROM workflow_bulk_batches
+            WHERE tenant_id = $1
+              AND workflow_instance_id LIKE $2
+              AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
+            GROUP BY throughput_backend, routing_reason, admission_policy_version
+            UNION ALL
+            SELECT
+                throughput_backend AS selected_backend,
+                routing_reason,
+                admission_policy_version,
+                COUNT(*)::bigint AS batch_count
+            FROM throughput_projection_batches
+            WHERE tenant_id = $1
+              AND workflow_instance_id LIKE $2
+              AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
+            GROUP BY throughput_backend, routing_reason, admission_policy_version
+        ) AS routing
+        GROUP BY selected_backend, routing_reason, admission_policy_version
+        ORDER BY batch_count DESC, selected_backend ASC, routing_reason ASC
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(format!("{instance_prefix}%"))
+    .bind(excluded_child_pattern)
+    .fetch_all(pool)
+    .await
+    .context("failed to query batch routing metrics")?;
+
+    let mut metrics = BatchRoutingMetrics::default();
+    for (backend, reason, version, count) in rows {
+        let count = count as u64;
+        *metrics.backend_counts.entry(backend).or_default() += count;
+        *metrics.routing_reason_counts.entry(reason).or_default() += count;
+        *metrics.admission_policy_version_counts.entry(version).or_default() += count;
+    }
+    Ok(metrics)
+}
+
 async fn coalescing_metrics(
     pool: &PgPool,
     tenant_id: &str,
@@ -1998,8 +2124,12 @@ fn summary_text(report: &BenchmarkReport) -> String {
             metrics.snapshot_writes,
         )
     }).unwrap_or_default();
+    let backend_counts = format_counts(&report.batch_routing_metrics.backend_counts);
+    let routing_reason_counts = format_counts(&report.batch_routing_metrics.routing_reason_counts);
+    let admission_policy_versions =
+        format_counts(&report.batch_routing_metrics.admission_policy_version_counts);
     format!(
-        "scenario={scenario}\nprofile={profile}\nexecution_mode={execution_mode}\nthroughput_backend={throughput_backend}\nbulk_reducer={bulk_reducer}\nretry_rate={retry_rate}\ncancel_rate={cancel_rate}\nchunk_size={chunk_size}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nexecution_duration_ms={execution_duration_ms}\nprojection_convergence_duration_ms={projection_convergence_duration_ms}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nprojection_batch_rows={projection_batch_rows}\nprojection_chunk_rows={projection_chunk_rows}\nmax_aggregation_group_count={max_aggregation_group_count}\ngrouped_batch_rows={grouped_batch_rows}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n{control_plane}{executor_debug_delta}",
+        "scenario={scenario}\nprofile={profile}\nexecution_mode={execution_mode}\nthroughput_backend={throughput_backend}\nbulk_reducer={bulk_reducer}\nretry_rate={retry_rate}\ncancel_rate={cancel_rate}\nchunk_size={chunk_size}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nexecution_duration_ms={execution_duration_ms}\nprojection_convergence_duration_ms={projection_convergence_duration_ms}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nprojection_batch_rows={projection_batch_rows}\nprojection_chunk_rows={projection_chunk_rows}\nmax_aggregation_group_count={max_aggregation_group_count}\ngrouped_batch_rows={grouped_batch_rows}\nadmission_backend_counts={backend_counts}\nadmission_routing_reason_counts={routing_reason_counts}\nadmission_policy_versions={admission_policy_versions}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n{control_plane}{executor_debug_delta}",
         scenario = report.scenario,
         profile = report.profile,
         execution_mode = match report.execution_mode {
@@ -2030,6 +2160,9 @@ fn summary_text(report: &BenchmarkReport) -> String {
         projection_chunk_rows = report.projection_chunk_rows,
         max_aggregation_group_count = report.max_aggregation_group_count,
         grouped_batch_rows = report.grouped_batch_rows,
+        backend_counts = backend_counts,
+        routing_reason_counts = routing_reason_counts,
+        admission_policy_versions = admission_policy_versions,
         max_workflow_backlog = report.backlog_metrics.max_workflow_backlog,
         max_activity_backlog = report.backlog_metrics.max_activity_backlog,
         final_workflow_backlog = report.backlog_metrics.final_workflow_backlog,
@@ -2041,6 +2174,13 @@ fn summary_text(report: &BenchmarkReport) -> String {
     )
 }
 
+fn format_counts(counts: &BTreeMap<String, u64>) -> String {
+    if counts.is_empty() {
+        return "none".to_owned();
+    }
+    counts.iter().map(|(key, value)| format!("{key}:{value}")).collect::<Vec<_>>().join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2048,6 +2188,7 @@ mod tests {
     fn demo_args() -> Args {
         Args {
             suite_name: None,
+            scenario_tag: None,
             profile_name: "target".to_owned(),
             profile: BenchmarkProfile { workflow_count: 100, activities_per_workflow: 1_000 },
             output_path: PathBuf::from("target/benchmark-reports/demo.json"),
@@ -2199,6 +2340,25 @@ mod tests {
         assert!(scenarios[0].profile.activities_per_workflow >= 2_000);
         assert!(scenarios[1].retry_rate >= 0.01);
         assert!(scenarios[1].cancel_rate >= 0.01);
+    }
+
+    #[test]
+    fn streaming_admission_suite_emits_auto_routing_variants() {
+        let scenarios =
+            benchmark_suite_scenarios(&demo_args(), "streaming-admission").expect("suite");
+        assert_eq!(scenarios.len(), 3);
+        assert!(scenarios.iter().all(|scenario| scenario.throughput_backend.is_none()));
+        assert_eq!(scenarios[0].scenario_tag.as_deref(), Some("auto-small"));
+        assert_eq!(scenarios[1].scenario_tag.as_deref(), Some("auto-large"));
+        assert_eq!(scenarios[2].scenario_tag.as_deref(), Some("auto-materialized"));
+        assert_eq!(scenario_name(&scenarios[1]), "throughput-auto-auto-large-all-settled");
+    }
+
+    #[test]
+    fn format_counts_renders_compact_summary() {
+        let counts = BTreeMap::from([("pg-v1".to_owned(), 2_u64), ("stream-v2".to_owned(), 5_u64)]);
+        assert_eq!(format_counts(&counts), "pg-v1:2,stream-v2:5");
+        assert_eq!(format_counts(&BTreeMap::new()), "none");
     }
 
     #[test]

@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
   "milestone_scope": "temporal_ts_subset_trust",
-  "generated_at": "2026-03-13T19:08:54.541Z",
+  "generated_at": "2026-03-13T20:02:20.626Z",
   "reports": [
     {
       "layer_id": "layer_a_support",
       "status": "passing",
-      "case_count": 9,
+      "case_count": 10,
       "failed_count": 0
     },
     {

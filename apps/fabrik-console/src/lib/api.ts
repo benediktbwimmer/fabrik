@@ -139,6 +139,85 @@ export type WorkflowActivitiesResponse = {
   activities: WorkflowActivity[];
 };
 
+export type WorkflowBulkBatch = {
+  tenant_id: string;
+  instance_id: string;
+  run_id: string;
+  definition_id: string;
+  definition_version: number | null;
+  artifact_hash: string | null;
+  batch_id: string;
+  activity_type: string;
+  task_queue: string;
+  state: string | null;
+  input_handle: unknown;
+  result_handle: unknown;
+  throughput_backend: string;
+  throughput_backend_version: string;
+  execution_mode: string;
+  selected_backend: string;
+  routing_reason: string;
+  admission_policy_version: string;
+  execution_policy: string | null;
+  reducer: string | null;
+  reducer_kind: string;
+  reducer_class: string;
+  reducer_version: string;
+  reducer_execution_path: string;
+  aggregation_tree_depth: number;
+  fast_lane_enabled: boolean;
+  aggregation_group_count: number;
+  status: string;
+  total_items: number;
+  chunk_size: number;
+  chunk_count: number;
+  succeeded_items: number;
+  failed_items: number;
+  cancelled_items: number;
+  max_attempts: number;
+  retry_delay_ms: number;
+  error: string | null;
+  scheduled_at: string;
+  terminal_at: string | null;
+  updated_at: string;
+};
+
+export type WorkflowBulkBatchRuntimeControl = {
+  tenant_id: string;
+  instance_id: string;
+  run_id: string;
+  batch_id: string;
+  is_paused: boolean;
+  reason: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type WorkflowBulkBatchesResponse = {
+  tenant_id: string;
+  instance_id: string;
+  run_id: string;
+  consistency: string;
+  authoritative_source: string;
+  projection_lag_ms: number | null;
+  watch_cursor: string;
+  page: PageInfo;
+  batch_count: number;
+  batches: WorkflowBulkBatch[];
+};
+
+export type WorkflowBulkBatchResponse = {
+  tenant_id: string;
+  instance_id: string;
+  run_id: string;
+  consistency: string;
+  authoritative_source: string;
+  projection_lag_ms: number | null;
+  watch_cursor: string;
+  runtime_control: WorkflowBulkBatchRuntimeControl | null;
+  batch: WorkflowBulkBatch;
+};
+
 export type WorkflowSignal = {
   signal_id: string;
   signal_type: string;
@@ -285,6 +364,11 @@ export type TaskQueueSummary = {
   registered_build_count: number;
   default_set_id: string | null;
   throughput_backend: string | null;
+  effective_throughput_backend: string | null;
+  is_paused: boolean;
+  is_draining: boolean;
+  stream_v2_capacity_state: string | null;
+  active_stream_v2_chunks: number | null;
   sticky_hit_rate: number | null;
   consistency: string;
   source: string;
@@ -316,10 +400,53 @@ export type TaskQueueInspection = {
   } | null;
   default_set_id: string | null;
   throughput_policy: { backend: string } | null;
+  admission: {
+    configured_default_backend: string;
+    configured_task_queue_backend: string | null;
+    persisted_task_queue_backend: string | null;
+    effective_preferred_backend: string;
+    stream_v2_active_chunks: {
+      tenant: number;
+      task_queue: number;
+    };
+    stream_v2_capacity: {
+      tenant_limit: number;
+      task_queue_limit: number;
+      tenant_utilization: number | null;
+      task_queue_utilization: number | null;
+      state: string;
+    };
+    nonterminal_backend_counts: Record<string, number>;
+    nonterminal_routing_reason_counts: Record<string, number>;
+    nonterminal_admission_policy_versions: Record<string, number>;
+  } | null;
+  runtime_control: {
+    tenant_id: string;
+    queue_kind: string;
+    task_queue: string;
+    is_paused: boolean;
+    is_draining: boolean;
+    reason: string | null;
+    created_at: string;
+    updated_at: string;
+  } | null;
   compatible_build_ids: string[];
   registered_builds: Array<{ build_id: string; artifact_hashes: string[]; updated_at: string }>;
   compatibility_sets: Array<{ set_id: string; build_ids: string[]; is_default: boolean; updated_at: string }>;
   pollers: Array<{ poller_id: string; build_id: string; partition_id: number | null; last_seen_at: string; expires_at: string }>;
+  watch_cursor?: string;
+};
+
+export type WatchEvent<T = unknown> = {
+  event_type: string;
+  occurred_at: string;
+  consistency: string;
+  authoritative_source: string;
+  projection_lag_ms: number | null;
+  owner_id: string | null;
+  partition_id: number | null;
+  cursor: string;
+  body: T;
 };
 
 export type SearchResult = {
@@ -694,6 +821,20 @@ export const api = {
         ? `/tenants/${tenantId}/workflows/${instanceId}/runs/${runId}/activities`
         : `/tenants/${tenantId}/workflows/${instanceId}/activities`
     ),
+  getWorkflowBulkBatches: (tenantId: string, instanceId: string, runId: string, consistency = "eventual") =>
+    request<WorkflowBulkBatchesResponse>(
+      `/tenants/${tenantId}/workflows/${instanceId}/runs/${runId}/bulk-batches?consistency=${consistency}`
+    ),
+  getWorkflowBulkBatch: (
+    tenantId: string,
+    instanceId: string,
+    runId: string,
+    batchId: string,
+    consistency = "eventual"
+  ) =>
+    request<WorkflowBulkBatchResponse>(
+      `/tenants/${tenantId}/workflows/${instanceId}/runs/${runId}/bulk-batches/${batchId}?consistency=${consistency}`
+    ),
   getWorkflowSignals: (tenantId: string, instanceId: string, runId?: string) =>
     request<WorkflowSignalsResponse>(
       runId
@@ -766,5 +907,35 @@ export const api = {
     request(`/admin/tenants/${tenantId}/task-queues/${queueKind}/${taskQueue}/throughput-policy`, {
       method: "PUT",
       body: JSON.stringify({ backend })
-    })
+    }),
+  setTaskQueueRuntimeControl: (
+    tenantId: string,
+    queueKind: string,
+    taskQueue: string,
+    payload: { is_paused: boolean; is_draining: boolean; reason?: string | null }
+  ) =>
+    request(`/admin/tenants/${tenantId}/task-queues/${queueKind}/${taskQueue}/runtime-control`, {
+      method: "PUT",
+      body: JSON.stringify(payload)
+    }),
+  setBulkBatchRuntimeControl: (
+    tenantId: string,
+    instanceId: string,
+    runId: string,
+    batchId: string,
+    payload: { is_paused: boolean; reason?: string | null }
+  ) =>
+    request(
+      `/admin/tenants/${tenantId}/workflows/${instanceId}/runs/${runId}/bulk-batches/${batchId}/runtime-control`,
+      {
+        method: "PUT",
+        body: JSON.stringify(payload)
+      }
+    ),
+  bulkBatchWatchPath: (tenantId: string, instanceId: string, runId: string, batchId: string) =>
+    `${DEFAULT_API_BASE}/tenants/${tenantId}/workflows/${instanceId}/runs/${runId}/bulk-batches/${batchId}/watch`,
+  workflowRunWatchPath: (tenantId: string, instanceId: string, runId: string) =>
+    `${DEFAULT_API_BASE}/tenants/${tenantId}/workflows/${instanceId}/runs/${runId}/watch`,
+  taskQueueWatchPath: (tenantId: string, queueKind: string, taskQueue: string) =>
+    `${DEFAULT_API_BASE}/admin/tenants/${tenantId}/task-queues/${queueKind}/${taskQueue}/watch`
 };

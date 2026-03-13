@@ -845,9 +845,7 @@ async fn continue_as_new(
         trigger.metadata.insert("memo_json".to_owned(), memo.to_string());
     }
     if let Some(search_attributes) = instance.search_attributes.as_ref() {
-        trigger
-            .metadata
-            .insert("search_attributes_json".to_owned(), search_attributes.to_string());
+        trigger.metadata.insert("search_attributes_json".to_owned(), search_attributes.to_string());
     }
 
     state.publisher.publish(&trigger, &trigger.partition_key).await.map_err(internal_error)?;
