@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env, fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     time::Duration,
 };
 
@@ -24,22 +24,27 @@ use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
     ActivityScheduleUpdate, ActivityStartUpdate, ActivityTerminalPayload, ActivityTerminalUpdate,
-    ConsumedSignalRecord, TaskQueueKind, WorkflowActivityStatus, WorkflowMailboxKind,
-    WorkflowMailboxRecord, WorkflowStore,
+    BulkChunkTerminalPayload, BulkChunkTerminalUpdate, ConsumedSignalRecord, TaskQueueKind,
+    WorkflowActivityStatus, WorkflowBulkChunkRecord, WorkflowMailboxKind, WorkflowMailboxRecord,
+    WorkflowStore,
 };
-use fabrik_throughput::{decode_cbor, encode_cbor};
+use fabrik_throughput::{
+    ThroughputBackend, bulk_reducer_class, decode_cbor, encode_cbor, planned_reduction_tree_depth,
+    stream_v2_fast_lane_enabled,
+};
 use fabrik_worker_protocol::activity_worker::{
     Ack, ActivityTask, ActivityTaskCancelledResult, ActivityTaskCompletedResult,
-    ActivityTaskFailedResult, ActivityTaskResult, PollActivityTaskRequest,
-    PollActivityTaskResponse, PollActivityTasksRequest, PollActivityTasksResponse,
-    PollBulkActivityTaskRequest, PollBulkActivityTaskResponse, RecordActivityHeartbeatRequest,
-    RecordActivityHeartbeatResponse, ReportActivityTaskCancelledRequest,
-    ReportActivityTaskResultsRequest, ReportBulkActivityTaskResultsRequest, activity_task_result,
+    ActivityTaskFailedResult, ActivityTaskResult, BulkActivityTask, BulkActivityTaskResult,
+    PollActivityTaskRequest, PollActivityTaskResponse, PollActivityTasksRequest,
+    PollActivityTasksResponse, PollBulkActivityTaskRequest, PollBulkActivityTaskResponse,
+    RecordActivityHeartbeatRequest, RecordActivityHeartbeatResponse,
+    ReportActivityTaskCancelledRequest, ReportActivityTaskResultsRequest,
+    ReportBulkActivityTaskResultsRequest, activity_task_result,
     activity_worker_api_server::{ActivityWorkerApi, ActivityWorkerApiServer},
 };
 use fabrik_workflow::{
-    ArtifactExecutionState, CompiledExecutionPlan, CompiledStateNode, CompiledWorkflowArtifact,
-    ExecutionTurnContext, RetryPolicy, WorkflowInstanceState, WorkflowStatus, parse_timer_ref,
+    ArtifactExecutionState, CompiledExecutionPlan, CompiledWorkflowArtifact, ExecutionTurnContext,
+    RetryPolicy, WorkflowInstanceState, WorkflowStatus, parse_timer_ref,
     replay_compiled_history_trace, replay_compiled_history_trace_from_snapshot,
     replay_history_trace_from_snapshot, retry_policy_allows_failure_retry,
 };
@@ -58,6 +63,10 @@ const DEFAULT_PERSIST_FLUSH_INTERVAL_MS: u64 = 200;
 const DEFAULT_OWNERSHIP_PARTITION_ID: i32 = 1_000_000;
 const DEFAULT_OWNERSHIP_LEASE_TTL_SECS: u64 = 30;
 const DEFAULT_OWNERSHIP_RENEW_INTERVAL_MS: u64 = 5_000;
+const BULK_EVENT_OUTBOX_BATCH_SIZE: usize = 128;
+const BULK_EVENT_OUTBOX_LEASE_SECONDS: i64 = 30;
+const BULK_EVENT_OUTBOX_RETRY_MS: u64 = 250;
+const COMPILED_ARTIFACT_CACHE_CAPACITY: usize = 64;
 
 #[derive(Clone)]
 struct AppState {
@@ -67,11 +76,14 @@ struct AppState {
     ownership: Arc<StdMutex<UnifiedOwnershipState>>,
     workflow_partition_count: i32,
     notify: Arc<Notify>,
+    bulk_notify: Arc<Notify>,
     retry_notify: Arc<Notify>,
+    outbox_notify: Arc<Notify>,
     persist_notify: Arc<Notify>,
     persist_lock: Arc<Mutex<()>>,
     persistence: PersistenceConfig,
     debug: Arc<StdMutex<UnifiedDebugState>>,
+    outbox_publisher_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -89,13 +101,34 @@ struct OwnershipConfig {
     renew_interval_ms: u64,
 }
 
+#[derive(Default)]
+struct SharedCompiledArtifactCache {
+    access_epoch: u64,
+    entries: HashMap<CompiledArtifactCacheKey, CachedCompiledArtifactEntry>,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct CompiledArtifactCacheKey {
+    tenant_id: String,
+    definition_id: String,
+    version: u32,
+}
+
+#[derive(Clone)]
+struct CachedCompiledArtifactEntry {
+    access_epoch: u64,
+    artifact: Option<CompiledWorkflowArtifact>,
+}
+
+static SHARED_COMPILED_ARTIFACT_CACHE: OnceLock<StdMutex<SharedCompiledArtifactCache>> =
+    OnceLock::new();
+
 #[derive(Debug, Clone, Serialize, Default)]
 struct UnifiedDebugState {
     restored_from_snapshot: bool,
     restore_records_applied: u64,
     workflow_triggers_applied: u64,
     duplicate_triggers_ignored: u64,
-    unsupported_triggers_ignored: u64,
     ignored_missing_instance_reports: u64,
     ignored_terminal_instance_reports: u64,
     ignored_missing_activity_reports: u64,
@@ -117,6 +150,75 @@ struct UnifiedDebugState {
     instance_terminals: u64,
     log_writes: u64,
     snapshot_writes: u64,
+}
+
+fn shared_compiled_artifact_cache() -> &'static StdMutex<SharedCompiledArtifactCache> {
+    SHARED_COMPILED_ARTIFACT_CACHE
+        .get_or_init(|| StdMutex::new(SharedCompiledArtifactCache::default()))
+}
+
+fn get_cached_compiled_artifact(
+    key: &CompiledArtifactCacheKey,
+) -> Option<Option<CompiledWorkflowArtifact>> {
+    let mut cache = shared_compiled_artifact_cache()
+        .lock()
+        .expect("compiled artifact cache lock poisoned");
+    let access_epoch = cache.access_epoch.saturating_add(1);
+    cache.access_epoch = access_epoch;
+    let entry = cache.entries.get_mut(key)?;
+    entry.access_epoch = access_epoch;
+    Some(entry.artifact.clone())
+}
+
+fn cache_compiled_artifact(
+    key: &CompiledArtifactCacheKey,
+    artifact: Option<&CompiledWorkflowArtifact>,
+) {
+    let mut cache = shared_compiled_artifact_cache()
+        .lock()
+        .expect("compiled artifact cache lock poisoned");
+    let access_epoch = cache.access_epoch.saturating_add(1);
+    cache.access_epoch = access_epoch;
+    cache.entries.insert(
+        key.clone(),
+        CachedCompiledArtifactEntry { access_epoch, artifact: artifact.cloned() },
+    );
+    evict_cached_compiled_artifacts(&mut cache);
+}
+
+fn evict_cached_compiled_artifacts(cache: &mut SharedCompiledArtifactCache) {
+    if cache.entries.len() <= COMPILED_ARTIFACT_CACHE_CAPACITY {
+        return;
+    }
+    let mut lru = cache
+        .entries
+        .iter()
+        .map(|(key, entry)| (entry.access_epoch, key.clone()))
+        .collect::<Vec<_>>();
+    lru.sort_unstable_by_key(|(access_epoch, _)| *access_epoch);
+    let remove_count = cache.entries.len().saturating_sub(COMPILED_ARTIFACT_CACHE_CAPACITY);
+    for (_, key) in lru.into_iter().take(remove_count) {
+        cache.entries.remove(&key);
+    }
+}
+
+async fn load_compiled_artifact_version(
+    state: &AppState,
+    tenant_id: &str,
+    definition_id: &str,
+    version: u32,
+) -> Result<Option<CompiledWorkflowArtifact>> {
+    let key = CompiledArtifactCacheKey {
+        tenant_id: tenant_id.to_owned(),
+        definition_id: definition_id.to_owned(),
+        version,
+    };
+    if let Some(artifact) = get_cached_compiled_artifact(&key) {
+        return Ok(artifact);
+    }
+    let artifact = state.store.get_artifact_version(tenant_id, definition_id, version).await?;
+    cache_compiled_artifact(&key, artifact.as_ref());
+    Ok(artifact)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -452,11 +554,14 @@ async fn main() -> Result<()> {
         ))),
         workflow_partition_count: redpanda.workflow_events_partitions,
         notify: Arc::new(Notify::new()),
+        bulk_notify: Arc::new(Notify::new()),
         retry_notify: Arc::new(Notify::new()),
+        outbox_notify: Arc::new(Notify::new()),
         persist_notify: Arc::new(Notify::new()),
         persist_lock: Arc::new(Mutex::new(())),
         persistence,
         debug: debug.clone(),
+        outbox_publisher_id: format!("unified-runtime:{}", Uuid::now_v7()),
     };
     acquire_initial_ownership(&state, &ownership).await?;
     reconcile_restored_ready_queue(&state).await?;
@@ -467,6 +572,7 @@ async fn main() -> Result<()> {
     tokio::spawn(run_ownership_loop(state.clone(), ownership.clone()));
     tokio::spawn(run_retry_release_loop(state.clone()));
     tokio::spawn(run_lease_requeue_loop(state.clone()));
+    tokio::spawn(run_workflow_event_outbox_publisher(state.clone()));
     tokio::spawn(run_persist_loop(state.clone()));
 
     let debug_state = state.clone();
@@ -1075,6 +1181,13 @@ async fn run_trigger_consumer(
                     error!(error = %error, "unified-runtime failed to handle trigger");
                 }
             }
+            WorkflowEvent::BulkActivityBatchCompleted { .. }
+            | WorkflowEvent::BulkActivityBatchFailed { .. }
+            | WorkflowEvent::BulkActivityBatchCancelled { .. } => {
+                if let Err(error) = handle_bulk_batch_terminal_event(&state, event).await {
+                    error!(error = %error, "unified-runtime failed to handle bulk terminal");
+                }
+            }
             WorkflowEvent::ActivityTaskCancellationRequested { .. } => {
                 if let Err(error) =
                     handle_activity_cancellation_requested_event(&state, event).await
@@ -1150,11 +1263,14 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
         }
     }
 
-    let artifact = state
-        .store
-        .get_artifact_version(&event.tenant_id, &event.definition_id, event.definition_version)
-        .await?
-        .ok_or_else(|| {
+    let artifact = load_compiled_artifact_version(
+        state,
+        &event.tenant_id,
+        &event.definition_id,
+        event.definition_version,
+    )
+    .await?
+    .ok_or_else(|| {
             anyhow::anyhow!(
                 "missing artifact {} v{} for tenant {}",
                 event.definition_id,
@@ -1162,19 +1278,6 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
                 event.tenant_id
             )
         })?;
-    if artifact_contains_unsupported_bulk_states(&artifact) {
-        warn!(
-            tenant_id = %event.tenant_id,
-            definition_id = %event.definition_id,
-            definition_version = event.definition_version,
-            instance_id = %event.instance_id,
-            run_id = %event.run_id,
-            "unified-runtime ignoring trigger for unsupported bulk activity artifact"
-        );
-        let mut debug = state.debug.lock().expect("unified debug lock poisoned");
-        debug.unsupported_triggers_ignored = debug.unsupported_triggers_ignored.saturating_add(1);
-        return Ok(());
-    }
     let plan = artifact.execute_trigger_with_turn(
         input,
         ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at },
@@ -1249,7 +1352,7 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
         schedule_actions,
     )
     .await?;
-    apply_post_plan_effects(
+    apply_post_plan_effects_with_options(
         state,
         PostPlanEffect {
             run_key: run_key.clone(),
@@ -1259,6 +1362,7 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
             source_event_id: event.event_id,
             occurred_at: event.occurred_at,
         },
+        false,
     )
     .await?;
     maybe_enact_pending_workflow_cancellation_unified(
@@ -1273,6 +1377,172 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
     drain_mailbox_for_run(state, &run_key.tenant_id, &run_key.instance_id, &run_key.run_id).await?;
     let mut debug = state.debug.lock().expect("unified debug lock poisoned");
     debug.workflow_triggers_applied = debug.workflow_triggers_applied.saturating_add(1);
+    Ok(())
+}
+
+async fn handle_bulk_batch_terminal_event(
+    state: &AppState,
+    event: EventEnvelope<WorkflowEvent>,
+) -> Result<()> {
+    let run_key = RunKey {
+        tenant_id: event.tenant_id.clone(),
+        instance_id: event.instance_id.clone(),
+        run_id: event.run_id.clone(),
+    };
+
+    let mut general = Vec::new();
+    let mut schedules = Vec::new();
+    let (final_instance, post_plan) = {
+        let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
+        let Some(runtime) = inner.instances.get_mut(&run_key) else {
+            return Ok(());
+        };
+        if runtime.instance.status.is_terminal() {
+            return Ok(());
+        }
+
+        let current_state = runtime
+            .instance
+            .current_state
+            .clone()
+            .unwrap_or_else(|| runtime.artifact.workflow.initial_state.clone());
+        let execution_state = runtime.instance.artifact_execution.clone().unwrap_or_default();
+        let turn_context =
+            ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at };
+        let plan = match &event.payload {
+            WorkflowEvent::BulkActivityBatchCompleted {
+                batch_id,
+                total_items,
+                succeeded_items,
+                failed_items,
+                cancelled_items,
+                chunk_count,
+            } => runtime.artifact.execute_after_bulk_completion_with_turn(
+                &current_state,
+                batch_id,
+                &bulk_terminal_payload(
+                    batch_id,
+                    "completed",
+                    None,
+                    *total_items,
+                    *succeeded_items,
+                    *failed_items,
+                    *cancelled_items,
+                    *chunk_count,
+                ),
+                execution_state,
+                turn_context,
+            )?,
+            WorkflowEvent::BulkActivityBatchFailed {
+                batch_id,
+                total_items,
+                succeeded_items,
+                failed_items,
+                cancelled_items,
+                chunk_count,
+                message,
+            } => runtime.artifact.execute_after_bulk_failure_with_turn(
+                &current_state,
+                batch_id,
+                &bulk_terminal_payload(
+                    batch_id,
+                    "failed",
+                    Some(message.as_str()),
+                    *total_items,
+                    *succeeded_items,
+                    *failed_items,
+                    *cancelled_items,
+                    *chunk_count,
+                ),
+                execution_state,
+                turn_context,
+            )?,
+            WorkflowEvent::BulkActivityBatchCancelled {
+                batch_id,
+                total_items,
+                succeeded_items,
+                failed_items,
+                cancelled_items,
+                chunk_count,
+                message,
+            } => runtime.artifact.execute_after_bulk_failure_with_turn(
+                &current_state,
+                batch_id,
+                &bulk_terminal_payload(
+                    batch_id,
+                    "cancelled",
+                    Some(message.as_str()),
+                    *total_items,
+                    *succeeded_items,
+                    *failed_items,
+                    *cancelled_items,
+                    *chunk_count,
+                ),
+                execution_state,
+                turn_context,
+            )?,
+            _ => return Ok(()),
+        };
+
+        runtime.instance.apply_event(&event);
+        apply_compiled_plan(&mut runtime.instance, &plan);
+        let scheduled_tasks = schedule_activities_from_plan(
+            &runtime.artifact,
+            &runtime.instance,
+            &plan,
+            event.occurred_at,
+        )?;
+        for task in &scheduled_tasks {
+            schedules.push(PreparedDbAction::Schedule(task.clone()));
+            runtime.active_activities.insert(
+                task.activity_id.clone(),
+                ActiveActivityMeta {
+                    attempt: task.attempt,
+                    task_queue: task.task_queue.clone(),
+                    activity_type: task.activity_type.clone(),
+                    wait_state: task.state.clone(),
+                    omit_success_output: task.omit_success_output,
+                },
+            );
+        }
+        let ready_tasks = scheduled_tasks;
+        let final_instance = runtime.instance.clone();
+        general.push(PreparedDbAction::UpsertInstance(runtime.instance.clone()));
+        let post_plan = PostPlanEffect {
+            run_key: run_key.clone(),
+            artifact: runtime.artifact.clone(),
+            instance: runtime.instance.clone(),
+            plan,
+            source_event_id: event.event_id,
+            occurred_at: event.occurred_at,
+        };
+        mark_runtime_dirty(&mut inner, "bulk_terminal", true);
+        for task in &ready_tasks {
+            inner
+                .ready
+                .entry(QueueKey {
+                    tenant_id: task.tenant_id.clone(),
+                    task_queue: task.task_queue.clone(),
+                })
+                .or_default()
+                .push_back(task.clone());
+        }
+        (final_instance, post_plan)
+    };
+
+    apply_db_actions(state, general, schedules).await?;
+    apply_post_plan_effects(state, post_plan).await?;
+    if final_instance.status.is_terminal() {
+        maybe_enact_pending_workflow_cancellation_unified(
+            state,
+            &run_key,
+            event.event_id,
+            event.occurred_at,
+        )
+        .await?;
+    }
+    state.notify.notify_waiters();
+    state.persist_notify.notify_one();
     Ok(())
 }
 
@@ -3780,6 +4050,14 @@ async fn materialize_continue_as_new_from_plan(
 }
 
 async fn apply_post_plan_effects(state: &AppState, effect: PostPlanEffect) -> Result<()> {
+    apply_post_plan_effects_with_options(state, effect, true).await
+}
+
+async fn apply_post_plan_effects_with_options(
+    state: &AppState,
+    effect: PostPlanEffect,
+    persist_instance: bool,
+) -> Result<()> {
     let (mut general, schedules, mut notifies, terminal_children) =
         materialize_child_workflows_from_plan(
             state,
@@ -3789,11 +4067,24 @@ async fn apply_post_plan_effects(state: &AppState, effect: PostPlanEffect) -> Re
             effect.source_event_id,
         )
         .await?;
-    general.push(PreparedDbAction::UpsertInstance(effect.instance.clone()));
+    let published_bulk_batches = materialize_bulk_batches_from_plan(
+        state,
+        &effect.instance,
+        &effect.plan,
+        effect.source_event_id,
+        effect.occurred_at,
+    )
+    .await?;
+    if persist_instance {
+        general.push(PreparedDbAction::UpsertInstance(effect.instance.clone()));
+    }
     general.extend(prepared_timer_actions_from_plan(state, &effect));
     if !general.is_empty() || !schedules.is_empty() {
         apply_db_actions(state, general, schedules).await?;
         state.persist_notify.notify_one();
+    }
+    if published_bulk_batches > 0 {
+        state.bulk_notify.notify_waiters();
     }
 
     for emission in &effect.plan.emissions {
@@ -3951,6 +4242,185 @@ async fn apply_post_plan_effects(state: &AppState, effect: PostPlanEffect) -> Re
         state.notify.notify_waiters();
     }
     Ok(())
+}
+
+async fn materialize_bulk_batches_from_plan(
+    state: &AppState,
+    instance: &WorkflowInstanceState,
+    plan: &CompiledExecutionPlan,
+    source_event_id: Uuid,
+    occurred_at: DateTime<Utc>,
+) -> Result<u64> {
+    let mut published = 0_u64;
+    for emission in &plan.emissions {
+        let WorkflowEvent::BulkActivityBatchScheduled {
+            batch_id,
+            activity_type,
+            task_queue,
+            items,
+            input_handle,
+            result_handle,
+            chunk_size,
+            max_attempts,
+            retry_delay_ms,
+            aggregation_group_count,
+            execution_policy,
+            reducer,
+            throughput_backend,
+            throughput_backend_version,
+            state: workflow_state,
+        } = &emission.event
+        else {
+            continue;
+        };
+
+        if throughput_backend == ThroughputBackend::PgV1.as_str() {
+            let reducer_class = bulk_reducer_class(reducer.as_deref());
+            let fast_lane_enabled = stream_v2_fast_lane_enabled(
+                throughput_backend,
+                execution_policy.as_deref(),
+                reducer.as_deref(),
+            );
+            let aggregation_tree_depth = planned_reduction_tree_depth(
+                if *chunk_size == 0 {
+                    0
+                } else {
+                    items.len().div_ceil(*chunk_size as usize) as u32
+                },
+                *aggregation_group_count,
+                reducer.as_deref(),
+            );
+            let _ = state
+                .store
+                .upsert_bulk_batch(
+                    &instance.tenant_id,
+                    &instance.instance_id,
+                    &instance.run_id,
+                    &instance.definition_id,
+                    instance.definition_version,
+                    instance.artifact_hash.as_deref(),
+                    batch_id,
+                    activity_type,
+                    task_queue,
+                    workflow_state.as_deref(),
+                    input_handle,
+                    result_handle,
+                    items,
+                    *chunk_size,
+                    *max_attempts,
+                    *retry_delay_ms,
+                    execution_policy.as_deref(),
+                    reducer.as_deref(),
+                    reducer_class.as_str(),
+                    aggregation_tree_depth,
+                    fast_lane_enabled,
+                    *aggregation_group_count,
+                    throughput_backend,
+                    throughput_backend_version,
+                    occurred_at,
+                )
+                .await?;
+        }
+
+        if let Some(publisher) = state.publisher.as_ref() {
+            let envelope = emitted_bulk_batch_event(
+                instance,
+                &emission.event,
+                throughput_backend,
+                source_event_id,
+                occurred_at,
+            );
+            publisher.publish(&envelope, &envelope.partition_key).await?;
+            published = published.saturating_add(1);
+        }
+    }
+    Ok(published)
+}
+
+async fn run_workflow_event_outbox_publisher(state: AppState) {
+    if state.publisher.is_none() {
+        return;
+    }
+
+    loop {
+        let now = Utc::now();
+        let leased = match state
+            .store
+            .lease_workflow_event_outbox(
+                &state.outbox_publisher_id,
+                chrono::Duration::seconds(BULK_EVENT_OUTBOX_LEASE_SECONDS),
+                BULK_EVENT_OUTBOX_BATCH_SIZE,
+                now,
+            )
+            .await
+        {
+            Ok(leased) => leased,
+            Err(error) => {
+                error!(error = %error, "unified-runtime failed to lease workflow event outbox");
+                tokio::time::sleep(Duration::from_millis(BULK_EVENT_OUTBOX_RETRY_MS)).await;
+                continue;
+            }
+        };
+
+        if leased.is_empty() {
+            if tokio::time::timeout(
+                Duration::from_millis(BULK_EVENT_OUTBOX_RETRY_MS),
+                state.outbox_notify.notified(),
+            )
+            .await
+            .is_err()
+            {
+                continue;
+            }
+            continue;
+        }
+
+        let publisher = state.publisher.as_ref().expect("publisher checked above");
+        for record in leased {
+            if let Err(error) = publisher.publish(&record.event, &record.partition_key).await {
+                error!(
+                    error = %error,
+                    outbox_id = %record.outbox_id,
+                    event_type = %record.event_type,
+                    "unified-runtime failed to publish workflow event outbox row"
+                );
+                let retry_at =
+                    Utc::now() + chrono::Duration::milliseconds(BULK_EVENT_OUTBOX_RETRY_MS as i64);
+                if let Err(release_error) = state
+                    .store
+                    .release_workflow_event_outbox_lease(
+                        record.outbox_id,
+                        &state.outbox_publisher_id,
+                        retry_at,
+                    )
+                    .await
+                {
+                    error!(
+                        error = %release_error,
+                        outbox_id = %record.outbox_id,
+                        "unified-runtime failed to release workflow event outbox lease"
+                    );
+                }
+                continue;
+            }
+
+            if let Err(error) = state
+                .store
+                .mark_workflow_event_outbox_published(
+                    record.outbox_id,
+                    &state.outbox_publisher_id,
+                    Utc::now(),
+                )
+                .await
+            {
+                error!(
+                    error = %error,
+                    outbox_id = %record.outbox_id,
+                    "unified-runtime failed to mark workflow event outbox row published"
+                );
+            }
+        }
+    }
 }
 
 async fn run_retry_release_loop(state: AppState) {
@@ -4134,9 +4604,7 @@ async fn execute_internal_query(
                 }),
             ));
         };
-        let artifact = state
-            .store
-            .get_artifact_version(&tenant_id, &instance.definition_id, version)
+        let artifact = load_compiled_artifact_version(&state, &tenant_id, &instance.definition_id, version)
             .await
             .map_err(|error| {
                 (
@@ -4358,9 +4826,53 @@ impl ActivityWorkerApi for WorkerApi {
         &self,
         request: Request<PollBulkActivityTaskRequest>,
     ) -> Result<Response<PollBulkActivityTaskResponse>, Status> {
-        let timeout = Duration::from_millis(request.get_ref().poll_timeout_ms.max(1).min(30_000));
-        let _ = tokio::time::timeout(timeout, self.state.notify.notified()).await;
-        Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }))
+        let request = request.into_inner();
+        if request.tenant_id.trim().is_empty() {
+            return Err(Status::invalid_argument("tenant_id is required"));
+        }
+        if request.task_queue.trim().is_empty() {
+            return Err(Status::invalid_argument("task_queue is required"));
+        }
+        if request.worker_id.trim().is_empty() {
+            return Err(Status::invalid_argument("worker_id is required"));
+        }
+        if request.worker_build_id.trim().is_empty() {
+            return Err(Status::invalid_argument("worker_build_id is required"));
+        }
+        let max_tasks = usize::try_from(request.max_tasks.max(1)).unwrap_or(1).min(32);
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(request.poll_timeout_ms.max(1).min(30_000));
+
+        loop {
+            let leased = self
+                .state
+                .store
+                .lease_next_bulk_chunks(
+                    &request.tenant_id,
+                    &request.task_queue,
+                    &request.worker_id,
+                    &request.worker_build_id,
+                    chrono::Duration::seconds(DEFAULT_LEASE_TTL_SECS),
+                    max_tasks,
+                )
+                .await
+                .map_err(internal_status)?;
+            if !leased.is_empty() {
+                let tasks = leased
+                    .iter()
+                    .map(|record| bulk_chunk_to_proto(record, request.supports_cbor))
+                    .collect::<Vec<_>>();
+                return Ok(Response::new(PollBulkActivityTaskResponse { tasks }));
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if tokio::time::timeout(remaining, self.state.bulk_notify.notified()).await.is_err() {
+                return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
+            }
+        }
     }
 
     async fn complete_activity_task(
@@ -4578,8 +5090,46 @@ impl ActivityWorkerApi for WorkerApi {
 
     async fn report_bulk_activity_task_results(
         &self,
-        _request: Request<ReportBulkActivityTaskResultsRequest>,
+        request: Request<ReportBulkActivityTaskResultsRequest>,
     ) -> Result<Response<Ack>, Status> {
+        if current_owner_epoch(&self.state).is_none() {
+            return Err(Status::unavailable("unified-runtime ownership inactive"));
+        }
+        for result in request.into_inner().results {
+            ensure_bulk_batch_backend(
+                &self.state.store,
+                &result.tenant_id,
+                &result.instance_id,
+                &result.run_id,
+                &result.batch_id,
+                ThroughputBackend::PgV1.as_str(),
+            )
+            .await?;
+            let update = prepare_bulk_result(result)?;
+            let applied = self
+                .state
+                .store
+                .apply_bulk_chunk_terminal_update(&update)
+                .await
+                .map_err(internal_status)?;
+            if applied.terminal_event.is_some() {
+                self.state.outbox_notify.notify_waiters();
+            } else if applied.chunk.status == fabrik_store::WorkflowBulkChunkStatus::Scheduled {
+                let now = Utc::now();
+                let delay = if applied.chunk.available_at > now {
+                    (applied.chunk.available_at - now)
+                        .to_std()
+                        .unwrap_or_else(|_| Duration::from_millis(0))
+                } else {
+                    Duration::from_millis(0)
+                };
+                let notify = self.state.bulk_notify.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    notify.notify_waiters();
+                });
+            }
+        }
         Ok(Response::new(Ack {}))
     }
 }
@@ -5253,6 +5803,146 @@ async fn publish_history_events(
     publisher.publish_all(events).await
 }
 
+fn bulk_chunk_to_proto(record: &WorkflowBulkChunkRecord, supports_cbor: bool) -> BulkActivityTask {
+    BulkActivityTask {
+        tenant_id: record.tenant_id.clone(),
+        definition_id: record.definition_id.clone(),
+        definition_version: record.definition_version.unwrap_or_default(),
+        artifact_hash: record.artifact_hash.clone().unwrap_or_default(),
+        instance_id: record.instance_id.clone(),
+        run_id: record.run_id.clone(),
+        batch_id: record.batch_id.clone(),
+        chunk_id: record.chunk_id.clone(),
+        chunk_index: record.chunk_index,
+        group_id: record.group_id,
+        activity_type: record.activity_type.clone(),
+        task_queue: record.task_queue.clone(),
+        attempt: record.attempt,
+        items_json: if supports_cbor {
+            String::new()
+        } else {
+            serde_json::to_string(&record.items).expect("bulk chunk items serialize")
+        },
+        input_handle_json: if supports_cbor {
+            String::new()
+        } else {
+            serde_json::to_string(&record.input_handle).expect("bulk chunk input handle serializes")
+        },
+        items_cbor: if supports_cbor {
+            encode_cbor(&record.items, "bulk chunk items").expect("bulk chunk items encode as CBOR")
+        } else {
+            Vec::new()
+        },
+        input_handle_cbor: if supports_cbor {
+            encode_cbor(&record.input_handle, "bulk chunk input handle")
+                .expect("bulk chunk input handle encodes as CBOR")
+        } else {
+            Vec::new()
+        },
+        prefer_cbor: supports_cbor,
+        scheduled_at_unix_ms: record.scheduled_at.timestamp_millis(),
+        lease_expires_at_unix_ms: record
+            .lease_expires_at
+            .map(|value| value.timestamp_millis())
+            .unwrap_or_default(),
+        cancellation_requested: record.cancellation_requested,
+        lease_token: record.lease_token.map(|value| value.to_string()).unwrap_or_default(),
+        lease_epoch: record.lease_epoch,
+        owner_epoch: record.owner_epoch,
+        omit_success_output: false,
+    }
+}
+
+async fn ensure_bulk_batch_backend(
+    store: &WorkflowStore,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    batch_id: &str,
+    expected_backend: &str,
+) -> Result<(), Status> {
+    let batch = store
+        .get_bulk_batch(tenant_id, instance_id, run_id, batch_id)
+        .await
+        .map_err(internal_status)?
+        .ok_or_else(|| Status::not_found(format!("bulk batch {batch_id} not found")))?;
+    if batch.throughput_backend != expected_backend {
+        return Err(Status::failed_precondition(format!(
+            "bulk batch {batch_id} is owned by backend {}",
+            batch.throughput_backend
+        )));
+    }
+    Ok(())
+}
+
+fn prepare_bulk_result(result: BulkActivityTaskResult) -> Result<BulkChunkTerminalUpdate, Status> {
+    let Some(outcome) = result.result else {
+        return Err(Status::invalid_argument("bulk activity result payload is required"));
+    };
+    let lease_token = Uuid::parse_str(&result.lease_token)
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let payload = match outcome {
+        fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
+            completed,
+        ) => BulkChunkTerminalPayload::Completed {
+            output: if !completed.output_cbor.is_empty() {
+                match decode_cbor::<Value>(&completed.output_cbor, "bulk result output")
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?
+                {
+                    Value::Array(items) => items,
+                    other => {
+                        return Err(Status::invalid_argument(format!(
+                            "bulk result output CBOR must decode to an array, got {other}"
+                        )));
+                    }
+                }
+            } else {
+                serde_json::from_str(&completed.output_json)
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?
+            },
+        },
+        fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Failed(
+            failed,
+        ) => BulkChunkTerminalPayload::Failed { error: failed.error },
+        fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Cancelled(
+            cancelled,
+        ) => {
+            let metadata = if !cancelled.metadata_cbor.is_empty() {
+                Some(
+                    decode_cbor::<Value>(&cancelled.metadata_cbor, "bulk cancellation metadata")
+                        .map_err(|error| Status::invalid_argument(error.to_string()))?,
+                )
+            } else if cancelled.metadata_json.trim().is_empty() {
+                None
+            } else {
+                Some(
+                    serde_json::from_str::<Value>(&cancelled.metadata_json)
+                        .map_err(|error| Status::invalid_argument(error.to_string()))?,
+                )
+            };
+            BulkChunkTerminalPayload::Cancelled { reason: cancelled.reason, metadata }
+        }
+    };
+    Ok(BulkChunkTerminalUpdate {
+        tenant_id: result.tenant_id,
+        instance_id: result.instance_id,
+        run_id: result.run_id,
+        batch_id: result.batch_id,
+        chunk_id: result.chunk_id,
+        chunk_index: result.chunk_index,
+        group_id: result.group_id,
+        attempt: result.attempt,
+        lease_epoch: result.lease_epoch,
+        owner_epoch: result.owner_epoch,
+        report_id: result.report_id,
+        lease_token,
+        worker_id: result.worker_id,
+        worker_build_id: result.worker_build_id,
+        occurred_at: Utc::now(),
+        payload,
+    })
+}
+
 fn activity_schedule_update(task: &QueuedActivity) -> ActivityScheduleUpdate {
     ActivityScheduleUpdate {
         tenant_id: task.tenant_id.clone(),
@@ -5470,27 +6160,6 @@ fn schedule_activities_from_plan(
         }
     }
     Ok(tasks)
-}
-
-fn artifact_contains_unsupported_bulk_states(artifact: &CompiledWorkflowArtifact) -> bool {
-    artifact.workflow.states.values().any(is_unsupported_unified_state)
-        || artifact
-            .signals
-            .values()
-            .flat_map(|handler| handler.states.values())
-            .any(is_unsupported_unified_state)
-        || artifact
-            .updates
-            .values()
-            .flat_map(|handler| handler.states.values())
-            .any(is_unsupported_unified_state)
-}
-
-fn is_unsupported_unified_state(state: &CompiledStateNode) -> bool {
-    matches!(
-        state,
-        CompiledStateNode::StartBulkActivity { .. } | CompiledStateNode::WaitForBulkActivity { .. }
-    )
 }
 
 fn resolve_activity_task_queue(workflow_task_queue: &str, scheduled_task_queue: &str) -> String {
@@ -5863,8 +6532,74 @@ fn internal_status(error: anyhow::Error) -> Status {
     Status::internal(error.to_string())
 }
 
+fn bulk_terminal_payload(
+    batch_id: &str,
+    status: &str,
+    message: Option<&str>,
+    total_items: u32,
+    succeeded_items: u32,
+    failed_items: u32,
+    cancelled_items: u32,
+    chunk_count: u32,
+) -> Value {
+    let mut payload = serde_json::json!({
+        "batchId": batch_id,
+        "status": status,
+        "totalItems": total_items,
+        "succeededItems": succeeded_items,
+        "failedItems": failed_items,
+        "cancelledItems": cancelled_items,
+        "chunkCount": chunk_count,
+    });
+    if status == "completed" {
+        payload["resultHandle"] = serde_json::json!({ "batchId": batch_id });
+    }
+    if let Some(message) = message {
+        payload["message"] = Value::String(message.to_owned());
+    }
+    payload
+}
+
+fn emitted_bulk_batch_event(
+    instance: &WorkflowInstanceState,
+    payload: &WorkflowEvent,
+    throughput_backend: &str,
+    source_event_id: Uuid,
+    occurred_at: DateTime<Utc>,
+) -> EventEnvelope<WorkflowEvent> {
+    let WorkflowEvent::BulkActivityBatchScheduled { batch_id, .. } = payload else {
+        unreachable!("bulk batch emitter only accepts bulk schedule events");
+    };
+    let mut envelope = EventEnvelope::new(
+        payload.event_type(),
+        WorkflowIdentity::new(
+            instance.tenant_id.clone(),
+            instance.definition_id.clone(),
+            instance.definition_version.unwrap_or_default(),
+            instance.artifact_hash.clone().unwrap_or_default(),
+            instance.instance_id.clone(),
+            instance.run_id.clone(),
+            "unified-runtime",
+        ),
+        payload.clone(),
+    )
+    .with_occurred_at(occurred_at);
+    envelope.event_id = unified_bulk_batch_event_id(source_event_id, batch_id);
+    envelope.causation_id = Some(source_event_id);
+    envelope.correlation_id = Some(source_event_id);
+    envelope.metadata.insert("throughput_backend".to_owned(), throughput_backend.to_owned());
+    envelope
+}
+
 fn unified_failure_allows_retry(attempt: u32, retry: &RetryPolicy, error: &str) -> bool {
     attempt < retry.max_attempts && retry_policy_allows_failure_retry(retry, error)
+}
+
+fn unified_bulk_batch_event_id(source_event_id: Uuid, batch_id: &str) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("unified-bulk-batch:{source_event_id}:{batch_id}").as_bytes(),
+    )
 }
 
 fn unified_child_trigger_event_id(parent_event_id: Uuid, child_id: &str) -> Uuid {
@@ -6815,11 +7550,14 @@ mod tests {
             ownership: Arc::new(StdMutex::new(UnifiedOwnershipState::inactive(1, "test-owner"))),
             workflow_partition_count: 8,
             notify: Arc::new(Notify::new()),
+            bulk_notify: Arc::new(Notify::new()),
             retry_notify: Arc::new(Notify::new()),
+            outbox_notify: Arc::new(Notify::new()),
             persist_notify: Arc::new(Notify::new()),
             persist_lock: Arc::new(Mutex::new(())),
             persistence: persistence_config_for(state_dir),
             debug: Arc::new(StdMutex::new(UnifiedDebugState::default())),
+            outbox_publisher_id: "unified-runtime-test-outbox".to_owned(),
         }
     }
 
@@ -7754,7 +8492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trigger_ignores_throughput_bulk_artifacts() -> Result<()> {
+    async fn trigger_materializes_throughput_bulk_batch() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
         };
@@ -7763,15 +8501,15 @@ mod tests {
         store.put_artifact("tenant", &artifact).await?;
 
         let state_dir = std::env::temp_dir()
-            .join(format!("unified-runtime-throughput-ignore-{}", Uuid::now_v7()));
+            .join(format!("unified-runtime-throughput-batch-{}", Uuid::now_v7()));
         let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
         let identity = WorkflowIdentity::new(
             "tenant",
             &artifact.definition_id,
             artifact.definition_version,
             artifact.artifact_hash.clone(),
-            "instance-throughput-ignore",
-            "run-throughput-ignore",
+            "instance-throughput-batch",
+            "run-throughput-batch",
             "unified-runtime-test",
         );
         let trigger = test_event(
@@ -7782,18 +8520,99 @@ mod tests {
 
         handle_trigger_event(&app_state, trigger).await?;
 
-        let stored = store.get_instance("tenant", "instance-throughput-ignore").await?;
-        assert!(stored.is_none());
+        let stored = store
+            .get_instance("tenant", "instance-throughput-batch")
+            .await?
+            .context("stored throughput instance should exist")?;
+        assert_eq!(stored.status, WorkflowStatus::Running);
+        assert_eq!(stored.current_state.as_deref(), Some("join"));
+
+        let batches = store
+            .list_bulk_batches_for_run_page(
+                "tenant",
+                "instance-throughput-batch",
+                "run-throughput-batch",
+                10,
+                0,
+            )
+            .await?;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].status.as_str(), "scheduled");
+        assert_eq!(batches[0].throughput_backend, ThroughputBackend::PgV1.as_str());
+
         let inner = app_state.inner.lock().expect("unified runtime lock poisoned");
-        assert!(!inner.instances.contains_key(&RunKey {
+        assert!(inner.instances.contains_key(&RunKey {
             tenant_id: "tenant".to_owned(),
-            instance_id: "instance-throughput-ignore".to_owned(),
-            run_id: "run-throughput-ignore".to_owned(),
+            instance_id: "instance-throughput-batch".to_owned(),
+            run_id: "run-throughput-batch".to_owned(),
         }));
-        drop(inner);
-        let debug = app_state.debug.lock().expect("unified debug lock poisoned");
-        assert_eq!(debug.unsupported_triggers_ignored, 1);
-        assert_eq!(debug.workflow_triggers_applied, 0);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bulk_terminal_event_completes_throughput_run() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = throughput_artifact("default");
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-throughput-complete-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-throughput-complete",
+            "run-throughput-complete",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({"items": [json!({"value": "x"})]}) },
+            Utc::now(),
+        );
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let batches = store
+            .list_bulk_batches_for_run_page(
+                "tenant",
+                "instance-throughput-complete",
+                "run-throughput-complete",
+                10,
+                0,
+            )
+            .await?;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        let completed = test_event(
+            &identity,
+            WorkflowEvent::BulkActivityBatchCompleted {
+                batch_id: batch.batch_id.clone(),
+                total_items: batch.total_items,
+                succeeded_items: batch.total_items,
+                failed_items: 0,
+                cancelled_items: 0,
+                chunk_count: batch.chunk_count,
+            },
+            Utc::now(),
+        );
+        handle_bulk_batch_terminal_event(&app_state, completed).await?;
+
+        let stored = store
+            .get_instance("tenant", "instance-throughput-complete")
+            .await?
+            .context("stored throughput instance should exist")?;
+        assert_eq!(stored.status, WorkflowStatus::Completed);
+        let output = stored.output.context("throughput output should exist")?;
+        assert_eq!(output.get("batchId"), Some(&Value::String(batch.batch_id.clone())));
+        assert_eq!(output.get("terminalStatus"), Some(&Value::String("completed".to_owned())));
+        assert_eq!(output.get("succeededItems"), Some(&json!(batch.total_items)));
 
         fs::remove_dir_all(state_dir).ok();
         Ok(())

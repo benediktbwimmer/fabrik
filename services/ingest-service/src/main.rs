@@ -480,30 +480,43 @@ async fn trigger_workflow(
             return Ok((StatusCode::ACCEPTED, Json(response)));
         }
     }
-    let (resolved_definition_id, definition_version, artifact_hash) = if let Some(artifact) = state
-        .store
-        .get_latest_artifact(&request.tenant_id, &definition_id)
-        .await
-        .map_err(internal_error)?
-    {
-        (artifact.definition_id, artifact.definition_version, artifact.artifact_hash)
-    } else {
-        let definition = state
+    let task_queue_hint = request.workflow_task_queue.as_deref();
+    let queue_default_artifact = if let Some(task_queue) = task_queue_hint {
+        state
             .store
-            .get_latest_definition(&request.tenant_id, &definition_id)
+            .get_default_workflow_artifact_for_queue(&request.tenant_id, task_queue, &definition_id)
             .await
             .map_err(internal_error)?
-            .ok_or_else(|| {
-                (
-                    StatusCode::NOT_FOUND,
-                    format!(
-                        "workflow definition {definition_id} not found for tenant {}",
-                        request.tenant_id
-                    ),
-                )
-            })?;
-        (definition.id.clone(), definition.version, artifact_hash(&definition))
+    } else {
+        None
     };
+    let (resolved_definition_id, definition_version, artifact_hash) =
+        if let Some(artifact) = queue_default_artifact {
+            (artifact.definition_id, artifact.definition_version, artifact.artifact_hash)
+        } else if let Some(artifact) = state
+            .store
+            .get_latest_artifact(&request.tenant_id, &definition_id)
+            .await
+            .map_err(internal_error)?
+        {
+            (artifact.definition_id, artifact.definition_version, artifact.artifact_hash)
+        } else {
+            let definition = state
+                .store
+                .get_latest_definition(&request.tenant_id, &definition_id)
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        format!(
+                            "workflow definition {definition_id} not found for tenant {}",
+                            request.tenant_id
+                        ),
+                    )
+                })?;
+            (definition.id.clone(), definition.version, artifact_hash(&definition))
+        };
 
     let instance_id =
         request.instance_id.clone().unwrap_or_else(|| format!("wf-{}", Uuid::now_v7()));

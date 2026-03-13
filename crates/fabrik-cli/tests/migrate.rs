@@ -47,7 +47,7 @@ fn supported_project_compiles_and_packages() {
     assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
     assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
     assert!(report["worker_packages"][0]["resolved_activity_module_path"].is_string());
-    assert_eq!(report["trust"]["support_summary"]["headline_trusted_feature_count"], 10);
+    assert_eq!(report["trust"]["support_summary"]["headline_trusted_feature_count"], 11);
     let generated = report["generated_artifacts"].as_array().expect("generated artifacts");
     assert!(generated.iter().any(|artifact| artifact["kind"] == "alpha_qualification"));
     assert!(generated.iter().any(|artifact| artifact["kind"] == "equivalence_contract"));
@@ -78,6 +78,39 @@ fn default_compatible_payload_converter_usage_is_qualified_for_alpha() {
     assert_eq!(
         report["worker_packages"][0]["data_converter_mode"],
         "default_temporal"
+    );
+}
+
+#[test]
+fn default_compatible_payload_converter_path_usage_is_qualified_for_alpha() {
+    let output_dir = temp_output_dir("payload-path-qualified");
+    let (status, report) = run_cli(&fixture("temporal-payload-path-qualified"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["validation"]["payload_data_converter_validation"]["status"], "passed");
+    assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
+    assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
+    assert_eq!(
+        report["worker_packages"][0]["data_converter_mode"],
+        "path_default_temporal"
+    );
+    assert!(report["worker_packages"][0]["resolved_payload_converter_module_path"].is_string());
+}
+
+#[test]
+fn mixed_build_payload_converter_path_upgrade_fixture_is_qualified_for_alpha() {
+    let output_dir = temp_output_dir("payload-path-qualified-v2");
+    let (status, report) =
+        run_cli(&fixture("temporal-payload-path-qualified-v2"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
+    assert_eq!(report["compiled_workflows"][0]["definition_version"], 1);
+    assert_eq!(
+        report["worker_packages"][0]["data_converter_mode"],
+        "path_default_temporal"
     );
 }
 

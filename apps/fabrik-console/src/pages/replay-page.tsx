@@ -40,15 +40,28 @@ export function ReplayPage() {
     enabled: tenantId !== "" && Boolean(searchParams.get("instance")),
     queryFn: () => api.getWorkflow(tenantId, searchParams.get("instance")!)
   });
+  const routingQuery = useQuery({
+    queryKey: ["replay-page-routing", tenantId, searchParams.get("instance")],
+    enabled: tenantId !== "" && Boolean(searchParams.get("instance")),
+    queryFn: () => api.getWorkflowRouting(tenantId, searchParams.get("instance")!)
+  });
   const workflowsQuery = useQuery({
     queryKey: ["replay-page-workflows", tenantId],
     enabled: tenantId !== "",
     queryFn: () => api.listWorkflows(tenantId)
   });
   const expectedQueue = workflowQuery.data?.workflow_task_queue ?? null;
+  const expectedDefinitionVersion = workflowQuery.data?.definition_version ?? null;
+  const expectedArtifactHash = workflowQuery.data?.artifact_hash ?? null;
   const replayQueue = replayQuery.data?.replayed_state?.workflow_task_queue ?? null;
   const replayQueuePreserved =
     expectedQueue != null && replayQueue != null ? expectedQueue === replayQueue : null;
+  const replayVersionMatchesPinned =
+    expectedDefinitionVersion != null ? replayQuery.data?.definition_version === expectedDefinitionVersion : null;
+  const replayArtifactMatchesPinned =
+    expectedArtifactHash != null && replayQuery.data?.artifact_hash != null
+      ? replayQuery.data.artifact_hash === expectedArtifactHash
+      : null;
 
   function onSubmit(event: FormEvent) {
     event.preventDefault();
@@ -113,11 +126,20 @@ export function ReplayPage() {
               {formatInlineValue(replayQuery.data.snapshot?.last_event_type)}
             </div>
             <strong>Divergence count {replayQuery.data.divergence_count}</strong>
+            <div className="muted">Pinned definition version {formatInlineValue(expectedDefinitionVersion)}</div>
+            <div className="muted">Replay definition version {formatInlineValue(replayQuery.data.definition_version)}</div>
+            <div className="muted">Pinned artifact hash {formatInlineValue(expectedArtifactHash)}</div>
+            <div className="muted">Replay artifact hash {formatInlineValue(replayQuery.data.artifact_hash)}</div>
+            <div className="muted">Replay kept pinned version {formatInlineValue(replayVersionMatchesPinned)}</div>
+            <div className="muted">Replay kept pinned artifact {formatInlineValue(replayArtifactMatchesPinned)}</div>
             <div className="muted">Expected queue {formatInlineValue(expectedQueue)}</div>
             <div className="muted">
               Replayed queue {formatInlineValue(replayQuery.data.replayed_state?.workflow_task_queue)}
             </div>
             <div className="muted">Queue preserved across replay/handoff {formatInlineValue(replayQueuePreserved)}</div>
+            <div className="muted">Routing status {formatInlineValue(routingQuery.data?.routing_status)}</div>
+            <div className="muted">Default set {formatInlineValue(routingQuery.data?.default_compatibility_set_id)}</div>
+            <div className="muted">Sticky build {formatInlineValue(routingQuery.data?.sticky_workflow_build_id)}</div>
             <div className="muted">Replayed memo {metadataPreview(replayQuery.data.replayed_state?.memo)}</div>
             <div className="muted">
               Replayed search {metadataPreview(replayQuery.data.replayed_state?.search_attributes)}

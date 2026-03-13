@@ -214,14 +214,14 @@
       "label": "Payload and data converter usage",
       "milestone_status": "supported",
       "support_level": "adapter",
-      "confidence_class": "supported",
+      "confidence_class": "supported_upgrade_validated",
       "replay_validation": false,
       "deploy_validation": true,
       "support_fixtures": true,
       "semantic_fixtures": false,
-      "trust_fixtures": false,
-      "upgrade_fixtures": false,
-      "semantic_caveats": ["alpha support is limited to static default-compatible dataConverter declarations; custom payloadCodecs, payloadConverterPath, failureConverterPath, and codec servers remain blocked"],
+      "trust_fixtures": true,
+      "upgrade_fixtures": true,
+      "semantic_caveats": ["alpha support is limited to static default-compatible dataConverter declarations and static default-compatible payloadConverterPath modules; custom payloadCodecs, broader converter modules, failureConverterPath, and codec servers remain blocked"],
       "blocking_severity": "warning"
     },
     {

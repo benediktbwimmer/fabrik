@@ -155,6 +155,7 @@ struct DiscoveredWorker {
     activities_reference: Option<String>,
     activity_module: Option<String>,
     data_converter_mode: Option<String>,
+    payload_converter_module: Option<String>,
     bootstrap_pattern: String,
     uses: Vec<String>,
 }
@@ -220,6 +221,7 @@ struct WorkerPackageRecord {
     bootstrap_path: String,
     resolved_activity_module_path: Option<String>,
     data_converter_mode: Option<String>,
+    resolved_payload_converter_module_path: Option<String>,
     log_path: String,
     pid_path: String,
     package_status: String,
@@ -1175,11 +1177,18 @@ fn build_worker_packages(
         let log_path = package_dir.join("worker.log");
         let pid_path = package_dir.join("worker.pid");
         let mut package_status = "packaged".to_owned();
+        let requires_transpile = worker.activity_module.is_some() || worker.payload_converter_module.is_some();
+        if requires_transpile {
+            transpile_project_into(project_root, &dist_dir)?;
+        }
         let resolved_activity_module_path =
             if let Some(activity_module) = worker.activity_module.as_deref() {
-                transpile_project_into(project_root, &dist_dir)?;
                 let resolved_source =
-                    resolve_module_specifier(&project_root.join(&worker.file), activity_module)?;
+                    resolve_module_specifier(
+                        project_root,
+                        &project_root.join(&worker.file),
+                        activity_module,
+                    )?;
                 Some(
                     transpiled_output_path(project_root, &dist_dir, &resolved_source)?
                         .display()
@@ -1189,12 +1198,28 @@ fn build_worker_packages(
                 package_status = "blocked".to_owned();
                 None
             };
+        let resolved_payload_converter_module_path =
+            if let Some(payload_converter_module) = worker.payload_converter_module.as_deref() {
+                let resolved_source = resolve_module_specifier(
+                    project_root,
+                    &project_root.join(&worker.file),
+                    payload_converter_module,
+                )?;
+                Some(
+                    transpiled_output_path(project_root, &dist_dir, &resolved_source)?
+                        .display()
+                        .to_string(),
+                )
+            } else {
+                None
+            };
         fs::write(
             &bootstrap_path,
             render_worker_bootstrap(
                 worker,
                 &build_id,
                 resolved_activity_module_path.as_deref(),
+                resolved_payload_converter_module_path.as_deref(),
             ),
         )
         .with_context(|| format!("failed to write {}", bootstrap_path.display()))?;
@@ -1210,9 +1235,11 @@ fn build_worker_packages(
                 "activities_reference": worker.activities_reference,
                 "activity_module": worker.activity_module,
                 "data_converter_mode": worker.data_converter_mode,
+                "payload_converter_module": worker.payload_converter_module,
                 "project_root": project_root.display().to_string(),
                 "dist_dir": dist_dir.display().to_string(),
                 "resolved_activity_module_path": resolved_activity_module_path,
+                "resolved_payload_converter_module_path": resolved_payload_converter_module_path,
                 "bootstrap_path": bootstrap_path.display().to_string(),
                 "log_path": log_path.display().to_string(),
                 "pid_path": pid_path.display().to_string()
@@ -1228,6 +1255,7 @@ fn build_worker_packages(
             bootstrap_path: bootstrap_path.display().to_string(),
             resolved_activity_module_path,
             data_converter_mode: worker.data_converter_mode.clone(),
+            resolved_payload_converter_module_path,
             log_path: log_path.display().to_string(),
             pid_path: pid_path.display().to_string(),
             package_status,
@@ -1272,12 +1300,17 @@ fn transpile_project_into(project_root: &Path, dist_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn resolve_module_specifier(from_file: &Path, specifier: &str) -> Result<PathBuf> {
+fn resolve_module_specifier(project_root: &Path, from_file: &Path, specifier: &str) -> Result<PathBuf> {
     if specifier.starts_with('.') {
-        let base = from_file.parent().unwrap_or_else(|| Path::new("")).join(specifier);
-        for candidate in module_resolution_candidates(&base) {
-            if candidate.exists() {
-                return Ok(candidate);
+        let bases = [
+            from_file.parent().unwrap_or_else(|| Path::new("")).join(specifier),
+            project_root.join(specifier),
+        ];
+        for base in bases {
+            for candidate in module_resolution_candidates(&base) {
+                if candidate.exists() {
+                    return Ok(candidate);
+                }
             }
         }
     }
@@ -1379,6 +1412,8 @@ fn write_deploy_manifest(
                 "workflows_path": worker.workflows_path,
                 "activities_reference": worker.activities_reference,
                 "activity_module": worker.activity_module,
+                "data_converter_mode": worker.data_converter_mode,
+                "payload_converter_module": worker.payload_converter_module,
                 "bootstrap_pattern": worker.bootstrap_pattern,
             })
         })
@@ -1759,6 +1794,7 @@ fn render_worker_bootstrap(
     worker: &DiscoveredWorker,
     build_id: &str,
     resolved_activity_module_path: Option<&str>,
+    resolved_payload_converter_module_path: Option<&str>,
 ) -> String {
     let source_worker = serde_json::to_string(&worker.file).expect("worker file serializes");
     let task_queue = serde_json::to_string(&worker.task_queue).expect("task queue serializes");
@@ -1771,17 +1807,34 @@ fn render_worker_bootstrap(
         serde_json::to_string(&worker.activity_module).expect("activity module serializes");
     let resolved_activity_module_path = serde_json::to_string(&resolved_activity_module_path)
         .expect("resolved activity module path serializes");
+    let resolved_payload_converter_module_path =
+        serde_json::to_string(&resolved_payload_converter_module_path)
+            .expect("resolved payload converter module path serializes");
     let data_converter_mode = serde_json::to_string(&worker.data_converter_mode)
         .expect("data converter mode serializes");
     let bootstrap_pattern =
         serde_json::to_string(&worker.bootstrap_pattern).expect("bootstrap pattern serializes");
     format!(
         "import {{ pathToFileURL }} from 'node:url';\n\
-         export const fabrikMigratedWorker = {{\n  sourceWorker: {source_worker},\n  taskQueue: {task_queue},\n  buildId: {build_id},\n  workflowsPath: {workflows_path},\n  activitiesReference: {activities_reference},\n  activityModule: {activity_module},\n  resolvedActivityModulePath: {resolved_activity_module_path},\n  dataConverterMode: {data_converter_mode},\n  bootstrapPattern: {bootstrap_pattern}\n}};\n\
+         export const fabrikMigratedWorker = {{\n  sourceWorker: {source_worker},\n  taskQueue: {task_queue},\n  buildId: {build_id},\n  workflowsPath: {workflows_path},\n  activitiesReference: {activities_reference},\n  activityModule: {activity_module},\n  resolvedActivityModulePath: {resolved_activity_module_path},\n  dataConverterMode: {data_converter_mode},\n  resolvedPayloadConverterModulePath: {resolved_payload_converter_module_path},\n  bootstrapPattern: {bootstrap_pattern}\n}};\n\
+         async function loadPayloadConverterModule() {{\n\
+           if (fabrikMigratedWorker.dataConverterMode !== 'path_default_temporal') {{\n\
+             return null;\n\
+           }}\n\
+           if (!fabrikMigratedWorker.resolvedPayloadConverterModulePath) {{\n\
+             throw new Error('worker package is missing a resolved payload converter module path');\n\
+           }}\n\
+           const converterMod = await import(pathToFileURL(fabrikMigratedWorker.resolvedPayloadConverterModulePath).href);\n\
+           if (!('payloadConverter' in converterMod)) {{\n\
+             throw new Error(`payload converter module ${{fabrikMigratedWorker.resolvedPayloadConverterModulePath}} does not export payloadConverter`);\n\
+           }}\n\
+           return converterMod.payloadConverter;\n\
+         }}\n\
          async function invoke(request) {{\n\
            if (!fabrikMigratedWorker.resolvedActivityModulePath) {{\n\
              throw new Error('worker package is missing a resolved activity module path');\n\
            }}\n\
+           await loadPayloadConverterModule();\n\
            const mod = await import(pathToFileURL(fabrikMigratedWorker.resolvedActivityModulePath).href);\n\
            const fn = mod[request.activity_type];\n\
            if (typeof fn !== 'function') {{\n\
@@ -1812,6 +1865,7 @@ fn render_worker_bootstrap(
         activity_module = activity_module,
         resolved_activity_module_path = resolved_activity_module_path,
         data_converter_mode = data_converter_mode,
+        resolved_payload_converter_module_path = resolved_payload_converter_module_path,
         bootstrap_pattern = bootstrap_pattern,
     )
 }

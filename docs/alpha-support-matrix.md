@@ -33,6 +33,8 @@ The alpha claim is:
 - start-time `searchAttributes` objects with static-evaluable top-level string or string-array values
 - exact-match visibility filtering over the supported `memo` and `searchAttributes` slice
 - static default-compatible `dataConverter` declarations on `Worker.create({ ... })`
+- static default-compatible `payloadConverterPath` modules on `Worker.create({ ... })`
+- mixed-build deploy, restart, replay, and rollback evidence for the supported payload/data-converter adapter slice
 - workflow task queue preservation through replay, snapshot restore, and owner handoff for the supported alpha slice
 
 ## Blocked in Alpha

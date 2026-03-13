@@ -39,8 +39,18 @@ test("migration analyzer supports default-compatible payload converters and bloc
     root,
     "crates/fabrik-cli/test-fixtures/temporal-payload-qualified",
   );
+  const payloadPathQualifiedFixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-payload-path-qualified",
+  );
+  const payloadPathQualifiedV2Fixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-payload-path-qualified-v2",
+  );
   const payloadFixture = path.join(root, "crates/fabrik-cli/test-fixtures/temporal-payload-blocked");
   const payloadQualified = await analyze(payloadQualifiedFixture);
+  const payloadPathQualified = await analyze(payloadPathQualifiedFixture);
+  const payloadPathQualifiedV2 = await analyze(payloadPathQualifiedV2Fixture);
   const visibilityFixture = path.join(
     root,
     "crates/fabrik-cli/test-fixtures/temporal-visibility-blocked",
@@ -49,6 +59,14 @@ test("migration analyzer supports default-compatible payload converters and bloc
   const visibility = await analyze(visibilityFixture);
   assert.equal(payloadQualified.summary.hard_block_count, 0);
   assert.equal(payloadQualified.workers[0].data_converter_mode, "default_temporal");
+  assert.equal(payloadPathQualified.summary.hard_block_count, 0);
+  assert.equal(payloadPathQualified.workers[0].data_converter_mode, "path_default_temporal");
+  assert.equal(
+    payloadPathQualified.workers[0].payload_converter_module,
+    "./src/custom-payload-converter.ts",
+  );
+  assert.equal(payloadPathQualifiedV2.summary.hard_block_count, 0);
+  assert.equal(payloadPathQualifiedV2.workers[0].data_converter_mode, "path_default_temporal");
   assert.ok(payload.findings.some((finding) => finding.feature === "payload_data_converter_usage"));
   assert.ok(!visibility.findings.some((finding) => finding.feature === "visibility_search_usage"));
   assert.equal(visibility.summary.hard_block_count, 0);

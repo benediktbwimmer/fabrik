@@ -3,7 +3,7 @@
   "milestone_scope": "temporal_ts_subset_trust",
   "title": "Temporal TS subset trust",
   "goal": "Freeze and validate the Temporal TypeScript subset Fabrik can trust under replay, failover, and upgrade conditions.",
-  "generated_at": "2026-03-13T18:31:00.500Z",
+  "generated_at": "2026-03-13T19:08:54.542Z",
   "status": "passing",
   "trusted_confidence_floor": "supported_failover_validated",
   "upgrade_confidence_floor": "supported_upgrade_validated",
@@ -12,8 +12,8 @@
       "layer_id": "layer_a_support",
       "title": "Layer A: support fixtures",
       "purpose": "Analyzer, compiler, import, and packaging correctness for the frozen Temporal TS subset.",
-      "case_count": 8,
-      "passed_count": 8,
+      "case_count": 9,
+      "passed_count": 9,
       "failed_count": 0,
       "report_path": "target/conformance-reports/layer-a-support.json",
       "public_report_path": "/conformance-reports/layer-a-support.json",
@@ -34,8 +34,8 @@
       "layer_id": "layer_c_trust",
       "title": "Layer C: trust and failure fixtures",
       "purpose": "Restart, failover, replay, upgrade, and routing trust checks for the frozen Temporal TS subset.",
-      "case_count": 17,
-      "passed_count": 17,
+      "case_count": 18,
+      "passed_count": 18,
       "failed_count": 0,
       "report_path": "target/conformance-reports/layer-c-trust.json",
       "public_report_path": "/conformance-reports/layer-c-trust.json",
@@ -67,17 +67,17 @@
     },
     {
       "confidence_class": "supported_upgrade_validated",
-      "count": 2,
+      "count": 3,
       "features": [
+        "Payload and data converter usage",
         "Version markers and workflow evolution",
         "Worker builds and routing"
       ]
     },
     {
       "confidence_class": "supported",
-      "count": 2,
+      "count": 1,
       "features": [
-        "Payload and data converter usage",
         "Worker bootstrap packaging"
       ]
     },
@@ -96,6 +96,7 @@
     "Child workflows",
     "Conditions and timer waits",
     "Continue-as-new",
+    "Payload and data converter usage",
     "Proxy activities",
     "Search attributes and memo",
     "Signals, queries, and updates",
@@ -445,18 +446,18 @@
       "label": "Payload and data converter usage",
       "milestone_status": "supported",
       "support_level": "adapter",
-      "confidence_class": "supported",
+      "confidence_class": "supported_upgrade_validated",
       "replay_validation": false,
       "deploy_validation": true,
       "support_fixtures": true,
       "semantic_fixtures": false,
-      "trust_fixtures": false,
-      "upgrade_fixtures": false,
+      "trust_fixtures": true,
+      "upgrade_fixtures": true,
       "semantic_caveats": [
-        "alpha support is limited to static default-compatible dataConverter declarations; custom payloadCodecs, payloadConverterPath, failureConverterPath, and codec servers remain blocked"
+        "alpha support is limited to static default-compatible dataConverter declarations and static default-compatible payloadConverterPath modules; custom payloadCodecs, broader converter modules, failureConverterPath, and codec servers remain blocked"
       ],
       "blocking_severity": "warning",
-      "declared_confidence_class": "supported",
+      "declared_confidence_class": "supported_upgrade_validated",
       "confidence_status": "declared_confirmed",
       "evidence": {
         "support_layer_status": "passing",

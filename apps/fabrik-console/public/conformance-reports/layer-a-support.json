@@ -3,8 +3,8 @@
   "layer_id": "layer_a_support",
   "title": "Layer A: support fixtures",
   "purpose": "Analyzer, compiler, import, and packaging correctness for the frozen Temporal TS subset.",
-  "case_count": 8,
-  "passed_count": 8,
+  "case_count": 9,
+  "passed_count": 9,
   "failed_count": 0,
   "results": [
     {
@@ -12,7 +12,7 @@
       "title": "analyzer-supported-project",
       "kind": "analyzer",
       "status": "passed",
-      "duration_ms": 1103,
+      "duration_ms": 826,
       "summary": "workflows=1 workers=1 hard_blocks=0",
       "observed": {
         "workflow_count": 1,
@@ -30,7 +30,25 @@
       "title": "analyzer-payload-qualified",
       "kind": "analyzer",
       "status": "passed",
-      "duration_ms": 1271,
+      "duration_ms": 805,
+      "summary": "workflows=1 workers=1 hard_blocks=0",
+      "observed": {
+        "workflow_count": 1,
+        "worker_count": 1,
+        "hard_block_count": 0,
+        "finding_features": []
+      },
+      "evidence": {
+        "finding_count": 0,
+        "finding_features": []
+      }
+    },
+    {
+      "id": "analyzer-payload-path-qualified",
+      "title": "analyzer-payload-path-qualified",
+      "kind": "analyzer",
+      "status": "passed",
+      "duration_ms": 847,
       "summary": "workflows=1 workers=1 hard_blocks=0",
       "observed": {
         "workflow_count": 1,
@@ -48,7 +66,7 @@
       "title": "analyzer-payload-blocked",
       "kind": "analyzer",
       "status": "passed",
-      "duration_ms": 768,
+      "duration_ms": 673,
       "summary": "workflows=0 workers=1 hard_blocks=2",
       "observed": {
         "workflow_count": 0,
@@ -72,7 +90,7 @@
       "title": "analyzer-visibility-blocked",
       "kind": "analyzer",
       "status": "passed",
-      "duration_ms": 444,
+      "duration_ms": 430,
       "summary": "workflows=0 workers=0 hard_blocks=0",
       "observed": {
         "workflow_count": 0,
@@ -90,7 +108,7 @@
       "title": "analyzer-dynamic-bootstrap-blocked",
       "kind": "analyzer",
       "status": "passed",
-      "duration_ms": 700,
+      "duration_ms": 677,
       "summary": "workflows=0 workers=0 hard_blocks=1",
       "observed": {
         "workflow_count": 0,
@@ -112,7 +130,7 @@
       "title": "analyzer-unsupported-api-blocked",
       "kind": "analyzer",
       "status": "passed",
-      "duration_ms": 725,
+      "duration_ms": 738,
       "summary": "workflows=1 workers=0 hard_blocks=1",
       "observed": {
         "workflow_count": 1,
@@ -134,7 +152,7 @@
       "title": "compiler-valid-source-map",
       "kind": "compiler",
       "status": "passed",
-      "duration_ms": 840,
+      "duration_ms": 960,
       "summary": "definition=valid-workflow source_files=2",
       "observed": {
         "definition_id": "valid-workflow",
@@ -153,7 +171,7 @@
       "title": "compiler-invalid-global-blocked",
       "kind": "compiler_error",
       "status": "passed",
-      "duration_ms": 845,
+      "duration_ms": 966,
       "summary": "compiler rejection matched expected diagnostics",
       "observed": {
         "rejected": true

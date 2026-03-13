@@ -3199,6 +3199,39 @@ impl WorkflowStore {
         .transpose()
     }
 
+    pub async fn get_artifact_by_hash(
+        &self,
+        tenant_id: &str,
+        workflow_id: &str,
+        artifact_hash: &str,
+    ) -> Result<Option<CompiledWorkflowArtifact>> {
+        let row = sqlx::query(
+            r#"
+            SELECT artifact
+            FROM workflow_artifacts
+            WHERE tenant_id = $1
+              AND workflow_id = $2
+              AND artifact->>'artifact_hash' = $3
+              AND is_active = TRUE
+            ORDER BY version DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(workflow_id)
+        .bind(artifact_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load workflow artifact by hash")?;
+
+        row.map(|row| {
+            row.try_get::<Json<CompiledWorkflowArtifact>, _>("artifact")
+                .map(|value| value.0)
+                .context("failed to decode workflow artifact")
+        })
+        .transpose()
+    }
+
     pub async fn get_artifact_version(
         &self,
         tenant_id: &str,
@@ -4765,6 +4798,48 @@ impl WorkflowStore {
 
         row.map(|row| row.try_get("task_queue").context("inferred workflow task_queue missing"))
             .transpose()
+    }
+
+    pub async fn get_default_workflow_artifact_for_queue(
+        &self,
+        tenant_id: &str,
+        task_queue: &str,
+        workflow_id: &str,
+    ) -> Result<Option<CompiledWorkflowArtifact>> {
+        let build_ids = self
+            .list_default_compatible_build_ids(tenant_id, TaskQueueKind::Workflow, task_queue)
+            .await?;
+        if build_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let mut selected = None;
+        for build_id in build_ids {
+            let Some(build) = self
+                .get_task_queue_build(tenant_id, TaskQueueKind::Workflow, task_queue, &build_id)
+                .await?
+            else {
+                continue;
+            };
+            for artifact_hash in build.artifact_hashes {
+                let Some(candidate) =
+                    self.get_artifact_by_hash(tenant_id, workflow_id, &artifact_hash).await?
+                else {
+                    continue;
+                };
+                let replace = selected
+                    .as_ref()
+                    .map(|current: &CompiledWorkflowArtifact| {
+                        candidate.definition_version > current.definition_version
+                    })
+                    .unwrap_or(true);
+                if replace {
+                    selected = Some(candidate);
+                }
+            }
+        }
+
+        Ok(selected)
     }
 
     pub async fn upsert_queue_poller(
@@ -13180,8 +13255,10 @@ mod tests {
     use super::*;
     use anyhow::Context;
     use fabrik_events::WorkflowIdentity;
+    use fabrik_workflow::{ArtifactEntrypoint, CompiledStateNode, CompiledWorkflow, Expression};
     use serde_json::json;
     use std::{
+        collections::{BTreeMap, BTreeSet},
         process::Command,
         time::{Duration as StdDuration, Instant},
     };
@@ -13345,6 +13422,35 @@ mod tests {
                 "test",
             ),
             WorkflowEvent::WorkflowTriggered { input: json!({"ok": true}) },
+        )
+    }
+
+    fn artifact_for_queue_routing(
+        definition_id: &str,
+        version: u32,
+        output: &str,
+    ) -> CompiledWorkflowArtifact {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "done".to_owned(),
+            CompiledStateNode::Succeed {
+                output: Some(Expression::Literal {
+                    value: Value::String(output.to_owned()),
+                }),
+            },
+        );
+
+        CompiledWorkflowArtifact::new(
+            definition_id.to_owned(),
+            version,
+            "store-test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "done".to_owned(),
+                states,
+                params: Vec::new(),
+                non_cancellable_states: BTreeSet::new(),
+            },
         )
     }
 
@@ -13524,6 +13630,91 @@ mod tests {
             .lease_next_workflow_task(2, "poller-b", "build-b", chrono::Duration::seconds(30))
             .await?;
         assert!(incompatible.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_workflow_artifact_tracks_default_build_set() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact_v1 = artifact_for_queue_routing("payments", 1, "v1");
+        let artifact_v2 = artifact_for_queue_routing("payments", 2, "v2");
+
+        store.put_artifact("tenant-a", &artifact_v1).await?;
+        store.put_artifact("tenant-a", &artifact_v2).await?;
+        store
+            .register_task_queue_build(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "payments",
+                "build-a",
+                &[artifact_v1.artifact_hash.clone()],
+                None,
+            )
+            .await?;
+        store
+            .register_task_queue_build(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "payments",
+                "build-b",
+                &[artifact_v2.artifact_hash.clone()],
+                None,
+            )
+            .await?;
+        store
+            .upsert_compatibility_set(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "payments",
+                "stable",
+                &["build-a".to_owned()],
+                true,
+            )
+            .await?;
+
+        let selected_v1 = store
+            .get_default_workflow_artifact_for_queue("tenant-a", "payments", "payments")
+            .await?
+            .context("stable default build should resolve an artifact")?;
+        assert_eq!(selected_v1.artifact_hash, artifact_v1.artifact_hash);
+
+        store
+            .upsert_compatibility_set(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "payments",
+                "canary",
+                &["build-b".to_owned()],
+                true,
+            )
+            .await?;
+
+        let selected_v2 = store
+            .get_default_workflow_artifact_for_queue("tenant-a", "payments", "payments")
+            .await?
+            .context("candidate default build should resolve an artifact")?;
+        assert_eq!(selected_v2.artifact_hash, artifact_v2.artifact_hash);
+
+        store
+            .upsert_compatibility_set(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "payments",
+                "stable",
+                &["build-a".to_owned()],
+                true,
+            )
+            .await?;
+
+        let selected_rollback = store
+            .get_default_workflow_artifact_for_queue("tenant-a", "payments", "payments")
+            .await?
+            .context("rollback default build should resolve the original artifact")?;
+        assert_eq!(selected_rollback.artifact_hash, artifact_v1.artifact_hash);
 
         Ok(())
     }

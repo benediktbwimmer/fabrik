@@ -1,3 +1,3 @@
-import { DefaultPayloadConverter } from "@temporalio/common";
+import { JsonPayloadConverter } from "@temporalio/common";
 
-export const payloadConverter = new DefaultPayloadConverter();
+export const payloadConverter = new JsonPayloadConverter();

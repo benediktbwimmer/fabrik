@@ -34,6 +34,7 @@ const RESULT_BATCH_MAX_BYTES: usize = 1_048_576;
 const DEFAULT_RESULT_BATCH_FLUSH_INTERVAL_MS: u64 = 5;
 const DEFAULT_ACTIVITY_WORKER_CONCURRENCY: usize = 8;
 const DEFAULT_RESULT_FLUSHER_CONCURRENCY: usize = 2;
+const DEFAULT_BULK_RESULT_FLUSHER_CONCURRENCY: usize = 1;
 const DEFAULT_ACTIVITY_POLL_MAX_TASKS: u32 = 8;
 const DEFAULT_BULK_POLL_MAX_TASKS: u32 = 8;
 const MAX_BULK_CHUNK_INPUT_BYTES: usize = 1024 * 1024;
@@ -78,6 +79,12 @@ async fn main() -> Result<()> {
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_RESULT_FLUSHER_CONCURRENCY)
         .min(concurrency);
+    let bulk_result_flusher_concurrency = env::var("ACTIVITY_BULK_RESULT_FLUSHER_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_BULK_RESULT_FLUSHER_CONCURRENCY)
+        .min(concurrency);
     let result_batch_flush_interval_ms = env::var("ACTIVITY_RESULT_BATCH_FLUSH_INTERVAL_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -114,6 +121,7 @@ async fn main() -> Result<()> {
         worker_build_id = %worker_build_id,
         concurrency,
         result_flusher_concurrency,
+        bulk_result_flusher_concurrency,
         result_batch_flush_interval_ms,
         activity_poll_max_tasks,
         bulk_poll_max_tasks,
@@ -141,8 +149,8 @@ async fn main() -> Result<()> {
     }
     let mut bulk_result_txs = Vec::new();
     if enable_bulk_lanes {
-        bulk_result_txs = Vec::with_capacity(result_flusher_concurrency);
-        for flusher_index in 0..result_flusher_concurrency {
+        bulk_result_txs = Vec::with_capacity(bulk_result_flusher_concurrency);
+        for flusher_index in 0..bulk_result_flusher_concurrency {
             let (bulk_result_tx, bulk_result_rx) = unbounded_channel();
             workers.spawn(run_bulk_result_flusher(
                 bulk_endpoint.clone(),

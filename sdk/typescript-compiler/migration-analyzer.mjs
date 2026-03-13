@@ -389,6 +389,29 @@ function maybeImportedModulePath(sourceFile, localName) {
   return null;
 }
 
+function resolveProjectModulePath(projectRoot, fromFileName, specifier) {
+  if (!specifier.startsWith(".")) {
+    return null;
+  }
+  const candidates = [];
+  for (const base of [
+    path.resolve(path.dirname(fromFileName), specifier),
+    path.resolve(projectRoot, specifier),
+  ]) {
+    if (path.extname(base)) {
+      candidates.push(base);
+    } else {
+      for (const extension of [".ts", ".mts", ".cts", ".js", ".mjs", ".cjs"]) {
+        candidates.push(`${base}${extension}`);
+      }
+      for (const indexName of ["index.ts", "index.mts", "index.cts", "index.js", "index.mjs", "index.cjs"]) {
+        candidates.push(path.join(base, indexName));
+      }
+    }
+  }
+  return candidates.find((candidate) => ts.sys.fileExists(candidate)) ?? null;
+}
+
 function combinedTemporalImports(...maps) {
   const combined = new Map();
   for (const map of maps) {
@@ -482,6 +505,100 @@ function analyzeSupportedDataConverter(node, bindings, temporalImports) {
   return { supported: true, mode: "default_temporal" };
 }
 
+function findExportedBindingExpression(sourceFile, exportName, bindings) {
+  for (const statement of sourceFile.statements) {
+    if (!ts.isVariableStatement(statement)) {
+      continue;
+    }
+    const isExported = statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword);
+    for (const declaration of statement.declarationList.declarations) {
+      if (!ts.isIdentifier(declaration.name) || declaration.initializer == null) {
+        continue;
+      }
+      bindings.set(declaration.name.text, declaration.initializer);
+      if (isExported && declaration.name.text === exportName) {
+        return declaration.initializer;
+      }
+    }
+  }
+
+  for (const statement of sourceFile.statements) {
+    if (!ts.isExportDeclaration(statement) || statement.exportClause == null || !ts.isNamedExports(statement.exportClause)) {
+      continue;
+    }
+    for (const element of statement.exportClause.elements) {
+      const exportedName = element.name.text;
+      const localName = element.propertyName?.text ?? element.name.text;
+      if (exportedName === exportName && bindings.has(localName)) {
+        return bindings.get(localName);
+      }
+    }
+  }
+
+  return null;
+}
+
+function analyzePayloadConverterModule(program, projectRoot, sourceFile, specifier) {
+  const resolvedModulePath = resolveProjectModulePath(projectRoot, sourceFile.fileName, specifier);
+  if (resolvedModulePath == null) {
+    return { supported: false, mode: null, resolvedModulePath: null };
+  }
+  const moduleSourceFile = program.getSourceFile(resolvedModulePath);
+  if (!moduleSourceFile) {
+    return { supported: false, mode: null, resolvedModulePath };
+  }
+  const moduleBindings = createScopeBindings(new Map(), moduleSourceFile);
+  const { commonImports } = collectImportInfo(moduleSourceFile);
+  const temporalImports = combinedTemporalImports(commonImports);
+  const exportedPayloadConverter =
+    findExportedBindingExpression(moduleSourceFile, "payloadConverter", moduleBindings);
+  if (exportedPayloadConverter == null) {
+    return { supported: false, mode: null, resolvedModulePath };
+  }
+  if (!isSupportedPayloadConverterExpression(exportedPayloadConverter, moduleBindings, temporalImports)) {
+    return { supported: false, mode: null, resolvedModulePath };
+  }
+  return { supported: true, mode: "path_default_temporal", resolvedModulePath };
+}
+
+function analyzeWorkerDataConverter(program, projectRoot, sourceFile, node, bindings, temporalImports) {
+  const directSupport = analyzeSupportedDataConverter(node, bindings, temporalImports);
+  if (directSupport.supported) {
+    return directSupport;
+  }
+  const resolved = resolveStaticExpression(node, bindings);
+  if (!ts.isObjectLiteralExpression(resolved)) {
+    return { supported: false, mode: null, resolvedModulePath: null, payloadConverterPathProperty: null };
+  }
+  const payloadConverterPathProperty = findObjectProperty(resolved, "payloadConverterPath");
+  if (
+    payloadConverterPathProperty == null ||
+    !ts.isPropertyAssignment(payloadConverterPathProperty)
+  ) {
+    return { supported: false, mode: null, resolvedModulePath: null, payloadConverterPathProperty: null };
+  }
+  const payloadConverterPath = findStaticString(payloadConverterPathProperty.initializer);
+  if (payloadConverterPath == null) {
+    return { supported: false, mode: null, resolvedModulePath: null, payloadConverterPathProperty };
+  }
+  const pathSupport = analyzePayloadConverterModule(program, projectRoot, sourceFile, payloadConverterPath);
+  if (!pathSupport.supported || pathSupport.resolvedModulePath == null) {
+    return {
+      supported: false,
+      mode: null,
+      resolvedModulePath: pathSupport.resolvedModulePath ?? null,
+      payloadConverterPathProperty,
+    };
+  }
+  return {
+    supported: true,
+    mode: pathSupport.mode,
+    resolvedModulePath: pathSupport.resolvedModulePath,
+    payloadConverterPathProperty,
+    payload_converter_module: payloadConverterPath,
+  };
+}
+
 function extractExportedAsyncWorkflows(projectRoot, program, sourceFile, fileUses) {
   const checker = program.getTypeChecker();
   const symbol = checker.getSymbolAtLocation(sourceFile);
@@ -547,6 +664,7 @@ async function main() {
   const workflows = [];
   const workers = [];
   let findings = [];
+  const supportedPayloadConverterPathNodes = new WeakSet();
 
   for (const sourceFile of program.getSourceFiles()) {
     if (!isProjectSourceFile(projectRoot, sourceFile)) {
@@ -733,14 +851,21 @@ async function main() {
           }
 
           let dataConverterMode = null;
+          let payloadConverterModule = null;
           if (dataConverterProperty) {
             fileUses.add("payload_data_converter_usage");
             const initializer =
               ts.isPropertyAssignment(dataConverterProperty)
                 ? dataConverterProperty.initializer
                 : dataConverterProperty.name;
-            const converterSupport =
-              analyzeSupportedDataConverter(initializer, currentBindings, temporalImportAliases);
+            const converterSupport = analyzeWorkerDataConverter(
+              program,
+              projectRoot,
+              sourceFile,
+              initializer,
+              currentBindings,
+              temporalImportAliases,
+            );
             if (!converterSupport.supported) {
               findings.push(
                 createFinding(
@@ -756,6 +881,12 @@ async function main() {
               );
             } else {
               dataConverterMode = converterSupport.mode;
+              payloadConverterModule = converterSupport.payload_converter_module ?? null;
+              if (converterSupport.payloadConverterPathProperty) {
+                supportedPayloadConverterPathNodes.add(
+                  converterSupport.payloadConverterPathProperty,
+                );
+              }
             }
           }
 
@@ -823,6 +954,7 @@ async function main() {
             activities_reference: activitiesReference,
             activity_module: activityModule,
             data_converter_mode: dataConverterMode,
+            payload_converter_module: payloadConverterModule,
             bootstrap_pattern: "worker_create_static",
             uses: [...fileUses].sort(),
           });
@@ -860,6 +992,10 @@ async function main() {
           propertyName === "payloadConverterPath" ||
           propertyName === "codecServer"
         ) {
+          if (supportedPayloadConverterPathNodes.has(node)) {
+            ts.forEachChild(node, (child) => visit(child, currentBindings));
+            return;
+          }
           fileUses.add("payload_data_converter_usage");
           findings.push(
             createFinding(

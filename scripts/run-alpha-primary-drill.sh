@@ -292,6 +292,7 @@ markdown.extend([
 
 (out_dir / "alpha-primary-drill-report.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 (out_dir / "alpha-primary-drill-report.md").write_text("\n".join(markdown) + "\n", encoding="utf-8")
+sys.exit(0 if overall else 1)
 PY
 }
 

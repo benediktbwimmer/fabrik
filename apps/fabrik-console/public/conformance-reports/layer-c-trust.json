@@ -3,8 +3,8 @@
   "layer_id": "layer_c_trust",
   "title": "Layer C: trust and failure fixtures",
   "purpose": "Restart, failover, replay, upgrade, and routing trust checks for the frozen Temporal TS subset.",
-  "case_count": 17,
-  "passed_count": 17,
+  "case_count": 18,
+  "passed_count": 18,
   "failed_count": 0,
   "results": [
     {
@@ -12,8 +12,8 @@
       "title": "Unified runtime rejects stale and duplicate results",
       "kind": "command",
       "status": "passed",
-      "duration_ms": 310,
-      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 0.01s",
+      "duration_ms": 327,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.01s",
       "observed": {
         "command": "cargo test -p unified-runtime --bin unified-runtime tests::result_matching_rejects_stale_duplicate_and_terminal_reports -- --exact",
         "rust_test_summary": {
@@ -21,15 +21,15 @@
           "failed": 0,
           "ignored": 0,
           "measured": 0,
-          "filtered_out": 30,
+          "filtered_out": 34,
           "executed": 1
         },
         "running_tests": 1
       },
       "evidence": {
-        "stdout_excerpt": "running 1 test\ntest tests::result_matching_rejects_stale_duplicate_and_terminal_reports ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 0.01s",
-        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.24s\n     Running unittests src/main.rs (target/debug/deps/unified_runtime-242b8aed8b377e73)",
-        "combined_excerpt": "running 1 test\ntest tests::result_matching_rejects_stale_duplicate_and_terminal_reports ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 0.01s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.24s\n     Running unittests src/main.rs (target/debug/deps/unified_runtime-242b8aed8b377e73)"
+        "stdout_excerpt": "running 1 test\ntest tests::result_matching_rejects_stale_duplicate_and_terminal_reports ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.01s",
+        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.26s\n     Running unittests src/main.rs (target/debug/deps/unified_runtime-242b8aed8b377e73)",
+        "combined_excerpt": "running 1 test\ntest tests::result_matching_rejects_stale_duplicate_and_terminal_reports ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.01s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.26s\n     Running unittests src/main.rs (target/debug/deps/unified_runtime-242b8aed8b377e73)"
       }
     },
     {
@@ -37,8 +37,8 @@
       "title": "Unified runtime restore prefers fresher shared run",
       "kind": "command",
       "status": "passed",
-      "duration_ms": 310,
-      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 0.01s",
+      "duration_ms": 217,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.01s",
       "observed": {
         "command": "cargo test -p unified-runtime --bin unified-runtime tests::restore_reconciliation_prefers_fresher_shared_run_and_removes_stale_local_work -- --exact",
         "rust_test_summary": {
@@ -46,15 +46,15 @@
           "failed": 0,
           "ignored": 0,
           "measured": 0,
-          "filtered_out": 30,
+          "filtered_out": 34,
           "executed": 1
         },
         "running_tests": 1
       },
       "evidence": {
-        "stdout_excerpt": "running 1 test\ntest tests::restore_reconciliation_prefers_fresher_shared_run_and_removes_stale_local_work ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 0.01s",
-        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s\n     Running unittests src/main.rs (target/debug/deps/unified_runtime-242b8aed8b377e73)",
-        "combined_excerpt": "running 1 test\ntest tests::restore_reconciliation_prefers_fresher_shared_run_and_removes_stale_local_work ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 0.01s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s\n     Running unittests src/main.rs (target/debug/deps/unified_runtime-242b8aed8b377e73)"
+        "stdout_excerpt": "running 1 test\ntest tests::restore_reconciliation_prefers_fresher_shared_run_and_removes_stale_local_work ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.01s",
+        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s\n     Running unittests src/main.rs (target/debug/deps/unified_runtime-242b8aed8b377e73)",
+        "combined_excerpt": "running 1 test\ntest tests::restore_reconciliation_prefers_fresher_shared_run_and_removes_stale_local_work ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.01s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s\n     Running unittests src/main.rs (target/debug/deps/unified_runtime-242b8aed8b377e73)"
       }
     },
     {
@@ -62,8 +62,8 @@
       "title": "Workflow replay skips duplicate timer fires",
       "kind": "command",
       "status": "passed",
-      "duration_ms": 188,
-      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.01s",
+      "duration_ms": 180,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.01s",
       "observed": {
         "command": "cargo test -p fabrik-workflow tests::compiled_replay_skips_duplicate_timer_fires_by_dedupe_key -- --exact",
         "rust_test_summary": {
@@ -71,15 +71,15 @@
           "failed": 0,
           "ignored": 0,
           "measured": 0,
-          "filtered_out": 56,
+          "filtered_out": 58,
           "executed": 1
         },
         "running_tests": 1
       },
       "evidence": {
-        "stdout_excerpt": "running 1 test\ntest tests::compiled_replay_skips_duplicate_timer_fires_by_dedupe_key ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.01s",
-        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_workflow-c26fd92110cf42c1)",
-        "combined_excerpt": "running 1 test\ntest tests::compiled_replay_skips_duplicate_timer_fires_by_dedupe_key ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.01s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_workflow-c26fd92110cf42c1)"
+        "stdout_excerpt": "running 1 test\ntest tests::compiled_replay_skips_duplicate_timer_fires_by_dedupe_key ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.01s",
+        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_workflow-c26fd92110cf42c1)",
+        "combined_excerpt": "running 1 test\ntest tests::compiled_replay_skips_duplicate_timer_fires_by_dedupe_key ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.01s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_workflow-c26fd92110cf42c1)"
       }
     },
     {
@@ -87,8 +87,8 @@
       "title": "Workflow compatibility accepts version-guarded change",
       "kind": "command",
       "status": "passed",
-      "duration_ms": 152,
-      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.00s",
+      "duration_ms": 159,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.00s",
       "observed": {
         "command": "cargo test -p fabrik-workflow tests::compiled_artifact_compatibility_accepts_version_marker_guarded_change -- --exact",
         "rust_test_summary": {
@@ -96,15 +96,15 @@
           "failed": 0,
           "ignored": 0,
           "measured": 0,
-          "filtered_out": 56,
+          "filtered_out": 58,
           "executed": 1
         },
         "running_tests": 1
       },
       "evidence": {
-        "stdout_excerpt": "running 1 test\ntest tests::compiled_artifact_compatibility_accepts_version_marker_guarded_change ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.00s",
+        "stdout_excerpt": "running 1 test\ntest tests::compiled_artifact_compatibility_accepts_version_marker_guarded_change ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.00s",
         "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_workflow-c26fd92110cf42c1)",
-        "combined_excerpt": "running 1 test\ntest tests::compiled_artifact_compatibility_accepts_version_marker_guarded_change ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.00s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_workflow-c26fd92110cf42c1)"
+        "combined_excerpt": "running 1 test\ntest tests::compiled_artifact_compatibility_accepts_version_marker_guarded_change ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.00s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_workflow-c26fd92110cf42c1)"
       }
     },
     {
@@ -112,8 +112,8 @@
       "title": "Workflow compatibility rejects unversioned change",
       "kind": "command",
       "status": "passed",
-      "duration_ms": 152,
-      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.00s",
+      "duration_ms": 153,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.00s",
       "observed": {
         "command": "cargo test -p fabrik-workflow tests::compiled_artifact_compatibility_rejects_unversioned_change -- --exact",
         "rust_test_summary": {
@@ -121,15 +121,15 @@
           "failed": 0,
           "ignored": 0,
           "measured": 0,
-          "filtered_out": 56,
+          "filtered_out": 58,
           "executed": 1
         },
         "running_tests": 1
       },
       "evidence": {
-        "stdout_excerpt": "running 1 test\ntest tests::compiled_artifact_compatibility_rejects_unversioned_change ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.00s",
+        "stdout_excerpt": "running 1 test\ntest tests::compiled_artifact_compatibility_rejects_unversioned_change ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.00s",
         "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_workflow-c26fd92110cf42c1)",
-        "combined_excerpt": "running 1 test\ntest tests::compiled_artifact_compatibility_rejects_unversioned_change ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.00s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_workflow-c26fd92110cf42c1)"
+        "combined_excerpt": "running 1 test\ntest tests::compiled_artifact_compatibility_rejects_unversioned_change ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.00s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_workflow-c26fd92110cf42c1)"
       }
     },
     {
@@ -137,7 +137,7 @@
       "title": "Owner query endpoints default to unified runtime",
       "kind": "command",
       "status": "passed",
-      "duration_ms": 4967,
+      "duration_ms": 6981,
       "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s",
       "observed": {
         "command": "cargo test -p query-service --bin query-service tests::owner_query_endpoints_uses_unified_only_by_default -- --exact",
@@ -153,8 +153,8 @@
       },
       "evidence": {
         "stdout_excerpt": "running 1 test\ntest tests::owner_query_endpoints_uses_unified_only_by_default ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s",
-        "stderr_excerpt": "   Compiling fabrik-workflow v0.1.0 (/Users/bene/code/fabrik/crates/fabrik-workflow)\n   Compiling fabrik-store v0.1.0 (/Users/bene/code/fabrik/crates/fabrik-store)\n   Compiling query-service v0.1.0 (/Users/bene/code/fabrik/services/query-service)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.18s\n     Running unittests src/main.rs (target/debug/deps/query_service-b741478a97ae8a51)",
-        "combined_excerpt": "running 1 test\ntest tests::owner_query_endpoints_uses_unified_only_by_default ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s\n   Compiling fabrik-workflow v0.1.0 (/Users/bene/code/fabrik/crates/fabrik-workflow)\n   Compiling fabrik-store v0.1.0 (/Users/bene/code/fabrik/crates/fabrik-store)\n   Compiling query-service v0.1.0 (/Users/bene/code/fabrik/services/query-service)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.18s\n     Running unittests src/main.rs (target/debug/deps/query_service-b741478a97ae8a51)"
+        "stderr_excerpt": "   Compiling fabrik-store v0.1.0 (/Users/bene/code/fabrik/crates/fabrik-store)\n   Compiling query-service v0.1.0 (/Users/bene/code/fabrik/services/query-service)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.20s\n     Running unittests src/main.rs (target/debug/deps/query_service-b741478a97ae8a51)",
+        "combined_excerpt": "running 1 test\ntest tests::owner_query_endpoints_uses_unified_only_by_default ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s\n   Compiling fabrik-store v0.1.0 (/Users/bene/code/fabrik/crates/fabrik-store)\n   Compiling query-service v0.1.0 (/Users/bene/code/fabrik/services/query-service)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.20s\n     Running unittests src/main.rs (target/debug/deps/query_service-b741478a97ae8a51)"
       }
     },
     {
@@ -162,7 +162,7 @@
       "title": "Owner query endpoint round-trips payloads",
       "kind": "command",
       "status": "passed",
-      "duration_ms": 205,
+      "duration_ms": 213,
       "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s",
       "observed": {
         "command": "cargo test -p query-service --bin query-service tests::owner_query_endpoint_round_trip_returns_payload -- --exact",
@@ -178,8 +178,8 @@
       },
       "evidence": {
         "stdout_excerpt": "running 1 test\ntest tests::owner_query_endpoint_round_trip_returns_payload ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s",
-        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s\n     Running unittests src/main.rs (target/debug/deps/query_service-b741478a97ae8a51)",
-        "combined_excerpt": "running 1 test\ntest tests::owner_query_endpoint_round_trip_returns_payload ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s\n     Running unittests src/main.rs (target/debug/deps/query_service-b741478a97ae8a51)"
+        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s\n     Running unittests src/main.rs (target/debug/deps/query_service-b741478a97ae8a51)",
+        "combined_excerpt": "running 1 test\ntest tests::owner_query_endpoint_round_trip_returns_payload ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.00s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s\n     Running unittests src/main.rs (target/debug/deps/query_service-b741478a97ae8a51)"
       }
     },
     {
@@ -187,8 +187,8 @@
       "title": "Store reconciles stale resume backlog",
       "kind": "command",
       "status": "passed",
-      "duration_ms": 5454,
-      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.70s",
+      "duration_ms": 1889,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 1.68s",
       "observed": {
         "command": "cargo test -p fabrik-store tests::complete_workflow_task_reconciles_stale_resume_backlog -- --exact",
         "rust_test_summary": {
@@ -196,15 +196,15 @@
           "failed": 0,
           "ignored": 0,
           "measured": 0,
-          "filtered_out": 22,
+          "filtered_out": 23,
           "executed": 1
         },
         "running_tests": 1
       },
       "evidence": {
-        "stdout_excerpt": "running 1 test\ntest tests::complete_workflow_task_reconciles_stale_resume_backlog ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.70s",
-        "stderr_excerpt": "   Compiling fabrik-workflow v0.1.0 (/Users/bene/code/fabrik/crates/fabrik-workflow)\n   Compiling fabrik-store v0.1.0 (/Users/bene/code/fabrik/crates/fabrik-store)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.85s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_store-9cfca823d905bf14)",
-        "combined_excerpt": "running 1 test\ntest tests::complete_workflow_task_reconciles_stale_resume_backlog ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.70s\n   Compiling fabrik-workflow v0.1.0 (/Users/bene/code/fabrik/crates/fabrik-workflow)\n   Compiling fabrik-store v0.1.0 (/Users/bene/code/fabrik/crates/fabrik-store)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.85s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_store-9cfca823d905bf14)"
+        "stdout_excerpt": "running 1 test\ntest tests::complete_workflow_task_reconciles_stale_resume_backlog ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 1.68s",
+        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_store-9cfca823d905bf14)",
+        "combined_excerpt": "running 1 test\ntest tests::complete_workflow_task_reconciles_stale_resume_backlog ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 1.68s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_store-9cfca823d905bf14)"
       }
     },
     {
@@ -212,8 +212,8 @@
       "title": "Workflow replay from snapshot only replays tail events",
       "kind": "command",
       "status": "passed",
-      "duration_ms": 160,
-      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.00s",
+      "duration_ms": 162,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.00s",
       "observed": {
         "command": "cargo test -p fabrik-workflow tests::replay_trace_from_snapshot_replays_only_tail -- --exact",
         "rust_test_summary": {
@@ -221,15 +221,15 @@
           "failed": 0,
           "ignored": 0,
           "measured": 0,
-          "filtered_out": 56,
+          "filtered_out": 58,
           "executed": 1
         },
         "running_tests": 1
       },
       "evidence": {
-        "stdout_excerpt": "running 1 test\ntest tests::replay_trace_from_snapshot_replays_only_tail ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.00s",
-        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_workflow-c26fd92110cf42c1)",
-        "combined_excerpt": "running 1 test\ntest tests::replay_trace_from_snapshot_replays_only_tail ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.00s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_workflow-c26fd92110cf42c1)"
+        "stdout_excerpt": "running 1 test\ntest tests::replay_trace_from_snapshot_replays_only_tail ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.00s",
+        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_workflow-c26fd92110cf42c1)",
+        "combined_excerpt": "running 1 test\ntest tests::replay_trace_from_snapshot_replays_only_tail ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.00s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_workflow-c26fd92110cf42c1)"
       }
     },
     {
@@ -237,8 +237,8 @@
       "title": "Workflow replay preserves alpha queue, memo, and search attributes",
       "kind": "command",
       "status": "passed",
-      "duration_ms": 152,
-      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.00s",
+      "duration_ms": 156,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.00s",
       "observed": {
         "command": "cargo test -p fabrik-workflow tests::replay_trace_preserves_alpha_queue_memo_and_search_attributes -- --exact",
         "rust_test_summary": {
@@ -246,15 +246,15 @@
           "failed": 0,
           "ignored": 0,
           "measured": 0,
-          "filtered_out": 56,
+          "filtered_out": 58,
           "executed": 1
         },
         "running_tests": 1
       },
       "evidence": {
-        "stdout_excerpt": "running 1 test\ntest tests::replay_trace_preserves_alpha_queue_memo_and_search_attributes ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.00s",
+        "stdout_excerpt": "running 1 test\ntest tests::replay_trace_preserves_alpha_queue_memo_and_search_attributes ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.00s",
         "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_workflow-c26fd92110cf42c1)",
-        "combined_excerpt": "running 1 test\ntest tests::replay_trace_preserves_alpha_queue_memo_and_search_attributes ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 56 filtered out; finished in 0.00s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_workflow-c26fd92110cf42c1)"
+        "combined_excerpt": "running 1 test\ntest tests::replay_trace_preserves_alpha_queue_memo_and_search_attributes ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 58 filtered out; finished in 0.00s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.10s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_workflow-c26fd92110cf42c1)"
       }
     },
     {
@@ -262,8 +262,8 @@
       "title": "Unified runtime restore replays broker tail after handoff",
       "kind": "command",
       "status": "passed",
-      "duration_ms": 3502,
-      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 3.29s",
+      "duration_ms": 3379,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 3.17s",
       "observed": {
         "command": "cargo test -p unified-runtime --bin unified-runtime tests::store_snapshot_restore_replays_broker_tail_after_handoff -- --exact",
         "rust_test_summary": {
@@ -271,15 +271,15 @@
           "failed": 0,
           "ignored": 0,
           "measured": 0,
-          "filtered_out": 30,
+          "filtered_out": 34,
           "executed": 1
         },
         "running_tests": 1
       },
       "evidence": {
-        "stdout_excerpt": "running 1 test\ntest tests::store_snapshot_restore_replays_broker_tail_after_handoff ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 3.29s",
+        "stdout_excerpt": "running 1 test\ntest tests::store_snapshot_restore_replays_broker_tail_after_handoff ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 3.17s",
         "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s\n     Running unittests src/main.rs (target/debug/deps/unified_runtime-242b8aed8b377e73)",
-        "combined_excerpt": "running 1 test\ntest tests::store_snapshot_restore_replays_broker_tail_after_handoff ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 3.29s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s\n     Running unittests src/main.rs (target/debug/deps/unified_runtime-242b8aed8b377e73)"
+        "combined_excerpt": "running 1 test\ntest tests::store_snapshot_restore_replays_broker_tail_after_handoff ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 3.17s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s\n     Running unittests src/main.rs (target/debug/deps/unified_runtime-242b8aed8b377e73)"
       }
     },
     {
@@ -287,8 +287,8 @@
       "title": "Unified runtime handoff preserves alpha queue, memo, and search attributes",
       "kind": "command",
       "status": "passed",
-      "duration_ms": 3291,
-      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 3.09s",
+      "duration_ms": 3337,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 3.13s",
       "observed": {
         "command": "cargo test -p unified-runtime --bin unified-runtime tests::store_snapshot_restore_preserves_alpha_queue_memo_and_search_attributes_after_handoff -- --exact",
         "rust_test_summary": {
@@ -296,15 +296,15 @@
           "failed": 0,
           "ignored": 0,
           "measured": 0,
-          "filtered_out": 30,
+          "filtered_out": 34,
           "executed": 1
         },
         "running_tests": 1
       },
       "evidence": {
-        "stdout_excerpt": "running 1 test\ntest tests::store_snapshot_restore_preserves_alpha_queue_memo_and_search_attributes_after_handoff ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 3.09s",
-        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s\n     Running unittests src/main.rs (target/debug/deps/unified_runtime-242b8aed8b377e73)",
-        "combined_excerpt": "running 1 test\ntest tests::store_snapshot_restore_preserves_alpha_queue_memo_and_search_attributes_after_handoff ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 30 filtered out; finished in 3.09s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s\n     Running unittests src/main.rs (target/debug/deps/unified_runtime-242b8aed8b377e73)"
+        "stdout_excerpt": "running 1 test\ntest tests::store_snapshot_restore_preserves_alpha_queue_memo_and_search_attributes_after_handoff ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 3.13s",
+        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s\n     Running unittests src/main.rs (target/debug/deps/unified_runtime-242b8aed8b377e73)",
+        "combined_excerpt": "running 1 test\ntest tests::store_snapshot_restore_preserves_alpha_queue_memo_and_search_attributes_after_handoff ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 3.13s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s\n     Running unittests src/main.rs (target/debug/deps/unified_runtime-242b8aed8b377e73)"
       }
     },
     {
@@ -312,8 +312,8 @@
       "title": "Store partition ownership hands off after lease expiry",
       "kind": "command",
       "status": "passed",
-      "duration_ms": 1964,
-      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.77s",
+      "duration_ms": 1928,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 1.75s",
       "observed": {
         "command": "cargo test -p fabrik-store tests::partition_ownership_handoffs_after_lease_expiry -- --exact",
         "rust_test_summary": {
@@ -321,15 +321,15 @@
           "failed": 0,
           "ignored": 0,
           "measured": 0,
-          "filtered_out": 22,
+          "filtered_out": 23,
           "executed": 1
         },
         "running_tests": 1
       },
       "evidence": {
-        "stdout_excerpt": "running 1 test\ntest tests::partition_ownership_handoffs_after_lease_expiry ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.77s",
-        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_store-9cfca823d905bf14)",
-        "combined_excerpt": "running 1 test\ntest tests::partition_ownership_handoffs_after_lease_expiry ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.77s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_store-9cfca823d905bf14)"
+        "stdout_excerpt": "running 1 test\ntest tests::partition_ownership_handoffs_after_lease_expiry ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 1.75s",
+        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_store-9cfca823d905bf14)",
+        "combined_excerpt": "running 1 test\ntest tests::partition_ownership_handoffs_after_lease_expiry ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 1.75s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_store-9cfca823d905bf14)"
       }
     },
     {
@@ -337,8 +337,8 @@
       "title": "Throughput partition handoff does not wait for owner expiry after membership loss",
       "kind": "command",
       "status": "passed",
-      "duration_ms": 1968,
-      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.80s",
+      "duration_ms": 1944,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 1.77s",
       "observed": {
         "command": "cargo test -p fabrik-store tests::throughput_partition_handoff_does_not_wait_for_lease_expiry_when_owner_membership_is_gone -- --exact",
         "rust_test_summary": {
@@ -346,15 +346,15 @@
           "failed": 0,
           "ignored": 0,
           "measured": 0,
-          "filtered_out": 22,
+          "filtered_out": 23,
           "executed": 1
         },
         "running_tests": 1
       },
       "evidence": {
-        "stdout_excerpt": "running 1 test\ntest tests::throughput_partition_handoff_does_not_wait_for_lease_expiry_when_owner_membership_is_gone ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.80s",
+        "stdout_excerpt": "running 1 test\ntest tests::throughput_partition_handoff_does_not_wait_for_lease_expiry_when_owner_membership_is_gone ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 1.77s",
         "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_store-9cfca823d905bf14)",
-        "combined_excerpt": "running 1 test\ntest tests::throughput_partition_handoff_does_not_wait_for_lease_expiry_when_owner_membership_is_gone ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.80s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_store-9cfca823d905bf14)"
+        "combined_excerpt": "running 1 test\ntest tests::throughput_partition_handoff_does_not_wait_for_lease_expiry_when_owner_membership_is_gone ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 1.77s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_store-9cfca823d905bf14)"
       }
     },
     {
@@ -362,8 +362,8 @@
       "title": "Workflow task leasing falls back after sticky build expiry",
       "kind": "command",
       "status": "passed",
-      "duration_ms": 1659,
-      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.49s",
+      "duration_ms": 1643,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 1.47s",
       "observed": {
         "command": "cargo test -p fabrik-store tests::workflow_task_lease_falls_back_after_expired_sticky_build -- --exact",
         "rust_test_summary": {
@@ -371,15 +371,15 @@
           "failed": 0,
           "ignored": 0,
           "measured": 0,
-          "filtered_out": 22,
+          "filtered_out": 23,
           "executed": 1
         },
         "running_tests": 1
       },
       "evidence": {
-        "stdout_excerpt": "running 1 test\ntest tests::workflow_task_lease_falls_back_after_expired_sticky_build ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.49s",
-        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_store-9cfca823d905bf14)",
-        "combined_excerpt": "running 1 test\ntest tests::workflow_task_lease_falls_back_after_expired_sticky_build ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.49s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.12s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_store-9cfca823d905bf14)"
+        "stdout_excerpt": "running 1 test\ntest tests::workflow_task_lease_falls_back_after_expired_sticky_build ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 1.47s",
+        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_store-9cfca823d905bf14)",
+        "combined_excerpt": "running 1 test\ntest tests::workflow_task_lease_falls_back_after_expired_sticky_build ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 1.47s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_store-9cfca823d905bf14)"
       }
     },
     {
@@ -387,8 +387,8 @@
       "title": "Incompatible build cannot lease workflow task",
       "kind": "command",
       "status": "passed",
-      "duration_ms": 1693,
-      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.52s",
+      "duration_ms": 1619,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 1.45s",
       "observed": {
         "command": "cargo test -p fabrik-store tests::incompatible_build_cannot_lease_workflow_task -- --exact",
         "rust_test_summary": {
@@ -396,15 +396,15 @@
           "failed": 0,
           "ignored": 0,
           "measured": 0,
-          "filtered_out": 22,
+          "filtered_out": 23,
           "executed": 1
         },
         "running_tests": 1
       },
       "evidence": {
-        "stdout_excerpt": "running 1 test\ntest tests::incompatible_build_cannot_lease_workflow_task ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.52s",
+        "stdout_excerpt": "running 1 test\ntest tests::incompatible_build_cannot_lease_workflow_task ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 1.45s",
         "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_store-9cfca823d905bf14)",
-        "combined_excerpt": "running 1 test\ntest tests::incompatible_build_cannot_lease_workflow_task ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 1.52s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_store-9cfca823d905bf14)"
+        "combined_excerpt": "running 1 test\ntest tests::incompatible_build_cannot_lease_workflow_task ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 23 filtered out; finished in 1.45s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.11s\n     Running unittests src/lib.rs (target/debug/deps/fabrik_store-9cfca823d905bf14)"
       }
     },
     {
@@ -412,8 +412,8 @@
       "title": "Query layer reports sticky build mismatch routing status",
       "kind": "command",
       "status": "passed",
-      "duration_ms": 1755,
-      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 1.54s",
+      "duration_ms": 1690,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 1.48s",
       "observed": {
         "command": "cargo test -p query-service --bin query-service tests::list_runs_includes_routing_status_when_sticky_build_is_incompatible -- --exact",
         "rust_test_summary": {
@@ -427,9 +427,27 @@
         "running_tests": 1
       },
       "evidence": {
-        "stdout_excerpt": "running 1 test\ntest tests::list_runs_includes_routing_status_when_sticky_build_is_incompatible ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 1.54s",
-        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s\n     Running unittests src/main.rs (target/debug/deps/query_service-b741478a97ae8a51)",
-        "combined_excerpt": "running 1 test\ntest tests::list_runs_includes_routing_status_when_sticky_build_is_incompatible ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 1.54s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s\n     Running unittests src/main.rs (target/debug/deps/query_service-b741478a97ae8a51)"
+        "stdout_excerpt": "running 1 test\ntest tests::list_runs_includes_routing_status_when_sticky_build_is_incompatible ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 1.48s",
+        "stderr_excerpt": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s\n     Running unittests src/main.rs (target/debug/deps/query_service-b741478a97ae8a51)",
+        "combined_excerpt": "running 1 test\ntest tests::list_runs_includes_routing_status_when_sticky_build_is_incompatible ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 1.48s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.14s\n     Running unittests src/main.rs (target/debug/deps/query_service-b741478a97ae8a51)"
+      }
+    },
+    {
+      "id": "payload-path-mixed-build-drill",
+      "title": "Payload path adapter survives mixed-build deploy, restart, and rollback",
+      "kind": "command",
+      "status": "passed",
+      "duration_ms": 125657,
+      "summary": "[mixed-build-drill] report: /Users/bene/code/fabrik/target/alpha-drills/conformance-payload-path-mixed-build/alpha-mixed-build-drill-report.md",
+      "observed": {
+        "command": "bash scripts/run-alpha-mixed-build-drill.sh --output-dir target/alpha-drills/conformance-payload-path-mixed-build",
+        "rust_test_summary": null,
+        "running_tests": null
+      },
+      "evidence": {
+        "stdout_excerpt": "[dev-stack] starting activity-worker-service (stream-v2)\n[dev-stack] stack is up\n[dev-stack] env file: target/dev-stack/environment.sh\n[mixed-build-drill] signaling old and new runs\n[mixed-build-drill] rolling back default workflow build to alpha-payload-path-mixed-v1\n[mixed-build-drill] triggering rollback run definition=src-workflows-orderworkflow instance=alpha-mixed-rollback-cb842a68\n[mixed-build-drill] completed 2026-03-13T19:08:52Z\n[mixed-build-drill] report: /Users/bene/code/fabrik/target/alpha-drills/conformance-payload-path-mixed-build/alpha-mixed-build-drill-report.md",
+        "stderr_excerpt": null,
+        "combined_excerpt": "[dev-stack] starting activity-worker-service (stream-v2)\n[dev-stack] stack is up\n[dev-stack] env file: target/dev-stack/environment.sh\n[mixed-build-drill] signaling old and new runs\n[mixed-build-drill] rolling back default workflow build to alpha-payload-path-mixed-v1\n[mixed-build-drill] triggering rollback run definition=src-workflows-orderworkflow instance=alpha-mixed-rollback-cb842a68\n[mixed-build-drill] completed 2026-03-13T19:08:52Z\n[mixed-build-drill] report: /Users/bene/code/fabrik/target/alpha-drills/conformance-payload-path-mixed-build/alpha-mixed-build-drill-report.md"
       }
     }
   ]

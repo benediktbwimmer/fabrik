@@ -65,6 +65,8 @@ The current workspace defaults are:
 - Primary repo: [`crates/fabrik-cli/test-fixtures/temporal-supported`](/Users/bene/code/fabrik/crates/fabrik-cli/test-fixtures/temporal-supported)
 - Shadow repo: [`crates/fabrik-cli/test-fixtures/temporal-shadow-qualified`](/Users/bene/code/fabrik/crates/fabrik-cli/test-fixtures/temporal-shadow-qualified)
 - Payload adapter fixture: [`crates/fabrik-cli/test-fixtures/temporal-payload-qualified`](/Users/bene/code/fabrik/crates/fabrik-cli/test-fixtures/temporal-payload-qualified)
+- Payload path adapter fixture: [`crates/fabrik-cli/test-fixtures/temporal-payload-path-qualified`](/Users/bene/code/fabrik/crates/fabrik-cli/test-fixtures/temporal-payload-path-qualified)
+- Payload path upgrade fixture: [`crates/fabrik-cli/test-fixtures/temporal-payload-path-qualified-v2`](/Users/bene/code/fabrik/crates/fabrik-cli/test-fixtures/temporal-payload-path-qualified-v2)
 
 ## Current Workspace Shadow Set
 
@@ -77,3 +79,19 @@ Refresh the generated fixture reports with:
 ```bash
 scripts/run-shadow-qualification.sh
 ```
+
+Run the mixed-build upgrade drill for the payload-path slice with:
+
+```bash
+scripts/run-alpha-mixed-build-drill.sh
+```
+
+For the next scoped payload-converter project boundary, use:
+
+```bash
+scripts/scope-payload-converter-project.sh
+```
+
+The project scope document is tracked in:
+
+- [`docs/payload-converter-scope.md`](/Users/bene/code/fabrik/docs/payload-converter-scope.md)

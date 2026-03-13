@@ -207,6 +207,16 @@
         "executed_tests_exact": 1,
         "running_tests_exact": 1
       }
+    },
+    {
+      "id": "payload-path-mixed-build-drill",
+      "title": "Payload path adapter survives mixed-build deploy, restart, and rollback",
+      "kind": "command",
+      "command": "bash",
+      "args": ["scripts/run-alpha-mixed-build-drill.sh", "--output-dir", "target/alpha-drills/conformance-payload-path-mixed-build"],
+      "expect": {
+        "output_matches": ["\\[mixed-build-drill\\] completed", "alpha-mixed-build-drill-report\\.md"]
+      }
     }
   ]
 }

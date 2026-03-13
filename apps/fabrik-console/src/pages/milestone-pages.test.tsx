@@ -710,6 +710,72 @@ const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       { status: 200 }
     );
   }
+  if (url.includes("/tenants/tenant-a/workflows/instance-1/runs/run-1/replay")) {
+    return new Response(
+      JSON.stringify({
+        tenant_id: "tenant-a",
+        instance_id: "instance-1",
+        run_id: "run-1",
+        definition_id: "payments",
+        definition_version: 1,
+        artifact_hash: "artifact-a",
+        divergence_count: 0,
+        divergences: [],
+        transition_count: 8,
+        replay_source: "snapshot_tail",
+        projection_matches_store: true,
+        snapshot: {
+          run_id: "run-1",
+          snapshot_schema_version: 1,
+          event_count: 8,
+          last_event_id: "evt-2",
+          last_event_type: "WorkflowContinuedAsNew",
+          updated_at: "2026-03-13T08:10:00Z"
+        },
+        replayed_state: {
+          workflow_task_queue: "payments",
+          memo: { region: "eu" },
+          search_attributes: { Region: "eu" },
+          status: "continued",
+          current_state: "handoff"
+        }
+      }),
+      { status: 200 }
+    );
+  }
+  if (url.includes("/tenants/tenant-a/workflows/instance-1/runs/run-2/replay")) {
+    return new Response(
+      JSON.stringify({
+        tenant_id: "tenant-a",
+        instance_id: "instance-1",
+        run_id: "run-2",
+        definition_id: "payments",
+        definition_version: 2,
+        artifact_hash: "artifact-b",
+        divergence_count: 0,
+        divergences: [],
+        transition_count: 12,
+        replay_source: "full_history",
+        projection_matches_store: true,
+        snapshot: {
+          run_id: "run-2",
+          snapshot_schema_version: 1,
+          event_count: 12,
+          last_event_id: "evt-9",
+          last_event_type: "ActivityScheduled",
+          updated_at: "2026-03-13T09:05:00Z"
+        },
+        replayed_state: {
+          workflow_task_queue: "payments",
+          memo: { region: "us" },
+          search_attributes: { Region: "us" },
+          status: "running",
+          current_state: "charge-card"
+        }
+      }),
+      { status: 200 }
+    );
+  }
   if (url.includes("/tenants/tenant-a/workflows/instance-1/routing")) {
     return new Response(
       JSON.stringify({
@@ -929,8 +995,22 @@ test("disables safe actions for a historical run detail", async () => {
     "href",
     "/task-queues?queue_kind=workflow&task_queue=payments"
   );
+  expect(screen.getByText("Pinned definition version 1")).toBeInTheDocument();
+  expect(screen.getByText("Replay kept pinned artifact true")).toBeInTheDocument();
+  expect(screen.getByText(/run-1 · v1 · artifact-a/)).toBeInTheDocument();
   await userEvent.click(screen.getByRole("button", { name: "raw-history" }));
   expect(screen.getAllByText("View payload").length).toBeGreaterThan(0);
+});
+
+test("shows pinned artifact and routing evidence in the replay workbench", async () => {
+  renderApp("/replay?instance=instance-1&run=run-2");
+
+  await waitFor(() => expect(screen.getByRole("heading", { name: "Replay" })).toBeInTheDocument());
+  await waitFor(() => expect(screen.getByText("Replay kept pinned artifact true")).toBeInTheDocument());
+  expect(screen.getByText("Replay kept pinned version true")).toBeInTheDocument();
+  expect(screen.getByText("Routing status sticky_active")).toBeInTheDocument();
+  expect(screen.getByText("Default set stable")).toBeInTheDocument();
+  expect(screen.getByText("Sticky build build-b")).toBeInTheDocument();
 });
 
 test("keeps task queue inspection read-only", async () => {

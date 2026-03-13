@@ -1,0 +1,12 @@
+{
+  "name": "temporal-payload-path-qualified-v2",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@temporalio/activity": "^1.11.3",
+    "@temporalio/client": "^1.11.3",
+    "@temporalio/common": "^1.11.3",
+    "@temporalio/worker": "^1.11.3",
+    "@temporalio/workflow": "^1.11.3"
+  }
+}

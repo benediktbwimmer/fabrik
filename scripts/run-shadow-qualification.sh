@@ -8,6 +8,7 @@ FIXTURES=(
   "temporal-shadow-qualified"
   "temporal-visibility-blocked"
   "temporal-payload-qualified"
+  "temporal-payload-path-qualified"
   "temporal-payload-blocked"
   "temporal-dynamic-bootstrap-blocked"
   "temporal-unsupported-api-blocked"
@@ -69,6 +70,11 @@ def decision_for(fixture, report):
         return {
             "decision": "fixed_now",
             "reason": "default-compatible dataConverter declarations now qualify for the alpha payload adapter slice",
+        }
+    if fixture == "temporal-payload-path-qualified" and verdict != "blocked":
+        return {
+            "decision": "fixed_now",
+            "reason": "default-compatible payloadConverterPath modules now qualify for the alpha payload adapter slice",
         }
     return {
         "decision": "explicit_alpha_limitation",

@@ -170,13 +170,25 @@ export function WorkflowDetailPage() {
   const routing = routingQuery.data;
   const replay = replayQuery.data;
   const expectedQueue = selectedRun?.workflow_task_queue ?? workflowQuery.data?.workflow_task_queue ?? null;
+  const expectedDefinitionVersion = selectedRun?.definition_version ?? workflowQuery.data?.definition_version ?? null;
+  const expectedArtifactHash = selectedRun?.artifact_hash ?? workflowQuery.data?.artifact_hash ?? null;
   const replayQueue = replay?.replayed_state?.workflow_task_queue ?? null;
   const replayQueuePreserved =
     expectedQueue != null && replayQueue != null ? replayQueue === expectedQueue : null;
+  const replayVersionMatchesPinned =
+    expectedDefinitionVersion != null ? replay?.definition_version === expectedDefinitionVersion : null;
+  const replayArtifactMatchesPinned =
+    expectedArtifactHash != null && replay?.artifact_hash != null ? replay.artifact_hash === expectedArtifactHash : null;
   const routingQueueHref =
     routing?.workflow_task_queue != null
       ? `/task-queues?queue_kind=workflow&task_queue=${encodeURIComponent(routing.workflow_task_queue)}`
       : null;
+  const relatedRunsSummary =
+    runs.length > 0
+      ? runs
+          .map((item) => `${item.run_id} · v${item.definition_version ?? "-"} · ${item.artifact_hash ?? "-"}`)
+          .join(" | ")
+      : "-";
 
   async function onSignal(event: FormEvent) {
     event.preventDefault();
@@ -276,6 +288,18 @@ export function WorkflowDetailPage() {
               </div>
 
               <div className="grid two">
+                <Panel className="nested-panel">
+                  <h3>Pinned artifact evidence</h3>
+                  <div className="stack">
+                    <div>Pinned definition version {formatInlineValue(expectedDefinitionVersion)}</div>
+                    <div>Pinned artifact hash {formatInlineValue(expectedArtifactHash)}</div>
+                    <div>Replay definition version {formatInlineValue(replay?.definition_version)}</div>
+                    <div>Replay artifact hash {formatInlineValue(replay?.artifact_hash)}</div>
+                    <div>Replay kept pinned version {formatInlineValue(replayVersionMatchesPinned)}</div>
+                    <div>Replay kept pinned artifact {formatInlineValue(replayArtifactMatchesPinned)}</div>
+                    <div>Run lineage {relatedRunsSummary}</div>
+                  </div>
+                </Panel>
                 <Panel className="nested-panel">
                   <h3>Alpha metadata evidence</h3>
                   <div className="stack">

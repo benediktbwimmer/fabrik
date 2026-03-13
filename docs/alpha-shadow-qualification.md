@@ -10,6 +10,8 @@ This document records the current shadow-qualification stance for the workspace 
   Static-evaluable start-time `memo` and `searchAttributes` shapes now qualify for the alpha slice, so this fixture is no longer a blocker.
 - `temporal-payload-qualified`: treat as `fixed_now`
   Static default-compatible `dataConverter` declarations now qualify for the alpha payload adapter slice.
+- `temporal-payload-path-qualified`: treat as `fixed_now`
+  Static default-compatible `payloadConverterPath` modules now qualify for the alpha payload adapter slice.
 - `temporal-payload-blocked`: treat as `explicit_alpha_limitation`
   Custom payload/data converter behavior remains out of scope for the current alpha.
 - `temporal-dynamic-bootstrap-blocked`: treat as `explicit_alpha_limitation`

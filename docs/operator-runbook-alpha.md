@@ -30,6 +30,12 @@ For the local primary alpha drill against the supported Temporal TS fixture, use
 scripts/run-alpha-primary-drill.sh
 ```
 
+For mixed-build, pinned-artifact, and rollback evidence on the path-based payload adapter slice, use:
+
+```bash
+scripts/run-alpha-mixed-build-drill.sh
+```
+
 Expected deployment evidence:
 
 - workflow artifacts published
@@ -53,6 +59,12 @@ Use these surfaces:
 - replay endpoint
 - task queue inspection
 
+The operator surfaces should answer three questions directly:
+
+- which definition version and artifact hash the current run is pinned to
+- why the run routed to its current sticky/default build state
+- whether replay used the same pinned artifact/version path after restart or handoff
+
 ## Replay and Recovery
 
 For a candidate primary alpha workflow:
@@ -63,6 +75,7 @@ For a candidate primary alpha workflow:
 4. restart or fail over the owning runtime
 5. confirm the workflow resumes from authoritative state
 6. confirm no stale completion mutates the workflow after recovery
+7. confirm replay still reports the pinned definition version and artifact hash
 
 ## Rollback Drill
 
@@ -74,6 +87,7 @@ For the primary alpha repo:
 4. verify health and replay consistency
 5. roll back the build or artifact candidate
 6. confirm pinned runs and queue routing remain sane
+7. confirm newly triggered runs follow the rolled-back workflow build set when task-queue routing is explicit
 
 ## Escalate as Blocked When
 
