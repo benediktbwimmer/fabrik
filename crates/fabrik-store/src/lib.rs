@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_throughput::{
-    ADMISSION_POLICY_VERSION, bulk_reducer_name, throughput_execution_mode,
+    ADMISSION_POLICY_VERSION, BULK_REDUCER_AVG, BULK_REDUCER_MAX, BULK_REDUCER_MIN,
+    BULK_REDUCER_SUM, bulk_reducer_name, bulk_reducer_reduce_values, throughput_execution_mode,
     throughput_reducer_execution_path, throughput_reducer_version, throughput_routing_reason,
 };
 use fabrik_workflow::{CompiledWorkflowArtifact, WorkflowDefinition, WorkflowInstanceState};
@@ -3356,7 +3357,10 @@ impl WorkflowStore {
         self.upsert_persisted_instance(&persisted_state).await
     }
 
-    pub async fn upsert_persisted_instance(&self, persisted_state: &WorkflowInstanceState) -> Result<()> {
+    pub async fn upsert_persisted_instance(
+        &self,
+        persisted_state: &WorkflowInstanceState,
+    ) -> Result<()> {
         sqlx::query(
             r#"
             INSERT INTO workflow_instances (
@@ -10365,6 +10369,8 @@ impl WorkflowStore {
                     if batch.succeeded_items >= batch.total_items {
                         batch.status = WorkflowBulkBatchStatus::Completed;
                         batch.terminal_at = Some(update.occurred_at);
+                        let reducer_output =
+                            Self::reduce_bulk_batch_success_outputs(tx.as_mut(), &batch).await?;
                         terminal_event = Some(Self::bulk_terminal_event(
                             &batch,
                             WorkflowEvent::BulkActivityBatchCompleted {
@@ -10374,6 +10380,7 @@ impl WorkflowStore {
                                 failed_items: batch.failed_items,
                                 cancelled_items: batch.cancelled_items,
                                 chunk_count: batch.chunk_count,
+                                reducer_output,
                             },
                         ));
                     } else if batch.status == WorkflowBulkBatchStatus::Scheduled {
@@ -10621,6 +10628,32 @@ impl WorkflowStore {
         .await
         .context("failed to lease workflow event outbox rows")?;
         rows.into_iter().map(Self::decode_workflow_event_outbox_row).collect()
+    }
+
+    pub async fn get_workflow_event_outbox(
+        &self,
+        event_id: Uuid,
+    ) -> Result<Option<WorkflowEventOutboxRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT *
+            FROM workflow_event_outbox
+            WHERE outbox_id = $1
+            "#,
+        )
+        .bind(event_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load workflow event outbox row")?;
+        row.map(Self::decode_workflow_event_outbox_row).transpose()
+    }
+
+    pub async fn put_workflow_event_outbox(
+        &self,
+        event: &EventEnvelope<WorkflowEvent>,
+        available_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.enqueue_workflow_event_outbox(&self.pool, event, available_at).await
     }
 
     pub async fn mark_workflow_event_outbox_published(
@@ -13646,6 +13679,51 @@ impl WorkflowStore {
         envelope
     }
 
+    async fn reduce_bulk_batch_success_outputs(
+        executor: &mut sqlx::PgConnection,
+        batch: &WorkflowBulkBatchRecord,
+    ) -> Result<Option<Value>> {
+        let reducer = batch.reducer.as_deref();
+        if !matches!(
+            reducer,
+            Some(BULK_REDUCER_SUM | BULK_REDUCER_MIN | BULK_REDUCER_MAX | BULK_REDUCER_AVG)
+        ) {
+            return Ok(None);
+        }
+
+        let mut values = Vec::new();
+        let rows = sqlx::query(
+            r#"
+            SELECT output
+            FROM workflow_bulk_chunks
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND batch_id = $4
+              AND status = 'completed'
+            ORDER BY chunk_index
+            "#,
+        )
+        .bind(&batch.tenant_id)
+        .bind(&batch.instance_id)
+        .bind(&batch.run_id)
+        .bind(&batch.batch_id)
+        .fetch_all(executor)
+        .await
+        .context("failed to load completed workflow bulk chunk outputs for reducer")?;
+
+        for row in rows {
+            if let Some(Json(mut output)) = row
+                .try_get::<Option<Json<Vec<Value>>>, _>("output")
+                .context("workflow bulk chunk output missing for reducer")?
+            {
+                values.append(&mut output);
+            }
+        }
+        bulk_reducer_reduce_values(reducer, &values)
+            .context("failed to reduce workflow bulk batch outputs")
+    }
+
     fn decode_bulk_batch_row(row: sqlx::postgres::PgRow) -> Result<WorkflowBulkBatchRecord> {
         let throughput_backend = row
             .try_get::<String, _>("throughput_backend")
@@ -15330,6 +15408,7 @@ mod tests {
                 failed_items: 0,
                 cancelled_items: 0,
                 chunk_count: 1,
+                reducer_output: None,
             }
             .event_type()
         );
@@ -15342,6 +15421,99 @@ mod tests {
                 )
                 .await?
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bulk_chunk_completion_reduces_numeric_outputs_for_terminal_event() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+
+        let (_batch, chunks) = store
+            .upsert_bulk_batch(
+                "tenant-a",
+                "wf-bulk-sum",
+                "run-bulk-sum",
+                "demo",
+                Some(1),
+                Some("artifact-1"),
+                "batch-sum",
+                "benchmark.echo",
+                "default",
+                Some("join"),
+                &json!({ "kind": "inline", "key": "bulk-input:batch-sum" }),
+                &json!({ "kind": "inline", "key": "bulk-result:batch-sum" }),
+                &[json!(1), json!(2), json!(3)],
+                3,
+                1,
+                0,
+                None,
+                Some("sum"),
+                "legacy",
+                1,
+                false,
+                1,
+                "pg-v1",
+                "1.0.0",
+                Utc::now(),
+            )
+            .await?;
+        assert_eq!(chunks.len(), 1);
+
+        let leased = store
+            .lease_next_bulk_chunks(
+                "tenant-a",
+                "default",
+                "worker-a",
+                "build-a",
+                chrono::Duration::seconds(30),
+                1,
+            )
+            .await?;
+        let leased_chunk = &leased[0];
+
+        store
+            .apply_bulk_chunk_terminal_update(&BulkChunkTerminalUpdate {
+                tenant_id: leased_chunk.tenant_id.clone(),
+                instance_id: leased_chunk.instance_id.clone(),
+                run_id: leased_chunk.run_id.clone(),
+                batch_id: leased_chunk.batch_id.clone(),
+                chunk_id: leased_chunk.chunk_id.clone(),
+                chunk_index: leased_chunk.chunk_index,
+                group_id: leased_chunk.group_id,
+                attempt: leased_chunk.attempt,
+                lease_epoch: leased_chunk.lease_epoch,
+                owner_epoch: leased_chunk.owner_epoch,
+                report_id: Uuid::now_v7().to_string(),
+                lease_token: leased_chunk
+                    .lease_token
+                    .context("leased chunk missing lease token")?,
+                worker_id: "worker-a".to_owned(),
+                worker_build_id: "build-a".to_owned(),
+                occurred_at: Utc::now(),
+                payload: BulkChunkTerminalPayload::Completed {
+                    output: vec![json!(10), json!(20), json!(30)],
+                },
+            })
+            .await?;
+
+        let outbox = store
+            .lease_workflow_event_outbox(
+                "publisher-a",
+                chrono::Duration::seconds(30),
+                10,
+                Utc::now(),
+            )
+            .await?;
+        assert_eq!(outbox.len(), 1);
+        assert!(matches!(
+            &outbox[0].event.payload,
+            WorkflowEvent::BulkActivityBatchCompleted { reducer_output, .. }
+                if reducer_output.as_ref() == Some(&json!(60.0))
+        ));
 
         Ok(())
     }

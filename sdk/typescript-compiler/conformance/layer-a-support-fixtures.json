@@ -78,6 +78,21 @@
       }
     },
     {
+      "id": "analyzer-worker-versioning-qualified",
+      "kind": "analyzer",
+      "project": "crates/fabrik-cli/test-fixtures/temporal-worker-versioning-qualified",
+      "expect": {
+        "summary": {
+          "workflow_count": 2,
+          "worker_count": 1,
+          "hard_block_count": 0
+        },
+        "workflow_exports_include": ["autoUpgradeWorkflow", "pinnedWorkflow"],
+        "worker_task_queues_include": ["worker-versioning-qualified"],
+        "finding_features_exclude": ["unsupported_temporal_api"]
+      }
+    },
+    {
       "id": "analyzer-payload-blocked",
       "kind": "analyzer",
       "project": "crates/fabrik-cli/test-fixtures/temporal-payload-blocked",

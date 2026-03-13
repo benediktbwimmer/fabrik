@@ -20,6 +20,7 @@ const WORKFLOW_SUPPORTED_IMPORTS = new Set([
   "patched",
   "proxyActivities",
   "deprecatePatch",
+  "setWorkflowOptions",
   "setHandler",
   "sleep",
   "startChild",
@@ -772,7 +773,40 @@ function analyzeWorkerDataConverter(program, projectRoot, sourceFile, node, bind
   };
 }
 
-function extractExportedAsyncWorkflows(projectRoot, program, sourceFile, fileUses) {
+function collectWorkflowOptionAnnotations(sourceFile, workflowImports) {
+  const annotations = new Map();
+  for (const statement of sourceFile.statements) {
+    if (
+      !ts.isExpressionStatement(statement) ||
+      !ts.isCallExpression(statement.expression) ||
+      !ts.isIdentifier(statement.expression.expression) ||
+      workflowImports.get(statement.expression.expression.text) !== "setWorkflowOptions" ||
+      statement.expression.arguments.length !== 2
+    ) {
+      continue;
+    }
+    const [optionsArg, workflowArg] = statement.expression.arguments;
+    if (!ts.isObjectLiteralExpression(optionsArg) || !ts.isIdentifier(workflowArg)) {
+      continue;
+    }
+    const versioningBehaviorProperty = findObjectProperty(optionsArg, "versioningBehavior");
+    if (
+      versioningBehaviorProperty == null ||
+      !ts.isPropertyAssignment(versioningBehaviorProperty) ||
+      !ts.isStringLiteralLike(versioningBehaviorProperty.initializer)
+    ) {
+      continue;
+    }
+    const versioningBehavior = versioningBehaviorProperty.initializer.text;
+    if (!["AUTO_UPGRADE", "PINNED"].includes(versioningBehavior)) {
+      continue;
+    }
+    annotations.set(workflowArg.text, { versioning_behavior: versioningBehavior });
+  }
+  return annotations;
+}
+
+function extractExportedAsyncWorkflows(projectRoot, program, sourceFile, fileUses, workflowAnnotations = new Map()) {
   const checker = program.getTypeChecker();
   const symbol = checker.getSymbolAtLocation(sourceFile);
   if (!symbol) return [];
@@ -794,6 +828,7 @@ function extractExportedAsyncWorkflows(projectRoot, program, sourceFile, fileUse
         export_name: candidate.getName(),
         definition_id_suggestion: definitionIdSuggestion(projectRoot, sourceFile.fileName, candidate.getName()),
         uses: [...fileUses].sort(),
+        ...(workflowAnnotations.get(candidate.getName()) ?? {}),
       });
     }
   }
@@ -846,6 +881,7 @@ async function main() {
 
     const relativeFile = relativeProjectPath(projectRoot, sourceFile.fileName);
     const { workflowImports, workerImports, clientImports, commonImports } = collectImportInfo(sourceFile);
+    const workflowAnnotations = collectWorkflowOptionAnnotations(sourceFile, workflowImports);
     const temporalImportAliases =
       combinedTemporalImports(workflowImports, workerImports, clientImports, commonImports);
     const temporalImports = [];
@@ -863,6 +899,12 @@ async function main() {
         if (["executeChild", "startChild"].includes(importedName)) fileUses.add("child_workflows");
         if (importedName === "getExternalWorkflowHandle") fileUses.add("external_workflow_handles");
         if (importedName === "continueAsNew") fileUses.add("continue_as_new");
+        if (["patched", "deprecatePatch", "setWorkflowOptions"].includes(importedName)) {
+          fileUses.add("ctx_version_workflow_evolution");
+          if (importedName === "setWorkflowOptions") {
+            fileUses.add("worker_build_ids_and_routing");
+          }
+        }
         continue;
       }
       if (BLOCKED_WORKFLOW_IMPORTS.has(importedName)) {
@@ -1200,7 +1242,7 @@ async function main() {
     visit(sourceFile, new Map());
 
     const exportedWorkflows = workflowImports.size > 0
-      ? extractExportedAsyncWorkflows(projectRoot, program, sourceFile, fileUses)
+      ? extractExportedAsyncWorkflows(projectRoot, program, sourceFile, fileUses, workflowAnnotations)
       : [];
     workflows.push(...exportedWorkflows);
 

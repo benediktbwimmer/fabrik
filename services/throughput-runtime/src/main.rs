@@ -2389,6 +2389,7 @@ async fn publish_stream_terminal_event(
             failed_items: projected.batch_failed_items,
             cancelled_items: projected.batch_cancelled_items,
             chunk_count: projected.batch_chunk_count,
+            reducer_output: None,
         },
         "failed" => WorkflowEvent::BulkActivityBatchFailed {
             batch_id: report.batch_id.clone(),
@@ -2456,6 +2457,7 @@ async fn publish_stream_batch_terminal_event(
             failed_items: batch.failed_items,
             cancelled_items: batch.cancelled_items,
             chunk_count: batch.chunk_count,
+            reducer_output: None,
         },
         WorkflowBulkBatchStatus::Failed => WorkflowEvent::BulkActivityBatchFailed {
             batch_id: batch.batch_id.clone(),

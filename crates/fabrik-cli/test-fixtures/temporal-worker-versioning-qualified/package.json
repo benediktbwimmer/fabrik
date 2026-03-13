@@ -1,0 +1,9 @@
+{
+  "name": "temporal-worker-versioning-qualified",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@temporalio/workflow": "^1.11.0",
+    "@temporalio/worker": "^1.11.0"
+  }
+}

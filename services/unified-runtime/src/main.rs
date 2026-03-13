@@ -8,23 +8,23 @@ use std::{
 
 use anyhow::{Context, Result};
 use axum::{
+    Json,
     extract::Path as AxumPath,
     extract::State as AxumState,
     http::StatusCode,
     routing::{get, post},
-    Json,
 };
 use chrono::{DateTime, Utc};
 use fabrik_broker::{
-    build_workflow_consumer, decode_consumed_workflow_event, partition_for_instance,
-    read_workflow_history, BrokerConfig, WorkflowHistoryFilter, WorkflowPublisher,
+    BrokerConfig, WorkflowHistoryFilter, WorkflowPublisher, build_workflow_consumer,
+    decode_consumed_workflow_event, partition_for_instance, read_workflow_history,
 };
 use fabrik_config::{
     ExecutorRuntimeConfig, GrpcServiceConfig, HttpServiceConfig, PostgresConfig, RedpandaConfig,
     ThroughputPayloadStoreKind, ThroughputRuntimeConfig,
 };
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
-use fabrik_service::{default_router, init_tracing, serve, ServiceInfo};
+use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
     ActivityScheduleUpdate, ActivityStartUpdate, ActivityTerminalPayload, ActivityTerminalUpdate,
     BulkChunkTerminalPayload, BulkChunkTerminalUpdate, ConsumedSignalRecord, TaskQueueKind,
@@ -32,33 +32,32 @@ use fabrik_store::{
     WorkflowStore,
 };
 use fabrik_throughput::{
-    bulk_reducer_class, bulk_reducer_is_mergeable, bulk_reducer_materializes_results, decode_cbor,
-    encode_cbor, planned_reduction_tree_depth, stream_v2_fast_lane_enabled, PayloadStore,
-    PayloadStoreConfig, PayloadStoreKind, ThroughputBackend, ADMISSION_POLICY_VERSION,
+    ADMISSION_POLICY_VERSION, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
+    ThroughputBackend, bulk_reducer_class, bulk_reducer_is_mergeable,
+    bulk_reducer_materializes_results, bulk_reducer_supports_stream_v2, decode_cbor, encode_cbor,
+    planned_reduction_tree_depth, stream_v2_fast_lane_enabled,
 };
 use fabrik_worker_protocol::activity_worker::{
-    activity_task_result,
-    activity_worker_api_server::{ActivityWorkerApi, ActivityWorkerApiServer},
     Ack, ActivityTask, ActivityTaskCancelledResult, ActivityTaskCompletedResult,
     ActivityTaskFailedResult, ActivityTaskResult, BulkActivityTask, BulkActivityTaskResult,
     PollActivityTaskRequest, PollActivityTaskResponse, PollActivityTasksRequest,
     PollActivityTasksResponse, PollBulkActivityTaskRequest, PollBulkActivityTaskResponse,
     RecordActivityHeartbeatRequest, RecordActivityHeartbeatResponse,
     ReportActivityTaskCancelledRequest, ReportActivityTaskResultsRequest,
-    ReportBulkActivityTaskResultsRequest,
+    ReportBulkActivityTaskResultsRequest, activity_task_result,
+    activity_worker_api_server::{ActivityWorkerApi, ActivityWorkerApiServer},
 };
 use fabrik_workflow::{
-    execution_state_for_event, parse_timer_ref, replay_compiled_history_trace,
-    replay_compiled_history_trace_from_snapshot, replay_history_trace_from_snapshot,
-    retry_policy_allows_failure_retry, ArtifactExecutionState, CompiledExecutionPlan,
-    CompiledWorkflowArtifact, ExecutionTurnContext, RetryPolicy, WorkflowInstanceState,
-    WorkflowStatus,
+    ArtifactExecutionState, CompiledExecutionPlan, CompiledWorkflowArtifact, ExecutionTurnContext,
+    RetryPolicy, WorkflowInstanceState, WorkflowStatus, execution_state_for_event, parse_timer_ref,
+    replay_compiled_history_trace, replay_compiled_history_trace_from_snapshot,
+    replay_history_trace_from_snapshot, retry_policy_allows_failure_retry,
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify};
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{Request, Response, Status, transport::Server};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -74,13 +73,10 @@ const BULK_EVENT_OUTBOX_LEASE_SECONDS: i64 = 30;
 const BULK_EVENT_OUTBOX_RETRY_MS: u64 = 250;
 const COMPILED_ARTIFACT_CACHE_CAPACITY: usize = 64;
 const TASK_QUEUE_POLICY_CACHE_TTL_MS: u64 = 1_000;
-const STREAM_V2_TRIGGER_INPUT_HANDLE_MIN_BYTES: usize = 16 * 1024;
-
 #[derive(Clone)]
 struct AppState {
     store: WorkflowStore,
     publisher: Option<WorkflowPublisher>,
-    payload_store: PayloadStore,
     inner: Arc<StdMutex<RuntimeInner>>,
     ownership: Arc<StdMutex<UnifiedOwnershipState>>,
     workflow_partition_count: i32,
@@ -641,15 +637,14 @@ async fn main() -> Result<()> {
 
     let debug = Arc::new(StdMutex::new(UnifiedDebugState::default()));
     let local_restored = restore_runtime_state(&persistence, &debug)?;
-    let payload_store = PayloadStore::from_config(build_payload_store_config(&throughput_runtime))
-        .await?;
+    let payload_store =
+        PayloadStore::from_config(build_payload_store_config(&throughput_runtime)).await?;
     let shared_restored =
         restore_runtime_state_from_store(&store, &broker, &payload_store, &debug).await?;
     let inner = reconcile_restored_runtime(local_restored, shared_restored, &debug);
     let state = AppState {
         store,
         publisher: Some(WorkflowPublisher::new(&broker, "unified-runtime").await?),
-        payload_store,
         inner: Arc::new(StdMutex::new(inner)),
         ownership: Arc::new(StdMutex::new(UnifiedOwnershipState::inactive(
             ownership.partition_id,
@@ -744,8 +739,7 @@ fn build_payload_store_config(runtime: &ThroughputRuntimeConfig) -> PayloadStore
     }
 }
 
-async fn prepare_stream_v2_trigger_persisted_instance(
-    state: &AppState,
+fn prepare_stream_v2_trigger_persisted_instance(
     artifact: &CompiledWorkflowArtifact,
     instance: &WorkflowInstanceState,
     plan: &CompiledExecutionPlan,
@@ -753,38 +747,8 @@ async fn prepare_stream_v2_trigger_persisted_instance(
     if !trigger_uses_stream_v2_bulk_wait(plan, artifact, instance) {
         return Ok(None);
     }
-    let Some(input) = instance.input.as_ref() else {
-        return Ok(None);
-    };
-    let encoded_len = serde_json::to_vec(input)
-        .map(|bytes| bytes.len())
-        .context("failed to measure trigger input size")?;
-    if encoded_len < STREAM_V2_TRIGGER_INPUT_HANDLE_MIN_BYTES {
-        return Ok(None);
-    }
-
-    let key = format!(
-        "workflow-inputs/{}/{}/{}/{}",
-        instance.tenant_id, instance.instance_id, instance.run_id, instance.last_event_id
-    );
-    let input_handle = match state.payload_store.write_value(&key, input).await {
-        Ok(handle) => handle,
-        Err(error) => {
-            warn!(
-                error = %error,
-                tenant_id = %instance.tenant_id,
-                instance_id = %instance.instance_id,
-                run_id = %instance.run_id,
-                "failed to externalize stream-v2 trigger input; falling back to inline persistence"
-            );
-            return Ok(None);
-        }
-    };
-
     let mut persisted = instance.clone();
-    let input_handle =
-        serde_json::to_value(input_handle).context("failed to serialize persisted input handle")?;
-    if !persisted.compact_trigger_bulk_wait_for_external_input(input_handle) {
+    if !persisted.compact_trigger_bulk_wait_for_replayable_restore() {
         return Ok(None);
     }
     Ok(Some(persisted))
@@ -870,7 +834,8 @@ async fn restore_runtime_state_from_store(
         let instance =
             restore_instance_from_store_snapshot_tail(store, broker, &snapshot, &artifact).await?;
         let (run_key, runtime, ready) =
-            restore_runtime_from_instance_row(store, payload_store, instance, Some(artifact)).await?;
+            restore_runtime_from_instance_row(store, payload_store, instance, Some(artifact))
+                .await?;
         for task in ready {
             inner
                 .ready
@@ -1501,7 +1466,7 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
     apply_compiled_plan(&mut instance, &plan);
     let queued = schedule_activities_from_plan(&artifact, &instance, &plan, event.occurred_at)?;
     let persisted_instance =
-        prepare_stream_v2_trigger_persisted_instance(state, &artifact, &instance, &plan).await?;
+        prepare_stream_v2_trigger_persisted_instance(&artifact, &instance, &plan)?;
     let state_apply_started_at = Instant::now();
     {
         let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
@@ -1543,9 +1508,11 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
     let db_apply_started_at = Instant::now();
     apply_db_actions(
         state,
-        vec![persisted_instance
-            .map(PreparedDbAction::UpsertPersistedInstance)
-            .unwrap_or_else(|| PreparedDbAction::UpsertInstance(instance.clone()))],
+        vec![
+            persisted_instance
+                .map(PreparedDbAction::UpsertPersistedInstance)
+                .unwrap_or_else(|| PreparedDbAction::UpsertInstance(instance.clone())),
+        ],
         schedule_actions,
     )
     .await?;
@@ -1635,6 +1602,7 @@ async fn handle_bulk_batch_terminal_event(
                 failed_items,
                 cancelled_items,
                 chunk_count,
+                reducer_output,
             } => runtime.artifact.execute_after_bulk_completion_with_turn(
                 &current_state,
                 batch_id,
@@ -1647,6 +1615,7 @@ async fn handle_bulk_batch_terminal_event(
                     *failed_items,
                     *cancelled_items,
                     *chunk_count,
+                    reducer_output.as_ref(),
                 ),
                 execution_state,
                 turn_context,
@@ -1671,6 +1640,7 @@ async fn handle_bulk_batch_terminal_event(
                     *failed_items,
                     *cancelled_items,
                     *chunk_count,
+                    None,
                 ),
                 execution_state,
                 turn_context,
@@ -1695,6 +1665,7 @@ async fn handle_bulk_batch_terminal_event(
                     *failed_items,
                     *cancelled_items,
                     *chunk_count,
+                    None,
                 ),
                 execution_state,
                 turn_context,
@@ -4724,18 +4695,38 @@ fn choose_bulk_admission_backend(
     item_count: usize,
     chunk_count: u32,
 ) -> BulkAdmissionDecision {
+    let mergeable_but_unsupported =
+        bulk_reducer_is_mergeable(reducer) && !bulk_reducer_supports_stream_v2(reducer);
     if let Some(backend) =
         task_queue_backend.filter(|backend| is_supported_throughput_backend(backend))
     {
+        if backend == ThroughputBackend::StreamV2.as_str() && mergeable_but_unsupported {
+            return bulk_admission_decision(
+                ThroughputBackend::PgV1.as_str(),
+                "mergeable_reducer_unsupported",
+            );
+        }
         return bulk_admission_decision(backend, "task_queue_policy_override");
     }
     if let Some(backend) =
         requested_backend.filter(|backend| is_supported_throughput_backend(backend))
     {
+        if backend == ThroughputBackend::StreamV2.as_str() && mergeable_but_unsupported {
+            return bulk_admission_decision(
+                ThroughputBackend::PgV1.as_str(),
+                "mergeable_reducer_unsupported",
+            );
+        }
         return bulk_admission_decision(backend, "workflow_backend_hint");
     }
     if bulk_reducer_materializes_results(reducer) {
         return bulk_admission_decision(ThroughputBackend::PgV1.as_str(), "materialized_results");
+    }
+    if mergeable_but_unsupported {
+        return bulk_admission_decision(
+            ThroughputBackend::PgV1.as_str(),
+            "mergeable_reducer_unsupported",
+        );
     }
     if bulk_reducer_is_mergeable(reducer)
         && (item_count >= config.stream_v2_min_items || chunk_count >= config.stream_v2_min_chunks)
@@ -5993,9 +5984,9 @@ async fn apply_db_actions(
     for action in general {
         match action {
             PreparedDbAction::Terminal(update) => terminal_updates.push(update),
-            PreparedDbAction::UpsertPersistedInstance(instance) => other_general.push(
-                PreparedDbAction::UpsertPersistedInstance(instance),
-            ),
+            PreparedDbAction::UpsertPersistedInstance(instance) => {
+                other_general.push(PreparedDbAction::UpsertPersistedInstance(instance))
+            }
             other => other_general.push(other),
         }
     }
@@ -6977,7 +6968,8 @@ async fn restore_runtime_from_instance_row(
             })?,
     };
     instance.expand_after_persistence_with_artifact(Some(&artifact));
-    rehydrate_stream_v2_trigger_input_for_restore(payload_store, &mut instance, &artifact).await?;
+    rehydrate_stream_v2_trigger_state_for_restore(store, payload_store, &mut instance, &artifact)
+        .await?;
     let activities = store
         .list_activities_for_run(&instance.tenant_id, &instance.instance_id, &instance.run_id)
         .await?;
@@ -7017,20 +7009,46 @@ async fn restore_runtime_from_instance_row(
     Ok((run_key, RuntimeWorkflowState { artifact, instance, active_activities }, ready))
 }
 
-async fn rehydrate_stream_v2_trigger_input_for_restore(
+async fn rehydrate_stream_v2_trigger_state_for_restore(
+    store: &WorkflowStore,
     payload_store: &PayloadStore,
     instance: &mut WorkflowInstanceState,
     artifact: &CompiledWorkflowArtifact,
 ) -> Result<()> {
-    let Some(handle_value) = instance.persisted_input_handle.clone() else {
+    if let Some(handle_value) = instance.persisted_input_handle.clone() {
+        let handle = serde_json::from_value(handle_value)
+            .context("failed to decode persisted workflow input handle")?;
+        let input = payload_store.read_value(&handle).await.context(format!(
+            "failed to read persisted workflow input for {}/{}",
+            instance.tenant_id, instance.instance_id
+        ))?;
+        instance.restore_trigger_bulk_wait_from_input(artifact, &input)?;
         return Ok(());
+    }
+    if instance.last_event_type != "WorkflowTriggered"
+        || instance.input.is_some()
+        || instance.artifact_execution.is_some()
+    {
+        return Ok(());
+    }
+    let event =
+        store.get_workflow_event_outbox(instance.last_event_id).await?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing workflow trigger outbox row for restore {}/{}/{} {}",
+                instance.tenant_id,
+                instance.instance_id,
+                instance.run_id,
+                instance.last_event_id
+            )
+        })?;
+    let WorkflowEvent::WorkflowTriggered { input } = event.event.payload else {
+        anyhow::bail!(
+            "workflow trigger restore expected WorkflowTriggered payload for {}/{}/{}",
+            instance.tenant_id,
+            instance.instance_id,
+            instance.run_id
+        );
     };
-    let handle = serde_json::from_value(handle_value)
-        .context("failed to decode persisted workflow input handle")?;
-    let input = payload_store.read_value(&handle).await.context(format!(
-        "failed to read persisted workflow input for {}/{}",
-        instance.tenant_id, instance.instance_id
-    ))?;
     instance.restore_trigger_bulk_wait_from_input(artifact, &input)?;
     Ok(())
 }
@@ -7114,6 +7132,7 @@ fn bulk_terminal_payload(
     failed_items: u32,
     cancelled_items: u32,
     chunk_count: u32,
+    reducer_output: Option<&Value>,
 ) -> Value {
     let mut payload = serde_json::json!({
         "batchId": batch_id,
@@ -7126,6 +7145,9 @@ fn bulk_terminal_payload(
     });
     if status == "completed" {
         payload["resultHandle"] = serde_json::json!({ "batchId": batch_id });
+    }
+    if let Some(reducer_output) = reducer_output {
+        payload["reducerOutput"] = reducer_output.clone();
     }
     if let Some(message) = message {
         payload["message"] = Value::String(message.to_owned());
@@ -7590,6 +7612,28 @@ mod tests {
     }
 
     #[test]
+    fn admission_falls_back_when_mergeable_reducer_is_not_stream_v2_capable() {
+        let decision = choose_bulk_admission_backend(
+            &BulkAdmissionConfig {
+                default_backend: ThroughputBackend::PgV1.as_str().to_owned(),
+                task_queue_backends: BTreeMap::new(),
+                stream_v2_min_items: 64,
+                stream_v2_min_chunks: 8,
+                max_active_chunks_per_tenant: 4_096,
+                max_active_chunks_per_task_queue: 2_048,
+            },
+            None,
+            Some(ThroughputBackend::StreamV2.as_str()),
+            None,
+            Some("sum"),
+            512,
+            32,
+        );
+        assert_eq!(decision.selected_backend, ThroughputBackend::PgV1.as_str());
+        assert_eq!(decision.routing_reason, "mergeable_reducer_unsupported");
+    }
+
+    #[test]
     fn prune_terminal_instances_removes_completed_runs_and_work() {
         let now = Utc::now();
         let terminal_run = run_key_for("terminal");
@@ -7655,16 +7699,12 @@ mod tests {
         assert!(inner.ready.values().flatten().any(|task| task.run_id == "active"));
         assert!(inner.leased.values().all(|leased| leased.task.run_id != "terminal"));
         assert!(inner.leased.values().any(|leased| leased.task.run_id == "active"));
-        assert!(inner
-            .delayed_retries
-            .values()
-            .flatten()
-            .all(|retry| retry.task.run_id != "terminal"));
-        assert!(inner
-            .delayed_retries
-            .values()
-            .flatten()
-            .any(|retry| retry.task.run_id == "active"));
+        assert!(
+            inner.delayed_retries.values().flatten().all(|retry| retry.task.run_id != "terminal")
+        );
+        assert!(
+            inner.delayed_retries.values().flatten().any(|retry| retry.task.run_id == "active")
+        );
     }
 
     fn test_artifact(task_queue: &str) -> CompiledWorkflowArtifact {
@@ -8185,13 +8225,15 @@ mod tests {
         artifact
     }
 
-    async fn test_app_state(store: WorkflowStore, inner: RuntimeInner, state_dir: PathBuf) -> AppState {
+    async fn test_app_state(
+        store: WorkflowStore,
+        inner: RuntimeInner,
+        state_dir: PathBuf,
+    ) -> AppState {
         fs::create_dir_all(&state_dir).expect("create app state dir");
-        let payload_store = test_payload_store(&state_dir).await;
         AppState {
             store,
             publisher: None,
-            payload_store,
             inner: Arc::new(StdMutex::new(inner)),
             ownership: Arc::new(StdMutex::new(UnifiedOwnershipState::inactive(1, "test-owner"))),
             workflow_partition_count: 8,
@@ -8884,8 +8926,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_mailbox_item_unwinds_active_activity_instead_of_force_cancelling_workflow(
-    ) -> Result<()> {
+    async fn cancel_mailbox_item_unwinds_active_activity_instead_of_force_cancelling_workflow()
+    -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
         };
@@ -9326,6 +9368,7 @@ mod tests {
                 failed_items: 0,
                 cancelled_items: 0,
                 chunk_count: batch.chunk_count,
+                reducer_output: None,
             },
             Utc::now(),
         );
@@ -10924,7 +10967,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_restore_rehydrates_stream_v2_trigger_input_from_payload_handle() -> Result<()> {
+    async fn store_restore_rehydrates_stream_v2_trigger_input_from_outbox_event() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
         };
@@ -10962,20 +11005,10 @@ mod tests {
         )?;
         let mut instance = WorkflowInstanceState::try_from(&trigger)?;
         apply_compiled_plan(&mut instance, &plan);
+        store.put_workflow_event_outbox(&trigger, occurred_at).await?;
 
-        let input_handle = payload_store
-            .write_value(
-                &format!(
-                    "workflow-inputs/{}/{}/{}/{}",
-                    instance.tenant_id, instance.instance_id, instance.run_id, instance.last_event_id
-                ),
-                &input,
-            )
-            .await?;
         let mut persisted = instance.clone();
-        assert!(persisted.compact_trigger_bulk_wait_for_external_input(
-            serde_json::to_value(input_handle)?
-        ));
+        assert!(persisted.compact_trigger_bulk_wait_for_replayable_restore());
         store.upsert_persisted_instance(&persisted).await?;
 
         let restored = restore_runtime_state_from_store(
@@ -10992,25 +11025,27 @@ mod tests {
                 instance_id: identity.instance_id.clone(),
                 run_id: identity.run_id.clone(),
             })
-            .context("restored runtime state should contain payload-backed workflow")?;
+            .context("restored runtime state should contain outbox-backed workflow")?;
 
         assert_eq!(runtime.instance.input.as_ref(), Some(&input));
         assert_eq!(
             runtime.instance.context,
             Some(json!([json!({"ok": true}), json!({"ok": false})]))
         );
-        assert!(runtime
-            .instance
-            .artifact_execution
-            .as_ref()
-            .is_some_and(|execution| artifact.waits_on_bulk_activity("join", execution)));
+        assert!(
+            runtime
+                .instance
+                .artifact_execution
+                .as_ref()
+                .is_some_and(|execution| artifact.waits_on_bulk_activity("join", execution))
+        );
         fs::remove_dir_all(state_dir).ok();
         Ok(())
     }
 
     #[tokio::test]
-    async fn store_snapshot_restore_falls_back_to_full_history_when_snapshot_tail_is_inconsistent(
-    ) -> Result<()> {
+    async fn store_snapshot_restore_falls_back_to_full_history_when_snapshot_tail_is_inconsistent()
+    -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
         };
@@ -11147,8 +11182,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_snapshot_restore_preserves_alpha_queue_memo_and_search_attributes_after_handoff(
-    ) -> Result<()> {
+    async fn store_snapshot_restore_preserves_alpha_queue_memo_and_search_attributes_after_handoff()
+    -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
         };

@@ -1,8 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
-use fabrik_throughput::{DEFAULT_AGGREGATION_GROUP_COUNT, PayloadHandle, ThroughputBackend};
+use fabrik_throughput::{
+    BULK_REDUCER_AVG, BULK_REDUCER_MAX, BULK_REDUCER_MIN, BULK_REDUCER_SUM,
+    DEFAULT_AGGREGATION_GROUP_COUNT, PayloadHandle, ThroughputBackend, bulk_reducer_reduce_values,
+    bulk_reducer_requires_success_outputs, bulk_reducer_summary_field_name,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
@@ -808,7 +813,9 @@ impl CompiledWorkflowArtifact {
                 match args.get(index) {
                     Some(value) => value.clone(),
                     None => match &param.default {
-                        Some(default) => evaluate_expression(default, execution_state, &self.helpers)?,
+                        Some(default) => {
+                            evaluate_expression(default, execution_state, &self.helpers)?
+                        }
                         None => Value::Null,
                     },
                 }
@@ -2065,7 +2072,7 @@ impl CompiledWorkflowArtifact {
 
                     let reducer_name = reducer.as_deref().unwrap_or("collect_results");
                     let uses_materialized_results =
-                        matches!(reducer_name, "collect_results" | "collect_settled_results");
+                        bulk_reducer_requires_success_outputs(Some(reducer_name));
                     let mut results = uses_materialized_results
                         .then(|| Vec::with_capacity(items.len()))
                         .unwrap_or_default();
@@ -2194,7 +2201,15 @@ impl CompiledWorkflowArtifact {
                             if let Some(output_var) = output_var {
                                 execution_state.bindings.insert(
                                     output_var.clone(),
-                                    bulk_success_summary(&batch_id, 0, 0, 0, 0, 0),
+                                    bulk_success_summary(
+                                        &batch_id,
+                                        reducer.as_deref(),
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                    ),
                                 );
                             }
                             current_state = after_wait.clone();
@@ -2813,13 +2828,14 @@ fn build_bulk_batch_id(turn_context: &ExecutionTurnContext, state_id: &str) -> S
 
 fn bulk_success_summary(
     batch_id: &str,
+    reducer: Option<&str>,
     total_items: u32,
     succeeded_items: u32,
     failed_items: u32,
     cancelled_items: u32,
     chunk_count: u32,
 ) -> Value {
-    serde_json::json!({
+    let mut summary = serde_json::json!({
         "batchId": batch_id,
         "status": "completed",
         "totalItems": total_items,
@@ -2828,7 +2844,15 @@ fn bulk_success_summary(
         "cancelledItems": cancelled_items,
         "chunkCount": chunk_count,
         "resultHandle": { "batchId": batch_id },
-    })
+    });
+    if let Some(field_name) = bulk_reducer_summary_field_name(reducer) {
+        summary[field_name] = match field_name {
+            "count" | BULK_REDUCER_SUM => Value::from(0.0),
+            BULK_REDUCER_MIN | BULK_REDUCER_MAX | BULK_REDUCER_AVG => Value::Null,
+            _ => Value::Null,
+        };
+    }
+    summary
 }
 
 fn bulk_reducer<'a>(bulk: &'a BulkActivityExecutionState) -> &'a str {
@@ -3039,6 +3063,17 @@ fn reduce_fanout_terminal_payload(fanout: &FanOutExecutionState) -> Value {
                     u64::try_from(succeeded + failed + cancelled)
                         .expect("fanout completion count exceeds u64"),
                 );
+            } else if terminal_status == "completed"
+                && let Some(field_name) = bulk_reducer_summary_field_name(Some(reducer))
+            {
+                let values =
+                    fanout.results.iter().filter_map(|value| value.clone()).collect::<Vec<_>>();
+                if let Some(reduced) = bulk_reducer_reduce_values(Some(reducer), &values)
+                    .context("failed to reduce fanout terminal payload")
+                    .expect("fanout reducer outputs are valid")
+                {
+                    summary[field_name] = reduced;
+                }
             }
             summary
         }
@@ -3060,6 +3095,12 @@ fn empty_fanout_terminal_payload(reducer: Option<&str>) -> Value {
     });
     if reducer == "count" {
         summary["count"] = Value::from(0_u64);
+    } else if let Some(field_name) = bulk_reducer_summary_field_name(Some(reducer)) {
+        summary[field_name] = match reducer {
+            BULK_REDUCER_SUM => Value::from(0.0),
+            BULK_REDUCER_MIN | BULK_REDUCER_MAX | BULK_REDUCER_AVG => Value::Null,
+            _ => Value::Null,
+        };
     }
     summary
 }
@@ -3122,7 +3163,14 @@ fn reduce_bulk_terminal_payload(payload: &Value, bulk: &BulkActivityExecutionSta
                 u64::from(succeeded_items) + u64::from(failed_items) + u64::from(cancelled_items),
             );
         }
-        _ => {}
+        reducer => {
+            if terminal_status == "completed"
+                && let Some(field_name) = bulk_reducer_summary_field_name(Some(reducer))
+                && let Some(reduced) = payload.get("reducerOutput")
+            {
+                summary[field_name] = reduced.clone();
+            }
+        }
     }
 
     summary
@@ -3506,6 +3554,34 @@ pub fn evaluate_expression(
                 };
                 items.push(value);
                 return Ok(Value::Array(items));
+            }
+            if callee == "__builtin_array_shift_head" {
+                if args.len() != 1 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 1,
+                        received: args.len(),
+                    });
+                }
+                let array = evaluate_expression(&args[0], execution_state, helpers)?;
+                let Value::Array(items) = array else {
+                    return Ok(Value::Null);
+                };
+                return Ok(items.into_iter().next().unwrap_or(Value::Null));
+            }
+            if callee == "__builtin_array_shift_tail" {
+                if args.len() != 1 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 1,
+                        received: args.len(),
+                    });
+                }
+                let array = evaluate_expression(&args[0], execution_state, helpers)?;
+                let Value::Array(items) = array else {
+                    return Ok(Value::Array(Vec::new()));
+                };
+                return Ok(Value::Array(items.into_iter().skip(1).collect()));
             }
             if callee == "__builtin_object_omit" {
                 if args.len() != 2 {
@@ -4243,7 +4319,11 @@ mod tests {
                     },
                 ),
             ]),
-            params: vec![CompiledWorkflowParam { name: "seconds".to_owned(), rest: false, default: None }],
+            params: vec![CompiledWorkflowParam {
+                name: "seconds".to_owned(),
+                rest: false,
+                default: None,
+            }],
             non_cancellable_states: BTreeSet::new(),
         };
         let artifact = CompiledWorkflowArtifact::new(
@@ -5540,6 +5620,67 @@ mod tests {
     }
 
     #[test]
+    fn fanout_sum_reducer_emits_terminal_sum_summary() {
+        let artifact = fanout_artifact_with_reducer(false, Some("sum"));
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"items": [1, 2, 3]}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        let waiting = artifact
+            .execute_after_step_completion_with_turn(
+                "join",
+                "dispatch::0",
+                &json!(10),
+                plan.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_100).unwrap(),
+                },
+            )
+            .unwrap();
+        let waiting = artifact
+            .execute_after_step_completion_with_turn(
+                "join",
+                "dispatch::1",
+                &json!(20),
+                waiting.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_200).unwrap(),
+                },
+            )
+            .unwrap();
+        let completed = artifact
+            .execute_after_step_completion_with_turn(
+                "join",
+                "dispatch::2",
+                &json!(30),
+                waiting.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_300).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            completed.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output["terminalStatus"] == json!("completed")
+                && output["sum"] == json!(60.0)
+                && output.get("resultHandle").is_none()
+        ));
+    }
+
+    #[test]
     fn fanout_count_reducer_avoids_storing_inputs_and_reconstructs_retry_input() {
         let artifact = fanout_artifact_with_reducer(true, Some("count"));
         let plan = artifact
@@ -5965,6 +6106,62 @@ mod tests {
                 ..
             }) if output["status"] == json!("settled")
                 && output["count"] == json!(3)
+                && output.get("resultHandle").is_none()
+        ));
+    }
+
+    #[test]
+    fn bulk_avg_reducer_uses_reducer_output_summary() {
+        let artifact = bulk_artifact_with_reducer("avg");
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"items": [{"value": 1}, {"value": 2}, {"value": 3}]}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+        let batch_id = plan
+            .emissions
+            .iter()
+            .find_map(|emission| match &emission.event {
+                WorkflowEvent::BulkActivityBatchScheduled { batch_id, .. } => {
+                    Some(batch_id.clone())
+                }
+                _ => None,
+            })
+            .expect("expected bulk schedule event");
+
+        let resumed = artifact
+            .execute_after_bulk_completion_with_turn(
+                "join",
+                &batch_id,
+                &json!({
+                    "batchId": batch_id,
+                    "status": "completed",
+                    "totalItems": 3,
+                    "succeededItems": 3,
+                    "failedItems": 0,
+                    "cancelledItems": 0,
+                    "chunkCount": 2,
+                    "reducerOutput": 20.0,
+                }),
+                plan.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_100).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            resumed.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output["terminalStatus"] == json!("completed")
+                && output["avg"] == json!(20.0)
                 && output.get("resultHandle").is_none()
         ));
     }

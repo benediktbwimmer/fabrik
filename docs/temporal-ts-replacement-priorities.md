@@ -29,7 +29,7 @@ The latest compiler and packaging passes materially shifted the remaining replac
 - `log`, `workflowInfo`, `uuid4`, `ApplicationFailure`, `ParentClosePolicy`, and `ActivityCancellationType` are no longer explicit hard-block imports in the official sample census
 - workflow-only workers no longer falsely block packaging, which moved `continue-as-new`, `nexus-hello`, and several other sample repos into the qualified set
 - `batch-sliding-window` and `cron-workflows` now compile cleanly in the official census after the recent compiler passes
-- post-census direct migration checks also moved `child-workflows` and `patching-api` onto the qualified side; the next full census should reflect that
+- post-census direct migration checks also moved `child-workflows`, `patching-api`, and `worker-versioning` onto the qualified side; the next full census should reflect that
 - The remaining explicit unsupported-import census is now dominated by:
   - `patched`: `2`
   - `deprecatePatch`: `1`
@@ -59,7 +59,7 @@ This means broad import coverage is no longer the main hard-blocker class. The n
   - failure/interceptor shapes: `ActivityFailure`, `WorkflowInterceptors`
   - visibility/sinks APIs: `SearchAttributes`, `upsertSearchAttributes`, `Sinks`, `proxySinks`
 - Recommendation: stop chasing generic import coverage and instead burn down one real compile-subset cluster at a time, starting with the official samples still failing after import support landed: `batch-sliding-window`, `child-workflows`, `cron-workflows`, `timer-examples`.
-- Recommendation: stop chasing generic import coverage and instead burn down one real compile-subset cluster at a time, starting with the official samples still failing after import support landed: `timer-examples`, `query-subscriptions`, `worker-versioning`, and `search-attributes`.
+- Recommendation: stop chasing generic import coverage and instead burn down one real compile-subset cluster at a time, starting with the official samples still failing after import support landed: `timer-examples`, `query-subscriptions`, `search-attributes`, and the remaining environment/bootstrap outliers.
 
 2. Remaining worker bootstrap edge cases
 - Hard-block findings: `9`
@@ -104,8 +104,8 @@ This means broad import coverage is no longer the main hard-blocker class. The n
 - Best first targets:
   - `timer-examples`
   - `query-subscriptions`
-  - `worker-versioning`
   - `search-attributes`
+  - `sinks`
 - Success criterion: reduce `unsupported_api` occurrences again without increasing trust debt.
 
 2. Re-run the blocker census after every parity slice.

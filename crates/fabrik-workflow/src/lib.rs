@@ -714,14 +714,15 @@ impl WorkflowInstanceState {
         }
     }
 
-    pub fn compact_trigger_bulk_wait_for_external_input(&mut self, input_handle: Value) -> bool {
+    pub fn compact_trigger_bulk_wait_for_replayable_restore(&mut self) -> bool {
         let Some(wait_state) = self.current_state.as_deref() else {
             return false;
         };
         let Some(execution) = self.artifact_execution.as_ref() else {
             return false;
         };
-        if self.last_event_type != "WorkflowTriggered" || !execution.waits_on_bulk_activity(wait_state)
+        if self.last_event_type != "WorkflowTriggered"
+            || !execution.waits_on_bulk_activity(wait_state)
         {
             return false;
         }
@@ -729,6 +730,14 @@ impl WorkflowInstanceState {
         self.context = None;
         self.input = None;
         self.artifact_execution = None;
+        self.persisted_input_handle = None;
+        true
+    }
+
+    pub fn compact_trigger_bulk_wait_for_external_input(&mut self, input_handle: Value) -> bool {
+        if !self.compact_trigger_bulk_wait_for_replayable_restore() {
+            return false;
+        }
         self.persisted_input_handle = Some(input_handle);
         true
     }
@@ -901,9 +910,9 @@ impl WorkflowInstanceState {
                 failed_items,
                 cancelled_items,
                 chunk_count,
+                reducer_output,
             } => {
-                self.status = WorkflowStatus::Running;
-                self.context = Some(serde_json::json!({
+                let mut context = serde_json::json!({
                     "batchId": batch_id,
                     "status": "completed",
                     "totalItems": total_items,
@@ -912,7 +921,12 @@ impl WorkflowInstanceState {
                     "cancelledItems": cancelled_items,
                     "chunkCount": chunk_count,
                     "resultHandle": { "batchId": batch_id },
-                }));
+                });
+                if let Some(value) = reducer_output {
+                    context["reducerOutput"] = value.clone();
+                }
+                self.status = WorkflowStatus::Running;
+                self.context = Some(context);
             }
             WorkflowEvent::WorkflowUpdateCompleted { output, .. }
             | WorkflowEvent::ChildWorkflowCompleted { output, .. } => {
@@ -1346,20 +1360,25 @@ pub fn replay_compiled_history_trace(
                     failed_items,
                     cancelled_items,
                     chunk_count,
+                    reducer_output,
                 } => {
+                    let mut payload = serde_json::json!({
+                        "batchId": batch_id,
+                        "status": "completed",
+                        "totalItems": total_items,
+                        "succeededItems": succeeded_items,
+                        "failedItems": failed_items,
+                        "cancelledItems": cancelled_items,
+                        "chunkCount": chunk_count,
+                        "resultHandle": { "batchId": batch_id },
+                    });
+                    if let Some(value) = reducer_output {
+                        payload["reducerOutput"] = value.clone();
+                    }
                     execution = artifact.execute_after_bulk_completion_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         batch_id,
-                        &serde_json::json!({
-                            "batchId": batch_id,
-                            "status": "completed",
-                            "totalItems": total_items,
-                            "succeededItems": succeeded_items,
-                            "failedItems": failed_items,
-                            "cancelledItems": cancelled_items,
-                            "chunkCount": chunk_count,
-                            "resultHandle": { "batchId": batch_id },
-                        }),
+                        &payload,
                         execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
@@ -1612,20 +1631,25 @@ pub fn replay_compiled_history_trace_from_snapshot(
                     failed_items,
                     cancelled_items,
                     chunk_count,
+                    reducer_output,
                 } => {
+                    let mut payload = serde_json::json!({
+                        "batchId": batch_id,
+                        "status": "completed",
+                        "totalItems": total_items,
+                        "succeededItems": succeeded_items,
+                        "failedItems": failed_items,
+                        "cancelledItems": cancelled_items,
+                        "chunkCount": chunk_count,
+                        "resultHandle": { "batchId": batch_id },
+                    });
+                    if let Some(value) = reducer_output {
+                        payload["reducerOutput"] = value.clone();
+                    }
                     let execution = artifact.execute_after_bulk_completion_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         batch_id,
-                        &serde_json::json!({
-                            "batchId": batch_id,
-                            "status": "completed",
-                            "totalItems": total_items,
-                            "succeededItems": succeeded_items,
-                            "failedItems": failed_items,
-                            "cancelledItems": cancelled_items,
-                            "chunkCount": chunk_count,
-                            "resultHandle": { "batchId": batch_id },
-                        }),
+                        &payload,
                         execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
@@ -3726,9 +3750,11 @@ mod tests {
         assert!(state.persisted_input_handle.is_none());
         assert_eq!(state.current_state.as_deref(), Some("join"));
         assert_eq!(state.context, Some(serde_json::json!([{"value": "x"}, {"value": "y"}])));
-        assert!(state
-            .artifact_execution
-            .as_ref()
-            .is_some_and(|execution| execution.waits_on_bulk_activity("join")));
+        assert!(
+            state
+                .artifact_execution
+                .as_ref()
+                .is_some_and(|execution| execution.waits_on_bulk_activity("join"))
+        );
     }
 }

@@ -22,6 +22,10 @@ pub const ADMISSION_POLICY_VERSION: &str = "2026-03-13.1";
 pub const BULK_REDUCER_ALL_SUCCEEDED: &str = "all_succeeded";
 pub const BULK_REDUCER_ALL_SETTLED: &str = "all_settled";
 pub const BULK_REDUCER_COUNT: &str = "count";
+pub const BULK_REDUCER_SUM: &str = "sum";
+pub const BULK_REDUCER_MIN: &str = "min";
+pub const BULK_REDUCER_MAX: &str = "max";
+pub const BULK_REDUCER_AVG: &str = "avg";
 pub const BULK_REDUCER_COLLECT_RESULTS: &str = "collect_results";
 pub const DEFAULT_AGGREGATION_GROUP_COUNT: u32 = 1;
 pub const DEFAULT_GROUP_ID: u32 = 0;
@@ -74,9 +78,13 @@ pub fn bulk_reducer_name(reducer: Option<&str>) -> &str {
 
 pub fn bulk_reducer_class(reducer: Option<&str>) -> BulkReducerClass {
     match bulk_reducer_name(reducer) {
-        BULK_REDUCER_ALL_SUCCEEDED | BULK_REDUCER_ALL_SETTLED | BULK_REDUCER_COUNT => {
-            BulkReducerClass::Mergeable
-        }
+        BULK_REDUCER_ALL_SUCCEEDED
+        | BULK_REDUCER_ALL_SETTLED
+        | BULK_REDUCER_COUNT
+        | BULK_REDUCER_SUM
+        | BULK_REDUCER_MIN
+        | BULK_REDUCER_MAX
+        | BULK_REDUCER_AVG => BulkReducerClass::Mergeable,
         _ => BulkReducerClass::Legacy,
     }
 }
@@ -87,6 +95,75 @@ pub fn bulk_reducer_is_mergeable(reducer: Option<&str>) -> bool {
 
 pub fn bulk_reducer_materializes_results(reducer: Option<&str>) -> bool {
     matches!(bulk_reducer_name(reducer), BULK_REDUCER_COLLECT_RESULTS | "collect_settled_results")
+}
+
+pub fn bulk_reducer_summary_field_name(reducer: Option<&str>) -> Option<&'static str> {
+    match bulk_reducer_name(reducer) {
+        BULK_REDUCER_COUNT => Some(BULK_REDUCER_COUNT),
+        BULK_REDUCER_SUM => Some(BULK_REDUCER_SUM),
+        BULK_REDUCER_MIN => Some(BULK_REDUCER_MIN),
+        BULK_REDUCER_MAX => Some(BULK_REDUCER_MAX),
+        BULK_REDUCER_AVG => Some(BULK_REDUCER_AVG),
+        _ => None,
+    }
+}
+
+pub fn bulk_reducer_requires_success_outputs(reducer: Option<&str>) -> bool {
+    bulk_reducer_materializes_results(reducer)
+        || matches!(
+            bulk_reducer_name(reducer),
+            BULK_REDUCER_SUM | BULK_REDUCER_MIN | BULK_REDUCER_MAX | BULK_REDUCER_AVG
+        )
+}
+
+pub fn bulk_reducer_supports_stream_v2(reducer: Option<&str>) -> bool {
+    matches!(
+        bulk_reducer_name(reducer),
+        BULK_REDUCER_ALL_SUCCEEDED | BULK_REDUCER_ALL_SETTLED | BULK_REDUCER_COUNT
+    )
+}
+
+pub fn bulk_reducer_reduce_values(
+    reducer: Option<&str>,
+    values: &[Value],
+) -> Result<Option<Value>> {
+    let reducer = bulk_reducer_name(reducer);
+    let Some(field_name) = bulk_reducer_summary_field_name(Some(reducer)) else {
+        return Ok(None);
+    };
+    if field_name == BULK_REDUCER_COUNT {
+        return Ok(Some(Value::from(
+            u64::try_from(values.len()).context("reducer value count exceeds u64")?,
+        )));
+    }
+
+    let numbers = values
+        .iter()
+        .map(|value| {
+            value.as_f64().ok_or_else(|| {
+                anyhow::anyhow!("bulk reducer {reducer} requires numeric outputs, got {value}")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let reduced = match reducer {
+        BULK_REDUCER_SUM => Value::from(numbers.iter().copied().sum::<f64>()),
+        BULK_REDUCER_MIN => {
+            numbers.iter().copied().reduce(f64::min).map(Value::from).unwrap_or(Value::Null)
+        }
+        BULK_REDUCER_MAX => {
+            numbers.iter().copied().reduce(f64::max).map(Value::from).unwrap_or(Value::Null)
+        }
+        BULK_REDUCER_AVG => {
+            if numbers.is_empty() {
+                Value::Null
+            } else {
+                Value::from(numbers.iter().copied().sum::<f64>() / numbers.len() as f64)
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(reduced))
 }
 
 pub fn throughput_execution_mode(_backend: &str) -> &'static str {
@@ -135,6 +212,7 @@ pub fn stream_v2_fast_lane_enabled(
     backend == STREAM_V2_BACKEND
         && execution_policy.unwrap_or("default") == "eager"
         && bulk_reducer_is_mergeable(reducer)
+        && bulk_reducer_supports_stream_v2(reducer)
 }
 
 pub fn planned_reduction_tree_depth(
@@ -1008,5 +1086,41 @@ mod tests {
         assert_eq!(reduction_tree_node_level(root), 2);
         assert_eq!(reduction_tree_child_group_ids(root, 16, 3).len(), 4);
         assert!(reduction_tree_parent_group_id(root, 16, 3).is_none());
+    }
+
+    #[test]
+    fn reducer_support_flags_distinguish_streaming_capability_from_output_requirements() {
+        assert!(bulk_reducer_is_mergeable(Some(BULK_REDUCER_SUM)));
+        assert!(bulk_reducer_requires_success_outputs(Some(BULK_REDUCER_SUM)));
+        assert!(!bulk_reducer_supports_stream_v2(Some(BULK_REDUCER_SUM)));
+        assert!(bulk_reducer_supports_stream_v2(Some(BULK_REDUCER_COUNT)));
+    }
+
+    #[test]
+    fn numeric_reducers_reduce_success_outputs() -> Result<()> {
+        let values = vec![Value::from(1), Value::from(4), Value::from(7)];
+
+        assert_eq!(
+            bulk_reducer_reduce_values(Some(BULK_REDUCER_SUM), &values)?,
+            Some(Value::from(12.0))
+        );
+        assert_eq!(
+            bulk_reducer_reduce_values(Some(BULK_REDUCER_MIN), &values)?,
+            Some(Value::from(1.0))
+        );
+        assert_eq!(
+            bulk_reducer_reduce_values(Some(BULK_REDUCER_MAX), &values)?,
+            Some(Value::from(7.0))
+        );
+        assert_eq!(
+            bulk_reducer_reduce_values(Some(BULK_REDUCER_AVG), &values)?,
+            Some(Value::from(4.0))
+        );
+        assert_eq!(bulk_reducer_reduce_values(Some(BULK_REDUCER_MIN), &[])?, Some(Value::Null));
+        assert_eq!(
+            bulk_reducer_reduce_values(Some(BULK_REDUCER_SUM), &[])?,
+            Some(Value::from(0.0))
+        );
+        Ok(())
     }
 }

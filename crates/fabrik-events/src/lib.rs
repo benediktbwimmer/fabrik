@@ -208,6 +208,8 @@ pub enum WorkflowEvent {
         failed_items: u32,
         cancelled_items: u32,
         chunk_count: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reducer_output: Option<Value>,
     },
     BulkActivityBatchFailed {
         batch_id: String,

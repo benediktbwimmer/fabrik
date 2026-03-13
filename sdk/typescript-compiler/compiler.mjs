@@ -155,6 +155,7 @@ function collectTemporalWorkflowApi(sourceFile) {
     defineUpdate: new Set(),
     defineSignal: new Set(),
     setHandler: new Set(),
+    setWorkflowOptions: new Set(),
     workflowInfo: new Set(),
     log: new Set(),
     uuid4: new Set(),
@@ -196,6 +197,7 @@ function collectTemporalWorkflowApi(sourceFile) {
       if (importedName === "defineUpdate") api.defineUpdate.add(localName);
       if (importedName === "defineSignal") api.defineSignal.add(localName);
       if (importedName === "setHandler") api.setHandler.add(localName);
+      if (importedName === "setWorkflowOptions") api.setWorkflowOptions.add(localName);
       if (importedName === "workflowInfo") api.workflowInfo.add(localName);
       if (importedName === "log") api.log.add(localName);
       if (importedName === "uuid4") api.uuid4.add(localName);
@@ -542,6 +544,38 @@ function isStaticTopLevelInitializer(expression) {
   return false;
 }
 
+function isSupportedSetWorkflowOptionsStatement(statement, temporalApi) {
+  if (
+    !ts.isExpressionStatement(statement) ||
+    !ts.isCallExpression(statement.expression) ||
+    !temporalImportedCallMatches(statement.expression, temporalApi.setWorkflowOptions, "setWorkflowOptions", temporalApi)
+  ) {
+    return false;
+  }
+  if (statement.expression.arguments.length !== 2) {
+    return false;
+  }
+  const [optionsArg, workflowArg] = statement.expression.arguments;
+  if (!ts.isObjectLiteralExpression(optionsArg) || !ts.isIdentifier(workflowArg)) {
+    return false;
+  }
+  const versioningBehaviorProperty = optionsArg.properties.find(
+    (property) =>
+      ts.isPropertyAssignment(property) &&
+      (
+        (ts.isIdentifier(property.name) && property.name.text === "versioningBehavior") ||
+        (ts.isStringLiteral(property.name) && property.name.text === "versioningBehavior")
+      ),
+  );
+  if (
+    versioningBehaviorProperty == null ||
+    !ts.isStringLiteralLike(versioningBehaviorProperty.initializer)
+  ) {
+    return false;
+  }
+  return ["AUTO_UPGRADE", "PINNED"].includes(versioningBehaviorProperty.initializer.text);
+}
+
 function assertNoTopLevelSideEffects(sourceFile) {
   const temporalApi = collectTemporalWorkflowApi(sourceFile);
   for (const statement of sourceFile.statements) {
@@ -574,6 +608,9 @@ function assertNoTopLevelSideEffects(sourceFile) {
       ) {
         continue;
       }
+    }
+    if (isSupportedSetWorkflowOptionsStatement(statement, temporalApi)) {
+      continue;
     }
     if (!ts.isEmptyStatement(statement)) {
       throw compilerError(
@@ -1034,6 +1071,41 @@ function compileArrayReduceHandler(handler) {
   };
 }
 
+function compileArrayPushAction(statement, callExpression) {
+  if (
+    !ts.isPropertyAccessExpression(callExpression.expression) ||
+    callExpression.expression.name.text !== "push" ||
+    !ts.isIdentifier(callExpression.expression.expression) ||
+    callExpression.arguments.length !== 1
+  ) {
+    return null;
+  }
+  const arrayName = callExpression.expression.expression.text;
+  return {
+    target: arrayName,
+    expr: {
+      kind: "call",
+      callee: "__builtin_array_append",
+      args: [
+        { kind: "identifier", name: arrayName },
+        compileExpression(callExpression.arguments[0]),
+      ],
+    },
+  };
+}
+
+function resolveArrayShiftCall(callExpression) {
+  if (
+    !ts.isPropertyAccessExpression(callExpression.expression) ||
+    callExpression.expression.name.text !== "shift" ||
+    !ts.isIdentifier(callExpression.expression.expression) ||
+    callExpression.arguments.length !== 0
+  ) {
+    return null;
+  }
+  return { arrayName: callExpression.expression.expression.text };
+}
+
 function compileSignalHandlerActions(handler) {
   if (!ts.isArrowFunction(handler) && !ts.isFunctionExpression(handler)) {
     throw compilerError(`Temporal signal setHandler requires an inline function handler`, handler);
@@ -1077,6 +1149,16 @@ function compileSignalHandlerActions(handler) {
     ) {
       actions.push(compileDeleteAssignment(statement, statement.expression));
       continue;
+    }
+    if (
+      ts.isExpressionStatement(statement) &&
+      ts.isCallExpression(statement.expression)
+    ) {
+      const pushAction = compileArrayPushAction(statement, statement.expression);
+      if (pushAction) {
+        actions.push(pushAction);
+        continue;
+      }
     }
     if (
       ts.isExpressionStatement(statement) &&
@@ -1577,6 +1659,7 @@ class WorkflowLowerer {
       defineUpdate: new Set(),
       defineSignal: new Set(),
       setHandler: new Set(),
+      setWorkflowOptions: new Set(),
       workflowInfo: new Set(),
       log: new Set(),
       uuid4: new Set(),
@@ -2084,6 +2167,14 @@ class WorkflowLowerer {
       if (pushedChildState) {
         return pushedChildState;
       }
+      const pushAction = compileArrayPushAction(statement, statement.expression);
+      if (pushAction) {
+        return this.addState("assign", {
+          type: "assign",
+          actions: [pushAction],
+          next: nextState,
+        }, statement);
+      }
       if (temporalLogCallMatches(statement.expression, this.temporalApi)) {
         return nextState;
       }
@@ -2121,6 +2212,39 @@ class WorkflowLowerer {
           nextState,
           errorTarget,
         );
+      }
+      if (
+        declarations.length === 1 &&
+        ts.isIdentifier(declarations[0].name) &&
+        declarations[0].initializer &&
+        ts.isCallExpression(declarations[0].initializer)
+      ) {
+        const shiftedArray = resolveArrayShiftCall(declarations[0].initializer);
+        if (shiftedArray) {
+          const targetName = declarations[0].name.text;
+          return this.addState("assign", {
+            type: "assign",
+            actions: [
+              {
+                target: targetName,
+                expr: {
+                  kind: "call",
+                  callee: "__builtin_array_shift_head",
+                  args: [{ kind: "identifier", name: shiftedArray.arrayName }],
+                },
+              },
+              {
+                target: shiftedArray.arrayName,
+                expr: {
+                  kind: "call",
+                  callee: "__builtin_array_shift_tail",
+                  args: [{ kind: "identifier", name: shiftedArray.arrayName }],
+                },
+              },
+            ],
+            next: nextState,
+          }, declarations[0]);
+        }
       }
       const actions = declarations.map((declaration) => {
         if (!ts.isIdentifier(declaration.name) || !declaration.initializer) {
@@ -3673,10 +3797,14 @@ function compileBulkOptions(expression) {
         reducer !== "all_succeeded"
         && reducer !== "all_settled"
         && reducer !== "count"
+        && reducer !== "sum"
+        && reducer !== "min"
+        && reducer !== "max"
+        && reducer !== "avg"
         && reducer !== "collect_results"
       ) {
         throw compilerError(
-          `ctx.bulkActivity reducer must be "all_succeeded", "all_settled", "count", or "collect_results"`,
+          `ctx.bulkActivity reducer must be "all_succeeded", "all_settled", "count", "sum", "min", "max", "avg", or "collect_results"`,
           property.initializer,
         );
       }
@@ -3807,6 +3935,8 @@ function validateArtifactCalls(artifact) {
     "__builtin_array_join",
     "__builtin_array_fill",
     "__builtin_array_append",
+    "__builtin_array_shift_head",
+    "__builtin_array_shift_tail",
     "__builtin_array_map_number",
     "__builtin_array_sort_default",
     "__builtin_array_sort_numeric_asc",

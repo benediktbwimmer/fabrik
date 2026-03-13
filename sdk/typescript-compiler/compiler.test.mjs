@@ -116,6 +116,28 @@ test("compiler lowers Temporal patched APIs onto version markers", async () => {
   assert.match(serialized, /"max_supported":1/);
 });
 
+test("compiler accepts static top-level Temporal setWorkflowOptions annotations", async () => {
+  const fixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-worker-versioning-qualified/src/workflows.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "autoUpgradeWorkflow",
+    "--definition-id",
+    "auto-upgrade-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"kind":"version"/);
+  assert.match(serialized, /"handler":"greet"/);
+});
+
 test("compiler lowers awaited ctx.activity calls into activity states", async () => {
   const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/activity-workflow.ts");
   const { stdout } = await runCompiler([
@@ -400,6 +422,50 @@ test("compiler lowers Temporal signal handler increment statements", async () =>
 
   assert.match(serializedSignals, /"target":"progress"/);
   assert.match(serializedSignals, /"op":"add"/);
+});
+
+test("compiler lowers local array push mutations in signal handlers", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-array-push-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalArrayPushWorkflow",
+    "--definition-id",
+    "temporal-array-push-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serializedSignals = JSON.stringify(artifact.signals.push.states);
+
+  assert.match(serializedSignals, /"callee":"__builtin_array_append"/);
+  assert.match(serializedSignals, /"target":"items"/);
+});
+
+test("compiler lowers local array shift mutations into head and tail assignments", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-array-shift-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalArrayShiftWorkflow",
+    "--definition-id",
+    "temporal-array-shift-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serializedWorkflow = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serializedWorkflow, /"callee":"__builtin_array_shift_head"/);
+  assert.match(serializedWorkflow, /"callee":"__builtin_array_shift_tail"/);
 });
 
 test("compiler lowers Temporal delete statements into object-omit assignments", async () => {

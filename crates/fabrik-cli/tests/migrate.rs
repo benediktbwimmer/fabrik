@@ -209,6 +209,18 @@ fn temporal_patching_api_slice_qualifies_and_packages() {
 }
 
 #[test]
+fn temporal_worker_versioning_annotations_qualify_and_package() {
+    let output_dir = temp_output_dir("worker-versioning-qualified");
+    let (status, report) = run_cli(&fixture("temporal-worker-versioning-qualified"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
+    assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
+    assert_eq!(report["worker_packages"][0]["task_queue"], "worker-versioning-qualified");
+}
+
+#[test]
 fn workflow_only_workers_package_without_activity_modules() {
     let output_dir = temp_output_dir("workflow-only-qualified");
     let (status, report) = run_cli(&fixture("temporal-workflow-only-qualified"), &output_dir, &[]);
