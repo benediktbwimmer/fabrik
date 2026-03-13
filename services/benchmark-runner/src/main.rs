@@ -34,6 +34,7 @@ struct BenchmarkProfile {
 enum ExecutionMode {
     Durable,
     Throughput,
+    Unified,
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +232,8 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         env::var("THROUGHPUT_DEBUG_URL").unwrap_or_else(|_| "http://127.0.0.1:3006".to_owned());
     let throughput_projector_base =
         env::var("THROUGHPUT_PROJECTOR_URL").unwrap_or_else(|_| "http://127.0.0.1:3007".to_owned());
+    let unified_runtime_debug_base =
+        env::var("UNIFIED_RUNTIME_DEBUG_URL").unwrap_or_else(|_| "http://127.0.0.1:3008".to_owned());
 
     let scenario_name = scenario_name(args);
     let definition_id = benchmark_definition_id(args, &scenario_name);
@@ -359,15 +362,18 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
     )
     .await?;
     let executor_debug = client
-        .get(format!("{executor_base}/debug/hybrid-routing"))
+        .get(match args.execution_mode {
+            ExecutionMode::Unified => format!("{unified_runtime_debug_base}/debug/unified"),
+            _ => format!("{executor_base}/debug/hybrid-routing"),
+        })
         .send()
         .await
-        .context("failed to fetch executor debug summary")?
+        .context("failed to fetch benchmark control-plane debug summary")?
         .error_for_status()
-        .context("executor debug endpoint returned error")?
+        .context("benchmark control-plane debug endpoint returned error")?
         .json::<Value>()
         .await
-        .context("failed to decode executor debug summary")?;
+        .context("failed to decode benchmark control-plane debug summary")?;
     let throughput_runtime_debug = if args.execution_mode == ExecutionMode::Throughput
         && args.throughput_backend.as_deref() == Some(STREAM_V2_BACKEND)
     {
@@ -488,8 +494,9 @@ fn parse_args() -> Result<Args> {
                 execution_mode = match value.as_str() {
                     "durable" => ExecutionMode::Durable,
                     "throughput" => ExecutionMode::Throughput,
+                    "unified" => ExecutionMode::Unified,
                     other => {
-                        bail!("unknown --execution-mode {other}; expected durable or throughput")
+                        bail!("unknown --execution-mode {other}; expected durable, throughput, or unified")
                     }
                 }
             }
@@ -571,7 +578,7 @@ fn benchmark_artifact(
 ) -> CompiledWorkflowArtifact {
     let mut states = BTreeMap::new();
     match execution_mode {
-        ExecutionMode::Durable => {
+        ExecutionMode::Durable | ExecutionMode::Unified => {
             states.insert(
                 "dispatch".to_owned(),
                 CompiledStateNode::FanOut {
@@ -826,6 +833,7 @@ fn scenario_name(args: &Args) -> String {
         ExecutionMode::Throughput => {
             format!("throughput-{}", args.throughput_backend.as_deref().unwrap_or(PG_V1_BACKEND))
         }
+        ExecutionMode::Unified => "unified-experiment".to_owned(),
     };
     if args.bulk_reducer != "collect_results" {
         scenario.push('-');
@@ -1379,6 +1387,7 @@ fn summary_text(report: &BenchmarkReport) -> String {
         execution_mode = match report.execution_mode {
             ExecutionMode::Durable => "durable",
             ExecutionMode::Throughput => "throughput",
+            ExecutionMode::Unified => "unified",
         },
         throughput_backend = report.throughput_backend.as_deref().unwrap_or("n/a"),
         bulk_reducer = report.bulk_reducer,

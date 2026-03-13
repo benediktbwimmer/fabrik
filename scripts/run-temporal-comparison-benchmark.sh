@@ -169,6 +169,7 @@ cargo build --release \
   -p ingest-service \
   -p matching-service \
   -p executor-service \
+  -p unified-runtime \
   -p throughput-runtime \
   -p throughput-projector \
   -p activity-worker-service >/dev/null

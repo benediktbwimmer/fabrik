@@ -66,7 +66,7 @@ def reserve():
     s.close()
     return port
 
-for _ in range(10):
+for _ in range(12):
     print(reserve())
 PY
 )
@@ -81,6 +81,8 @@ THROUGHPUT_PROJECTOR_PORT="${THROUGHPUT_PROJECTOR_PORT:-${PORTS[6]}}"
 ACTIVITY_WORKER_SERVICE_PORT="${ACTIVITY_WORKER_SERVICE_PORT:-${PORTS[7]}}"
 STREAM_ACTIVITY_WORKER_SERVICE_PORT="${STREAM_ACTIVITY_WORKER_SERVICE_PORT:-${PORTS[8]}}"
 TIMER_SERVICE_PORT="${TIMER_SERVICE_PORT:-${PORTS[9]}}"
+UNIFIED_RUNTIME_PORT="${UNIFIED_RUNTIME_PORT:-${PORTS[10]}}"
+UNIFIED_DEBUG_PORT="${UNIFIED_DEBUG_PORT:-${PORTS[11]}}"
 
 PIDS=()
 REPORT_PATH=""
@@ -291,6 +293,7 @@ stop_existing_local_services() {
     'target/release/throughput-runtime'
     'target/release/throughput-projector'
     'target/release/timer-service'
+    'target/release/unified-runtime'
     'target/release/activity-worker-service'
     'target/release/benchmark-runner'
   )
@@ -358,6 +361,7 @@ if [[ "$BUILD_RELEASE" == "1" ]]; then
     -p ingest-service \
     -p matching-service \
     -p executor-service \
+    -p unified-runtime \
     -p throughput-runtime \
     -p throughput-projector \
     -p timer-service \
@@ -385,6 +389,7 @@ COMMON_ENV=(
   "THROUGHPUT_CHECKPOINT_KEY_PREFIX=$CHECKPOINT_KEY_PREFIX"
   "THROUGHPUT_LOCAL_STATE_DIR=$STATE_DIR"
   "THROUGHPUT_CHECKPOINT_DIR=$CHECKPOINT_DIR"
+  "UNIFIED_RUNTIME_STATE_DIR=$RUN_DIR/unified-runtime-state"
   "WORKFLOW_PARTITIONS=$WORKFLOW_PARTITIONS"
   "THROUGHPUT_OWNERSHIP_PARTITIONS=$THROUGHPUT_PARTITIONS"
   "THROUGHPUT_MAX_AGGREGATION_GROUPS=${THROUGHPUT_MAX_AGGREGATION_GROUPS:-32}"
@@ -398,24 +403,6 @@ COMMON_ENV=(
   "RUST_LOG=${RUST_LOG:-warn}"
 )
 
-echo "[isolated-benchmark] starting matching-service"
-start_service matching-service "$LOG_DIR/matching-service.log" \
-  "${COMMON_ENV[@]}" \
-  "MATCHING_SERVICE_PORT=$MATCHING_PORT" \
-  "MATCHING_DEBUG_PORT=$MATCHING_DEBUG_PORT" \
-  -- \
-  target/release/matching-service
-wait_for_port 127.0.0.1 "$MATCHING_PORT" "matching-service"
-
-echo "[isolated-benchmark] starting executor-service"
-start_service executor-service "$LOG_DIR/executor-service.log" \
-  "${COMMON_ENV[@]}" \
-  "EXECUTOR_SERVICE_PORT=$EXECUTOR_PORT" \
-  "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
-  -- \
-  target/release/executor-service
-wait_for_port 127.0.0.1 "$EXECUTOR_PORT" "executor-service"
-
 echo "[isolated-benchmark] starting ingest-service"
 start_service ingest-service "$LOG_DIR/ingest-service.log" \
   "${COMMON_ENV[@]}" \
@@ -424,63 +411,116 @@ start_service ingest-service "$LOG_DIR/ingest-service.log" \
   target/release/ingest-service
 wait_for_port 127.0.0.1 "$INGEST_PORT" "ingest-service"
 
-echo "[isolated-benchmark] starting throughput-runtime"
-start_service throughput-runtime "$LOG_DIR/throughput-runtime.log" \
-  "${COMMON_ENV[@]}" \
-  "THROUGHPUT_RUNTIME_PORT=$THROUGHPUT_RUNTIME_PORT" \
-  "THROUGHPUT_DEBUG_PORT=$THROUGHPUT_DEBUG_PORT" \
-  -- \
-  target/release/throughput-runtime
-wait_for_port 127.0.0.1 "$THROUGHPUT_RUNTIME_PORT" "throughput-runtime"
-wait_for_port 127.0.0.1 "$THROUGHPUT_DEBUG_PORT" "throughput-runtime-debug"
-
-echo "[isolated-benchmark] starting throughput-projector"
-start_service throughput-projector "$LOG_DIR/throughput-projector.log" \
-  "${COMMON_ENV[@]}" \
-  "THROUGHPUT_PROJECTOR_PORT=$THROUGHPUT_PROJECTOR_PORT" \
-  -- \
-  target/release/throughput-projector
-wait_for_port 127.0.0.1 "$THROUGHPUT_PROJECTOR_PORT" "throughput-projector"
-
-echo "[isolated-benchmark] starting timer-service"
-start_service timer-service "$LOG_DIR/timer-service.log" \
-  "${COMMON_ENV[@]}" \
-  "TIMER_SERVICE_PORT=$TIMER_SERVICE_PORT" \
-  -- \
-  target/release/timer-service
-wait_for_port 127.0.0.1 "$TIMER_SERVICE_PORT" "timer-service"
-
-echo "[isolated-benchmark] starting activity-worker-service (pg-v1/matching)"
-start_service activity-worker-service "$LOG_DIR/activity-worker-service-pg-v1.log" \
-  "${COMMON_ENV[@]}" \
-  "ACTIVITY_WORKER_SERVICE_PORT=$ACTIVITY_WORKER_SERVICE_PORT" \
-  "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
-  "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
-  "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
-  "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \
-  "ACTIVITY_WORKER_CONCURRENCY=${ACTIVITY_WORKER_CONCURRENCY:-8}" \
-  "ACTIVITY_BULK_POLL_MAX_TASKS=${ACTIVITY_BULK_POLL_MAX_TASKS:-32}" \
-  -- \
-  target/release/activity-worker-service
-
-echo "[isolated-benchmark] starting activity-worker-service (stream-v2)"
-start_service activity-worker-service-stream-v2 "$LOG_DIR/activity-worker-service-stream-v2.log" \
-  "${COMMON_ENV[@]}" \
-  "ACTIVITY_WORKER_SERVICE_PORT=$STREAM_ACTIVITY_WORKER_SERVICE_PORT" \
-  "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
-  "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$THROUGHPUT_RUNTIME_PORT" \
-  "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
-  "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \
-  "ACTIVITY_WORKER_CONCURRENCY=${STREAM_ACTIVITY_WORKER_CONCURRENCY:-8}" \
-  "ACTIVITY_BULK_POLL_MAX_TASKS=${STREAM_ACTIVITY_BULK_POLL_MAX_TASKS:-32}" \
-  -- \
-  target/release/activity-worker-service
-sleep 2
-
 RUNNER_ARGS=("$@")
 if [[ ${#RUNNER_ARGS[@]} -eq 0 ]]; then
   RUNNER_ARGS=(--suite streaming --profile target --worker-count 8)
 fi
+
+EXECUTION_MODE="durable"
+for ((i = 0; i < ${#RUNNER_ARGS[@]}; i++)); do
+  if [[ "${RUNNER_ARGS[$i]}" == "--execution-mode" ]] && (( i + 1 < ${#RUNNER_ARGS[@]} )); then
+    EXECUTION_MODE="${RUNNER_ARGS[$((i + 1))]}"
+    break
+  fi
+done
+
+if [[ "$EXECUTION_MODE" == "unified" ]]; then
+  echo "[isolated-benchmark] starting unified-runtime"
+  start_service unified-runtime "$LOG_DIR/unified-runtime.log" \
+    "${COMMON_ENV[@]}" \
+    "UNIFIED_RUNTIME_PORT=$UNIFIED_RUNTIME_PORT" \
+    "UNIFIED_DEBUG_PORT=$UNIFIED_DEBUG_PORT" \
+    -- \
+    target/release/unified-runtime
+  wait_for_port 127.0.0.1 "$UNIFIED_RUNTIME_PORT" "unified-runtime"
+  wait_for_port 127.0.0.1 "$UNIFIED_DEBUG_PORT" "unified-runtime-debug"
+
+  echo "[isolated-benchmark] starting activity-worker-service (unified)"
+  start_service activity-worker-service-unified "$LOG_DIR/activity-worker-service-unified.log" \
+    "${COMMON_ENV[@]}" \
+    "ACTIVITY_WORKER_SERVICE_PORT=$ACTIVITY_WORKER_SERVICE_PORT" \
+    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
+    "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
+    "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
+    "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \
+    "ACTIVITY_WORKER_CONCURRENCY=${ACTIVITY_WORKER_CONCURRENCY:-8}" \
+    "ACTIVITY_POLL_MAX_TASKS=${ACTIVITY_POLL_MAX_TASKS:-32}" \
+    "ACTIVITY_BULK_POLL_MAX_TASKS=${ACTIVITY_BULK_POLL_MAX_TASKS:-32}" \
+    "ACTIVITY_ENABLE_BULK_LANES=${ACTIVITY_ENABLE_BULK_LANES:-false}" \
+    -- \
+    target/release/activity-worker-service
+else
+  echo "[isolated-benchmark] starting matching-service"
+  start_service matching-service "$LOG_DIR/matching-service.log" \
+    "${COMMON_ENV[@]}" \
+    "MATCHING_SERVICE_PORT=$MATCHING_PORT" \
+    "MATCHING_DEBUG_PORT=$MATCHING_DEBUG_PORT" \
+    -- \
+    target/release/matching-service
+  wait_for_port 127.0.0.1 "$MATCHING_PORT" "matching-service"
+
+  echo "[isolated-benchmark] starting executor-service"
+  start_service executor-service "$LOG_DIR/executor-service.log" \
+    "${COMMON_ENV[@]}" \
+    "EXECUTOR_SERVICE_PORT=$EXECUTOR_PORT" \
+    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
+    -- \
+    target/release/executor-service
+  wait_for_port 127.0.0.1 "$EXECUTOR_PORT" "executor-service"
+
+  echo "[isolated-benchmark] starting throughput-runtime"
+  start_service throughput-runtime "$LOG_DIR/throughput-runtime.log" \
+    "${COMMON_ENV[@]}" \
+    "THROUGHPUT_RUNTIME_PORT=$THROUGHPUT_RUNTIME_PORT" \
+    "THROUGHPUT_DEBUG_PORT=$THROUGHPUT_DEBUG_PORT" \
+    -- \
+    target/release/throughput-runtime
+  wait_for_port 127.0.0.1 "$THROUGHPUT_RUNTIME_PORT" "throughput-runtime"
+  wait_for_port 127.0.0.1 "$THROUGHPUT_DEBUG_PORT" "throughput-runtime-debug"
+
+  echo "[isolated-benchmark] starting throughput-projector"
+  start_service throughput-projector "$LOG_DIR/throughput-projector.log" \
+    "${COMMON_ENV[@]}" \
+    "THROUGHPUT_PROJECTOR_PORT=$THROUGHPUT_PROJECTOR_PORT" \
+    -- \
+    target/release/throughput-projector
+  wait_for_port 127.0.0.1 "$THROUGHPUT_PROJECTOR_PORT" "throughput-projector"
+
+  echo "[isolated-benchmark] starting timer-service"
+  start_service timer-service "$LOG_DIR/timer-service.log" \
+    "${COMMON_ENV[@]}" \
+    "TIMER_SERVICE_PORT=$TIMER_SERVICE_PORT" \
+    -- \
+    target/release/timer-service
+  wait_for_port 127.0.0.1 "$TIMER_SERVICE_PORT" "timer-service"
+
+  echo "[isolated-benchmark] starting activity-worker-service (pg-v1/matching)"
+  start_service activity-worker-service "$LOG_DIR/activity-worker-service-pg-v1.log" \
+    "${COMMON_ENV[@]}" \
+    "ACTIVITY_WORKER_SERVICE_PORT=$ACTIVITY_WORKER_SERVICE_PORT" \
+    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
+    "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
+    "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
+    "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \
+    "ACTIVITY_WORKER_CONCURRENCY=${ACTIVITY_WORKER_CONCURRENCY:-8}" \
+    "ACTIVITY_BULK_POLL_MAX_TASKS=${ACTIVITY_BULK_POLL_MAX_TASKS:-32}" \
+    -- \
+    target/release/activity-worker-service
+
+  echo "[isolated-benchmark] starting activity-worker-service (stream-v2)"
+  start_service activity-worker-service-stream-v2 "$LOG_DIR/activity-worker-service-stream-v2.log" \
+    "${COMMON_ENV[@]}" \
+    "ACTIVITY_WORKER_SERVICE_PORT=$STREAM_ACTIVITY_WORKER_SERVICE_PORT" \
+    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
+    "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$THROUGHPUT_RUNTIME_PORT" \
+    "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
+    "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \
+    "ACTIVITY_WORKER_CONCURRENCY=${STREAM_ACTIVITY_WORKER_CONCURRENCY:-8}" \
+    "ACTIVITY_BULK_POLL_MAX_TASKS=${STREAM_ACTIVITY_BULK_POLL_MAX_TASKS:-32}" \
+    -- \
+    target/release/activity-worker-service
+fi
+sleep 2
 
 if ! has_runner_arg --tenant-id "${RUNNER_ARGS[@]}"; then
   RUNNER_ARGS+=(--tenant-id "$TENANT_ID")
@@ -518,6 +558,7 @@ EXECUTOR_SERVICE_URL=http://127.0.0.1:$EXECUTOR_PORT
 THROUGHPUT_DEBUG_URL=http://127.0.0.1:$THROUGHPUT_DEBUG_PORT
 THROUGHPUT_PROJECTOR_URL=http://127.0.0.1:$THROUGHPUT_PROJECTOR_PORT
 TIMER_SERVICE_URL=http://127.0.0.1:$TIMER_SERVICE_PORT
+UNIFIED_RUNTIME_DEBUG_URL=http://127.0.0.1:$UNIFIED_DEBUG_PORT
 EOF
 
 echo "[isolated-benchmark] running benchmark-runner"
@@ -527,6 +568,7 @@ env \
   "EXECUTOR_SERVICE_URL=http://127.0.0.1:$EXECUTOR_PORT" \
   "THROUGHPUT_DEBUG_URL=http://127.0.0.1:$THROUGHPUT_DEBUG_PORT" \
   "THROUGHPUT_PROJECTOR_URL=http://127.0.0.1:$THROUGHPUT_PROJECTOR_PORT" \
+  "UNIFIED_RUNTIME_DEBUG_URL=http://127.0.0.1:$UNIFIED_DEBUG_PORT" \
   target/release/benchmark-runner "${RUNNER_ARGS[@]}"
 
 stop_services

@@ -394,6 +394,10 @@ async function runFabrikWorkload({ outputDir, profile, repoRoot, repetition, wor
       args: ["--execution-mode", "durable", "--bulk-reducer", "all_settled"],
     },
     {
+      name: "unified-experiment",
+      args: ["--execution-mode", "unified", "--bulk-reducer", "all_settled"],
+    },
+    {
       name: "throughput-pg-v1",
       args: ["--execution-mode", "throughput", "--throughput-backend", "pg-v1"],
     },

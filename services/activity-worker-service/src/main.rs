@@ -30,6 +30,13 @@ const DEFAULT_ACTIVITY_POLL_MAX_TASKS: u32 = 8;
 const DEFAULT_BULK_POLL_MAX_TASKS: u32 = 8;
 const MAX_BULK_CHUNK_INPUT_BYTES: usize = 1024 * 1024;
 
+fn parse_env_flag(name: &str, default: bool) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON"))
+        .unwrap_or(default)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config =
@@ -66,6 +73,8 @@ async fn main() -> Result<()> {
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_ACTIVITY_POLL_MAX_TASKS);
+    let enable_activity_lanes = parse_env_flag("ACTIVITY_ENABLE_NORMAL_LANES", true);
+    let enable_bulk_lanes = parse_env_flag("ACTIVITY_ENABLE_BULK_LANES", true);
     let client = Arc::new(Client::new());
     let payload_store = Arc::new(PayloadStore::from_config(build_payload_store_config()).await?);
 
@@ -80,57 +89,78 @@ async fn main() -> Result<()> {
         result_flusher_concurrency,
         activity_poll_max_tasks,
         bulk_poll_max_tasks,
+        enable_activity_lanes,
+        enable_bulk_lanes,
         port = config.port,
         "activity-worker-service starting"
     );
 
     let mut workers = JoinSet::new();
-    let mut result_txs = Vec::with_capacity(result_flusher_concurrency);
-    let mut bulk_result_txs = Vec::with_capacity(result_flusher_concurrency);
-    for flusher_index in 0..result_flusher_concurrency {
-        let (result_tx, result_rx) = unbounded_channel();
-        workers.spawn(run_result_flusher(
-            endpoint.clone(),
-            format!("result-flusher-{flusher_index}"),
-            result_rx,
-        ));
-        result_txs.push(result_tx);
-        let (bulk_result_tx, bulk_result_rx) = unbounded_channel();
-        workers.spawn(run_bulk_result_flusher(
-            bulk_endpoint.clone(),
-            format!("bulk-result-flusher-{flusher_index}"),
-            payload_store.clone(),
-            bulk_endpoint != endpoint,
-            bulk_result_rx,
-        ));
-        bulk_result_txs.push(bulk_result_tx);
+    let mut result_txs = Vec::new();
+    if enable_activity_lanes {
+        result_txs = Vec::with_capacity(result_flusher_concurrency);
+        for flusher_index in 0..result_flusher_concurrency {
+            let (result_tx, result_rx) = unbounded_channel();
+            workers.spawn(run_result_flusher(
+                endpoint.clone(),
+                format!("result-flusher-{flusher_index}"),
+                result_rx,
+            ));
+            result_txs.push(result_tx);
+        }
+    }
+    let mut bulk_result_txs = Vec::new();
+    if enable_bulk_lanes {
+        bulk_result_txs = Vec::with_capacity(result_flusher_concurrency);
+        for flusher_index in 0..result_flusher_concurrency {
+            let (bulk_result_tx, bulk_result_rx) = unbounded_channel();
+            workers.spawn(run_bulk_result_flusher(
+                bulk_endpoint.clone(),
+                format!("bulk-result-flusher-{flusher_index}"),
+                payload_store.clone(),
+                bulk_endpoint != endpoint,
+                bulk_result_rx,
+            ));
+            bulk_result_txs.push(bulk_result_tx);
+        }
     }
 
-    for lane in 0..concurrency {
-        workers.spawn(run_activity_lane(
-            endpoint.clone(),
-            tenant_id.clone(),
-            task_queue.clone(),
-            lane_worker_id(&worker_id, lane, concurrency),
-            worker_build_id.clone(),
-            activity_poll_max_tasks,
-            client.clone(),
-            result_txs[lane % result_txs.len()].clone(),
-        ));
-        workers.spawn(run_bulk_activity_lane(
-            bulk_endpoint.clone(),
-            tenant_id.clone(),
-            task_queue.clone(),
-            lane_worker_id(&worker_id, lane, concurrency),
-            worker_build_id.clone(),
-            client.clone(),
-            payload_store.clone(),
-            bulk_poll_max_tasks,
-            bulk_result_txs[lane % bulk_result_txs.len()].clone(),
-        ));
+    if enable_activity_lanes {
+        for lane in 0..concurrency {
+            workers.spawn(run_activity_lane(
+                endpoint.clone(),
+                tenant_id.clone(),
+                task_queue.clone(),
+                lane_worker_id(&worker_id, lane, concurrency),
+                worker_build_id.clone(),
+                activity_poll_max_tasks,
+                client.clone(),
+                result_txs[lane % result_txs.len()].clone(),
+            ));
+        }
+        drop(result_txs);
     }
-    drop(result_txs);
-    drop(bulk_result_txs);
+
+    if enable_bulk_lanes {
+        for lane in 0..concurrency {
+            workers.spawn(run_bulk_activity_lane(
+                bulk_endpoint.clone(),
+                tenant_id.clone(),
+                task_queue.clone(),
+                lane_worker_id(&worker_id, lane, concurrency),
+                worker_build_id.clone(),
+                client.clone(),
+                payload_store.clone(),
+                bulk_poll_max_tasks,
+                bulk_result_txs[lane % bulk_result_txs.len()].clone(),
+            ));
+        }
+        drop(bulk_result_txs);
+    }
+
+    if !enable_activity_lanes && !enable_bulk_lanes {
+        anyhow::bail!("activity worker started with both normal and bulk lanes disabled");
+    }
 
     while let Some(result) = workers.join_next().await {
         match result {

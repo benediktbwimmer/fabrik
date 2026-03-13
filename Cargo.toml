@@ -17,6 +17,7 @@ members = [
     "services/query-service",
     "services/replay-tool",
     "services/timer-service",
+    "services/unified-runtime",
     "services/throughput-projector",
     "services/throughput-runtime",
 ]
