@@ -123,12 +123,11 @@ async fn run_projection_consumer(state: AppState, config: JsonTopicConfig) {
                 if batch.len() >= PROJECTION_APPLY_BATCH_SIZE {
                     break;
                 }
-                let Ok(Some(message)) =
-                    tokio::time::timeout(
-                        Duration::from_millis(PROJECTION_APPLY_BATCH_WAIT_MS),
-                        consumer.next(),
-                    )
-                    .await
+                let Ok(Some(message)) = tokio::time::timeout(
+                    Duration::from_millis(PROJECTION_APPLY_BATCH_WAIT_MS),
+                    consumer.next(),
+                )
+                .await
                 else {
                     break;
                 };
@@ -176,7 +175,11 @@ fn decode_projection_record(
             return None;
         }
     };
-    Some(BufferedProjectionRecord { partition_id: record.partition_id, offset: record.record.offset, event })
+    Some(BufferedProjectionRecord {
+        partition_id: record.partition_id,
+        offset: record.record.offset,
+        event,
+    })
 }
 
 async fn apply_projection_batch(

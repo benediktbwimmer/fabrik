@@ -66,7 +66,7 @@ def reserve():
     s.close()
     return port
 
-for _ in range(9):
+for _ in range(10):
     print(reserve())
 PY
 )
@@ -80,6 +80,7 @@ THROUGHPUT_DEBUG_PORT="${THROUGHPUT_DEBUG_PORT:-${PORTS[5]}}"
 THROUGHPUT_PROJECTOR_PORT="${THROUGHPUT_PROJECTOR_PORT:-${PORTS[6]}}"
 ACTIVITY_WORKER_SERVICE_PORT="${ACTIVITY_WORKER_SERVICE_PORT:-${PORTS[7]}}"
 STREAM_ACTIVITY_WORKER_SERVICE_PORT="${STREAM_ACTIVITY_WORKER_SERVICE_PORT:-${PORTS[8]}}"
+TIMER_SERVICE_PORT="${TIMER_SERVICE_PORT:-${PORTS[9]}}"
 
 PIDS=()
 REPORT_PATH=""
@@ -289,6 +290,7 @@ stop_existing_local_services() {
     'target/release/ingest-service'
     'target/release/throughput-runtime'
     'target/release/throughput-projector'
+    'target/release/timer-service'
     'target/release/activity-worker-service'
     'target/release/benchmark-runner'
   )
@@ -358,6 +360,7 @@ if [[ "$BUILD_RELEASE" == "1" ]]; then
     -p executor-service \
     -p throughput-runtime \
     -p throughput-projector \
+    -p timer-service \
     -p activity-worker-service >/dev/null
 fi
 
@@ -439,6 +442,14 @@ start_service throughput-projector "$LOG_DIR/throughput-projector.log" \
   target/release/throughput-projector
 wait_for_port 127.0.0.1 "$THROUGHPUT_PROJECTOR_PORT" "throughput-projector"
 
+echo "[isolated-benchmark] starting timer-service"
+start_service timer-service "$LOG_DIR/timer-service.log" \
+  "${COMMON_ENV[@]}" \
+  "TIMER_SERVICE_PORT=$TIMER_SERVICE_PORT" \
+  -- \
+  target/release/timer-service
+wait_for_port 127.0.0.1 "$TIMER_SERVICE_PORT" "timer-service"
+
 echo "[isolated-benchmark] starting activity-worker-service (pg-v1/matching)"
 start_service activity-worker-service "$LOG_DIR/activity-worker-service-pg-v1.log" \
   "${COMMON_ENV[@]}" \
@@ -506,6 +517,7 @@ INGEST_SERVICE_URL=http://127.0.0.1:$INGEST_PORT
 EXECUTOR_SERVICE_URL=http://127.0.0.1:$EXECUTOR_PORT
 THROUGHPUT_DEBUG_URL=http://127.0.0.1:$THROUGHPUT_DEBUG_PORT
 THROUGHPUT_PROJECTOR_URL=http://127.0.0.1:$THROUGHPUT_PROJECTOR_PORT
+TIMER_SERVICE_URL=http://127.0.0.1:$TIMER_SERVICE_PORT
 EOF
 
 echo "[isolated-benchmark] running benchmark-runner"

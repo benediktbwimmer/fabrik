@@ -391,7 +391,7 @@ async function runFabrikWorkload({ outputDir, profile, repoRoot, repetition, wor
   const scenarios = [
     {
       name: "durable",
-      args: ["--execution-mode", "durable"],
+      args: ["--execution-mode", "durable", "--bulk-reducer", "all_settled"],
     },
     {
       name: "throughput-pg-v1",

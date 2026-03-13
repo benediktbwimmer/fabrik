@@ -372,7 +372,7 @@ impl MatchingRuntimeConfig {
             )?,
             activity_result_apply_flush_interval_ms: read_u64_with_default(
                 "MATCHING_ACTIVITY_RESULT_BATCH_FLUSH_INTERVAL_MS",
-                5,
+                20,
             )?,
             result_apply_per_run_coalescing_cap: read_usize_with_default(
                 "MATCHING_RESULT_APPLY_PER_RUN_COALESCING_CAP",
@@ -436,6 +436,7 @@ pub struct ExecutorRuntimeConfig {
     pub continue_as_new_event_threshold: Option<u64>,
     pub continue_as_new_activity_attempt_threshold: Option<u64>,
     pub continue_as_new_run_age_seconds: Option<u64>,
+    pub workflow_task_resume_coalescing_ms: u64,
     pub max_mailbox_items_per_turn: usize,
     pub max_transitions_per_turn: usize,
     pub throughput_default_backend: String,
@@ -458,6 +459,10 @@ impl ExecutorRuntimeConfig {
             )?,
             continue_as_new_run_age_seconds: read_optional_u64(
                 "EXECUTOR_CONTINUE_AS_NEW_RUN_AGE_SECONDS",
+            )?,
+            workflow_task_resume_coalescing_ms: read_u64_with_default(
+                "EXECUTOR_WORKFLOW_TASK_RESUME_COALESCING_MS",
+                50,
             )?,
             max_mailbox_items_per_turn: read_usize_with_default(
                 "EXECUTOR_MAX_MAILBOX_ITEMS_PER_TURN",

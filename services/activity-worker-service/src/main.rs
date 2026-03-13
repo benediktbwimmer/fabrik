@@ -1,4 +1,4 @@
-use std::{env, sync::Arc, time::Duration};
+use std::{collections::VecDeque, env, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use fabrik_config::{GrpcServiceConfig, ThroughputPayloadStoreConfig, ThroughputPayloadStoreKind};
@@ -9,7 +9,7 @@ use fabrik_worker_protocol::activity_worker::{
     ActivityTaskCancelledResult, ActivityTaskCompletedResult, ActivityTaskFailedResult,
     ActivityTaskResult, BulkActivityTaskCancelledResult, BulkActivityTaskCompletedResult,
     BulkActivityTaskFailedResult, BulkActivityTaskResult, PollActivityTaskRequest,
-    PollBulkActivityTaskRequest, ReportActivityTaskResultsRequest,
+    PollActivityTasksRequest, PollBulkActivityTaskRequest, ReportActivityTaskResultsRequest,
     ReportBulkActivityTaskResultsRequest, activity_task_result,
     activity_worker_api_client::ActivityWorkerApiClient,
 };
@@ -25,7 +25,8 @@ const RESULT_BATCH_MAX_ITEMS: usize = 256;
 const RESULT_BATCH_MAX_BYTES: usize = 1_048_576;
 const RESULT_BATCH_FLUSH_INTERVAL_MS: u64 = 5;
 const DEFAULT_ACTIVITY_WORKER_CONCURRENCY: usize = 8;
-const DEFAULT_RESULT_FLUSHER_CONCURRENCY: usize = 1;
+const DEFAULT_RESULT_FLUSHER_CONCURRENCY: usize = 2;
+const DEFAULT_ACTIVITY_POLL_MAX_TASKS: u32 = 8;
 const DEFAULT_BULK_POLL_MAX_TASKS: u32 = 8;
 const MAX_BULK_CHUNK_INPUT_BYTES: usize = 1024 * 1024;
 
@@ -60,6 +61,11 @@ async fn main() -> Result<()> {
         .and_then(|value| value.parse::<u32>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_BULK_POLL_MAX_TASKS);
+    let activity_poll_max_tasks = env::var("ACTIVITY_POLL_MAX_TASKS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_ACTIVITY_POLL_MAX_TASKS);
     let client = Arc::new(Client::new());
     let payload_store = Arc::new(PayloadStore::from_config(build_payload_store_config()).await?);
 
@@ -72,6 +78,7 @@ async fn main() -> Result<()> {
         worker_build_id = %worker_build_id,
         concurrency,
         result_flusher_concurrency,
+        activity_poll_max_tasks,
         bulk_poll_max_tasks,
         port = config.port,
         "activity-worker-service starting"
@@ -106,6 +113,7 @@ async fn main() -> Result<()> {
             task_queue.clone(),
             lane_worker_id(&worker_id, lane, concurrency),
             worker_build_id.clone(),
+            activity_poll_max_tasks,
             client.clone(),
             result_txs[lane % result_txs.len()].clone(),
         ));
@@ -412,32 +420,56 @@ async fn run_activity_lane(
     task_queue: String,
     worker_id: String,
     worker_build_id: String,
+    activity_poll_max_tasks: u32,
     client: Arc<Client>,
     result_tx: UnboundedSender<ActivityTaskResult>,
 ) -> Result<()> {
     let mut worker = connect_activity_worker_with_retry(&endpoint, &worker_id).await;
+    let mut pending_tasks = VecDeque::new();
 
     loop {
-        let response = worker
-            .poll_activity_task(PollActivityTaskRequest {
-                tenant_id: tenant_id.clone(),
-                task_queue: task_queue.clone(),
-                worker_id: worker_id.clone(),
-                worker_build_id: worker_build_id.clone(),
-                poll_timeout_ms: 30_000,
-            })
-            .await;
+        if pending_tasks.is_empty() {
+            let response = if activity_poll_max_tasks <= 1 {
+                worker
+                    .poll_activity_task(PollActivityTaskRequest {
+                        tenant_id: tenant_id.clone(),
+                        task_queue: task_queue.clone(),
+                        worker_id: worker_id.clone(),
+                        worker_build_id: worker_build_id.clone(),
+                        poll_timeout_ms: 30_000,
+                    })
+                    .await
+                    .map(|response| response.into_inner().task.into_iter().collect::<VecDeque<_>>())
+            } else {
+                worker
+                    .poll_activity_tasks(PollActivityTasksRequest {
+                        tenant_id: tenant_id.clone(),
+                        task_queue: task_queue.clone(),
+                        worker_id: worker_id.clone(),
+                        worker_build_id: worker_build_id.clone(),
+                        poll_timeout_ms: 30_000,
+                        max_tasks: activity_poll_max_tasks,
+                    })
+                    .await
+                    .map(|response| {
+                        response.into_inner().tasks.into_iter().collect::<VecDeque<_>>()
+                    })
+            };
 
-        let Some(task) = (match response {
-            Ok(response) => response.into_inner().task,
-            Err(error) => {
-                error!(error = %error, worker_id = %worker_id, "failed to poll matching-service");
-                tokio::time::sleep(Duration::from_millis(500)).await;
+            pending_tasks = match response {
+                Ok(tasks) => tasks,
+                Err(error) => {
+                    error!(error = %error, worker_id = %worker_id, "failed to poll matching-service");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+            };
+            if pending_tasks.is_empty() {
                 continue;
             }
-        }) else {
-            continue;
-        };
+        }
+
+        let task = pending_tasks.pop_front().expect("pending activity task exists");
 
         let activity_result = execute_activity_task(
             client.as_ref(),

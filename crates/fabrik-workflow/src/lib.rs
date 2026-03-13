@@ -742,8 +742,7 @@ impl WorkflowInstanceState {
             }
             WorkflowEvent::ActivityTaskFailed { error, .. }
             | WorkflowEvent::ActivityTaskCancelled { reason: error, .. } => {
-                self.status = WorkflowStatus::Failed;
-                self.output = Some(Value::String(error.clone()));
+                self.status = WorkflowStatus::Running;
                 self.context = Some(Value::String(error.clone()));
             }
             WorkflowEvent::BulkActivityBatchFailed {
@@ -764,15 +763,13 @@ impl WorkflowInstanceState {
                 chunk_count,
                 message,
             } => {
-                let status =
-                    if matches!(&event.payload, WorkflowEvent::BulkActivityBatchFailed { .. }) {
-                        WorkflowStatus::Failed
-                    } else {
-                        WorkflowStatus::Cancelled
-                    };
                 let error = serde_json::json!({
                     "batchId": batch_id,
-                    "status": if status == WorkflowStatus::Failed { "failed" } else { "cancelled" },
+                    "status": if matches!(&event.payload, WorkflowEvent::BulkActivityBatchFailed { .. }) {
+                        "failed"
+                    } else {
+                        "cancelled"
+                    },
                     "message": message,
                     "totalItems": total_items,
                     "succeededItems": succeeded_items,
@@ -780,13 +777,11 @@ impl WorkflowInstanceState {
                     "cancelledItems": cancelled_items,
                     "chunkCount": chunk_count,
                 });
-                self.status = status;
-                self.output = Some(error.clone());
+                self.status = WorkflowStatus::Running;
                 self.context = Some(error);
             }
             WorkflowEvent::ActivityTaskTimedOut { .. } => {
-                self.status = WorkflowStatus::Failed;
-                self.output = Some(Value::String("activity timed out".to_owned()));
+                self.status = WorkflowStatus::Running;
                 self.context = Some(Value::String("activity timed out".to_owned()));
             }
             WorkflowEvent::WorkflowFailed { reason: error } => {
@@ -1052,7 +1047,7 @@ pub fn replay_compiled_history_trace(
                     advanced = true;
                 }
                 WorkflowEvent::ActivityTaskCancelled { activity_id, reason, .. } => {
-                    execution = artifact.execute_after_step_failure_with_turn(
+                    execution = artifact.execute_after_step_cancellation_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         activity_id,
                         reason,
@@ -1291,7 +1286,7 @@ pub fn replay_compiled_history_trace_from_snapshot(
                     apply_compiled_execution(&mut replayed, &execution);
                 }
                 WorkflowEvent::ActivityTaskCancelled { activity_id, reason, .. } => {
-                    let execution = artifact.execute_after_step_failure_with_turn(
+                    let execution = artifact.execute_after_step_cancellation_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         activity_id,
                         reason,
@@ -1996,6 +1991,44 @@ mod tests {
         state.apply_event(&cancelled);
         assert_eq!(state.status, WorkflowStatus::Cancelled);
         assert_eq!(state.output, Some(Value::String("operator requested cancellation".to_owned())));
+    }
+
+    #[test]
+    fn projection_keeps_activity_terminal_events_non_terminal_for_workflow() {
+        let triggered = test_event(
+            "WorkflowTriggered",
+            "run-1",
+            WorkflowEvent::WorkflowTriggered { input: json!({"hello": "world"}) },
+            &[],
+        );
+        let activity_failed = test_event(
+            "ActivityTaskFailed",
+            "run-1",
+            WorkflowEvent::ActivityTaskFailed {
+                activity_id: "step-1".to_owned(),
+                attempt: 1,
+                error: "boom".to_owned(),
+                worker_id: "worker-1".to_owned(),
+                worker_build_id: "build-1".to_owned(),
+            },
+            &[],
+        );
+        let workflow_failed = test_event(
+            "WorkflowFailed",
+            "run-1",
+            WorkflowEvent::WorkflowFailed { reason: "boom".to_owned() },
+            &[],
+        );
+
+        let mut state = WorkflowInstanceState::try_from(&triggered).unwrap();
+        state.apply_event(&activity_failed);
+        assert_eq!(state.status, WorkflowStatus::Running);
+        assert_eq!(state.output, None);
+        assert_eq!(state.context, Some(Value::String("boom".to_owned())));
+
+        state.apply_event(&workflow_failed);
+        assert_eq!(state.status, WorkflowStatus::Failed);
+        assert_eq!(state.output, Some(Value::String("boom".to_owned())));
     }
 
     #[test]

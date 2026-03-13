@@ -10,6 +10,15 @@ message PollActivityTaskRequest {
   uint64 poll_timeout_ms = 5;
 }
 
+message PollActivityTasksRequest {
+  string tenant_id = 1;
+  string task_queue = 2;
+  string worker_id = 3;
+  string worker_build_id = 4;
+  uint64 poll_timeout_ms = 5;
+  uint32 max_tasks = 6;
+}
+
 message ActivityTask {
   string tenant_id = 1;
   string definition_id = 2;
@@ -34,6 +43,10 @@ message ActivityTask {
 
 message PollActivityTaskResponse {
   ActivityTask task = 1;
+}
+
+message PollActivityTasksResponse {
+  repeated ActivityTask tasks = 1;
 }
 
 message PollBulkActivityTaskRequest {
@@ -250,6 +263,7 @@ message Ack {}
 
 service ActivityWorkerApi {
   rpc PollActivityTask(PollActivityTaskRequest) returns (PollActivityTaskResponse);
+  rpc PollActivityTasks(PollActivityTasksRequest) returns (PollActivityTasksResponse);
   rpc PollBulkActivityTask(PollBulkActivityTaskRequest) returns (PollBulkActivityTaskResponse);
   rpc CompleteActivityTask(CompleteActivityTaskRequest) returns (Ack);
   rpc FailActivityTask(FailActivityTaskRequest) returns (Ack);

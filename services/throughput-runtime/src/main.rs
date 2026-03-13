@@ -1347,6 +1347,14 @@ impl ActivityWorkerApi for WorkerApi {
         Err(Status::unimplemented("throughput-runtime only serves bulk tasks"))
     }
 
+    async fn poll_activity_tasks(
+        &self,
+        _request: Request<fabrik_worker_protocol::activity_worker::PollActivityTasksRequest>,
+    ) -> Result<Response<fabrik_worker_protocol::activity_worker::PollActivityTasksResponse>, Status>
+    {
+        Err(Status::unimplemented("throughput-runtime only serves bulk tasks"))
+    }
+
     async fn poll_bulk_activity_task(
         &self,
         request: Request<PollBulkActivityTaskRequest>,

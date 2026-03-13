@@ -585,6 +585,7 @@ fn benchmark_artifact(
                     task_queue: Some(Expression::Literal {
                         value: Value::String(task_queue.to_owned()),
                     }),
+                    reducer: Some(bulk_reducer.to_owned()),
                     retry: enable_retry
                         .then_some(RetryPolicy { max_attempts: 2, delay: "1s".to_owned() }),
                     config: None,
@@ -826,9 +827,7 @@ fn scenario_name(args: &Args) -> String {
             format!("throughput-{}", args.throughput_backend.as_deref().unwrap_or(PG_V1_BACKEND))
         }
     };
-    if matches!(args.execution_mode, ExecutionMode::Throughput)
-        && args.bulk_reducer != "collect_results"
-    {
+    if args.bulk_reducer != "collect_results" {
         scenario.push('-');
         scenario.push_str(&args.bulk_reducer.replace('_', "-"));
     }
@@ -1469,6 +1468,34 @@ mod tests {
     }
 
     #[test]
+    fn durable_reducer_variant_is_reflected_in_scenario_and_artifact() {
+        let mut durable = Args {
+            execution_mode: ExecutionMode::Durable,
+            throughput_backend: None,
+            ..demo_args()
+        };
+        durable.bulk_reducer = "all_settled".to_owned();
+
+        assert_eq!(scenario_name(&durable), "durable-all-settled");
+
+        let artifact = benchmark_artifact(
+            "fanout-benchmark-target-durable-all-settled",
+            "default",
+            false,
+            ExecutionMode::Durable,
+            &durable.bulk_reducer,
+            None,
+            100,
+        );
+        match artifact.workflow.states.get("dispatch") {
+            Some(CompiledStateNode::FanOut { reducer, .. }) => {
+                assert_eq!(reducer.as_deref(), Some("all_settled"));
+            }
+            other => panic!("expected fanout dispatch state, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn throughput_artifact_uses_backend_specific_execution_policy() {
         let pg_artifact = benchmark_artifact(
             "fanout-benchmark-target-throughput-pg-v1",
@@ -1495,9 +1522,7 @@ mod tests {
 
         match pg_dispatch {
             CompiledStateNode::StartBulkActivity {
-                execution_policy,
-                throughput_backend,
-                ..
+                execution_policy, throughput_backend, ..
             } => {
                 assert_eq!(execution_policy.as_deref(), None);
                 assert_eq!(throughput_backend.as_deref(), Some(PG_V1_BACKEND));
@@ -1507,9 +1532,7 @@ mod tests {
 
         match stream_dispatch {
             CompiledStateNode::StartBulkActivity {
-                execution_policy,
-                throughput_backend,
-                ..
+                execution_policy, throughput_backend, ..
             } => {
                 assert_eq!(execution_policy.as_deref(), Some("eager"));
                 assert_eq!(throughput_backend.as_deref(), Some(STREAM_V2_BACKEND));

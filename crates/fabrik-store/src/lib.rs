@@ -157,6 +157,28 @@ pub struct ActivityTerminalUpdate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActivityStartUpdate {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub activity_id: String,
+    pub attempt: u32,
+    pub worker_id: String,
+    pub worker_build_id: String,
+    pub lease_expires_at: DateTime<Utc>,
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub occurred_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AppliedActivityStartUpdate {
+    pub record: WorkflowActivityRecord,
+    pub event_id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppliedActivityTerminalUpdate {
     pub record: WorkflowActivityRecord,
     pub event_id: Uuid,
@@ -6596,6 +6618,117 @@ impl WorkflowStore {
         Ok(result.rows_affected() == 1)
     }
 
+    pub async fn mark_events_processed_batch(
+        &self,
+        events: &[&EventEnvelope<WorkflowEvent>],
+    ) -> Result<Vec<bool>> {
+        const BATCH_SIZE: usize = 250;
+
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut inserted = vec![false; events.len()];
+        for (offset, batch) in events.chunks(BATCH_SIZE).enumerate() {
+            let base_index = offset * BATCH_SIZE;
+            let mut builder = QueryBuilder::<Postgres>::new(
+                r#"
+                WITH input (
+                    batch_index,
+                    event_id,
+                    tenant_id,
+                    workflow_instance_id,
+                    dedupe_key,
+                    event_type
+                ) AS (
+                "#,
+            );
+            builder.push_values(batch.iter().enumerate(), |mut row, (index, event)| {
+                row.push_bind(i64::try_from(base_index + index).expect("batch index exceeds i64"))
+                    .push_bind(event.event_id)
+                    .push_bind(&event.tenant_id)
+                    .push_bind(&event.instance_id)
+                    .push_bind(event.dedupe_key.as_deref())
+                    .push_bind(&event.event_type);
+            });
+            builder.push(
+                r#"
+                ),
+                inserted AS (
+                    INSERT INTO processed_workflow_events (
+                        event_id,
+                        tenant_id,
+                        workflow_instance_id,
+                        dedupe_key,
+                        event_type
+                    )
+                    SELECT
+                        event_id,
+                        tenant_id,
+                        workflow_instance_id,
+                        dedupe_key,
+                        event_type
+                    FROM input
+                    ON CONFLICT DO NOTHING
+                    RETURNING event_id
+                )
+                SELECT input.batch_index
+                FROM input
+                INNER JOIN inserted USING (event_id)
+                "#,
+            );
+
+            let rows = builder
+                .build()
+                .fetch_all(&self.pool)
+                .await
+                .context("failed to mark workflow events as processed in batch")?;
+            for row in rows {
+                let index = usize::try_from(row.get::<i64, _>("batch_index"))
+                    .expect("batch index is negative");
+                inserted[index] = true;
+            }
+        }
+
+        Ok(inserted)
+    }
+
+    pub async fn unmark_events_processed_batch(
+        &self,
+        events: &[&EventEnvelope<WorkflowEvent>],
+    ) -> Result<()> {
+        const BATCH_SIZE: usize = 250;
+
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        for batch in events.chunks(BATCH_SIZE) {
+            let mut builder = QueryBuilder::<Postgres>::new(
+                r#"
+                WITH input (event_id) AS (
+                "#,
+            );
+            builder.push_values(batch, |mut row, event| {
+                row.push_bind(event.event_id);
+            });
+            builder.push(
+                r#"
+                )
+                DELETE FROM processed_workflow_events
+                WHERE event_id IN (SELECT event_id FROM input)
+                "#,
+            );
+            builder
+                .build()
+                .execute(&self.pool)
+                .await
+                .context("failed to rollback processed workflow events")?;
+        }
+
+        Ok(())
+    }
+
     pub async fn upsert_timer(
         &self,
         partition_id: i32,
@@ -7141,6 +7274,134 @@ impl WorkflowStore {
         .context("failed to mark workflow activity started")?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn mark_activities_started_batch(
+        &self,
+        updates: &[ActivityStartUpdate],
+    ) -> Result<Vec<AppliedActivityStartUpdate>> {
+        if updates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut query = QueryBuilder::<Postgres>::new(
+            r#"
+            WITH updates (
+                batch_index,
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                activity_id,
+                attempt,
+                worker_id,
+                worker_build_id,
+                occurred_at,
+                lease_expires_at,
+                event_id,
+                event_type
+            ) AS (
+            "#,
+        );
+
+        query.push_values(updates.iter().enumerate(), |mut builder, (batch_index, update)| {
+            builder
+                .push_bind(batch_index as i64)
+                .push_bind(&update.tenant_id)
+                .push_bind(&update.instance_id)
+                .push_bind(&update.run_id)
+                .push_bind(&update.activity_id)
+                .push_bind(i32::try_from(update.attempt).expect("activity attempt exceeds i32"))
+                .push_bind(&update.worker_id)
+                .push_bind(&update.worker_build_id)
+                .push_bind(update.occurred_at)
+                .push_bind(update.lease_expires_at)
+                .push_bind(update.event_id)
+                .push_bind(&update.event_type);
+        });
+
+        query.push(
+            r#"
+            ),
+            applied AS (
+                UPDATE workflow_activities AS activity
+                SET status = 'started',
+                    worker_id = updates.worker_id,
+                    worker_build_id = updates.worker_build_id,
+                    started_at = COALESCE(activity.started_at, updates.occurred_at),
+                    last_heartbeat_at = updates.occurred_at,
+                    lease_expires_at = updates.lease_expires_at,
+                    last_event_id = updates.event_id,
+                    last_event_type = updates.event_type,
+                    updated_at = updates.occurred_at
+                FROM updates
+                WHERE activity.tenant_id = updates.tenant_id
+                  AND activity.workflow_instance_id = updates.workflow_instance_id
+                  AND activity.run_id = updates.run_id
+                  AND activity.activity_id = updates.activity_id
+                  AND activity.attempt = updates.attempt
+                  AND activity.status = 'scheduled'
+                  AND activity.cancellation_requested = FALSE
+                RETURNING
+                    updates.batch_index,
+                    activity.tenant_id,
+                    activity.workflow_instance_id,
+                    activity.run_id,
+                    activity.workflow_id,
+                    activity.workflow_version,
+                    activity.artifact_hash,
+                    activity.activity_id,
+                    activity.attempt,
+                    activity.activity_type,
+                    activity.task_queue,
+                    activity.state,
+                    activity.status,
+                    activity.input,
+                    activity.config,
+                    activity.output,
+                    activity.error,
+                    activity.cancellation_requested,
+                    activity.cancellation_reason,
+                    activity.cancellation_metadata,
+                    activity.worker_id,
+                    activity.worker_build_id,
+                    activity.scheduled_at,
+                    activity.started_at,
+                    activity.last_heartbeat_at,
+                    activity.lease_expires_at,
+                    activity.completed_at,
+                    activity.schedule_to_start_timeout_ms,
+                    activity.start_to_close_timeout_ms,
+                    activity.heartbeat_timeout_ms,
+                    activity.last_event_id,
+                    activity.last_event_type,
+                    activity.updated_at
+            )
+            SELECT *
+            FROM applied
+            ORDER BY batch_index
+            "#,
+        );
+
+        let rows = query
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to batch mark workflow activities started")?;
+
+        let mut applied = Vec::with_capacity(rows.len());
+        for row in rows {
+            let batch_index = row
+                .try_get::<i64, _>("batch_index")
+                .context("activity batch_index missing")? as usize;
+            let update = &updates[batch_index];
+            applied.push(AppliedActivityStartUpdate {
+                record: Self::decode_activity_row(row)?,
+                event_id: update.event_id,
+                occurred_at: update.occurred_at,
+            });
+        }
+
+        Ok(applied)
     }
 
     pub async fn requeue_activity(

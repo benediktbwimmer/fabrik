@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use fabrik_events::WorkflowEvent;
+use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_throughput::{DEFAULT_AGGREGATION_GROUP_COUNT, PayloadHandle, ThroughputBackend};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
@@ -98,6 +98,8 @@ pub enum CompiledStateNode {
         handle_var: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task_queue: Option<Expression>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reducer: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry: Option<RetryPolicy>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -310,9 +312,32 @@ struct FanOutExecutionState {
     pub origin_state: String,
     pub wait_state: String,
     pub task_queue: String,
+    #[serde(default)]
+    pub total_count: usize,
+    #[serde(default)]
+    pub pending_count: usize,
+    #[serde(default)]
+    pub succeeded_count: usize,
+    #[serde(default)]
+    pub failed_count: usize,
+    #[serde(default)]
+    pub cancelled_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_activity_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub results: Vec<Option<Value>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub failed_activity_errors: BTreeMap<usize, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_failed_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_failed_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reducer: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settlement_bitmap: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -906,6 +931,100 @@ impl CompiledWorkflowArtifact {
         )
     }
 
+    pub fn try_execute_after_step_terminal_batch(
+        &self,
+        step_state: &str,
+        events: &[EventEnvelope<WorkflowEvent>],
+        execution_state: ArtifactExecutionState,
+    ) -> Result<Option<(CompiledExecutionPlan, usize)>, CompiledWorkflowError> {
+        self.try_execute_after_step_terminal_batch_with_turn(step_state, events, execution_state)
+    }
+
+    pub fn try_execute_after_step_terminal_batch_with_turn(
+        &self,
+        step_state: &str,
+        events: &[EventEnvelope<WorkflowEvent>],
+        mut execution_state: ArtifactExecutionState,
+    ) -> Result<Option<(CompiledExecutionPlan, usize)>, CompiledWorkflowError> {
+        if events.is_empty() {
+            return Ok(None);
+        }
+        let states = self
+            .states_for(step_state, &execution_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(step_state.to_owned()))?;
+        let state = states
+            .get(step_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(step_state.to_owned()))?;
+        let CompiledStateNode::WaitForAllActivities { fanout_ref_var, next, output_var, .. } =
+            state
+        else {
+            return Ok(None);
+        };
+
+        let mut fanout = self.fanout_binding(step_state, fanout_ref_var, &execution_state)?;
+        if !fanout_reducer_settles(&fanout) {
+            return Ok(None);
+        }
+
+        let mut applied = 0usize;
+        let mut last_turn_context = None;
+        for event in events {
+            let Some((activity_id, value, completion)) = fanout_terminal_update(event) else {
+                break;
+            };
+            let Some((origin_state, fanout_index)) = parse_fanout_activity_id(activity_id) else {
+                break;
+            };
+            if fanout.origin_state != origin_state
+                || fanout_index >= fanout_total_count(&fanout)
+                || !fanout_slot_is_pending(&fanout, fanout_index)
+            {
+                break;
+            }
+            fanout_mark_completed(&mut fanout, fanout_index, value, completion);
+            last_turn_context = Some(ExecutionTurnContext {
+                event_id: event.event_id,
+                occurred_at: event.occurred_at,
+            });
+            applied += 1;
+            if fanout.pending_count == 0 {
+                break;
+            }
+        }
+
+        if applied == 0 {
+            return Ok(None);
+        }
+
+        execution_state.turn_context = last_turn_context;
+        if fanout.pending_count == 0 {
+            execution_state.bindings.remove(fanout_ref_var);
+            if let Some(output_var) = output_var {
+                execution_state
+                    .bindings
+                    .insert(output_var.clone(), reduce_fanout_terminal_payload(&fanout));
+            }
+            let plan = self.execute_from_state_in_graph(states, next, execution_state, false)?;
+            return Ok(Some((plan, applied)));
+        }
+
+        execution_state.bindings.insert(
+            fanout_ref_var.clone(),
+            serde_json::to_value(&fanout).expect("fanout state serializes"),
+        );
+        Ok(Some((
+            CompiledExecutionPlan {
+                workflow_version: self.definition_version,
+                final_state: step_state.to_owned(),
+                emissions: Vec::new(),
+                execution_state,
+                context: None,
+                output: None,
+            },
+            applied,
+        )))
+    }
+
     pub fn execute_after_step_completion_with_turn(
         &self,
         step_state: &str,
@@ -940,28 +1059,26 @@ impl CompiledWorkflowArtifact {
                     return Err(CompiledWorkflowError::InvalidFanOutActivityId(step_id.to_owned()));
                 };
                 if fanout.origin_state != origin_state
-                    || fanout_index >= fanout.results.len()
-                    || !fanout.pending_activity_ids.iter().any(|activity_id| activity_id == step_id)
+                    || fanout_index >= fanout_total_count(&fanout)
+                    || !fanout_slot_is_pending(&fanout, fanout_index)
                 {
                     return Err(CompiledWorkflowError::UnexpectedFanOutActivity {
                         state: step_state.to_owned(),
                         activity_id: step_id.to_owned(),
                     });
                 }
-                fanout.pending_activity_ids.retain(|activity_id| activity_id != step_id);
-                fanout.results[fanout_index] = Some(output.clone());
-                if fanout.pending_activity_ids.is_empty() {
-                    let ordered_results = Value::Array(
-                        fanout
-                            .results
-                            .iter()
-                            .cloned()
-                            .map(|value| value.unwrap_or(Value::Null))
-                            .collect(),
-                    );
+                fanout_mark_completed(
+                    &mut fanout,
+                    fanout_index,
+                    output.clone(),
+                    CompletionKind::Succeeded,
+                );
+                if fanout.pending_count == 0 {
                     execution_state.bindings.remove(fanout_ref_var);
                     if let Some(output_var) = output_var {
-                        execution_state.bindings.insert(output_var.clone(), ordered_results);
+                        execution_state
+                            .bindings
+                            .insert(output_var.clone(), reduce_fanout_terminal_payload(&fanout));
                     }
                     self.execute_from_state_in_graph(states, next, execution_state, false)
                 } else {
@@ -974,7 +1091,7 @@ impl CompiledWorkflowArtifact {
                         final_state: step_state.to_owned(),
                         emissions: Vec::new(),
                         execution_state,
-                        context: Some(output.clone()),
+                        context: None,
                         output: None,
                     })
                 }
@@ -994,11 +1111,12 @@ impl CompiledWorkflowArtifact {
         error: &str,
         execution_state: ArtifactExecutionState,
     ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
-        self.execute_after_step_failure_with_turn(
+        self.execute_after_step_terminal_with_turn(
             step_state,
             step_id,
             error,
             execution_state,
+            CompletionKind::Failed,
             Self::synthetic_turn_context("step_failure"),
         )
     }
@@ -1008,7 +1126,44 @@ impl CompiledWorkflowArtifact {
         step_state: &str,
         step_id: &str,
         error: &str,
+        execution_state: ArtifactExecutionState,
+        turn_context: ExecutionTurnContext,
+    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
+        self.execute_after_step_terminal_with_turn(
+            step_state,
+            step_id,
+            error,
+            execution_state,
+            CompletionKind::Failed,
+            turn_context,
+        )
+    }
+
+    pub fn execute_after_step_cancellation_with_turn(
+        &self,
+        step_state: &str,
+        step_id: &str,
+        reason: &str,
+        execution_state: ArtifactExecutionState,
+        turn_context: ExecutionTurnContext,
+    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
+        self.execute_after_step_terminal_with_turn(
+            step_state,
+            step_id,
+            reason,
+            execution_state,
+            CompletionKind::Cancelled,
+            turn_context,
+        )
+    }
+
+    fn execute_after_step_terminal_with_turn(
+        &self,
+        step_state: &str,
+        step_id: &str,
+        error: &str,
         mut execution_state: ArtifactExecutionState,
+        completion: CompletionKind,
         turn_context: ExecutionTurnContext,
     ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
         execution_state.turn_context = Some(turn_context);
@@ -1058,18 +1213,59 @@ impl CompiledWorkflowArtifact {
                     output: Some(Value::String(error.to_owned())),
                 })
             }
-            CompiledStateNode::WaitForAllActivities { fanout_ref_var, on_error, .. } => {
-                let fanout = self.fanout_binding(step_state, fanout_ref_var, &execution_state)?;
+            CompiledStateNode::WaitForAllActivities {
+                fanout_ref_var,
+                next,
+                output_var,
+                on_error,
+            } => {
+                let mut fanout =
+                    self.fanout_binding(step_state, fanout_ref_var, &execution_state)?;
                 let Some((origin_state, fanout_index)) = parse_fanout_activity_id(step_id) else {
                     return Err(CompiledWorkflowError::InvalidFanOutActivityId(step_id.to_owned()));
                 };
                 if fanout.origin_state != origin_state
-                    || fanout_index >= fanout.results.len()
-                    || !fanout.pending_activity_ids.iter().any(|activity_id| activity_id == step_id)
+                    || fanout_index >= fanout_total_count(&fanout)
+                    || !fanout_slot_is_pending(&fanout, fanout_index)
                 {
                     return Err(CompiledWorkflowError::UnexpectedFanOutActivity {
                         state: step_state.to_owned(),
                         activity_id: step_id.to_owned(),
+                    });
+                }
+                if fanout_reducer_settles(&fanout) {
+                    fanout_mark_completed(
+                        &mut fanout,
+                        fanout_index,
+                        Value::String(error.to_owned()),
+                        completion,
+                    );
+                    if fanout.pending_count == 0 {
+                        execution_state.bindings.remove(fanout_ref_var);
+                        if let Some(output_var) = output_var {
+                            execution_state.bindings.insert(
+                                output_var.clone(),
+                                reduce_fanout_terminal_payload(&fanout),
+                            );
+                        }
+                        return self.execute_from_state_in_graph(
+                            states,
+                            next,
+                            execution_state,
+                            false,
+                        );
+                    }
+                    execution_state.bindings.insert(
+                        fanout_ref_var.clone(),
+                        serde_json::to_value(&fanout).expect("fanout state serializes"),
+                    );
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: step_state.to_owned(),
+                        emissions: Vec::new(),
+                        execution_state,
+                        context: None,
+                        output: None,
                     });
                 }
                 execution_state.bindings.remove(fanout_ref_var);
@@ -1163,7 +1359,7 @@ impl CompiledWorkflowArtifact {
                 let input = evaluate_expression(input, &mut execution_state, &self.helpers)?;
                 Ok((handler.clone(), config.clone(), input))
             }
-            CompiledStateNode::FanOut { activity_type, config, .. } => {
+            CompiledStateNode::FanOut { activity_type, config, items, .. } => {
                 let Some((origin_state, index)) = parse_fanout_activity_id(step_state) else {
                     return Err(CompiledWorkflowError::InvalidFanOutActivityId(
                         step_state.to_owned(),
@@ -1175,11 +1371,17 @@ impl CompiledWorkflowArtifact {
                         state: origin_state.clone(),
                         activity_id: step_state.to_owned(),
                     })?;
-                Ok((
-                    activity_type.clone(),
-                    config.clone(),
-                    fanout.inputs.get(index).cloned().unwrap_or(Value::Null),
-                ))
+                let input = fanout.inputs.get(index).cloned().map(Ok).unwrap_or_else(|| {
+                    let mut replay_state = execution_state.clone();
+                    let evaluated = evaluate_expression(items, &mut replay_state, &self.helpers)?;
+                    let Value::Array(items) = evaluated else {
+                        return Err(CompiledWorkflowError::InvalidFanOutItems {
+                            state: origin_state.clone(),
+                        });
+                    };
+                    Ok(items.get(index).cloned().unwrap_or(Value::Null))
+                })?;
+                Ok((activity_type.clone(), config.clone(), input))
             }
             _ => Err(CompiledWorkflowError::NotWaitingOnStep(step_state.to_owned())),
         }
@@ -1243,7 +1445,7 @@ impl CompiledWorkflowArtifact {
     ) -> Option<(String, FanOutExecutionState)> {
         execution_state.bindings.iter().find_map(|(binding, value)| {
             let fanout = decode_fanout_state(value)?;
-            (fanout.origin_state == origin_state && index < fanout.inputs.len())
+            (fanout.origin_state == origin_state && index < fanout_total_count(&fanout))
                 .then_some((binding.clone(), fanout))
         })
     }
@@ -1357,6 +1559,7 @@ impl CompiledWorkflowArtifact {
                     next,
                     handle_var,
                     task_queue,
+                    reducer,
                     config,
                     ..
                 } => {
@@ -1387,9 +1590,10 @@ impl CompiledWorkflowArtifact {
                         {
                             execution_state.bindings.remove(fanout_ref_var);
                             if let Some(output_var) = output_var {
-                                execution_state
-                                    .bindings
-                                    .insert(output_var.clone(), Value::Array(Vec::new()));
+                                execution_state.bindings.insert(
+                                    output_var.clone(),
+                                    empty_fanout_terminal_payload(reducer.as_deref()),
+                                );
                             }
                             current_state = after_wait.clone();
                             continue;
@@ -1397,12 +1601,16 @@ impl CompiledWorkflowArtifact {
                         return Err(CompiledWorkflowError::NotWaitingOnFanOut(next.clone()));
                     }
 
-                    let mut pending_activity_ids = Vec::with_capacity(items.len());
-                    let mut results = Vec::with_capacity(items.len());
+                    let reducer_name = reducer.as_deref().unwrap_or("collect_results");
+                    let uses_materialized_results = reducer_name == "collect_results";
+                    let mut results = uses_materialized_results
+                        .then(|| Vec::with_capacity(items.len()))
+                        .unwrap_or_default();
                     for (index, item) in items.iter().enumerate() {
                         let activity_id = build_fanout_activity_id(&current_state, index);
-                        pending_activity_ids.push(activity_id.clone());
-                        results.push(None);
+                        if uses_materialized_results {
+                            results.push(None);
+                        }
                         emissions.push(ExecutionEmission {
                             event: WorkflowEvent::ActivityTaskScheduled {
                                 activity_id,
@@ -1428,9 +1636,25 @@ impl CompiledWorkflowArtifact {
                             origin_state: current_state.clone(),
                             wait_state: next.clone(),
                             task_queue,
-                            inputs: items.clone(),
-                            pending_activity_ids,
+                            total_count: items.len(),
+                            pending_count: items.len(),
+                            succeeded_count: 0,
+                            failed_count: 0,
+                            cancelled_count: 0,
+                            inputs: uses_materialized_results
+                                .then_some(items.clone())
+                                .unwrap_or_default(),
+                            pending_activity_ids: Vec::new(),
                             results,
+                            failed_activity_errors: BTreeMap::new(),
+                            first_failed_index: None,
+                            first_failed_error: None,
+                            reducer: reducer.clone(),
+                            settlement_bitmap: if uses_materialized_results {
+                                Vec::new()
+                            } else {
+                                vec![0; items.len().div_ceil(64)]
+                            },
                         })
                         .expect("fanout execution state serializes"),
                     );
@@ -1897,6 +2121,214 @@ fn bulk_reducer<'a>(bulk: &'a BulkActivityExecutionState) -> &'a str {
     bulk.reducer.as_deref().unwrap_or("collect_results")
 }
 
+fn fanout_reducer<'a>(fanout: &'a FanOutExecutionState) -> &'a str {
+    fanout.reducer.as_deref().unwrap_or("collect_results")
+}
+
+fn fanout_reducer_settles(fanout: &FanOutExecutionState) -> bool {
+    matches!(fanout_reducer(fanout), "all_settled" | "count")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionKind {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+fn fanout_total_count(fanout: &FanOutExecutionState) -> usize {
+    if fanout.total_count > 0 {
+        return fanout.total_count;
+    }
+    fanout.inputs.len().max(fanout.results.len()).max(fanout.pending_activity_ids.len()).max(
+        fanout
+            .failed_activity_errors
+            .last_key_value()
+            .map(|(index, _)| index.saturating_add(1))
+            .unwrap_or(0),
+    )
+}
+
+fn fanout_uses_counter_state(fanout: &FanOutExecutionState) -> bool {
+    !fanout.settlement_bitmap.is_empty()
+}
+
+fn fanout_bitmap_contains(fanout: &FanOutExecutionState, index: usize) -> bool {
+    let Some(word) = fanout.settlement_bitmap.get(index / 64) else {
+        return false;
+    };
+    let mask = 1u64 << (index % 64);
+    word & mask != 0
+}
+
+fn fanout_bitmap_mark(fanout: &mut FanOutExecutionState, index: usize) {
+    if let Some(word) = fanout.settlement_bitmap.get_mut(index / 64) {
+        *word |= 1u64 << (index % 64);
+    }
+}
+
+fn fanout_legacy_summary_counts(fanout: &FanOutExecutionState) -> (usize, usize, usize) {
+    let succeeded = fanout.results.iter().filter(|value| value.is_some()).count();
+    let failed = fanout.failed_activity_errors.len();
+    (succeeded, failed, 0)
+}
+
+fn fanout_summary_counts(fanout: &FanOutExecutionState) -> (usize, usize, usize) {
+    if fanout_uses_counter_state(fanout) {
+        return (fanout.succeeded_count, fanout.failed_count, fanout.cancelled_count);
+    }
+    fanout_legacy_summary_counts(fanout)
+}
+
+fn fanout_mark_completed(
+    fanout: &mut FanOutExecutionState,
+    index: usize,
+    value: Value,
+    completion: CompletionKind,
+) {
+    let error_message = (!matches!(completion, CompletionKind::Succeeded))
+        .then(|| value.as_str().unwrap_or("activity failed").to_owned());
+    fanout.pending_activity_ids.retain(|activity_id| {
+        activity_id != &build_fanout_activity_id(&fanout.origin_state, index)
+    });
+    fanout.pending_count = fanout_pending_count(fanout).saturating_sub(1);
+    if fanout_uses_counter_state(fanout) {
+        fanout_bitmap_mark(fanout, index);
+        match completion {
+            CompletionKind::Succeeded => {
+                fanout.succeeded_count = fanout.succeeded_count.saturating_add(1)
+            }
+            CompletionKind::Failed => fanout.failed_count = fanout.failed_count.saturating_add(1),
+            CompletionKind::Cancelled => {
+                fanout.cancelled_count = fanout.cancelled_count.saturating_add(1)
+            }
+        }
+        if !matches!(completion, CompletionKind::Succeeded)
+            && fanout.first_failed_index.map_or(true, |current| index < current)
+        {
+            fanout.first_failed_index = Some(index);
+            fanout.first_failed_error = error_message.clone();
+        }
+    } else {
+        if index < fanout.results.len() {
+            fanout.results[index] =
+                matches!(completion, CompletionKind::Succeeded).then_some(value);
+        }
+    }
+    if matches!(completion, CompletionKind::Succeeded) {
+        fanout.failed_activity_errors.remove(&index);
+    } else {
+        let error_message = error_message.expect("error message is present for failures");
+        if !fanout_uses_counter_state(fanout) {
+            fanout.failed_activity_errors.insert(index, error_message);
+        }
+    }
+}
+
+fn fanout_slot_is_pending(fanout: &FanOutExecutionState, index: usize) -> bool {
+    if index >= fanout_total_count(fanout) {
+        return false;
+    }
+    if !fanout.pending_activity_ids.is_empty() {
+        let activity_id = build_fanout_activity_id(&fanout.origin_state, index);
+        return fanout.pending_activity_ids.iter().any(|pending_id| pending_id == &activity_id);
+    }
+    if !fanout.settlement_bitmap.is_empty() {
+        return !fanout_bitmap_contains(fanout, index);
+    }
+    fanout.results.get(index).is_some_and(|slot| slot.is_none())
+        && !fanout.failed_activity_errors.contains_key(&index)
+}
+
+fn fanout_pending_count(fanout: &FanOutExecutionState) -> usize {
+    if fanout.pending_count > 0 {
+        return fanout.pending_count;
+    }
+    if fanout_uses_counter_state(fanout) {
+        return fanout_total_count(fanout).saturating_sub(
+            fanout.settlement_bitmap.iter().map(|word| word.count_ones() as usize).sum::<usize>(),
+        );
+    }
+    if !fanout.pending_activity_ids.is_empty() {
+        return fanout.pending_activity_ids.len();
+    }
+    fanout
+        .results
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| fanout_slot_is_pending(fanout, *index))
+        .count()
+}
+
+fn reduce_fanout_terminal_payload(fanout: &FanOutExecutionState) -> Value {
+    match fanout_reducer(fanout) {
+        "collect_results" => Value::Array(
+            fanout.results.iter().cloned().map(|value| value.unwrap_or(Value::Null)).collect(),
+        ),
+        reducer => {
+            let (succeeded, failed, cancelled) = fanout_summary_counts(fanout);
+            let terminal_status = if failed > 0 {
+                "failed"
+            } else if cancelled > 0 {
+                "cancelled"
+            } else {
+                "completed"
+            };
+            let mut summary = serde_json::json!({
+                "status": if fanout_reducer_settles(fanout) { "settled" } else { terminal_status },
+                "terminalStatus": terminal_status,
+                "totalItems": fanout_total_count(fanout),
+                "succeededItems": succeeded,
+                "failedItems": failed,
+                "cancelledItems": cancelled,
+            });
+            if reducer == "count" {
+                summary["count"] = Value::from(
+                    u64::try_from(succeeded + failed + cancelled)
+                        .expect("fanout completion count exceeds u64"),
+                );
+            }
+            summary
+        }
+    }
+}
+
+fn empty_fanout_terminal_payload(reducer: Option<&str>) -> Value {
+    let reducer = reducer.unwrap_or("collect_results");
+    if reducer == "collect_results" {
+        return Value::Array(Vec::new());
+    }
+    let mut summary = serde_json::json!({
+        "status": "settled",
+        "terminalStatus": "completed",
+        "totalItems": 0,
+        "succeededItems": 0,
+        "failedItems": 0,
+        "cancelledItems": 0,
+    });
+    if reducer == "count" {
+        summary["count"] = Value::from(0_u64);
+    }
+    summary
+}
+
+fn fanout_terminal_update(
+    event: &EventEnvelope<WorkflowEvent>,
+) -> Option<(&str, Value, CompletionKind)> {
+    match &event.payload {
+        WorkflowEvent::ActivityTaskCompleted { activity_id, output, .. } => {
+            Some((activity_id.as_str(), output.clone(), CompletionKind::Succeeded))
+        }
+        WorkflowEvent::ActivityTaskFailed { activity_id, error, .. } => {
+            Some((activity_id.as_str(), Value::String(error.clone()), CompletionKind::Failed))
+        }
+        WorkflowEvent::ActivityTaskCancelled { activity_id, reason, .. } => {
+            Some((activity_id.as_str(), Value::String(reason.clone()), CompletionKind::Cancelled))
+        }
+        _ => None,
+    }
+}
+
 fn bulk_reducer_settles(bulk: &BulkActivityExecutionState) -> bool {
     matches!(bulk_reducer(bulk), "all_settled" | "count")
 }
@@ -2349,6 +2781,7 @@ pub enum CompiledWorkflowError {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
     use serde_json::json;
 
     use super::*;
@@ -2476,7 +2909,10 @@ mod tests {
         artifact
     }
 
-    fn fanout_artifact(enable_retry: bool) -> CompiledWorkflowArtifact {
+    fn fanout_artifact_with_reducer(
+        enable_retry: bool,
+        reducer: Option<&str>,
+    ) -> CompiledWorkflowArtifact {
         let workflow = CompiledWorkflow {
             initial_state: "dispatch".to_owned(),
             states: BTreeMap::from([
@@ -2491,6 +2927,7 @@ mod tests {
                         next: "join".to_owned(),
                         handle_var: "fanout".to_owned(),
                         task_queue: None,
+                        reducer: reducer.map(str::to_owned),
                         retry: enable_retry
                             .then_some(RetryPolicy { max_attempts: 2, delay: "1s".to_owned() }),
                         config: None,
@@ -2531,6 +2968,32 @@ mod tests {
         );
         artifact.artifact_hash = artifact.hash();
         artifact
+    }
+
+    fn fanout_artifact(enable_retry: bool) -> CompiledWorkflowArtifact {
+        fanout_artifact_with_reducer(enable_retry, None)
+    }
+
+    fn terminal_event(
+        artifact: &CompiledWorkflowArtifact,
+        payload: WorkflowEvent,
+        occurred_at_ms: i64,
+    ) -> EventEnvelope<WorkflowEvent> {
+        let mut event = EventEnvelope::new(
+            payload.event_type(),
+            fabrik_events::WorkflowIdentity::new(
+                "tenant-a",
+                artifact.definition_id.clone(),
+                artifact.definition_version,
+                artifact.artifact_hash.clone(),
+                "instance-a",
+                "run-a",
+                "test",
+            ),
+            payload,
+        );
+        event.occurred_at = DateTime::<Utc>::from_timestamp_millis(occurred_at_ms).unwrap();
+        event
     }
 
     fn bulk_artifact_with_reducer(reducer: &str) -> CompiledWorkflowArtifact {
@@ -2903,6 +3366,269 @@ mod tests {
                 ..
             }) if reason == "boom"
         ));
+    }
+
+    #[test]
+    fn fanout_all_settled_waits_for_remaining_activities_before_completing() {
+        let artifact = fanout_artifact_with_reducer(false, Some("all_settled"));
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"items": [{"value": 1}, {"value": 2}, {"value": 3}]}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        let waiting = artifact
+            .execute_after_step_failure_with_turn(
+                "join",
+                "dispatch::2",
+                "later error",
+                plan.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_100).unwrap(),
+                },
+            )
+            .unwrap();
+        assert_eq!(waiting.final_state, "join");
+        assert!(waiting.emissions.is_empty());
+
+        let waiting = artifact
+            .execute_after_step_completion_with_turn(
+                "join",
+                "dispatch::1",
+                &json!({"value": 20}),
+                waiting.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_200).unwrap(),
+                },
+            )
+            .unwrap();
+        assert_eq!(waiting.final_state, "join");
+        assert!(waiting.emissions.is_empty());
+
+        let settled = artifact
+            .execute_after_step_failure_with_turn(
+                "join",
+                "dispatch::0",
+                "first error",
+                waiting.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_300).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(settled.final_state, "done");
+        assert!(matches!(
+            settled.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output["status"] == json!("settled")
+                && output["terminalStatus"] == json!("failed")
+                && output["succeededItems"] == json!(1)
+                && output["failedItems"] == json!(2)
+        ));
+    }
+
+    #[test]
+    fn fanout_all_settled_batch_apply_completes_in_one_transition() {
+        let artifact = fanout_artifact_with_reducer(false, Some("all_settled"));
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"items": [{"value": 1}, {"value": 2}, {"value": 3}]}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        let events = vec![
+            terminal_event(
+                &artifact,
+                WorkflowEvent::ActivityTaskFailed {
+                    activity_id: "dispatch::2".to_owned(),
+                    attempt: 1,
+                    error: "later error".to_owned(),
+                    worker_id: "worker-a".to_owned(),
+                    worker_build_id: "build-a".to_owned(),
+                },
+                1_700_000_000_100,
+            ),
+            terminal_event(
+                &artifact,
+                WorkflowEvent::ActivityTaskCompleted {
+                    activity_id: "dispatch::1".to_owned(),
+                    attempt: 1,
+                    output: json!({"value": 20}),
+                    worker_id: "worker-a".to_owned(),
+                    worker_build_id: "build-a".to_owned(),
+                },
+                1_700_000_000_200,
+            ),
+            terminal_event(
+                &artifact,
+                WorkflowEvent::ActivityTaskFailed {
+                    activity_id: "dispatch::0".to_owned(),
+                    attempt: 1,
+                    error: "first error".to_owned(),
+                    worker_id: "worker-a".to_owned(),
+                    worker_build_id: "build-a".to_owned(),
+                },
+                1_700_000_000_300,
+            ),
+        ];
+
+        let Some((settled, applied)) = artifact
+            .try_execute_after_step_terminal_batch("join", &events, plan.execution_state)
+            .unwrap()
+        else {
+            panic!("expected fanout batch fast path");
+        };
+
+        assert_eq!(applied, 3);
+        assert_eq!(settled.final_state, "done");
+        assert!(matches!(
+            settled.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output["status"] == json!("settled")
+                && output["terminalStatus"] == json!("failed")
+                && output["succeededItems"] == json!(1)
+                && output["failedItems"] == json!(2)
+        ));
+    }
+
+    #[test]
+    fn fanout_all_settled_intermediate_completion_drops_context_and_failure_map() {
+        let artifact = fanout_artifact_with_reducer(false, Some("all_settled"));
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"items": [{"value": 1}, {"value": 2}]}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        let waiting = artifact
+            .execute_after_step_failure_with_turn(
+                "join",
+                "dispatch::1",
+                "later error",
+                plan.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_100).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert!(waiting.context.is_none());
+        let fanout = artifact.fanout_binding("join", "fanout", &waiting.execution_state).unwrap();
+        assert!(fanout.failed_activity_errors.is_empty());
+        assert_eq!(fanout.first_failed_index, Some(1));
+        assert_eq!(fanout.first_failed_error.as_deref(), Some("later error"));
+    }
+
+    #[test]
+    fn fanout_count_reducer_emits_terminal_count_summary() {
+        let artifact = fanout_artifact_with_reducer(false, Some("count"));
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"items": [{"value": 1}, {"value": 2}, {"value": 3}]}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        let waiting = artifact
+            .execute_after_step_completion_with_turn(
+                "join",
+                "dispatch::2",
+                &json!({"value": 30}),
+                plan.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_100).unwrap(),
+                },
+            )
+            .unwrap();
+        let settled = artifact
+            .execute_after_step_failure_with_turn(
+                "join",
+                "dispatch::0",
+                "boom",
+                waiting.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_200).unwrap(),
+                },
+            )
+            .unwrap();
+        let settled = artifact
+            .execute_after_step_completion_with_turn(
+                "join",
+                "dispatch::1",
+                &json!({"value": 20}),
+                settled.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_300).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            settled.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output["status"] == json!("settled")
+                && output["count"] == json!(3)
+                && output["succeededItems"] == json!(2)
+                && output["failedItems"] == json!(1)
+        ));
+    }
+
+    #[test]
+    fn fanout_count_reducer_avoids_storing_inputs_and_reconstructs_retry_input() {
+        let artifact = fanout_artifact_with_reducer(true, Some("count"));
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"items": [{"value": 1}, {"value": 2}]}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        let fanout = artifact.fanout_binding("join", "fanout", &plan.execution_state).unwrap();
+        assert_eq!(fanout.total_count, 2);
+        assert!(fanout.inputs.is_empty());
+        assert!(fanout.results.is_empty());
+        assert_eq!(fanout.pending_count, 2);
+        assert_eq!(fanout.settlement_bitmap.len(), 1);
+
+        let retry = artifact.step_retry("join", &plan.execution_state).unwrap().unwrap();
+        assert_eq!(retry.max_attempts, 2);
+
+        let (activity_type, _config, input) =
+            artifact.step_details("dispatch::1", &plan.execution_state).unwrap();
+        assert_eq!(activity_type, "benchmark.echo");
+        assert_eq!(input, json!({"value": 2}));
     }
 
     #[test]

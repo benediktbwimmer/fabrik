@@ -17,10 +17,10 @@ use fabrik_config::{
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, serve};
 use fabrik_store::{
-    ActivityTerminalPayload, ActivityTerminalUpdate, AppliedActivityTerminalUpdate,
-    BulkChunkTerminalPayload, BulkChunkTerminalUpdate, TaskQueueKind, WorkflowActivityRecord,
-    WorkflowActivityStatus, WorkflowBulkChunkRecord, WorkflowMailboxKind, WorkflowResumeKind,
-    WorkflowStore, WorkflowTaskRecord,
+    ActivityStartUpdate, ActivityTerminalPayload, ActivityTerminalUpdate,
+    AppliedActivityTerminalUpdate, BulkChunkTerminalPayload, BulkChunkTerminalUpdate,
+    TaskQueueKind, WorkflowActivityRecord, WorkflowActivityStatus, WorkflowBulkChunkRecord,
+    WorkflowMailboxKind, WorkflowResumeKind, WorkflowStore, WorkflowTaskRecord,
 };
 use fabrik_throughput::{
     ThroughputBackend, bulk_reducer_class, decode_cbor, encode_cbor, planned_reduction_tree_depth,
@@ -30,8 +30,9 @@ use fabrik_worker_protocol::activity_worker::{
     Ack, ActivityTask, ActivityTaskResult, BulkActivityTask, BulkActivityTaskResult,
     CompleteActivityTaskRequest, CompleteWorkflowTaskRequest, FailActivityTaskRequest,
     FailWorkflowTaskRequest, PollActivityTaskRequest, PollActivityTaskResponse,
-    PollBulkActivityTaskRequest, PollBulkActivityTaskResponse, PollWorkflowTaskRequest,
-    PollWorkflowTaskResponse, RecordActivityHeartbeatRequest, RecordActivityHeartbeatResponse,
+    PollActivityTasksRequest, PollActivityTasksResponse, PollBulkActivityTaskRequest,
+    PollBulkActivityTaskResponse, PollWorkflowTaskRequest, PollWorkflowTaskResponse,
+    RecordActivityHeartbeatRequest, RecordActivityHeartbeatResponse,
     ReportActivityTaskCancelledRequest, ReportActivityTaskResultsRequest,
     ReportBulkActivityTaskResultsRequest, WorkflowTask, activity_task_result,
     activity_worker_api_server::{ActivityWorkerApi, ActivityWorkerApiServer},
@@ -172,16 +173,6 @@ impl ActivityPrefetchIndex {
             buffers.remove(worker_key);
         }
         item
-    }
-
-    async fn push_remaining(
-        &self,
-        worker_key: &str,
-        records: impl IntoIterator<Item = WorkflowActivityRecord>,
-    ) {
-        let mut buffers = self.buffers.lock().await;
-        let buffer = buffers.entry(worker_key.to_owned()).or_default();
-        buffer.extend(records);
     }
 }
 
@@ -727,97 +718,39 @@ impl ActivityWorkerApi for ActivityApi {
         request: Request<PollActivityTaskRequest>,
     ) -> Result<Response<PollActivityTaskResponse>, Status> {
         let request = request.into_inner();
-        if request.tenant_id.trim().is_empty() {
-            return Err(Status::invalid_argument("tenant_id is required"));
-        }
-        if request.task_queue.trim().is_empty() {
-            return Err(Status::invalid_argument("task_queue is required"));
-        }
-        if request.worker_id.trim().is_empty() {
-            return Err(Status::invalid_argument("worker_id is required"));
-        }
-        if request.worker_build_id.trim().is_empty() {
-            return Err(Status::invalid_argument("worker_build_id is required"));
-        }
-        let timeout_ms =
-            if request.poll_timeout_ms == 0 { 30_000 } else { request.poll_timeout_ms };
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
-        if !self
-            .state
-            .store
-            .is_build_compatible_with_queue(
-                &request.tenant_id,
-                TaskQueueKind::Activity,
-                &request.task_queue,
-                &request.worker_build_id,
-            )
-            .await
-            .map_err(internal_status)?
-        {
-            return Err(Status::permission_denied(
-                "worker build is not compatible with task queue",
-            ));
-        }
-        self.state
-            .store
-            .upsert_queue_poller(
-                &request.tenant_id,
-                TaskQueueKind::Activity,
-                &request.task_queue,
-                &request.worker_id,
-                &request.worker_build_id,
-                None,
-                None,
-                chrono::Duration::seconds(self.state.runtime.lease_ttl_seconds as i64),
-            )
-            .await
-            .map_err(internal_status)?;
-
-        let worker_key = activity_worker_key(
+        let tasks = poll_activity_tasks_for_worker(
+            &self.state,
             &request.tenant_id,
             &request.task_queue,
             &request.worker_id,
             &request.worker_build_id,
-        );
+            request.poll_timeout_ms,
+            1,
+        )
+        .await?;
+        Ok(Response::new(PollActivityTaskResponse { task: tasks.first().map(record_to_proto) }))
+    }
 
-        if let Some(record) = self.state.activity_prefetch.pop(&worker_key).await {
-            return Ok(Response::new(PollActivityTaskResponse {
-                task: Some(record_to_proto(&record)),
-            }));
-        }
-
-        loop {
-            let leased = lease_next_activities(
-                &self.state,
-                &request.tenant_id,
-                &request.task_queue,
-                &request.worker_id,
-                &request.worker_build_id,
-            )
-            .await
-            .map_err(internal_status)?;
-            if !leased.is_empty() {
-                let (first, remaining) = leased.split_first().expect("leased batch is non-empty");
-                if !remaining.is_empty() {
-                    self.state
-                        .activity_prefetch
-                        .push_remaining(&worker_key, remaining.iter().cloned())
-                        .await;
-                }
-                return Ok(Response::new(PollActivityTaskResponse {
-                    task: Some(record_to_proto(first)),
-                }));
-            }
-
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                return Ok(Response::new(PollActivityTaskResponse { task: None }));
-            }
-            let remaining = deadline.saturating_duration_since(now);
-            if tokio::time::timeout(remaining, self.state.queues.notify.notified()).await.is_err() {
-                return Ok(Response::new(PollActivityTaskResponse { task: None }));
-            }
-        }
+    async fn poll_activity_tasks(
+        &self,
+        request: Request<PollActivityTasksRequest>,
+    ) -> Result<Response<PollActivityTasksResponse>, Status> {
+        let request = request.into_inner();
+        let max_tasks =
+            usize::try_from(request.max_tasks.max(1)).unwrap_or(1).min(ACTIVITY_POLL_PREFETCH_SIZE);
+        let tasks = poll_activity_tasks_for_worker(
+            &self.state,
+            &request.tenant_id,
+            &request.task_queue,
+            &request.worker_id,
+            &request.worker_build_id,
+            request.poll_timeout_ms,
+            max_tasks,
+        )
+        .await?;
+        Ok(Response::new(PollActivityTasksResponse {
+            tasks: tasks.iter().map(record_to_proto).collect(),
+        }))
     }
 
     async fn poll_bulk_activity_task(
@@ -1810,12 +1743,14 @@ async fn lease_next_activities(
     task_queue: &str,
     worker_id: &str,
     worker_build_id: &str,
+    max_tasks: usize,
 ) -> Result<Vec<WorkflowActivityRecord>> {
     let queue_key = queue_key(tenant_id, task_queue);
-    let mut leased_records = Vec::new();
+    let mut start_updates = Vec::new();
     let mut started_envelopes = Vec::new();
+    let max_tasks = max_tasks.max(1).min(ACTIVITY_POLL_PREFETCH_SIZE);
 
-    while leased_records.len() < ACTIVITY_POLL_PREFETCH_SIZE {
+    while start_updates.len() < max_tasks {
         let Some(record) = state.queues.pop(&queue_key).await else {
             break;
         };
@@ -1839,48 +1774,37 @@ async fn lease_next_activities(
         }
 
         let occurred_at = Utc::now();
-        let event_id = Uuid::now_v7();
-        let lease_expires_at =
-            occurred_at + chrono::Duration::seconds(state.runtime.lease_ttl_seconds as i64);
-        if !state
-            .store
-            .mark_activity_started(
-                &record.tenant_id,
-                &record.instance_id,
-                &record.run_id,
-                &record.activity_id,
-                record.attempt,
-                worker_id,
-                worker_build_id,
-                lease_expires_at,
-                event_id,
-                "ActivityTaskStarted",
-                occurred_at,
-            )
-            .await?
-        {
-            continue;
-        }
+        start_updates.push(ActivityStartUpdate {
+            tenant_id: record.tenant_id,
+            instance_id: record.instance_id,
+            run_id: record.run_id,
+            activity_id: record.activity_id,
+            attempt: record.attempt,
+            worker_id: worker_id.to_owned(),
+            worker_build_id: worker_build_id.to_owned(),
+            lease_expires_at: occurred_at
+                + chrono::Duration::seconds(state.runtime.lease_ttl_seconds as i64),
+            event_id: Uuid::now_v7(),
+            event_type: "ActivityTaskStarted".to_owned(),
+            occurred_at,
+        });
+    }
 
-        let mut leased = record.clone();
-        leased.status = WorkflowActivityStatus::Started;
-        leased.worker_id = Some(worker_id.to_owned());
-        leased.worker_build_id = Some(worker_build_id.to_owned());
-        leased.started_at = Some(occurred_at);
-        leased.last_heartbeat_at = Some(occurred_at);
-        leased.lease_expires_at = Some(lease_expires_at);
+    let applied = state.store.mark_activities_started_batch(&start_updates).await?;
+    let mut leased_records = Vec::with_capacity(applied.len());
+    for started in applied {
         started_envelopes.push(build_activity_event_envelope(
-            &leased,
+            &started.record,
             WorkflowEvent::ActivityTaskStarted {
-                activity_id: leased.activity_id.clone(),
-                attempt: leased.attempt,
+                activity_id: started.record.activity_id.clone(),
+                attempt: started.record.attempt,
                 worker_id: worker_id.to_owned(),
                 worker_build_id: worker_build_id.to_owned(),
             },
-            event_id,
-            occurred_at,
+            started.event_id,
+            started.occurred_at,
         ));
-        leased_records.push(leased);
+        leased_records.push(started.record);
     }
 
     if !started_envelopes.is_empty() {
@@ -1888,6 +1812,99 @@ async fn lease_next_activities(
     }
 
     Ok(leased_records)
+}
+
+async fn poll_activity_tasks_for_worker(
+    state: &AppState,
+    tenant_id: &str,
+    task_queue: &str,
+    worker_id: &str,
+    worker_build_id: &str,
+    poll_timeout_ms: u64,
+    max_tasks: usize,
+) -> Result<Vec<WorkflowActivityRecord>, Status> {
+    if tenant_id.trim().is_empty() {
+        return Err(Status::invalid_argument("tenant_id is required"));
+    }
+    if task_queue.trim().is_empty() {
+        return Err(Status::invalid_argument("task_queue is required"));
+    }
+    if worker_id.trim().is_empty() {
+        return Err(Status::invalid_argument("worker_id is required"));
+    }
+    if worker_build_id.trim().is_empty() {
+        return Err(Status::invalid_argument("worker_build_id is required"));
+    }
+
+    let timeout_ms = if poll_timeout_ms == 0 { 30_000 } else { poll_timeout_ms };
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let max_tasks = max_tasks.max(1).min(ACTIVITY_POLL_PREFETCH_SIZE);
+
+    if !state
+        .store
+        .is_build_compatible_with_queue(
+            tenant_id,
+            TaskQueueKind::Activity,
+            task_queue,
+            worker_build_id,
+        )
+        .await
+        .map_err(internal_status)?
+    {
+        return Err(Status::permission_denied("worker build is not compatible with task queue"));
+    }
+    state
+        .store
+        .upsert_queue_poller(
+            tenant_id,
+            TaskQueueKind::Activity,
+            task_queue,
+            worker_id,
+            worker_build_id,
+            None,
+            None,
+            chrono::Duration::seconds(state.runtime.lease_ttl_seconds as i64),
+        )
+        .await
+        .map_err(internal_status)?;
+
+    let worker_key = activity_worker_key(tenant_id, task_queue, worker_id, worker_build_id);
+
+    loop {
+        let mut tasks = Vec::new();
+        while tasks.len() < max_tasks {
+            let Some(record) = state.activity_prefetch.pop(&worker_key).await else {
+                break;
+            };
+            tasks.push(record);
+        }
+        if !tasks.is_empty() {
+            return Ok(tasks);
+        }
+
+        let leased = lease_next_activities(
+            state,
+            tenant_id,
+            task_queue,
+            worker_id,
+            worker_build_id,
+            max_tasks,
+        )
+        .await
+        .map_err(internal_status)?;
+        if !leased.is_empty() {
+            return Ok(leased);
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Ok(Vec::new());
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        if tokio::time::timeout(remaining, state.queues.notify.notified()).await.is_err() {
+            return Ok(Vec::new());
+        }
+    }
 }
 
 async fn publish_timed_out_event(state: &AppState, record: &WorkflowActivityRecord) -> Result<()> {
@@ -3256,6 +3273,79 @@ mod tests {
             .context("first activity attempt should exist")?;
         assert_eq!(first_record.status, WorkflowActivityStatus::Started);
         assert_eq!(first_record.worker_build_id.as_deref(), Some("build-a"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn activity_batch_poll_returns_multiple_tasks() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let state = app_state(store.clone(), publisher);
+        let api = ActivityApi { state: state.clone() };
+
+        store
+            .register_task_queue_build(
+                "tenant-a",
+                TaskQueueKind::Activity,
+                "payments",
+                "build-a",
+                &[],
+                None,
+            )
+            .await?;
+        store
+            .upsert_compatibility_set(
+                "tenant-a",
+                TaskQueueKind::Activity,
+                "payments",
+                "stable",
+                &["build-a".to_owned()],
+                true,
+            )
+            .await?;
+
+        for (activity_id, amount) in [("a1", 10), ("a2", 20), ("a3", 30)] {
+            process_event(
+                &state,
+                0,
+                demo_event(WorkflowEvent::ActivityTaskScheduled {
+                    activity_id: activity_id.to_owned(),
+                    activity_type: "charge".to_owned(),
+                    task_queue: "payments".to_owned(),
+                    attempt: 1,
+                    input: json!({"amount": amount}),
+                    config: None,
+                    state: Some("pay".to_owned()),
+                    schedule_to_start_timeout_ms: None,
+                    start_to_close_timeout_ms: None,
+                    heartbeat_timeout_ms: None,
+                }),
+            )
+            .await?;
+        }
+
+        let response = api
+            .poll_activity_tasks(Request::new(PollActivityTasksRequest {
+                tenant_id: "tenant-a".to_owned(),
+                task_queue: "payments".to_owned(),
+                worker_id: "worker-a".to_owned(),
+                worker_build_id: "build-a".to_owned(),
+                poll_timeout_ms: 1,
+                max_tasks: 3,
+            }))
+            .await?
+            .into_inner();
+
+        assert_eq!(response.tasks.len(), 3);
+        assert_eq!(response.tasks[0].activity_id, "a1");
+        assert_eq!(response.tasks[1].activity_id, "a2");
+        assert_eq!(response.tasks[2].activity_id, "a3");
         Ok(())
     }
 
