@@ -156,6 +156,18 @@ node sdk/typescript-compiler/compiler.mjs \
   --out /tmp/order-workflow-artifact.json
 ```
 
+Analyze or package an existing Temporal TypeScript repo for Fabrik migration:
+
+```bash
+cargo run -p fabrik-cli -- \
+  migrate temporal ./path-to-temporal-app \
+  --output-dir /tmp/fabrik-migration
+```
+
+Migration policy and generated output contract:
+
+- [Temporal TypeScript Migration Policy](/Users/bene/code/fabrik/docs/temporal-typescript-migration.md)
+
 ## Near-Term Documentation Priorities
 
 - lock the Temporal-parity semantic contract

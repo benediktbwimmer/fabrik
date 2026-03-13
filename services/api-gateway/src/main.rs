@@ -227,7 +227,7 @@ fn build_app(state: AppState, service_name: String) -> Router {
     )
     .route(
         "/tenants/{tenant_id}/workflow-definitions",
-        get(proxy_to_query_get),
+        get(proxy_to_query_get).post(proxy_to_ingest),
     )
     .route(
         "/tenants/{tenant_id}/workflow-definitions/{definition_id}/latest",
@@ -247,7 +247,7 @@ fn build_app(state: AppState, service_name: String) -> Router {
     )
     .route(
         "/tenants/{tenant_id}/workflow-artifacts",
-        get(proxy_to_query_get),
+        get(proxy_to_query_get).post(proxy_to_ingest),
     )
     .route(
         "/tenants/{tenant_id}/workflow-artifacts/{definition_id}/latest",

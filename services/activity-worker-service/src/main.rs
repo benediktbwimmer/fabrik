@@ -1,6 +1,13 @@
-use std::{collections::VecDeque, env, sync::Arc, time::Duration};
+use std::{
+    collections::VecDeque,
+    env,
+    io::Write,
+    process::{Command, Stdio},
+    sync::Arc,
+    time::Duration,
+};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use fabrik_config::{GrpcServiceConfig, ThroughputPayloadStoreConfig, ThroughputPayloadStoreKind};
 use fabrik_throughput::{
     PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind, decode_cbor, encode_cbor,
@@ -30,6 +37,12 @@ const DEFAULT_RESULT_FLUSHER_CONCURRENCY: usize = 2;
 const DEFAULT_ACTIVITY_POLL_MAX_TASKS: u32 = 8;
 const DEFAULT_BULK_POLL_MAX_TASKS: u32 = 8;
 const MAX_BULK_CHUNK_INPUT_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone)]
+struct ManagedNodeActivityConfig {
+    node_executable: String,
+    bootstrap_path: String,
+}
 
 fn parse_env_flag(name: &str, default: bool) -> bool {
     env::var(name)
@@ -81,6 +94,13 @@ async fn main() -> Result<()> {
         .unwrap_or(DEFAULT_ACTIVITY_POLL_MAX_TASKS);
     let enable_activity_lanes = parse_env_flag("ACTIVITY_ENABLE_NORMAL_LANES", true);
     let enable_bulk_lanes = parse_env_flag("ACTIVITY_ENABLE_BULK_LANES", true);
+    let managed_node = env::var("ACTIVITY_NODE_BOOTSTRAP").ok().map(|bootstrap_path| {
+        Arc::new(ManagedNodeActivityConfig {
+            node_executable: env::var("ACTIVITY_NODE_EXECUTABLE")
+                .unwrap_or_else(|_| "node".to_owned()),
+            bootstrap_path,
+        })
+    });
     let client = Arc::new(Client::new());
     let payload_store = Arc::new(PayloadStore::from_config(build_payload_store_config()).await?);
 
@@ -98,6 +118,7 @@ async fn main() -> Result<()> {
         bulk_poll_max_tasks,
         enable_activity_lanes,
         enable_bulk_lanes,
+        managed_node_bootstrap = managed_node.as_ref().map(|config| config.bootstrap_path.as_str()),
         port = config.port,
         "activity-worker-service starting"
     );
@@ -144,6 +165,7 @@ async fn main() -> Result<()> {
                 worker_build_id.clone(),
                 activity_poll_max_tasks,
                 client.clone(),
+                managed_node.clone(),
                 result_txs[lane % result_txs.len()].clone(),
             ));
         }
@@ -160,6 +182,7 @@ async fn main() -> Result<()> {
                 worker_build_id.clone(),
                 client.clone(),
                 payload_store.clone(),
+                managed_node.clone(),
                 bulk_poll_max_tasks,
                 bulk_result_txs[lane % bulk_result_txs.len()].clone(),
             ));
@@ -468,6 +491,7 @@ async fn run_activity_lane(
     worker_build_id: String,
     activity_poll_max_tasks: u32,
     client: Arc<Client>,
+    managed_node: Option<Arc<ManagedNodeActivityConfig>>,
     result_tx: UnboundedSender<ActivityTaskResult>,
 ) -> Result<()> {
     let mut worker = connect_activity_worker_with_retry(&endpoint, &worker_id).await;
@@ -521,6 +545,7 @@ async fn run_activity_lane(
 
         let activity_result = execute_activity_task(
             client.as_ref(),
+            managed_node.as_deref(),
             task,
             worker_id.clone(),
             worker_build_id.clone(),
@@ -540,6 +565,7 @@ async fn run_bulk_activity_lane(
     worker_build_id: String,
     client: Arc<Client>,
     payload_store: Arc<PayloadStore>,
+    managed_node: Option<Arc<ManagedNodeActivityConfig>>,
     bulk_poll_max_tasks: u32,
     result_tx: UnboundedSender<BulkActivityTaskResult>,
 ) -> Result<()> {
@@ -577,6 +603,7 @@ async fn run_bulk_activity_lane(
                 task,
                 worker_id.clone(),
                 worker_build_id.clone(),
+                managed_node.as_deref(),
             )
             .await?;
             if result_tx.send(activity_result).is_err() {
@@ -586,11 +613,17 @@ async fn run_bulk_activity_lane(
     }
 }
 
-fn encode_bulk_completed_result(outputs: &[Value]) -> Result<BulkActivityTaskCompletedResult> {
+fn encode_bulk_completed_result(
+    outputs: Option<&[Value]>,
+) -> Result<BulkActivityTaskCompletedResult> {
+    let output_cbor = match outputs {
+        Some(outputs) => encode_cbor(&Value::Array(outputs.to_vec()), "bulk result output")?,
+        None => Vec::new(),
+    };
     Ok(BulkActivityTaskCompletedResult {
         output_json: String::new(),
         result_handle_json: String::new(),
-        output_cbor: encode_cbor(&Value::Array(outputs.to_vec()), "bulk result output")?,
+        output_cbor,
         result_handle_cbor: Vec::new(),
     })
 }
@@ -622,6 +655,7 @@ async fn connect_activity_worker_with_retry(
 
 async fn execute_activity_task(
     client: &Client,
+    managed_node: Option<&ManagedNodeActivityConfig>,
     task: fabrik_worker_protocol::activity_worker::ActivityTask,
     worker_id: String,
     worker_build_id: String,
@@ -631,6 +665,7 @@ async fn execute_activity_task(
     } else {
         execute_activity(
             client,
+            managed_node,
             &task.activity_type,
             task.attempt,
             parse_activity_task_config(&task)?,
@@ -776,16 +811,24 @@ async fn execute_bulk_activity_task(
     task: fabrik_worker_protocol::activity_worker::BulkActivityTask,
     worker_id: String,
     worker_build_id: String,
+    managed_node: Option<&ManagedNodeActivityConfig>,
 ) -> Result<BulkActivityTaskResult> {
     let input_handle = task_input_handle(&task)?;
     let items = resolve_bulk_task_items(payload_store, &task, input_handle.as_ref()).await?;
     if task.activity_type == "benchmark.echo" {
         return execute_benchmark_echo_bulk_task(task, worker_id, worker_build_id, items);
     }
-    let mut outputs = Vec::with_capacity(items.len());
+    let omit_success_output = task.omit_success_output;
+    let mut outputs = (!omit_success_output).then(|| Vec::with_capacity(items.len()));
     for item in items {
-        match execute_activity(client, &task.activity_type, task.attempt, None, &item).await {
-            Ok(output) => outputs.push(output),
+        match execute_activity(client, managed_node, &task.activity_type, task.attempt, None, &item)
+            .await
+        {
+            Ok(output) => {
+                if let Some(outputs) = outputs.as_mut() {
+                    outputs.push(output);
+                }
+            }
             Err(error) if error.to_string() == "activity cancelled" => {
                 return Ok(BulkActivityTaskResult {
                     tenant_id: task.tenant_id,
@@ -858,7 +901,7 @@ async fn execute_bulk_activity_task(
         report_id: Uuid::now_v7().to_string(),
         result: Some(
             fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
-                encode_bulk_completed_result(&outputs)?,
+                encode_bulk_completed_result(outputs.as_deref())?,
             ),
         ),
     })
@@ -870,10 +913,15 @@ fn execute_benchmark_echo_bulk_task(
     worker_build_id: String,
     items: Vec<Value>,
 ) -> Result<BulkActivityTaskResult> {
-    let mut outputs = Vec::with_capacity(items.len());
+    let omit_success_output = task.omit_success_output;
+    let mut outputs = (!omit_success_output).then(|| Vec::with_capacity(items.len()));
     for item in items {
         match execute_benchmark_echo(task.attempt, &item) {
-            Ok(output) => outputs.push(output),
+            Ok(output) => {
+                if let Some(outputs) = outputs.as_mut() {
+                    outputs.push(output);
+                }
+            }
             Err(error) if error.to_string() == "activity cancelled" => {
                 return Ok(BulkActivityTaskResult {
                     tenant_id: task.tenant_id,
@@ -946,7 +994,7 @@ fn execute_benchmark_echo_bulk_task(
         report_id: Uuid::now_v7().to_string(),
         result: Some(
             fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
-                encode_bulk_completed_result(&outputs)?,
+                encode_bulk_completed_result(outputs.as_deref())?,
             ),
         ),
     })
@@ -1082,6 +1130,7 @@ fn lane_worker_id(base_worker_id: &str, lane: usize, concurrency: usize) -> Stri
 
 async fn execute_activity(
     client: &Client,
+    managed_node: Option<&ManagedNodeActivityConfig>,
     activity_type: &str,
     attempt: u32,
     config: Option<Value>,
@@ -1093,7 +1142,60 @@ async fn execute_activity(
     if activity_type == "http.request" {
         return execute_http_request(client, config.as_ref(), input, "activity-worker").await;
     }
+    if let Some(managed_node) = managed_node {
+        return execute_managed_node_activity(managed_node, activity_type, input, config.as_ref());
+    }
     execute_handler(activity_type, input).map_err(anyhow::Error::from)
+}
+
+fn execute_managed_node_activity(
+    managed_node: &ManagedNodeActivityConfig,
+    activity_type: &str,
+    input: &Value,
+    config: Option<&Value>,
+) -> Result<Value> {
+    let envelope = serde_json::to_vec(&serde_json::json!({
+        "activity_type": activity_type,
+        "input": input,
+        "config": config.cloned().unwrap_or(Value::Null),
+    }))?;
+    let mut child = Command::new(&managed_node.node_executable)
+        .arg(&managed_node.bootstrap_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to start managed Node activity bootstrap {}",
+                managed_node.bootstrap_path
+            )
+        })?;
+    {
+        let stdin = child.stdin.as_mut().context("managed Node bootstrap stdin unavailable")?;
+        stdin.write_all(&envelope)?;
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        anyhow::bail!(
+            "managed Node activity bootstrap failed for {activity_type}: {}",
+            if stderr.is_empty() { "unknown error" } else { &stderr }
+        );
+    }
+    let response: Value = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!("managed Node activity bootstrap produced invalid JSON for {activity_type}")
+    })?;
+    if response.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return Ok(response.get("output").cloned().unwrap_or(Value::Null));
+    }
+    anyhow::bail!(
+        "{}",
+        response
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("managed Node activity failed without an explicit error")
+    )
 }
 
 fn build_payload_store_config() -> PayloadStoreConfig {
@@ -1218,6 +1320,10 @@ async fn response_body(response: Response) -> Result<Value> {
 mod tests {
     use super::*;
     use fabrik_worker_protocol::activity_worker::{ActivityTask, BulkActivityTask};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn cbor_null_input_handle_is_treated_as_absent() {
@@ -1305,5 +1411,63 @@ mod tests {
         let error =
             execute_benchmark_echo_task_without_output(&task).expect_err("task should fail");
         assert_eq!(error.to_string(), "benchmark configured failure on attempt 1");
+    }
+
+    #[test]
+    fn bulk_completed_results_elide_success_payload_when_requested() {
+        let completed = encode_bulk_completed_result(None).expect("encode completed bulk result");
+
+        assert!(completed.output_json.is_empty());
+        assert!(completed.output_cbor.is_empty());
+        assert!(completed.result_handle_json.is_empty());
+        assert!(completed.result_handle_cbor.is_empty());
+    }
+
+    #[test]
+    fn bulk_completed_results_encode_cbor_when_outputs_present() {
+        let completed = encode_bulk_completed_result(Some(&[serde_json::json!({"ok": true})]))
+            .expect("encode completed bulk result");
+
+        assert!(completed.output_json.is_empty());
+        assert!(!completed.output_cbor.is_empty());
+    }
+
+    #[test]
+    fn managed_node_activity_executes_exported_function() {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos();
+        let dir = std::env::temp_dir().join(format!("managed-node-activity-{nonce}"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let module_path = dir.join("activities.mjs");
+        let bootstrap_path = dir.join("bootstrap.mjs");
+        fs::write(&module_path, "export async function greet(name) { return `hello ${name}`; }\n")
+            .expect("write module");
+        fs::write(
+            &bootstrap_path,
+            format!(
+                "import {{ pathToFileURL }} from 'node:url';\n\
+                 const stdin = await new Promise((resolve, reject) => {{\n\
+                   let data = '';\n\
+                   process.stdin.setEncoding('utf8');\n\
+                   process.stdin.on('data', (chunk) => {{ data += chunk; }});\n\
+                   process.stdin.on('end', () => resolve(data));\n\
+                   process.stdin.on('error', reject);\n\
+                 }});\n\
+                 const request = JSON.parse(stdin || '{{}}');\n\
+                 const mod = await import(pathToFileURL({module_path:?}).href);\n\
+                 const result = await mod[request.activity_type](...(Array.isArray(request.input) ? request.input : [request.input]));\n\
+                 process.stdout.write(JSON.stringify({{ ok: true, output: result }}));\n",
+                module_path = module_path.display().to_string()
+            ),
+        )
+        .expect("write bootstrap");
+
+        let config = ManagedNodeActivityConfig {
+            node_executable: "node".to_owned(),
+            bootstrap_path: bootstrap_path.display().to_string(),
+        };
+        let output =
+            execute_managed_node_activity(&config, "greet", &serde_json::json!(["alice"]), None)
+                .expect("managed activity succeeds");
+        assert_eq!(output, serde_json::json!("hello alice"));
     }
 }

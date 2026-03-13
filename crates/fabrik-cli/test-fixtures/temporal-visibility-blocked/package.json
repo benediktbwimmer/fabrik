@@ -1,0 +1,8 @@
+{
+  "name": "temporal-visibility-blocked",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@temporalio/client": "^1.15.0"
+  }
+}

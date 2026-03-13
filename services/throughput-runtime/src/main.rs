@@ -1507,7 +1507,7 @@ impl ActivityWorkerApi for WorkerApi {
                             },
                         ));
                     }
-                    leased_tasks.push(bulk_chunk_to_proto(&leased, request.supports_cbor));
+                    leased_tasks.push(bulk_chunk_to_proto(&leased_local, request.supports_cbor));
                 }
                 let lease_projection_result =
                     publish_projection_records(&self.state, projection_records).await;
@@ -1675,9 +1675,13 @@ impl ActivityWorkerApi for WorkerApi {
                     }
                     PreparedReportApply::Accepted(projected) => projected,
                 };
-                let terminal_artifacts = materialize_chunk_terminal_artifacts(&self.state, &report)
-                    .await
-                    .map_err(internal_status)?;
+                let terminal_artifacts = materialize_chunk_terminal_artifacts(
+                    &self.state,
+                    &report,
+                    projected.batch_reducer.as_deref(),
+                )
+                .await
+                .map_err(internal_status)?;
                 projection_records.extend(projected_apply_projection_records(
                     &report,
                     &projected,
@@ -1874,8 +1878,13 @@ async fn build_stream_projection_records(
     let aggregation_tree_depth =
         planned_reduction_tree_depth(chunk_count, effective_group_count, reducer.as_deref());
     let batch_input_handle = externalize_batch_input(app_state, batch_id, items).await?;
-    let batch_result_handle =
-        maybe_initialize_batch_result_manifest(app_state, batch_id, result_handle).await?;
+    let batch_result_handle = maybe_initialize_batch_result_manifest(
+        app_state,
+        batch_id,
+        result_handle,
+        reducer.as_deref(),
+    )
+    .await?;
     let batch = fabrik_store::WorkflowBulkBatchRecord {
         tenant_id: event.tenant_id.clone(),
         instance_id: event.instance_id.clone(),
@@ -2158,7 +2167,11 @@ async fn maybe_initialize_batch_result_manifest(
     state: &AppState,
     batch_id: &str,
     default_handle: &Value,
+    reducer: Option<&str>,
 ) -> Result<Value> {
+    if !bulk_reducer_materializes_results(reducer) {
+        return Ok(Value::Null);
+    }
     let handle = PayloadHandle::Manifest {
         key: format!("batches/{batch_id}/results/manifest"),
         store: state.payload_store.default_store_kind().as_str().to_owned(),
@@ -2185,9 +2198,17 @@ async fn maybe_externalize_chunk_output(
 async fn materialize_chunk_terminal_artifacts(
     state: &AppState,
     report: &ThroughputChunkReport,
+    reducer: Option<&str>,
 ) -> Result<ChunkTerminalArtifacts> {
     match &report.payload {
         ThroughputChunkReportPayload::ChunkCompleted { result_handle, output } => {
+            if !bulk_reducer_materializes_results(reducer) {
+                return Ok(ChunkTerminalArtifacts {
+                    result_handle: None,
+                    cancellation_reason: None,
+                    cancellation_metadata: None,
+                });
+            }
             let resolved_result_handle = if result_handle.is_null() {
                 let Some(output) = output else {
                     anyhow::bail!(
@@ -2787,6 +2808,9 @@ async fn sync_projection_batch_result_manifest(
     else {
         return Ok(());
     };
+    if !bulk_reducer_materializes_results(batch.reducer.as_deref()) {
+        return Ok(());
+    }
     let chunks = state
         .store
         .list_bulk_chunks_for_batch_page_query_view(
@@ -2935,15 +2959,15 @@ fn throughput_report_from_result(
     })
 }
 
-fn bulk_chunk_to_proto(record: &WorkflowBulkChunkRecord, supports_cbor: bool) -> BulkActivityTask {
+fn bulk_chunk_to_proto(record: &LeasedChunkSnapshot, supports_cbor: bool) -> BulkActivityTask {
     BulkActivityTask {
-        tenant_id: record.tenant_id.clone(),
+        tenant_id: record.identity.tenant_id.clone(),
         definition_id: record.definition_id.clone(),
         definition_version: record.definition_version.unwrap_or_default(),
         artifact_hash: record.artifact_hash.clone().unwrap_or_default(),
-        instance_id: record.instance_id.clone(),
-        run_id: record.run_id.clone(),
-        batch_id: record.batch_id.clone(),
+        instance_id: record.identity.instance_id.clone(),
+        run_id: record.identity.run_id.clone(),
+        batch_id: record.identity.batch_id.clone(),
         chunk_id: record.chunk_id.clone(),
         chunk_index: record.chunk_index,
         group_id: record.group_id,
@@ -2970,9 +2994,10 @@ fn bulk_chunk_to_proto(record: &WorkflowBulkChunkRecord, supports_cbor: bool) ->
             .map(|value| value.timestamp_millis())
             .unwrap_or_default(),
         cancellation_requested: record.cancellation_requested,
-        lease_token: record.lease_token.map(|value| value.to_string()).unwrap_or_default(),
+        lease_token: record.lease_token.clone().unwrap_or_default(),
         lease_epoch: record.lease_epoch,
         owner_epoch: record.owner_epoch,
+        omit_success_output: record.omit_success_output,
     }
 }
 
@@ -2983,6 +3008,10 @@ fn batch_identity(record: &WorkflowBulkChunkRecord) -> ThroughputBatchIdentity {
         run_id: record.run_id.clone(),
         batch_id: record.batch_id.clone(),
     }
+}
+
+fn bulk_reducer_materializes_results(reducer: Option<&str>) -> bool {
+    matches!(reducer.unwrap_or("collect_results"), "collect_results" | "collect_settled_results")
 }
 
 fn projected_apply_projection_records(
@@ -3207,6 +3236,45 @@ mod tests {
 
         assert_eq!(actual_handle, result_handle);
         assert_eq!(output, Some(vec![serde_json::json!({"ok": true})]));
+    }
+
+    #[test]
+    fn throughput_report_from_result_accepts_elided_completed_payloads() {
+        let result = BulkActivityTaskResult {
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "wf-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            batch_id: "batch-a".to_owned(),
+            chunk_id: "chunk-a".to_owned(),
+            chunk_index: 0,
+            group_id: 0,
+            attempt: 1,
+            worker_id: "worker-a".to_owned(),
+            worker_build_id: "build-a".to_owned(),
+            lease_token: Uuid::now_v7().to_string(),
+            lease_epoch: 1,
+            owner_epoch: 1,
+            report_id: "report-a".to_owned(),
+            result: Some(
+                fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
+                    fabrik_worker_protocol::activity_worker::BulkActivityTaskCompletedResult {
+                        output_json: String::new(),
+                        result_handle_json: String::new(),
+                        output_cbor: Vec::new(),
+                        result_handle_cbor: Vec::new(),
+                    },
+                ),
+            ),
+        };
+
+        let report = throughput_report_from_result(result).expect("elided result should decode");
+        let ThroughputChunkReportPayload::ChunkCompleted { result_handle, output } = report.payload
+        else {
+            panic!("expected completed payload");
+        };
+
+        assert_eq!(result_handle, Value::Null);
+        assert_eq!(output, None);
     }
 }
 

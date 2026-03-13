@@ -2162,6 +2162,7 @@ fn bulk_chunk_to_proto(record: &WorkflowBulkChunkRecord, supports_cbor: bool) ->
         lease_token: record.lease_token.map(|value| value.to_string()).unwrap_or_default(),
         lease_epoch: record.lease_epoch,
         owner_epoch: record.owner_epoch,
+        omit_success_output: false,
     }
 }
 

@@ -92,6 +92,7 @@ message BulkActivityTask {
   string lease_token = 17;
   uint64 lease_epoch = 19;
   uint64 owner_epoch = 20;
+  bool omit_success_output = 25;
 }
 
 message PollBulkActivityTaskResponse {

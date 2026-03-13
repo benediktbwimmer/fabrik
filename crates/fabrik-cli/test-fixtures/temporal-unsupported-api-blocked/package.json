@@ -1,0 +1,8 @@
+{
+  "name": "temporal-unsupported-api-blocked",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@temporalio/workflow": "^1.15.0"
+  }
+}

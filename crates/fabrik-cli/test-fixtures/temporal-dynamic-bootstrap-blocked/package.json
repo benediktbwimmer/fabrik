@@ -1,0 +1,8 @@
+{
+  "name": "temporal-dynamic-bootstrap-blocked",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@temporalio/worker": "^1.15.0"
+  }
+}

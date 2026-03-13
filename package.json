@@ -6,6 +6,7 @@
   "scripts": {
     "compile:workflow": "node sdk/typescript-compiler/compiler.mjs",
     "test:compiler": "node --test sdk/typescript-compiler/compiler.test.mjs",
+    "test:migration-analyzer": "node --test sdk/typescript-compiler/migration-analyzer.test.mjs",
     "test:benchmarks": "node --test benchmarks/temporal-comparison/helpers.test.mjs",
     "benchmark:compare-temporal": "bash scripts/run-temporal-comparison-benchmark.sh",
     "ui:dev": "npm --prefix apps/fabrik-console run dev",

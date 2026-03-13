@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/fabrik-broker",
+    "crates/fabrik-cli",
     "crates/fabrik-config",
     "crates/fabrik-events",
     "crates/fabrik-service",

@@ -1232,6 +1232,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fabrik-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "fabrik-workflow",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "fabrik-config"
 version = "0.1.0"
 dependencies = [

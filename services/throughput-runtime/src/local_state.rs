@@ -148,6 +148,10 @@ fn default_reducer_class() -> String {
     "legacy".to_owned()
 }
 
+fn batch_reducer_materializes_results(reducer: Option<&str>) -> bool {
+    matches!(reducer.unwrap_or("collect_results"), "collect_results" | "collect_settled_results")
+}
+
 fn default_aggregation_tree_depth() -> u32 {
     1
 }
@@ -278,6 +282,7 @@ pub struct LeasedChunkSnapshot {
     pub retry_delay_ms: u64,
     pub items: Vec<Value>,
     pub input_handle: Value,
+    pub omit_success_output: bool,
     pub cancellation_requested: bool,
     pub lease_epoch: u64,
     pub owner_epoch: u64,
@@ -1053,6 +1058,7 @@ impl LocalThroughputState {
                 retry_delay_ms: leased_chunk.retry_delay_ms,
                 items: leased_chunk.items.clone(),
                 input_handle: leased_chunk.input_handle.clone(),
+                omit_success_output: !batch_reducer_materializes_results(batch.reducer.as_deref()),
                 cancellation_requested: leased_chunk.cancellation_requested,
                 lease_epoch: leased_chunk.lease_epoch,
                 owner_epoch: leased_chunk.owner_epoch,

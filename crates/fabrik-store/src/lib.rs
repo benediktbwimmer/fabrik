@@ -5562,6 +5562,7 @@ impl WorkflowStore {
               AND (mailbox_backlog > 0 OR resume_backlog > 0)
               AND (status = 'pending' OR (status = 'leased' AND lease_expires_at <= $2))
             ORDER BY
+                attempt_count ASC,
                 CASE WHEN preferred_build_id = $3 THEN 0 ELSE 1 END,
                 created_at ASC
             LIMIT 128
@@ -13371,6 +13372,128 @@ mod tests {
             .lease_next_workflow_task(2, "poller-b", "build-b", chrono::Duration::seconds(30))
             .await?;
         assert!(incompatible.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workflow_task_lease_prioritizes_lower_attempt_count() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+
+        store
+            .register_task_queue_build(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "payments",
+                "build-a",
+                &["artifact-a".to_owned()],
+                None,
+            )
+            .await?;
+        store
+            .upsert_compatibility_set(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "payments",
+                "stable",
+                &["build-a".to_owned()],
+                true,
+            )
+            .await?;
+
+        let first = store
+            .enqueue_workflow_task(2, "payments", None, &demo_event("artifact-a"))
+            .await?
+            .context("first workflow task should be created")?;
+        let first_lease = store
+            .lease_next_workflow_task(2, "poller-a", "build-a", chrono::Duration::seconds(30))
+            .await?
+            .context("first workflow task should be leased")?;
+        assert_eq!(first_lease.task_id, first.task_id);
+        store
+            .fail_workflow_task(
+                first.task_id,
+                "poller-a",
+                "build-a",
+                "poisoned task",
+                chrono::Utc::now(),
+            )
+            .await?;
+
+        let second = store
+            .enqueue_workflow_task(2, "payments", None, &demo_event("artifact-a"))
+            .await?
+            .context("second workflow task should be created")?;
+
+        let next = store
+            .lease_next_workflow_task(2, "poller-a", "build-a", chrono::Duration::seconds(30))
+            .await?
+            .context("lower-attempt workflow task should be leased first")?;
+        assert_eq!(next.task_id, second.task_id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sticky_preference_does_not_starve_lower_attempt_workflow_task() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+
+        store
+            .register_task_queue_build(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "payments",
+                "build-a",
+                &["artifact-a".to_owned()],
+                None,
+            )
+            .await?;
+        store
+            .upsert_compatibility_set(
+                "tenant-a",
+                TaskQueueKind::Workflow,
+                "payments",
+                "stable",
+                &["build-a".to_owned()],
+                true,
+            )
+            .await?;
+
+        let sticky = store
+            .enqueue_workflow_task(2, "payments", Some("build-a"), &demo_event("artifact-a"))
+            .await?
+            .context("sticky workflow task should be created")?;
+        let sticky_lease = store
+            .lease_next_workflow_task(2, "poller-a", "build-a", chrono::Duration::seconds(30))
+            .await?
+            .context("sticky workflow task should be leased")?;
+        assert_eq!(sticky_lease.task_id, sticky.task_id);
+        store
+            .fail_workflow_task(
+                sticky.task_id,
+                "poller-a",
+                "build-a",
+                "sticky poisoned task",
+                chrono::Utc::now(),
+            )
+            .await?;
+
+        let fresh = store
+            .enqueue_workflow_task(2, "payments", None, &demo_event("artifact-a"))
+            .await?
+            .context("fresh workflow task should be created")?;
+
+        let leased = store
+            .lease_next_workflow_task(2, "poller-a", "build-a", chrono::Duration::seconds(30))
+            .await?
+            .context("lower-attempt workflow task should beat sticky retry")?;
+        assert_eq!(leased.task_id, fresh.task_id);
 
         Ok(())
     }
