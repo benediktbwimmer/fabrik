@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_throughput::{
-    BULK_REDUCER_AVG, BULK_REDUCER_MAX, BULK_REDUCER_MIN, BULK_REDUCER_SUM,
-    DEFAULT_AGGREGATION_GROUP_COUNT, PayloadHandle, ThroughputBackend, bulk_reducer_reduce_values,
-    bulk_reducer_requires_success_outputs, bulk_reducer_summary_field_name,
+    DEFAULT_AGGREGATION_GROUP_COUNT, PayloadHandle, ThroughputBackend,
+    bulk_reducer_default_summary_value, bulk_reducer_reduce_values,
+    bulk_reducer_requires_success_outputs, bulk_reducer_settles as throughput_bulk_reducer_settles,
+    bulk_reducer_summary_field_name,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
@@ -119,9 +120,20 @@ pub enum CompiledStateNode {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         schedule_to_start_timeout_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        schedule_to_close_timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         start_to_close_timeout_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         heartbeat_timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_var: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on_error: Option<ErrorTransition>,
+    },
+    DynamicStep {
+        descriptor: Expression,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_var: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -142,6 +154,8 @@ pub enum CompiledStateNode {
         config: Option<StepConfig>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         schedule_to_start_timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schedule_to_close_timeout_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         start_to_close_timeout_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -354,6 +368,9 @@ pub enum Expression {
         max_supported: u32,
     },
     Now,
+    Random {
+        scope: String,
+    },
     Uuid {
         scope: String,
     },
@@ -525,6 +542,19 @@ struct FanOutExecutionState {
     pub reducer: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub settlement_bitmap: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct DynamicActivityDescriptor {
+    activity_type: String,
+    input: Value,
+    task_queue: Option<String>,
+    retry: Option<RetryPolicy>,
+    config: Option<StepConfig>,
+    schedule_to_start_timeout_ms: Option<u64>,
+    schedule_to_close_timeout_ms: Option<u64>,
+    start_to_close_timeout_ms: Option<u64>,
+    heartbeat_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -881,6 +911,35 @@ impl CompiledWorkflowArtifact {
                     expected: event_type.clone(),
                     received: signal_type.to_owned(),
                 })
+            }
+            _ => Err(CompiledWorkflowError::NotWaitingOnSignal(wait_state.to_owned())),
+        }
+    }
+
+    pub fn execute_after_workflow_cancellation_with_turn(
+        &self,
+        wait_state: &str,
+        reason: &str,
+        mut execution_state: ArtifactExecutionState,
+        turn_context: ExecutionTurnContext,
+    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
+        execution_state.turn_context = Some(turn_context);
+        let states = self
+            .states_for(wait_state, &execution_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
+        let state = states
+            .get(wait_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
+        match state {
+            CompiledStateNode::WaitForEvent { event_type, next, output_var }
+                if event_type == "__workflow_cancellation_requested" =>
+            {
+                if let Some(output_var) = output_var {
+                    execution_state
+                        .bindings
+                        .insert(output_var.clone(), Value::String(reason.to_owned()));
+                }
+                self.execute_from_state_in_graph(states, next, execution_state, false)
             }
             _ => Err(CompiledWorkflowError::NotWaitingOnSignal(wait_state.to_owned())),
         }
@@ -1381,7 +1440,10 @@ impl CompiledWorkflowArtifact {
             .get(step_state)
             .ok_or_else(|| CompiledWorkflowError::UnknownState(step_state.to_owned()))?;
         match state {
-            CompiledStateNode::Step { next, output_var, .. } if step_state == step_id => {
+            CompiledStateNode::Step { next, output_var, .. }
+            | CompiledStateNode::DynamicStep { next, output_var, .. }
+                if step_state == step_id =>
+            {
                 if let Some(output_var) = output_var {
                     execution_state.bindings.insert(output_var.clone(), output.clone());
                 }
@@ -1436,10 +1498,12 @@ impl CompiledWorkflowArtifact {
                     })
                 }
             }
-            CompiledStateNode::Step { .. } => Err(CompiledWorkflowError::UnexpectedStep {
+            CompiledStateNode::Step { .. } | CompiledStateNode::DynamicStep { .. } => {
+                Err(CompiledWorkflowError::UnexpectedStep {
                 expected: step_state.to_owned(),
                 received: step_id.to_owned(),
-            }),
+            })
+            }
             _ => Err(CompiledWorkflowError::NotWaitingOnStep(step_state.to_owned())),
         }
     }
@@ -1514,7 +1578,14 @@ impl CompiledWorkflowArtifact {
             .get(step_state)
             .ok_or_else(|| CompiledWorkflowError::UnknownState(step_state.to_owned()))?;
         match state {
-            CompiledStateNode::Step { on_error: Some(on_error), .. } if step_state == step_id => {
+            CompiledStateNode::Step {
+                on_error: Some(on_error),
+                ..
+            }
+            | CompiledStateNode::DynamicStep {
+                on_error: Some(on_error),
+                ..
+            } if step_state == step_id => {
                 if let Some(error_var) = &on_error.error_var {
                     execution_state
                         .bindings
@@ -1522,7 +1593,10 @@ impl CompiledWorkflowArtifact {
                 }
                 self.execute_from_state_in_graph(states, &on_error.next, execution_state, false)
             }
-            CompiledStateNode::Step { on_error: None, .. } if step_state == step_id => {
+            CompiledStateNode::Step { on_error: None, .. }
+            | CompiledStateNode::DynamicStep { on_error: None, .. }
+                if step_state == step_id =>
+            {
                 if let Some(active_update) = execution_state.active_update.take() {
                     let return_state = active_update.return_state;
                     return Ok(CompiledExecutionPlan {
@@ -1654,10 +1728,12 @@ impl CompiledWorkflowArtifact {
                     output: Some(Value::String(error.to_owned())),
                 })
             }
-            CompiledStateNode::Step { .. } => Err(CompiledWorkflowError::UnexpectedStep {
+            CompiledStateNode::Step { .. } | CompiledStateNode::DynamicStep { .. } => {
+                Err(CompiledWorkflowError::UnexpectedStep {
                 expected: step_state.to_owned(),
                 received: step_id.to_owned(),
-            }),
+            })
+            }
             _ => Err(CompiledWorkflowError::NotWaitingOnStep(step_state.to_owned())),
         }
     }
@@ -1666,16 +1742,22 @@ impl CompiledWorkflowArtifact {
         &self,
         step_state: &str,
         execution_state: &ArtifactExecutionState,
-    ) -> Result<Option<&RetryPolicy>, CompiledWorkflowError> {
+    ) -> Result<Option<RetryPolicy>, CompiledWorkflowError> {
         let state = self
             .state_by_id(step_state)
             .ok_or_else(|| CompiledWorkflowError::UnknownState(step_state.to_owned()))?;
         match state {
-            CompiledStateNode::Step { retry, .. } => Ok(retry.as_ref()),
+            CompiledStateNode::Step { retry, .. } => Ok(retry.clone()),
+            CompiledStateNode::DynamicStep { descriptor, .. } => {
+                let mut execution_state = execution_state.clone();
+                let descriptor =
+                    evaluate_expression(descriptor, &mut execution_state, &self.helpers)?;
+                Ok(parse_dynamic_activity_descriptor(step_state, descriptor)?.retry)
+            }
             CompiledStateNode::WaitForAllActivities { fanout_ref_var, .. } => {
                 let fanout = self.fanout_binding(step_state, fanout_ref_var, execution_state)?;
                 match self.state_by_id(&fanout.origin_state) {
-                    Some(CompiledStateNode::FanOut { retry, .. }) => Ok(retry.as_ref()),
+                    Some(CompiledStateNode::FanOut { retry, .. }) => Ok(retry.clone()),
                     _ => Err(CompiledWorkflowError::NotWaitingOnFanOut(step_state.to_owned())),
                 }
             }
@@ -1700,6 +1782,13 @@ impl CompiledWorkflowArtifact {
                 let mut execution_state = execution_state.clone();
                 let input = evaluate_expression(input, &mut execution_state, &self.helpers)?;
                 Ok((handler.clone(), config.clone(), input))
+            }
+            CompiledStateNode::DynamicStep { descriptor, .. } => {
+                let mut execution_state = execution_state.clone();
+                let descriptor =
+                    evaluate_expression(descriptor, &mut execution_state, &self.helpers)?;
+                let descriptor = parse_dynamic_activity_descriptor(step_state, descriptor)?;
+                Ok((descriptor.activity_type, descriptor.config, descriptor.input))
             }
             CompiledStateNode::FanOut { activity_type, config, items, .. } => {
                 let Some((origin_state, index)) = parse_fanout_activity_id(step_state) else {
@@ -1754,7 +1843,8 @@ impl CompiledWorkflowArtifact {
     pub fn step_timeouts(
         &self,
         step_state: &str,
-    ) -> Result<(Option<u64>, Option<u64>, Option<u64>), CompiledWorkflowError> {
+        execution_state: &ArtifactExecutionState,
+    ) -> Result<(Option<u64>, Option<u64>, Option<u64>, Option<u64>), CompiledWorkflowError> {
         let state = self
             .state_by_id(step_state)
             .or_else(|| {
@@ -1765,20 +1855,35 @@ impl CompiledWorkflowArtifact {
         match state {
             CompiledStateNode::Step {
                 schedule_to_start_timeout_ms,
+                schedule_to_close_timeout_ms,
                 start_to_close_timeout_ms,
                 heartbeat_timeout_ms,
                 ..
             }
             | CompiledStateNode::FanOut {
                 schedule_to_start_timeout_ms,
+                schedule_to_close_timeout_ms,
                 start_to_close_timeout_ms,
                 heartbeat_timeout_ms,
                 ..
             } => Ok((
                 *schedule_to_start_timeout_ms,
+                *schedule_to_close_timeout_ms,
                 *start_to_close_timeout_ms,
                 *heartbeat_timeout_ms,
             )),
+            CompiledStateNode::DynamicStep { descriptor, .. } => {
+                let mut execution_state = execution_state.clone();
+                let descriptor =
+                    evaluate_expression(descriptor, &mut execution_state, &self.helpers)?;
+                let descriptor = parse_dynamic_activity_descriptor(step_state, descriptor)?;
+                Ok((
+                    descriptor.schedule_to_start_timeout_ms,
+                    descriptor.schedule_to_close_timeout_ms,
+                    descriptor.start_to_close_timeout_ms,
+                    descriptor.heartbeat_timeout_ms,
+                ))
+            }
             _ => Err(CompiledWorkflowError::NotWaitingOnStep(step_state.to_owned())),
         }
     }
@@ -1970,6 +2075,7 @@ impl CompiledWorkflowArtifact {
                     task_queue,
                     config,
                     schedule_to_start_timeout_ms,
+                    schedule_to_close_timeout_ms,
                     start_to_close_timeout_ms,
                     heartbeat_timeout_ms,
                     ..
@@ -1997,8 +2103,50 @@ impl CompiledWorkflowArtifact {
                             }),
                             state: Some(current_state.clone()),
                             schedule_to_start_timeout_ms: *schedule_to_start_timeout_ms,
+                            schedule_to_close_timeout_ms: *schedule_to_close_timeout_ms,
                             start_to_close_timeout_ms: *start_to_close_timeout_ms,
                             heartbeat_timeout_ms: *heartbeat_timeout_ms,
+                        },
+                        state: Some(current_state.clone()),
+                    });
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: current_state,
+                        emissions,
+                        execution_state,
+                        context,
+                        output,
+                    });
+                }
+                CompiledStateNode::DynamicStep {
+                    descriptor,
+                    ..
+                } => {
+                    let descriptor =
+                        evaluate_expression(descriptor, &mut execution_state, &self.helpers)?;
+                    let descriptor =
+                        parse_dynamic_activity_descriptor(&current_state, descriptor)?;
+                    context = Some(descriptor.input.clone());
+                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+                    let task_queue = descriptor
+                        .task_queue
+                        .unwrap_or_else(|| "default".to_owned());
+                    emissions.push(ExecutionEmission {
+                        event: WorkflowEvent::ActivityTaskScheduled {
+                            activity_id: current_state.clone(),
+                            activity_type: descriptor.activity_type,
+                            task_queue,
+                            attempt: 1,
+                            input: descriptor.input,
+                            config: descriptor
+                                .config
+                                .as_ref()
+                                .map(|config| serde_json::to_value(config).expect("step config serializes")),
+                            state: Some(current_state.clone()),
+                            schedule_to_start_timeout_ms: descriptor.schedule_to_start_timeout_ms,
+                            schedule_to_close_timeout_ms: descriptor.schedule_to_close_timeout_ms,
+                            start_to_close_timeout_ms: descriptor.start_to_close_timeout_ms,
+                            heartbeat_timeout_ms: descriptor.heartbeat_timeout_ms,
                         },
                         state: Some(current_state.clone()),
                     });
@@ -2020,6 +2168,7 @@ impl CompiledWorkflowArtifact {
                     reducer,
                     config,
                     schedule_to_start_timeout_ms,
+                    schedule_to_close_timeout_ms,
                     start_to_close_timeout_ms,
                     heartbeat_timeout_ms,
                     ..
@@ -2102,6 +2251,7 @@ impl CompiledWorkflowArtifact {
                                 }),
                                 state: Some(next.clone()),
                                 schedule_to_start_timeout_ms: *schedule_to_start_timeout_ms,
+                                schedule_to_close_timeout_ms: *schedule_to_close_timeout_ms,
                                 start_to_close_timeout_ms: *start_to_close_timeout_ms,
                                 heartbeat_timeout_ms: *heartbeat_timeout_ms,
                             },
@@ -2773,6 +2923,11 @@ impl CompiledStateNode {
                 .map(String::as_str)
                 .chain(on_error.iter().map(|transition| transition.next.as_str()))
                 .collect(),
+            Self::DynamicStep { next, on_error, .. } => next
+                .iter()
+                .map(String::as_str)
+                .chain(on_error.iter().map(|transition| transition.next.as_str()))
+                .collect(),
             Self::FanOut { next, .. } => vec![next.as_str()],
             Self::StartBulkActivity { next, .. } => vec![next.as_str()],
             Self::WaitForBulkActivity { next, on_error, .. } => std::iter::once(next.as_str())
@@ -2795,6 +2950,185 @@ impl CompiledStateNode {
             Self::Succeed { .. } | Self::Fail { .. } | Self::ContinueAsNew { .. } => Vec::new(),
         }
     }
+}
+
+fn parse_descriptor_u64(
+    descriptor: &serde_json::Map<String, Value>,
+    field: &str,
+    state: &str,
+) -> Result<Option<u64>, CompiledWorkflowError> {
+    match descriptor.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .ok_or_else(|| CompiledWorkflowError::InvalidDynamicStepDescriptor {
+                state: state.to_owned(),
+                details: format!("{field} must be an unsigned integer"),
+            })
+            .map(Some),
+        Some(_) => Err(CompiledWorkflowError::InvalidDynamicStepDescriptor {
+            state: state.to_owned(),
+            details: format!("{field} must be an unsigned integer"),
+        }),
+    }
+}
+
+fn parse_descriptor_retry(
+    descriptor: &serde_json::Map<String, Value>,
+    state: &str,
+) -> Result<Option<RetryPolicy>, CompiledWorkflowError> {
+    let Some(retry) = descriptor.get("retry") else {
+        return Ok(None);
+    };
+    if retry.is_null() {
+        return Ok(None);
+    }
+    let Value::Object(retry) = retry else {
+        return Err(CompiledWorkflowError::InvalidDynamicStepDescriptor {
+            state: state.to_owned(),
+            details: "retry must be an object".to_owned(),
+        });
+    };
+    let max_attempts = retry
+        .get("max_attempts")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| CompiledWorkflowError::InvalidDynamicStepDescriptor {
+            state: state.to_owned(),
+            details: "retry.max_attempts must be an unsigned integer".to_owned(),
+        })? as u32;
+    let delay = retry
+        .get("delay")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CompiledWorkflowError::InvalidDynamicStepDescriptor {
+            state: state.to_owned(),
+            details: "retry.delay must be a string".to_owned(),
+        })?
+        .to_owned();
+    let non_retryable_error_types = match retry.get("non_retryable_error_types") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value.as_str().map(str::to_owned).ok_or_else(|| {
+                    CompiledWorkflowError::InvalidDynamicStepDescriptor {
+                        state: state.to_owned(),
+                        details: "retry.non_retryable_error_types must be string array"
+                            .to_owned(),
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err(CompiledWorkflowError::InvalidDynamicStepDescriptor {
+                state: state.to_owned(),
+                details: "retry.non_retryable_error_types must be string array".to_owned(),
+            });
+        }
+    };
+    let maximum_interval = match retry.get("maximum_interval") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.clone()),
+        Some(_) => {
+            return Err(CompiledWorkflowError::InvalidDynamicStepDescriptor {
+                state: state.to_owned(),
+                details: "retry.maximum_interval must be a string".to_owned(),
+            });
+        }
+    };
+    let backoff_coefficient_millis = match retry.get("backoff_coefficient_millis") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(value)) => Some(
+            value.as_u64().map(|value| value as u32).ok_or_else(|| {
+                CompiledWorkflowError::InvalidDynamicStepDescriptor {
+                    state: state.to_owned(),
+                    details: "retry.backoff_coefficient_millis must be an unsigned integer"
+                        .to_owned(),
+                }
+            })?,
+        ),
+        Some(_) => {
+            return Err(CompiledWorkflowError::InvalidDynamicStepDescriptor {
+                state: state.to_owned(),
+                details: "retry.backoff_coefficient_millis must be an unsigned integer"
+                    .to_owned(),
+            });
+        }
+    };
+    Ok(Some(RetryPolicy {
+        max_attempts,
+        delay,
+        maximum_interval,
+        backoff_coefficient_millis,
+        non_retryable_error_types,
+    }))
+}
+
+fn parse_dynamic_activity_descriptor(
+    state: &str,
+    descriptor: Value,
+) -> Result<DynamicActivityDescriptor, CompiledWorkflowError> {
+    let Value::Object(descriptor) = descriptor else {
+        return Err(CompiledWorkflowError::InvalidDynamicStepDescriptor {
+            state: state.to_owned(),
+            details: "descriptor must evaluate to an object".to_owned(),
+        });
+    };
+    let Some(Value::String(kind)) = descriptor.get("__kind") else {
+        return Err(CompiledWorkflowError::InvalidDynamicStepDescriptor {
+            state: state.to_owned(),
+            details: "descriptor must include __kind".to_owned(),
+        });
+    };
+    if kind != "activity_descriptor" {
+        return Err(CompiledWorkflowError::InvalidDynamicStepDescriptor {
+            state: state.to_owned(),
+            details: format!("unsupported descriptor kind {kind}"),
+        });
+    }
+    let activity_type = descriptor
+        .get("activity_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CompiledWorkflowError::InvalidDynamicStepDescriptor {
+            state: state.to_owned(),
+            details: "descriptor must include activity_type string".to_owned(),
+        })?
+        .to_owned();
+    let input = descriptor.get("input").cloned().unwrap_or(Value::Null);
+    let task_queue = descriptor
+        .get("task_queue")
+        .and_then(|value| if value.is_null() { None } else { stringify_value(value) });
+    let config = match descriptor.get("config") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(serde_json::from_value(value.clone()).map_err(|error| {
+            CompiledWorkflowError::InvalidDynamicStepDescriptor {
+                state: state.to_owned(),
+                details: format!("config is invalid: {error}"),
+            }
+        })?),
+    };
+    Ok(DynamicActivityDescriptor {
+        activity_type,
+        input,
+        task_queue,
+        retry: parse_descriptor_retry(&descriptor, state)?,
+        config,
+        schedule_to_start_timeout_ms: parse_descriptor_u64(
+            &descriptor,
+            "schedule_to_start_timeout_ms",
+            state,
+        )?,
+        schedule_to_close_timeout_ms: parse_descriptor_u64(
+            &descriptor,
+            "schedule_to_close_timeout_ms",
+            state,
+        )?,
+        start_to_close_timeout_ms: parse_descriptor_u64(
+            &descriptor,
+            "start_to_close_timeout_ms",
+            state,
+        )?,
+        heartbeat_timeout_ms: parse_descriptor_u64(&descriptor, "heartbeat_timeout_ms", state)?,
+    })
 }
 
 impl ParentClosePolicy {
@@ -2853,12 +3187,10 @@ fn bulk_success_summary(
         "chunkCount": chunk_count,
         "resultHandle": { "batchId": batch_id },
     });
-    if let Some(field_name) = bulk_reducer_summary_field_name(reducer) {
-        summary[field_name] = match field_name {
-            "count" | BULK_REDUCER_SUM => Value::from(0.0),
-            BULK_REDUCER_MIN | BULK_REDUCER_MAX | BULK_REDUCER_AVG => Value::Null,
-            _ => Value::Null,
-        };
+    if let Some(field_name) = bulk_reducer_summary_field_name(reducer)
+        && let Some(default_value) = bulk_reducer_default_summary_value(reducer)
+    {
+        summary[field_name] = default_value;
     }
     summary
 }
@@ -3103,12 +3435,10 @@ fn empty_fanout_terminal_payload(reducer: Option<&str>) -> Value {
     });
     if reducer == "count" {
         summary["count"] = Value::from(0_u64);
-    } else if let Some(field_name) = bulk_reducer_summary_field_name(Some(reducer)) {
-        summary[field_name] = match reducer {
-            BULK_REDUCER_SUM => Value::from(0.0),
-            BULK_REDUCER_MIN | BULK_REDUCER_MAX | BULK_REDUCER_AVG => Value::Null,
-            _ => Value::Null,
-        };
+    } else if let Some(field_name) = bulk_reducer_summary_field_name(Some(reducer))
+        && let Some(default_value) = bulk_reducer_default_summary_value(Some(reducer))
+    {
+        summary[field_name] = default_value;
     }
     summary
 }
@@ -3131,7 +3461,7 @@ fn fanout_terminal_update(
 }
 
 fn bulk_reducer_settles(bulk: &BulkActivityExecutionState) -> bool {
-    matches!(bulk_reducer(bulk), "all_settled" | "count")
+    throughput_bulk_reducer_settles(Some(bulk_reducer(bulk)))
 }
 
 fn reduce_bulk_terminal_payload(payload: &Value, bulk: &BulkActivityExecutionState) -> Value {
@@ -3172,9 +3502,9 @@ fn reduce_bulk_terminal_payload(payload: &Value, bulk: &BulkActivityExecutionSta
             );
         }
         reducer => {
-            if terminal_status == "completed"
-                && let Some(field_name) = bulk_reducer_summary_field_name(Some(reducer))
+            if let Some(field_name) = bulk_reducer_summary_field_name(Some(reducer))
                 && let Some(reduced) = payload.get("reducerOutput")
+                && (terminal_status == "completed" || bulk_reducer_settles(bulk))
             {
                 summary[field_name] = reduced.clone();
             }
@@ -3484,6 +3814,240 @@ pub fn evaluate_expression(
                     _ => Value::Array(Vec::new()),
                 });
             }
+            if callee == "__builtin_map_get" {
+                if args.len() != 2 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 2,
+                        received: args.len(),
+                    });
+                }
+                let object = evaluate_expression(&args[0], execution_state, helpers)?;
+                let key = evaluate_expression(&args[1], execution_state, helpers)?;
+                let key =
+                    key.as_str().map(str::to_owned).unwrap_or_else(|| join_stringify_value(&key));
+                let Value::Object(map) = object else {
+                    return Ok(Value::Null);
+                };
+                return Ok(map.get(&key).cloned().unwrap_or(Value::Null));
+            }
+            if callee == "__builtin_map_has" {
+                if args.len() != 2 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 2,
+                        received: args.len(),
+                    });
+                }
+                let object = evaluate_expression(&args[0], execution_state, helpers)?;
+                let key = evaluate_expression(&args[1], execution_state, helpers)?;
+                let key =
+                    key.as_str().map(str::to_owned).unwrap_or_else(|| join_stringify_value(&key));
+                let Value::Object(map) = object else {
+                    return Ok(Value::Bool(false));
+                };
+                return Ok(Value::Bool(map.contains_key(&key)));
+            }
+            if callee == "__builtin_map_set" {
+                if args.len() != 3 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 3,
+                        received: args.len(),
+                    });
+                }
+                let object = evaluate_expression(&args[0], execution_state, helpers)?;
+                let key = evaluate_expression(&args[1], execution_state, helpers)?;
+                let value = evaluate_expression(&args[2], execution_state, helpers)?;
+                let key =
+                    key.as_str().map(str::to_owned).unwrap_or_else(|| join_stringify_value(&key));
+                let Value::Object(mut map) = object else {
+                    let mut map = Map::new();
+                    map.insert(key, value);
+                    return Ok(Value::Object(map));
+                };
+                map.insert(key, value);
+                return Ok(Value::Object(map));
+            }
+            if callee == "__builtin_binding_map_set_and_null" {
+                if args.len() != 3 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 3,
+                        received: args.len(),
+                    });
+                }
+                let binding = evaluate_expression(&args[0], execution_state, helpers)?;
+                let key = evaluate_expression(&args[1], execution_state, helpers)?;
+                let value = evaluate_expression(&args[2], execution_state, helpers)?;
+                let Some(binding_name) = binding.as_str() else {
+                    return Ok(Value::Null);
+                };
+                let existing = execution_state
+                    .bindings
+                    .get(binding_name)
+                    .cloned()
+                    .unwrap_or_else(|| Value::Object(Map::new()));
+                let key =
+                    key.as_str().map(str::to_owned).unwrap_or_else(|| join_stringify_value(&key));
+                let mut map = match existing {
+                    Value::Object(map) => map,
+                    _ => Map::new(),
+                };
+                map.insert(key, value);
+                execution_state
+                    .bindings
+                    .insert(binding_name.to_owned(), Value::Object(map));
+                return Ok(Value::Null);
+            }
+            if callee == "__builtin_date_new" {
+                if args.len() > 1 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 1,
+                        received: args.len(),
+                    });
+                }
+                let millis = if let Some(arg) = args.first() {
+                    let value = evaluate_expression(arg, execution_state, helpers)?;
+                    if let Some(object) = value.as_object() {
+                        object
+                            .get("__fabrik_date_ms")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(0)
+                    } else if let Some(number) = value.as_i64() {
+                        number
+                    } else if let Some(text) = value.as_str() {
+                        DateTime::parse_from_rfc3339(text)
+                            .map(|dt| dt.with_timezone(&Utc).timestamp_millis())
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    }
+                } else {
+                    execution_state
+                        .turn_context
+                        .as_ref()
+                        .map(|turn| turn.occurred_at.timestamp_millis())
+                        .unwrap_or_else(|| Utc::now().timestamp_millis())
+                };
+                let mut map = Map::new();
+                map.insert("__fabrik_date_ms".to_owned(), Value::Number(Number::from(millis)));
+                return Ok(Value::Object(map));
+            }
+            if callee == "__builtin_date_value_of" {
+                if args.len() != 1 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 1,
+                        received: args.len(),
+                    });
+                }
+                let value = evaluate_expression(&args[0], execution_state, helpers)?;
+                let millis = value
+                    .as_object()
+                    .and_then(|object| object.get("__fabrik_date_ms"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                return Ok(Value::Number(Number::from(millis)));
+            }
+            if callee == "__builtin_date_get_date" {
+                if args.len() != 1 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 1,
+                        received: args.len(),
+                    });
+                }
+                let value = evaluate_expression(&args[0], execution_state, helpers)?;
+                let millis = value
+                    .as_object()
+                    .and_then(|object| object.get("__fabrik_date_ms"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let day = Utc
+                    .timestamp_millis_opt(millis)
+                    .single()
+                    .map(|dt| dt.day() as i64)
+                    .unwrap_or(1);
+                return Ok(Value::Number(Number::from(day)));
+            }
+            if callee == "__builtin_date_set_date" {
+                if args.len() != 2 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 2,
+                        received: args.len(),
+                    });
+                }
+                let value = evaluate_expression(&args[0], execution_state, helpers)?;
+                let day = evaluate_expression(&args[1], execution_state, helpers)?;
+                let millis = value
+                    .as_object()
+                    .and_then(|object| object.get("__fabrik_date_ms"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let mut dt = Utc.timestamp_millis_opt(millis).single().unwrap_or_else(Utc::now);
+                if let Some(updated) = dt.with_day(numeric(&day)?.trunc() as u32) {
+                    dt = updated;
+                }
+                let mut map = Map::new();
+                map.insert(
+                    "__fabrik_date_ms".to_owned(),
+                    Value::Number(Number::from(dt.timestamp_millis())),
+                );
+                return Ok(Value::Object(map));
+            }
+            if callee == "__builtin_date_set_hours" {
+                if args.len() < 2 || args.len() > 5 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 5,
+                        received: args.len(),
+                    });
+                }
+                let value = evaluate_expression(&args[0], execution_state, helpers)?;
+                let millis = value
+                    .as_object()
+                    .and_then(|object| object.get("__fabrik_date_ms"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let mut dt = Utc.timestamp_millis_opt(millis).single().unwrap_or_else(Utc::now);
+                let hour = evaluate_expression(&args[1], execution_state, helpers)?;
+                let minute = if args.len() > 2 {
+                    numeric(&evaluate_expression(&args[2], execution_state, helpers)?)?.trunc() as u32
+                } else {
+                    dt.minute()
+                };
+                let second = if args.len() > 3 {
+                    numeric(&evaluate_expression(&args[3], execution_state, helpers)?)?.trunc() as u32
+                } else {
+                    dt.second()
+                };
+                let millis_part = if args.len() > 4 {
+                    numeric(&evaluate_expression(&args[4], execution_state, helpers)?)?.trunc() as u32
+                } else {
+                    dt.timestamp_subsec_millis()
+                };
+                if let Some(updated) = dt.with_hour(numeric(&hour)?.trunc() as u32) {
+                    dt = updated;
+                }
+                if let Some(updated) = dt.with_minute(minute) {
+                    dt = updated;
+                }
+                if let Some(updated) = dt.with_second(second) {
+                    dt = updated;
+                }
+                if let Some(updated) = dt.with_nanosecond(millis_part.saturating_mul(1_000_000)) {
+                    dt = updated;
+                }
+                let mut map = Map::new();
+                map.insert(
+                    "__fabrik_date_ms".to_owned(),
+                    Value::Number(Number::from(dt.timestamp_millis())),
+                );
+                return Ok(Value::Object(map));
+            }
             if callee == "__builtin_array_join" {
                 if args.len() != 2 {
                     return Err(CompiledWorkflowError::HelperArityMismatch {
@@ -3532,6 +4096,28 @@ pub fn evaluate_expression(
                 }
                 let value = evaluate_expression(&args[0], execution_state, helpers)?;
                 return Ok(Value::String(join_stringify_value(&value)));
+            }
+            if callee == "__builtin_string_to_lowercase" {
+                if args.len() != 1 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 1,
+                        received: args.len(),
+                    });
+                }
+                let value = evaluate_expression(&args[0], execution_state, helpers)?;
+                return Ok(Value::String(join_stringify_value(&value).to_lowercase()));
+            }
+            if callee == "__builtin_string_to_uppercase" {
+                if args.len() != 1 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 1,
+                        received: args.len(),
+                    });
+                }
+                let value = evaluate_expression(&args[0], execution_state, helpers)?;
+                return Ok(Value::String(join_stringify_value(&value).to_uppercase()));
             }
             if callee == "__builtin_math_floor" {
                 if args.len() != 1 {
@@ -3584,6 +4170,24 @@ pub fn evaluate_expression(
                 };
                 items.push(value);
                 return Ok(Value::Array(items));
+            }
+            if callee == "__builtin_array_prepend" {
+                if args.len() != 2 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 2,
+                        received: args.len(),
+                    });
+                }
+                let array = evaluate_expression(&args[0], execution_state, helpers)?;
+                let value = evaluate_expression(&args[1], execution_state, helpers)?;
+                let Value::Array(items) = array else {
+                    return Ok(Value::Array(vec![value]));
+                };
+                let mut result = Vec::with_capacity(items.len() + 1);
+                result.push(value);
+                result.extend(items);
+                return Ok(Value::Array(result));
             }
             if callee == "__builtin_array_shift_head" {
                 if args.len() != 1 {
@@ -3752,6 +4356,20 @@ pub fn evaluate_expression(
                 .map(|context| context.occurred_at.timestamp_millis() as f64)
                 .unwrap_or_default(),
         )),
+        Expression::Random { scope } => {
+            let turn_context = execution_state.turn_context.as_ref().ok_or_else(|| {
+                CompiledWorkflowError::MissingTurnContext("Math.random()".to_owned())
+            })?;
+            let value = uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_URL,
+                format!("{}:{scope}:random", turn_context.event_id).as_bytes(),
+            );
+            let bytes = value.as_bytes();
+            let mut raw = [0_u8; 8];
+            raw.copy_from_slice(&bytes[..8]);
+            let sample = u64::from_be_bytes(raw) >> 11;
+            Ok(number_value(sample as f64 / ((1_u64 << 53) as f64)))
+        }
         Expression::Uuid { scope } => {
             let turn_context = execution_state.turn_context.as_ref().ok_or_else(|| {
                 CompiledWorkflowError::MissingTurnContext("ctx.uuid()".to_owned())
@@ -4236,6 +4854,8 @@ pub enum CompiledWorkflowError {
     UnknownChildReference(String),
     #[error("compiled workflow state {0} evaluated external workflow target to a non-string value")]
     InvalidExternalWorkflowTarget(String),
+    #[error("compiled workflow state {state} has invalid dynamic step descriptor: {details}")]
+    InvalidDynamicStepDescriptor { state: String, details: String },
     #[error("unknown helper function {0}")]
     UnknownHelper(String),
     #[error("helper {helper} expected {expected} args, received {received}")]
@@ -4284,6 +4904,7 @@ mod tests {
                         retry: None,
                         config: None,
                         schedule_to_start_timeout_ms: None,
+                        schedule_to_close_timeout_ms: None,
                         start_to_close_timeout_ms: None,
                         heartbeat_timeout_ms: None,
                         output_var: Some("result".to_owned()),
@@ -4571,10 +5192,13 @@ mod tests {
                         retry: enable_retry.then_some(RetryPolicy {
                             max_attempts: 2,
                             delay: "1s".to_owned(),
+                            maximum_interval: None,
+                            backoff_coefficient_millis: None,
                             non_retryable_error_types: Vec::new(),
                         }),
                         config: None,
                         schedule_to_start_timeout_ms: None,
+                        schedule_to_close_timeout_ms: None,
                         start_to_close_timeout_ms: None,
                         heartbeat_timeout_ms: None,
                     },
@@ -4666,6 +5290,8 @@ mod tests {
                         retry: Some(RetryPolicy {
                             max_attempts: 2,
                             delay: "1s".to_owned(),
+                            maximum_interval: None,
+                            backoff_coefficient_millis: None,
                             non_retryable_error_types: Vec::new(),
                         }),
                     },
@@ -4896,6 +5522,12 @@ mod tests {
         };
 
         let now = evaluate_expression(&Expression::Now, &mut state, &BTreeMap::new()).unwrap();
+        let random = evaluate_expression(
+            &Expression::Random { scope: "callsite-1".to_owned() },
+            &mut state,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let uuid = evaluate_expression(
             &Expression::Uuid { scope: "callsite-1".to_owned() },
             &mut state,
@@ -4904,6 +5536,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(now, json!(1_700_000_000_123i64));
+        assert!(random.as_f64().is_some_and(|value| (0.0..1.0).contains(&value)));
         assert_eq!(
             uuid,
             json!(
@@ -5003,6 +5636,76 @@ mod tests {
             &BTreeMap::new(),
         )
         .unwrap();
+        let mapped = evaluate_expression(
+            &Expression::Call {
+                callee: "__builtin_map_set".to_owned(),
+                args: vec![
+                    Expression::Literal { value: json!({}) },
+                    Expression::Literal { value: json!("alpha") },
+                    Expression::Literal { value: json!(7) },
+                ],
+            },
+            &mut state,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let mapped_value = evaluate_expression(
+            &Expression::Call {
+                callee: "__builtin_map_get".to_owned(),
+                args: vec![
+                    Expression::Literal { value: json!({"alpha": 7}) },
+                    Expression::Literal { value: json!("alpha") },
+                ],
+            },
+            &mut state,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let mapped_has = evaluate_expression(
+            &Expression::Call {
+                callee: "__builtin_map_has".to_owned(),
+                args: vec![
+                    Expression::Literal { value: json!({"alpha": 7}) },
+                    Expression::Literal { value: json!("alpha") },
+                ],
+            },
+            &mut state,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let mapped_side_effect = evaluate_expression(
+            &Expression::Call {
+                callee: "__builtin_binding_map_set_and_null".to_owned(),
+                args: vec![
+                    Expression::Literal { value: json!("state") },
+                    Expression::Literal { value: json!("alpha") },
+                    Expression::Literal { value: json!(9) },
+                ],
+            },
+            &mut state,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let date = evaluate_expression(
+            &Expression::Call {
+                callee: "__builtin_date_new".to_owned(),
+                args: vec![Expression::Literal { value: json!(1_700_000_000_000i64) }],
+            },
+            &mut state,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let date_value = evaluate_expression(
+            &Expression::Call {
+                callee: "__builtin_date_value_of".to_owned(),
+                args: vec![Expression::Literal {
+                    value: json!({"__fabrik_date_ms": 1_700_000_000_000i64}),
+                }],
+            },
+            &mut state,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let joined = evaluate_expression(
             &Expression::Call {
                 callee: "__builtin_array_join".to_owned(),
@@ -5023,6 +5726,13 @@ mod tests {
         assert_eq!(inserted, json!({"alpha": 1, "beta": 2}));
         assert_eq!(reduced, json!(6));
         assert_eq!(appended, json!([1, 2, 3]));
+        assert_eq!(mapped, json!({"alpha": 7}));
+        assert_eq!(mapped_value, json!(7));
+        assert_eq!(mapped_has, json!(true));
+        assert_eq!(mapped_side_effect, Value::Null);
+        assert_eq!(state.bindings.get("state"), Some(&json!({"alpha": 9})));
+        assert_eq!(date, json!({"__fabrik_date_ms": 1_700_000_000_000i64}));
+        assert_eq!(date_value, json!(1_700_000_000_000i64));
         assert_eq!(joined, json!("a\n\nc"));
     }
 
@@ -6210,6 +6920,7 @@ mod tests {
         let mut artifact = fanout_artifact_with_reducer(true, Some("collect_results"));
         if let Some(CompiledStateNode::FanOut {
             task_queue,
+            schedule_to_close_timeout_ms,
             start_to_close_timeout_ms,
             heartbeat_timeout_ms,
             schedule_to_start_timeout_ms,
@@ -6218,6 +6929,7 @@ mod tests {
         {
             *task_queue = Some(Expression::Literal { value: json!("payments") });
             *schedule_to_start_timeout_ms = Some(1_000);
+            *schedule_to_close_timeout_ms = Some(60_000);
             *start_to_close_timeout_ms = Some(30_000);
             *heartbeat_timeout_ms = Some(5_000);
         } else {
@@ -6242,6 +6954,7 @@ mod tests {
                     event: WorkflowEvent::ActivityTaskScheduled {
                         task_queue,
                         schedule_to_start_timeout_ms,
+                        schedule_to_close_timeout_ms,
                         start_to_close_timeout_ms,
                         heartbeat_timeout_ms,
                         ..
@@ -6249,6 +6962,7 @@ mod tests {
                     ..
                 } if task_queue == "payments"
                     && schedule_to_start_timeout_ms == &Some(1_000)
+                    && schedule_to_close_timeout_ms == &Some(60_000)
                     && start_to_close_timeout_ms == &Some(30_000)
                     && heartbeat_timeout_ms == &Some(5_000)
             )
@@ -6257,6 +6971,125 @@ mod tests {
         let retry = artifact.step_retry("join", &plan.execution_state).unwrap().unwrap();
         assert_eq!(retry.max_attempts, 2);
         assert_eq!(retry.delay, "1s");
+    }
+
+    #[test]
+    fn dynamic_step_descriptor_emits_activity_schedule_metadata() {
+        let artifact = CompiledWorkflowArtifact::new(
+            "dynamic-step-demo".to_owned(),
+            1,
+            "test",
+            ArtifactEntrypoint {
+                module: "workflow.ts".to_owned(),
+                export: "workflow".to_owned(),
+            },
+            CompiledWorkflow {
+                initial_state: "cleanup".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "cleanup".to_owned(),
+                        CompiledStateNode::DynamicStep {
+                            descriptor: Expression::Object {
+                                fields: BTreeMap::from([
+                                    (
+                                        "__kind".to_owned(),
+                                        Expression::Literal {
+                                            value: json!("activity_descriptor"),
+                                        },
+                                    ),
+                                    (
+                                        "activity_type".to_owned(),
+                                        Expression::Literal { value: json!("cleanup") },
+                                    ),
+                                    (
+                                        "input".to_owned(),
+                                        Expression::Identifier {
+                                            name: "input".to_owned(),
+                                        },
+                                    ),
+                                    (
+                                        "task_queue".to_owned(),
+                                        Expression::Literal { value: json!("payments") },
+                                    ),
+                                    (
+                                        "schedule_to_close_timeout_ms".to_owned(),
+                                        Expression::Literal { value: json!(15_000) },
+                                    ),
+                                    (
+                                        "start_to_close_timeout_ms".to_owned(),
+                                        Expression::Literal { value: json!(5_000) },
+                                    ),
+                                    (
+                                        "retry".to_owned(),
+                                        Expression::Object {
+                                            fields: BTreeMap::from([
+                                                (
+                                                    "max_attempts".to_owned(),
+                                                    Expression::Literal { value: json!(3) },
+                                                ),
+                                                (
+                                                    "delay".to_owned(),
+                                                    Expression::Literal { value: json!("2s") },
+                                                ),
+                                            ]),
+                                        },
+                                    ),
+                                ]),
+                            },
+                            next: Some("done".to_owned()),
+                            output_var: Some("cleanupResult".to_owned()),
+                            on_error: None,
+                        },
+                    ),
+                    (
+                        "done".to_owned(),
+                        CompiledStateNode::Succeed {
+                            output: Some(Expression::Identifier {
+                                name: "cleanupResult".to_owned(),
+                            }),
+                        },
+                    ),
+                ]),
+                params: Vec::new(),
+                non_cancellable_states: BTreeSet::new(),
+            },
+        );
+
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"accountId": "acct-1"}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            plan.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::ActivityTaskScheduled {
+                    activity_type,
+                    task_queue,
+                    input,
+                    schedule_to_close_timeout_ms,
+                    start_to_close_timeout_ms,
+                    ..
+                },
+                ..
+            }) if activity_type == "cleanup"
+                && task_queue == "payments"
+                && input == &json!({"accountId": "acct-1"})
+                && schedule_to_close_timeout_ms == &Some(15_000)
+                && start_to_close_timeout_ms == &Some(5_000)
+        ));
+
+        let retry = artifact
+            .step_retry("cleanup", &plan.execution_state)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.max_attempts, 3);
+        assert_eq!(retry.delay, "2s");
     }
 
     #[test]
@@ -6574,6 +7407,125 @@ mod tests {
     }
 
     #[test]
+    fn bulk_histogram_reducer_uses_object_reducer_output_summary() {
+        let artifact = bulk_artifact_with_reducer("histogram");
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"items": [{"value": 1}, {"value": 2}, {"value": 3}]}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+        let batch_id = plan
+            .emissions
+            .iter()
+            .find_map(|emission| match &emission.event {
+                WorkflowEvent::BulkActivityBatchScheduled { batch_id, .. } => Some(batch_id.clone()),
+                _ => None,
+            })
+            .expect("expected bulk schedule event");
+
+        let resumed = artifact
+            .execute_after_bulk_completion_with_turn(
+                "join",
+                &batch_id,
+                &json!({
+                    "batchId": batch_id,
+                    "status": "completed",
+                    "totalItems": 3,
+                    "succeededItems": 3,
+                    "failedItems": 0,
+                    "cancelledItems": 0,
+                    "chunkCount": 2,
+                    "reducerOutput": {
+                        "alpha": 2,
+                        "beta": 1
+                    },
+                }),
+                plan.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_100).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            resumed.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output["terminalStatus"] == json!("completed")
+                && output["histogram"] == json!({"alpha": 2, "beta": 1})
+        ));
+    }
+
+    #[test]
+    fn bulk_sample_errors_reducer_treats_failure_as_settled_success() {
+        let artifact = bulk_artifact_with_reducer("sample_errors");
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"items": [{"value": 1}, {"value": 2}, {"value": 3}]}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+        let batch_id = plan
+            .emissions
+            .iter()
+            .find_map(|emission| match &emission.event {
+                WorkflowEvent::BulkActivityBatchScheduled { batch_id, .. } => Some(batch_id.clone()),
+                _ => None,
+            })
+            .expect("expected bulk schedule event");
+
+        let resumed = artifact
+            .execute_after_bulk_failure_with_turn(
+                "join",
+                &batch_id,
+                &json!({
+                    "batchId": batch_id,
+                    "status": "failed",
+                    "message": "one chunk failed",
+                    "totalItems": 3,
+                    "succeededItems": 2,
+                    "failedItems": 1,
+                    "cancelledItems": 0,
+                    "chunkCount": 2,
+                    "reducerOutput": {
+                        "sample": ["boom"],
+                        "total": 1,
+                        "truncated": false
+                    },
+                }),
+                plan.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_100).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            resumed.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output["status"] == json!("settled")
+                && output["terminalStatus"] == json!("failed")
+                && output["sample_errors"] == json!({
+                    "sample": ["boom"],
+                    "total": 1,
+                    "truncated": false
+                })
+        ));
+    }
+
+    #[test]
     fn pending_cancellation_pauses_at_non_cancellable_boundary() {
         let artifact = CompiledWorkflowArtifact::new(
             "non-cancellable-boundary",
@@ -6595,6 +7547,7 @@ mod tests {
                             retry: None,
                             config: None,
                             schedule_to_start_timeout_ms: None,
+                            schedule_to_close_timeout_ms: None,
                             start_to_close_timeout_ms: None,
                             heartbeat_timeout_ms: None,
                             output_var: None,
@@ -6623,6 +7576,7 @@ mod tests {
                             retry: None,
                             config: None,
                             schedule_to_start_timeout_ms: None,
+                            schedule_to_close_timeout_ms: None,
                             start_to_close_timeout_ms: None,
                             heartbeat_timeout_ms: None,
                             output_var: None,

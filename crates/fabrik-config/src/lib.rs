@@ -148,6 +148,7 @@ pub struct MatchingRuntimeConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThroughputRuntimeConfig {
+    pub native_stream_v2_engine_enabled: bool,
     pub lease_ttl_seconds: u64,
     pub sweep_interval_ms: u64,
     pub poll_max_tasks: usize,
@@ -211,6 +212,10 @@ impl ThroughputRuntimeConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         let owner_first_apply = read_bool_with_default("THROUGHPUT_OWNER_FIRST_APPLY", true)?;
         Ok(Self {
+            native_stream_v2_engine_enabled: read_bool_with_default(
+                "THROUGHPUT_NATIVE_STREAM_V2_ENGINE",
+                false,
+            )?,
             lease_ttl_seconds: read_u64_with_default("THROUGHPUT_LEASE_TTL_SECONDS", 30)?,
             sweep_interval_ms: read_u64_with_default("THROUGHPUT_SWEEP_INTERVAL_MS", 500)?,
             poll_max_tasks: read_usize_with_default("THROUGHPUT_POLL_MAX_TASKS", 32)?,

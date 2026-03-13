@@ -14,7 +14,7 @@ use fabrik_workflow::{
     ErrorTransition, Expression, RetryPolicy,
 };
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -135,9 +135,14 @@ struct BenchmarkReport {
     executor_debug_before: Option<Value>,
     executor_debug_after: Option<Value>,
     executor_debug_delta: Option<Value>,
+    throughput_runtime_debug_before: Option<Value>,
     throughput_runtime_debug: Option<Value>,
+    throughput_runtime_debug_delta: Option<Value>,
+    throughput_projector_debug_before: Option<Value>,
     throughput_projector_debug: Option<Value>,
+    throughput_projector_debug_delta: Option<Value>,
     batch_routing_metrics: BatchRoutingMetrics,
+    failover_injection: Option<FailoverInjectionMetrics>,
     control_plane_metrics: Option<ControlPlaneMetrics>,
     executor_debug_delta_metrics: Option<ExecutorDebugDeltaMetrics>,
 }
@@ -147,6 +152,18 @@ struct BatchRoutingMetrics {
     backend_counts: BTreeMap<String, u64>,
     routing_reason_counts: BTreeMap<String, u64>,
     admission_policy_version_counts: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FailoverInjectionMetrics {
+    status: String,
+    delay_ms: u64,
+    stop_requested_at_ms: Option<u64>,
+    stop_completed_at_ms: Option<u64>,
+    restart_started_at_ms: Option<u64>,
+    restart_ready_at_ms: Option<u64>,
+    downtime_ms: Option<u64>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -247,12 +264,29 @@ struct CoalescingRow {
 struct StreamProjectionConvergenceRow {
     projection_batch_rows: i64,
     terminal_batch_rows: i64,
+    inferred_terminal_batches: i64,
     batch_accounted_items: i64,
+    interrupted_batch_missing_items: i64,
     completed_items: i64,
     failed_items: i64,
     cancelled_items: i64,
     terminal_chunk_rows: i64,
     pending_chunks: i64,
+}
+
+fn stream_projection_accounted_items(row: &StreamProjectionConvergenceRow) -> i64 {
+    let chunk_accounted_items = row.completed_items + row.failed_items + row.cancelled_items;
+    chunk_accounted_items.max(row.batch_accounted_items + row.interrupted_batch_missing_items)
+}
+
+fn stream_projection_has_converged(
+    row: &StreamProjectionConvergenceRow,
+    expected_batches: u64,
+    expected_items: u64,
+) -> bool {
+    row.projection_batch_rows as u64 >= expected_batches
+        && row.terminal_batch_rows as u64 >= expected_batches
+        && stream_projection_accounted_items(row) as u64 >= expected_items
 }
 
 #[tokio::main]
@@ -303,6 +337,32 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
     let started = Instant::now();
     let executor_debug_url = format!("{unified_runtime_debug_base}/debug/unified");
     let executor_debug_before = Some(fetch_optional_debug(&client, &executor_debug_url).await);
+    let throughput_runtime_debug_before = if args.execution_mode == ExecutionMode::Throughput
+        && args.throughput_backend.as_deref() == Some(STREAM_V2_BACKEND)
+    {
+        Some(
+            fetch_optional_debug(
+                &client,
+                &format!("{throughput_runtime_debug_base}/debug/throughput"),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let throughput_projector_debug_before = if args.execution_mode == ExecutionMode::Throughput
+        && args.throughput_backend.as_deref() == Some(STREAM_V2_BACKEND)
+    {
+        Some(
+            fetch_optional_debug(
+                &client,
+                &format!("{throughput_projector_base}/debug/throughput-projector"),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
 
     if args.execution_mode == ExecutionMode::Throughput {
         apply_task_queue_throughput_policy(
@@ -453,7 +513,7 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         .as_ref()
         .zip(executor_debug_after.as_ref())
         .map(|(before, after)| json_numeric_delta(before, after));
-    let throughput_runtime_debug = if args.execution_mode == ExecutionMode::Throughput
+    let throughput_runtime_debug_after = if args.execution_mode == ExecutionMode::Throughput
         && args.throughput_backend.as_deref() == Some(STREAM_V2_BACKEND)
     {
         Some(
@@ -466,7 +526,11 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
     } else {
         None
     };
-    let throughput_projector_debug = if args.execution_mode == ExecutionMode::Throughput
+    let throughput_runtime_debug_delta = throughput_runtime_debug_before
+        .as_ref()
+        .zip(throughput_runtime_debug_after.as_ref())
+        .map(|(before, after)| json_numeric_delta(before, after));
+    let throughput_projector_debug_after = if args.execution_mode == ExecutionMode::Throughput
         && args.throughput_backend.as_deref() == Some(STREAM_V2_BACKEND)
     {
         Some(
@@ -479,6 +543,10 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
     } else {
         None
     };
+    let throughput_projector_debug_delta = throughput_projector_debug_before
+        .as_ref()
+        .zip(throughput_projector_debug_after.as_ref())
+        .map(|(before, after)| json_numeric_delta(before, after));
     let (
         bulk_batch_rows,
         bulk_chunk_rows,
@@ -488,12 +556,13 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         grouped_batch_rows,
     ) = bulk_metrics(&pool, &args.tenant_id, &instance_prefix, args.workload_kind).await?;
     let control_plane_metrics = control_plane_metrics(
-        throughput_runtime_debug.as_ref(),
-        throughput_projector_debug.as_ref(),
+        throughput_runtime_debug_delta.as_ref(),
+        throughput_projector_debug_delta.as_ref(),
         &activity_metrics,
     );
     let executor_debug_delta_metrics =
         executor_debug_delta_metrics(executor_debug_delta.as_ref(), &activity_metrics);
+    let failover_injection = load_failover_injection_metrics()?;
 
     Ok(BenchmarkReport {
         scenario: scenario_name,
@@ -537,9 +606,14 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         executor_debug_before,
         executor_debug_after,
         executor_debug_delta,
-        throughput_runtime_debug,
-        throughput_projector_debug,
+        throughput_runtime_debug_before,
+        throughput_runtime_debug: throughput_runtime_debug_after,
+        throughput_runtime_debug_delta,
+        throughput_projector_debug_before,
+        throughput_projector_debug: throughput_projector_debug_after,
+        throughput_projector_debug_delta,
         batch_routing_metrics,
+        failover_injection,
         control_plane_metrics,
         executor_debug_delta_metrics,
     })
@@ -608,9 +682,9 @@ fn parse_args() -> Result<Args> {
                 bulk_reducer_explicit = true;
                 bulk_reducer = match value.as_str() {
                     "all_succeeded" | "all_settled" | "count" | "collect_results" | "sum"
-                    | "min" | "max" | "avg" => value,
+                    | "min" | "max" | "avg" | "histogram" | "sample_errors" => value,
                     other => bail!(
-                        "unknown --bulk-reducer {other}; expected all_succeeded, all_settled, count, collect_results, sum, min, max, or avg"
+                        "unknown --bulk-reducer {other}; expected all_succeeded, all_settled, count, collect_results, sum, min, max, avg, histogram, or sample_errors"
                     ),
                 }
             }
@@ -1000,10 +1074,13 @@ fn insert_dispatch_graph(
                     retry: enable_retry.then_some(RetryPolicy {
                         max_attempts: 2,
                         delay: "1s".to_owned(),
+                        maximum_interval: None,
+                        backoff_coefficient_millis: None,
                         non_retryable_error_types: Vec::new(),
                     }),
                     config: None,
                     schedule_to_start_timeout_ms: None,
+                    schedule_to_close_timeout_ms: None,
                     start_to_close_timeout_ms: None,
                     heartbeat_timeout_ms: None,
                 },
@@ -1044,6 +1121,8 @@ fn insert_dispatch_graph(
                     retry: enable_retry.then_some(RetryPolicy {
                         max_attempts: 2,
                         delay: "1s".to_owned(),
+                        maximum_interval: None,
+                        backoff_coefficient_millis: None,
                         non_retryable_error_types: Vec::new(),
                     }),
                 },
@@ -1119,8 +1198,9 @@ fn benchmark_input(
                             json!(index >= retry_count && index < retry_count + cancel_count),
                         ),
                     ]);
-                    if benchmark_reducer_uses_numeric_outputs(&args.bulk_reducer) {
-                        item.insert("reducer_value".to_owned(), json!(index + 1));
+                    if let Some(reducer_value) = benchmark_reducer_value(&args.bulk_reducer, index)
+                    {
+                        item.insert("reducer_value".to_owned(), reducer_value);
                     }
                     Value::Object(item)
                 })
@@ -1212,7 +1292,13 @@ async fn publish_artifact(
 }
 
 async fn run_suite(args: Args, suite_name: String) -> Result<()> {
-    let scenarios = benchmark_suite_scenarios(&args, &suite_name)?;
+    let mut scenarios = benchmark_suite_scenarios(&args, &suite_name)?;
+    if let Some(filter_tag) = args.scenario_tag.as_deref() {
+        scenarios.retain(|scenario| scenario.scenario_tag.as_deref() == Some(filter_tag));
+        if scenarios.is_empty() {
+            bail!("suite {suite_name} does not contain scenario tag {filter_tag}");
+        }
+    }
     let mut reports = Vec::new();
     for scenario in scenarios {
         let report = run_benchmark(&scenario).await?;
@@ -1279,6 +1365,25 @@ fn benchmark_suite_scenarios(args: &Args, suite_name: &str) -> Result<Vec<Args>>
 
             Ok(vec![count, settled])
         }
+        "stream-v2-failover" => {
+            let mut failover = args.clone();
+            failover.suite_name = None;
+            failover.execution_mode = ExecutionMode::Throughput;
+            failover.throughput_backend = Some(STREAM_V2_BACKEND.to_owned());
+            failover.bulk_reducer = "all_settled".to_owned();
+            failover.chunk_size = failover.chunk_size.min(64);
+            failover.profile.workflow_count = failover.profile.workflow_count.max(12);
+            failover.profile.activities_per_workflow =
+                failover.profile.activities_per_workflow.max(4_096);
+            failover.scenario_tag = Some("owner-restart".to_owned());
+
+            let mut failover_retry_cancel = failover.clone();
+            failover_retry_cancel.scenario_tag = Some("owner-restart-retry-cancel".to_owned());
+            failover_retry_cancel.retry_rate = failover_retry_cancel.retry_rate.max(0.01);
+            failover_retry_cancel.cancel_rate = failover_retry_cancel.cancel_rate.max(0.01);
+
+            Ok(vec![failover, failover_retry_cancel])
+        }
         "streaming-admission" => {
             let mut auto_small = args.clone();
             auto_small.suite_name = None;
@@ -1314,7 +1419,7 @@ fn benchmark_suite_scenarios(args: &Args, suite_name: &str) -> Result<Vec<Args>>
             Ok(vec![auto_small, auto_large, auto_materialized])
         }
         "streaming-reducers" => {
-            let reducers = ["sum", "min", "max", "avg"];
+            let reducers = ["sum", "min", "max", "avg", "histogram", "sample_errors"];
             let mut scenarios = Vec::with_capacity(reducers.len() * 2);
             for reducer in reducers {
                 let mut pg = args.clone();
@@ -1324,6 +1429,10 @@ fn benchmark_suite_scenarios(args: &Args, suite_name: &str) -> Result<Vec<Args>>
                 pg.bulk_reducer = reducer.to_owned();
                 pg.chunk_size = pg.chunk_size.min(64);
                 pg.profile.activities_per_workflow = pg.profile.activities_per_workflow.max(1_024);
+                if reducer == "sample_errors" {
+                    pg.retry_rate = pg.retry_rate.max(0.01);
+                    pg.cancel_rate = pg.cancel_rate.max(0.01);
+                }
                 pg.scenario_tag = Some(format!("{reducer}-pg-v1"));
                 scenarios.push(pg);
 
@@ -1335,19 +1444,48 @@ fn benchmark_suite_scenarios(args: &Args, suite_name: &str) -> Result<Vec<Args>>
                 stream.chunk_size = stream.chunk_size.min(64);
                 stream.profile.activities_per_workflow =
                     stream.profile.activities_per_workflow.max(1_024);
+                if reducer == "sample_errors" {
+                    stream.retry_rate = stream.retry_rate.max(0.01);
+                    stream.cancel_rate = stream.cancel_rate.max(0.01);
+                }
                 stream.scenario_tag = Some(format!("{reducer}-stream-v2"));
                 scenarios.push(stream);
             }
             Ok(scenarios)
         }
         other => bail!(
-            "unknown suite {other}; expected streaming, stream-v2-robustness, stream-v2-fast-lane, streaming-admission, or streaming-reducers"
+            "unknown suite {other}; expected streaming, stream-v2-robustness, stream-v2-fast-lane, stream-v2-failover, streaming-admission, or streaming-reducers"
         ),
     }
 }
 
-fn benchmark_reducer_uses_numeric_outputs(reducer: &str) -> bool {
-    matches!(reducer, "sum" | "min" | "max" | "avg")
+fn load_failover_injection_metrics() -> Result<Option<FailoverInjectionMetrics>> {
+    let path = match env::var("BENCHMARK_FAILOVER_INJECTION_PATH") {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        _ => return Ok(None),
+    };
+    let payload = fs::read(&path)
+        .with_context(|| format!("failed to read failover injection report {}", path.display()))?;
+    let metrics = serde_json::from_slice(&payload).with_context(|| {
+        format!(
+            "failed to decode failover injection report {}",
+            path.display()
+        )
+    })?;
+    Ok(Some(metrics))
+}
+
+fn benchmark_reducer_value(reducer: &str, index: usize) -> Option<Value> {
+    match reducer {
+        "sum" | "min" | "max" | "avg" => Some(json!(index + 1)),
+        "histogram" => Some(json!(match index % 4 {
+            0 => "alpha",
+            1 => "beta",
+            2 => "gamma",
+            _ => "delta",
+        })),
+        _ => None,
+    }
 }
 
 fn scenario_name(args: &Args) -> String {
@@ -1585,12 +1723,36 @@ async fn wait_for_stream_projection_convergence(
                  WHERE tenant_id = $1
                    AND workflow_instance_id LIKE $2
                    AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)) AS terminal_batch_rows,
+                (SELECT COUNT(*)::bigint
+                 FROM (
+                     SELECT batch_id
+                     FROM throughput_projection_chunks
+                     WHERE tenant_id = $1
+                       AND workflow_instance_id LIKE $2
+                       AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
+                     GROUP BY batch_id
+                     HAVING BOOL_AND(status IN ('completed', 'failed', 'cancelled'))
+                 ) AS chunk_terminal_batches) AS inferred_terminal_batches,
                 (SELECT COALESCE(SUM(succeeded_items + failed_items + cancelled_items), 0)::bigint
                  FROM throughput_projection_batches
                  WHERE tenant_id = $1
                    AND workflow_instance_id LIKE $2
                    AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
                    AND status IN ('completed', 'failed', 'cancelled')) AS batch_accounted_items,
+                (SELECT COALESCE(
+                    SUM(
+                        GREATEST(
+                            total_items - succeeded_items - failed_items - cancelled_items,
+                            0
+                        )
+                    ),
+                    0
+                )::bigint
+                 FROM throughput_projection_batches
+                 WHERE tenant_id = $1
+                   AND workflow_instance_id LIKE $2
+                   AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
+                   AND status IN ('failed', 'cancelled')) AS interrupted_batch_missing_items,
                 (SELECT COALESCE(SUM(item_count), 0)::bigint
                  FROM throughput_projection_chunks
                  WHERE tenant_id = $1
@@ -1632,25 +1794,23 @@ async fn wait_for_stream_projection_convergence(
         .context("failed to query stream-v2 projection convergence")?;
 
         let chunk_accounted_items = row.completed_items + row.failed_items + row.cancelled_items;
-        let accounted_items = chunk_accounted_items.max(row.batch_accounted_items);
-        if row.projection_batch_rows as u64 >= expected_batches
-            && row.terminal_batch_rows as u64 >= expected_batches
-            && accounted_items as u64 >= expected_items
-        {
+        if stream_projection_has_converged(&row, expected_batches, expected_items) {
             return Ok(());
         }
 
         if started.elapsed() >= timeout {
             bail!(
-                "timed out waiting for stream-v2 projection convergence: batches={}/{} terminal_batches={}/{} batch_items={}/{} chunk_items={}/{} pending_chunks={}",
+                "timed out waiting for stream-v2 projection convergence: batches={}/{} terminal_batches={}/{} inferred_terminal_batches={} batch_items={}/{} chunk_items={}/{} terminal_chunk_rows={} pending_chunks={}",
                 row.projection_batch_rows,
                 expected_batches,
                 row.terminal_batch_rows,
                 expected_batches,
-                row.batch_accounted_items,
+                row.inferred_terminal_batches,
+                row.batch_accounted_items + row.interrupted_batch_missing_items,
                 expected_items,
                 chunk_accounted_items,
                 expected_items,
+                row.terminal_chunk_rows,
                 row.pending_chunks
             );
         }
@@ -2029,11 +2189,11 @@ fn instance_exclusion_pattern(
 }
 
 fn control_plane_metrics(
-    runtime_debug: Option<&Value>,
-    projector_debug: Option<&Value>,
+    runtime_debug_delta: Option<&Value>,
+    projector_debug_delta: Option<&Value>,
     activity_metrics: &ActivityMetrics,
 ) -> Option<ControlPlaneMetrics> {
-    let runtime = runtime_debug?.get("runtime")?;
+    let runtime = runtime_debug_delta?.get("runtime")?;
     let completed_chunks =
         activity_metrics.completed + activity_metrics.failed + activity_metrics.cancelled;
     let poll_requests = json_u64(runtime, "poll_requests");
@@ -2046,7 +2206,7 @@ fn control_plane_metrics(
     let projection_events_applied_directly =
         json_u64(runtime, "projection_events_applied_directly");
     let changelog_entries_published = json_u64(runtime, "changelog_entries_published");
-    let manifest_writes = projector_debug
+    let manifest_writes = projector_debug_delta
         .and_then(|value| value.get("manifest_writes"))
         .and_then(Value::as_u64)
         .unwrap_or_default();
@@ -2172,8 +2332,32 @@ fn summary_text(report: &BenchmarkReport) -> String {
     let routing_reason_counts = format_counts(&report.batch_routing_metrics.routing_reason_counts);
     let admission_policy_versions =
         format_counts(&report.batch_routing_metrics.admission_policy_version_counts);
+    let failover = report.failover_injection.as_ref().map(|metrics| {
+        let downtime_ms = metrics
+            .downtime_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_owned());
+        let stop_requested_at_ms = metrics
+            .stop_requested_at_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_owned());
+        let restart_ready_at_ms = metrics
+            .restart_ready_at_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_owned());
+        let error = metrics.error.clone().unwrap_or_else(|| "none".to_owned());
+        format!(
+            "failover_status={}\nfailover_delay_ms={}\nfailover_stop_requested_at_ms={}\nfailover_restart_ready_at_ms={}\nfailover_downtime_ms={}\nfailover_error={}\n",
+            metrics.status,
+            metrics.delay_ms,
+            stop_requested_at_ms,
+            restart_ready_at_ms,
+            downtime_ms,
+            error,
+        )
+    }).unwrap_or_default();
     format!(
-        "scenario={scenario}\nprofile={profile}\nexecution_mode={execution_mode}\nthroughput_backend={throughput_backend}\nbulk_reducer={bulk_reducer}\nretry_rate={retry_rate}\ncancel_rate={cancel_rate}\nchunk_size={chunk_size}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nexecution_duration_ms={execution_duration_ms}\nprojection_convergence_duration_ms={projection_convergence_duration_ms}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nprojection_batch_rows={projection_batch_rows}\nprojection_chunk_rows={projection_chunk_rows}\nmax_aggregation_group_count={max_aggregation_group_count}\ngrouped_batch_rows={grouped_batch_rows}\nadmission_backend_counts={backend_counts}\nadmission_routing_reason_counts={routing_reason_counts}\nadmission_policy_versions={admission_policy_versions}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n{control_plane}{executor_debug_delta}",
+        "scenario={scenario}\nprofile={profile}\nexecution_mode={execution_mode}\nthroughput_backend={throughput_backend}\nbulk_reducer={bulk_reducer}\nretry_rate={retry_rate}\ncancel_rate={cancel_rate}\nchunk_size={chunk_size}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nexecution_duration_ms={execution_duration_ms}\nprojection_convergence_duration_ms={projection_convergence_duration_ms}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nprojection_batch_rows={projection_batch_rows}\nprojection_chunk_rows={projection_chunk_rows}\nmax_aggregation_group_count={max_aggregation_group_count}\ngrouped_batch_rows={grouped_batch_rows}\nadmission_backend_counts={backend_counts}\nadmission_routing_reason_counts={routing_reason_counts}\nadmission_policy_versions={admission_policy_versions}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n{failover}{control_plane}{executor_debug_delta}",
         scenario = report.scenario,
         profile = report.profile,
         execution_mode = match report.execution_mode {
@@ -2213,6 +2397,7 @@ fn summary_text(report: &BenchmarkReport) -> String {
         final_activity_backlog = report.backlog_metrics.final_activity_backlog,
         avg_schedule = report.activity_metrics.avg_schedule_to_start_latency_ms,
         avg_close = report.activity_metrics.avg_start_to_close_latency_ms,
+        failover = failover,
         control_plane = control_plane,
         executor_debug_delta = executor_debug_delta,
     )
@@ -2387,6 +2572,24 @@ mod tests {
     }
 
     #[test]
+    fn stream_v2_failover_suite_emits_owner_restart_variant() {
+        let scenarios =
+            benchmark_suite_scenarios(&demo_args(), "stream-v2-failover").expect("suite");
+        assert_eq!(scenarios.len(), 2);
+        assert_eq!(scenarios[0].throughput_backend.as_deref(), Some(STREAM_V2_BACKEND));
+        assert_eq!(scenarios[0].bulk_reducer, "all_settled");
+        assert_eq!(scenarios[0].scenario_tag.as_deref(), Some("owner-restart"));
+        assert!(scenarios[0].profile.workflow_count >= 12);
+        assert!(scenarios[0].profile.activities_per_workflow >= 4_096);
+        assert_eq!(
+            scenarios[1].scenario_tag.as_deref(),
+            Some("owner-restart-retry-cancel")
+        );
+        assert!(scenarios[1].retry_rate >= 0.01);
+        assert!(scenarios[1].cancel_rate >= 0.01);
+    }
+
+    #[test]
     fn streaming_admission_suite_emits_auto_routing_variants() {
         let scenarios =
             benchmark_suite_scenarios(&demo_args(), "streaming-admission").expect("suite");
@@ -2402,13 +2605,15 @@ mod tests {
     fn streaming_reducers_suite_emits_backend_pairs_for_numeric_reducers() {
         let scenarios =
             benchmark_suite_scenarios(&demo_args(), "streaming-reducers").expect("suite");
-        assert_eq!(scenarios.len(), 8);
+        assert_eq!(scenarios.len(), 12);
         assert_eq!(scenarios[0].bulk_reducer, "sum");
         assert_eq!(scenarios[0].throughput_backend.as_deref(), Some(PG_V1_BACKEND));
         assert_eq!(scenarios[1].bulk_reducer, "sum");
         assert_eq!(scenarios[1].throughput_backend.as_deref(), Some(STREAM_V2_BACKEND));
-        assert_eq!(scenarios[6].bulk_reducer, "avg");
-        assert_eq!(scenarios[7].throughput_backend.as_deref(), Some(STREAM_V2_BACKEND));
+        assert_eq!(scenarios[8].bulk_reducer, "histogram");
+        assert_eq!(scenarios[10].bulk_reducer, "sample_errors");
+        assert!(scenarios[10].retry_rate >= 0.01);
+        assert!(scenarios[11].cancel_rate >= 0.01);
         assert!(
             scenarios
                 .iter()
@@ -2432,6 +2637,22 @@ mod tests {
     }
 
     #[test]
+    fn histogram_reducer_inputs_include_bucket_values() {
+        let mut args = demo_args();
+        args.bulk_reducer = "histogram".to_owned();
+
+        let input = benchmark_input(&args, 4, 8, 0.0, 0.0, "instance-1");
+        let items = input
+            .get("items")
+            .and_then(Value::as_array)
+            .expect("items array");
+
+        assert_eq!(items[0].get("reducer_value"), Some(&json!("alpha")));
+        assert_eq!(items[1].get("reducer_value"), Some(&json!("beta")));
+        assert_eq!(items[3].get("reducer_value"), Some(&json!("delta")));
+    }
+
+    #[test]
     fn non_numeric_reducer_inputs_preserve_object_outputs() {
         let args = demo_args();
 
@@ -2449,6 +2670,110 @@ mod tests {
         let counts = BTreeMap::from([("pg-v1".to_owned(), 2_u64), ("stream-v2".to_owned(), 5_u64)]);
         assert_eq!(format_counts(&counts), "pg-v1:2,stream-v2:5");
         assert_eq!(format_counts(&BTreeMap::new()), "none");
+    }
+
+    #[test]
+    fn stream_projection_convergence_requires_terminal_batch_rows() {
+        let row = StreamProjectionConvergenceRow {
+            projection_batch_rows: 2,
+            terminal_batch_rows: 1,
+            inferred_terminal_batches: 2,
+            batch_accounted_items: 128,
+            interrupted_batch_missing_items: 0,
+            completed_items: 128,
+            failed_items: 0,
+            cancelled_items: 0,
+            terminal_chunk_rows: 16,
+            pending_chunks: 0,
+        };
+
+        assert!(!stream_projection_has_converged(&row, 2, 128));
+        assert_eq!(stream_projection_accounted_items(&row), 128);
+    }
+
+    #[test]
+    fn summary_text_renders_failover_metrics_when_present() {
+        let report = BenchmarkReport {
+            scenario: "throughput-stream-v2-owner-restart-all-settled".to_owned(),
+            profile: "gate".to_owned(),
+            started_at: Utc::now(),
+            execution_completed_at: Utc::now(),
+            completed_at: Utc::now(),
+            execution_duration_ms: 100,
+            projection_convergence_duration_ms: 25,
+            duration_ms: 125,
+            workflow_count: 12,
+            activities_per_workflow: 4_096,
+            total_activities: 49_152,
+            worker_count: 8,
+            payload_size: 128,
+            retry_rate: 0.0,
+            cancel_rate: 0.0,
+            definition_id: "bench".to_owned(),
+            task_queue: "default".to_owned(),
+            execution_mode: ExecutionMode::Throughput,
+            throughput_backend: Some(STREAM_V2_BACKEND.to_owned()),
+            bulk_reducer: "all_settled".to_owned(),
+            chunk_size: 64,
+            instance_prefix: "instance".to_owned(),
+            workflow_outcomes: WorkflowOutcomeMetrics {
+                completed: 12,
+                failed: 0,
+                cancelled: 0,
+                running: 0,
+            },
+            activity_metrics: ActivityMetrics {
+                completed: 49_152,
+                failed: 0,
+                cancelled: 0,
+                timed_out: 0,
+                avg_schedule_to_start_latency_ms: 1.0,
+                max_schedule_to_start_latency_ms: 2,
+                avg_start_to_close_latency_ms: 3.0,
+                max_start_to_close_latency_ms: 4,
+                throughput_activities_per_second: 10_000.0,
+            },
+            coalescing_metrics: CoalescingMetrics {
+                workflow_task_rows: 12,
+                resume_rows: 12,
+                resume_events_per_task_row: 1.0,
+            },
+            backlog_metrics: BacklogMetrics {
+                final_workflow_backlog: 0,
+                final_activity_backlog: 0,
+                max_workflow_backlog: 5,
+                max_activity_backlog: 10,
+            },
+            bulk_batch_rows: 12,
+            bulk_chunk_rows: 768,
+            projection_batch_rows: 12,
+            projection_chunk_rows: 768,
+            max_aggregation_group_count: 4,
+            grouped_batch_rows: 12,
+            executor_debug: json!({}),
+            executor_debug_before: None,
+            executor_debug_after: None,
+            executor_debug_delta: None,
+            throughput_runtime_debug: None,
+            throughput_projector_debug: None,
+            batch_routing_metrics: BatchRoutingMetrics::default(),
+            failover_injection: Some(FailoverInjectionMetrics {
+                status: "completed".to_owned(),
+                delay_ms: 1_000,
+                stop_requested_at_ms: Some(10),
+                stop_completed_at_ms: Some(20),
+                restart_started_at_ms: Some(20),
+                restart_ready_at_ms: Some(180),
+                downtime_ms: Some(160),
+                error: None,
+            }),
+            control_plane_metrics: None,
+            executor_debug_delta_metrics: None,
+        };
+
+        let summary = summary_text(&report);
+        assert!(summary.contains("failover_status=completed"));
+        assert!(summary.contains("failover_downtime_ms=160"));
     }
 
     #[test]

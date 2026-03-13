@@ -1,0 +1,4 @@
+{
+  "name": "@demo/common",
+  "types": "./index.ts"
+}

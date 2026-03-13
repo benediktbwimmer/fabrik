@@ -47,6 +47,7 @@ message ActivityTask {
   uint64 lease_epoch = 20;
   uint64 owner_epoch = 21;
   bool omit_success_output = 25;
+  uint64 schedule_to_close_timeout_ms = 26;
 }
 
 message PollActivityTaskResponse {

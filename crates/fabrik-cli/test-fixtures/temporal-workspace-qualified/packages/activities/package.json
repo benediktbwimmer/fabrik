@@ -1,0 +1,4 @@
+{
+  "name": "@demo/activities",
+  "types": "./index.ts"
+}

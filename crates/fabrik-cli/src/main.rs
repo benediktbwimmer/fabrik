@@ -1272,22 +1272,45 @@ fn transpile_project_into(project_root: &Path, dist_dir: &Path) -> Result<()> {
     if !tsc.exists() {
         bail!("missing TypeScript compiler at {}", tsc.display());
     }
-    let output = Command::new(tsc)
-        .arg("-p")
-        .arg(project_root.join("tsconfig.json"))
+    let mut command = Command::new(tsc);
+    let tsconfig = project_root.join("tsconfig.json");
+    if tsconfig.exists() {
+        command.arg("-p").arg(&tsconfig);
+    } else {
+        let inputs = collect_transpile_inputs(project_root)?;
+        if inputs.is_empty() {
+            bail!("no source files found to transpile in {}", project_root.display());
+        }
+        command.args(inputs);
+        command.arg("--target").arg("es2022");
+        command.arg("--rootDir").arg(project_root);
+        command.arg("--esModuleInterop");
+        command.arg("--resolveJsonModule");
+    }
+    let output = command
         .arg("--outDir")
         .arg(dist_dir)
         .arg("--module")
         .arg("es2022")
         .arg("--moduleResolution")
         .arg("bundler")
+        .arg("--allowJs")
+        .arg("--checkJs")
+        .arg("false")
         .arg("--skipLibCheck")
+        .arg("--noEmitOnError")
+        .arg("false")
+        .arg("--pretty")
+        .arg("false")
         .current_dir(project_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .with_context(|| format!("failed to run tsc for {}", project_root.display()))?;
     if !output.status.success() {
+        if dist_dir.read_dir()?.next().is_some() {
+            return Ok(());
+        }
         bail!(
             "TypeScript transpile failed for {}: {}{}{}",
             project_root.display(),
@@ -1297,6 +1320,48 @@ fn transpile_project_into(project_root: &Path, dist_dir: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn collect_transpile_inputs(project_root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut stack = vec![project_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)
+            .with_context(|| format!("failed to read {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                    continue;
+                };
+                if [".git", ".next", ".turbo", "build", "coverage", "dist", "node_modules"]
+                    .contains(&name)
+                {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if !["ts", "mts", "cts", "js", "mjs", "cjs", "tsx", "jsx"].contains(&extension) {
+                continue;
+            }
+            if path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.ends_with(".d.ts"))
+            {
+                continue;
+            }
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
 }
 
 fn resolve_module_specifier(
@@ -1317,7 +1382,50 @@ fn resolve_module_specifier(
             }
         }
     }
+    if let Some(resolved) =
+        resolve_module_specifier_with_typescript(project_root, from_file, specifier)?
+    {
+        return Ok(resolved);
+    }
     bail!("failed to resolve module specifier {specifier} from {}", from_file.display())
+}
+
+fn resolve_module_specifier_with_typescript(
+    project_root: &Path,
+    from_file: &Path,
+    specifier: &str,
+) -> Result<Option<PathBuf>> {
+    let resolver = Path::new(REPO_ROOT).join("scripts/resolve-module-specifier.mjs");
+    if !resolver.exists() {
+        return Ok(None);
+    }
+    let output = Command::new("node")
+        .arg(&resolver)
+        .arg(project_root)
+        .arg(from_file)
+        .arg(specifier)
+        .current_dir(REPO_ROOT)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("failed to run {} for {specifier}", resolver.display()))?;
+    if !output.status.success() {
+        bail!(
+            "module resolution helper failed for {specifier}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let payload: Value = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "failed to decode module resolution helper output for {specifier}"
+        )
+    })?;
+    let resolved = payload
+        .get("resolved")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    Ok(resolved.filter(|path| path.exists()))
 }
 
 fn module_resolution_candidates(base: &Path) -> Vec<PathBuf> {

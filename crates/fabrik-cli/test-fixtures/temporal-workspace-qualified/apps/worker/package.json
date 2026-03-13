@@ -1,0 +1,9 @@
+{
+  "name": "@demo/worker",
+  "private": true,
+  "dependencies": {
+    "@demo/activities": "*",
+    "@demo/common": "*",
+    "@temporalio/worker": "^1.15.0"
+  }
+}

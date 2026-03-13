@@ -16,7 +16,8 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use fabrik_broker::{
-    BrokerConfig, WorkflowHistoryFilter, WorkflowPublisher, build_workflow_consumer,
+    BrokerConfig, JsonTopicConfig, JsonTopicPublisher, WorkflowHistoryFilter, WorkflowPublisher,
+    build_workflow_consumer,
     decode_consumed_workflow_event, partition_for_instance, read_workflow_history,
 };
 use fabrik_config::{
@@ -28,14 +29,15 @@ use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
     ActivityScheduleUpdate, ActivityStartUpdate, ActivityTerminalPayload, ActivityTerminalUpdate,
     BulkChunkTerminalPayload, BulkChunkTerminalUpdate, ConsumedSignalRecord, TaskQueueKind,
-    WorkflowActivityStatus, WorkflowBulkChunkRecord, WorkflowMailboxKind, WorkflowMailboxRecord,
-    WorkflowStore,
+    ThroughputRunInputRecord, ThroughputRunRecord, WorkflowActivityStatus,
+    WorkflowBulkChunkRecord, WorkflowMailboxKind, WorkflowMailboxRecord, WorkflowStore,
 };
 use fabrik_throughput::{
-    ADMISSION_POLICY_VERSION, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
-    ThroughputBackend, bulk_reducer_class, bulk_reducer_is_mergeable,
-    bulk_reducer_materializes_results, decode_cbor, encode_cbor, planned_reduction_tree_depth,
-    stream_v2_fast_lane_enabled,
+    ADMISSION_POLICY_VERSION, PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
+    StartThroughputRunCommand, ThroughputBackend, ThroughputCommand, ThroughputCommandEnvelope,
+    bulk_reducer_class, bulk_reducer_is_mergeable, bulk_reducer_materializes_results,
+    decode_cbor, encode_cbor, planned_reduction_tree_depth, stream_v2_fast_lane_enabled,
+    throughput_partition_key,
 };
 use fabrik_worker_protocol::activity_worker::{
     Ack, ActivityTask, ActivityTaskCancelledResult, ActivityTaskCompletedResult,
@@ -77,6 +79,9 @@ const TASK_QUEUE_POLICY_CACHE_TTL_MS: u64 = 1_000;
 struct AppState {
     store: WorkflowStore,
     publisher: Option<WorkflowPublisher>,
+    throughput_command_publisher: Option<JsonTopicPublisher<ThroughputCommandEnvelope>>,
+    payload_store: PayloadStore,
+    throughput_runtime: ThroughputRuntimeConfig,
     inner: Arc<StdMutex<RuntimeInner>>,
     ownership: Arc<StdMutex<UnifiedOwnershipState>>,
     workflow_partition_count: i32,
@@ -380,6 +385,7 @@ struct QueuedActivity {
     config: Option<Value>,
     state: String,
     schedule_to_start_timeout_ms: Option<u64>,
+    schedule_to_close_timeout_ms: Option<u64>,
     start_to_close_timeout_ms: Option<u64>,
     heartbeat_timeout_ms: Option<u64>,
     scheduled_at: DateTime<Utc>,
@@ -593,6 +599,11 @@ async fn main() -> Result<()> {
         redpanda.workflow_events_topic.clone(),
         redpanda.workflow_events_partitions,
     );
+    let throughput_commands = JsonTopicConfig::new(
+        redpanda.brokers.clone(),
+        redpanda.throughput_commands_topic.clone(),
+        redpanda.throughput_partitions,
+    );
 
     let store = WorkflowStore::connect(&postgres.url).await?;
     store.init().await?;
@@ -645,6 +656,12 @@ async fn main() -> Result<()> {
     let state = AppState {
         store,
         publisher: Some(WorkflowPublisher::new(&broker, "unified-runtime").await?),
+        throughput_command_publisher: Some(
+            JsonTopicPublisher::new(&throughput_commands, "unified-runtime-throughput-commands")
+                .await?,
+        ),
+        payload_store,
+        throughput_runtime,
         inner: Arc::new(StdMutex::new(inner)),
         ownership: Arc::new(StdMutex::new(UnifiedOwnershipState::inactive(
             ownership.partition_id,
@@ -674,6 +691,9 @@ async fn main() -> Result<()> {
     tokio::spawn(run_lease_requeue_loop(state.clone()));
     tokio::spawn(run_workflow_event_outbox_publisher(state.clone()));
     tokio::spawn(run_persist_loop(state.clone()));
+    if native_stream_v2_engine_enabled(&state) {
+        tokio::spawn(run_throughput_run_repair_loop(state.clone()));
+    }
 
     let debug_state = state.clone();
     let debug_app = default_router::<AppState>(ServiceInfo::new(
@@ -736,6 +756,21 @@ fn build_payload_store_config(runtime: &ThroughputRuntimeConfig) -> PayloadStore
         s3_secret_access_key: runtime.payload_store.s3_secret_access_key.clone(),
         s3_force_path_style: runtime.payload_store.s3_force_path_style,
         s3_key_prefix: runtime.payload_store.s3_key_prefix.clone(),
+    }
+}
+
+fn native_stream_v2_engine_enabled(state: &AppState) -> bool {
+    state.throughput_runtime.native_stream_v2_engine_enabled
+}
+
+fn native_stream_v2_run_input_handle(
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    batch_id: &str,
+) -> PayloadHandle {
+    PayloadHandle::Inline {
+        key: format!("throughput-run-input:{tenant_id}:{instance_id}:{run_id}:{batch_id}"),
     }
 }
 
@@ -1628,6 +1663,7 @@ async fn handle_bulk_batch_terminal_event(
                 cancelled_items,
                 chunk_count,
                 message,
+                reducer_output,
             } => runtime.artifact.execute_after_bulk_failure_with_turn(
                 &current_state,
                 batch_id,
@@ -1640,7 +1676,7 @@ async fn handle_bulk_batch_terminal_event(
                     *failed_items,
                     *cancelled_items,
                     *chunk_count,
-                    None,
+                    reducer_output.as_ref(),
                 ),
                 execution_state,
                 turn_context,
@@ -1653,6 +1689,7 @@ async fn handle_bulk_batch_terminal_event(
                 cancelled_items,
                 chunk_count,
                 message,
+                reducer_output,
             } => runtime.artifact.execute_after_bulk_failure_with_turn(
                 &current_state,
                 batch_id,
@@ -1665,7 +1702,7 @@ async fn handle_bulk_batch_terminal_event(
                     *failed_items,
                     *cancelled_items,
                     *chunk_count,
-                    None,
+                    reducer_output.as_ref(),
                 ),
                 execution_state,
                 turn_context,
@@ -4539,25 +4576,98 @@ async fn materialize_bulk_batches_from_plan(
                 .saturating_add(elapsed_micros(pg_materialize_started_at));
         }
 
-        if let Some(publisher) = state.publisher.as_ref() {
-            let publish_started_at = Instant::now();
-            let scheduled_event = WorkflowEvent::BulkActivityBatchScheduled {
-                batch_id: batch_id.clone(),
-                activity_type: activity_type.clone(),
-                task_queue: task_queue.clone(),
-                items: items.clone(),
-                input_handle: input_handle.clone(),
-                result_handle: result_handle.clone(),
-                chunk_size: *chunk_size,
-                max_attempts: *max_attempts,
-                retry_delay_ms: *retry_delay_ms,
-                aggregation_group_count: *aggregation_group_count,
-                execution_policy: execution_policy.clone(),
-                reducer: reducer.clone(),
-                throughput_backend: selected_backend.to_owned(),
-                throughput_backend_version: selected_backend_version.to_owned(),
-                state: workflow_state.clone(),
-            };
+        let publish_started_at = Instant::now();
+        let native_stream_v2 = selected_backend == ThroughputBackend::StreamV2.as_str()
+            && native_stream_v2_engine_enabled(state);
+        let scheduled_event = WorkflowEvent::BulkActivityBatchScheduled {
+            batch_id: batch_id.clone(),
+            activity_type: activity_type.clone(),
+            task_queue: task_queue.clone(),
+            items: items.clone(),
+            input_handle: input_handle.clone(),
+            result_handle: result_handle.clone(),
+            chunk_size: *chunk_size,
+            max_attempts: *max_attempts,
+            retry_delay_ms: *retry_delay_ms,
+            aggregation_group_count: *aggregation_group_count,
+            execution_policy: execution_policy.clone(),
+            reducer: reducer.clone(),
+            throughput_backend: selected_backend.to_owned(),
+            throughput_backend_version: selected_backend_version.to_owned(),
+            state: workflow_state.clone(),
+        };
+        if native_stream_v2 {
+            state
+                .store
+                .upsert_throughput_run_input(&ThroughputRunInputRecord {
+                    tenant_id: instance.tenant_id.clone(),
+                    instance_id: instance.instance_id.clone(),
+                    run_id: instance.run_id.clone(),
+                    batch_id: batch_id.clone(),
+                    items: items.clone(),
+                    created_at: occurred_at,
+                    updated_at: occurred_at,
+                })
+                .await?;
+            let command = start_throughput_run_command(
+                state,
+                instance,
+                batch_id,
+                activity_type,
+                task_queue,
+                items.len(),
+                result_handle,
+                workflow_state.clone(),
+                *chunk_size,
+                *max_attempts,
+                *retry_delay_ms,
+                *aggregation_group_count,
+                execution_policy.clone(),
+                reducer.clone(),
+                selected_backend,
+                selected_backend_version,
+                &admission,
+                source_event_id,
+                occurred_at,
+            )
+            .await?;
+            state
+                .store
+                .upsert_throughput_run(&ThroughputRunRecord {
+                    tenant_id: instance.tenant_id.clone(),
+                    instance_id: instance.instance_id.clone(),
+                    run_id: instance.run_id.clone(),
+                    definition_id: instance.definition_id.clone(),
+                    definition_version: instance.definition_version,
+                    artifact_hash: instance.artifact_hash.clone(),
+                    batch_id: batch_id.clone(),
+                    throughput_backend: selected_backend.to_owned(),
+                    status: "scheduled".to_owned(),
+                    command_dedupe_key: command.dedupe_key.clone(),
+                    command: command.clone(),
+                    command_published_at: None,
+                    started_at: None,
+                    terminal_at: None,
+                    created_at: occurred_at,
+                    updated_at: occurred_at,
+                })
+                .await?;
+            let command_publisher = state
+                .throughput_command_publisher
+                .as_ref()
+                .context("stream-v2 bulk admission requires throughput command publisher")?;
+            command_publisher.publish(&command, &command.partition_key).await?;
+            let _ = state
+                .store
+                .mark_throughput_run_command_published(
+                    &instance.tenant_id,
+                    &instance.instance_id,
+                    &instance.run_id,
+                    batch_id,
+                    Utc::now(),
+                )
+                .await?;
+        } else if let Some(publisher) = state.publisher.as_ref() {
             let envelope = emitted_bulk_batch_event(
                 instance,
                 &scheduled_event,
@@ -4568,6 +4678,8 @@ async fn materialize_bulk_batches_from_plan(
                 occurred_at,
             );
             publisher.publish(&envelope, &envelope.partition_key).await?;
+        }
+        if native_stream_v2 || state.publisher.is_some() {
             published = published.saturating_add(1);
             let mut debug = state.debug.lock().expect("unified debug lock poisoned");
             debug.trigger_bulk_publish_micros = debug
@@ -4597,7 +4709,13 @@ async fn admit_bulk_batch(
     let task_queue_backend = if configured_task_queue_backend.is_some() {
         None
     } else {
-        cached_task_queue_throughput_backend(state, tenant_id, task_queue).await?
+        cached_task_queue_throughput_backend(
+            state,
+            tenant_id,
+            task_queue,
+            requested_backend.is_some(),
+        )
+        .await?
     };
     let has_task_queue_override =
         task_queue_backend.is_some() || configured_task_queue_backend.is_some();
@@ -4659,12 +4777,13 @@ async fn cached_task_queue_throughput_backend(
     state: &AppState,
     tenant_id: &str,
     task_queue: &str,
+    bypass_cache: bool,
 ) -> Result<Option<String>> {
     let key = TaskQueuePolicyCacheKey {
         tenant_id: tenant_id.to_owned(),
         task_queue: task_queue.to_owned(),
     };
-    {
+    if !bypass_cache {
         let cache = state.task_queue_policy_cache.lock().expect("task queue policy cache poisoned");
         if let Some(entry) = cache.get(&key) {
             if entry.fetched_at.elapsed() < Duration::from_millis(TASK_QUEUE_POLICY_CACHE_TTL_MS) {
@@ -4962,6 +5081,59 @@ async fn run_persist_loop(state: AppState) {
         {
             error!(error = %error, reason = %reason, "unified-runtime failed to persist state");
         }
+    }
+}
+
+async fn repair_unpublished_stream_v2_runs(state: &AppState) -> Result<usize> {
+    let Some(command_publisher) = state.throughput_command_publisher.as_ref() else {
+        return Ok(0);
+    };
+    let runs = state
+        .store
+        .list_unpublished_scheduled_throughput_runs_for_backend(ThroughputBackend::StreamV2.as_str(), 10_000)
+        .await?;
+    let mut repaired = 0_usize;
+    for run in runs {
+        let ThroughputCommand::StartThroughputRun(_) = &run.command.payload else {
+            continue;
+        };
+        command_publisher
+            .publish(&run.command, &run.command.partition_key)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to republish native throughput run command for batch {}",
+                    run.batch_id
+                )
+            })?;
+        let published_at = Utc::now();
+        let _ = state
+            .store
+            .mark_throughput_run_command_published(
+                &run.tenant_id,
+                &run.instance_id,
+                &run.run_id,
+                &run.batch_id,
+                published_at,
+            )
+            .await?;
+        repaired = repaired.saturating_add(1);
+    }
+    Ok(repaired)
+}
+
+async fn run_throughput_run_repair_loop(state: AppState) {
+    loop {
+        match repair_unpublished_stream_v2_runs(&state).await {
+            Ok(repaired) if repaired > 0 => {
+                info!(repaired, "repaired unpublished native stream-v2 admissions");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(error = %error, "failed to repair unpublished native stream-v2 admissions");
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
     }
 }
 
@@ -5714,12 +5886,12 @@ fn prepare_result_application(
                     .artifact
                     .step_retry(&active.wait_state, runtime_execution_state(runtime))?
                 {
-                    if unified_failure_allows_retry(result.attempt, retry, &failed.error) {
+                    if unified_failure_allows_retry(result.attempt, &retry, &failed.error) {
                         if let Some(retry_task) = build_retry_task(
                             runtime,
                             &result.activity_id,
                             result.attempt + 1,
-                            retry,
+                            &retry,
                             now,
                         )? {
                             runtime.active_activities.insert(
@@ -6367,6 +6539,7 @@ fn activity_schedule_update(task: &QueuedActivity) -> ActivityScheduleUpdate {
         input: task.input.clone(),
         config: task.config.clone(),
         schedule_to_start_timeout_ms: task.schedule_to_start_timeout_ms,
+        schedule_to_close_timeout_ms: task.schedule_to_close_timeout_ms,
         start_to_close_timeout_ms: task.start_to_close_timeout_ms,
         heartbeat_timeout_ms: task.heartbeat_timeout_ms,
         event_id: Uuid::now_v7(),
@@ -6390,6 +6563,7 @@ fn queued_activity_from_record(record: &fabrik_store::WorkflowActivityRecord) ->
         input: record.input.clone(),
         config: record.config.clone(),
         state: record.state.clone().unwrap_or_default(),
+        schedule_to_close_timeout_ms: record.schedule_to_close_timeout_ms,
         schedule_to_start_timeout_ms: record.schedule_to_start_timeout_ms,
         start_to_close_timeout_ms: record.start_to_close_timeout_ms,
         heartbeat_timeout_ms: record.heartbeat_timeout_ms,
@@ -6486,6 +6660,7 @@ fn activity_proto(leased: &LeasedActivity, supports_cbor: bool) -> ActivityTask 
         lease_epoch: leased.task.lease_epoch,
         owner_epoch: leased.owner_epoch,
         omit_success_output: leased.task.omit_success_output,
+        schedule_to_close_timeout_ms: leased.task.schedule_to_close_timeout_ms.unwrap_or_default(),
     }
 }
 
@@ -6532,6 +6707,7 @@ fn schedule_activities_from_plan(
             config,
             state,
             schedule_to_start_timeout_ms,
+            schedule_to_close_timeout_ms,
             start_to_close_timeout_ms,
             heartbeat_timeout_ms,
             ..
@@ -6558,6 +6734,7 @@ fn schedule_activities_from_plan(
                 config: config.clone(),
                 state: wait_state.clone(),
                 schedule_to_start_timeout_ms: *schedule_to_start_timeout_ms,
+                schedule_to_close_timeout_ms: *schedule_to_close_timeout_ms,
                 start_to_close_timeout_ms: *start_to_close_timeout_ms,
                 heartbeat_timeout_ms: *heartbeat_timeout_ms,
                 scheduled_at,
@@ -6591,9 +6768,15 @@ fn build_retry_task(
     let execution_state = runtime_execution_state(runtime).clone();
     let (activity_type, config, input) =
         runtime.artifact.step_details(activity_id, &execution_state)?;
-    let (schedule_to_start_timeout_ms, start_to_close_timeout_ms, heartbeat_timeout_ms) =
-        runtime.artifact.step_timeouts(activity_id)?;
-    let due_at = now + parse_timer_ref(&retry.delay)?;
+    let (
+        schedule_to_start_timeout_ms,
+        schedule_to_close_timeout_ms,
+        start_to_close_timeout_ms,
+        heartbeat_timeout_ms,
+    ) = runtime
+        .artifact
+        .step_timeouts(activity_id, &execution_state)?;
+    let due_at = now + retry_delay_for_attempt(retry, next_attempt)?;
     Ok(Some(DelayedRetryTask {
         task: QueuedActivity {
             tenant_id: runtime.instance.tenant_id.clone(),
@@ -6614,6 +6797,7 @@ fn build_retry_task(
                 .map(|value| serde_json::to_value(value).expect("step config serializes")),
             state: active.wait_state.clone(),
             schedule_to_start_timeout_ms,
+            schedule_to_close_timeout_ms,
             start_to_close_timeout_ms,
             heartbeat_timeout_ms,
             scheduled_at: due_at,
@@ -6623,6 +6807,38 @@ fn build_retry_task(
         },
         due_at,
     }))
+}
+
+fn retry_delay_for_attempt(
+    retry: &RetryPolicy,
+    next_attempt: u32,
+) -> Result<chrono::TimeDelta> {
+    let base_delay = parse_timer_ref(&retry.delay)?;
+    let Some(backoff_millis) = retry.backoff_coefficient_millis else {
+        return Ok(cap_retry_delay(base_delay, retry.maximum_interval.as_deref())?);
+    };
+    let exponent = next_attempt.saturating_sub(2);
+    if exponent == 0 {
+        return Ok(cap_retry_delay(base_delay, retry.maximum_interval.as_deref())?);
+    }
+    let coefficient = backoff_millis as f64 / 1000.0;
+    let scaled_ms = (base_delay.num_milliseconds() as f64) * coefficient.powi(exponent as i32);
+    let scaled_ms = scaled_ms.round().clamp(0.0, i64::MAX as f64) as i64;
+    cap_retry_delay(
+        chrono::TimeDelta::milliseconds(scaled_ms),
+        retry.maximum_interval.as_deref(),
+    )
+}
+
+fn cap_retry_delay(
+    delay: chrono::TimeDelta,
+    maximum_interval: Option<&str>,
+) -> Result<chrono::TimeDelta> {
+    let Some(maximum_interval) = maximum_interval else {
+        return Ok(delay);
+    };
+    let maximum = parse_timer_ref(maximum_interval)?;
+    Ok(if delay > maximum { maximum } else { delay })
 }
 
 fn synthetic_runtime_event(
@@ -7172,6 +7388,73 @@ fn emitted_bulk_batch_event(
     envelope
 }
 
+async fn start_throughput_run_command(
+    _state: &AppState,
+    instance: &WorkflowInstanceState,
+    batch_id: &str,
+    activity_type: &str,
+    task_queue: &str,
+    total_items: usize,
+    result_handle: &Value,
+    workflow_state: Option<String>,
+    chunk_size: u32,
+    max_attempts: u32,
+    retry_delay_ms: u64,
+    aggregation_group_count: u32,
+    execution_policy: Option<String>,
+    reducer: Option<String>,
+    throughput_backend: &str,
+    throughput_backend_version: &str,
+    admission: &BulkAdmissionDecision,
+    source_event_id: Uuid,
+    occurred_at: DateTime<Utc>,
+) -> Result<ThroughputCommandEnvelope> {
+    let input_handle = native_stream_v2_run_input_handle(
+        &instance.tenant_id,
+        &instance.instance_id,
+        &instance.run_id,
+        batch_id,
+    );
+    let result_handle: PayloadHandle = serde_json::from_value(result_handle.clone())
+        .context("failed to deserialize bulk result handle for throughput command")?;
+    let dedupe_key = format!("throughput-start:{source_event_id}:{batch_id}");
+    Ok(ThroughputCommandEnvelope {
+        command_id: Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("unified-throughput-start:{source_event_id}:{batch_id}").as_bytes(),
+        ),
+        occurred_at,
+        dedupe_key: dedupe_key.clone(),
+        partition_key: throughput_partition_key(batch_id, 0),
+        payload: ThroughputCommand::StartThroughputRun(StartThroughputRunCommand {
+            dedupe_key,
+            tenant_id: instance.tenant_id.clone(),
+            definition_id: instance.definition_id.clone(),
+            definition_version: instance.definition_version,
+            artifact_hash: instance.artifact_hash.clone(),
+            instance_id: instance.instance_id.clone(),
+            run_id: instance.run_id.clone(),
+            batch_id: batch_id.to_owned(),
+            activity_type: activity_type.to_owned(),
+            task_queue: task_queue.to_owned(),
+            state: workflow_state,
+            chunk_size,
+            max_attempts,
+            retry_delay_ms,
+            total_items: total_items as u32,
+            aggregation_group_count,
+            execution_policy,
+            reducer,
+            throughput_backend: throughput_backend.to_owned(),
+            throughput_backend_version: throughput_backend_version.to_owned(),
+            routing_reason: admission.routing_reason.clone(),
+            admission_policy_version: admission.admission_policy_version.clone(),
+            input_handle,
+            result_handle,
+        }),
+    })
+}
+
 fn unified_failure_allows_retry(attempt: u32, retry: &RetryPolicy, error: &str) -> bool {
     attempt < retry.max_attempts && retry_policy_allows_failure_retry(retry, error)
 }
@@ -7317,6 +7600,7 @@ mod tests {
             config: None,
             state: "join".to_owned(),
             schedule_to_start_timeout_ms: None,
+            schedule_to_close_timeout_ms: None,
             start_to_close_timeout_ms: None,
             heartbeat_timeout_ms: None,
             scheduled_at,
@@ -7454,6 +7738,7 @@ mod tests {
                             retry: None,
                             config: None,
                             schedule_to_start_timeout_ms: None,
+                            schedule_to_close_timeout_ms: None,
                             start_to_close_timeout_ms: None,
                             heartbeat_timeout_ms: None,
                         },
@@ -7613,6 +7898,56 @@ mod tests {
         assert_eq!(decision.routing_reason, "task_queue_policy_override");
     }
 
+    #[tokio::test]
+    async fn admission_bypasses_stale_task_queue_cache_for_explicit_backend_requests() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir =
+            std::env::temp_dir().join(format!("unified-cache-bypass-{}", Uuid::now_v7()));
+        let state = test_app_state(store.clone(), RuntimeInner::default(), state_dir).await;
+        let tenant_id = "benchmark";
+        let task_queue = "default";
+
+        store
+            .upsert_task_queue_throughput_policy(
+                tenant_id,
+                TaskQueueKind::Activity,
+                task_queue,
+                ThroughputBackend::StreamV2.as_str(),
+            )
+            .await?;
+        let cached = cached_task_queue_throughput_backend(&state, tenant_id, task_queue, false)
+            .await?;
+        assert_eq!(cached.as_deref(), Some(ThroughputBackend::StreamV2.as_str()));
+
+        store
+            .upsert_task_queue_throughput_policy(
+                tenant_id,
+                TaskQueueKind::Activity,
+                task_queue,
+                ThroughputBackend::PgV1.as_str(),
+            )
+            .await?;
+
+        let decision = admit_bulk_batch(
+            &state,
+            tenant_id,
+            task_queue,
+            Some(ThroughputBackend::PgV1.as_str()),
+            None,
+            Some("max"),
+            1024,
+            64,
+        )
+        .await?;
+
+        assert_eq!(decision.selected_backend, ThroughputBackend::PgV1.as_str());
+        assert_eq!(decision.routing_reason, "task_queue_policy_override");
+        Ok(())
+    }
+
     #[test]
     fn prune_terminal_instances_removes_completed_runs_and_work() {
         let now = Utc::now();
@@ -7706,6 +8041,7 @@ mod tests {
                 retry: None,
                 config: None,
                 schedule_to_start_timeout_ms: None,
+                schedule_to_close_timeout_ms: None,
                 start_to_close_timeout_ms: None,
                 heartbeat_timeout_ms: None,
             },
@@ -7942,6 +8278,7 @@ mod tests {
                         on_error: None,
                         config: None,
                         schedule_to_start_timeout_ms: None,
+                        schedule_to_close_timeout_ms: None,
                         start_to_close_timeout_ms: Some(30_000),
                         heartbeat_timeout_ms: None,
                     },
@@ -8211,9 +8548,15 @@ mod tests {
         state_dir: PathBuf,
     ) -> AppState {
         fs::create_dir_all(&state_dir).expect("create app state dir");
+        let throughput_runtime =
+            ThroughputRuntimeConfig::from_env().expect("load test throughput runtime config");
+        let payload_store = test_payload_store(&state_dir).await;
         AppState {
             store,
             publisher: None,
+            throughput_command_publisher: None,
+            payload_store,
+            throughput_runtime,
             inner: Arc::new(StdMutex::new(inner)),
             ownership: Arc::new(StdMutex::new(UnifiedOwnershipState::inactive(1, "test-owner"))),
             workflow_partition_count: 8,
@@ -8726,6 +9069,8 @@ mod tests {
         let retry = RetryPolicy {
             max_attempts: 3,
             delay: "5s".to_owned(),
+            maximum_interval: None,
+            backoff_coefficient_millis: None,
             non_retryable_error_types: vec!["ValidationError".to_owned()],
         };
 
@@ -8736,6 +9081,21 @@ mod tests {
             r#"{"type":"ValidationError","message":"bad input"}"#
         ));
         assert!(!unified_failure_allows_retry(3, &retry, "TransientError: retry me"));
+    }
+
+    #[test]
+    fn retry_delay_scales_with_backoff_and_caps_at_maximum_interval() {
+        let retry = RetryPolicy {
+            max_attempts: 5,
+            delay: "500ms".to_owned(),
+            maximum_interval: Some("1s".to_owned()),
+            backoff_coefficient_millis: Some(2000),
+            non_retryable_error_types: Vec::new(),
+        };
+
+        assert_eq!(retry_delay_for_attempt(&retry, 2).unwrap().num_milliseconds(), 500);
+        assert_eq!(retry_delay_for_attempt(&retry, 3).unwrap().num_milliseconds(), 1000);
+        assert_eq!(retry_delay_for_attempt(&retry, 4).unwrap().num_milliseconds(), 1000);
     }
 
     #[tokio::test]
@@ -9242,6 +9602,82 @@ mod tests {
             instance_id: "instance-throughput-batch".to_owned(),
             run_id: "run-throughput-batch".to_owned(),
         }));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_start_throughput_run_command_stores_db_backed_input_reference() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-native-start-command-{}", Uuid::now_v7()));
+        let mut app_state =
+            test_app_state(store, RuntimeInner::default(), state_dir.clone()).await;
+        app_state.throughput_runtime.native_stream_v2_engine_enabled = true;
+
+        let instance = WorkflowInstanceState {
+            tenant_id: "tenant".to_owned(),
+            instance_id: "instance-native-start".to_owned(),
+            run_id: "run-native-start".to_owned(),
+            definition_id: "demo".to_owned(),
+            definition_version: Some(1),
+            artifact_hash: Some("artifact-a".to_owned()),
+            workflow_task_queue: "default".to_owned(),
+            sticky_workflow_build_id: None,
+            sticky_workflow_poller_id: None,
+            current_state: Some("join".to_owned()),
+            context: None,
+            artifact_execution: None,
+            status: WorkflowStatus::Running,
+            input: None,
+            persisted_input_handle: None,
+            memo: None,
+            search_attributes: None,
+            output: None,
+            event_count: 1,
+            last_event_id: Uuid::now_v7(),
+            last_event_type: "WorkflowTriggered".to_owned(),
+            updated_at: Utc::now(),
+        };
+        let command = start_throughput_run_command(
+            &app_state,
+            &instance,
+            "batch-a",
+            "benchmark.echo",
+            "bulk",
+            2,
+            &serde_json::to_value(PayloadHandle::inline_batch_result("batch-a"))?,
+            Some("join".to_owned()),
+            16,
+            3,
+            1000,
+            2,
+            Some("parallel".to_owned()),
+            Some("count".to_owned()),
+            ThroughputBackend::StreamV2.as_str(),
+            ThroughputBackend::StreamV2.default_version(),
+            &BulkAdmissionDecision {
+                selected_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
+                selected_backend_version: ThroughputBackend::StreamV2.default_version().to_owned(),
+                routing_reason: "stream_v2_selected".to_owned(),
+                admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
+            },
+            Uuid::now_v7(),
+            Utc::now(),
+        )
+        .await?;
+
+        let ThroughputCommand::StartThroughputRun(start) = &command.payload else {
+            panic!("expected native start throughput command");
+        };
+        let PayloadHandle::Inline { key } = &start.input_handle else {
+            panic!("expected db-backed native input handle reference");
+        };
+        assert!(key.starts_with("throughput-run-input:"));
 
         fs::remove_dir_all(state_dir).ok();
         Ok(())
@@ -10543,6 +10979,7 @@ mod tests {
                         on_error: None,
                         config: None,
                         schedule_to_start_timeout_ms: None,
+                        schedule_to_close_timeout_ms: None,
                         start_to_close_timeout_ms: Some(30_000),
                         heartbeat_timeout_ms: None,
                     },
@@ -10588,6 +11025,7 @@ mod tests {
                     config: None,
                     state: Some("start".to_owned()),
                     schedule_to_start_timeout_ms: None,
+                    schedule_to_close_timeout_ms: None,
                     start_to_close_timeout_ms: Some(30_000),
                     heartbeat_timeout_ms: None,
                 },

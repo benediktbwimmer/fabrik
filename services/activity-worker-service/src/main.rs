@@ -292,6 +292,8 @@ fn estimate_bulk_result_size(result: &BulkActivityTaskResult) -> usize {
 
 async fn flush_results(
     worker: &mut ActivityWorkerApiClient<tonic::transport::Channel>,
+    endpoint: &str,
+    flusher_id: &str,
     pending_results: &mut Vec<ActivityTaskResult>,
     pending_result_bytes: &mut usize,
     first_pending_at: &mut Option<std::time::Instant>,
@@ -299,18 +301,62 @@ async fn flush_results(
     if pending_results.is_empty() {
         return Ok(());
     }
-    worker
-        .report_activity_task_results(ReportActivityTaskResultsRequest {
-            results: std::mem::take(pending_results),
-        })
-        .await?;
-    *pending_result_bytes = 0;
-    *first_pending_at = None;
-    Ok(())
+    loop {
+        match worker
+            .report_activity_task_results(ReportActivityTaskResultsRequest {
+                results: pending_results.clone(),
+            })
+            .await
+        {
+            Ok(_) => {
+                pending_results.clear();
+                *pending_result_bytes = 0;
+                *first_pending_at = None;
+                return Ok(());
+            }
+            Err(error) => {
+                error!(
+                    error = %error,
+                    flusher_id = %flusher_id,
+                    "failed to flush activity task results"
+                );
+                *worker = connect_activity_worker_with_retry(endpoint, flusher_id).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+}
+
+async fn report_bulk_results(
+    worker: &mut ActivityWorkerApiClient<tonic::transport::Channel>,
+    endpoint: &str,
+    flusher_id: &str,
+    pending_results: &[BulkActivityTaskResult],
+) -> Result<()> {
+    loop {
+        match worker
+            .report_bulk_activity_task_results(ReportBulkActivityTaskResultsRequest {
+                results: pending_results.to_vec(),
+            })
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(error) => {
+                error!(
+                    error = %error,
+                    flusher_id = %flusher_id,
+                    "failed to flush bulk activity task results"
+                );
+                *worker = connect_activity_worker_with_retry(endpoint, flusher_id).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
 }
 
 async fn flush_bulk_results(
     worker: &mut ActivityWorkerApiClient<tonic::transport::Channel>,
+    endpoint: &str,
     payload_store: &PayloadStore,
     flusher_id: &str,
     externalize_outputs: bool,
@@ -324,11 +370,8 @@ async fn flush_bulk_results(
     if externalize_outputs {
         externalize_bulk_result_outputs(payload_store, flusher_id, pending_results).await?;
     }
-    worker
-        .report_bulk_activity_task_results(ReportBulkActivityTaskResultsRequest {
-            results: std::mem::take(pending_results),
-        })
-        .await?;
+    report_bulk_results(worker, endpoint, flusher_id, pending_results).await?;
+    pending_results.clear();
     *pending_result_bytes = 0;
     *first_pending_at = None;
     Ok(())
@@ -364,6 +407,8 @@ async fn run_result_flusher(
         ) {
             flush_results(
                 &mut worker,
+                &endpoint,
+                &flusher_id,
                 &mut pending_results,
                 &mut pending_result_bytes,
                 &mut first_pending_at,
@@ -387,6 +432,8 @@ async fn run_result_flusher(
             Ok(None) => {
                 flush_results(
                     &mut worker,
+                    &endpoint,
+                    &flusher_id,
                     &mut pending_results,
                     &mut pending_result_bytes,
                     &mut first_pending_at,
@@ -397,6 +444,8 @@ async fn run_result_flusher(
             Err(_) => {
                 flush_results(
                     &mut worker,
+                    &endpoint,
+                    &flusher_id,
                     &mut pending_results,
                     &mut pending_result_bytes,
                     &mut first_pending_at,
@@ -440,6 +489,7 @@ async fn run_bulk_result_flusher(
         {
             flush_bulk_results(
                 &mut worker,
+                &endpoint,
                 payload_store.as_ref(),
                 &flusher_id,
                 externalize_outputs,
@@ -466,6 +516,7 @@ async fn run_bulk_result_flusher(
             Ok(None) => {
                 flush_bulk_results(
                     &mut worker,
+                    &endpoint,
                     payload_store.as_ref(),
                     &flusher_id,
                     externalize_outputs,
@@ -479,6 +530,7 @@ async fn run_bulk_result_flusher(
             Err(_) => {
                 flush_bulk_results(
                     &mut worker,
+                    &endpoint,
                     payload_store.as_ref(),
                     &flusher_id,
                     externalize_outputs,
@@ -541,6 +593,7 @@ async fn run_activity_lane(
                 Ok(tasks) => tasks,
                 Err(error) => {
                     error!(error = %error, worker_id = %worker_id, "failed to poll matching-service");
+                    worker = connect_activity_worker_with_retry(&endpoint, &worker_id).await;
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     continue;
                 }
@@ -597,6 +650,7 @@ async fn run_bulk_activity_lane(
             Ok(response) => response.into_inner().tasks,
             Err(error) => {
                 error!(error = %error, worker_id = %worker_id, "failed to poll matching-service for bulk task");
+                worker = connect_activity_worker_with_retry(&endpoint, &worker_id).await;
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
@@ -922,7 +976,8 @@ fn execute_benchmark_echo_bulk_task(
     worker_build_id: String,
     items: Vec<Value>,
 ) -> Result<BulkActivityTaskResult> {
-    let omit_success_output = task.omit_success_output;
+    let omit_success_output =
+        task.omit_success_output && !items.iter().any(benchmark_echo_item_requires_output);
     let mut outputs = (!omit_success_output).then(|| Vec::with_capacity(items.len()));
     for item in items {
         match execute_benchmark_echo(task.attempt, &item) {
@@ -1009,6 +1064,14 @@ fn execute_benchmark_echo_bulk_task(
     })
 }
 
+fn benchmark_echo_item_requires_output(item: &Value) -> bool {
+    item.get("reducer_value").is_some()
+}
+
+fn bulk_output_should_remain_inline(output: &[Value]) -> bool {
+    !output.is_empty() && output.iter().all(|value| !value.is_array() && !value.is_object())
+}
+
 async fn externalize_bulk_result_outputs(
     payload_store: &PayloadStore,
     flusher_id: &str,
@@ -1046,6 +1109,9 @@ async fn externalize_bulk_result_outputs(
         } else {
             serde_json::from_str::<Vec<Value>>(&completed.output_json)?
         };
+        if bulk_output_should_remain_inline(&output) {
+            continue;
+        }
         let start = flattened_outputs.len();
         let len = output.len();
         flattened_outputs.extend(output);
@@ -1458,6 +1524,45 @@ mod tests {
         .expect("benchmark echo succeeds");
 
         assert_eq!(output, json!(42));
+    }
+
+    #[test]
+    fn bulk_benchmark_echo_keeps_outputs_for_numeric_reducer_items() {
+        let task = BulkActivityTask {
+            tenant_id: "tenant".to_owned(),
+            instance_id: "instance".to_owned(),
+            run_id: "run".to_owned(),
+            batch_id: "batch".to_owned(),
+            chunk_id: "batch::0".to_owned(),
+            attempt: 1,
+            omit_success_output: true,
+            ..BulkActivityTask::default()
+        };
+        let result = execute_benchmark_echo_bulk_task(
+            task,
+            "worker".to_owned(),
+            "build".to_owned(),
+            vec![json!({"reducer_value": 7})],
+        )
+        .expect("bulk benchmark echo succeeds");
+
+        let completed = match result.result.expect("result present") {
+            fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
+                completed,
+            ) => completed,
+            other => panic!("expected completed result, got {other:?}"),
+        };
+
+        assert!(!completed.output_cbor.is_empty());
+    }
+
+    #[test]
+    fn scalar_numeric_bulk_outputs_stay_inline() {
+        assert!(bulk_output_should_remain_inline(&[json!(1), json!(2), json!(3)]));
+        assert!(bulk_output_should_remain_inline(&[json!("alpha"), json!("beta")]));
+        assert!(bulk_output_should_remain_inline(&[json!(true), json!(false)]));
+        assert!(!bulk_output_should_remain_inline(&[json!({"ok": true})]));
+        assert!(!bulk_output_should_remain_inline(&[]));
     }
 
     #[test]

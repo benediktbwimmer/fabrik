@@ -248,6 +248,18 @@ fn temporal_search_attributes_workflow_slice_qualifies_and_packages() {
 }
 
 #[test]
+fn workflow_local_map_state_qualifies_and_packages() {
+    let output_dir = temp_output_dir("map-state-qualified");
+    let (status, report) = run_cli(&fixture("temporal-map-state-qualified"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
+    assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
+    assert_eq!(report["worker_packages"][0]["task_queue"], "map-state-qualified");
+}
+
+#[test]
 fn workflow_only_workers_package_without_activity_modules() {
     let output_dir = temp_output_dir("workflow-only-qualified");
     let (status, report) = run_cli(&fixture("temporal-workflow-only-qualified"), &output_dir, &[]);
@@ -258,6 +270,18 @@ fn workflow_only_workers_package_without_activity_modules() {
     assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
     assert!(report["worker_packages"][0]["resolved_activity_module_path"].is_null());
     assert_eq!(report["worker_packages"][0]["task_queue"], "workflow-only");
+}
+
+#[test]
+fn workspace_and_tsconfig_path_activity_modules_package_cleanly() {
+    let output_dir = temp_output_dir("workspace-qualified");
+    let (status, report) = run_cli(&fixture("temporal-workspace-qualified"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
+    assert_eq!(report["worker_packages"][0]["task_queue"], "workspace-qualified");
+    assert!(report["worker_packages"][0]["resolved_activity_module_path"].is_string());
 }
 
 #[test]

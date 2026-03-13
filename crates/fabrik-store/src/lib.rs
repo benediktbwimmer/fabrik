@@ -2,8 +2,10 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_throughput::{
-    ADMISSION_POLICY_VERSION, BULK_REDUCER_AVG, BULK_REDUCER_MAX, BULK_REDUCER_MIN,
-    BULK_REDUCER_SUM, bulk_reducer_name, bulk_reducer_reduce_values, throughput_execution_mode,
+    ADMISSION_POLICY_VERSION, ThroughputChunkReport, ThroughputCommandEnvelope,
+    bulk_reducer_default_summary_value, bulk_reducer_name, bulk_reducer_reduce_errors,
+    bulk_reducer_reduce_values, bulk_reducer_requires_error_outputs,
+    bulk_reducer_requires_success_outputs, bulk_reducer_settles, throughput_execution_mode,
     throughput_reducer_execution_path, throughput_reducer_version, throughput_routing_reason,
 };
 use fabrik_workflow::{CompiledWorkflowArtifact, WorkflowDefinition, WorkflowInstanceState};
@@ -126,6 +128,7 @@ pub struct WorkflowActivityRecord {
     pub lease_expires_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub schedule_to_start_timeout_ms: Option<u64>,
+    pub schedule_to_close_timeout_ms: Option<u64>,
     pub start_to_close_timeout_ms: Option<u64>,
     pub heartbeat_timeout_ms: Option<u64>,
     pub last_event_id: Uuid,
@@ -192,6 +195,7 @@ pub struct ActivityScheduleUpdate {
     pub input: Value,
     pub config: Option<Value>,
     pub schedule_to_start_timeout_ms: Option<u64>,
+    pub schedule_to_close_timeout_ms: Option<u64>,
     pub start_to_close_timeout_ms: Option<u64>,
     pub heartbeat_timeout_ms: Option<u64>,
     pub event_id: Uuid,
@@ -327,6 +331,57 @@ pub struct WorkflowBulkBatchRecord {
     pub scheduled_at: DateTime<Utc>,
     pub terminal_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThroughputRunRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub definition_id: String,
+    pub definition_version: Option<u32>,
+    pub artifact_hash: Option<String>,
+    pub batch_id: String,
+    pub throughput_backend: String,
+    pub status: String,
+    pub command_dedupe_key: String,
+    pub command: ThroughputCommandEnvelope,
+    pub command_published_at: Option<DateTime<Utc>>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub terminal_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThroughputRunInputRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub batch_id: String,
+    pub items: Vec<Value>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThroughputTerminalRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub batch_id: String,
+    pub status: String,
+    pub terminal_at: DateTime<Utc>,
+    pub terminal_event_id: Uuid,
+    pub terminal_event: EventEnvelope<WorkflowEvent>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThroughputReportLogEntry {
+    pub report: ThroughputChunkReport,
+    pub captured_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1343,6 +1398,7 @@ impl WorkflowStore {
                 lease_expires_at TIMESTAMPTZ,
                 completed_at TIMESTAMPTZ,
                 schedule_to_start_timeout_ms BIGINT,
+                schedule_to_close_timeout_ms BIGINT,
                 start_to_close_timeout_ms BIGINT,
                 heartbeat_timeout_ms BIGINT,
                 last_event_id UUID NOT NULL,
@@ -1553,6 +1609,131 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to add throughput_bridge_progress.command_published_at")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS throughput_runs (
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                workflow_id TEXT NOT NULL,
+                workflow_version INTEGER,
+                artifact_hash TEXT,
+                batch_id TEXT NOT NULL,
+                throughput_backend TEXT NOT NULL,
+                status TEXT NOT NULL,
+                command_dedupe_key TEXT NOT NULL,
+                command JSONB NOT NULL,
+                command_published_at TIMESTAMPTZ,
+                started_at TIMESTAMPTZ,
+                terminal_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, workflow_instance_id, run_id, batch_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize throughput_runs table")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS throughput_runs_backend_status_idx
+            ON throughput_runs (throughput_backend, status, created_at)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize throughput_runs backend status index")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS throughput_run_inputs (
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                batch_id TEXT NOT NULL,
+                items JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, workflow_instance_id, run_id, batch_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize throughput_run_inputs table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS throughput_terminals (
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                batch_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                terminal_at TIMESTAMPTZ NOT NULL,
+                terminal_event_id UUID NOT NULL UNIQUE,
+                terminal_event JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, workflow_instance_id, run_id, batch_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize throughput_terminals table")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS throughput_terminals_terminal_idx
+            ON throughput_terminals (terminal_at, tenant_id, workflow_instance_id, run_id, batch_id)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize throughput_terminals terminal index")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS throughput_report_log (
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                batch_id TEXT NOT NULL,
+                chunk_id TEXT NOT NULL,
+                report_id TEXT NOT NULL,
+                occurred_at TIMESTAMPTZ NOT NULL,
+                captured_at TIMESTAMPTZ NOT NULL,
+                owner_epoch BIGINT NOT NULL,
+                lease_epoch BIGINT NOT NULL,
+                report JSONB NOT NULL,
+                PRIMARY KEY (
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    batch_id,
+                    chunk_id,
+                    report_id
+                )
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize throughput_report_log table")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS throughput_report_log_captured_idx
+            ON throughput_report_log (captured_at, tenant_id, workflow_instance_id, run_id, batch_id)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize throughput_report_log captured index")?;
 
         sqlx::query(
             r#"
@@ -8402,6 +8583,7 @@ impl WorkflowStore {
         input: &Value,
         config: Option<&Value>,
         schedule_to_start_timeout_ms: Option<u64>,
+        schedule_to_close_timeout_ms: Option<u64>,
         start_to_close_timeout_ms: Option<u64>,
         heartbeat_timeout_ms: Option<u64>,
         event_id: Uuid,
@@ -8438,6 +8620,7 @@ impl WorkflowStore {
                 lease_expires_at,
                 completed_at,
                 schedule_to_start_timeout_ms,
+                schedule_to_close_timeout_ms,
                 start_to_close_timeout_ms,
                 heartbeat_timeout_ms,
                 last_event_id,
@@ -8447,7 +8630,7 @@ impl WorkflowStore {
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'scheduled', $12, $13,
                 NULL, NULL, FALSE, NULL, NULL, NULL, NULL, $14, NULL, NULL, NULL, NULL,
-                $15, $16, $17, $18, $19, $20
+                $15, $16, $17, $18, $19, $20, $21
             )
             ON CONFLICT (tenant_id, workflow_instance_id, run_id, activity_id, attempt)
             DO UPDATE SET
@@ -8473,6 +8656,7 @@ impl WorkflowStore {
                 lease_expires_at = NULL,
                 completed_at = NULL,
                 schedule_to_start_timeout_ms = EXCLUDED.schedule_to_start_timeout_ms,
+                schedule_to_close_timeout_ms = EXCLUDED.schedule_to_close_timeout_ms,
                 start_to_close_timeout_ms = EXCLUDED.start_to_close_timeout_ms,
                 heartbeat_timeout_ms = EXCLUDED.heartbeat_timeout_ms,
                 last_event_id = EXCLUDED.last_event_id,
@@ -8495,6 +8679,7 @@ impl WorkflowStore {
         .bind(config.map(Json))
         .bind(occurred_at)
         .bind(schedule_to_start_timeout_ms.map(|value| value as i64))
+        .bind(schedule_to_close_timeout_ms.map(|value| value as i64))
         .bind(start_to_close_timeout_ms.map(|value| value as i64))
         .bind(heartbeat_timeout_ms.map(|value| value as i64))
         .bind(event_id)
@@ -8533,6 +8718,7 @@ impl WorkflowStore {
                 config,
                 scheduled_at,
                 schedule_to_start_timeout_ms,
+                schedule_to_close_timeout_ms,
                 start_to_close_timeout_ms,
                 heartbeat_timeout_ms,
                 last_event_id,
@@ -8559,6 +8745,7 @@ impl WorkflowStore {
                 .push_bind(update.config.as_ref().map(Json))
                 .push_bind(update.occurred_at)
                 .push_bind(update.schedule_to_start_timeout_ms.map(|value| value as i64))
+                .push_bind(update.schedule_to_close_timeout_ms.map(|value| value as i64))
                 .push_bind(update.start_to_close_timeout_ms.map(|value| value as i64))
                 .push_bind(update.heartbeat_timeout_ms.map(|value| value as i64))
                 .push_bind(update.event_id)
@@ -8597,6 +8784,7 @@ impl WorkflowStore {
                 lease_expires_at,
                 completed_at,
                 schedule_to_start_timeout_ms,
+                schedule_to_close_timeout_ms,
                 start_to_close_timeout_ms,
                 heartbeat_timeout_ms,
                 last_event_id,
@@ -8631,6 +8819,7 @@ impl WorkflowStore {
                 NULL,
                 NULL,
                 schedule_to_start_timeout_ms,
+                schedule_to_close_timeout_ms,
                 start_to_close_timeout_ms,
                 heartbeat_timeout_ms,
                 last_event_id,
@@ -8661,6 +8850,7 @@ impl WorkflowStore {
                 lease_expires_at = NULL,
                 completed_at = NULL,
                 schedule_to_start_timeout_ms = EXCLUDED.schedule_to_start_timeout_ms,
+                schedule_to_close_timeout_ms = EXCLUDED.schedule_to_close_timeout_ms,
                 start_to_close_timeout_ms = EXCLUDED.start_to_close_timeout_ms,
                 heartbeat_timeout_ms = EXCLUDED.heartbeat_timeout_ms,
                 last_event_id = EXCLUDED.last_event_id,
@@ -8873,6 +9063,7 @@ impl WorkflowStore {
                     activity.lease_expires_at,
                     activity.completed_at,
                     activity.schedule_to_start_timeout_ms,
+                    activity.schedule_to_close_timeout_ms,
                     activity.start_to_close_timeout_ms,
                     activity.heartbeat_timeout_ms,
                     activity.last_event_id,
@@ -9164,6 +9355,7 @@ impl WorkflowStore {
                     activity.lease_expires_at,
                     activity.completed_at,
                     activity.schedule_to_start_timeout_ms,
+                    activity.schedule_to_close_timeout_ms,
                     activity.start_to_close_timeout_ms,
                     activity.heartbeat_timeout_ms,
                     activity.last_event_id,
@@ -10255,6 +10447,7 @@ impl WorkflowStore {
                 cancelled_items: batch.cancelled_items,
                 chunk_count: batch.chunk_count,
                 message: reason.to_owned(),
+                reducer_output: batch.reducer_output.clone(),
             },
         ));
         if let Some(event) = terminal_event.as_ref() {
@@ -10378,7 +10571,7 @@ impl WorkflowStore {
                         batch.status = WorkflowBulkBatchStatus::Completed;
                         batch.terminal_at = Some(update.occurred_at);
                         let reducer_output =
-                            Self::reduce_bulk_batch_success_outputs(tx.as_mut(), &batch).await?;
+                            Self::reduce_bulk_batch_reducer_output(tx.as_mut(), &batch).await?;
                         batch.reducer_output = reducer_output.clone();
                         terminal_event = Some(Self::bulk_terminal_event(
                             &batch,
@@ -10467,6 +10660,8 @@ impl WorkflowStore {
                         batch.status = WorkflowBulkBatchStatus::Failed;
                         batch.error = Some(error.clone());
                         batch.terminal_at = Some(update.occurred_at);
+                        batch.reducer_output =
+                            Self::reduce_bulk_batch_reducer_output(tx.as_mut(), &batch).await?;
                         terminal_event = Some(Self::bulk_terminal_event(
                             &batch,
                             WorkflowEvent::BulkActivityBatchFailed {
@@ -10477,6 +10672,7 @@ impl WorkflowStore {
                                 cancelled_items: batch.cancelled_items,
                                 chunk_count: batch.chunk_count,
                                 message: error.clone(),
+                                reducer_output: batch.reducer_output.clone(),
                             },
                         ));
                     }
@@ -10517,6 +10713,8 @@ impl WorkflowStore {
                     batch.status = WorkflowBulkBatchStatus::Cancelled;
                     batch.error = Some(reason.clone());
                     batch.terminal_at = Some(update.occurred_at);
+                    batch.reducer_output =
+                        Self::reduce_bulk_batch_reducer_output(tx.as_mut(), &batch).await?;
                     terminal_event = Some(Self::bulk_terminal_event(
                         &batch,
                         WorkflowEvent::BulkActivityBatchCancelled {
@@ -10527,6 +10725,7 @@ impl WorkflowStore {
                             cancelled_items: batch.cancelled_items,
                             chunk_count: batch.chunk_count,
                             message: reason.clone(),
+                            reducer_output: batch.reducer_output.clone(),
                         },
                     ));
                 }
@@ -10788,6 +10987,572 @@ impl WorkflowStore {
         .await
         .context("failed to mark throughput bridge command published")?;
         Ok(())
+    }
+
+    pub async fn upsert_throughput_run(&self, run: &ThroughputRunRecord) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO throughput_runs (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                workflow_id,
+                workflow_version,
+                artifact_hash,
+                batch_id,
+                throughput_backend,
+                status,
+                command_dedupe_key,
+                command,
+                command_published_at,
+                started_at,
+                terminal_at,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
+            )
+            ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id)
+            DO UPDATE SET
+                workflow_id = EXCLUDED.workflow_id,
+                workflow_version = EXCLUDED.workflow_version,
+                artifact_hash = EXCLUDED.artifact_hash,
+                throughput_backend = EXCLUDED.throughput_backend,
+                command_dedupe_key = EXCLUDED.command_dedupe_key,
+                command = EXCLUDED.command,
+                command_published_at =
+                    COALESCE(throughput_runs.command_published_at, EXCLUDED.command_published_at),
+                started_at = COALESCE(throughput_runs.started_at, EXCLUDED.started_at),
+                terminal_at = COALESCE(throughput_runs.terminal_at, EXCLUDED.terminal_at),
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(&run.tenant_id)
+        .bind(&run.instance_id)
+        .bind(&run.run_id)
+        .bind(&run.definition_id)
+        .bind(run.definition_version.map(|value| value as i32))
+        .bind(&run.artifact_hash)
+        .bind(&run.batch_id)
+        .bind(&run.throughput_backend)
+        .bind(&run.status)
+        .bind(&run.command_dedupe_key)
+        .bind(Json(&run.command))
+        .bind(run.command_published_at)
+        .bind(run.started_at)
+        .bind(run.terminal_at)
+        .bind(run.created_at)
+        .bind(run.updated_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert throughput run")?;
+        Ok(())
+    }
+
+    pub async fn upsert_throughput_run_input(&self, input: &ThroughputRunInputRecord) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO throughput_run_inputs (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                batch_id,
+                items,
+                created_at,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id)
+            DO UPDATE SET
+                items = EXCLUDED.items,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(&input.tenant_id)
+        .bind(&input.instance_id)
+        .bind(&input.run_id)
+        .bind(&input.batch_id)
+        .bind(Json(&input.items))
+        .bind(input.created_at)
+        .bind(input.updated_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert throughput run input")?;
+        Ok(())
+    }
+
+    pub async fn get_throughput_run(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+    ) -> Result<Option<ThroughputRunRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT *
+            FROM throughput_runs
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND batch_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load throughput run")?;
+        row.map(Self::decode_throughput_run_row).transpose()
+    }
+
+    pub async fn get_throughput_run_input(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+    ) -> Result<Option<ThroughputRunInputRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT *
+            FROM throughput_run_inputs
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND batch_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load throughput run input")?;
+        row.map(Self::decode_throughput_run_input_row).transpose()
+    }
+
+    pub async fn get_throughput_terminal(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+    ) -> Result<Option<ThroughputTerminalRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT *
+            FROM throughput_terminals
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND batch_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load throughput terminal")?;
+        row.map(Self::decode_throughput_terminal_row).transpose()
+    }
+
+    pub async fn list_nonterminal_throughput_runs_for_backend(
+        &self,
+        throughput_backend: &str,
+        limit: usize,
+    ) -> Result<Vec<ThroughputRunRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM throughput_runs
+            WHERE throughput_backend = $1
+              AND status IN ('scheduled', 'running')
+            ORDER BY created_at ASC, batch_id ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(throughput_backend)
+        .bind(i64::try_from(limit.max(1)).context("throughput run bootstrap limit exceeds i64")?)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list nonterminal throughput runs for backend")?;
+        rows.into_iter().map(Self::decode_throughput_run_row).collect()
+    }
+
+    pub async fn list_unpublished_scheduled_throughput_runs_for_backend(
+        &self,
+        throughput_backend: &str,
+        limit: usize,
+    ) -> Result<Vec<ThroughputRunRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM throughput_runs
+            WHERE throughput_backend = $1
+              AND status = 'scheduled'
+              AND command_published_at IS NULL
+            ORDER BY created_at ASC, batch_id ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(throughput_backend)
+        .bind(i64::try_from(limit.max(1)).context("throughput run bootstrap limit exceeds i64")?)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list unpublished scheduled throughput runs for backend")?;
+        rows.into_iter().map(Self::decode_throughput_run_row).collect()
+    }
+
+    pub async fn mark_throughput_run_command_published(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+        published_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE throughput_runs
+            SET command_published_at = COALESCE(command_published_at, $5),
+                updated_at = $5
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND batch_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .bind(published_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to mark throughput run command published")?;
+        Ok(updated.rows_affected() > 0)
+    }
+
+    pub async fn mark_throughput_run_started(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+        started_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE throughput_runs
+            SET status = CASE
+                    WHEN terminal_at IS NULL THEN 'running'
+                    ELSE status
+                END,
+                started_at = COALESCE(started_at, $5),
+                updated_at = $5
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND batch_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .bind(started_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to mark throughput run started")?;
+        Ok(updated.rows_affected() > 0)
+    }
+
+    pub async fn mark_throughput_run_terminal(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+        status: &str,
+        terminal_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let updated = sqlx::query(
+            r#"
+            UPDATE throughput_runs
+            SET status = CASE
+                    WHEN terminal_at IS NULL THEN $5
+                    ELSE status
+                END,
+                terminal_at = COALESCE(terminal_at, $6),
+                updated_at = $6
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND batch_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .bind(status)
+        .bind(terminal_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to mark throughput run terminal")?;
+        Ok(updated.rows_affected() > 0)
+    }
+
+    pub async fn commit_throughput_terminal_handoff(
+        &self,
+        terminal: &ThroughputTerminalRecord,
+    ) -> Result<bool> {
+        if terminal.terminal_event.event_id != terminal.terminal_event_id {
+            anyhow::bail!(
+                "throughput terminal handoff event id {} does not match envelope {}",
+                terminal.terminal_event_id,
+                terminal.terminal_event.event_id
+            );
+        }
+
+        let mut tx = self.pool.begin().await.context("failed to begin throughput terminal handoff transaction")?;
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO throughput_terminals (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                batch_id,
+                status,
+                terminal_at,
+                terminal_event_id,
+                terminal_event,
+                created_at,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id) DO NOTHING
+            "#,
+        )
+        .bind(&terminal.tenant_id)
+        .bind(&terminal.instance_id)
+        .bind(&terminal.run_id)
+        .bind(&terminal.batch_id)
+        .bind(&terminal.status)
+        .bind(terminal.terminal_at)
+        .bind(terminal.terminal_event_id)
+        .bind(Json(&terminal.terminal_event))
+        .bind(terminal.created_at)
+        .bind(terminal.updated_at)
+        .execute(tx.as_mut())
+        .await
+        .context("failed to insert throughput terminal handoff")?;
+
+        if inserted.rows_affected() == 0 {
+            let row = sqlx::query(
+                r#"
+                SELECT *
+                FROM throughput_terminals
+                WHERE tenant_id = $1
+                  AND workflow_instance_id = $2
+                  AND run_id = $3
+                  AND batch_id = $4
+                "#,
+            )
+            .bind(&terminal.tenant_id)
+            .bind(&terminal.instance_id)
+            .bind(&terminal.run_id)
+            .bind(&terminal.batch_id)
+            .fetch_one(tx.as_mut())
+            .await
+            .context("failed to load existing throughput terminal handoff")?;
+            let existing = Self::decode_throughput_terminal_row(row)?;
+            tx.commit().await.context("failed to commit idempotent throughput terminal handoff")?;
+            if existing.status == terminal.status
+                && existing.terminal_event.event_type == terminal.terminal_event.event_type
+            {
+                return Ok(false);
+            }
+            anyhow::bail!(
+                "conflicting throughput terminal handoff for tenant={} instance={} run={} batch={}",
+                terminal.tenant_id,
+                terminal.instance_id,
+                terminal.run_id,
+                terminal.batch_id
+            );
+        }
+
+        self.enqueue_workflow_event_outbox(tx.as_mut(), &terminal.terminal_event, terminal.terminal_at)
+            .await?;
+
+        let updated = sqlx::query(
+            r#"
+            UPDATE throughput_runs
+            SET status = CASE
+                    WHEN terminal_at IS NULL THEN $5
+                    ELSE status
+                END,
+                terminal_at = COALESCE(terminal_at, $6),
+                updated_at = $6
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND batch_id = $4
+            "#,
+        )
+        .bind(&terminal.tenant_id)
+        .bind(&terminal.instance_id)
+        .bind(&terminal.run_id)
+        .bind(&terminal.batch_id)
+        .bind(&terminal.status)
+        .bind(terminal.terminal_at)
+        .execute(tx.as_mut())
+        .await
+        .context("failed to mark throughput run terminal during handoff")?;
+        if updated.rows_affected() == 0 {
+            anyhow::bail!(
+                "throughput terminal handoff missing run row for tenant={} instance={} run={} batch={}",
+                terminal.tenant_id,
+                terminal.instance_id,
+                terminal.run_id,
+                terminal.batch_id
+            );
+        }
+
+        tx.commit().await.context("failed to commit throughput terminal handoff transaction")?;
+        Ok(true)
+    }
+
+    pub async fn append_throughput_report_log_entries(
+        &self,
+        reports: &[ThroughputChunkReport],
+        captured_at: DateTime<Utc>,
+    ) -> Result<()> {
+        if reports.is_empty() {
+            return Ok(());
+        }
+
+        let mut builder = QueryBuilder::<Postgres>::new(
+            r#"
+            INSERT INTO throughput_report_log (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                batch_id,
+                chunk_id,
+                report_id,
+                occurred_at,
+                captured_at,
+                owner_epoch,
+                lease_epoch,
+                report
+            )
+            "#,
+        );
+        builder.push_values(reports, |mut row, report| {
+            row.push_bind(&report.tenant_id)
+                .push_bind(&report.instance_id)
+                .push_bind(&report.run_id)
+                .push_bind(&report.batch_id)
+                .push_bind(&report.chunk_id)
+                .push_bind(&report.report_id)
+                .push_bind(report.occurred_at)
+                .push_bind(captured_at)
+                .push_bind(i64::try_from(report.owner_epoch).unwrap_or(i64::MAX))
+                .push_bind(i64::try_from(report.lease_epoch).unwrap_or(i64::MAX))
+                .push_bind(Json(report));
+        });
+        builder.push(
+            r#"
+            ON CONFLICT (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                batch_id,
+                chunk_id,
+                report_id
+            ) DO NOTHING
+            "#,
+        );
+        builder
+            .build()
+            .execute(&self.pool)
+            .await
+            .context("failed to append throughput report log entries")?;
+        Ok(())
+    }
+
+    pub async fn list_throughput_report_log_since(
+        &self,
+        captured_after: Option<DateTime<Utc>>,
+        limit: usize,
+    ) -> Result<Vec<ThroughputReportLogEntry>> {
+        let rows = if let Some(captured_after) = captured_after {
+            sqlx::query(
+                r#"
+                SELECT report, captured_at
+                FROM throughput_report_log
+                WHERE captured_at > $1
+                ORDER BY captured_at ASC, report_id ASC
+                LIMIT $2
+                "#,
+            )
+            .bind(captured_after)
+            .bind(i64::try_from(limit.max(1)).context("throughput report log limit exceeds i64")?)
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to list throughput report log tail")?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT report, captured_at
+                FROM throughput_report_log
+                ORDER BY captured_at ASC, report_id ASC
+                LIMIT $1
+                "#,
+            )
+            .bind(i64::try_from(limit.max(1)).context("throughput report log limit exceeds i64")?)
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to list throughput report log")?
+        };
+        rows.into_iter()
+            .map(|row| {
+                Ok(ThroughputReportLogEntry {
+                    report: row
+                        .try_get::<Json<ThroughputChunkReport>, _>("report")
+                        .map(|json| json.0)
+                        .context("throughput report log row missing report payload")?,
+                    captured_at: row
+                        .try_get("captured_at")
+                        .context("throughput report log row missing captured_at")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn delete_throughput_report_log_through(
+        &self,
+        captured_through: DateTime<Utc>,
+    ) -> Result<u64> {
+        let deleted = sqlx::query(
+            r#"
+            DELETE FROM throughput_report_log
+            WHERE captured_at <= $1
+            "#,
+        )
+        .bind(captured_through)
+        .execute(&self.pool)
+        .await
+        .context("failed to prune throughput report log")?;
+        Ok(deleted.rows_affected())
     }
 
     pub async fn upsert_throughput_projection_batch(
@@ -12642,6 +13407,7 @@ impl WorkflowStore {
                 lease_expires_at,
                 completed_at,
                 schedule_to_start_timeout_ms,
+                schedule_to_close_timeout_ms,
                 start_to_close_timeout_ms,
                 heartbeat_timeout_ms,
                 last_event_id,
@@ -12721,6 +13487,7 @@ impl WorkflowStore {
                 lease_expires_at,
                 completed_at,
                 schedule_to_start_timeout_ms,
+                schedule_to_close_timeout_ms,
                 start_to_close_timeout_ms,
                 heartbeat_timeout_ms,
                 last_event_id,
@@ -12771,6 +13538,7 @@ impl WorkflowStore {
                 lease_expires_at,
                 completed_at,
                 schedule_to_start_timeout_ms,
+                schedule_to_close_timeout_ms,
                 start_to_close_timeout_ms,
                 heartbeat_timeout_ms,
                 last_event_id,
@@ -12828,6 +13596,7 @@ impl WorkflowStore {
                 lease_expires_at,
                 completed_at,
                 schedule_to_start_timeout_ms,
+                schedule_to_close_timeout_ms,
                 start_to_close_timeout_ms,
                 heartbeat_timeout_ms,
                 last_event_id,
@@ -12890,6 +13659,7 @@ impl WorkflowStore {
                 lease_expires_at,
                 completed_at,
                 schedule_to_start_timeout_ms,
+                schedule_to_close_timeout_ms,
                 start_to_close_timeout_ms,
                 heartbeat_timeout_ms,
                 last_event_id,
@@ -13710,28 +14480,39 @@ impl WorkflowStore {
         envelope
     }
 
-    async fn reduce_bulk_batch_success_outputs(
+    async fn reduce_bulk_batch_reducer_output(
         executor: &mut sqlx::PgConnection,
         batch: &WorkflowBulkBatchRecord,
     ) -> Result<Option<Value>> {
         let reducer = batch.reducer.as_deref();
-        if !matches!(
-            reducer,
-            Some(BULK_REDUCER_SUM | BULK_REDUCER_MIN | BULK_REDUCER_MAX | BULK_REDUCER_AVG)
-        ) {
+        if reducer.is_none() {
             return Ok(None);
+        }
+        if reducer == Some("count") {
+            let count = if bulk_reducer_settles(reducer) {
+                u64::from(batch.succeeded_items)
+                    + u64::from(batch.failed_items)
+                    + u64::from(batch.cancelled_items)
+            } else {
+                u64::from(batch.succeeded_items)
+            };
+            return Ok(Some(Value::from(count)));
         }
 
         let mut values = Vec::new();
+        let mut errors = Vec::new();
         let rows = sqlx::query(
             r#"
-            SELECT output
+            SELECT output, error, item_count, status
             FROM workflow_bulk_chunks
             WHERE tenant_id = $1
               AND workflow_instance_id = $2
               AND run_id = $3
               AND batch_id = $4
-              AND status = 'completed'
+              AND (
+                ($5::boolean AND status = 'completed')
+                OR ($6::boolean AND status IN ('failed', 'cancelled'))
+              )
             ORDER BY chunk_index
             "#,
         )
@@ -13739,20 +14520,42 @@ impl WorkflowStore {
         .bind(&batch.instance_id)
         .bind(&batch.run_id)
         .bind(&batch.batch_id)
+        .bind(bulk_reducer_requires_success_outputs(reducer))
+        .bind(bulk_reducer_requires_error_outputs(reducer))
         .fetch_all(executor)
         .await
-        .context("failed to load completed workflow bulk chunk outputs for reducer")?;
+        .context("failed to load workflow bulk chunk reducer inputs")?;
 
         for row in rows {
-            if let Some(Json(mut output)) = row
-                .try_get::<Option<Json<Vec<Value>>>, _>("output")
-                .context("workflow bulk chunk output missing for reducer")?
+            let item_count = row
+                .try_get::<i32, _>("item_count")
+                .context("workflow bulk chunk item_count missing for reducer")?;
+            let status = row
+                .try_get::<String, _>("status")
+                .context("workflow bulk chunk status missing for reducer")?;
+            if status == "completed" && bulk_reducer_requires_success_outputs(reducer) {
+                if let Some(Json(mut output)) = row
+                    .try_get::<Option<Json<Vec<Value>>>, _>("output")
+                    .context("workflow bulk chunk output missing for reducer")?
+                {
+                    values.append(&mut output);
+                }
+            } else if bulk_reducer_requires_error_outputs(reducer)
+                && let Some(error) = row
+                    .try_get::<Option<String>, _>("error")
+                    .context("workflow bulk chunk error missing for reducer")?
             {
-                values.append(&mut output);
+                errors.push((error, item_count.max(0) as u32));
             }
         }
-        bulk_reducer_reduce_values(reducer, &values)
-            .context("failed to reduce workflow bulk batch outputs")
+        if bulk_reducer_requires_error_outputs(reducer) {
+            return bulk_reducer_reduce_errors(reducer, &errors)
+                .context("failed to reduce workflow bulk batch errors");
+        }
+        if values.is_empty() {
+            return Ok(bulk_reducer_default_summary_value(reducer));
+        }
+        bulk_reducer_reduce_values(reducer, &values).context("failed to reduce workflow bulk batch outputs")
     }
 
     fn decode_bulk_batch_row(row: sqlx::postgres::PgRow) -> Result<WorkflowBulkBatchRecord> {
@@ -13876,6 +14679,116 @@ impl WorkflowStore {
             scheduled_at: row.try_get("scheduled_at").context("bulk batch scheduled_at missing")?,
             terminal_at: row.try_get("terminal_at").context("bulk batch terminal_at missing")?,
             updated_at: row.try_get("updated_at").context("bulk batch updated_at missing")?,
+        })
+    }
+
+    fn decode_throughput_run_row(row: sqlx::postgres::PgRow) -> Result<ThroughputRunRecord> {
+        Ok(ThroughputRunRecord {
+            tenant_id: row.try_get("tenant_id").context("throughput run tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("throughput run workflow_instance_id missing")?,
+            run_id: row.try_get("run_id").context("throughput run run_id missing")?,
+            definition_id: row
+                .try_get("workflow_id")
+                .context("throughput run workflow_id missing")?,
+            definition_version: row
+                .try_get::<Option<i32>, _>("workflow_version")
+                .context("throughput run workflow_version missing")?
+                .map(|value| value as u32),
+            artifact_hash: row
+                .try_get("artifact_hash")
+                .context("throughput run artifact_hash missing")?,
+            batch_id: row.try_get("batch_id").context("throughput run batch_id missing")?,
+            throughput_backend: row
+                .try_get("throughput_backend")
+                .context("throughput run throughput_backend missing")?,
+            status: row.try_get("status").context("throughput run status missing")?,
+            command_dedupe_key: row
+                .try_get("command_dedupe_key")
+                .context("throughput run command_dedupe_key missing")?,
+            command: row
+                .try_get::<Json<ThroughputCommandEnvelope>, _>("command")
+                .map(|value| value.0)
+                .context("throughput run command missing")?,
+            command_published_at: row
+                .try_get("command_published_at")
+                .context("throughput run command_published_at missing")?,
+            started_at: row
+                .try_get("started_at")
+                .context("throughput run started_at missing")?,
+            terminal_at: row
+                .try_get("terminal_at")
+                .context("throughput run terminal_at missing")?,
+            created_at: row
+                .try_get("created_at")
+                .context("throughput run created_at missing")?,
+            updated_at: row
+                .try_get("updated_at")
+                .context("throughput run updated_at missing")?,
+        })
+    }
+
+    fn decode_throughput_run_input_row(
+        row: sqlx::postgres::PgRow,
+    ) -> Result<ThroughputRunInputRecord> {
+        Ok(ThroughputRunInputRecord {
+            tenant_id: row
+                .try_get("tenant_id")
+                .context("throughput run input tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("throughput run input workflow_instance_id missing")?,
+            run_id: row.try_get("run_id").context("throughput run input run_id missing")?,
+            batch_id: row.try_get("batch_id").context("throughput run input batch_id missing")?,
+            items: row
+                .try_get::<Json<Vec<Value>>, _>("items")
+                .map(|value| value.0)
+                .context("throughput run input items missing")?,
+            created_at: row
+                .try_get("created_at")
+                .context("throughput run input created_at missing")?,
+            updated_at: row
+                .try_get("updated_at")
+                .context("throughput run input updated_at missing")?,
+        })
+    }
+
+    fn decode_throughput_terminal_row(
+        row: sqlx::postgres::PgRow,
+    ) -> Result<ThroughputTerminalRecord> {
+        Ok(ThroughputTerminalRecord {
+            tenant_id: row
+                .try_get("tenant_id")
+                .context("throughput terminal tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("throughput terminal workflow_instance_id missing")?,
+            run_id: row
+                .try_get("run_id")
+                .context("throughput terminal run_id missing")?,
+            batch_id: row
+                .try_get("batch_id")
+                .context("throughput terminal batch_id missing")?,
+            status: row
+                .try_get("status")
+                .context("throughput terminal status missing")?,
+            terminal_at: row
+                .try_get("terminal_at")
+                .context("throughput terminal terminal_at missing")?,
+            terminal_event_id: row
+                .try_get("terminal_event_id")
+                .context("throughput terminal terminal_event_id missing")?,
+            terminal_event: row
+                .try_get::<Json<EventEnvelope<WorkflowEvent>>, _>("terminal_event")
+                .map(|value| value.0)
+                .context("throughput terminal terminal_event missing")?,
+            created_at: row
+                .try_get("created_at")
+                .context("throughput terminal created_at missing")?,
+            updated_at: row
+                .try_get("updated_at")
+                .context("throughput terminal updated_at missing")?,
         })
     }
 
@@ -14068,6 +14981,10 @@ impl WorkflowStore {
             schedule_to_start_timeout_ms: row
                 .try_get::<Option<i64>, _>("schedule_to_start_timeout_ms")
                 .context("activity schedule_to_start_timeout_ms missing")?
+                .map(|value| value as u64),
+            schedule_to_close_timeout_ms: row
+                .try_get::<Option<i64>, _>("schedule_to_close_timeout_ms")
+                .context("activity schedule_to_close_timeout_ms missing")?
                 .map(|value| value as u64),
             start_to_close_timeout_ms: row
                 .try_get::<Option<i64>, _>("start_to_close_timeout_ms")
@@ -15554,6 +16471,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bulk_chunk_failure_reduces_sample_errors_for_terminal_event() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+
+        let (_batch, chunks) = store
+            .upsert_bulk_batch(
+                "tenant-a",
+                "wf-bulk-errors",
+                "run-bulk-errors",
+                "demo",
+                Some(1),
+                Some("artifact-1"),
+                "batch-errors",
+                "benchmark.echo",
+                "default",
+                Some("join"),
+                &json!({ "kind": "inline", "key": "bulk-input:batch-errors" }),
+                &json!({ "kind": "inline", "key": "bulk-result:batch-errors" }),
+                &[json!(1), json!(2), json!(3)],
+                3,
+                1,
+                0,
+                None,
+                Some("sample_errors"),
+                "legacy",
+                1,
+                false,
+                1,
+                "pg-v1",
+                "1.0.0",
+                Utc::now(),
+            )
+            .await?;
+        assert_eq!(chunks.len(), 1);
+
+        let leased = store
+            .lease_next_bulk_chunks(
+                "tenant-a",
+                "default",
+                "worker-a",
+                "build-a",
+                chrono::Duration::seconds(30),
+                1,
+            )
+            .await?;
+        let leased_chunk = &leased[0];
+        store
+            .apply_bulk_chunk_terminal_update(&BulkChunkTerminalUpdate {
+                tenant_id: leased_chunk.tenant_id.clone(),
+                instance_id: leased_chunk.instance_id.clone(),
+                run_id: leased_chunk.run_id.clone(),
+                batch_id: leased_chunk.batch_id.clone(),
+                chunk_id: leased_chunk.chunk_id.clone(),
+                chunk_index: leased_chunk.chunk_index,
+                group_id: leased_chunk.group_id,
+                attempt: leased_chunk.attempt,
+                lease_epoch: leased_chunk.lease_epoch,
+                owner_epoch: leased_chunk.owner_epoch,
+                report_id: "report-0".to_owned(),
+                lease_token: leased_chunk
+                    .lease_token
+                    .context("leased chunk missing lease token")?,
+                worker_id: "worker-a".to_owned(),
+                worker_build_id: "build-a".to_owned(),
+                occurred_at: Utc::now(),
+                payload: BulkChunkTerminalPayload::Failed {
+                    error: "boom".to_owned(),
+                },
+            })
+            .await?;
+
+        let outbox = store
+            .lease_workflow_event_outbox(
+                "publisher-a",
+                chrono::Duration::seconds(30),
+                10,
+                Utc::now(),
+            )
+            .await?;
+        assert_eq!(outbox.len(), 1);
+        assert!(matches!(
+            &outbox[0].event.payload,
+            WorkflowEvent::BulkActivityBatchFailed { reducer_output, .. }
+                if reducer_output.as_ref() == Some(&json!({
+                    "sample": ["boom"],
+                    "total": 3,
+                    "truncated": false
+                }))
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn bulk_chunk_leasing_is_pinned_to_backend() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
@@ -16438,6 +17451,347 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn throughput_run_round_trips_and_tracks_lifecycle() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+        let command = ThroughputCommandEnvelope {
+            command_id: Uuid::now_v7(),
+            occurred_at: now,
+            dedupe_key: "throughput-start:test".to_owned(),
+            partition_key: "batch-a:0".to_owned(),
+            payload: fabrik_throughput::ThroughputCommand::StartThroughputRun(
+                fabrik_throughput::StartThroughputRunCommand {
+                    dedupe_key: "throughput-start:test".to_owned(),
+                    tenant_id: "tenant-a".to_owned(),
+                    definition_id: "demo".to_owned(),
+                    definition_version: Some(1),
+                    artifact_hash: Some("artifact-a".to_owned()),
+                    instance_id: "instance-a".to_owned(),
+                    run_id: "run-a".to_owned(),
+                    batch_id: "batch-a".to_owned(),
+                    activity_type: "benchmark.echo".to_owned(),
+                    task_queue: "bulk".to_owned(),
+                    state: Some("join".to_owned()),
+                    chunk_size: 16,
+                    max_attempts: 3,
+                    retry_delay_ms: 1000,
+                    total_items: 32,
+                    aggregation_group_count: 2,
+                    execution_policy: Some("eager".to_owned()),
+                    reducer: Some("count".to_owned()),
+                    throughput_backend: "stream-v2".to_owned(),
+                    throughput_backend_version: "2.0.0".to_owned(),
+                    routing_reason: "stream_v2_selected".to_owned(),
+                    admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
+                    input_handle: fabrik_throughput::PayloadHandle::Inline {
+                        key: "bulk-input:batch-a".to_owned(),
+                    },
+                    result_handle: fabrik_throughput::PayloadHandle::Inline {
+                        key: "bulk-result:batch-a".to_owned(),
+                    },
+                },
+            ),
+        };
+        store
+            .upsert_throughput_run(&ThroughputRunRecord {
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "instance-a".to_owned(),
+                run_id: "run-a".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                batch_id: "batch-a".to_owned(),
+                throughput_backend: "stream-v2".to_owned(),
+                status: "scheduled".to_owned(),
+                command_dedupe_key: command.dedupe_key.clone(),
+                command: command.clone(),
+                command_published_at: None,
+                started_at: None,
+                terminal_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        store
+            .upsert_throughput_run_input(&ThroughputRunInputRecord {
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "instance-a".to_owned(),
+                run_id: "run-a".to_owned(),
+                batch_id: "batch-a".to_owned(),
+                items: vec![json!({"value": 1}), json!({"value": 2})],
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        let stored_input = store
+            .get_throughput_run_input("tenant-a", "instance-a", "run-a", "batch-a")
+            .await?
+            .context("throughput run input should exist")?;
+        assert_eq!(stored_input.items.len(), 2);
+        let unpublished = store
+            .list_unpublished_scheduled_throughput_runs_for_backend("stream-v2", 10)
+            .await?;
+        assert_eq!(unpublished.len(), 1);
+        assert_eq!(unpublished[0].batch_id, "batch-a");
+        assert!(
+            store
+                .mark_throughput_run_command_published(
+                    "tenant-a",
+                    "instance-a",
+                    "run-a",
+                    "batch-a",
+                    now + chrono::Duration::seconds(1),
+                )
+                .await?
+        );
+        assert!(
+            store
+                .mark_throughput_run_started(
+                    "tenant-a",
+                    "instance-a",
+                    "run-a",
+                    "batch-a",
+                    now + chrono::Duration::seconds(2),
+                )
+                .await?
+        );
+        assert!(
+            store
+                .mark_throughput_run_terminal(
+                    "tenant-a",
+                    "instance-a",
+                    "run-a",
+                    "batch-a",
+                    "completed",
+                    now + chrono::Duration::seconds(3),
+                )
+                .await?
+        );
+
+        let stored = store
+            .get_throughput_run("tenant-a", "instance-a", "run-a", "batch-a")
+            .await?
+            .context("throughput run should exist")?;
+        assert_eq!(stored.status, "completed");
+        assert_eq!(stored.command, command);
+        assert!(stored.command_published_at.is_some());
+        assert!(stored.started_at.is_some());
+        assert!(stored.terminal_at.is_some());
+        assert!(
+            store
+                .list_nonterminal_throughput_runs_for_backend("stream-v2", 10)
+                .await?
+                .is_empty()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn throughput_report_log_round_trips_and_prunes_by_checkpoint_cutoff() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+        let report = ThroughputChunkReport {
+            report_id: "report-a".to_owned(),
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "instance-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            batch_id: "batch-a".to_owned(),
+            chunk_id: "batch-a::0".to_owned(),
+            chunk_index: 0,
+            group_id: 0,
+            attempt: 1,
+            lease_epoch: 1,
+            owner_epoch: 1,
+            worker_id: "worker-a".to_owned(),
+            worker_build_id: "build-a".to_owned(),
+            lease_token: Uuid::now_v7().to_string(),
+            occurred_at: now,
+            payload: fabrik_throughput::ThroughputChunkReportPayload::ChunkCompleted {
+                result_handle: Value::Null,
+                output: Some(vec![json!({"value": 1})]),
+            },
+        };
+        store
+            .append_throughput_report_log_entries(std::slice::from_ref(&report), now)
+            .await?;
+        store
+            .append_throughput_report_log_entries(std::slice::from_ref(&report), now)
+            .await?;
+
+        let entries = store.list_throughput_report_log_since(None, 10).await?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].report, report);
+        assert_eq!(entries[0].captured_at, now);
+
+        assert_eq!(
+            store
+                .delete_throughput_report_log_through(now - chrono::Duration::milliseconds(1))
+                .await?,
+            0
+        );
+        assert_eq!(
+            store.delete_throughput_report_log_through(now).await?,
+            1
+        );
+        assert!(store.list_throughput_report_log_since(None, 10).await?.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn throughput_terminal_handoff_round_trips_and_is_idempotent() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+        let command = ThroughputCommandEnvelope {
+            command_id: Uuid::now_v7(),
+            occurred_at: now,
+            dedupe_key: "throughput-start:test-terminal".to_owned(),
+            partition_key: "batch-a:0".to_owned(),
+            payload: fabrik_throughput::ThroughputCommand::StartThroughputRun(
+                fabrik_throughput::StartThroughputRunCommand {
+                dedupe_key: "throughput-start:test-terminal".to_owned(),
+                tenant_id: "tenant-a".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                instance_id: "instance-a".to_owned(),
+                run_id: "run-a".to_owned(),
+                batch_id: "batch-a".to_owned(),
+                activity_type: "benchmark.echo".to_owned(),
+                task_queue: "bulk".to_owned(),
+                state: Some("join".to_owned()),
+                chunk_size: 2,
+                max_attempts: 1,
+                retry_delay_ms: 0,
+                total_items: 2,
+                aggregation_group_count: 1,
+                execution_policy: Some("parallel".to_owned()),
+                reducer: Some("count".to_owned()),
+                throughput_backend: "stream-v2".to_owned(),
+                throughput_backend_version: "2.0.0".to_owned(),
+                routing_reason: "stream_v2_selected".to_owned(),
+                admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
+                input_handle: fabrik_throughput::PayloadHandle::Inline {
+                    key: "bulk-input:batch-a".to_owned(),
+                },
+                result_handle: fabrik_throughput::PayloadHandle::Inline {
+                    key: "bulk-result:batch-a".to_owned(),
+                },
+                },
+            ),
+        };
+        store
+            .upsert_throughput_run(&ThroughputRunRecord {
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "instance-a".to_owned(),
+                run_id: "run-a".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                batch_id: "batch-a".to_owned(),
+                throughput_backend: "stream-v2".to_owned(),
+                status: "running".to_owned(),
+                command_dedupe_key: command.dedupe_key.clone(),
+                command,
+                command_published_at: Some(now),
+                started_at: Some(now),
+                terminal_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+
+        let payload = WorkflowEvent::BulkActivityBatchCompleted {
+            batch_id: "batch-a".to_owned(),
+            total_items: 2,
+            succeeded_items: 2,
+            failed_items: 0,
+            cancelled_items: 0,
+            chunk_count: 1,
+            reducer_output: Some(json!(2)),
+        };
+        let mut envelope = EventEnvelope::new(
+            payload.event_type(),
+            WorkflowIdentity::new(
+                "tenant-a".to_owned(),
+                "demo".to_owned(),
+                1,
+                "artifact-a".to_owned(),
+                "instance-a".to_owned(),
+                "run-a".to_owned(),
+                "throughput-runtime",
+            ),
+            payload,
+        );
+        envelope.occurred_at = now + chrono::Duration::seconds(3);
+        envelope.dedupe_key = Some("terminal:tenant-a:instance-a:run-a:batch-a".to_owned());
+
+        let terminal = ThroughputTerminalRecord {
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "instance-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            batch_id: "batch-a".to_owned(),
+            status: "completed".to_owned(),
+            terminal_at: envelope.occurred_at,
+            terminal_event_id: envelope.event_id,
+            terminal_event: envelope.clone(),
+            created_at: envelope.occurred_at,
+            updated_at: envelope.occurred_at,
+        };
+
+        assert!(store.commit_throughput_terminal_handoff(&terminal).await?);
+        assert!(!store.commit_throughput_terminal_handoff(&terminal).await?);
+
+        let mut duplicate_envelope = terminal.terminal_event.clone();
+        duplicate_envelope.event_id = Uuid::now_v7();
+        duplicate_envelope.occurred_at += chrono::Duration::milliseconds(250);
+        duplicate_envelope.dedupe_key = Some("terminal:tenant-a:instance-a:run-a:batch-a:duplicate".to_owned());
+        let duplicate_terminal = ThroughputTerminalRecord {
+            terminal_at: duplicate_envelope.occurred_at,
+            terminal_event_id: duplicate_envelope.event_id,
+            terminal_event: duplicate_envelope,
+            created_at: terminal.created_at + chrono::Duration::milliseconds(250),
+            updated_at: terminal.updated_at + chrono::Duration::milliseconds(250),
+            ..terminal.clone()
+        };
+        assert!(!store.commit_throughput_terminal_handoff(&duplicate_terminal).await?);
+
+        let stored_terminal = store
+            .get_throughput_terminal("tenant-a", "instance-a", "run-a", "batch-a")
+            .await?
+            .context("throughput terminal should exist")?;
+        assert_eq!(stored_terminal.status, "completed");
+        assert_eq!(stored_terminal.terminal_at, terminal.terminal_at);
+        assert_eq!(stored_terminal.terminal_event_id, terminal.terminal_event_id);
+        assert_eq!(stored_terminal.terminal_event, terminal.terminal_event);
+
+        let outbox = store
+            .get_workflow_event_outbox(terminal.terminal_event_id)
+            .await?
+            .context("workflow terminal outbox row should exist")?;
+        assert_eq!(outbox.event, terminal.terminal_event);
+
+        let stored_run = store
+            .get_throughput_run("tenant-a", "instance-a", "run-a", "batch-a")
+            .await?
+            .context("throughput run should exist")?;
+        assert_eq!(stored_run.status, "completed");
+        assert_eq!(stored_run.terminal_at, Some(terminal.terminal_at));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn bulk_chunk_batch_limit_skips_capped_batch() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
@@ -16629,6 +17983,7 @@ mod tests {
                 cancelled_items: 3,
                 chunk_count: 3,
                 message: "workflow cancelled".to_owned(),
+                reducer_output: None,
             }
             .event_type()
         );

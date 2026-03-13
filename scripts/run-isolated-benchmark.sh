@@ -68,13 +68,15 @@ RUN_DIR="${BENCHMARK_RUN_DIR:-target/benchmark-runs/$NAMESPACE}"
 LOG_DIR="$RUN_DIR/logs"
 STATE_DIR="$RUN_DIR/state"
 CHECKPOINT_DIR="$RUN_DIR/checkpoints"
+PID_DIR="$RUN_DIR/pids"
+FAILOVER_INJECTION_PATH="$RUN_DIR/failover-injection.json"
 REPORT_PATH_DEFAULT="target/benchmark-reports/${NAMESPACE}.json"
 BUILD_RELEASE="${BUILD_RELEASE_BINARIES:-1}"
 KEEP_DATABASE="${KEEP_BENCHMARK_DATABASE:-0}"
 KEEP_TOPICS="${KEEP_BENCHMARK_TOPICS:-0}"
 KILL_LOCAL_SERVICES="${BENCHMARK_KILL_LOCAL_SERVICES:-1}"
 
-mkdir -p "$LOG_DIR" "$STATE_DIR" "$CHECKPOINT_DIR" target/benchmark-reports
+mkdir -p "$LOG_DIR" "$STATE_DIR" "$CHECKPOINT_DIR" "$PID_DIR" target/benchmark-reports
 
 PORTS=()
 while IFS= read -r port; do
@@ -108,19 +110,46 @@ UNIFIED_DEBUG_PORT="${UNIFIED_DEBUG_PORT:-${PORTS[10]}}"
 
 PIDS=()
 REPORT_PATH=""
+FAILOVER_INJECTOR_PID=""
+
+pid_file_for() {
+  printf '%s/%s.pid\n' "$PID_DIR" "$1"
+}
+
+collect_service_pids() {
+  {
+    printf '%s\n' "${PIDS[@]:-}"
+    local pid_file
+    for pid_file in "$PID_DIR"/*.pid; do
+      [[ -f "$pid_file" ]] || continue
+      cat "$pid_file"
+    done
+  } | awk 'NF {print $1}' | sort -u
+}
+
+stop_pid() {
+  local pid=$1
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    kill "$pid" >/dev/null 2>&1 || true
+  fi
+}
 
 stop_services() {
+  local pids=()
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    pids+=("$pid")
+  done < <(collect_service_pids)
+
   local pid
-  for pid in "${PIDS[@]:-}"; do
-    if kill -0 "$pid" >/dev/null 2>&1; then
-      kill "$pid" >/dev/null 2>&1 || true
-    fi
+  for pid in "${pids[@]:-}"; do
+    stop_pid "$pid"
   done
 
   local deadline=$((SECONDS + 5))
   while (( SECONDS < deadline )); do
     local any_running=0
-    for pid in "${PIDS[@]:-}"; do
+    for pid in "${pids[@]:-}"; do
       if kill -0 "$pid" >/dev/null 2>&1; then
         any_running=1
         break
@@ -132,16 +161,21 @@ stop_services() {
     sleep 1
   done
 
-  for pid in "${PIDS[@]:-}"; do
+  for pid in "${pids[@]:-}"; do
     if kill -0 "$pid" >/dev/null 2>&1; then
       kill -9 "$pid" >/dev/null 2>&1 || true
     fi
     wait "$pid" >/dev/null 2>&1 || true
   done
+  rm -f "$PID_DIR"/*.pid >/dev/null 2>&1 || true
 }
 
 cleanup() {
   local exit_code=$?
+  if [[ -n "${FAILOVER_INJECTOR_PID:-}" ]] && kill -0 "$FAILOVER_INJECTOR_PID" >/dev/null 2>&1; then
+    kill "$FAILOVER_INJECTOR_PID" >/dev/null 2>&1 || true
+    wait "$FAILOVER_INJECTOR_PID" >/dev/null 2>&1 || true
+  fi
   stop_services
 
   if [[ $exit_code -ne 0 ]]; then
@@ -358,6 +392,152 @@ print(proc.pid)
 PY
   )"
   PIDS+=("$pid")
+  printf '%s\n' "$pid" >"$(pid_file_for "$name")"
+}
+
+stop_service_by_name() {
+  local name=$1
+  local grace_seconds=${2:-10}
+  local pid_file
+  pid_file="$(pid_file_for "$name")"
+  if [[ ! -f "$pid_file" ]]; then
+    return 0
+  fi
+  local pid
+  pid="$(cat "$pid_file")"
+  if (( grace_seconds > 0 )); then
+    stop_pid "$pid"
+    local deadline=$((SECONDS + grace_seconds))
+    while kill -0 "$pid" >/dev/null 2>&1 && (( SECONDS < deadline )); do
+      sleep 1
+    done
+  fi
+  if kill -0 "$pid" >/dev/null 2>&1; then
+    kill -9 "$pid" >/dev/null 2>&1 || true
+  fi
+  wait "$pid" >/dev/null 2>&1 || true
+  rm -f "$pid_file"
+}
+
+now_ms() {
+  python3 - <<'PY'
+import time
+print(int(time.time() * 1000))
+PY
+}
+
+write_failover_record() {
+  local status=$1
+  local delay_ms=${2:-0}
+  local stop_requested_at_ms=${3:-}
+  local stop_completed_at_ms=${4:-}
+  local restart_started_at_ms=${5:-}
+  local restart_ready_at_ms=${6:-}
+  local error_message=${7:-}
+  python3 - "$FAILOVER_INJECTION_PATH" \
+    "$status" \
+    "$delay_ms" \
+    "$stop_requested_at_ms" \
+    "$stop_completed_at_ms" \
+    "$restart_started_at_ms" \
+    "$restart_ready_at_ms" \
+    "$error_message" <<'PY'
+import json
+import sys
+
+path, status, delay_ms, stop_requested_at_ms, stop_completed_at_ms, restart_started_at_ms, restart_ready_at_ms, error_message = sys.argv[1:]
+
+def nullable_int(value: str):
+    return None if value == "" else int(value)
+
+stop_requested = nullable_int(stop_requested_at_ms)
+stop_completed = nullable_int(stop_completed_at_ms)
+restart_started = nullable_int(restart_started_at_ms)
+restart_ready = nullable_int(restart_ready_at_ms)
+downtime_ms = None
+if stop_requested is not None and restart_ready is not None:
+    downtime_ms = max(0, restart_ready - stop_requested)
+
+payload = {
+    "status": status,
+    "delay_ms": int(delay_ms),
+    "stop_requested_at_ms": stop_requested,
+    "stop_completed_at_ms": stop_completed,
+    "restart_started_at_ms": restart_started,
+    "restart_ready_at_ms": restart_ready,
+    "downtime_ms": downtime_ms,
+    "error": error_message or None,
+}
+
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2, sort_keys=True)
+PY
+}
+
+refresh_failover_reports() {
+  [[ -f "$FAILOVER_INJECTION_PATH" ]] || return 0
+  [[ -n "${REPORT_PATH:-}" ]] || return 0
+  python3 - "$REPORT_PATH" "$FAILOVER_INJECTION_PATH" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+report_path = Path(sys.argv[1])
+failover = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+
+def fmt(value):
+    return "n/a" if value is None else str(value)
+
+def update_json(path: Path):
+    if not path.exists():
+        return
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict) and "scenarios" in payload:
+        for scenario in payload.get("scenarios", []):
+            scenario["failover_injection"] = failover
+    elif isinstance(payload, dict):
+        payload["failover_injection"] = failover
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+def update_txt(path: Path):
+    if not path.exists():
+        return
+    values = {
+        "failover_status": failover.get("status"),
+        "failover_delay_ms": failover.get("delay_ms"),
+        "failover_stop_requested_at_ms": failover.get("stop_requested_at_ms"),
+        "failover_restart_ready_at_ms": failover.get("restart_ready_at_ms"),
+        "failover_downtime_ms": failover.get("downtime_ms"),
+        "failover_error": failover.get("error") or "none",
+    }
+    lines = path.read_text(encoding="utf-8").splitlines()
+    out = []
+    seen = set()
+    for line in lines:
+        if "=" in line:
+            key = line.split("=", 1)[0]
+            if key in values:
+                out.append(f"{key}={fmt(values[key])}")
+                seen.add(key)
+                continue
+        out.append(line)
+    for key, value in values.items():
+        if key not in seen:
+            out.append(f"{key}={fmt(value)}")
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+paths = [report_path]
+if report_path.exists():
+    stem = report_path.stem
+    for candidate in report_path.parent.glob(f"{stem}-*.json"):
+        paths.append(candidate)
+    for path in paths:
+        update_json(path)
+    txt_paths = [report_path.with_suffix(".txt")]
+    txt_paths.extend(report_path.parent.glob(f"{stem}-*.txt"))
+    for path in txt_paths:
+        update_txt(path)
+PY
 }
 
 stop_existing_local_services() {
@@ -473,6 +653,20 @@ if [[ "$BUILD_RELEASE" == "1" ]]; then
     -p activity-worker-service >/dev/null
 fi
 
+RUNNER_ARGS=("$@")
+if [[ ${#RUNNER_ARGS[@]} -eq 0 ]]; then
+  RUNNER_ARGS=(--suite streaming --profile target --worker-count 8)
+fi
+RUNNER_SUITE="$(runner_arg_value --suite "${RUNNER_ARGS[@]}" || true)"
+RUNNER_SCENARIO_TAG="$(runner_arg_value --scenario-tag "${RUNNER_ARGS[@]}" || true)"
+FAILOVER_INJECTION_DELAY_SECS="${FAILOVER_INJECTION_DELAY_SECS:-1}"
+FAILOVER_INJECTION_DELAY_MS="$(
+  python3 - "$FAILOVER_INJECTION_DELAY_SECS" <<'PY'
+import sys
+print(int(float(sys.argv[1]) * 1000))
+PY
+)"
+
 COMMON_ENV=(
   "POSTGRES_URL=$POSTGRES_URL"
   "REDPANDA_BROKERS=localhost:${REDPANDA_HOST_PORT:-29092}"
@@ -496,18 +690,229 @@ COMMON_ENV=(
   "THROUGHPUT_CHECKPOINT_DIR=$CHECKPOINT_DIR"
   "UNIFIED_RUNTIME_STATE_DIR=$RUN_DIR/unified-runtime-state"
   "WORKFLOW_PARTITIONS=$WORKFLOW_PARTITIONS"
-  "THROUGHPUT_OWNERSHIP_PARTITIONS=$THROUGHPUT_PARTITIONS"
   "THROUGHPUT_OWNERSHIP_PARTITION_ID_OFFSET=$THROUGHPUT_OWNERSHIP_PARTITION_ID_OFFSET"
   "THROUGHPUT_MAX_AGGREGATION_GROUPS=${THROUGHPUT_MAX_AGGREGATION_GROUPS:-32}"
   "THROUGHPUT_POLL_MAX_TASKS=${THROUGHPUT_POLL_MAX_TASKS:-32}"
   "THROUGHPUT_REPORT_APPLY_BATCH_SIZE=${THROUGHPUT_REPORT_APPLY_BATCH_SIZE:-64}"
   "THROUGHPUT_CHANGELOG_PUBLISH_BATCH_SIZE=${THROUGHPUT_CHANGELOG_PUBLISH_BATCH_SIZE:-128}"
   "THROUGHPUT_PROJECTION_PUBLISH_BATCH_SIZE=${THROUGHPUT_PROJECTION_PUBLISH_BATCH_SIZE:-128}"
+  "THROUGHPUT_NATIVE_STREAM_V2_ENGINE=${THROUGHPUT_NATIVE_STREAM_V2_ENGINE:-true}"
   "THROUGHPUT_MAX_ACTIVE_CHUNKS_PER_BATCH=${THROUGHPUT_MAX_ACTIVE_CHUNKS_PER_BATCH:-1024}"
   "THROUGHPUT_GROUPING_CHUNK_THRESHOLD=${THROUGHPUT_GROUPING_CHUNK_THRESHOLD:-16}"
   "THROUGHPUT_TARGET_CHUNKS_PER_GROUP=${THROUGHPUT_TARGET_CHUNKS_PER_GROUP:-16}"
   "RUST_LOG=${RUST_LOG:-warn}"
 )
+OWNERSHIP_ENV=(
+  "THROUGHPUT_OWNERSHIP_PARTITIONS=$THROUGHPUT_PARTITIONS"
+)
+if [[ "$RUNNER_SUITE" == "stream-v2-failover" ]]; then
+  OWNERSHIP_ENV=(
+    "THROUGHPUT_RUNTIME_CAPACITY=$THROUGHPUT_TOPIC_PARTITION_COUNT"
+    "THROUGHPUT_OWNERSHIP_MEMBER_HEARTBEAT_TTL_SECONDS=${THROUGHPUT_OWNERSHIP_MEMBER_HEARTBEAT_TTL_SECONDS:-2}"
+    "THROUGHPUT_OWNERSHIP_ASSIGNMENT_POLL_INTERVAL_SECONDS=${THROUGHPUT_OWNERSHIP_ASSIGNMENT_POLL_INTERVAL_SECONDS:-1}"
+    "THROUGHPUT_OWNERSHIP_REBALANCE_INTERVAL_SECONDS=${THROUGHPUT_OWNERSHIP_REBALANCE_INTERVAL_SECONDS:-1}"
+    "THROUGHPUT_OWNERSHIP_LEASE_TTL_SECONDS=${THROUGHPUT_OWNERSHIP_LEASE_TTL_SECONDS:-2}"
+    "THROUGHPUT_OWNERSHIP_RENEW_INTERVAL_SECONDS=${THROUGHPUT_OWNERSHIP_RENEW_INTERVAL_SECONDS:-1}"
+  )
+fi
+
+start_throughput_runtime_service() {
+  echo "[isolated-benchmark] starting throughput-runtime"
+  start_service throughput-runtime "$LOG_DIR/throughput-runtime.log" \
+    "${COMMON_ENV[@]}" \
+    "${OWNERSHIP_ENV[@]}" \
+    "THROUGHPUT_RUNTIME_PORT=$THROUGHPUT_RUNTIME_PORT" \
+    "THROUGHPUT_DEBUG_PORT=$THROUGHPUT_DEBUG_PORT" \
+    -- \
+    target/release/throughput-runtime
+  wait_for_port 127.0.0.1 "$THROUGHPUT_RUNTIME_PORT" "throughput-runtime"
+  wait_for_port 127.0.0.1 "$THROUGHPUT_DEBUG_PORT" "throughput-runtime-debug"
+}
+
+start_failover_injector() {
+  write_failover_record scheduled "$FAILOVER_INJECTION_DELAY_MS"
+  (
+    local stop_requested_at_ms=""
+    local stop_completed_at_ms=""
+    local restart_started_at_ms=""
+    local restart_ready_at_ms=""
+    local error_message=""
+    sleep "$FAILOVER_INJECTION_DELAY_SECS"
+    stop_requested_at_ms="$(now_ms)"
+    write_failover_record in_progress \
+      "$FAILOVER_INJECTION_DELAY_MS" \
+      "$stop_requested_at_ms"
+    if ! stop_service_by_name throughput-runtime 0; then
+      error_message="failed to stop throughput-runtime"
+      write_failover_record failed \
+        "$FAILOVER_INJECTION_DELAY_MS" \
+        "$stop_requested_at_ms" \
+        "$stop_completed_at_ms" \
+        "$restart_started_at_ms" \
+        "$restart_ready_at_ms" \
+        "$error_message"
+      exit 1
+    fi
+    stop_completed_at_ms="$(now_ms)"
+    restart_started_at_ms="$stop_completed_at_ms"
+    if ! start_throughput_runtime_service; then
+      error_message="failed to restart throughput-runtime"
+      write_failover_record failed \
+        "$FAILOVER_INJECTION_DELAY_MS" \
+        "$stop_requested_at_ms" \
+        "$stop_completed_at_ms" \
+        "$restart_started_at_ms" \
+        "$restart_ready_at_ms" \
+        "$error_message"
+      exit 1
+    fi
+    restart_ready_at_ms="$(now_ms)"
+    write_failover_record completed \
+      "$FAILOVER_INJECTION_DELAY_MS" \
+      "$stop_requested_at_ms" \
+      "$stop_completed_at_ms" \
+      "$restart_started_at_ms" \
+      "$restart_ready_at_ms"
+  ) &
+  FAILOVER_INJECTOR_PID=$!
+}
+
+runner_args_without_output_and_scenario() {
+  FILTERED_RUNNER_ARGS=()
+  local index=0
+  while (( index < ${#RUNNER_ARGS[@]} )); do
+    case "${RUNNER_ARGS[$index]}" in
+      --output|--scenario-tag)
+        ((index += 2))
+        ;;
+      *)
+        FILTERED_RUNNER_ARGS+=("${RUNNER_ARGS[$index]}")
+        ((index += 1))
+        ;;
+    esac
+  done
+}
+
+run_benchmark_runner() {
+  local -a extra_env=()
+  while (( $# > 0 )); do
+    if [[ "$1" == "--" ]]; then
+      shift
+      break
+    fi
+    extra_env+=("$1")
+    shift
+  done
+  local -a args=("$@")
+  echo "[isolated-benchmark] running benchmark-runner"
+  if (( ${#extra_env[@]} > 0 )); then
+    env \
+      "${COMMON_ENV[@]}" \
+      "INGEST_SERVICE_URL=http://127.0.0.1:$INGEST_PORT" \
+      "THROUGHPUT_DEBUG_URL=http://127.0.0.1:$THROUGHPUT_DEBUG_PORT" \
+      "THROUGHPUT_PROJECTOR_URL=http://127.0.0.1:$THROUGHPUT_PROJECTOR_PORT" \
+      "UNIFIED_RUNTIME_DEBUG_URL=http://127.0.0.1:$UNIFIED_DEBUG_PORT" \
+      "${extra_env[@]}" \
+      target/release/benchmark-runner "${args[@]}"
+  else
+    env \
+      "${COMMON_ENV[@]}" \
+      "INGEST_SERVICE_URL=http://127.0.0.1:$INGEST_PORT" \
+      "THROUGHPUT_DEBUG_URL=http://127.0.0.1:$THROUGHPUT_DEBUG_PORT" \
+      "THROUGHPUT_PROJECTOR_URL=http://127.0.0.1:$THROUGHPUT_PROJECTOR_PORT" \
+      "UNIFIED_RUNTIME_DEBUG_URL=http://127.0.0.1:$UNIFIED_DEBUG_PORT" \
+      target/release/benchmark-runner "${args[@]}"
+  fi
+}
+
+materialize_isolated_scenario_report() {
+  local temp_suite_output=$1
+  local final_suite_output=$2
+  python3 - "$temp_suite_output" "$final_suite_output" <<'PY'
+import json
+import shutil
+import sys
+from pathlib import Path
+
+temp_suite_output = Path(sys.argv[1])
+final_suite_output = Path(sys.argv[2])
+suite = json.loads(temp_suite_output.read_text(encoding="utf-8"))
+scenario = suite["scenarios"][0]["scenario"]
+extension = temp_suite_output.suffix.lstrip(".") or "json"
+source_report = temp_suite_output.parent / f"{temp_suite_output.stem}-{scenario}.{extension}"
+dest_report = final_suite_output.parent / f"{final_suite_output.stem}-{scenario}.{extension}"
+dest_report.parent.mkdir(parents=True, exist_ok=True)
+shutil.copy2(source_report, dest_report)
+source_summary = source_report.with_suffix(".txt")
+if source_summary.exists():
+    shutil.copy2(source_summary, dest_report.with_suffix(".txt"))
+print(dest_report)
+PY
+}
+
+write_failover_suite_report() {
+  local suite_output=$1
+  shift
+  python3 - "$suite_output" "$@" <<'PY'
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+suite_output = Path(sys.argv[1])
+scenario_paths = [Path(value) for value in sys.argv[2:]]
+scenarios = [
+    json.loads(path.read_text(encoding="utf-8"))
+    for path in scenario_paths
+]
+payload = {
+    "suite": "stream-v2-failover",
+    "profile": scenarios[0]["profile"] if scenarios else "unknown",
+    "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    "scenarios": scenarios,
+}
+suite_output.parent.mkdir(parents=True, exist_ok=True)
+suite_output.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+run_failover_suite_isolated() {
+  local final_output=$1
+  local requested_tag="${RUNNER_SCENARIO_TAG:-}"
+  runner_args_without_output_and_scenario
+  local -a scenario_tags=()
+  if [[ -n "$requested_tag" ]]; then
+    scenario_tags=("$requested_tag")
+  else
+    scenario_tags=("owner-restart" "owner-restart-retry-cancel")
+  fi
+  local -a scenario_report_paths=()
+  local scenario_tag temp_output scenario_report
+  for scenario_tag in "${scenario_tags[@]}"; do
+    rm -f "$FAILOVER_INJECTION_PATH"
+    temp_output="$RUN_DIR/${scenario_tag}.json"
+    REPORT_PATH="$temp_output"
+    echo "[isolated-benchmark] scheduling throughput-runtime failover injection for $scenario_tag"
+    start_failover_injector
+    run_benchmark_runner \
+      "BENCHMARK_FAILOVER_INJECTION_PATH=$FAILOVER_INJECTION_PATH" \
+      -- \
+      "${FILTERED_RUNNER_ARGS[@]}" \
+      --output "$temp_output" \
+      --scenario-tag "$scenario_tag"
+    if [[ -n "${FAILOVER_INJECTOR_PID:-}" ]]; then
+      wait "$FAILOVER_INJECTOR_PID"
+      refresh_failover_reports
+      FAILOVER_INJECTOR_PID=""
+    fi
+    scenario_report="$(materialize_isolated_scenario_report "$temp_output" "$final_output")"
+    echo "scenario_report_path=$scenario_report"
+    scenario_report_paths+=("$scenario_report")
+  done
+  write_failover_suite_report "$final_output" "${scenario_report_paths[@]}"
+  REPORT_PATH="$final_output"
+  echo "suite_report_path=$final_output"
+}
 
 echo "[isolated-benchmark] starting ingest-service"
 start_service ingest-service "$LOG_DIR/ingest-service.log" \
@@ -516,11 +921,6 @@ start_service ingest-service "$LOG_DIR/ingest-service.log" \
   -- \
   target/release/ingest-service
 wait_for_port 127.0.0.1 "$INGEST_PORT" "ingest-service"
-
-RUNNER_ARGS=("$@")
-if [[ ${#RUNNER_ARGS[@]} -eq 0 ]]; then
-  RUNNER_ARGS=(--suite streaming --profile target --worker-count 8)
-fi
 
 EXECUTION_MODE="durable"
 for ((i = 0; i < ${#RUNNER_ARGS[@]}; i++)); do
@@ -569,15 +969,7 @@ if [[ "$EXECUTION_MODE" == "unified" ]]; then
     -- \
     target/release/activity-worker-service
 elif [[ "$EXECUTION_MODE" == "throughput" ]]; then
-  echo "[isolated-benchmark] starting throughput-runtime"
-  start_service throughput-runtime "$LOG_DIR/throughput-runtime.log" \
-    "${COMMON_ENV[@]}" \
-    "THROUGHPUT_RUNTIME_PORT=$THROUGHPUT_RUNTIME_PORT" \
-    "THROUGHPUT_DEBUG_PORT=$THROUGHPUT_DEBUG_PORT" \
-    -- \
-    target/release/throughput-runtime
-  wait_for_port 127.0.0.1 "$THROUGHPUT_RUNTIME_PORT" "throughput-runtime"
-  wait_for_port 127.0.0.1 "$THROUGHPUT_DEBUG_PORT" "throughput-runtime-debug"
+  start_throughput_runtime_service
 
   echo "[isolated-benchmark] starting throughput-projector"
   start_service throughput-projector "$LOG_DIR/throughput-projector.log" \
@@ -624,15 +1016,7 @@ else
     target/release/matching-service
   wait_for_port 127.0.0.1 "$MATCHING_PORT" "matching-service"
 
-  echo "[isolated-benchmark] starting throughput-runtime"
-  start_service throughput-runtime "$LOG_DIR/throughput-runtime.log" \
-    "${COMMON_ENV[@]}" \
-    "THROUGHPUT_RUNTIME_PORT=$THROUGHPUT_RUNTIME_PORT" \
-    "THROUGHPUT_DEBUG_PORT=$THROUGHPUT_DEBUG_PORT" \
-    -- \
-    target/release/throughput-runtime
-  wait_for_port 127.0.0.1 "$THROUGHPUT_RUNTIME_PORT" "throughput-runtime"
-  wait_for_port 127.0.0.1 "$THROUGHPUT_DEBUG_PORT" "throughput-runtime-debug"
+  start_throughput_runtime_service
 
   echo "[isolated-benchmark] starting throughput-projector"
   start_service throughput-projector "$LOG_DIR/throughput-projector.log" \
@@ -708,14 +1092,16 @@ TIMER_SERVICE_URL=http://127.0.0.1:$TIMER_SERVICE_PORT
 UNIFIED_RUNTIME_DEBUG_URL=http://127.0.0.1:$UNIFIED_DEBUG_PORT
 EOF
 
-echo "[isolated-benchmark] running benchmark-runner"
-env \
-  "${COMMON_ENV[@]}" \
-  "INGEST_SERVICE_URL=http://127.0.0.1:$INGEST_PORT" \
-  "THROUGHPUT_DEBUG_URL=http://127.0.0.1:$THROUGHPUT_DEBUG_PORT" \
-  "THROUGHPUT_PROJECTOR_URL=http://127.0.0.1:$THROUGHPUT_PROJECTOR_PORT" \
-  "UNIFIED_RUNTIME_DEBUG_URL=http://127.0.0.1:$UNIFIED_DEBUG_PORT" \
-  target/release/benchmark-runner "${RUNNER_ARGS[@]}"
+if [[ "$RUNNER_SUITE" == "stream-v2-failover" ]]; then
+  run_failover_suite_isolated "$REPORT_PATH"
+else
+  run_benchmark_runner -- "${RUNNER_ARGS[@]}"
+fi
+
+if [[ -n "${FAILOVER_INJECTOR_PID:-}" ]]; then
+  wait "$FAILOVER_INJECTOR_PID"
+  refresh_failover_reports
+fi
 
 stop_services
 

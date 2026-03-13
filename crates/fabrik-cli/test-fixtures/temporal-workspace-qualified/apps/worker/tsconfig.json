@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "target": "es2021",
+    "module": "Node16",
+    "moduleResolution": "node16",
+    "baseUrl": ".",
+    "paths": {
+      "@demo/activities": ["../../packages/activities/index"]
+    }
+  },
+  "include": ["src/**/*.ts"]
+}

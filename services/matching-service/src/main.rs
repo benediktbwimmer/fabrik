@@ -402,6 +402,7 @@ async fn process_event(
             config,
             state: workflow_state,
             schedule_to_start_timeout_ms,
+            schedule_to_close_timeout_ms,
             start_to_close_timeout_ms,
             heartbeat_timeout_ms,
         } => {
@@ -422,6 +423,7 @@ async fn process_event(
                     input,
                     config.as_ref(),
                     *schedule_to_start_timeout_ms,
+                    *schedule_to_close_timeout_ms,
                     *start_to_close_timeout_ms,
                     *heartbeat_timeout_ms,
                     event.event_id,
@@ -636,6 +638,13 @@ async fn run_timeout_loop(state: AppState) {
 async fn sweep_activities(state: &AppState) -> Result<()> {
     let now = Utc::now();
     for record in state.store.list_runnable_activities(state.runtime.max_rebuild_tasks).await? {
+        if let Some(timeout_ms) = record.schedule_to_close_timeout_ms {
+            let deadline = record.scheduled_at + chrono::Duration::milliseconds(timeout_ms as i64);
+            if deadline <= now {
+                publish_timed_out_event(state, &record).await?;
+                continue;
+            }
+        }
         if let Some(timeout_ms) = record.schedule_to_start_timeout_ms {
             let deadline = record.scheduled_at + chrono::Duration::milliseconds(timeout_ms as i64);
             if deadline <= now {
@@ -644,6 +653,13 @@ async fn sweep_activities(state: &AppState) -> Result<()> {
         }
     }
     for record in state.store.list_started_activities(state.runtime.max_rebuild_tasks).await? {
+        if let Some(timeout_ms) = record.schedule_to_close_timeout_ms {
+            let deadline = record.scheduled_at + chrono::Duration::milliseconds(timeout_ms as i64);
+            if deadline <= now {
+                publish_timed_out_event(state, &record).await?;
+                continue;
+            }
+        }
         if let Some(started_at) = record.started_at {
             if let Some(timeout_ms) = record.start_to_close_timeout_ms {
                 let deadline = started_at + chrono::Duration::milliseconds(timeout_ms as i64);
@@ -2117,6 +2133,7 @@ fn record_to_proto(record: &WorkflowActivityRecord) -> ActivityTask {
         heartbeat_timeout_ms: record.heartbeat_timeout_ms.unwrap_or_default(),
         cancellation_requested: record.cancellation_requested,
         schedule_to_start_timeout_ms: record.schedule_to_start_timeout_ms.unwrap_or_default(),
+        schedule_to_close_timeout_ms: record.schedule_to_close_timeout_ms.unwrap_or_default(),
         lease_epoch: 0,
         owner_epoch: 0,
         omit_success_output: false,
@@ -2312,6 +2329,7 @@ fn scheduled_activity_record(event: &EventEnvelope<WorkflowEvent>) -> WorkflowAc
         config,
         state,
         schedule_to_start_timeout_ms,
+        schedule_to_close_timeout_ms,
         start_to_close_timeout_ms,
         heartbeat_timeout_ms,
     } = &event.payload
@@ -2347,6 +2365,7 @@ fn scheduled_activity_record(event: &EventEnvelope<WorkflowEvent>) -> WorkflowAc
         lease_expires_at: None,
         completed_at: None,
         schedule_to_start_timeout_ms: *schedule_to_start_timeout_ms,
+        schedule_to_close_timeout_ms: *schedule_to_close_timeout_ms,
         start_to_close_timeout_ms: *start_to_close_timeout_ms,
         heartbeat_timeout_ms: *heartbeat_timeout_ms,
         last_event_id: event.event_id,
@@ -2978,6 +2997,7 @@ mod tests {
                 config: None,
                 state: None,
                 schedule_to_start_timeout_ms: None,
+                schedule_to_close_timeout_ms: None,
                 start_to_close_timeout_ms: None,
                 heartbeat_timeout_ms: None,
             }),
@@ -3274,6 +3294,7 @@ mod tests {
                 config: None,
                 state: Some("pay".to_owned()),
                 schedule_to_start_timeout_ms: None,
+                schedule_to_close_timeout_ms: None,
                 start_to_close_timeout_ms: None,
                 heartbeat_timeout_ms: None,
             }),
@@ -3316,6 +3337,7 @@ mod tests {
                 config: None,
                 state: Some("pay".to_owned()),
                 schedule_to_start_timeout_ms: None,
+                schedule_to_close_timeout_ms: None,
                 start_to_close_timeout_ms: None,
                 heartbeat_timeout_ms: None,
             }),
@@ -3356,6 +3378,46 @@ mod tests {
             .context("first activity attempt should exist")?;
         assert_eq!(first_record.status, WorkflowActivityStatus::Started);
         assert_eq!(first_record.worker_build_id.as_deref(), Some("build-a"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sweep_times_out_schedule_to_close_from_scheduled_at() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let state = app_state(store.clone(), publisher);
+
+        let mut event = demo_event(WorkflowEvent::ActivityTaskScheduled {
+            activity_id: "a1".to_owned(),
+            activity_type: "charge".to_owned(),
+            task_queue: "payments".to_owned(),
+            attempt: 1,
+            input: json!({"amount": 10}),
+            config: None,
+            state: Some("pay".to_owned()),
+            schedule_to_start_timeout_ms: None,
+            schedule_to_close_timeout_ms: Some(1),
+            start_to_close_timeout_ms: Some(30_000),
+            heartbeat_timeout_ms: None,
+        });
+        event.occurred_at = Utc::now() - chrono::Duration::seconds(5);
+
+        process_event(&state, 0, event).await?;
+        sweep_activities(&state).await?;
+
+        let record = store
+            .get_activity_attempt("tenant-a", "wf-1", "run-1", "a1", 1)
+            .await?
+            .context("activity attempt should exist after sweep")?;
+        assert_eq!(record.status, WorkflowActivityStatus::TimedOut);
+        assert_eq!(record.last_event_type, "ActivityTaskTimedOut");
+        assert_eq!(record.schedule_to_close_timeout_ms, Some(1));
         Ok(())
     }
 
@@ -3406,6 +3468,7 @@ mod tests {
                     config: None,
                     state: Some("pay".to_owned()),
                     schedule_to_start_timeout_ms: None,
+                    schedule_to_close_timeout_ms: None,
                     start_to_close_timeout_ms: None,
                     heartbeat_timeout_ms: None,
                 }),

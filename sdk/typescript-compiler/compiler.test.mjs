@@ -444,6 +444,52 @@ test("compiler lowers Date.now, Object.keys, and array join expressions", async 
   assert.match(serialized, /"callee":"__builtin_array_join"/);
 });
 
+test("compiler lowers Math.random and richer Temporal retry options", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-random-retry-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalRandomRetryWorkflow",
+    "--definition-id",
+    "temporal-random-retry-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"kind":"random"/);
+  assert.match(serialized, /"maximum_interval":"5s"/);
+  assert.match(serialized, /"backoff_coefficient_millis":1500/);
+});
+
+test("compiler lowers dynamic proxy activity member calls with spread args", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-dynamic-activity-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalDynamicActivityWorkflow",
+    "--definition-id",
+    "temporal-dynamic-activity-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"dynamic_step"/);
+  assert.match(serialized, /"activity_type":\{"kind":"identifier","name":"activityName"\}/);
+  assert.match(serialized, /"input":\{"kind":"identifier","name":"args"\}/);
+});
+
 test("compiler lowers dynamic Temporal sleep durations", async () => {
   const fixture = path.join(
     root,
@@ -465,6 +511,116 @@ test("compiler lowers dynamic Temporal sleep durations", async () => {
   assert.match(serialized, /"type":"wait_for_timer"/);
   assert.match(serialized, /"timer_expr"/);
   assert.match(serialized, /"op":"coalesce"/);
+});
+
+test("compiler lowers common string case helpers", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-string-case-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalStringCaseWorkflow",
+    "--definition-id",
+    "temporal-string-case-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"callee":"__builtin_string_to_uppercase"/);
+  assert.match(serialized, /"callee":"__builtin_string_to_lowercase"/);
+});
+
+test("compiler accepts ApplicationFailure.create shorthand properties", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-application-failure-shorthand-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalApplicationFailureShorthandWorkflow",
+    "--definition-id",
+    "temporal-application-failure-shorthand-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"fail"/);
+  assert.match(serialized, /"message"/);
+});
+
+test("compiler lowers uninitialized local let declarations", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-uninitialized-let-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalUninitializedLetWorkflow",
+    "--definition-id",
+    "temporal-uninitialized-let-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"target":"message"/);
+  assert.match(serialized, /"value":null/);
+});
+
+test("compiler ignores top-level runtime guards gated by inWorkflowContext", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-top-level-guard-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalTopLevelGuardWorkflow",
+    "--definition-id",
+    "temporal-top-level-guard-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"handler":"greet"/);
+});
+
+test("compiler lowers awaited Temporal conditions wrapped in pure expressions", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-negated-condition-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalNegatedConditionWorkflow",
+    "--definition-id",
+    "temporal-negated-condition-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"wait_for_condition"/);
+  assert.match(serialized, /"target":"timedOut"/);
+  assert.match(serialized, /"op":"not"/);
 });
 
 test("compiler lowers Temporal signal handler increment statements", async () => {
@@ -600,6 +756,28 @@ test("compiler lowers indexed object assignments into object-set calls", async (
   assert.match(serializedSignals, /"target":"records"/);
 });
 
+test("compiler lowers member object assignments into object-set calls", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-member-set-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalMemberSetWorkflow",
+    "--definition-id",
+    "temporal-member-set-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"callee":"__builtin_object_set"/);
+  assert.match(serialized, /"value":"count"/);
+});
+
 test("compiler lowers block-bodied pure helpers with for-range statements", async () => {
   const fixture = path.join(
     root,
@@ -646,6 +824,76 @@ test("compiler lowers block-bodied pure helpers with if statements", async () =>
 
   assert.match(serializedHelper, /"type":"if"/);
   assert.match(serializedHelper, /"target":"errMessage"/);
+});
+
+test("compiler lowers awaited local async helpers into workflow states", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-async-helper-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalAsyncHelperWorkflow",
+    "--definition-id",
+    "temporal-async-helper-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"handler":"greet"/);
+  assert.match(serialized, /__helper_name/);
+});
+
+test("compiler accepts static top-level proxyActivities option constants", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-static-proxy-options-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalStaticProxyOptionsWorkflow",
+    "--definition-id",
+    "temporal-static-proxy-options-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"handler":"greet"/);
+  assert.match(serialized, /"schedule_to_close_timeout_ms":15000/);
+  assert.match(serialized, /"start_to_close_timeout_ms":5000/);
+});
+
+test("compiler lowers deferred activity thunks and array unshift compensation patterns", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-deferred-activity-thunk-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalDeferredActivityThunkWorkflow",
+    "--definition-id",
+    "temporal-deferred-activity-thunk-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"dynamic_step"/);
+  assert.match(serialized, /"__kind":\{"kind":"literal","value":"activity_descriptor"\}/);
+  assert.match(serialized, /"activity_type":\{"kind":"literal","value":"cleanup"\}/);
+  assert.match(serialized, /"schedule_to_close_timeout_ms":\{"kind":"literal","value":15000\}/);
+  assert.match(serialized, /"callee":"__builtin_array_prepend"/);
 });
 
 test("compiler lowers array reduce expressions", async () => {

@@ -346,6 +346,7 @@ impl WorkflowDefinition {
                             config,
                             state: Some(current_state.clone()),
                             schedule_to_start_timeout_ms: None,
+                            schedule_to_close_timeout_ms: None,
                             start_to_close_timeout_ms: None,
                             heartbeat_timeout_ms: None,
                         },
@@ -454,6 +455,10 @@ impl StateNode {
 pub struct RetryPolicy {
     pub max_attempts: u32,
     pub delay: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_interval: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backoff_coefficient_millis: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub non_retryable_error_types: Vec<String>,
 }
@@ -957,6 +962,7 @@ impl WorkflowInstanceState {
                 cancelled_items,
                 chunk_count,
                 message,
+                ..
             }
             | WorkflowEvent::BulkActivityBatchCancelled {
                 batch_id,
@@ -966,8 +972,9 @@ impl WorkflowInstanceState {
                 cancelled_items,
                 chunk_count,
                 message,
+                ..
             } => {
-                let error = serde_json::json!({
+                let mut error = serde_json::json!({
                     "batchId": batch_id,
                     "status": if matches!(&event.payload, WorkflowEvent::BulkActivityBatchFailed { .. }) {
                         "failed"
@@ -981,6 +988,12 @@ impl WorkflowInstanceState {
                     "cancelledItems": cancelled_items,
                     "chunkCount": chunk_count,
                 });
+                if let WorkflowEvent::BulkActivityBatchFailed { reducer_output: Some(value), .. }
+                | WorkflowEvent::BulkActivityBatchCancelled { reducer_output: Some(value), .. } =
+                    &event.payload
+                {
+                    error["reducerOutput"] = value.clone();
+                }
                 self.status = WorkflowStatus::Running;
                 self.context = Some(error);
             }
@@ -1239,6 +1252,18 @@ pub fn replay_compiled_history_trace(
         let mut advanced = false;
         if !skip_semantic {
             match &event.payload {
+                WorkflowEvent::WorkflowCancellationRequested { reason } => {
+                    execution = artifact.execute_after_workflow_cancellation_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        reason,
+                        execution_state_for_event(&replayed, Some(event)),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    advanced = true;
+                }
                 WorkflowEvent::SignalReceived { signal_id, signal_type, payload } => {
                     let current_state = replayed.current_state.as_deref().unwrap_or_default();
                     let turn_context = ExecutionTurnContext {
@@ -1399,6 +1424,7 @@ pub fn replay_compiled_history_trace(
                     cancelled_items,
                     chunk_count,
                     message,
+                    ..
                 }
                 | WorkflowEvent::BulkActivityBatchCancelled {
                     batch_id,
@@ -1408,24 +1434,32 @@ pub fn replay_compiled_history_trace(
                     cancelled_items,
                     chunk_count,
                     message,
+                    ..
                 } => {
+                    let mut payload = serde_json::json!({
+                        "batchId": batch_id,
+                        "status": if matches!(&event.payload, WorkflowEvent::BulkActivityBatchFailed { .. }) {
+                            "failed"
+                        } else {
+                            "cancelled"
+                        },
+                        "message": message,
+                        "totalItems": total_items,
+                        "succeededItems": succeeded_items,
+                        "failedItems": failed_items,
+                        "cancelledItems": cancelled_items,
+                        "chunkCount": chunk_count,
+                    });
+                    if let WorkflowEvent::BulkActivityBatchFailed { reducer_output: Some(value), .. }
+                    | WorkflowEvent::BulkActivityBatchCancelled { reducer_output: Some(value), .. } =
+                        &event.payload
+                    {
+                        payload["reducerOutput"] = value.clone();
+                    }
                     execution = artifact.execute_after_bulk_failure_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         batch_id,
-                        &serde_json::json!({
-                            "batchId": batch_id,
-                            "status": if matches!(&event.payload, WorkflowEvent::BulkActivityBatchFailed { .. }) {
-                                "failed"
-                            } else {
-                                "cancelled"
-                            },
-                            "message": message,
-                            "totalItems": total_items,
-                            "succeededItems": succeeded_items,
-                            "failedItems": failed_items,
-                            "cancelledItems": cancelled_items,
-                            "chunkCount": chunk_count,
-                        }),
+                        &payload,
                         execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
@@ -1510,6 +1544,18 @@ pub fn replay_compiled_history_trace_from_snapshot(
         }
         if !should_skip_replay_event(event, &mut seen_dedupe_keys) {
             match &event.payload {
+                WorkflowEvent::WorkflowCancellationRequested { reason } => {
+                    let execution = artifact.execute_after_workflow_cancellation_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        reason,
+                        execution_state_for_event(&replayed, Some(event)),
+                        ExecutionTurnContext {
+                            event_id: event.event_id,
+                            occurred_at: event.occurred_at,
+                        },
+                    )?;
+                    apply_compiled_execution(&mut replayed, &execution);
+                }
                 WorkflowEvent::SignalReceived { signal_id, signal_type, payload } => {
                     let current_state = replayed.current_state.as_deref().unwrap_or_default();
                     let turn_context = ExecutionTurnContext {
@@ -1670,6 +1716,7 @@ pub fn replay_compiled_history_trace_from_snapshot(
                     cancelled_items,
                     chunk_count,
                     message,
+                    ..
                 }
                 | WorkflowEvent::BulkActivityBatchCancelled {
                     batch_id,
@@ -1679,24 +1726,32 @@ pub fn replay_compiled_history_trace_from_snapshot(
                     cancelled_items,
                     chunk_count,
                     message,
+                    ..
                 } => {
+                    let mut payload = serde_json::json!({
+                        "batchId": batch_id,
+                        "status": if matches!(&event.payload, WorkflowEvent::BulkActivityBatchFailed { .. }) {
+                            "failed"
+                        } else {
+                            "cancelled"
+                        },
+                        "message": message,
+                        "totalItems": total_items,
+                        "succeededItems": succeeded_items,
+                        "failedItems": failed_items,
+                        "cancelledItems": cancelled_items,
+                        "chunkCount": chunk_count,
+                    });
+                    if let WorkflowEvent::BulkActivityBatchFailed { reducer_output: Some(value), .. }
+                    | WorkflowEvent::BulkActivityBatchCancelled { reducer_output: Some(value), .. } =
+                        &event.payload
+                    {
+                        payload["reducerOutput"] = value.clone();
+                    }
                     let execution = artifact.execute_after_bulk_failure_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         batch_id,
-                        &serde_json::json!({
-                            "batchId": batch_id,
-                            "status": if matches!(&event.payload, WorkflowEvent::BulkActivityBatchFailed { .. }) {
-                                "failed"
-                            } else {
-                                "cancelled"
-                            },
-                            "message": message,
-                            "totalItems": total_items,
-                            "succeededItems": succeeded_items,
-                            "failedItems": failed_items,
-                            "cancelledItems": cancelled_items,
-                            "chunkCount": chunk_count,
-                        }),
+                        &payload,
                         execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
@@ -2169,6 +2224,7 @@ mod tests {
                 retry: None,
                 config: None,
                 schedule_to_start_timeout_ms: None,
+                schedule_to_close_timeout_ms: None,
                 start_to_close_timeout_ms: None,
                 heartbeat_timeout_ms: None,
                 output_var: Some("echoed".to_owned()),
@@ -2288,6 +2344,7 @@ mod tests {
                         retry: None,
                         config: None,
                         schedule_to_start_timeout_ms: None,
+                        schedule_to_close_timeout_ms: None,
                         start_to_close_timeout_ms: None,
                         heartbeat_timeout_ms: None,
                         output_var: Some("greeted".to_owned()),
@@ -2873,6 +2930,7 @@ mod tests {
                 config: None,
                 state: Some("echo".to_owned()),
                 schedule_to_start_timeout_ms: None,
+                schedule_to_close_timeout_ms: None,
                 start_to_close_timeout_ms: None,
                 heartbeat_timeout_ms: None,
             },
@@ -3020,6 +3078,7 @@ mod tests {
                     config: None,
                     state: Some("echo".to_owned()),
                     schedule_to_start_timeout_ms: None,
+                    schedule_to_close_timeout_ms: None,
                     start_to_close_timeout_ms: None,
                     heartbeat_timeout_ms: None,
                 },
@@ -3399,6 +3458,8 @@ mod tests {
                 retry: Some(RetryPolicy {
                     max_attempts: 3,
                     delay: "5s".to_owned(),
+                    maximum_interval: None,
+                    backoff_coefficient_millis: None,
                     non_retryable_error_types: Vec::new(),
                 }),
                 config: None,
@@ -3428,6 +3489,8 @@ mod tests {
                 retry: Some(RetryPolicy {
                     max_attempts: 0,
                     delay: "5s".to_owned(),
+                    maximum_interval: None,
+                    backoff_coefficient_millis: None,
                     non_retryable_error_types: Vec::new(),
                 }),
                 config: None,
@@ -3450,6 +3513,8 @@ mod tests {
         let policy = RetryPolicy {
             max_attempts: 3,
             delay: "5s".to_owned(),
+            maximum_interval: None,
+            backoff_coefficient_millis: None,
             non_retryable_error_types: vec!["ValidationError".to_owned(), "FatalError".to_owned()],
         };
 

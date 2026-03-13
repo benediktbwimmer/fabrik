@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -26,7 +27,10 @@ pub const BULK_REDUCER_SUM: &str = "sum";
 pub const BULK_REDUCER_MIN: &str = "min";
 pub const BULK_REDUCER_MAX: &str = "max";
 pub const BULK_REDUCER_AVG: &str = "avg";
+pub const BULK_REDUCER_HISTOGRAM: &str = "histogram";
+pub const BULK_REDUCER_SAMPLE_ERRORS: &str = "sample_errors";
 pub const BULK_REDUCER_COLLECT_RESULTS: &str = "collect_results";
+pub const BULK_REDUCER_ERROR_SAMPLE_LIMIT: usize = 8;
 pub const DEFAULT_AGGREGATION_GROUP_COUNT: u32 = 1;
 pub const DEFAULT_GROUP_ID: u32 = 0;
 pub const INITIAL_OWNER_EPOCH: u64 = 1;
@@ -84,7 +88,9 @@ pub fn bulk_reducer_class(reducer: Option<&str>) -> BulkReducerClass {
         | BULK_REDUCER_SUM
         | BULK_REDUCER_MIN
         | BULK_REDUCER_MAX
-        | BULK_REDUCER_AVG => BulkReducerClass::Mergeable,
+        | BULK_REDUCER_AVG
+        | BULK_REDUCER_HISTOGRAM
+        | BULK_REDUCER_SAMPLE_ERRORS => BulkReducerClass::Mergeable,
         _ => BulkReducerClass::Legacy,
     }
 }
@@ -104,6 +110,8 @@ pub fn bulk_reducer_summary_field_name(reducer: Option<&str>) -> Option<&'static
         BULK_REDUCER_MIN => Some(BULK_REDUCER_MIN),
         BULK_REDUCER_MAX => Some(BULK_REDUCER_MAX),
         BULK_REDUCER_AVG => Some(BULK_REDUCER_AVG),
+        BULK_REDUCER_HISTOGRAM => Some(BULK_REDUCER_HISTOGRAM),
+        BULK_REDUCER_SAMPLE_ERRORS => Some(BULK_REDUCER_SAMPLE_ERRORS),
         _ => None,
     }
 }
@@ -112,8 +120,23 @@ pub fn bulk_reducer_requires_success_outputs(reducer: Option<&str>) -> bool {
     bulk_reducer_materializes_results(reducer)
         || matches!(
             bulk_reducer_name(reducer),
-            BULK_REDUCER_SUM | BULK_REDUCER_MIN | BULK_REDUCER_MAX | BULK_REDUCER_AVG
+            BULK_REDUCER_SUM
+                | BULK_REDUCER_MIN
+                | BULK_REDUCER_MAX
+                | BULK_REDUCER_AVG
+                | BULK_REDUCER_HISTOGRAM
         )
+}
+
+pub fn bulk_reducer_requires_error_outputs(reducer: Option<&str>) -> bool {
+    matches!(bulk_reducer_name(reducer), BULK_REDUCER_SAMPLE_ERRORS)
+}
+
+pub fn bulk_reducer_settles(reducer: Option<&str>) -> bool {
+    matches!(
+        bulk_reducer_name(reducer),
+        BULK_REDUCER_ALL_SETTLED | BULK_REDUCER_COUNT | BULK_REDUCER_SAMPLE_ERRORS
+    )
 }
 
 pub fn bulk_reducer_supports_stream_v2(reducer: Option<&str>) -> bool {
@@ -126,7 +149,24 @@ pub fn bulk_reducer_supports_stream_v2(reducer: Option<&str>) -> bool {
             | BULK_REDUCER_MIN
             | BULK_REDUCER_MAX
             | BULK_REDUCER_AVG
+            | BULK_REDUCER_HISTOGRAM
+            | BULK_REDUCER_SAMPLE_ERRORS
     )
+}
+
+pub fn bulk_reducer_default_summary_value(reducer: Option<&str>) -> Option<Value> {
+    match bulk_reducer_name(reducer) {
+        BULK_REDUCER_COUNT => Some(Value::from(0_u64)),
+        BULK_REDUCER_SUM => Some(Value::from(0.0)),
+        BULK_REDUCER_MIN | BULK_REDUCER_MAX | BULK_REDUCER_AVG => Some(Value::Null),
+        BULK_REDUCER_HISTOGRAM => Some(Value::Object(serde_json::Map::new())),
+        BULK_REDUCER_SAMPLE_ERRORS => Some(serde_json::json!({
+            "sample": [],
+            "total": 0,
+            "truncated": false,
+        })),
+        _ => None,
+    }
 }
 
 pub fn bulk_reducer_reduce_values(
@@ -141,6 +181,17 @@ pub fn bulk_reducer_reduce_values(
         return Ok(Some(Value::from(
             u64::try_from(values.len()).context("reducer value count exceeds u64")?,
         )));
+    }
+    if field_name == BULK_REDUCER_HISTOGRAM {
+        let mut buckets = BTreeMap::<String, u64>::new();
+        for value in values {
+            *buckets.entry(histogram_bucket_key(value)?).or_default() += 1;
+        }
+        return Ok(Some(Value::Object(serde_json::Map::from_iter(
+            buckets
+                .into_iter()
+                .map(|(bucket, count)| (bucket, Value::from(count))),
+        ))));
     }
 
     let numbers = values
@@ -170,6 +221,40 @@ pub fn bulk_reducer_reduce_values(
         _ => return Ok(None),
     };
     Ok(Some(reduced))
+}
+
+pub fn bulk_reducer_reduce_errors(
+    reducer: Option<&str>,
+    errors: &[(String, u32)],
+) -> Result<Option<Value>> {
+    if bulk_reducer_name(reducer) != BULK_REDUCER_SAMPLE_ERRORS {
+        return Ok(None);
+    }
+
+    let mut sample = Vec::new();
+    let mut total = 0_u64;
+    for (message, weight) in errors {
+        total = total.saturating_add(u64::from(*weight));
+        if sample.len() < BULK_REDUCER_ERROR_SAMPLE_LIMIT {
+            sample.push(Value::String(message.clone()));
+        }
+    }
+
+    Ok(Some(serde_json::json!({
+        "sample": sample,
+        "total": total,
+        "truncated": usize::try_from(total).unwrap_or(usize::MAX) > BULK_REDUCER_ERROR_SAMPLE_LIMIT,
+    })))
+}
+
+fn histogram_bucket_key(value: &Value) -> Result<String> {
+    Ok(match value {
+        Value::Null => "null".to_owned(),
+        Value::Bool(boolean) => boolean.to_string(),
+        Value::Number(number) => number.to_string(),
+        Value::String(string) => string.clone(),
+        other => serde_json::to_string(other).context("failed to serialize histogram bucket")?,
+    })
 }
 
 pub fn throughput_execution_mode(_backend: &str) -> &'static str {
@@ -362,6 +447,34 @@ pub struct ThroughputBatchIdentity {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StartThroughputRunCommand {
+    pub dedupe_key: String,
+    pub tenant_id: String,
+    pub definition_id: String,
+    pub definition_version: Option<u32>,
+    pub artifact_hash: Option<String>,
+    pub instance_id: String,
+    pub run_id: String,
+    pub batch_id: String,
+    pub activity_type: String,
+    pub task_queue: String,
+    pub state: Option<String>,
+    pub chunk_size: u32,
+    pub max_attempts: u32,
+    pub retry_delay_ms: u64,
+    pub total_items: u32,
+    pub aggregation_group_count: u32,
+    pub execution_policy: Option<String>,
+    pub reducer: Option<String>,
+    pub throughput_backend: String,
+    pub throughput_backend_version: String,
+    pub routing_reason: String,
+    pub admission_policy_version: String,
+    pub input_handle: PayloadHandle,
+    pub result_handle: PayloadHandle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CreateBatchCommand {
     pub dedupe_key: String,
     pub tenant_id: String,
@@ -379,16 +492,52 @@ pub struct CreateBatchCommand {
     pub retry_delay_ms: u64,
     pub total_items: u32,
     pub aggregation_group_count: u32,
+    pub execution_policy: Option<String>,
+    pub reducer: Option<String>,
     pub throughput_backend: String,
     pub throughput_backend_version: String,
+    pub routing_reason: String,
+    pub admission_policy_version: String,
     pub input_handle: PayloadHandle,
     pub result_handle: PayloadHandle,
     pub items: Vec<Value>,
 }
 
+impl CreateBatchCommand {
+    pub fn to_start_throughput_run(&self) -> StartThroughputRunCommand {
+        StartThroughputRunCommand {
+            dedupe_key: self.dedupe_key.clone(),
+            tenant_id: self.tenant_id.clone(),
+            definition_id: self.definition_id.clone(),
+            definition_version: Some(self.definition_version),
+            artifact_hash: Some(self.artifact_hash.clone()),
+            instance_id: self.instance_id.clone(),
+            run_id: self.run_id.clone(),
+            batch_id: self.batch_id.clone(),
+            activity_type: self.activity_type.clone(),
+            task_queue: self.task_queue.clone(),
+            state: self.state.clone(),
+            chunk_size: self.chunk_size,
+            max_attempts: self.max_attempts,
+            retry_delay_ms: self.retry_delay_ms,
+            total_items: self.total_items,
+            aggregation_group_count: self.aggregation_group_count,
+            execution_policy: self.execution_policy.clone(),
+            reducer: self.reducer.clone(),
+            throughput_backend: self.throughput_backend.clone(),
+            throughput_backend_version: self.throughput_backend_version.clone(),
+            routing_reason: self.routing_reason.clone(),
+            admission_policy_version: self.admission_policy_version.clone(),
+            input_handle: self.input_handle.clone(),
+            result_handle: self.result_handle.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ThroughputCommand {
+    StartThroughputRun(StartThroughputRunCommand),
     CreateBatch(CreateBatchCommand),
     CancelBatch { identity: ThroughputBatchIdentity, reason: String },
     TimeoutBatch { identity: ThroughputBatchIdentity, reason: String },
@@ -1082,6 +1231,95 @@ mod tests {
     }
 
     #[test]
+    fn native_start_throughput_run_command_round_trips() -> Result<()> {
+        let command = ThroughputCommandEnvelope {
+            command_id: Uuid::now_v7(),
+            occurred_at: Utc::now(),
+            dedupe_key: "throughput-start:test".to_owned(),
+            partition_key: "batch-a:0".to_owned(),
+            payload: ThroughputCommand::StartThroughputRun(StartThroughputRunCommand {
+                dedupe_key: "throughput-start:test".to_owned(),
+                tenant_id: "tenant-a".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(7),
+                artifact_hash: Some("artifact-a".to_owned()),
+                instance_id: "instance-a".to_owned(),
+                run_id: "run-a".to_owned(),
+                batch_id: "batch-a".to_owned(),
+                activity_type: "benchmark.echo".to_owned(),
+                task_queue: "bulk".to_owned(),
+                state: Some("join".to_owned()),
+                chunk_size: 16,
+                max_attempts: 3,
+                retry_delay_ms: 1000,
+                total_items: 32,
+                aggregation_group_count: 2,
+                execution_policy: Some("parallel".to_owned()),
+                reducer: Some("count".to_owned()),
+                throughput_backend: "stream-v2".to_owned(),
+                throughput_backend_version: "2.0.0".to_owned(),
+                routing_reason: "stream_v2_selected".to_owned(),
+                admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
+                input_handle: PayloadHandle::Manifest {
+                    key: "batches/batch-a/input".to_owned(),
+                    store: LOCAL_FILESYSTEM_STORE.to_owned(),
+                },
+                result_handle: PayloadHandle::Inline {
+                    key: "bulk-result:batch-a".to_owned(),
+                },
+            }),
+        };
+
+        let encoded = serde_json::to_value(&command)?;
+        let round_tripped: ThroughputCommandEnvelope = serde_json::from_value(encoded.clone())?;
+        assert_eq!(round_tripped, command);
+        assert!(encoded.to_string().contains("\"start_throughput_run\""));
+        assert!(!encoded.to_string().contains("\"items\""));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_create_batch_converts_to_native_start_command() {
+        let legacy = CreateBatchCommand {
+            dedupe_key: "throughput-start:test".to_owned(),
+            tenant_id: "tenant-a".to_owned(),
+            definition_id: "demo".to_owned(),
+            definition_version: 3,
+            artifact_hash: "artifact-a".to_owned(),
+            instance_id: "instance-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            batch_id: "batch-a".to_owned(),
+            activity_type: "benchmark.echo".to_owned(),
+            task_queue: "bulk".to_owned(),
+            state: Some("join".to_owned()),
+            chunk_size: 16,
+            max_attempts: 2,
+            retry_delay_ms: 500,
+            total_items: 10,
+            aggregation_group_count: 1,
+            execution_policy: Some("parallel".to_owned()),
+            reducer: Some("count".to_owned()),
+            throughput_backend: "stream-v2".to_owned(),
+            throughput_backend_version: "2.0.0".to_owned(),
+            routing_reason: "bridge".to_owned(),
+            admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
+            input_handle: PayloadHandle::Inline {
+                key: "bulk-input:batch-a".to_owned(),
+            },
+            result_handle: PayloadHandle::Inline {
+                key: "bulk-result:batch-a".to_owned(),
+            },
+            items: vec![Value::from(1)],
+        };
+
+        let native = legacy.to_start_throughput_run();
+        assert_eq!(native.definition_version, Some(3));
+        assert_eq!(native.artifact_hash.as_deref(), Some("artifact-a"));
+        assert_eq!(native.total_items, 10);
+        assert_eq!(native.input_handle, legacy.input_handle);
+    }
+
+    #[test]
     fn reduction_tree_helpers_plan_three_level_layout() {
         assert_eq!(reduction_tree_level_counts(16, 3), vec![16, 4, 1]);
         let parent = reduction_tree_parent_group_id(7, 16, 3).expect("leaf parent should exist");
@@ -1100,6 +1338,12 @@ mod tests {
         assert!(bulk_reducer_requires_success_outputs(Some(BULK_REDUCER_SUM)));
         assert!(bulk_reducer_supports_stream_v2(Some(BULK_REDUCER_SUM)));
         assert!(bulk_reducer_supports_stream_v2(Some(BULK_REDUCER_COUNT)));
+        assert!(bulk_reducer_requires_success_outputs(Some(BULK_REDUCER_HISTOGRAM)));
+        assert!(!bulk_reducer_requires_success_outputs(Some(BULK_REDUCER_SAMPLE_ERRORS)));
+        assert!(bulk_reducer_requires_error_outputs(Some(BULK_REDUCER_SAMPLE_ERRORS)));
+        assert!(bulk_reducer_supports_stream_v2(Some(BULK_REDUCER_HISTOGRAM)));
+        assert!(bulk_reducer_supports_stream_v2(Some(BULK_REDUCER_SAMPLE_ERRORS)));
+        assert!(bulk_reducer_settles(Some(BULK_REDUCER_SAMPLE_ERRORS)));
     }
 
     #[test]
@@ -1126,6 +1370,24 @@ mod tests {
         assert_eq!(
             bulk_reducer_reduce_values(Some(BULK_REDUCER_SUM), &[])?,
             Some(Value::from(0.0))
+        );
+        assert_eq!(
+            bulk_reducer_reduce_values(
+                Some(BULK_REDUCER_HISTOGRAM),
+                &[Value::from("a"), Value::from("b"), Value::from("a")]
+            )?,
+            Some(serde_json::json!({"a": 2, "b": 1}))
+        );
+        assert_eq!(
+            bulk_reducer_reduce_errors(
+                Some(BULK_REDUCER_SAMPLE_ERRORS),
+                &[("boom".to_owned(), 3), ("cancelled".to_owned(), 1)]
+            )?,
+            Some(serde_json::json!({
+                "sample": ["boom", "cancelled"],
+                "total": 4,
+                "truncated": false,
+            }))
         );
         Ok(())
     }

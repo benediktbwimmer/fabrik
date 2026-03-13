@@ -130,6 +130,8 @@ pub enum WorkflowEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         schedule_to_start_timeout_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        schedule_to_close_timeout_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         start_to_close_timeout_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         heartbeat_timeout_ms: Option<u64>,
@@ -222,6 +224,8 @@ pub enum WorkflowEvent {
         cancelled_items: u32,
         chunk_count: u32,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reducer_output: Option<Value>,
     },
     BulkActivityBatchCancelled {
         batch_id: String,
@@ -231,6 +235,8 @@ pub enum WorkflowEvent {
         cancelled_items: u32,
         chunk_count: u32,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reducer_output: Option<Value>,
     },
     WorkflowContinuedAsNew {
         new_run_id: String,

@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
@@ -130,6 +131,115 @@ function rootIdentifierName(expression) {
   return null;
 }
 
+function isCtxReceiver(expression) {
+  return ts.isIdentifier(expression) && expression.text === "ctx";
+}
+
+function resolveTemporalActivityBinding(expression, bindings = currentTemporalActivityBindings) {
+  if (ts.isIdentifier(expression)) {
+    const activity = bindings.direct.get(expression.text);
+    return activity ? { activityType: activity.activityType, options: activity.options } : null;
+  }
+  if (
+    ts.isPropertyAccessExpression(expression) &&
+    ts.isIdentifier(expression.expression) &&
+    bindings.objects.has(expression.expression.text)
+  ) {
+    return {
+      activityType: expression.name.text,
+      options: bindings.objectOptions.get(expression.expression.text) ?? {},
+    };
+  }
+  return null;
+}
+
+function jsonValueToExpression(value) {
+  if (value == null) {
+    return { kind: "literal", value: null };
+  }
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return { kind: "literal", value };
+  }
+  if (Array.isArray(value)) {
+    return { kind: "array", items: value.map(jsonValueToExpression) };
+  }
+  const fields = {};
+  for (const [key, entry] of Object.entries(value)) {
+    fields[key] = jsonValueToExpression(entry);
+  }
+  return { kind: "object", fields };
+}
+
+function compileTemporalActivityDescriptor(activityType, options, args) {
+  const fields = {
+    __kind: { kind: "literal", value: "activity_descriptor" },
+    activity_type: { kind: "literal", value: activityType },
+    input: compileCallArgumentsAsInput(args),
+  };
+  if (options.task_queue) {
+    fields.task_queue = options.task_queue;
+  }
+  if (options.retry) {
+    fields.retry = jsonValueToExpression(options.retry);
+  }
+  if (options.schedule_to_start_timeout_ms != null) {
+    fields.schedule_to_start_timeout_ms = {
+      kind: "literal",
+      value: options.schedule_to_start_timeout_ms,
+    };
+  }
+  if (options.schedule_to_close_timeout_ms != null) {
+    fields.schedule_to_close_timeout_ms = {
+      kind: "literal",
+      value: options.schedule_to_close_timeout_ms,
+    };
+  }
+  if (options.start_to_close_timeout_ms != null) {
+    fields.start_to_close_timeout_ms = {
+      kind: "literal",
+      value: options.start_to_close_timeout_ms,
+    };
+  }
+  if (options.heartbeat_timeout_ms != null) {
+    fields.heartbeat_timeout_ms = {
+      kind: "literal",
+      value: options.heartbeat_timeout_ms,
+    };
+  }
+  return { kind: "object", fields };
+}
+
+function compileDeferredActivityThunkExpression(expression) {
+  if (!ts.isArrowFunction(expression) && !ts.isFunctionExpression(expression)) {
+    return null;
+  }
+  if (expression.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) {
+    throw compilerError(`deferred workflow thunks must not be async`, expression);
+  }
+  if (expression.parameters.length !== 0) {
+    throw compilerError(`deferred workflow thunks must not declare parameters`, expression);
+  }
+  const bodyExpression = functionBodyExpression(expression.body);
+  if (!bodyExpression || !ts.isCallExpression(bodyExpression)) {
+    throw compilerError(
+      `deferred workflow thunks must return a supported Temporal activity call`,
+      expression.body,
+    );
+  }
+  const temporalActivity = resolveTemporalActivityBinding(bodyExpression.expression);
+  if (!temporalActivity) {
+    throw compilerError(
+      `deferred workflow thunks currently support only Temporal activity calls`,
+      bodyExpression,
+    );
+  }
+  return compileTemporalActivityDescriptor(
+    temporalActivity.activityType,
+    temporalActivity.options,
+    bodyExpression.arguments,
+  );
+}
+
 function assertAllowedRootIdentifier(expression) {
   const root = rootIdentifierName(expression);
   if (root && ["Date", "Math", "process", "globalThis", "window", "document"].includes(root)) {
@@ -173,6 +283,7 @@ function collectTemporalWorkflowApi(sourceFile) {
     setWorkflowOptions: new Set(),
     upsertSearchAttributes: new Set(),
     workflowInfo: new Set(),
+    inWorkflowContext: new Set(),
     log: new Set(),
     uuid4: new Set(),
     patched: new Set(),
@@ -217,6 +328,7 @@ function collectTemporalWorkflowApi(sourceFile) {
       if (importedName === "setWorkflowOptions") api.setWorkflowOptions.add(localName);
       if (importedName === "upsertSearchAttributes") api.upsertSearchAttributes.add(localName);
       if (importedName === "workflowInfo") api.workflowInfo.add(localName);
+      if (importedName === "inWorkflowContext") api.inWorkflowContext.add(localName);
       if (importedName === "log") api.log.add(localName);
       if (importedName === "uuid4") api.uuid4.add(localName);
       if (importedName === "patched") api.patched.add(localName);
@@ -236,6 +348,47 @@ let currentTemporalApi = collectTemporalWorkflowApi(ts.createSourceFile(
   false,
   ts.ScriptKind.TS,
 ));
+let currentTemporalActivityBindings = {
+  direct: new Map(),
+  objects: new Set(),
+  objectOptions: new Map(),
+};
+let currentStaticTopLevelInitializers = new Map();
+
+function unwrapStaticReferenceExpression(expression) {
+  if (
+    ts.isParenthesizedExpression(expression) ||
+    ts.isAsExpression(expression) ||
+    ts.isTypeAssertionExpression(expression) ||
+    ts.isNonNullExpression(expression) ||
+    ts.isSatisfiesExpression?.(expression)
+  ) {
+    return unwrapStaticReferenceExpression(expression.expression);
+  }
+  if (ts.isIdentifier(expression) && currentStaticTopLevelInitializers.has(expression.text)) {
+    return unwrapStaticReferenceExpression(currentStaticTopLevelInitializers.get(expression.text));
+  }
+  return expression;
+}
+
+function collectStaticTopLevelInitializers(sourceFile) {
+  const bindings = new Map();
+  for (const statement of sourceFile.statements) {
+    if (!ts.isVariableStatement(statement)) {
+      continue;
+    }
+    for (const declaration of statement.declarationList.declarations) {
+      if (
+        ts.isIdentifier(declaration.name) &&
+        declaration.initializer &&
+        isStaticTopLevelInitializer(declaration.initializer)
+      ) {
+        bindings.set(declaration.name.text, declaration.initializer);
+      }
+    }
+  }
+  return bindings;
+}
 
 function temporalImportedReferenceMatches(expression, aliases, importedName, temporalApi = currentTemporalApi) {
   if (ts.isIdentifier(expression)) {
@@ -270,10 +423,13 @@ function temporalEnumReferenceMatches(expression, aliases, importedName, tempora
 }
 
 function isTemporalProxyDeclaration(declaration, temporalApi) {
-  if (!declaration.initializer || !ts.isCallExpression(declaration.initializer)) {
+  const initializer = declaration.initializer
+    ? unwrapStaticReferenceExpression(declaration.initializer)
+    : null;
+  if (!initializer || !ts.isCallExpression(initializer)) {
     return false;
   }
-  if (!temporalImportedCallMatches(declaration.initializer, temporalApi.proxyActivities, "proxyActivities", temporalApi)) {
+  if (!temporalImportedCallMatches(initializer, temporalApi.proxyActivities, "proxyActivities", temporalApi)) {
     return false;
   }
   if (ts.isIdentifier(declaration.name)) {
@@ -415,20 +571,21 @@ function compileApplicationFailureCreateExpression(expression) {
     nonRetryable: { kind: "literal", value: false },
   };
   for (const property of config.properties) {
-    if (!ts.isPropertyAssignment(property)) {
+    if (!ts.isPropertyAssignment(property) && !ts.isShorthandPropertyAssignment(property)) {
       throw compilerError(`unsupported ApplicationFailure.create property ${property.getText()}`, property);
     }
     const key = property.name.getText().replaceAll(/^["']|["']$/g, "");
+    const initializer = ts.isPropertyAssignment(property) ? property.initializer : property.name;
     if (key === "message") {
-      fields.message = compileExpression(property.initializer);
+      fields.message = compileExpression(initializer);
       continue;
     }
     if (key === "nonRetryable") {
-      fields.nonRetryable = compileExpression(property.initializer);
+      fields.nonRetryable = compileExpression(initializer);
       continue;
     }
     if (key === "details" || key === "category") {
-      fields[key] = compileExpression(property.initializer);
+      fields[key] = compileExpression(initializer);
       continue;
     }
     throw compilerError(`unsupported ApplicationFailure.create property ${key}`, property);
@@ -437,6 +594,7 @@ function compileApplicationFailureCreateExpression(expression) {
 }
 
 function parseTemporalRetryOptions(expression) {
+  expression = unwrapStaticReferenceExpression(expression);
   if (!ts.isObjectLiteralExpression(expression)) {
     throw compilerError(`proxyActivities retry must be a static object`, expression);
   }
@@ -455,6 +613,23 @@ function parseTemporalRetryOptions(expression) {
     }
     if (key === "initialInterval") {
       retry.delay = literalString(property.initializer, "proxyActivities retry.initialInterval");
+      continue;
+    }
+    if (key === "maximumInterval") {
+      retry.maximum_interval = literalString(
+        property.initializer,
+        "proxyActivities retry.maximumInterval",
+      );
+      continue;
+    }
+    if (key === "backoffCoefficient") {
+      if (!ts.isNumericLiteral(property.initializer)) {
+        throw compilerError(
+          `proxyActivities retry.backoffCoefficient must be a numeric literal`,
+          property.initializer,
+        );
+      }
+      retry.backoff_coefficient_millis = Math.round(Number(property.initializer.text) * 1000);
       continue;
     }
     if (key === "nonRetryableErrorTypes") {
@@ -479,7 +654,9 @@ function parseTemporalRetryOptions(expression) {
 }
 
 function parseTemporalProxyActivityOptions(callExpression) {
-  const optionsExpression = callExpression.arguments[0];
+  const optionsExpression = callExpression.arguments[0]
+    ? unwrapStaticReferenceExpression(callExpression.arguments[0])
+    : null;
   if (!optionsExpression) {
     return {};
   }
@@ -500,6 +677,13 @@ function parseTemporalProxyActivityOptions(callExpression) {
       options.schedule_to_start_timeout_ms = parseTemporalDurationMs(
         property.initializer,
         "proxyActivities scheduleToStartTimeout",
+      );
+      continue;
+    }
+    if (key === "scheduleToCloseTimeout") {
+      options.schedule_to_close_timeout_ms = parseTemporalDurationMs(
+        property.initializer,
+        "proxyActivities scheduleToCloseTimeout",
       );
       continue;
     }
@@ -564,11 +748,42 @@ function isStaticTopLevelInitializer(expression) {
     return expression.elements.every((element) => isStaticTopLevelInitializer(element));
   }
   if (ts.isObjectLiteralExpression(expression)) {
-    return expression.properties.every((property) =>
-      ts.isPropertyAssignment(property) && isStaticTopLevelInitializer(property.initializer),
-    );
+    return expression.properties.every((property) => {
+      if (ts.isPropertyAssignment(property)) {
+        return isStaticTopLevelInitializer(property.initializer);
+      }
+      if (ts.isMethodDeclaration(property)) {
+        return true;
+      }
+      return false;
+    });
+  }
+  if (ts.isArrowFunction(expression) || ts.isFunctionExpression(expression)) {
+    return true;
   }
   return false;
+}
+
+function isSupportedWorkflowContextGuard(statement, temporalApi) {
+  if (!ts.isIfStatement(statement)) {
+    return false;
+  }
+  const condition = statement.expression;
+  if (
+    !ts.isPrefixUnaryExpression(condition) ||
+    condition.operator !== ts.SyntaxKind.ExclamationToken ||
+    !ts.isCallExpression(condition.operand) ||
+    !temporalImportedCallMatches(
+      condition.operand,
+      temporalApi.inWorkflowContext,
+      "inWorkflowContext",
+      temporalApi,
+    ) ||
+    condition.operand.arguments.length !== 0
+  ) {
+    return false;
+  }
+  return true;
 }
 
 function isSupportedSetWorkflowOptionsStatement(statement, temporalApi) {
@@ -640,6 +855,9 @@ function assertNoTopLevelSideEffects(sourceFile) {
     if (isSupportedSetWorkflowOptionsStatement(statement, temporalApi)) {
       continue;
     }
+    if (isSupportedWorkflowContextGuard(statement, temporalApi)) {
+      continue;
+    }
     if (!ts.isEmptyStatement(statement)) {
       throw compilerError(
         `top-level side effects are not allowed in workflow modules (${sourceFile.fileName})`,
@@ -654,6 +872,122 @@ function getResolvedSources(program) {
     .getSourceFiles()
     .filter((sourceFile) => !sourceFile.isDeclarationFile)
     .filter((sourceFile) => !sourceFile.fileName.includes(`${path.sep}node_modules${path.sep}`));
+}
+
+function moduleResolutionCandidates(base) {
+  const candidates = [];
+  if (path.extname(base)) {
+    candidates.push(base);
+    return candidates;
+  }
+  for (const extension of [".ts", ".mts", ".cts", ".js", ".mjs", ".cjs"]) {
+    candidates.push(`${base}${extension}`);
+  }
+  for (const indexName of ["index.ts", "index.mts", "index.cts", "index.js", "index.mjs", "index.cjs"]) {
+    candidates.push(path.join(base, indexName));
+  }
+  return candidates;
+}
+
+function findWorkspaceRoot(startFile) {
+  let current = path.dirname(startFile);
+  let nearestPackageRoot = null;
+  while (true) {
+    const packageJsonPath = path.join(current, "package.json");
+    if (ts.sys.fileExists(packageJsonPath)) {
+      nearestPackageRoot ??= current;
+      try {
+        const manifest = JSON.parse(fsSync.readFileSync(packageJsonPath, "utf8"));
+        if (manifest.workspaces) {
+          return current;
+        }
+      } catch {
+        // Ignore malformed manifests and continue walking upward.
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return nearestPackageRoot ?? path.dirname(startFile);
+    }
+    current = parent;
+  }
+}
+
+function findWorkspacePackages(workspaceRoot) {
+  const packages = [];
+  const stack = [workspaceRoot];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    for (const entry of fsSync.readdirSync(current, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        if ([".git", "node_modules", "dist", "build", "coverage"].includes(entry.name)) {
+          continue;
+        }
+        stack.push(path.join(current, entry.name));
+        continue;
+      }
+      if (entry.name !== "package.json") {
+        continue;
+      }
+      const packageJsonPath = path.join(current, entry.name);
+      try {
+        const manifest = JSON.parse(fsSync.readFileSync(packageJsonPath, "utf8"));
+        if (typeof manifest.name === "string" && manifest.name.length > 0) {
+          packages.push({ dir: current, manifest });
+        }
+      } catch {
+        // Ignore malformed workspace manifests during import resolution.
+      }
+    }
+  }
+  return packages;
+}
+
+function resolveWorkspaceImportPath(fromFileName, moduleName) {
+  const workspaceRoot = findWorkspaceRoot(fromFileName);
+  const packages = findWorkspacePackages(workspaceRoot);
+  const matched = packages
+    .filter(({ manifest }) => moduleName === manifest.name || moduleName.startsWith(`${manifest.name}/`))
+    .sort((left, right) => right.manifest.name.length - left.manifest.name.length)[0];
+  if (!matched) {
+    return null;
+  }
+  const { dir, manifest } = matched;
+  const subpath =
+    moduleName === manifest.name ? "" : moduleName.slice(manifest.name.length + 1);
+  const sourceRoots = new Set([dir]);
+  for (const field of ["types", "source", "module", "main"]) {
+    if (typeof manifest[field] !== "string" || manifest[field].length === 0) {
+      continue;
+    }
+    sourceRoots.add(path.resolve(dir, path.dirname(manifest[field])));
+  }
+  const subpaths = new Set();
+  if (subpath.length === 0) {
+    for (const field of ["types", "source", "module", "main"]) {
+      if (typeof manifest[field] === "string" && manifest[field].length > 0) {
+        subpaths.add(manifest[field]);
+      }
+    }
+    subpaths.add("index");
+  } else {
+    subpaths.add(subpath);
+    for (const prefix of ["lib/", "dist/", "build/", "src/"]) {
+      if (subpath.startsWith(prefix)) {
+        subpaths.add(subpath.slice(prefix.length));
+      }
+    }
+  }
+  for (const root of sourceRoots) {
+    for (const candidateSubpath of subpaths) {
+      for (const candidate of moduleResolutionCandidates(path.resolve(root, candidateSubpath))) {
+        if (ts.sys.fileExists(candidate)) {
+          return candidate;
+        }
+      }
+    }
+  }
+  return null;
 }
 
 function findExportedFunction(program, exportName) {
@@ -700,7 +1034,11 @@ function buildHelperRegistry(program, workflowDeclaration) {
         const resolvedSymbol =
           symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol;
         const declaration = resolvedSymbol.valueDeclaration ?? resolvedSymbol.declarations?.[0];
-        if (hasCompilableHelperBody(declaration) && declaration !== workflowDeclaration) {
+        if (
+          hasCompilableHelperBody(declaration) &&
+          !isAsyncHelperDeclaration(declaration) &&
+          declaration !== workflowDeclaration
+        ) {
           helpers.set(node.expression.text, compileHelperFunction(node.expression.text, declaration));
         }
       }
@@ -725,16 +1063,22 @@ function collectImportedHelpers(program, sourceFile) {
     if (moduleName === "@temporalio/workflow") {
       continue;
     }
-    const resolved = ts.resolveModuleName(
+    let resolved = ts.resolveModuleName(
       moduleName,
       sourceFile.fileName,
       program.getCompilerOptions(),
       ts.sys,
     ).resolvedModule;
     if (!resolved) {
+      const workspaceResolved = resolveWorkspaceImportPath(sourceFile.fileName, moduleName);
+      if (workspaceResolved) {
+        resolved = { resolvedFileName: workspaceResolved };
+      }
+    }
+    if (!resolved) {
       continue;
     }
-    const importedSource = program.getSourceFile(resolved.resolvedFileName);
+    const importedSource = loadSourceFile(program, resolved.resolvedFileName);
     if (!importedSource) {
       continue;
     }
@@ -810,6 +1154,23 @@ function findExportedFunctionDeclaration(sourceFile, exportName) {
   return null;
 }
 
+function loadSourceFile(program, fileName) {
+  const existing = program.getSourceFile(fileName);
+  if (existing) {
+    return existing;
+  }
+  const contents = ts.sys.readFile(fileName);
+  if (contents == null) {
+    return null;
+  }
+  return ts.createSourceFile(
+    fileName,
+    contents,
+    program.getCompilerOptions().target ?? ts.ScriptTarget.ES2022,
+    true,
+  );
+}
+
 function hasCompilableHelperBody(declaration) {
   return (
     !!declaration &&
@@ -817,6 +1178,12 @@ function hasCompilableHelperBody(declaration) {
       ts.isFunctionExpression(declaration) ||
       ts.isArrowFunction(declaration)) &&
     declaration.body != null
+  );
+}
+
+function isAsyncHelperDeclaration(declaration) {
+  return Boolean(
+    declaration?.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword),
   );
 }
 
@@ -1009,6 +1376,166 @@ function compileDeleteAssignment(statement, expression) {
   };
 }
 
+function collectBoundIdentifiers(name, names) {
+  if (ts.isIdentifier(name)) {
+    names.add(name.text);
+    return;
+  }
+  if (ts.isObjectBindingPattern(name) || ts.isArrayBindingPattern(name)) {
+    for (const element of name.elements) {
+      if (ts.isBindingElement(element)) {
+        collectBoundIdentifiers(element.name, names);
+      }
+    }
+  }
+}
+
+function collectAsyncHelperBindingNames(declaration) {
+  const names = new Set();
+  for (const parameter of declaration.parameters ?? []) {
+    collectBoundIdentifiers(parameter.name, names);
+  }
+  const body = declaration.body;
+  if (!body || !ts.isBlock(body)) {
+    return names;
+  }
+  const visit = (node) => {
+    if (ts.isVariableDeclaration(node)) {
+      collectBoundIdentifiers(node.name, names);
+    } else if (ts.isCatchClause(node) && node.variableDeclaration) {
+      collectBoundIdentifiers(node.variableDeclaration.name, names);
+    } else if (ts.isParameter(node)) {
+      collectBoundIdentifiers(node.name, names);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(body);
+  return names;
+}
+
+function shouldRenameIdentifierNode(node) {
+  const parent = node.parent;
+  if (!parent) {
+    return true;
+  }
+  if (ts.isPropertyAccessExpression(parent) && parent.name === node) {
+    return false;
+  }
+  if (
+    (ts.isPropertyAssignment(parent) || ts.isMethodDeclaration(parent) || ts.isPropertySignature(parent)) &&
+    parent.name === node
+  ) {
+    return false;
+  }
+  if (ts.isShorthandPropertyAssignment(parent) && parent.name === node) {
+    return false;
+  }
+  if (ts.isImportSpecifier(parent) || ts.isExportSpecifier(parent)) {
+    return false;
+  }
+  if (ts.isLabeledStatement(parent) && parent.label === node) {
+    return false;
+  }
+  return true;
+}
+
+function ensureAwaitedReturnExpression(expression) {
+  if (!expression) {
+    return expression;
+  }
+  return (
+    ts.isAwaitExpression(expression) ||
+    !ts.isCallExpression(expression)
+  )
+    ? expression
+    : ts.setTextRange(ts.factory.createAwaitExpression(expression), expression);
+}
+
+function extractWrappedAwaitExpression(expression) {
+  if (ts.isAwaitExpression(expression)) {
+    return {
+      awaitExpression: expression,
+      rebuild: (replacement) => replacement,
+    };
+  }
+  if (ts.isParenthesizedExpression(expression)) {
+    const inner = extractWrappedAwaitExpression(expression.expression);
+    if (!inner) {
+      return null;
+    }
+    return {
+      awaitExpression: inner.awaitExpression,
+      rebuild: (replacement) =>
+        ts.setTextRange(
+          ts.factory.updateParenthesizedExpression(expression, inner.rebuild(replacement)),
+          expression,
+        ),
+    };
+  }
+  if (
+    ts.isAsExpression(expression) ||
+    ts.isTypeAssertionExpression(expression) ||
+    ts.isNonNullExpression(expression) ||
+    ts.isSatisfiesExpression?.(expression)
+  ) {
+    return extractWrappedAwaitExpression(expression.expression);
+  }
+  if (ts.isPrefixUnaryExpression(expression)) {
+    const inner = extractWrappedAwaitExpression(expression.operand);
+    if (!inner) {
+      return null;
+    }
+    return {
+      awaitExpression: inner.awaitExpression,
+      rebuild: (replacement) =>
+        ts.setTextRange(
+          ts.factory.updatePrefixUnaryExpression(expression, inner.rebuild(replacement)),
+          expression,
+        ),
+    };
+  }
+  return null;
+}
+
+function prepareAsyncHelperStatements(declaration, renames) {
+  const sourceStatements =
+    declaration.body && ts.isBlock(declaration.body)
+      ? declaration.body.statements
+      : [
+          ts.setTextRange(
+            ts.factory.createReturnStatement(
+              ensureAwaitedReturnExpression(declaration.body),
+            ),
+            declaration.body ?? declaration,
+          ),
+        ];
+  const transformer = (context) => {
+    const visit = (node) => {
+      if (ts.isReturnStatement(node) && node.expression) {
+        return ts.visitEachChild(
+          ts.setTextRange(
+            ts.factory.createReturnStatement(ensureAwaitedReturnExpression(node.expression)),
+            node,
+          ),
+          visit,
+          context,
+        );
+      }
+      if (ts.isIdentifier(node) && renames.has(node.text) && shouldRenameIdentifierNode(node)) {
+        return ts.setTextRange(ts.factory.createIdentifier(renames.get(node.text)), node);
+      }
+      return ts.visitEachChild(node, visit, context);
+    };
+    return (root) => ts.visitNode(root, visit);
+  };
+  const result = ts.transform(sourceStatements, [transformer]);
+  try {
+    return result.transformed;
+  } finally {
+    result.dispose();
+  }
+}
+
 function compileAssignmentAction(statement, left, operatorKind, right) {
   if (ts.isIdentifier(left)) {
     if (operatorKind === ts.SyntaxKind.EqualsToken) {
@@ -1024,6 +1551,36 @@ function compileAssignmentAction(statement, left, operatorKind, right) {
         op: "add",
         left: { kind: "identifier", name: left.text },
         right: compileExpression(right),
+      },
+    };
+  }
+  if (
+    ts.isPropertyAccessExpression(left) &&
+    ts.isIdentifier(left.expression)
+  ) {
+    const expr =
+      operatorKind === ts.SyntaxKind.EqualsToken
+        ? compileExpression(right)
+        : {
+            kind: "binary",
+            op: "add",
+            left: {
+              kind: "member",
+              object: { kind: "identifier", name: left.expression.text },
+              property: left.name.text,
+            },
+            right: compileExpression(right),
+          };
+    return {
+      target: left.expression.text,
+      expr: {
+        kind: "call",
+        callee: "__builtin_object_set",
+        args: [
+          { kind: "identifier", name: left.expression.text },
+          { kind: "literal", value: left.name.text },
+          expr,
+        ],
       },
     };
   }
@@ -1058,6 +1615,114 @@ function compileAssignmentAction(statement, left, operatorKind, right) {
     };
   }
   throw compilerError(`unsupported assignment target: ${statement.getText()}`, statement);
+}
+
+function compileMutatingCollectionAction(callExpression) {
+  if (!ts.isPropertyAccessExpression(callExpression.expression)) {
+    return null;
+  }
+  const receiver = callExpression.expression.expression;
+  const method = callExpression.expression.name.text;
+  if (ts.isIdentifier(receiver) && method === "set" && callExpression.arguments.length === 2) {
+    return {
+      target: receiver.text,
+      expr: {
+        kind: "call",
+        callee: "__builtin_map_set",
+        args: [
+          { kind: "identifier", name: receiver.text },
+          compileExpression(callExpression.arguments[0]),
+          compileExpression(callExpression.arguments[1]),
+        ],
+      },
+    };
+  }
+  if (ts.isIdentifier(receiver) && method === "setDate" && callExpression.arguments.length === 1) {
+    return {
+      target: receiver.text,
+      expr: {
+        kind: "call",
+        callee: "__builtin_date_set_date",
+        args: [
+          { kind: "identifier", name: receiver.text },
+          compileExpression(callExpression.arguments[0]),
+        ],
+      },
+    };
+  }
+  if (
+    ts.isIdentifier(receiver) &&
+    method === "setHours" &&
+    callExpression.arguments.length >= 1 &&
+    callExpression.arguments.length <= 4
+  ) {
+    return {
+      target: receiver.text,
+      expr: {
+        kind: "call",
+        callee: "__builtin_date_set_hours",
+        args: [
+          { kind: "identifier", name: receiver.text },
+          ...callExpression.arguments.map(compileExpression),
+        ],
+      },
+    };
+  }
+  return null;
+}
+
+function compileMutatingCollectionExpression(callExpression) {
+  if (!ts.isPropertyAccessExpression(callExpression.expression)) {
+    return null;
+  }
+  const receiver = callExpression.expression.expression;
+  const method = callExpression.expression.name.text;
+  if (!ts.isIdentifier(receiver) || method !== "set" || callExpression.arguments.length !== 2) {
+    return null;
+  }
+  return {
+    kind: "call",
+    callee: "__builtin_binding_map_set_and_null",
+    args: [
+      { kind: "literal", value: receiver.text },
+      compileExpression(callExpression.arguments[0]),
+      compileExpression(callExpression.arguments[1]),
+    ],
+  };
+}
+
+function blockFromInlineHandlerBody(body) {
+  if (ts.isBlock(body)) {
+    if (
+      body.statements.length === 1 &&
+      ts.isReturnStatement(body.statements[0]) &&
+      body.statements[0].expression
+    ) {
+      const expression = body.statements[0].expression;
+      if (
+        ts.isVoidExpression(expression) &&
+        ts.isCallExpression(expression.expression) &&
+        compileMutatingCollectionAction(expression.expression)
+      ) {
+        return ts.factory.createBlock([ts.factory.createExpressionStatement(expression.expression)], true);
+      }
+      if (ts.isCallExpression(expression) && compileMutatingCollectionAction(expression)) {
+        return ts.factory.createBlock([ts.factory.createExpressionStatement(expression)], true);
+      }
+    }
+    return body;
+  }
+  if (
+    ts.isVoidExpression(body) &&
+    ts.isCallExpression(body.expression) &&
+    compileMutatingCollectionAction(body.expression)
+  ) {
+    return ts.factory.createBlock([ts.factory.createExpressionStatement(body.expression)], true);
+  }
+  if (ts.isCallExpression(body) && compileMutatingCollectionAction(body)) {
+    return ts.factory.createBlock([ts.factory.createExpressionStatement(body)], true);
+  }
+  return ts.factory.createBlock([ts.factory.createReturnStatement(body)], true);
 }
 
 function compileWorkflowParam(parameter) {
@@ -1147,6 +1812,29 @@ function compileArrayPushAction(statement, callExpression) {
   };
 }
 
+function compileArrayUnshiftAction(statement, callExpression) {
+  if (
+    !ts.isPropertyAccessExpression(callExpression.expression) ||
+    callExpression.expression.name.text !== "unshift" ||
+    !ts.isIdentifier(callExpression.expression.expression) ||
+    callExpression.arguments.length !== 1
+  ) {
+    return null;
+  }
+  const arrayName = callExpression.expression.expression.text;
+  return {
+    target: arrayName,
+    expr: {
+      kind: "call",
+      callee: "__builtin_array_prepend",
+      args: [
+        { kind: "identifier", name: arrayName },
+        compileExpression(callExpression.arguments[0]),
+      ],
+    },
+  };
+}
+
 function resolveArrayShiftCall(callExpression) {
   if (
     !ts.isPropertyAccessExpression(callExpression.expression) ||
@@ -1210,6 +1898,11 @@ function compileSignalHandlerActions(handler) {
       const pushAction = compileArrayPushAction(statement, statement.expression);
       if (pushAction) {
         actions.push(pushAction);
+        continue;
+      }
+      const unshiftAction = compileArrayUnshiftAction(statement, statement.expression);
+      if (unshiftAction) {
+        actions.push(unshiftAction);
         continue;
       }
     }
@@ -1360,6 +2053,14 @@ function compileExpression(expression) {
   if (ts.isParenthesizedExpression(expression)) {
     return compileExpression(expression.expression);
   }
+  if (ts.isVoidExpression(expression)) {
+    if (ts.isCallExpression(expression.expression)) {
+      const mutatingCollectionExpression = compileMutatingCollectionExpression(expression.expression);
+      if (mutatingCollectionExpression) {
+        return mutatingCollectionExpression;
+      }
+    }
+  }
   if (ts.isPrefixUnaryExpression(expression)) {
     if (expression.operator === ts.SyntaxKind.ExclamationToken) {
       return { kind: "unary", op: "not", expr: compileExpression(expression.operand) };
@@ -1485,6 +2186,17 @@ function compileExpression(expression) {
     if (
       ts.isPropertyAccessExpression(expression.expression) &&
       ts.isIdentifier(expression.expression.expression) &&
+      expression.expression.expression.text === "Math" &&
+      expression.expression.name.text === "random"
+    ) {
+      if (expression.arguments.length !== 0) {
+        throw compilerError(`Math.random() does not accept arguments`, expression);
+      }
+      return { kind: "random", scope: stableNodeKey(expression) };
+    }
+    if (
+      ts.isPropertyAccessExpression(expression.expression) &&
+      ts.isIdentifier(expression.expression.expression) &&
       expression.expression.expression.text === "Object" &&
       expression.expression.name.text === "keys"
     ) {
@@ -1531,6 +2243,52 @@ function compileExpression(expression) {
     }
     if (ts.isPropertyAccessExpression(expression.expression)) {
       const method = expression.expression.name.text;
+      if (method === "get") {
+        if (expression.arguments.length !== 1) {
+          throw compilerError(`Map.get() requires exactly one key argument`, expression);
+        }
+        return {
+          kind: "call",
+          callee: "__builtin_map_get",
+          args: [
+            compileExpression(expression.expression.expression),
+            compileExpression(expression.arguments[0]),
+          ],
+        };
+      }
+      if (method === "has") {
+        if (expression.arguments.length !== 1) {
+          throw compilerError(`Map.has() requires exactly one key argument`, expression);
+        }
+        return {
+          kind: "call",
+          callee: "__builtin_map_has",
+          args: [
+            compileExpression(expression.expression.expression),
+            compileExpression(expression.arguments[0]),
+          ],
+        };
+      }
+      if (method === "valueOf") {
+        if (expression.arguments.length !== 0) {
+          throw compilerError(`Date.valueOf() does not accept arguments`, expression);
+        }
+        return {
+          kind: "call",
+          callee: "__builtin_date_value_of",
+          args: [compileExpression(expression.expression.expression)],
+        };
+      }
+      if (method === "getDate") {
+        if (expression.arguments.length !== 0) {
+          throw compilerError(`Date.getDate() does not accept arguments`, expression);
+        }
+        return {
+          kind: "call",
+          callee: "__builtin_date_get_date",
+          args: [compileExpression(expression.expression.expression)],
+        };
+      }
       if (
         method === "fill" &&
         ts.isNewExpression(expression.expression.expression) &&
@@ -1565,6 +2323,19 @@ function compileExpression(expression) {
               ? compileExpression(expression.arguments[0])
               : { kind: "literal", value: "," },
           ],
+        };
+      }
+      if (method === "toLowerCase" || method === "toUpperCase") {
+        if (expression.arguments.length !== 0) {
+          throw compilerError(`${method}() does not accept arguments`, expression);
+        }
+        return {
+          kind: "call",
+          callee:
+            method === "toLowerCase"
+              ? "__builtin_string_to_lowercase"
+              : "__builtin_string_to_uppercase",
+          args: [compileExpression(expression.expression.expression)],
         };
       }
       if (method === "reduce") {
@@ -1656,7 +2427,7 @@ function compileExpression(expression) {
     }
     if (
       ts.isPropertyAccessExpression(expression.expression) &&
-      expression.expression.expression.getText() === "ctx"
+      isCtxReceiver(expression.expression.expression)
     ) {
       const method = expression.expression.name.text;
       if (method === "now") {
@@ -1716,6 +2487,22 @@ function compileExpression(expression) {
     }
   }
   if (ts.isNewExpression(expression)) {
+    if (ts.isIdentifier(expression.expression) && expression.expression.text === "Date") {
+      if ((expression.arguments?.length ?? 0) > 1) {
+        throw compilerError(`new Date() currently supports zero or one argument`, expression);
+      }
+      return {
+        kind: "call",
+        callee: "__builtin_date_new",
+        args: expression.arguments ? expression.arguments.map(compileExpression) : [],
+      };
+    }
+    if (ts.isIdentifier(expression.expression) && expression.expression.text === "Map") {
+      if ((expression.arguments?.length ?? 0) !== 0) {
+        throw compilerError(`new Map() currently supports only the zero-argument form`, expression);
+      }
+      return { kind: "object", fields: {} };
+    }
     if (
       temporalImportedReferenceMatches(
         expression.expression,
@@ -1724,6 +2511,12 @@ function compileExpression(expression) {
       )
     ) {
       return compileApplicationFailureExpression(expression.arguments?.[0], {}, expression);
+    }
+  }
+  if (ts.isArrowFunction(expression) || ts.isFunctionExpression(expression)) {
+    const descriptor = compileDeferredActivityThunkExpression(expression);
+    if (descriptor) {
+      return descriptor;
     }
   }
 
@@ -1763,12 +2556,14 @@ class WorkflowLowerer {
       namespaceImports: new Set(),
     },
     statePrefix = "",
+    typeChecker = null,
   ) {
     this.definitionId = definitionId;
     this.version = version;
     this.workflowDeclaration = workflowDeclaration;
     this.temporalApi = temporalApi;
     this.statePrefix = statePrefix;
+    this.typeChecker = typeChecker;
     this.states = {};
     this.sourceMap = {};
     this.syntheticCounts = new Map();
@@ -1791,6 +2586,7 @@ class WorkflowLowerer {
     this.temporalActivityBindings = sourceFile
       ? this.discoverTemporalActivityBindings(sourceFile)
       : { direct: new Map(), objects: new Set() };
+    this.asyncLocalHelpers = sourceFile ? this.discoverAsyncLocalHelpers(sourceFile) : new Map();
     this.discoverHandleDeclarations(workflowDeclaration.body);
   }
 
@@ -1822,6 +2618,59 @@ class WorkflowLowerer {
     return definitions;
   }
 
+  resolveTemporalDefinitionReference(expression) {
+    if (ts.isIdentifier(expression)) {
+      const localKinds = [
+        ["query", this.temporalDefinitions.query],
+        ["update", this.temporalDefinitions.update],
+        ["signal", this.temporalDefinitions.signal],
+      ];
+      for (const [kind, definitions] of localKinds) {
+        if (definitions.has(expression.text)) {
+          return { kind, name: definitions.get(expression.text) };
+        }
+      }
+    }
+    if (!this.typeChecker) {
+      return null;
+    }
+    const symbolTarget =
+      ts.isPropertyAccessExpression(expression) ? expression.name : expression;
+    let symbol = this.typeChecker.getSymbolAtLocation(symbolTarget);
+    if (!symbol) {
+      return null;
+    }
+    const declaration = symbol?.valueDeclaration ?? symbol?.declarations?.[0] ?? null;
+    if (
+      (symbol.flags & ts.SymbolFlags.Alias) !== 0 ||
+      ts.isImportSpecifier(declaration) ||
+      ts.isImportClause(declaration) ||
+      ts.isNamespaceImport(declaration)
+    ) {
+      symbol = this.typeChecker.getAliasedSymbol(symbol);
+    }
+    const resolvedDeclaration = symbol?.valueDeclaration ?? symbol?.declarations?.[0] ?? null;
+    const declarationApi = resolvedDeclaration
+      ? collectTemporalWorkflowApi(resolvedDeclaration.getSourceFile())
+      : this.temporalApi;
+    if (
+      !resolvedDeclaration ||
+      !ts.isVariableDeclaration(resolvedDeclaration) ||
+      !isTemporalDefinitionDeclaration(resolvedDeclaration, declarationApi)
+    ) {
+      return null;
+    }
+    const kind = temporalDefinitionKind(resolvedDeclaration, declarationApi);
+    const name =
+      resolvedDeclaration.initializer.arguments[0] != null
+        ? literalString(
+            resolvedDeclaration.initializer.arguments[0],
+            `Temporal ${kind} definition name`,
+          )
+        : resolvedDeclaration.name.text;
+    return { kind, name };
+  }
+
   discoverTemporalActivityBindings(sourceFile) {
     const bindings = {
       direct: new Map(),
@@ -1836,7 +2685,11 @@ class WorkflowLowerer {
         if (!isTemporalProxyDeclaration(declaration, this.temporalApi)) {
           continue;
         }
-        const options = parseTemporalProxyActivityOptions(declaration.initializer);
+        const proxyCall = unwrapStaticReferenceExpression(declaration.initializer);
+        if (!ts.isCallExpression(proxyCall)) {
+          throw compilerError(`proxyActivities options must be declared inline`, declaration);
+        }
+        const options = parseTemporalProxyActivityOptions(proxyCall);
         if (ts.isIdentifier(declaration.name)) {
           bindings.objects.add(declaration.name.text);
           bindings.objectOptions.set(declaration.name.text, options);
@@ -1851,6 +2704,35 @@ class WorkflowLowerer {
       }
     }
     return bindings;
+  }
+
+  discoverAsyncLocalHelpers(sourceFile) {
+    const helpers = new Map();
+    for (const statement of sourceFile.statements) {
+      if (
+        ts.isFunctionDeclaration(statement) &&
+        statement.name &&
+        statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)
+      ) {
+        helpers.set(statement.name.text, statement);
+        continue;
+      }
+      if (!ts.isVariableStatement(statement)) {
+        continue;
+      }
+      for (const declaration of statement.declarationList.declarations) {
+        if (!ts.isIdentifier(declaration.name) || !declaration.initializer) {
+          continue;
+        }
+        if (
+          (ts.isArrowFunction(declaration.initializer) || ts.isFunctionExpression(declaration.initializer)) &&
+          declaration.initializer.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)
+        ) {
+          helpers.set(declaration.name.text, declaration.initializer);
+        }
+      }
+    }
+    return helpers;
   }
 
   resolveTemporalActivityCall(expression) {
@@ -1871,11 +2753,59 @@ class WorkflowLowerer {
     return null;
   }
 
+  resolveTemporalDynamicActivityCall(expression) {
+    if (
+      ts.isElementAccessExpression(expression) &&
+      ts.isIdentifier(expression.expression) &&
+      this.temporalActivityBindings.objects.has(expression.expression.text)
+    ) {
+      return {
+        activityTypeExpr: compileExpression(expression.argumentExpression),
+        options: this.temporalActivityBindings.objectOptions.get(expression.expression.text) ?? {},
+      };
+    }
+    return null;
+  }
+
   resolveTemporalSignalName(expression, label) {
+    const definition = this.resolveTemporalDefinitionReference(expression);
+    if (definition?.kind === "signal") {
+      return definition.name;
+    }
     if (ts.isIdentifier(expression)) {
-      return this.temporalDefinitions.signal.get(expression.text) ?? expression.text;
+      return expression.text;
     }
     return literalString(expression, label);
+  }
+
+  resolveTemporalCancellationRequestedAwait(expression) {
+    if (
+      !ts.isPropertyAccessExpression(expression) ||
+      expression.name.text !== "cancelRequested" ||
+      !ts.isCallExpression(expression.expression) ||
+      !ts.isPropertyAccessExpression(expression.expression.expression)
+    ) {
+      return false;
+    }
+    const receiver = expression.expression.expression.expression;
+    const method = expression.expression.expression.name.text;
+    return (
+      temporalImportedReferenceMatches(
+        receiver,
+        this.temporalApi.cancellationScope,
+        "CancellationScope",
+        this.temporalApi,
+      ) &&
+      method === "current" &&
+      expression.expression.arguments.length === 0
+    );
+  }
+
+  resolveAsyncLocalHelperCall(callExpression) {
+    if (!ts.isIdentifier(callExpression.expression)) {
+      return null;
+    }
+    return this.asyncLocalHelpers.get(callExpression.expression.text) ?? null;
   }
 
   resolveTemporalPromiseFanout(call) {
@@ -1973,7 +2903,7 @@ class WorkflowLowerer {
         const awaitedCall = current.initializer.expression;
         if (
           ts.isPropertyAccessExpression(awaitedCall.expression) &&
-          awaitedCall.expression.expression.getText() === "ctx"
+          isCtxReceiver(awaitedCall.expression.expression)
         ) {
           const method = awaitedCall.expression.name.text;
           if (method === "startChild") this.childHandleVars.add(current.name.text);
@@ -2018,11 +2948,15 @@ class WorkflowLowerer {
   registerTemporalNamedHandler(callExpression) {
     const definition = callExpression.arguments[0];
     const handler = callExpression.arguments[1];
-    if (!definition || !ts.isIdentifier(definition)) {
+    if (
+      !definition ||
+      (!ts.isIdentifier(definition) && !ts.isPropertyAccessExpression(definition))
+    ) {
       throw compilerError(`setHandler requires a named Temporal definition`, callExpression);
     }
-    if (this.temporalDefinitions.query.has(definition.text)) {
-      const queryName = this.temporalDefinitions.query.get(definition.text);
+    const resolvedDefinition = this.resolveTemporalDefinitionReference(definition);
+    if (resolvedDefinition?.kind === "query") {
+      const queryName = resolvedDefinition.name;
       if (!handler || (!ts.isArrowFunction(handler) && !ts.isFunctionExpression(handler))) {
         throw compilerError(`Temporal query setHandler requires an inline function handler`, callExpression);
       }
@@ -2036,27 +2970,22 @@ class WorkflowLowerer {
       };
       return;
     }
-    if (this.temporalDefinitions.update.has(definition.text)) {
-      const updateName = this.temporalDefinitions.update.get(definition.text);
+    if (resolvedDefinition?.kind === "update") {
+      const updateName = resolvedDefinition.name;
       if (!handler || (!ts.isArrowFunction(handler) && !ts.isFunctionExpression(handler))) {
         throw compilerError(`Temporal update setHandler requires an inline function handler`, callExpression);
       }
+      const bodyBlock = blockFromInlineHandlerBody(handler.body);
       const lowered = new WorkflowLowerer(
         this.definitionId,
         this.version,
-        {
-          body: ts.isBlock(handler.body)
-            ? handler.body
-            : ts.factory.createBlock([ts.factory.createReturnStatement(handler.body)], true),
-        },
+        { body: bodyBlock },
         this.temporalApi,
         `update_${shortHash(updateName)}_`,
+        this.typeChecker,
       );
       lowered.temporalDefinitions = this.temporalDefinitions;
       lowered.temporalActivityBindings = this.temporalActivityBindings;
-      const bodyBlock = ts.isBlock(handler.body)
-        ? handler.body
-        : ts.factory.createBlock([ts.factory.createReturnStatement(handler.body)], true);
       const terminalFail = lowered.addState("fail_terminal", {
         type: "fail",
         reason: { kind: "literal", value: `update ${updateName} terminated without explicit completion` },
@@ -2072,27 +3001,22 @@ class WorkflowLowerer {
       }
       return;
     }
-    if (this.temporalDefinitions.signal.has(definition.text)) {
-      const signalName = this.temporalDefinitions.signal.get(definition.text);
+    if (resolvedDefinition?.kind === "signal") {
+      const signalName = resolvedDefinition.name;
       if (!handler || (!ts.isArrowFunction(handler) && !ts.isFunctionExpression(handler))) {
         throw compilerError(`Temporal signal setHandler requires an inline function handler`, callExpression);
       }
+      const bodyBlock = blockFromInlineHandlerBody(handler.body);
       const lowered = new WorkflowLowerer(
         this.definitionId,
         this.version,
-        {
-          body: ts.isBlock(handler.body)
-            ? handler.body
-            : ts.factory.createBlock([ts.factory.createReturnStatement(handler.body)], true),
-        },
+        { body: bodyBlock },
         this.temporalApi,
         `signal_${shortHash(signalName)}_`,
+        this.typeChecker,
       );
       lowered.temporalDefinitions = this.temporalDefinitions;
       lowered.temporalActivityBindings = this.temporalActivityBindings;
-      const bodyBlock = ts.isBlock(handler.body)
-        ? handler.body
-        : ts.factory.createBlock([ts.factory.createReturnStatement(handler.body)], true);
       const terminalComplete = lowered.addState("signal_complete", {
         type: "succeed",
       });
@@ -2245,6 +3169,14 @@ class WorkflowLowerer {
 
   lowerStatement(statement, nextState, breakTarget, continueTarget, errorTarget, returnTarget = null) {
     if (ts.isExpressionStatement(statement) && ts.isCallExpression(statement.expression)) {
+      const mutatingCollectionAction = compileMutatingCollectionAction(statement.expression);
+      if (mutatingCollectionAction) {
+        return this.addState("assign", {
+          type: "assign",
+          actions: [mutatingCollectionAction],
+          next: nextState,
+        }, statement);
+      }
       if (temporalImportedCallMatches(statement.expression, this.temporalApi.setHandler, "setHandler", this.temporalApi)) {
         this.registerTemporalNamedHandler(statement.expression);
         return nextState;
@@ -2303,12 +3235,20 @@ class WorkflowLowerer {
           next: nextState,
         }, statement);
       }
+      const unshiftAction = compileArrayUnshiftAction(statement, statement.expression);
+      if (unshiftAction) {
+        return this.addState("assign", {
+          type: "assign",
+          actions: [unshiftAction],
+          next: nextState,
+        }, statement);
+      }
       if (temporalLogCallMatches(statement.expression, this.temporalApi)) {
         return nextState;
       }
       if (
         ts.isPropertyAccessExpression(statement.expression.expression) &&
-        statement.expression.expression.expression.getText() === "ctx"
+        isCtxReceiver(statement.expression.expression.expression)
       ) {
         const method = statement.expression.expression.name.text;
         if (method === "query") {
@@ -2344,6 +3284,21 @@ class WorkflowLowerer {
       if (
         declarations.length === 1 &&
         ts.isIdentifier(declarations[0].name) &&
+        declarations[0].initializer
+      ) {
+        const wrappedAwaitState = this.lowerWrappedAwaitExpression(
+          declarations[0].initializer,
+          declarations[0].name.text,
+          nextState,
+          errorTarget,
+        );
+        if (wrappedAwaitState) {
+          return wrappedAwaitState;
+        }
+      }
+      if (
+        declarations.length === 1 &&
+        ts.isIdentifier(declarations[0].name) &&
         declarations[0].initializer &&
         ts.isCallExpression(declarations[0].initializer)
       ) {
@@ -2375,8 +3330,14 @@ class WorkflowLowerer {
         }
       }
       const actions = declarations.map((declaration) => {
-        if (!ts.isIdentifier(declaration.name) || !declaration.initializer) {
+        if (!ts.isIdentifier(declaration.name)) {
           throw compilerError(`unsupported declaration: ${statement.getText()}`, declaration);
+        }
+        if (!declaration.initializer) {
+          return {
+            target: declaration.name.text,
+            expr: { kind: "literal", value: null },
+          };
         }
         if (
           ts.isCallExpression(declaration.initializer) &&
@@ -2401,6 +3362,19 @@ class WorkflowLowerer {
     }
 
     if (ts.isExpressionStatement(statement)) {
+      if (
+        ts.isVoidExpression(statement.expression) &&
+        ts.isCallExpression(statement.expression.expression)
+      ) {
+        const mutatingCollectionAction = compileMutatingCollectionAction(statement.expression.expression);
+        if (mutatingCollectionAction) {
+          return this.addState("assign", {
+            type: "assign",
+            actions: [mutatingCollectionAction],
+            next: nextState,
+          }, statement);
+        }
+      }
       if (ts.isAwaitExpression(statement.expression)) {
         return this.lowerAwait(statement.expression, null, nextState, errorTarget);
       }
@@ -2431,6 +3405,17 @@ class WorkflowLowerer {
             nextState,
             errorTarget,
           );
+        }
+        if (ts.isIdentifier(statement.expression.left)) {
+          const wrappedAwaitState = this.lowerWrappedAwaitExpression(
+            statement.expression.right,
+            statement.expression.left.text,
+            nextState,
+            errorTarget,
+          );
+          if (wrappedAwaitState) {
+            return wrappedAwaitState;
+          }
         }
         return this.addState("assign", {
           type: "assign",
@@ -2696,6 +3681,27 @@ class WorkflowLowerer {
             errorTarget,
           );
         }
+        const mutatingCollectionAction =
+          ts.isCallExpression(statement.expression)
+            ? compileMutatingCollectionAction(statement.expression)
+            : ts.isVoidExpression(statement.expression) &&
+                ts.isCallExpression(statement.expression.expression)
+              ? compileMutatingCollectionAction(statement.expression.expression)
+              : null;
+        if (mutatingCollectionAction) {
+          const actions = [mutatingCollectionAction];
+          if (returnTarget.targetVar) {
+            actions.push({
+              target: returnTarget.targetVar,
+              expr: { kind: "literal", value: null },
+            });
+          }
+          return this.addState("assign", {
+            type: "assign",
+            actions,
+            next: returnTarget.next,
+          }, statement);
+        }
         if (
           ts.isCallExpression(statement.expression) &&
           (
@@ -2707,7 +3713,7 @@ class WorkflowLowerer {
             )) ||
             (
               ts.isPropertyAccessExpression(statement.expression.expression) &&
-              statement.expression.expression.expression.getText() === "ctx"
+              isCtxReceiver(statement.expression.expression.expression)
             )
           )
         ) {
@@ -2760,7 +3766,7 @@ class WorkflowLowerer {
       }
       if (
         ts.isPropertyAccessExpression(statement.expression.expression) &&
-        statement.expression.expression.expression.getText() === "ctx"
+        isCtxReceiver(statement.expression.expression.expression)
       ) {
         return this.lowerTerminalCall(statement.expression);
       }
@@ -2795,19 +3801,21 @@ class WorkflowLowerer {
             returnTarget,
           )
         : nextState;
-      const catchError = statement.catchClause
-        ? {
-            next: this.lowerBlock(
-              statement.catchClause.block.statements,
-              finallyStart,
+	      const catchError = statement.catchClause
+	        ? {
+	            next: this.lowerBlock(
+	              statement.catchClause.block.statements,
+	              finallyStart,
               breakTarget,
               continueTarget,
-              errorTarget,
-              returnTarget,
-            ),
-            error_var: statement.catchClause.variableDeclaration?.name.getText() ?? "__error",
-          }
-        : errorTarget;
+	              errorTarget,
+	              returnTarget,
+	            ),
+	            error_var: ts.isIdentifier(statement.catchClause.variableDeclaration?.name)
+	              ? statement.catchClause.variableDeclaration.name.text
+	              : "__error",
+	          }
+	        : errorTarget;
       return this.lowerStatementOrBlock(
         statement.tryBlock,
         finallyStart,
@@ -2926,6 +3934,25 @@ class WorkflowLowerer {
       return this.addState("assign", { type: "assign", actions, next: nextState }, initializer);
     }
     return this.lowerSyntheticExpression(initializer, nextState);
+  }
+
+  lowerWrappedAwaitExpression(expression, targetVar, nextState, errorTarget) {
+    const wrappedAwait = extractWrappedAwaitExpression(expression);
+    if (!wrappedAwait) {
+      return null;
+    }
+    const tempVar = this.nextId("await_value", wrappedAwait.awaitExpression);
+    const assignState = this.addState("assign", {
+      type: "assign",
+      actions: [
+        {
+          target: targetVar,
+          expr: compileExpression(wrappedAwait.rebuild(ts.factory.createIdentifier(tempVar))),
+        },
+      ],
+      next: nextState,
+    }, expression);
+    return this.lowerAwait(wrappedAwait.awaitExpression, tempVar, assignState, errorTarget);
   }
 
   lowerSyntheticExpression(expression, nextState) {
@@ -3047,7 +4074,82 @@ class WorkflowLowerer {
     }
   }
 
+  lowerAsyncLocalHelperCall(helperDeclaration, call, targetVar, nextState, errorTarget, originNode) {
+    const helperName =
+      ts.isFunctionDeclaration(helperDeclaration) && helperDeclaration.name
+        ? helperDeclaration.name.text
+        : originNode.getText();
+    const renames = new Map();
+    for (const name of collectAsyncHelperBindingNames(helperDeclaration)) {
+      renames.set(name, this.nextId(`__helper_${name}`, originNode));
+    }
+    const statements = prepareAsyncHelperStatements(helperDeclaration, renames);
+    const helperBlock = ts.factory.createBlock(statements, true);
+    this.discoverHandleDeclarations(helperBlock);
+
+    const parameterActions = [];
+    const parameters = helperDeclaration.parameters ?? [];
+    for (let index = 0; index < parameters.length; index += 1) {
+      const parameter = parameters[index];
+      if (parameter.dotDotDotToken) {
+        throw compilerError(`async helper ${helperName} does not support rest parameters`, parameter);
+      }
+      if (!ts.isIdentifier(parameter.name)) {
+        throw compilerError(`async helper ${helperName} parameters must be plain identifiers`, parameter.name);
+      }
+      const target = renames.get(parameter.name.text) ?? parameter.name.text;
+      const provided = call.arguments[index];
+      parameterActions.push({
+        target,
+        expr: provided
+          ? compileExpression(provided)
+          : parameter.initializer
+            ? compileExpression(parameter.initializer)
+            : { kind: "literal", value: null },
+      });
+    }
+    if (call.arguments.length > parameters.length) {
+      throw compilerError(
+        `async helper ${helperName} received too many arguments for the current subset`,
+        call.arguments[parameters.length],
+      );
+    }
+
+    const helperResultVar = targetVar ?? this.nextId("__helper_result", originNode);
+    const fallthroughState = targetVar
+      ? this.addState("assign", {
+          type: "assign",
+          actions: [{ target: helperResultVar, expr: { kind: "literal", value: null } }],
+          next: nextState,
+        }, originNode)
+      : nextState;
+    const bodyStart = this.lowerBlock(
+      statements,
+      fallthroughState,
+      null,
+      null,
+      errorTarget,
+      { next: nextState, targetVar: helperResultVar },
+    );
+    if (parameterActions.length === 0) {
+      return bodyStart;
+    }
+    return this.addState("assign", {
+      type: "assign",
+      actions: parameterActions,
+      next: bodyStart,
+    }, originNode);
+  }
+
   lowerAwait(awaitExpression, targetVar, nextState, errorTarget) {
+    if (this.resolveTemporalCancellationRequestedAwait(awaitExpression.expression)) {
+      return this.addState("wait_cancel", {
+        type: "wait_for_event",
+        event_type: "__workflow_cancellation_requested",
+        next: nextState,
+        output_var: targetVar ?? undefined,
+      }, awaitExpression);
+    }
     if (!ts.isCallExpression(awaitExpression.expression)) {
       throw compilerError(
         `non-deterministic await detected; all async operations must go through ctx.* methods`,
@@ -3065,6 +4167,17 @@ class WorkflowLowerer {
       );
     }
     const call = awaitExpression.expression;
+    const asyncLocalHelper = this.resolveAsyncLocalHelperCall(call);
+    if (asyncLocalHelper) {
+      return this.lowerAsyncLocalHelperCall(
+        asyncLocalHelper,
+        call,
+        targetVar,
+        nextState,
+        errorTarget,
+        awaitExpression,
+      );
+    }
     const localChildPromiseAll = this.resolveLocalChildPromiseAll(call);
     if (localChildPromiseAll) {
       return this.lowerLocalChildPromiseAll(
@@ -3220,11 +4333,12 @@ class WorkflowLowerer {
         reducer: temporalFanout.reducer,
         retry: temporalFanout.options.retry,
         schedule_to_start_timeout_ms: temporalFanout.options.schedule_to_start_timeout_ms,
+        schedule_to_close_timeout_ms: temporalFanout.options.schedule_to_close_timeout_ms,
         start_to_close_timeout_ms: temporalFanout.options.start_to_close_timeout_ms,
         heartbeat_timeout_ms: temporalFanout.options.heartbeat_timeout_ms,
       }, awaitExpression);
     }
-    if (!ts.isPropertyAccessExpression(call.expression) || call.expression.expression.getText() !== "ctx") {
+    if (!ts.isPropertyAccessExpression(call.expression) || !isCtxReceiver(call.expression.expression)) {
       const temporalActivity = this.resolveTemporalActivityCall(call.expression);
       if (temporalActivity) {
         return this.addState("step", {
@@ -3235,8 +4349,64 @@ class WorkflowLowerer {
           task_queue: temporalActivity.options.task_queue,
           retry: temporalActivity.options.retry,
           schedule_to_start_timeout_ms: temporalActivity.options.schedule_to_start_timeout_ms,
+          schedule_to_close_timeout_ms: temporalActivity.options.schedule_to_close_timeout_ms,
           start_to_close_timeout_ms: temporalActivity.options.start_to_close_timeout_ms,
           heartbeat_timeout_ms: temporalActivity.options.heartbeat_timeout_ms,
+          output_var: targetVar ?? undefined,
+          on_error: errorTarget ?? undefined,
+        }, awaitExpression);
+      }
+      const dynamicTemporalActivity = this.resolveTemporalDynamicActivityCall(call.expression);
+      if (dynamicTemporalActivity) {
+        return this.addState("dynamic_step", {
+          type: "dynamic_step",
+          descriptor: {
+            kind: "object",
+            fields: {
+              __kind: { kind: "literal", value: "activity_descriptor" },
+              activity_type: dynamicTemporalActivity.activityTypeExpr,
+              input: compileCallArgumentsAsInput(call.arguments),
+              ...(dynamicTemporalActivity.options.task_queue
+                ? { task_queue: dynamicTemporalActivity.options.task_queue }
+                : {}),
+              ...(dynamicTemporalActivity.options.retry
+                ? { retry: jsonValueToExpression(dynamicTemporalActivity.options.retry) }
+                : {}),
+              ...(dynamicTemporalActivity.options.schedule_to_start_timeout_ms != null
+                ? {
+                    schedule_to_start_timeout_ms: {
+                      kind: "literal",
+                      value: dynamicTemporalActivity.options.schedule_to_start_timeout_ms,
+                    },
+                  }
+                : {}),
+              ...(dynamicTemporalActivity.options.schedule_to_close_timeout_ms != null
+                ? {
+                    schedule_to_close_timeout_ms: {
+                      kind: "literal",
+                      value: dynamicTemporalActivity.options.schedule_to_close_timeout_ms,
+                    },
+                  }
+                : {}),
+              ...(dynamicTemporalActivity.options.start_to_close_timeout_ms != null
+                ? {
+                    start_to_close_timeout_ms: {
+                      kind: "literal",
+                      value: dynamicTemporalActivity.options.start_to_close_timeout_ms,
+                    },
+                  }
+                : {}),
+              ...(dynamicTemporalActivity.options.heartbeat_timeout_ms != null
+                ? {
+                    heartbeat_timeout_ms: {
+                      kind: "literal",
+                      value: dynamicTemporalActivity.options.heartbeat_timeout_ms,
+                    },
+                  }
+                : {}),
+            },
+          },
+          next: nextState,
           output_var: targetVar ?? undefined,
           on_error: errorTarget ?? undefined,
         }, awaitExpression);
@@ -3300,6 +4470,22 @@ class WorkflowLowerer {
           workflow_id: options.workflow_id,
           task_queue: options.task_queue,
           parent_close_policy: options.parent_close_policy ?? "TERMINATE",
+        }, awaitExpression);
+      }
+      if (
+        call.arguments.length === 0 &&
+        (
+          ts.isIdentifier(call.expression) ||
+          ts.isPropertyAccessExpression(call.expression) ||
+          ts.isElementAccessExpression(call.expression)
+        )
+      ) {
+        return this.addState("dynamic_step", {
+          type: "dynamic_step",
+          descriptor: compileExpression(call.expression),
+          next: nextState,
+          output_var: targetVar ?? undefined,
+          on_error: errorTarget ?? undefined,
         }, awaitExpression);
       }
       throw compilerError(
@@ -3625,7 +4811,7 @@ class WorkflowLowerer {
   }
 
   lowerTerminalCall(callExpression) {
-    if (!ts.isPropertyAccessExpression(callExpression.expression) || callExpression.expression.expression.getText() !== "ctx") {
+    if (!ts.isPropertyAccessExpression(callExpression.expression) || !isCtxReceiver(callExpression.expression.expression)) {
       throw compilerError(`terminal return must be ctx.complete/fail/continueAsNew`, callExpression);
     }
     const method = callExpression.expression.name.text;
@@ -3672,16 +4858,15 @@ class WorkflowLowerer {
     if (!handler || (!ts.isArrowFunction(handler) && !ts.isFunctionExpression(handler))) {
       throw compilerError(`ctx.update requires an inline function handler`, callExpression);
     }
+    const bodyBlock = blockFromInlineHandlerBody(handler.body);
     const lowered = new WorkflowLowerer(
       this.definitionId,
       this.version,
-      { body: ts.isBlock(handler.body) ? handler.body : ts.factory.createBlock([ts.factory.createReturnStatement(handler.body)], true) },
+      { body: bodyBlock },
       this.temporalApi,
       `update_${shortHash(updateName)}_`,
+      this.typeChecker,
     );
-    const bodyBlock = ts.isBlock(handler.body)
-      ? handler.body
-      : ts.factory.createBlock([ts.factory.createReturnStatement(handler.body)], true);
     const terminalFail = lowered.addState("fail_terminal", {
       type: "fail",
       reason: { kind: "literal", value: `update ${updateName} terminated without explicit completion` },
@@ -3862,6 +5047,15 @@ function compileCallArgumentsAsInput(argumentsList) {
   if (argumentsList.length === 0) {
     return { kind: "literal", value: null };
   }
+  if (argumentsList.length === 1 && ts.isSpreadElement(argumentsList[0])) {
+    return compileExpression(argumentsList[0].expression);
+  }
+  if (argumentsList.some((argument) => ts.isSpreadElement(argument))) {
+    throw compilerError(
+      `spread call arguments are only supported as a single ...args array`,
+      argumentsList[0],
+    );
+  }
   if (argumentsList.length === 1) {
     return compileExpression(argumentsList[0]);
   }
@@ -3929,10 +5123,12 @@ function compileBulkOptions(expression) {
         && reducer !== "min"
         && reducer !== "max"
         && reducer !== "avg"
+        && reducer !== "histogram"
+        && reducer !== "sample_errors"
         && reducer !== "collect_results"
       ) {
         throw compilerError(
-          `ctx.bulkActivity reducer must be "all_succeeded", "all_settled", "count", "sum", "min", "max", "avg", or "collect_results"`,
+          `ctx.bulkActivity reducer must be "all_succeeded", "all_settled", "count", "sum", "min", "max", "avg", "histogram", "sample_errors", or "collect_results"`,
           property.initializer,
         );
       }
@@ -4065,6 +5261,7 @@ function validateArtifactCalls(artifact) {
     "__builtin_array_join",
     "__builtin_array_fill",
     "__builtin_array_append",
+    "__builtin_array_prepend",
     "__builtin_array_shift_head",
     "__builtin_array_shift_tail",
     "__builtin_array_map_number",
@@ -4075,8 +5272,19 @@ function validateArtifactCalls(artifact) {
     "__builtin_object_omit",
     "__builtin_object_set",
     "__builtin_object_keys",
+    "__builtin_map_get",
+    "__builtin_map_has",
+    "__builtin_map_set",
+    "__builtin_binding_map_set_and_null",
+    "__builtin_date_new",
+    "__builtin_date_value_of",
+    "__builtin_date_get_date",
+    "__builtin_date_set_date",
+    "__builtin_date_set_hours",
     "__builtin_search_attributes_upsert",
     "__builtin_string",
+    "__builtin_string_to_lowercase",
+    "__builtin_string_to_uppercase",
   ]);
   const validateExpression = (expression) => {
     walkExpression(expression, (node) => {
@@ -4138,6 +5346,9 @@ function validateCompiledState(state, validateExpression) {
       validateExpression(state.input);
       if (state.task_queue) validateExpression(state.task_queue);
       break;
+    case "dynamic_step":
+      validateExpression(state.descriptor);
+      break;
     case "fan_out":
       validateExpression(state.items);
       if (state.task_queue) validateExpression(state.task_queue);
@@ -4171,8 +5382,17 @@ async function main() {
   const workflow = findExportedFunction(program, args.exportName);
   const temporalApi = collectTemporalWorkflowApi(workflow.getSourceFile());
   currentTemporalApi = temporalApi;
+  currentStaticTopLevelInitializers = collectStaticTopLevelInitializers(workflow.getSourceFile());
+  const lowerer = new WorkflowLowerer(
+    args.definitionId,
+    args.version,
+    workflow,
+    temporalApi,
+    "",
+    program.getTypeChecker(),
+  );
+  currentTemporalActivityBindings = lowerer.temporalActivityBindings;
   const helpers = injectTemporalBuiltinHelpers(buildHelperRegistry(program, workflow), temporalApi);
-  const lowerer = new WorkflowLowerer(args.definitionId, args.version, workflow, temporalApi);
   const { initialState, states, sourceMap, queries, signals, updates, params, nonCancellableStates } =
     lowerer.lower();
 

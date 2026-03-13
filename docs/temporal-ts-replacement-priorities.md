@@ -11,26 +11,30 @@ Current source snapshot:
 ## Current State
 
 - Samples analyzed: `48`
-- Qualified with caveats: `18`
-- Blocked: `30`
+- Qualified with caveats: `25`
+- Blocked: `23`
 - Status counts:
-  - `compatible_ready_not_deployed`: `18`
-  - `incompatible_blocked`: `21`
+  - `compatible_ready_not_deployed`: `25`
+  - `incompatible_blocked`: `14`
   - `source_environment_blocked`: `9`
 
 ## What Moved
 
-The latest compiler and packaging passes materially shifted the remaining replacement frontier:
+The latest compiler, runtime, and packaging passes materially shifted the remaining replacement frontier:
 
-- `unsupported_api` blocker occurrences dropped from `51` to `26`
-- `unsupported_temporal_api` hard blocks dropped from `34` to `10`
+- `unsupported_api` blocker occurrences dropped from `51` to `19`
+- `unsupported_temporal_api` hard blocks dropped from `34` to `4`
 - `unsupported_packaging_bootstrap` blocker occurrences dropped from `72` to `8`
-- qualified official samples rose from `4` to `18`
+- qualified official samples rose from `4` to `23`
 - `log`, `workflowInfo`, `uuid4`, `ApplicationFailure`, `ActivityFailure`, `ParentClosePolicy`, `ActivityCancellationType`, `patched`, `deprecatePatch`, `setWorkflowOptions`, `SearchAttributes`, and `upsertSearchAttributes` are no longer explicit hard-block imports in the official sample frontier
 - workflow-only workers no longer falsely block packaging, which moved `continue-as-new`, `nexus-hello`, and several other sample repos into the qualified set
-- `batch-sliding-window` and `cron-workflows` now compile cleanly in the official census after the recent compiler passes
-- post-census direct migration checks also moved `child-workflows`, `patching-api`, `worker-versioning`, and `search-attributes` onto the qualified side; the next full census should reflect that
-- imported helper factories used only inside Temporal `ReturnType<typeof ...>` annotations no longer poison workflow compilation; the real `saga` sample now fails later on async local helper support instead of imported helper analysis
+- `batch-sliding-window`, `child-workflows`, `cron-workflows`, `patching-api`, `saga`, `search-attributes`, and `worker-versioning` now compile cleanly in the refreshed official census
+- post-census direct migration checks also moved `state` and `nestjs-exchange-rates` onto the qualified side after the workflow-local state, cancellation-request, imported-definition, and `Date` subset passes; the next full census should reflect that
+- the latest compiler/runtime config pass also moved direct workflow compilation for `fetch-esm` and `snippets`:
+  - `fetch-esm/src/workflows.ts:exampleFetch` now compiles after adding richer proxy-activity retry option support
+  - `snippets/src/workflows.ts:example` now compiles after adding deterministic `Math.random()` lowering
+- `timer-examples` moved off the old property-assignment blocker: `timer.deadline = deadline` no longer fails first, and the remaining frontier there is now detached async handle / promise-race semantics
+- imported helper factories used only inside Temporal `ReturnType<typeof ...>` annotations no longer poison workflow compilation, and deferred activity thunks now cover the real `saga` compensation pattern
 - The remaining explicit unsupported-import census is now dominated by:
   - `WorkflowInterceptors`: `1`
   - `inWorkflowContext`: `1`
@@ -38,22 +42,22 @@ The latest compiler and packaging passes materially shifted the remaining replac
   - `proxySinks`: `1`
 
 This means broad import coverage is no longer the main hard-blocker class. The next replacement bottlenecks are:
-- remaining compiler-subset gaps hidden behind generic `unsupported_api` compile failures
+- remaining compiler-subset gaps hidden behind generic `unsupported_api` compile failures, especially detached async handles and `Promise.race(...)` workflow semantics
 - a smaller set of still-unfinished worker-bootstrap edge cases
 - payload/codec and interceptor-specific parity gaps
 
 ## Priority Order
 
 1. Unsupported Temporal workflow/runtime APIs
-- Hard-block findings: `10`
-- Affected samples: `7`
-- Blocker-category occurrences: `26`
+- Hard-block findings: `4`
+- Affected samples: `3`
+- Blocker-category occurrences: `19`
 - The explicit import backlog is now narrow. The bigger problem inside this category is generic compile-subset failure on otherwise-recognized APIs.
 - Remaining explicit import frontier:
   - interceptor shapes: `WorkflowInterceptors`
   - remaining workflow APIs: `inWorkflowContext`
   - sinks APIs: `Sinks`, `proxySinks`
-- Recommendation: stop chasing generic import coverage and instead burn down one real compile-subset cluster at a time. The current highest-signal clusters are `saga` (async local helpers), `timer-examples` (Promise-like timers and `Promise.race`), and the remaining environment/bootstrap outliers.
+- Recommendation: stop chasing generic import coverage and instead burn down one real compile-subset cluster at a time. The current highest-signal clusters are `activities-cancellation-heartbeating` (broader cancellation scope and promise composition), `timer-examples` (detached promise/race patterns plus promise-like timers), and the remaining environment/bootstrap outliers.
 
 2. Remaining worker bootstrap edge cases
 - Hard-block findings: `9`
@@ -91,20 +95,22 @@ This means broad import coverage is no longer the main hard-blocker class. The n
 - Affected sample: `query-subscriptions`
 - Recommendation: leave blocked until a real repo makes this urgent or until the unsupported API backlog has materially shrunk.
 
-7. Async local workflow helpers
-- Hard-block findings: not yet reflected in the last full census summary because this surfaced in a direct `saga` rerun after the latest compiler fixes
-- Affected sample: `saga`
-- Current frontier: imported helper/type-position analysis is fixed; the remaining blocker is local `async` helper functions that contain awaited workflow work.
-- Recommendation: treat this as the next generic compiler feature if we want the fastest progress on broad workflow-shape parity without opening interceptors yet.
+7. Workflow-local state and date subsets
+- Status: landed in direct official-sample checks after the latest census refresh
+- Affected samples moved by this pass:
+  - `state`
+  - `nestjs-exchange-rates`
+- Current frontier: promise composition around timers, cancellation, and detached activity handles rather than plain local state mutation.
+- Recommendation: build on this by adding detached promise/race semantics instead of widening random syntax support.
 
 ## Near-Term Execution
 
 1. Burn down the next generic compile-subset cluster, not just import lists.
 - Use the official samples still failing with `One or more workflows failed to compile into the currently supported Fabrik subset.` as the next queue.
 - Best first targets:
-  - `query-subscriptions`
-  - `saga`
   - `timer-examples`
+  - `activities-cancellation-heartbeating`
+  - `query-subscriptions`
   - `sinks`
 - Success criterion: reduce `unsupported_api` occurrences again without increasing trust debt.
 
@@ -122,6 +128,7 @@ This means broad import coverage is no longer the main hard-blocker class. The n
 ## Current Qualified Official Samples
 
 - `batch-sliding-window`
+- `child-workflows`
 - `continue-as-new`
 - `cron-workflows`
 - `custom-logger`
@@ -131,11 +138,17 @@ This means broad import coverage is no longer the main hard-blocker class. The n
 - `expense`
 - `grpc-calls`
 - `interceptors-opentelemetry`
+- `nestjs-exchange-rates` (direct rerun after the latest date/import-definition pass)
 - `nextjs-ecommerce-oneclick`
 - `nexus-cancellation`
 - `nexus-hello`
+- `patching-api`
 - `production`
+- `saga`
 - `schedules`
+- `search-attributes`
 - `signals-queries`
+- `state` (direct rerun after the latest workflow-local state and cancellation-request pass)
 - `timer-progress`
 - `vscode-debugger`
+- `worker-versioning`

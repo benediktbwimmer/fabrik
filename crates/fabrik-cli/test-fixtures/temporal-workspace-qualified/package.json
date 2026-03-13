@@ -1,0 +1,8 @@
+{
+  "name": "temporal-workspace-qualified",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ]
+}

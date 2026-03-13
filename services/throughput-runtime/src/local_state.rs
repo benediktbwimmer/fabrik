@@ -18,8 +18,9 @@ use fabrik_throughput::{
 };
 use fabrik_throughput::{
     ThroughputBatchIdentity, ThroughputChangelogEntry, ThroughputChangelogPayload,
-    ThroughputChunkReport, ThroughputChunkReportPayload, bulk_reducer_reduce_values,
-    bulk_reducer_requires_success_outputs, bulk_reducer_summary_field_name,
+    ThroughputChunkReport, ThroughputChunkReportPayload, bulk_reducer_default_summary_value,
+    bulk_reducer_reduce_errors, bulk_reducer_reduce_values, bulk_reducer_requires_error_outputs,
+    bulk_reducer_requires_success_outputs, bulk_reducer_settles, bulk_reducer_summary_field_name,
     reduction_tree_child_group_ids, reduction_tree_level_counts, reduction_tree_node_id,
     reduction_tree_node_level, reduction_tree_parent_group_id,
 };
@@ -886,21 +887,64 @@ impl LocalThroughputState {
             return Ok(None);
         };
         let reducer = batch.reducer.as_deref();
-        if !bulk_reducer_requires_success_outputs(reducer)
-            || bulk_reducer_summary_field_name(reducer).is_none()
-        {
+        if bulk_reducer_summary_field_name(reducer).is_none() {
             return Ok(None);
         }
 
+        if reducer == Some("count") {
+            let count = if bulk_reducer_settles(reducer) {
+                u64::from(batch.succeeded_items)
+                    + u64::from(batch.failed_items)
+                    + u64::from(batch.cancelled_items)
+            } else {
+                u64::from(batch.succeeded_items)
+            };
+            return Ok(Some(Value::from(count)));
+        }
+
         let mut values = Vec::new();
-        for chunk in self.load_chunks_for_batch(identity)? {
+        let mut errors = Vec::new();
+        let mut chunks = self.load_chunks_for_batch(identity)?;
+        chunks.sort_by_key(|chunk| chunk.chunk_index);
+        for chunk in chunks {
             if let Some(report) = pending_report.filter(|report| report.chunk_id == chunk.chunk_id)
             {
-                if let ThroughputChunkReportPayload::ChunkCompleted { output, .. } = &report.payload
+                match &report.payload {
+                    ThroughputChunkReportPayload::ChunkCompleted { output, .. }
+                        if bulk_reducer_requires_success_outputs(reducer) =>
+                    {
+                        let output = output.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "throughput batch {} reducer {} requires output for chunk {}",
+                                identity.batch_id,
+                                reducer.unwrap_or_default(),
+                                chunk.chunk_id
+                            )
+                        })?;
+                        values.extend(output.iter().cloned());
+                    }
+                    ThroughputChunkReportPayload::ChunkFailed { error }
+                        if bulk_reducer_requires_error_outputs(reducer) =>
+                    {
+                        errors.push((error.clone(), chunk.item_count));
+                    }
+                    ThroughputChunkReportPayload::ChunkCancelled { reason, .. }
+                        if bulk_reducer_requires_error_outputs(reducer) =>
+                    {
+                        errors.push((reason.clone(), chunk.item_count));
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            match chunk.status.as_str() {
+                status if status == WorkflowBulkChunkStatus::Completed.as_str()
+                    && bulk_reducer_requires_success_outputs(reducer) =>
                 {
-                    let output = output.as_ref().ok_or_else(|| {
+                    let output = chunk.output.as_ref().ok_or_else(|| {
                         anyhow::anyhow!(
-                            "throughput batch {} reducer {} requires output for chunk {}",
+                            "throughput batch {} reducer {} missing completed output for chunk {}",
                             identity.batch_id,
                             reducer.unwrap_or_default(),
                             chunk.chunk_id
@@ -908,25 +952,31 @@ impl LocalThroughputState {
                     })?;
                     values.extend(output.iter().cloned());
                 }
-                continue;
+                status
+                    if matches!(
+                        status,
+                        s if s == WorkflowBulkChunkStatus::Failed.as_str()
+                            || s == WorkflowBulkChunkStatus::Cancelled.as_str()
+                    ) && bulk_reducer_requires_error_outputs(reducer) =>
+                {
+                    if let Some(error) = chunk.error.as_ref() {
+                        errors.push((error.clone(), chunk.item_count));
+                    }
+                }
+                _ => {}
             }
-
-            if chunk.status != WorkflowBulkChunkStatus::Completed.as_str() {
-                continue;
-            }
-            let output = chunk.output.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "throughput batch {} reducer {} missing completed output for chunk {}",
-                    identity.batch_id,
-                    reducer.unwrap_or_default(),
-                    chunk.chunk_id
-                )
-            })?;
-            values.extend(output.iter().cloned());
         }
 
-        bulk_reducer_reduce_values(reducer, &values)
-            .context("failed to reduce throughput batch success outputs")
+        if bulk_reducer_requires_error_outputs(reducer) {
+            return bulk_reducer_reduce_errors(reducer, &errors)
+                .context("failed to reduce throughput batch errors");
+        }
+
+        if values.is_empty() {
+            return Ok(bulk_reducer_default_summary_value(reducer));
+        }
+
+        bulk_reducer_reduce_values(reducer, &values).context("failed to reduce throughput batch success outputs")
     }
 
     pub fn count_started_chunks(
@@ -5022,6 +5072,150 @@ mod tests {
             }),
         )?;
         assert_eq!(reduced, Some(json!(40.0)));
+
+        let _ = fs::remove_dir_all(&db_path);
+        let _ = fs::remove_dir_all(&checkpoint_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn reduce_batch_success_outputs_after_report_reduces_histogram_outputs() -> Result<()> {
+        let db_path = temp_path("throughput-state-histogram-output-db");
+        let checkpoint_dir = temp_path("throughput-state-histogram-output-checkpoints");
+        let state = LocalThroughputState::open(&db_path, &checkpoint_dir, 3)?;
+        let now = Utc::now();
+        let mut batch = store_batch(WorkflowBulkBatchStatus::Running, 3, 3, 3, now);
+        batch.reducer = Some("histogram".to_owned());
+        batch.reducer_kind = bulk_reducer_name(Some("histogram")).to_owned();
+        batch.reducer_version = throughput_reducer_version(Some("histogram")).to_owned();
+        batch.reducer_execution_path = throughput_reducer_execution_path(
+            "stream-v2",
+            Some("eager"),
+            Some("histogram"),
+        )
+        .to_owned();
+        state.upsert_batch_record(&batch)?;
+
+        let mut completed =
+            store_chunk(&batch, "chunk-completed", 0, WorkflowBulkChunkStatus::Completed, 2, now);
+        completed.output = Some(vec![json!("alpha"), json!("beta")]);
+        completed.completed_at = Some(now);
+        state.upsert_chunk_record(&completed)?;
+
+        let mut started =
+            store_chunk(&batch, "chunk-pending", 1, WorkflowBulkChunkStatus::Started, 1, now);
+        started.started_at = Some(now);
+        started.lease_token = Some(Uuid::now_v7());
+        state.upsert_chunk_record(&started)?;
+
+        let reduced = state.reduce_batch_success_outputs_after_report(
+            &ThroughputBatchIdentity {
+                tenant_id: batch.tenant_id.clone(),
+                instance_id: batch.instance_id.clone(),
+                run_id: batch.run_id.clone(),
+                batch_id: batch.batch_id.clone(),
+            },
+            Some(&ThroughputChunkReport {
+                report_id: "report-histogram".to_owned(),
+                tenant_id: batch.tenant_id.clone(),
+                instance_id: batch.instance_id.clone(),
+                run_id: batch.run_id.clone(),
+                batch_id: batch.batch_id.clone(),
+                chunk_id: "chunk-pending".to_owned(),
+                chunk_index: 1,
+                group_id: group_id_for_chunk_index(1, batch.aggregation_group_count),
+                attempt: 1,
+                lease_epoch: 1,
+                owner_epoch: 1,
+                worker_id: "worker-a".to_owned(),
+                worker_build_id: "build-a".to_owned(),
+                lease_token: TEST_LEASE_TOKEN.to_owned(),
+                occurred_at: now,
+                payload: ThroughputChunkReportPayload::ChunkCompleted {
+                    result_handle: Value::Null,
+                    output: Some(vec![json!("alpha")]),
+                },
+            }),
+        )?;
+        assert_eq!(reduced, Some(json!({ "alpha": 2, "beta": 1 })));
+
+        let _ = fs::remove_dir_all(&db_path);
+        let _ = fs::remove_dir_all(&checkpoint_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn reduce_batch_success_outputs_after_report_reduces_sampled_errors() -> Result<()> {
+        let db_path = temp_path("throughput-state-sample-errors-db");
+        let checkpoint_dir = temp_path("throughput-state-sample-errors-checkpoints");
+        let state = LocalThroughputState::open(&db_path, &checkpoint_dir, 3)?;
+        let now = Utc::now();
+        let mut batch = store_batch(WorkflowBulkBatchStatus::Running, 4, 4, 4, now);
+        batch.reducer = Some("sample_errors".to_owned());
+        batch.reducer_kind = bulk_reducer_name(Some("sample_errors")).to_owned();
+        batch.reducer_version = throughput_reducer_version(Some("sample_errors")).to_owned();
+        batch.reducer_execution_path = throughput_reducer_execution_path(
+            "stream-v2",
+            Some("eager"),
+            Some("sample_errors"),
+        )
+        .to_owned();
+        state.upsert_batch_record(&batch)?;
+
+        let mut failed =
+            store_chunk(&batch, "chunk-failed", 0, WorkflowBulkChunkStatus::Failed, 2, now);
+        failed.error = Some("boom".to_owned());
+        failed.completed_at = Some(now);
+        state.upsert_chunk_record(&failed)?;
+
+        let mut cancelled =
+            store_chunk(&batch, "chunk-cancelled", 1, WorkflowBulkChunkStatus::Cancelled, 1, now);
+        cancelled.error = Some("cancelled".to_owned());
+        cancelled.completed_at = Some(now);
+        state.upsert_chunk_record(&cancelled)?;
+
+        let mut started =
+            store_chunk(&batch, "chunk-pending", 2, WorkflowBulkChunkStatus::Started, 1, now);
+        started.started_at = Some(now);
+        started.lease_token = Some(Uuid::now_v7());
+        state.upsert_chunk_record(&started)?;
+
+        let reduced = state.reduce_batch_success_outputs_after_report(
+            &ThroughputBatchIdentity {
+                tenant_id: batch.tenant_id.clone(),
+                instance_id: batch.instance_id.clone(),
+                run_id: batch.run_id.clone(),
+                batch_id: batch.batch_id.clone(),
+            },
+            Some(&ThroughputChunkReport {
+                report_id: "report-sample-errors".to_owned(),
+                tenant_id: batch.tenant_id.clone(),
+                instance_id: batch.instance_id.clone(),
+                run_id: batch.run_id.clone(),
+                batch_id: batch.batch_id.clone(),
+                chunk_id: "chunk-pending".to_owned(),
+                chunk_index: 2,
+                group_id: group_id_for_chunk_index(2, batch.aggregation_group_count),
+                attempt: 1,
+                lease_epoch: 1,
+                owner_epoch: 1,
+                worker_id: "worker-a".to_owned(),
+                worker_build_id: "build-a".to_owned(),
+                lease_token: TEST_LEASE_TOKEN.to_owned(),
+                occurred_at: now,
+                payload: ThroughputChunkReportPayload::ChunkFailed {
+                    error: "timeout".to_owned(),
+                },
+            }),
+        )?;
+        assert_eq!(
+            reduced,
+            Some(json!({
+                "sample": ["boom", "cancelled", "timeout"],
+                "total": 4,
+                "truncated": false
+            }))
+        );
 
         let _ = fs::remove_dir_all(&db_path);
         let _ = fs::remove_dir_all(&checkpoint_dir);

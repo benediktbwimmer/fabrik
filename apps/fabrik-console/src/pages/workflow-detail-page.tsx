@@ -94,6 +94,32 @@ function reducerOutputPreview(value: unknown) {
   if (typeof value === "number" || typeof value === "boolean" || typeof value === "string") {
     return String(value);
   }
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "[]";
+    return `${value.slice(0, 4).map((item) => formatInlineValue(item)).join(", ")}${
+      value.length > 4 ? ` +${value.length - 4}` : ""
+    }`;
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    if (Array.isArray(record.sample) && typeof record.total === "number") {
+      const sample = record.sample
+        .slice(0, 3)
+        .map((item) => formatInlineValue(item))
+        .join(", ");
+      const truncated = record.truncated === true ? "+" : "";
+      return `sample(${sample || "-"}) · total ${formatNumber(record.total)}${truncated}`;
+    }
+    const entries = Object.entries(record);
+    const numericEntries = entries.filter(([, entryValue]) => typeof entryValue === "number");
+    if (numericEntries.length > 0 && numericEntries.length === entries.length) {
+      return numericEntries
+        .sort((left, right) => Number(right[1]) - Number(left[1]))
+        .slice(0, 4)
+        .map(([key, count]) => `${key}:${formatNumber(Number(count))}`)
+        .join(" · ");
+    }
+  }
   return JSON.stringify(value);
 }
 

@@ -1,3 +1,4 @@
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
@@ -15,6 +16,7 @@ const WORKFLOW_SUPPORTED_IMPORTS = new Set([
   "defineUpdate",
   "executeChild",
   "getExternalWorkflowHandle",
+  "inWorkflowContext",
   "isCancellation",
   "log",
   "ParentClosePolicy",
@@ -238,6 +240,144 @@ function createScopeBindings(parentBindings, node) {
   return bindings;
 }
 
+function findNearestTsconfig(startFile, projectRoot) {
+  let current = path.dirname(startFile);
+  const boundary = path.resolve(projectRoot);
+  while (true) {
+    const candidate = path.join(current, "tsconfig.json");
+    if (ts.sys.fileExists(candidate)) {
+      return candidate;
+    }
+    if (current === boundary) {
+      return null;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    current = parent;
+  }
+}
+
+function parseCompilerOptionsForFile(projectRoot, fromFileName) {
+  const configPath = findNearestTsconfig(fromFileName, projectRoot);
+  if (!configPath) {
+    return {
+      target: ts.ScriptTarget.ES2022,
+      module: ts.ModuleKind.NodeNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeNext,
+      allowJs: true,
+    };
+  }
+  const config = ts.readConfigFile(configPath, ts.sys.readFile);
+  if (config.error) {
+    return {
+      target: ts.ScriptTarget.ES2022,
+      module: ts.ModuleKind.NodeNext,
+      moduleResolution: ts.ModuleResolutionKind.NodeNext,
+      allowJs: true,
+    };
+  }
+  return ts.parseJsonConfigFileContent(
+    config.config,
+    ts.sys,
+    path.dirname(configPath),
+    undefined,
+    configPath,
+  ).options;
+}
+
+function moduleResolutionCandidates(base) {
+  const candidates = [];
+  if (path.extname(base)) {
+    candidates.push(base);
+    return candidates;
+  }
+  for (const extension of [".ts", ".mts", ".cts", ".js", ".mjs", ".cjs"]) {
+    candidates.push(`${base}${extension}`);
+  }
+  for (const indexName of ["index.ts", "index.mts", "index.cts", "index.js", "index.mjs", "index.cjs"]) {
+    candidates.push(path.join(base, indexName));
+  }
+  return candidates;
+}
+
+function findWorkspacePackages(projectRoot) {
+  const packages = [];
+  const stack = [projectRoot];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    for (const entry of fsSync.readdirSync(current, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        if ([".git", "node_modules", "dist", "build", "coverage"].includes(entry.name)) {
+          continue;
+        }
+        stack.push(path.join(current, entry.name));
+        continue;
+      }
+      if (entry.name !== "package.json") {
+        continue;
+      }
+      const packageJsonPath = path.join(current, entry.name);
+      try {
+        const manifest = JSON.parse(fsSync.readFileSync(packageJsonPath, "utf8"));
+        if (typeof manifest.name === "string" && manifest.name.length > 0) {
+          packages.push({ dir: current, manifest });
+        }
+      } catch {
+        // Ignore invalid workspace manifests during static analysis.
+      }
+    }
+  }
+  return packages;
+}
+
+function resolveWorkspaceModulePath(projectRoot, specifier) {
+  const packages = findWorkspacePackages(projectRoot);
+  const matched = packages
+    .filter(({ manifest }) => specifier === manifest.name || specifier.startsWith(`${manifest.name}/`))
+    .sort((left, right) => right.manifest.name.length - left.manifest.name.length)[0];
+  if (!matched) {
+    return null;
+  }
+  const { dir, manifest } = matched;
+  const subpath =
+    specifier === manifest.name ? "" : specifier.slice(manifest.name.length + 1);
+  const sourceRoots = new Set([dir]);
+  for (const field of ["types", "source", "module", "main"]) {
+    if (typeof manifest[field] !== "string" || manifest[field].length === 0) {
+      continue;
+    }
+    sourceRoots.add(path.resolve(dir, path.dirname(manifest[field])));
+  }
+  const subpaths = new Set();
+  if (subpath.length === 0) {
+    for (const field of ["types", "source", "module", "main"]) {
+      if (typeof manifest[field] === "string" && manifest[field].length > 0) {
+        subpaths.add(manifest[field]);
+      }
+    }
+    subpaths.add("index");
+  } else {
+    subpaths.add(subpath);
+    for (const prefix of ["lib/", "dist/", "build/", "src/"]) {
+      if (subpath.startsWith(prefix)) {
+        subpaths.add(subpath.slice(prefix.length));
+      }
+    }
+  }
+  for (const root of sourceRoots) {
+    for (const candidateSubpath of subpaths) {
+      for (const candidate of moduleResolutionCandidates(path.resolve(root, candidateSubpath))) {
+        if (ts.sys.fileExists(candidate)) {
+          return candidate;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 function declarationKey(declaration) {
   const sourceFile = declaration.getSourceFile?.();
   return `${sourceFile?.fileName ?? "<unknown>"}:${declaration.pos}:${declaration.end}`;
@@ -355,6 +495,12 @@ function evaluateStaticValue(node, bindings, checker = null, seen = new Set()) {
     return evaluateStaticValue(node.expression, bindings, checker, seen);
   }
   if (ts.isIdentifier(node)) {
+    if (node.text === "__filename") {
+      return node.getSourceFile().fileName;
+    }
+    if (node.text === "__dirname") {
+      return path.dirname(node.getSourceFile().fileName);
+    }
     const initializer = resolveIdentifierInitializer(node, bindings, checker, seen);
     if (initializer == null) {
       return undefined;
@@ -576,26 +722,77 @@ function maybeImportedModulePath(sourceFile, localName) {
 }
 
 function resolveProjectModulePath(projectRoot, fromFileName, specifier) {
-  if (!specifier.startsWith(".")) {
-    return null;
+  const compilerOptions = parseCompilerOptionsForFile(projectRoot, fromFileName);
+  const resolved = ts.resolveModuleName(specifier, fromFileName, compilerOptions, ts.sys).resolvedModule;
+  if (resolved?.resolvedFileName && ts.sys.fileExists(resolved.resolvedFileName)) {
+    return resolved.resolvedFileName;
   }
-  const candidates = [];
-  for (const base of [
-    path.resolve(path.dirname(fromFileName), specifier),
-    path.resolve(projectRoot, specifier),
-  ]) {
-    if (path.extname(base)) {
-      candidates.push(base);
-    } else {
-      for (const extension of [".ts", ".mts", ".cts", ".js", ".mjs", ".cjs"]) {
-        candidates.push(`${base}${extension}`);
+  if (specifier.startsWith(".")) {
+    const candidates = [];
+    for (const base of [
+      path.resolve(path.dirname(fromFileName), specifier),
+      path.resolve(projectRoot, specifier),
+    ]) {
+      if (path.extname(base)) {
+        candidates.push(base);
+      } else {
+        for (const extension of [".ts", ".mts", ".cts", ".js", ".mjs", ".cjs"]) {
+          candidates.push(`${base}${extension}`);
+        }
+        for (const indexName of ["index.ts", "index.mts", "index.cts", "index.js", "index.mjs", "index.cjs"]) {
+          candidates.push(path.join(base, indexName));
+        }
       }
-      for (const indexName of ["index.ts", "index.mts", "index.cts", "index.js", "index.mjs", "index.cjs"]) {
-        candidates.push(path.join(base, indexName));
+    }
+    const relativeMatch = candidates.find((candidate) => ts.sys.fileExists(candidate));
+    if (relativeMatch) {
+      return relativeMatch;
+    }
+  }
+  return resolveWorkspaceModulePath(projectRoot, specifier);
+}
+
+function createSourceBindings(parentBindings, sourceFile, projectRoot, program) {
+  const bindings = createScopeBindings(parentBindings, sourceFile);
+  const checker = program.getTypeChecker();
+  for (const statement of sourceFile.statements) {
+    if (!ts.isImportDeclaration(statement) || !statement.importClause) {
+      continue;
+    }
+    const namedBindings = statement.importClause.namedBindings;
+    if (!namedBindings || !ts.isNamedImports(namedBindings)) {
+      continue;
+    }
+    const resolvedModulePath = resolveProjectModulePath(
+      projectRoot,
+      sourceFile.fileName,
+      statement.moduleSpecifier.text,
+    );
+    if (resolvedModulePath == null) {
+      continue;
+    }
+    const moduleSourceFile = program.getSourceFile(resolvedModulePath);
+    if (!moduleSourceFile) {
+      continue;
+    }
+    const moduleBindings = createScopeBindings(new Map(), moduleSourceFile);
+    for (const element of namedBindings.elements) {
+      const importedName = element.propertyName?.text ?? element.name.text;
+      const initializer = findExportedBindingExpression(
+        moduleSourceFile,
+        importedName,
+        moduleBindings,
+      );
+      if (initializer == null) {
+        continue;
+      }
+      const staticValue = evaluateStaticValue(initializer, moduleBindings, checker);
+      if (staticValue !== undefined) {
+        bindings.set(element.name.text, initializer);
       }
     }
   }
-  return candidates.find((candidate) => ts.sys.fileExists(candidate)) ?? null;
+  return bindings;
 }
 
 function combinedTemporalImports(...maps) {
@@ -974,8 +1171,10 @@ async function main() {
 
     function visit(node, scopeBindings = new Map()) {
       const currentBindings =
-        ts.isSourceFile(node) || ts.isBlock(node) || ts.isModuleBlock(node)
-          ? createScopeBindings(scopeBindings, node)
+        ts.isSourceFile(node)
+          ? createSourceBindings(scopeBindings, node, projectRoot, program)
+          : ts.isBlock(node) || ts.isModuleBlock(node)
+            ? createScopeBindings(scopeBindings, node)
           : scopeBindings;
       if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
         const importedWorkflowName = workflowImports.get(node.expression.text);
