@@ -17,7 +17,7 @@ use axum::{
 use chrono::{DateTime, Utc};
 use fabrik_broker::{
     BrokerConfig, WorkflowHistoryFilter, build_workflow_consumer, decode_consumed_workflow_event,
-    partition_for_instance, read_workflow_history,
+    partition_for_instance, read_workflow_history, WorkflowPublisher,
 };
 use fabrik_config::{GrpcServiceConfig, HttpServiceConfig, PostgresConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
@@ -62,6 +62,7 @@ const DEFAULT_OWNERSHIP_RENEW_INTERVAL_MS: u64 = 5_000;
 #[derive(Clone)]
 struct AppState {
     store: WorkflowStore,
+    publisher: Option<WorkflowPublisher>,
     inner: Arc<StdMutex<RuntimeInner>>,
     ownership: Arc<StdMutex<UnifiedOwnershipState>>,
     workflow_partition_count: i32,
@@ -442,6 +443,7 @@ async fn main() -> Result<()> {
     let inner = reconcile_restored_runtime(local_restored, shared_restored, &debug);
     let state = AppState {
         store,
+        publisher: Some(WorkflowPublisher::new(&broker, "unified-runtime").await?),
         inner: Arc::new(StdMutex::new(inner)),
         ownership: Arc::new(StdMutex::new(UnifiedOwnershipState::inactive(
             ownership.partition_id,
@@ -2118,6 +2120,7 @@ enum MailboxDrainOutcome {
     Processed {
         signal: Option<ConsumedSignalRecord>,
         accepted_seq: u64,
+        emitted_events: Vec<EventEnvelope<WorkflowEvent>>,
         general: Vec<PreparedDbAction>,
         schedules: Vec<PreparedDbAction>,
         notifies: bool,
@@ -2162,6 +2165,7 @@ async fn drain_mailbox_for_run(
                 MailboxDrainOutcome::Processed {
                     signal,
                     accepted_seq,
+                    emitted_events,
                     general,
                     schedules,
                     notifies,
@@ -2171,6 +2175,7 @@ async fn drain_mailbox_for_run(
                     if let Some(signal) = signal {
                         consumed_signals.push(signal);
                     }
+                    publish_history_events(state, &emitted_events).await?;
                     apply_db_actions(state, general, schedules).await?;
                     if let Some(post_plan) = post_plan {
                         let post_plan_run_key = post_plan.run_key.clone();
@@ -2424,6 +2429,7 @@ async fn dispatch_signal_mailbox_item_unified(
             consumed_at: signal_event.occurred_at,
         }),
         accepted_seq: item.accepted_seq,
+        emitted_events: vec![signal_event.clone()],
         general,
         schedules,
         notifies,
@@ -2488,6 +2494,7 @@ async fn dispatch_cancel_mailbox_item_unified(
         return Ok(MailboxDrainOutcome::Processed {
             signal: None,
             accepted_seq: item.accepted_seq,
+            emitted_events: Vec::new(),
             general: Vec::new(),
             schedules: Vec::new(),
             notifies: false,
@@ -2561,6 +2568,7 @@ async fn dispatch_cancel_mailbox_item_unified(
         return Ok(MailboxDrainOutcome::Processed {
             signal: None,
             accepted_seq: item.accepted_seq,
+            emitted_events: Vec::new(),
             general: Vec::new(),
             schedules: Vec::new(),
             notifies: false,
@@ -2607,6 +2615,7 @@ async fn dispatch_cancel_mailbox_item_unified(
     Ok(MailboxDrainOutcome::Processed {
         signal: None,
         accepted_seq: item.accepted_seq,
+        emitted_events: vec![cancelled_event.clone()],
         general: vec![
             PreparedDbAction::UpsertInstance(terminal_instance.clone()),
             PreparedDbAction::CloseRun(run_key, cancelled_event.occurred_at),
@@ -3105,6 +3114,7 @@ async fn dispatch_update_mailbox_item_unified(
     Ok(MailboxDrainOutcome::Processed {
         signal: None,
         accepted_seq: item.accepted_seq,
+        emitted_events: vec![accepted_event.clone()],
         general,
         schedules,
         notifies,
@@ -4488,6 +4498,9 @@ impl ActivityWorkerApi for WorkerApi {
         let now = Utc::now();
         let actions = prepare_result_application(&self.state, request.results, now)
             .map_err(internal_status)?;
+        publish_history_events(&self.state, &actions.emitted_events)
+            .await
+            .map_err(internal_status)?;
         apply_db_actions(&self.state, actions.general, actions.schedules)
             .await
             .map_err(internal_status)?;
@@ -4547,6 +4560,7 @@ impl ActivityWorkerApi for WorkerApi {
 }
 
 struct PreparedActions {
+    emitted_events: Vec<EventEnvelope<WorkflowEvent>>,
     general: Vec<PreparedDbAction>,
     schedules: Vec<PreparedDbAction>,
     notifies: bool,
@@ -4612,6 +4626,7 @@ fn prepare_result_application(
     let mut ignored_worker_mismatches = 0_u64;
     let mut notifies = false;
     let mut post_plans = Vec::new();
+    let mut emitted_events = Vec::new();
     let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
     let mut grouped = HashMap::<RunKey, Vec<EventEnvelope<WorkflowEvent>>>::new();
 
@@ -4807,6 +4822,7 @@ fn prepare_result_application(
     }
 
     for (run_key, events) in grouped {
+        emitted_events.extend(events.iter().cloned());
         let mut index = 0usize;
         while index < events.len() {
             let mut applied_post_plan = None;
@@ -4940,6 +4956,7 @@ fn prepare_result_application(
 
     mark_runtime_dirty(&mut inner, "report_batch", false);
     Ok(PreparedActions {
+        emitted_events,
         general,
         schedules,
         notifies,
@@ -5197,6 +5214,16 @@ async fn apply_db_actions(
         }
     }
     Ok(())
+}
+
+async fn publish_history_events(
+    state: &AppState,
+    events: &[EventEnvelope<WorkflowEvent>],
+) -> Result<()> {
+    let Some(publisher) = state.publisher.as_ref() else {
+        return Ok(());
+    };
+    publisher.publish_all(events).await
 }
 
 fn activity_schedule_update(task: &QueuedActivity) -> ActivityScheduleUpdate {
@@ -5481,7 +5508,8 @@ fn synthetic_runtime_event(
     artifact_hash: &str,
     occurred_at: DateTime<Utc>,
 ) -> EventEnvelope<WorkflowEvent> {
-    EventEnvelope::new(
+    let event_type = payload.event_type();
+    let mut envelope = EventEnvelope::new(
         payload.event_type(),
         WorkflowIdentity::new(
             result.tenant_id.clone(),
@@ -5494,7 +5522,12 @@ fn synthetic_runtime_event(
         ),
         payload,
     )
-    .with_occurred_at(occurred_at)
+    .with_occurred_at(occurred_at);
+    envelope.dedupe_key = Some(format!(
+        "runtime:{}:{}:{}:{}",
+        result.run_id, result.activity_id, result.attempt, event_type
+    ));
+    envelope
 }
 
 trait EventEnvelopeExt {
@@ -6677,6 +6710,7 @@ mod tests {
         fs::create_dir_all(&state_dir).expect("create app state dir");
         AppState {
             store,
+            publisher: None,
             inner: Arc::new(StdMutex::new(inner)),
             ownership: Arc::new(StdMutex::new(UnifiedOwnershipState::inactive(1, "test-owner"))),
             workflow_partition_count: 8,
@@ -6687,6 +6721,17 @@ mod tests {
             persistence: persistence_config_for(state_dir),
             debug: Arc::new(StdMutex::new(UnifiedDebugState::default())),
         }
+    }
+
+    fn test_app_state_with_publisher(
+        store: WorkflowStore,
+        publisher: WorkflowPublisher,
+        inner: RuntimeInner,
+        state_dir: PathBuf,
+    ) -> AppState {
+        let mut state = test_app_state(store, inner, state_dir);
+        state.publisher = Some(publisher);
+        state
     }
 
     fn mailbox_record(
@@ -8422,6 +8467,143 @@ mod tests {
         assert_eq!(current.status, WorkflowStatus::Completed);
         assert_eq!(current.output, Some(Value::String("hello fiona".to_owned())));
         assert_eq!(current.last_event_type, "ActivityTaskCompleted");
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hot_signal_and_activity_completion_are_published_to_broker_history() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let artifact = signal_then_step_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-signal-history-{}", Uuid::now_v7()));
+        let app_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher.clone(),
+            RuntimeInner::default(),
+            state_dir.clone(),
+        );
+        apply_ownership_record(
+            &app_state,
+            1,
+            "test-owner",
+            3,
+            Utc::now() + ChronoDuration::seconds(30),
+        );
+        let worker = WorkerApi { state: app_state.clone() };
+
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-signal-history",
+            "run-signal-history-1",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: Value::Null },
+            Utc::now(),
+        );
+        publisher.publish(&trigger, &trigger.partition_key).await?;
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let signal_event = test_event(
+            &identity,
+            WorkflowEvent::SignalQueued {
+                signal_id: "sig-approve".to_owned(),
+                signal_type: "approve".to_owned(),
+                payload: Value::String("fiona".to_owned()),
+            },
+            Utc::now(),
+        );
+        publisher.publish(&signal_event, &signal_event.partition_key).await?;
+        store
+            .queue_signal(
+                "tenant",
+                "instance-signal-history",
+                "run-signal-history-1",
+                "sig-approve",
+                "approve",
+                None,
+                &Value::String("fiona".to_owned()),
+                signal_event.event_id,
+                signal_event.occurred_at,
+            )
+            .await?;
+        handle_mailbox_queue_event(&app_state, signal_event).await?;
+
+        let task = worker
+            .poll_activity_tasks(Request::new(PollActivityTasksRequest {
+                tenant_id: "tenant".to_owned(),
+                task_queue: "orders".to_owned(),
+                worker_id: "worker-a".to_owned(),
+                worker_build_id: "build-a".to_owned(),
+                poll_timeout_ms: 10,
+                max_tasks: 1,
+                supports_cbor: false,
+            }))
+            .await?
+            .into_inner()
+            .tasks
+            .into_iter()
+            .next()
+            .context("activity task should be available after brokered signal")?;
+
+        worker
+            .complete_activity_task(Request::new(
+                fabrik_worker_protocol::activity_worker::CompleteActivityTaskRequest {
+                    tenant_id: task.tenant_id.clone(),
+                    instance_id: task.instance_id.clone(),
+                    run_id: task.run_id.clone(),
+                    activity_id: task.activity_id.clone(),
+                    attempt: task.attempt,
+                    worker_id: "worker-a".to_owned(),
+                    worker_build_id: "build-a".to_owned(),
+                    lease_epoch: task.lease_epoch,
+                    owner_epoch: task.owner_epoch,
+                    output_json: "\"hello fiona\"".to_owned(),
+                },
+            ))
+            .await?;
+
+        let history_deadline = Instant::now() + StdDuration::from_secs(10);
+        let history = loop {
+            let history = read_workflow_history(
+                &redpanda.broker,
+                "unified-runtime-history-test",
+                &WorkflowHistoryFilter::new("tenant", "instance-signal-history", "run-signal-history-1"),
+                StdDuration::from_millis(500),
+                StdDuration::from_secs(2),
+            )
+            .await?;
+            let event_types = history.iter().map(|event| event.event_type.as_str()).collect::<Vec<_>>();
+            if event_types.contains(&"SignalReceived")
+                && event_types.contains(&"ActivityTaskCompleted")
+            {
+                break history;
+            }
+            if Instant::now() >= history_deadline {
+                anyhow::bail!("broker history did not contain hot runtime signal/completion events");
+            }
+            sleep(StdDuration::from_millis(100)).await;
+        };
+
+        let trace = replay_compiled_history_trace(&history, &artifact)?;
+        assert_eq!(trace.final_state.status, WorkflowStatus::Completed);
+        assert_eq!(trace.final_state.output, Some(Value::String("hello fiona".to_owned())));
+        assert!(history.iter().any(|event| event.event_type == "SignalReceived"));
+        assert!(history.iter().any(|event| event.event_type == "ActivityTaskCompleted"));
 
         fs::remove_dir_all(state_dir).ok();
         Ok(())

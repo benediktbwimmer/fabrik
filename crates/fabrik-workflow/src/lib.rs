@@ -1000,10 +1000,7 @@ pub fn replay_compiled_history_trace(
         preload_recorded_markers(history),
         ExecutionTurnContext { event_id: trigger.0.event_id, occurred_at: trigger.0.occurred_at },
     )?;
-    replayed.current_state = Some(execution.final_state.clone());
-    replayed.context = execution.context.clone();
-    replayed.output = execution.output.clone();
-    replayed.artifact_execution = Some(execution.execution_state.clone());
+    apply_compiled_execution(&mut replayed, &execution);
     let mut transitions = vec![ReplayTransitionTraceEntry {
         event_id: trigger.0.event_id,
         event_type: trigger.0.event_type.clone(),
@@ -1014,7 +1011,9 @@ pub fn replay_compiled_history_trace(
     for event in history.iter().skip(1) {
         let before = replay_checkpoint(&replayed);
         let was_terminal = replayed.status.is_terminal();
-        replayed.apply_event(event);
+        if should_apply_replay_projection_event(event) {
+            replayed.apply_event(event);
+        }
         if was_terminal {
             transitions.push(ReplayTransitionTraceEntry {
                 event_id: event.event_id,
@@ -1029,17 +1028,40 @@ pub fn replay_compiled_history_trace(
         let mut advanced = false;
         if !skip_semantic {
             match &event.payload {
-                WorkflowEvent::SignalReceived { signal_type, payload, .. } => {
-                    execution = artifact.execute_after_signal_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        signal_type,
-                        payload,
-                        replayed.artifact_execution.clone().unwrap_or_default(),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
+                WorkflowEvent::SignalReceived { signal_id, signal_type, payload } => {
+                    let current_state = replayed.current_state.as_deref().unwrap_or_default();
+                    let turn_context =
+                        ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at };
+                    let execution_state = replayed.artifact_execution.clone().unwrap_or_default();
+                    execution = if artifact
+                        .expected_signal_type(current_state)?
+                        .is_some_and(|expected| expected == signal_type)
+                    {
+                        artifact.execute_after_signal_with_turn(
+                            current_state,
+                            signal_type,
+                            payload,
+                            execution_state,
+                            turn_context,
+                        )?
+                    } else if artifact.has_signal_handler(signal_type) {
+                        artifact.execute_signal_handler_with_turn(
+                            current_state,
+                            signal_id,
+                            signal_type,
+                            payload,
+                            execution_state,
+                            turn_context,
+                        )?
+                    } else {
+                        artifact.execute_after_signal_with_turn(
+                            current_state,
+                            signal_type,
+                            payload,
+                            execution_state,
+                            turn_context,
+                        )?
+                    };
                     advanced = true;
                 }
                 WorkflowEvent::WorkflowUpdateAccepted { update_id, update_name, payload } => {
@@ -1255,7 +1277,9 @@ pub fn replay_compiled_history_trace_from_snapshot(
     for event in history_tail {
         let before = replay_checkpoint(&replayed);
         let was_terminal = replayed.status.is_terminal();
-        replayed.apply_event(event);
+        if should_apply_replay_projection_event(event) {
+            replayed.apply_event(event);
+        }
         if was_terminal {
             transitions.push(ReplayTransitionTraceEntry {
                 event_id: event.event_id,
@@ -1268,17 +1292,40 @@ pub fn replay_compiled_history_trace_from_snapshot(
         }
         if !should_skip_replay_event(event, &mut seen_dedupe_keys) {
             match &event.payload {
-                WorkflowEvent::SignalReceived { signal_type, payload, .. } => {
-                    let execution = artifact.execute_after_signal_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        signal_type,
-                        payload,
-                        replayed.artifact_execution.clone().unwrap_or_default(),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
+                WorkflowEvent::SignalReceived { signal_id, signal_type, payload } => {
+                    let current_state = replayed.current_state.as_deref().unwrap_or_default();
+                    let turn_context =
+                        ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at };
+                    let execution_state = replayed.artifact_execution.clone().unwrap_or_default();
+                    let execution = if artifact
+                        .expected_signal_type(current_state)?
+                        .is_some_and(|expected| expected == signal_type)
+                    {
+                        artifact.execute_after_signal_with_turn(
+                            current_state,
+                            signal_type,
+                            payload,
+                            execution_state,
+                            turn_context,
+                        )?
+                    } else if artifact.has_signal_handler(signal_type) {
+                        artifact.execute_signal_handler_with_turn(
+                            current_state,
+                            signal_id,
+                            signal_type,
+                            payload,
+                            execution_state,
+                            turn_context,
+                        )?
+                    } else {
+                        artifact.execute_after_signal_with_turn(
+                            current_state,
+                            signal_type,
+                            payload,
+                            execution_state,
+                            turn_context,
+                        )?
+                    };
                     apply_compiled_execution(&mut replayed, &execution);
                 }
                 WorkflowEvent::WorkflowUpdateAccepted { update_id, update_name, payload } => {
@@ -1492,6 +1539,22 @@ fn apply_compiled_execution(
     replayed.context = execution.context.clone();
     replayed.output = execution.output.clone();
     replayed.artifact_execution = Some(execution.execution_state.clone());
+    if !replayed.status.is_terminal() {
+        replayed.status = WorkflowStatus::Running;
+    }
+    for emission in &execution.emissions {
+        match emission.event {
+            WorkflowEvent::WorkflowCompleted { .. } => replayed.status = WorkflowStatus::Completed,
+            WorkflowEvent::WorkflowFailed { .. } => replayed.status = WorkflowStatus::Failed,
+            WorkflowEvent::WorkflowCancelled { .. } => replayed.status = WorkflowStatus::Cancelled,
+            WorkflowEvent::WorkflowTerminated { .. } => replayed.status = WorkflowStatus::Terminated,
+            _ => {}
+        }
+    }
+}
+
+fn should_apply_replay_projection_event(event: &EventEnvelope<WorkflowEvent>) -> bool {
+    !matches!(event.payload, WorkflowEvent::SignalQueued { .. })
 }
 
 fn should_skip_replay_event(
@@ -1783,8 +1846,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::compiled::{
-        ArtifactEntrypoint, BinaryOp, CompiledStateNode, CompiledWorkflow,
-        CompiledWorkflowArtifact, Expression,
+        ArtifactEntrypoint, BinaryOp, CompiledSignalHandler, CompiledStateNode,
+        CompiledWorkflow, CompiledWorkflowArtifact, Expression,
     };
 
     use super::{
@@ -1967,6 +2030,80 @@ mod tests {
             ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
             workflow,
         );
+        artifact.artifact_hash = artifact.hash();
+        artifact
+    }
+
+    fn signal_condition_artifact() -> CompiledWorkflowArtifact {
+        let workflow = CompiledWorkflow {
+            initial_state: "wait_ready".to_owned(),
+            states: BTreeMap::from([
+                (
+                    "wait_ready".to_owned(),
+                    CompiledStateNode::WaitForCondition {
+                        condition: Expression::Identifier { name: "ready".to_owned() },
+                        next: "greet".to_owned(),
+                        timeout_ref: None,
+                        timeout_next: None,
+                    },
+                ),
+                (
+                    "greet".to_owned(),
+                    CompiledStateNode::Step {
+                        handler: "greet".to_owned(),
+                        input: Expression::Identifier { name: "name".to_owned() },
+                        next: Some("done".to_owned()),
+                        task_queue: None,
+                        retry: None,
+                        config: None,
+                        schedule_to_start_timeout_ms: None,
+                        start_to_close_timeout_ms: None,
+                        heartbeat_timeout_ms: None,
+                        output_var: Some("greeted".to_owned()),
+                        on_error: None,
+                    },
+                ),
+                (
+                    "done".to_owned(),
+                    CompiledStateNode::Succeed {
+                        output: Some(Expression::Identifier { name: "greeted".to_owned() }),
+                    },
+                ),
+            ]),
+            params: vec![crate::compiled::CompiledWorkflowParam {
+                name: "name".to_owned(),
+                default: None,
+            }],
+            non_cancellable_states: BTreeSet::new(),
+        };
+        let signals = BTreeMap::from([(
+            "approved".to_owned(),
+            CompiledSignalHandler {
+                arg_name: Some("value".to_owned()),
+                initial_state: "apply".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "apply".to_owned(),
+                        CompiledStateNode::Assign {
+                            actions: vec![Assignment {
+                                target: "ready".to_owned(),
+                                expr: Expression::Identifier { name: "value".to_owned() },
+                            }],
+                            next: "finish".to_owned(),
+                        },
+                    ),
+                    ("finish".to_owned(), CompiledStateNode::Succeed { output: None }),
+                ]),
+            },
+        )]);
+        let mut artifact = CompiledWorkflowArtifact::new(
+            "demo-signal-condition",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            workflow,
+        );
+        artifact.signals = signals;
         artifact.artifact_hash = artifact.hash();
         artifact
     }
@@ -2640,6 +2777,82 @@ mod tests {
         assert_eq!(trace.transitions.len(), 10);
         assert_eq!(trace.final_state.event_count, 10);
         assert_eq!(trace.final_state.current_state, Some("done".to_owned()));
+    }
+
+    #[test]
+    fn compiled_replay_of_trigger_only_history_enters_running_state() {
+        let artifact = compiled_test_artifact();
+        let history = vec![test_event(
+            "WorkflowTriggered",
+            "run-trigger-only",
+            WorkflowEvent::WorkflowTriggered { input: json!({"request_id": "live-trigger"}) },
+            &[],
+        )];
+
+        let trace = replay_compiled_history_trace(&history, &artifact).unwrap();
+
+        assert_eq!(trace.final_state.status, WorkflowStatus::Running);
+        assert_eq!(trace.final_state.current_state, Some("wait_signal".to_owned()));
+        let bindings = &trace
+            .final_state
+            .artifact_execution
+            .as_ref()
+            .expect("compiled execution should exist")
+            .bindings;
+        assert_eq!(bindings.get("input"), Some(&json!({"request_id": "live-trigger"})));
+    }
+
+    #[test]
+    fn compiled_replay_uses_signal_handler_for_condition_workflows() {
+        let artifact = signal_condition_artifact();
+        let history = vec![
+            test_event(
+                "WorkflowTriggered",
+                "run-signal-condition",
+                WorkflowEvent::WorkflowTriggered { input: json!(["alice"]) },
+                &[],
+            ),
+            test_event(
+                "SignalQueued",
+                "run-signal-condition",
+                WorkflowEvent::SignalQueued {
+                    signal_id: "sig-1".to_owned(),
+                    signal_type: "approved".to_owned(),
+                    payload: Value::Bool(true),
+                },
+                &[],
+            ),
+            test_event(
+                "SignalReceived",
+                "run-signal-condition",
+                WorkflowEvent::SignalReceived {
+                    signal_id: "sig-1".to_owned(),
+                    signal_type: "approved".to_owned(),
+                    payload: Value::Bool(true),
+                },
+                &[],
+            ),
+            test_event(
+                "ActivityTaskCompleted",
+                "run-signal-condition",
+                WorkflowEvent::ActivityTaskCompleted {
+                    activity_id: "greet".to_owned(),
+                    attempt: 1,
+                    output: Value::String("hello alice".to_owned()),
+                    worker_id: "worker-1".to_owned(),
+                    worker_build_id: "build-1".to_owned(),
+                },
+                &[],
+            ),
+        ];
+
+        let trace = replay_compiled_history_trace(&history, &artifact).unwrap();
+
+        assert_eq!(trace.final_state.status, WorkflowStatus::Completed);
+        assert_eq!(trace.final_state.output, Some(Value::String("hello alice".to_owned())));
+        assert_eq!(trace.final_state.current_state, Some("done".to_owned()));
+        assert_eq!(trace.final_state.event_count, 3);
+        assert_eq!(trace.final_state.last_event_type, "ActivityTaskCompleted");
     }
 
     #[test]

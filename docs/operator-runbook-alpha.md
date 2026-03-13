@@ -24,6 +24,12 @@ Run the migration flow with deployment enabled:
 cargo run -p fabrik-cli -- migrate temporal <repo> --deploy --api-url <url> --tenant <tenant>
 ```
 
+For the local primary alpha drill against the supported Temporal TS fixture, use:
+
+```bash
+scripts/run-alpha-primary-drill.sh
+```
+
 Expected deployment evidence:
 
 - workflow artifacts published
