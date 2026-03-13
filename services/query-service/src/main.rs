@@ -14,9 +14,11 @@ use fabrik_config::{HttpServiceConfig, PostgresConfig, QueryRuntimeConfig, Redpa
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
-    QueryRetentionCutoffs, QueryRetentionPruneResult, WorkflowActivityRecord,
-    WorkflowBulkBatchRecord, WorkflowBulkChunkRecord, WorkflowRunRecord, WorkflowSignalRecord,
-    WorkflowStateSnapshot, WorkflowStore,
+    QueryRetentionCutoffs, QueryRetentionPruneResult, TaskQueueKind, WorkflowActivityRecord,
+    WorkflowArtifactSummary, WorkflowBulkBatchRecord, WorkflowBulkChunkRecord, WorkflowChildRecord,
+    WorkflowDefinitionSummary, WorkflowInstanceFilters, WorkflowRunFilters, WorkflowRunRecord,
+    WorkflowRunSummaryRecord, WorkflowSignalRecord, WorkflowStateSnapshot, WorkflowStore,
+    WorkflowUpdateRecord,
 };
 use fabrik_throughput::{
     PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind, ThroughputBackend,
@@ -31,8 +33,9 @@ use fabrik_workflow::{
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, to_value};
+use serde_json::{Value, json, to_value};
 use std::{
+    collections::BTreeMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -184,6 +187,24 @@ struct WorkflowSignalsResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct WorkflowUpdatesResponse {
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    page: PageInfo,
+    update_count: usize,
+    updates: Vec<WorkflowUpdateRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowUpdateResponse {
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    update: WorkflowUpdateRecord,
+}
+
+#[derive(Debug, Serialize)]
 struct WorkflowRunsResponse {
     tenant_id: String,
     instance_id: String,
@@ -191,6 +212,144 @@ struct WorkflowRunsResponse {
     page: PageInfo,
     run_count: usize,
     runs: Vec<WorkflowRunRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowListItem {
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    definition_id: String,
+    definition_version: Option<u32>,
+    artifact_hash: Option<String>,
+    workflow_task_queue: String,
+    sticky_workflow_build_id: Option<String>,
+    sticky_workflow_poller_id: Option<String>,
+    current_state: Option<String>,
+    status: String,
+    event_count: i64,
+    last_event_id: Uuid,
+    last_event_type: String,
+    updated_at: DateTime<Utc>,
+    consistency: &'static str,
+    source: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowListResponse {
+    tenant_id: String,
+    consistency: &'static str,
+    authoritative_source: &'static str,
+    page: PageInfo,
+    workflow_count: usize,
+    items: Vec<WorkflowListItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct RunListItem {
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    definition_id: String,
+    definition_version: Option<u32>,
+    artifact_hash: Option<String>,
+    workflow_task_queue: String,
+    sticky_workflow_build_id: Option<String>,
+    sticky_workflow_poller_id: Option<String>,
+    sticky_updated_at: Option<DateTime<Utc>>,
+    previous_run_id: Option<String>,
+    next_run_id: Option<String>,
+    continue_reason: Option<String>,
+    started_at: DateTime<Utc>,
+    closed_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
+    last_transition_at: DateTime<Utc>,
+    status: String,
+    current_state: Option<String>,
+    last_event_type: Option<String>,
+    event_count: Option<i64>,
+    consistency: &'static str,
+    source: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct RunListResponse {
+    tenant_id: String,
+    consistency: &'static str,
+    authoritative_source: &'static str,
+    page: PageInfo,
+    run_count: usize,
+    items: Vec<RunListItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowDefinitionSummariesResponse {
+    tenant_id: String,
+    items: Vec<WorkflowDefinitionSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowArtifactSummariesResponse {
+    tenant_id: String,
+    items: Vec<WorkflowArtifactSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct OverviewTaskQueueSummary {
+    queue_kind: String,
+    task_queue: String,
+    backlog: u64,
+    poller_count: usize,
+    registered_build_count: usize,
+    default_set_id: Option<String>,
+    throughput_backend: Option<String>,
+    oldest_backlog_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+struct OverviewSummaryResponse {
+    tenant_id: String,
+    consistency: &'static str,
+    authoritative_source: &'static str,
+    total_workflows: u64,
+    total_workflow_definitions: u64,
+    total_workflow_artifacts: u64,
+    counts_by_status: BTreeMap<String, u64>,
+    total_task_queues: usize,
+    total_backlog: u64,
+    total_pollers: usize,
+    total_registered_builds: usize,
+    replay_divergence_count: u64,
+    recent_failures: Vec<WorkflowListItem>,
+    hottest_task_queues: Vec<OverviewTaskQueueSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowExecutionGraphNode {
+    id: String,
+    kind: String,
+    label: String,
+    status: String,
+    subtitle: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowExecutionGraphEdge {
+    id: String,
+    source: String,
+    target: String,
+    label: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowExecutionGraphResponse {
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    consistency: &'static str,
+    authoritative_source: &'static str,
+    nodes: Vec<WorkflowExecutionGraphNode>,
+    edges: Vec<WorkflowExecutionGraphEdge>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -205,15 +364,58 @@ struct StrongQueryResponse {
     instance_id: String,
     run_id: String,
     query_name: String,
-    consistency: &'static str,
-    source: &'static str,
+    consistency: String,
+    source: String,
     result: Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct InternalQueryRequest {
+    #[serde(default)]
+    args: Value,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct InternalQueryResponse {
+    result: Value,
+    consistency: String,
+    source: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct PaginationQuery {
     limit: Option<usize>,
     offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct WorkflowListQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    status: Option<String>,
+    definition_id: Option<String>,
+    task_queue: Option<String>,
+    updated_after: Option<DateTime<Utc>>,
+    q: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RunListQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    status: Option<String>,
+    definition_id: Option<String>,
+    instance_id: Option<String>,
+    run_id: Option<String>,
+    task_queue: Option<String>,
+    q: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct SearchableListQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    q: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -318,9 +520,17 @@ async fn main() -> Result<()> {
         "query",
         env!("CARGO_PKG_VERSION"),
     ))
+    .route("/tenants", get(list_tenants))
+    .route("/tenants/{tenant_id}/overview", get(get_overview_summary))
+    .route("/tenants/{tenant_id}/workflows", get(list_workflows))
+    .route("/tenants/{tenant_id}/runs", get(list_runs))
     .route(
         "/tenants/{tenant_id}/workflow-definitions/{definition_id}/latest",
         get(get_latest_workflow_definition),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflow-definitions",
+        get(list_workflow_definition_summaries),
     )
     .route(
         "/tenants/{tenant_id}/workflow-definitions/{definition_id}/versions/{version}",
@@ -329,6 +539,10 @@ async fn main() -> Result<()> {
     .route(
         "/tenants/{tenant_id}/workflow-artifacts/{definition_id}/latest",
         get(get_latest_workflow_artifact),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflow-artifacts",
+        get(list_workflow_artifact_summaries),
     )
     .route(
         "/tenants/{tenant_id}/workflow-artifacts/{definition_id}/versions/{version}",
@@ -355,12 +569,28 @@ async fn main() -> Result<()> {
         get(get_current_workflow_signals),
     )
     .route(
+        "/tenants/{tenant_id}/workflows/{instance_id}/updates",
+        get(get_current_workflow_updates),
+    )
+    .route(
         "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/activities",
         get(get_workflow_activities_for_run),
     )
     .route(
         "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/signals",
         get(get_workflow_signals_for_run),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/updates",
+        get(get_workflow_updates_for_run),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{instance_id}/updates/{update_id}",
+        get(get_current_workflow_update),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/updates/{update_id}",
+        get(get_workflow_update_for_run),
     )
     .route(
         "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/bulk-batches",
@@ -390,6 +620,10 @@ async fn main() -> Result<()> {
     .route(
         "/tenants/{tenant_id}/workflows/{instance_id}/runs/{run_id}/replay",
         get(get_workflow_replay_for_run),
+    )
+    .route(
+        "/tenants/{tenant_id}/workflows/{instance_id}/execution-graph",
+        get(get_workflow_execution_graph),
     )
     .with_state(AppState {
         store,
@@ -424,6 +658,252 @@ async fn get_retention_debug(
         last_sweep_at: snapshot.last_sweep_at,
         last_result: snapshot.last_result.clone(),
     }))
+}
+
+async fn list_tenants(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+    let tenants = state.store.list_tenants().await.map_err(internal_error)?;
+    Ok(Json(json!({ "tenants": tenants })))
+}
+
+async fn get_overview_summary(
+    Path(tenant_id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<OverviewSummaryResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let total_workflow_definitions = state
+        .store
+        .count_workflow_definition_summaries(&tenant_id, None)
+        .await
+        .map_err(internal_error)?;
+    let total_workflow_artifacts = state
+        .store
+        .count_workflow_artifact_summaries(&tenant_id, None)
+        .await
+        .map_err(internal_error)?;
+    let total_workflows = state
+        .store
+        .count_instances_with_filters(&tenant_id, &WorkflowInstanceFilters::default())
+        .await
+        .map_err(internal_error)?;
+
+    let mut counts_by_status = BTreeMap::new();
+    for status in ["triggered", "running", "completed", "failed", "cancelled", "terminated"] {
+        counts_by_status.insert(
+            status.to_owned(),
+            state
+                .store
+                .count_instances_with_filters(
+                    &tenant_id,
+                    &WorkflowInstanceFilters {
+                        status: Some(status.to_owned()),
+                        ..WorkflowInstanceFilters::default()
+                    },
+                )
+                .await
+                .map_err(internal_error)?,
+        );
+    }
+
+    let recent_failures = state
+        .store
+        .list_instances_page_with_filters(
+            &tenant_id,
+            &WorkflowInstanceFilters {
+                status: Some("failed".to_owned()),
+                ..WorkflowInstanceFilters::default()
+            },
+            6,
+            0,
+        )
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .map(workflow_list_item_from_state)
+        .collect::<Vec<_>>();
+
+    let queue_refs =
+        state.store.list_task_queue_refs_for_tenant(&tenant_id).await.map_err(internal_error)?;
+    let mut task_queues = Vec::with_capacity(queue_refs.len());
+    let mut total_backlog = 0_u64;
+    let mut total_pollers = 0_usize;
+    let mut total_registered_builds = 0_usize;
+    for queue_ref in queue_refs {
+        let inspection = state
+            .store
+            .inspect_task_queue(
+                &tenant_id,
+                queue_ref.queue_kind.clone(),
+                &queue_ref.task_queue,
+                Utc::now(),
+            )
+            .await
+            .map_err(internal_error)?;
+        total_backlog += inspection.backlog;
+        total_pollers += inspection.pollers.len();
+        total_registered_builds += inspection.registered_builds.len();
+        task_queues.push(OverviewTaskQueueSummary {
+            queue_kind: queue_kind_label(&inspection.queue_kind).to_owned(),
+            task_queue: inspection.task_queue,
+            backlog: inspection.backlog,
+            poller_count: inspection.pollers.len(),
+            registered_build_count: inspection.registered_builds.len(),
+            default_set_id: inspection.default_set_id,
+            throughput_backend: inspection.throughput_policy.map(|policy| policy.backend),
+            oldest_backlog_at: inspection.oldest_backlog_at,
+        });
+    }
+    task_queues.sort_by(|left, right| {
+        right
+            .backlog
+            .cmp(&left.backlog)
+            .then_with(|| left.queue_kind.cmp(&right.queue_kind))
+            .then_with(|| left.task_queue.cmp(&right.task_queue))
+    });
+
+    Ok(Json(OverviewSummaryResponse {
+        tenant_id,
+        consistency: "eventual",
+        authoritative_source: "projection",
+        total_workflows,
+        total_workflow_definitions,
+        total_workflow_artifacts,
+        counts_by_status,
+        total_task_queues: task_queues.len(),
+        total_backlog,
+        total_pollers,
+        total_registered_builds,
+        replay_divergence_count: 0,
+        recent_failures,
+        hottest_task_queues: task_queues.into_iter().take(6).collect(),
+    }))
+}
+
+async fn list_workflows(
+    Path(tenant_id): Path<String>,
+    Query(query): Query<WorkflowListQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowListResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let page =
+        resolve_page(&state.query, &PaginationQuery { limit: query.limit, offset: query.offset });
+    let filters = WorkflowInstanceFilters {
+        status: query.status.and_then(non_empty),
+        definition_id: query.definition_id.and_then(non_empty),
+        task_queue: query.task_queue.and_then(non_empty),
+        updated_after: query.updated_after,
+        query: query.q.and_then(non_empty),
+    };
+    let total = state
+        .store
+        .count_instances_with_filters(&tenant_id, &filters)
+        .await
+        .map_err(internal_error)? as usize;
+    let items = state
+        .store
+        .list_instances_page_with_filters(
+            &tenant_id,
+            &filters,
+            i64::try_from(page.limit).map_err(internal_error_from_display)?,
+            i64::try_from(page.offset).map_err(internal_error_from_display)?,
+        )
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .map(workflow_list_item_from_state)
+        .collect::<Vec<_>>();
+
+    Ok(Json(WorkflowListResponse {
+        tenant_id,
+        consistency: "eventual",
+        authoritative_source: "projection",
+        page: build_page_info(&page, total, items.len()),
+        workflow_count: total,
+        items,
+    }))
+}
+
+async fn list_runs(
+    Path(tenant_id): Path<String>,
+    Query(query): Query<RunListQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<RunListResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let page =
+        resolve_page(&state.query, &PaginationQuery { limit: query.limit, offset: query.offset });
+    let filters = WorkflowRunFilters {
+        status: query.status.and_then(non_empty),
+        definition_id: query.definition_id.and_then(non_empty),
+        instance_id: query.instance_id.and_then(non_empty),
+        run_id: query.run_id.and_then(non_empty),
+        task_queue: query.task_queue.and_then(non_empty),
+        query: query.q.and_then(non_empty),
+    };
+    let total = state
+        .store
+        .count_runs_with_filters(&tenant_id, &filters)
+        .await
+        .map_err(internal_error)? as usize;
+    let items = state
+        .store
+        .list_runs_page_with_filters(
+            &tenant_id,
+            &filters,
+            i64::try_from(page.limit).map_err(internal_error_from_display)?,
+            i64::try_from(page.offset).map_err(internal_error_from_display)?,
+        )
+        .await
+        .map_err(internal_error)?
+        .into_iter()
+        .map(run_list_item_from_record)
+        .collect::<Vec<_>>();
+
+    Ok(Json(RunListResponse {
+        tenant_id,
+        consistency: "eventual",
+        authoritative_source: "projection",
+        page: build_page_info(&page, total, items.len()),
+        run_count: total,
+        items,
+    }))
+}
+
+async fn list_workflow_definition_summaries(
+    Path(tenant_id): Path<String>,
+    Query(query): Query<SearchableListQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowDefinitionSummariesResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let page =
+        resolve_page(&state.query, &PaginationQuery { limit: query.limit, offset: query.offset });
+    let items = state
+        .store
+        .list_workflow_definition_summaries(
+            &tenant_id,
+            query.q.as_deref().and_then(non_empty_ref),
+            i64::try_from(page.limit).map_err(internal_error_from_display)?,
+            i64::try_from(page.offset).map_err(internal_error_from_display)?,
+        )
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(WorkflowDefinitionSummariesResponse { tenant_id, items }))
+}
+
+async fn list_workflow_artifact_summaries(
+    Path(tenant_id): Path<String>,
+    Query(query): Query<SearchableListQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowArtifactSummariesResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let page =
+        resolve_page(&state.query, &PaginationQuery { limit: query.limit, offset: query.offset });
+    let items = state
+        .store
+        .list_workflow_artifact_summaries(
+            &tenant_id,
+            query.q.as_deref().and_then(non_empty_ref),
+            i64::try_from(page.limit).map_err(internal_error_from_display)?,
+            i64::try_from(page.offset).map_err(internal_error_from_display)?,
+        )
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(WorkflowArtifactSummariesResponse { tenant_id, items }))
 }
 
 async fn get_workflow_instance(
@@ -532,9 +1012,26 @@ async fn execute_strong_query(
             ))
         })?;
 
+    if !instance.status.is_terminal() && instance.artifact_execution.is_some() {
+        if let Some(owner_response) =
+            try_owner_strong_query(&state, &tenant_id, &instance_id, &query_name, &request.args)
+                .await
+        {
+            return Ok(Json(StrongQueryResponse {
+                tenant_id,
+                instance_id,
+                run_id: instance.run_id,
+                query_name,
+                consistency: owner_response.consistency,
+                source: owner_response.source,
+                result: owner_response.result,
+            }));
+        }
+    }
+
     let (query_state, source) =
         if !instance.status.is_terminal() && instance.artifact_execution.is_some() {
-            (instance.clone(), "hot_owner")
+            (instance.clone(), "hot_owner_fallback")
         } else {
             let history = read_workflow_history(
                 &state.broker,
@@ -563,10 +1060,71 @@ async fn execute_strong_query(
         instance_id,
         run_id: query_state.run_id,
         query_name,
-        consistency: "strong",
-        source,
+        consistency: "strong".to_owned(),
+        source: source.to_owned(),
         result,
     }))
+}
+
+async fn try_owner_strong_query(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    query_name: &str,
+    args: &Value,
+) -> Option<InternalQueryResponse> {
+    for base_url in owner_query_endpoints(&state.query) {
+        if let Some(payload) = try_owner_strong_query_endpoint(
+            &state.client,
+            &base_url,
+            tenant_id,
+            instance_id,
+            query_name,
+            args,
+        )
+        .await
+        {
+            return Some(payload);
+        }
+    }
+    None
+}
+
+async fn try_owner_strong_query_endpoint(
+    client: &Client,
+    base_url: &str,
+    tenant_id: &str,
+    instance_id: &str,
+    query_name: &str,
+    args: &Value,
+) -> Option<InternalQueryResponse> {
+    let url = format!(
+        "{}/internal/workflows/{}/{}/queries/{}",
+        base_url.trim_end_matches('/'),
+        tenant_id,
+        instance_id,
+        query_name,
+    );
+    let response =
+        match client.post(&url).json(&InternalQueryRequest { args: args.clone() }).send().await {
+            Ok(response) => response,
+            Err(_) => return None,
+        };
+    if !response.status().is_success() {
+        return None;
+    }
+    response.json::<InternalQueryResponse>().await.ok()
+}
+
+fn owner_query_endpoints(config: &QueryRuntimeConfig) -> Vec<String> {
+    let mut endpoints = Vec::new();
+    if let Some(url) = config.strong_query_unified_url.as_ref() {
+        endpoints.push(url.clone());
+    }
+    if let Some(url) = config.strong_query_executor_url.as_ref() {
+        endpoints.push(url.clone());
+    }
+    endpoints
 }
 
 async fn get_latest_workflow_snapshot(
@@ -635,6 +1193,33 @@ async fn get_current_workflow_signals(
         })?;
     let response =
         load_workflow_signals(&state, &tenant_id, &instance_id, &instance.run_id, pagination)
+            .await
+            .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+async fn get_current_workflow_updates(
+    Path((tenant_id, instance_id)): Path<(String, String)>,
+    Query(pagination): Query<PaginationQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowUpdatesResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let instance = state
+        .store
+        .get_instance(&tenant_id, &instance_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    message: format!(
+                        "workflow instance {instance_id} not found for tenant {tenant_id}"
+                    ),
+                }),
+            )
+        })?;
+    let response =
+        load_workflow_updates(&state, &tenant_id, &instance_id, &instance.run_id, pagination)
             .await
             .map_err(internal_error)?;
     Ok(Json(response))
@@ -736,6 +1321,51 @@ async fn get_workflow_signals_for_run(
     Ok(Json(response))
 }
 
+async fn get_workflow_updates_for_run(
+    Path((tenant_id, instance_id, run_id)): Path<(String, String, String)>,
+    Query(pagination): Query<PaginationQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowUpdatesResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let response = load_workflow_updates(&state, &tenant_id, &instance_id, &run_id, pagination)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+async fn get_current_workflow_update(
+    Path((tenant_id, instance_id, update_id)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowUpdateResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let instance = state
+        .store
+        .get_instance(&tenant_id, &instance_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    message: format!(
+                        "workflow instance {instance_id} not found for tenant {tenant_id}"
+                    ),
+                }),
+            )
+        })?;
+    let response =
+        load_workflow_update(&state, &tenant_id, &instance_id, &instance.run_id, &update_id)
+            .await?;
+    Ok(Json(response))
+}
+
+async fn get_workflow_update_for_run(
+    Path((tenant_id, instance_id, run_id, update_id)): Path<(String, String, String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowUpdateResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let response =
+        load_workflow_update(&state, &tenant_id, &instance_id, &run_id, &update_id).await?;
+    Ok(Json(response))
+}
+
 async fn get_workflow_history_for_run(
     Path((tenant_id, instance_id, run_id)): Path<(String, String, String)>,
     Query(pagination): Query<PaginationQuery>,
@@ -796,9 +1426,232 @@ async fn get_workflow_replay_for_run(
     Ok(Json(response))
 }
 
+async fn get_workflow_execution_graph(
+    Path((tenant_id, instance_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<WorkflowExecutionGraphResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let instance = state
+        .store
+        .get_instance(&tenant_id, &instance_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| not_found(format!("workflow instance {instance_id} not found")))?;
+    let run_id = instance.run_id.clone();
+    let run = state
+        .store
+        .get_run_record(&tenant_id, &instance_id, &run_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| not_found(format!("workflow run {run_id} not found")))?;
+    let activities = state
+        .store
+        .list_activities_for_run(&tenant_id, &instance_id, &run_id)
+        .await
+        .map_err(internal_error)?;
+    let signals = state
+        .store
+        .list_signals_for_run(&tenant_id, &instance_id, &run_id)
+        .await
+        .map_err(internal_error)?;
+    let children = state
+        .store
+        .list_children_for_run(&tenant_id, &instance_id, &run_id)
+        .await
+        .map_err(internal_error)?;
+    let bulk_batches = state
+        .store
+        .list_bulk_batches_for_run_page(&tenant_id, &instance_id, &run_id, i64::MAX, 0)
+        .await
+        .map_err(internal_error)?;
+    let runs = state
+        .store
+        .list_runs_for_instance(&tenant_id, &instance_id)
+        .await
+        .map_err(internal_error)?;
+
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+
+    let workflow_node_id = format!("workflow:{instance_id}:{run_id}");
+    nodes.push(WorkflowExecutionGraphNode {
+        id: workflow_node_id.clone(),
+        kind: "workflow".to_owned(),
+        label: instance.definition_id.clone(),
+        status: instance.status.as_str().to_owned(),
+        subtitle: instance.current_state.clone(),
+    });
+
+    let queue_node_id = format!("queue:workflow:{}", run.workflow_task_queue);
+    nodes.push(WorkflowExecutionGraphNode {
+        id: queue_node_id.clone(),
+        kind: "workflow_queue".to_owned(),
+        label: run.workflow_task_queue.clone(),
+        status: "active".to_owned(),
+        subtitle: Some("workflow task queue".to_owned()),
+    });
+    edges.push(WorkflowExecutionGraphEdge {
+        id: format!("{queue_node_id}->{workflow_node_id}"),
+        source: queue_node_id.clone(),
+        target: workflow_node_id.clone(),
+        label: "dispatches".to_owned(),
+    });
+
+    if let Some(build_id) = instance.sticky_workflow_build_id.clone() {
+        let build_node_id = format!("build:{build_id}");
+        nodes.push(WorkflowExecutionGraphNode {
+            id: build_node_id.clone(),
+            kind: "workflow_build".to_owned(),
+            label: build_id,
+            status: "sticky".to_owned(),
+            subtitle: Some("sticky build".to_owned()),
+        });
+        edges.push(WorkflowExecutionGraphEdge {
+            id: format!("{build_node_id}->{workflow_node_id}"),
+            source: build_node_id.clone(),
+            target: workflow_node_id.clone(),
+            label: "routes".to_owned(),
+        });
+        if let Some(poller_id) = instance.sticky_workflow_poller_id.clone() {
+            let poller_node_id = format!("poller:{poller_id}");
+            nodes.push(WorkflowExecutionGraphNode {
+                id: poller_node_id.clone(),
+                kind: "workflow_poller".to_owned(),
+                label: poller_id,
+                status: "active".to_owned(),
+                subtitle: Some("sticky poller".to_owned()),
+            });
+            edges.push(WorkflowExecutionGraphEdge {
+                id: format!("{poller_node_id}->{build_node_id}"),
+                source: poller_node_id,
+                target: build_node_id,
+                label: "advertises".to_owned(),
+            });
+        }
+    }
+
+    for activity in activities {
+        let activity_node_id = format!("activity:{}:{}", activity.activity_id, activity.attempt);
+        nodes.push(activity_graph_node(&activity_node_id, &activity));
+        edges.push(WorkflowExecutionGraphEdge {
+            id: format!("{workflow_node_id}->{activity_node_id}"),
+            source: workflow_node_id.clone(),
+            target: activity_node_id.clone(),
+            label: activity.activity_type.clone(),
+        });
+        let queue_id = format!("queue:activity:{}", activity.task_queue);
+        nodes.push(WorkflowExecutionGraphNode {
+            id: queue_id.clone(),
+            kind: "activity_queue".to_owned(),
+            label: activity.task_queue.clone(),
+            status: "active".to_owned(),
+            subtitle: Some("activity task queue".to_owned()),
+        });
+        edges.push(WorkflowExecutionGraphEdge {
+            id: format!("{activity_node_id}->{queue_id}"),
+            source: activity_node_id,
+            target: queue_id,
+            label: "queued_on".to_owned(),
+        });
+    }
+
+    for signal in signals {
+        let signal_node_id = format!("signal:{}", signal.signal_id);
+        nodes.push(WorkflowExecutionGraphNode {
+            id: signal_node_id.clone(),
+            kind: "signal".to_owned(),
+            label: signal.signal_type.clone(),
+            status: signal_status_label(&signal),
+            subtitle: Some(signal.signal_id.clone()),
+        });
+        edges.push(WorkflowExecutionGraphEdge {
+            id: format!("{signal_node_id}->{workflow_node_id}"),
+            source: signal_node_id,
+            target: workflow_node_id.clone(),
+            label: "delivers".to_owned(),
+        });
+    }
+
+    for child in children {
+        let child_node_id = format!("child:{}", child.child_id);
+        nodes.push(child_graph_node(&child_node_id, &child));
+        edges.push(WorkflowExecutionGraphEdge {
+            id: format!("{workflow_node_id}->{child_node_id}"),
+            source: workflow_node_id.clone(),
+            target: child_node_id,
+            label: "starts".to_owned(),
+        });
+    }
+
+    for batch in bulk_batches {
+        let batch_node_id = format!("bulk:{}", batch.batch_id);
+        nodes.push(WorkflowExecutionGraphNode {
+            id: batch_node_id.clone(),
+            kind: "bulk_batch".to_owned(),
+            label: batch.activity_type.clone(),
+            status: batch.status.as_str().to_owned(),
+            subtitle: Some(format!("{} items / {} chunks", batch.total_items, batch.chunk_count)),
+        });
+        edges.push(WorkflowExecutionGraphEdge {
+            id: format!("{workflow_node_id}->{batch_node_id}"),
+            source: workflow_node_id.clone(),
+            target: batch_node_id,
+            label: "bulk fan-out".to_owned(),
+        });
+    }
+
+    for run_record in runs {
+        let run_node_id = format!("run:{}", run_record.run_id);
+        nodes.push(WorkflowExecutionGraphNode {
+            id: run_node_id.clone(),
+            kind: "run".to_owned(),
+            label: run_record.run_id.clone(),
+            status: if run_record.closed_at.is_some() { "closed" } else { "open" }.to_owned(),
+            subtitle: run_record.continue_reason.clone(),
+        });
+        if run_record.run_id == run_id {
+            edges.push(WorkflowExecutionGraphEdge {
+                id: format!("{run_node_id}->{workflow_node_id}"),
+                source: run_node_id.clone(),
+                target: workflow_node_id.clone(),
+                label: "active".to_owned(),
+            });
+        }
+        if let Some(previous_run_id) = run_record.previous_run_id.clone() {
+            edges.push(WorkflowExecutionGraphEdge {
+                id: format!("run:{previous_run_id}->{run_node_id}"),
+                source: format!("run:{previous_run_id}"),
+                target: run_node_id.clone(),
+                label: "continue-as-new".to_owned(),
+            });
+        }
+    }
+
+    dedupe_graph_nodes(&mut nodes);
+    dedupe_graph_edges(&mut edges);
+
+    Ok(Json(WorkflowExecutionGraphResponse {
+        tenant_id,
+        instance_id,
+        run_id,
+        consistency: "eventual",
+        authoritative_source: "projection",
+        nodes,
+        edges,
+    }))
+}
+
 fn resolve_page(config: &QueryRuntimeConfig, pagination: &PaginationQuery) -> ResolvedPage {
     let limit = pagination.limit.unwrap_or(config.default_page_size).min(config.max_page_size);
     ResolvedPage { limit: limit.max(1), offset: pagination.offset.unwrap_or(0) }
+}
+
+fn non_empty(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) }
+}
+
+fn non_empty_ref(value: &str) -> Option<&str> {
+    if value.trim().is_empty() { None } else { Some(value) }
 }
 
 fn build_page_info(page: &ResolvedPage, total: usize, returned: usize) -> PageInfo {
@@ -806,6 +1659,113 @@ fn build_page_info(page: &ResolvedPage, total: usize, returned: usize) -> PageIn
     let offset = page.offset;
     let next_offset = (offset + returned < total).then_some(offset + returned);
     PageInfo { limit, offset, returned, total, has_more: next_offset.is_some(), next_offset }
+}
+
+fn workflow_list_item_from_state(state: WorkflowInstanceState) -> WorkflowListItem {
+    WorkflowListItem {
+        tenant_id: state.tenant_id,
+        instance_id: state.instance_id,
+        run_id: state.run_id,
+        definition_id: state.definition_id,
+        definition_version: state.definition_version,
+        artifact_hash: state.artifact_hash,
+        workflow_task_queue: state.workflow_task_queue,
+        sticky_workflow_build_id: state.sticky_workflow_build_id,
+        sticky_workflow_poller_id: state.sticky_workflow_poller_id,
+        current_state: state.current_state,
+        status: state.status.as_str().to_owned(),
+        event_count: state.event_count,
+        last_event_id: state.last_event_id,
+        last_event_type: state.last_event_type,
+        updated_at: state.updated_at,
+        consistency: "eventual",
+        source: "projection",
+    }
+}
+
+fn run_list_item_from_record(record: WorkflowRunSummaryRecord) -> RunListItem {
+    RunListItem {
+        tenant_id: record.tenant_id,
+        instance_id: record.instance_id,
+        run_id: record.run_id,
+        definition_id: record.definition_id,
+        definition_version: record.definition_version,
+        artifact_hash: record.artifact_hash,
+        workflow_task_queue: record.workflow_task_queue,
+        sticky_workflow_build_id: record.sticky_workflow_build_id,
+        sticky_workflow_poller_id: record.sticky_workflow_poller_id,
+        sticky_updated_at: record.sticky_updated_at,
+        previous_run_id: record.previous_run_id,
+        next_run_id: record.next_run_id,
+        continue_reason: record.continue_reason,
+        started_at: record.started_at,
+        closed_at: record.closed_at,
+        updated_at: record.updated_at,
+        last_transition_at: record.last_transition_at,
+        status: record.status,
+        current_state: record.current_state,
+        last_event_type: record.last_event_type,
+        event_count: record.event_count,
+        consistency: "eventual",
+        source: "projection",
+    }
+}
+
+fn activity_graph_node(
+    node_id: &str,
+    activity: &WorkflowActivityRecord,
+) -> WorkflowExecutionGraphNode {
+    WorkflowExecutionGraphNode {
+        id: node_id.to_owned(),
+        kind: "activity".to_owned(),
+        label: activity.activity_type.clone(),
+        status: match activity.status {
+            fabrik_store::WorkflowActivityStatus::Scheduled => "scheduled",
+            fabrik_store::WorkflowActivityStatus::Started => "started",
+            fabrik_store::WorkflowActivityStatus::Completed => "completed",
+            fabrik_store::WorkflowActivityStatus::Failed => "failed",
+            fabrik_store::WorkflowActivityStatus::TimedOut => "timed_out",
+            fabrik_store::WorkflowActivityStatus::Cancelled => "cancelled",
+        }
+        .to_owned(),
+        subtitle: Some(format!("{} attempt {}", activity.activity_id, activity.attempt)),
+    }
+}
+
+fn child_graph_node(node_id: &str, child: &WorkflowChildRecord) -> WorkflowExecutionGraphNode {
+    WorkflowExecutionGraphNode {
+        id: node_id.to_owned(),
+        kind: "child_workflow".to_owned(),
+        label: child.child_definition_id.clone(),
+        status: child.status.clone(),
+        subtitle: Some(child.child_workflow_id.clone()),
+    }
+}
+
+fn queue_kind_label(queue_kind: &TaskQueueKind) -> &'static str {
+    match queue_kind {
+        TaskQueueKind::Workflow => "workflow",
+        TaskQueueKind::Activity => "activity",
+    }
+}
+
+fn signal_status_label(signal: &WorkflowSignalRecord) -> String {
+    match signal.status {
+        fabrik_store::WorkflowSignalStatus::Queued => "queued",
+        fabrik_store::WorkflowSignalStatus::Dispatching => "dispatching",
+        fabrik_store::WorkflowSignalStatus::Consumed => "consumed",
+    }
+    .to_owned()
+}
+
+fn dedupe_graph_nodes(nodes: &mut Vec<WorkflowExecutionGraphNode>) {
+    let mut seen = std::collections::HashSet::new();
+    nodes.retain(|node| seen.insert(node.id.clone()));
+}
+
+fn dedupe_graph_edges(edges: &mut Vec<WorkflowExecutionGraphEdge>) {
+    let mut seen = std::collections::HashSet::new();
+    edges.retain(|edge| seen.insert(edge.id.clone()));
 }
 
 fn projection_lag_ms_from_times(
@@ -1485,6 +2445,65 @@ async fn load_workflow_signals(
     })
 }
 
+async fn load_workflow_updates(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    pagination: PaginationQuery,
+) -> Result<WorkflowUpdatesResponse> {
+    let page = resolve_page(&state.query, &pagination);
+    let total = state.store.count_updates_for_run(tenant_id, instance_id, run_id).await? as usize;
+    let updates = state
+        .store
+        .list_updates_for_run_page(
+            tenant_id,
+            instance_id,
+            run_id,
+            i64::try_from(page.limit).context("updates page limit exceeds i64")?,
+            i64::try_from(page.offset).context("updates page offset exceeds i64")?,
+        )
+        .await?;
+    Ok(WorkflowUpdatesResponse {
+        tenant_id: tenant_id.to_owned(),
+        instance_id: instance_id.to_owned(),
+        run_id: run_id.to_owned(),
+        page: build_page_info(&page, total, updates.len()),
+        update_count: total,
+        updates,
+    })
+}
+
+async fn load_workflow_update(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    update_id: &str,
+) -> Result<WorkflowUpdateResponse, (StatusCode, Json<ErrorResponse>)> {
+    let update = state
+        .store
+        .get_update(tenant_id, instance_id, run_id, update_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    message: format!(
+                        "workflow update {update_id} not found for instance {instance_id} run {run_id}"
+                    ),
+                }),
+            )
+        })?;
+    Ok(WorkflowUpdateResponse {
+        tenant_id: tenant_id.to_owned(),
+        instance_id: instance_id.to_owned(),
+        run_id: run_id.to_owned(),
+        update,
+    })
+}
+
 async fn replay_workflow_run(
     state: &AppState,
     current_instance: &WorkflowInstanceState,
@@ -1852,5 +2871,400 @@ async fn get_workflow_artifact_version(
                 ),
             }),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        net::SocketAddr,
+        process::Command,
+        sync::{Arc, Mutex},
+        time::{Duration as StdDuration, Instant},
+    };
+    use chrono::Utc;
+    use fabrik_config::{ThroughputPayloadStoreConfig, ThroughputPayloadStoreKind};
+    use fabrik_workflow::WorkflowStatus;
+    use serde_json::json;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        time::sleep,
+    };
+    use uuid::Uuid;
+
+    struct TestPostgres {
+        container_name: String,
+        database_url: String,
+    }
+
+    impl TestPostgres {
+        fn start() -> Result<Option<Self>> {
+            if !docker_available() {
+                eprintln!("skipping query-service integration tests because docker is unavailable");
+                return Ok(None);
+            }
+
+            let container_name = format!("fabrik-query-test-pg-{}", Uuid::now_v7());
+            let image = std::env::var("FABRIK_TEST_POSTGRES_IMAGE")
+                .unwrap_or_else(|_| "postgres:16-alpine".to_owned());
+            let output = Command::new("docker")
+                .args([
+                    "run",
+                    "--detach",
+                    "--rm",
+                    "--name",
+                    &container_name,
+                    "--env",
+                    "POSTGRES_USER=fabrik",
+                    "--env",
+                    "POSTGRES_PASSWORD=fabrik",
+                    "--env",
+                    "POSTGRES_DB=fabrik_test",
+                    "--publish-all",
+                    &image,
+                ])
+                .output()
+                .with_context(|| format!("failed to start docker container {container_name}"))?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "docker failed to start postgres test container: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+
+            let host_port = match wait_for_docker_port(&container_name, "5432/tcp") {
+                Ok(port) => port,
+                Err(error) => {
+                    let _ = cleanup_container(&container_name);
+                    return Err(error);
+                }
+            };
+            let database_url = format!(
+                "postgres://fabrik:fabrik@127.0.0.1:{host_port}/fabrik_test?sslmode=disable"
+            );
+            Ok(Some(Self { container_name, database_url }))
+        }
+
+        async fn connect_store(&self) -> Result<WorkflowStore> {
+            let deadline = Instant::now() + StdDuration::from_secs(30);
+            loop {
+                match WorkflowStore::connect(&self.database_url).await {
+                    Ok(store) => {
+                        store.init().await?;
+                        return Ok(store);
+                    }
+                    Err(error) if Instant::now() < deadline => {
+                        let _ = error;
+                        sleep(StdDuration::from_millis(250)).await;
+                    }
+                    Err(error) => {
+                        let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        return Err(error).with_context(|| {
+                            format!(
+                                "postgres test container {} did not become ready; logs:\n{}",
+                                self.container_name, logs
+                            )
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for TestPostgres {
+        fn drop(&mut self) {
+            let _ = cleanup_container(&self.container_name);
+        }
+    }
+
+    fn docker_available() -> bool {
+        Command::new("docker")
+            .args(["info", "--format", "{{.ServerVersion}}"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    fn wait_for_docker_port(container_name: &str, container_port: &str) -> Result<u16> {
+        let deadline = Instant::now() + StdDuration::from_secs(15);
+        loop {
+            let output = Command::new("docker")
+                .args([
+                    "inspect",
+                    "--format",
+                    &format!(
+                        "{{{{(index (index .NetworkSettings.Ports \"{container_port}\") 0).HostPort}}}}"
+                    ),
+                    container_name,
+                ])
+                .output()
+                .with_context(|| format!("failed to inspect docker container {container_name}"))?;
+            if output.status.success() {
+                let host_port = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                if !host_port.is_empty() {
+                    return host_port
+                        .parse::<u16>()
+                        .with_context(|| format!("invalid mapped port {host_port}"));
+                }
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("timed out waiting for port {container_port} on {container_name}");
+            }
+            std::thread::sleep(StdDuration::from_millis(100));
+        }
+    }
+
+    fn docker_logs(container_name: &str) -> Result<String> {
+        let output = Command::new("docker")
+            .args(["logs", container_name])
+            .output()
+            .with_context(|| format!("failed to read docker logs for {container_name}"))?;
+        Ok(format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+
+    fn cleanup_container(container_name: &str) -> Result<()> {
+        let output = Command::new("docker")
+            .args(["rm", "--force", container_name])
+            .output()
+            .with_context(|| format!("failed to remove docker container {container_name}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "docker failed to remove container {container_name}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        }
+    }
+
+    async fn test_state(store: WorkflowStore) -> Result<AppState> {
+        let temp_dir = std::env::temp_dir().join(format!("fabrik-query-payloads-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&temp_dir).context("failed to create test payload store dir")?;
+        let query = QueryRuntimeConfig {
+            default_page_size: 100,
+            max_page_size: 500,
+            throughput_payload_store: ThroughputPayloadStoreConfig {
+                kind: ThroughputPayloadStoreKind::LocalFilesystem,
+                local_dir: temp_dir.display().to_string(),
+                s3_bucket: None,
+                s3_region: "us-east-1".to_owned(),
+                s3_endpoint: None,
+                s3_access_key_id: None,
+                s3_secret_access_key: None,
+                s3_force_path_style: false,
+                s3_key_prefix: String::new(),
+            },
+            strong_query_unified_url: None,
+            strong_query_executor_url: None,
+            history_retention_days: None,
+            run_retention_days: None,
+            activity_retention_days: None,
+            signal_retention_days: None,
+            snapshot_retention_days: None,
+            retention_sweep_interval_seconds: 300,
+        };
+        let payload_store = PayloadStore::from_config(build_payload_store_config(&query)).await?;
+        Ok(AppState {
+            store,
+            broker: BrokerConfig::new("127.0.0.1:9092", "workflow-events", 1),
+            query,
+            payload_store,
+            client: Client::new(),
+            throughput_partitions: 1,
+            retention: Arc::new(Mutex::new(RetentionDebugState::default())),
+        })
+    }
+
+    #[test]
+    fn owner_query_endpoints_prefers_unified_then_executor() {
+        let config = QueryRuntimeConfig {
+            default_page_size: 100,
+            max_page_size: 500,
+            throughput_payload_store: fabrik_config::ThroughputPayloadStoreConfig {
+                kind: fabrik_config::ThroughputPayloadStoreKind::LocalFilesystem,
+                local_dir: "/tmp".to_owned(),
+                s3_bucket: None,
+                s3_region: "us-east-1".to_owned(),
+                s3_endpoint: None,
+                s3_access_key_id: None,
+                s3_secret_access_key: None,
+                s3_force_path_style: false,
+                s3_key_prefix: String::new(),
+            },
+            strong_query_unified_url: Some("http://unified".to_owned()),
+            strong_query_executor_url: Some("http://executor".to_owned()),
+            history_retention_days: None,
+            run_retention_days: None,
+            activity_retention_days: None,
+            signal_retention_days: None,
+            snapshot_retention_days: None,
+            retention_sweep_interval_seconds: 300,
+        };
+
+        assert_eq!(
+            owner_query_endpoints(&config),
+            vec!["http://unified".to_owned(), "http://executor".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_query_endpoint_round_trip_returns_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
+        let addr: SocketAddr = listener.local_addr().expect("read test listener address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept test connection");
+            let mut buf = vec![0_u8; 4096];
+            let _ = socket.read(&mut buf).await.expect("read test request");
+            let body = serde_json::to_string(&InternalQueryResponse {
+                result: json!({"ok": true}),
+                consistency: "strong".to_owned(),
+                source: "hot_owner".to_owned(),
+            })
+            .expect("serialize test response");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body,
+            );
+            socket.write_all(response.as_bytes()).await.expect("write test response");
+        });
+
+        let response = try_owner_strong_query_endpoint(
+            &Client::new(),
+            &format!("http://{addr}"),
+            "tenant",
+            "instance",
+            "summary",
+            &json!({"ok": true}),
+        )
+        .await
+        .expect("owner query should succeed");
+
+        assert_eq!(response.result, json!({"ok": true}));
+        assert_eq!(response.consistency, "strong");
+        assert_eq!(response.source, "hot_owner");
+    }
+
+    #[tokio::test]
+    async fn list_runs_uses_current_projection_and_snapshots_for_filters() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state = test_state(store.clone()).await?;
+
+        let historical_updated_at = Utc::now() - chrono::Duration::minutes(10);
+        store
+            .put_run_start(
+                "tenant-a",
+                "instance-1",
+                "run-1",
+                "payments",
+                Some(1),
+                Some("artifact-a"),
+                "payments",
+                Uuid::now_v7(),
+                historical_updated_at - chrono::Duration::minutes(2),
+                None,
+                None,
+            )
+            .await?;
+        store
+            .close_run("tenant-a", "instance-1", "run-1", historical_updated_at)
+            .await?;
+        store
+            .put_snapshot(&WorkflowInstanceState {
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "instance-1".to_owned(),
+                run_id: "run-1".to_owned(),
+                definition_id: "payments".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                workflow_task_queue: "payments".to_owned(),
+                sticky_workflow_build_id: Some("build-a".to_owned()),
+                sticky_workflow_poller_id: Some("poller-a".to_owned()),
+                current_state: Some("settled".to_owned()),
+                context: None,
+                artifact_execution: None,
+                status: WorkflowStatus::Completed,
+                input: Some(json!({"orderId": 1})),
+                output: Some(json!({"ok": true})),
+                event_count: 8,
+                last_event_id: Uuid::now_v7(),
+                last_event_type: "WorkflowCompleted".to_owned(),
+                updated_at: historical_updated_at,
+            })
+            .await?;
+        store
+            .put_run_start(
+                "tenant-a",
+                "instance-1",
+                "run-2",
+                "payments",
+                Some(2),
+                Some("artifact-b"),
+                "payments",
+                Uuid::now_v7(),
+                Utc::now() - chrono::Duration::minutes(1),
+                Some("run-1"),
+                Some("run-1"),
+            )
+            .await?;
+        store
+            .record_run_continuation(
+                "tenant-a",
+                "instance-1",
+                "run-1",
+                "run-2",
+                "continue-as-new",
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                Utc::now() - chrono::Duration::minutes(1),
+            )
+            .await?;
+        store
+            .upsert_instance(&WorkflowInstanceState {
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "instance-1".to_owned(),
+                run_id: "run-2".to_owned(),
+                definition_id: "payments".to_owned(),
+                definition_version: Some(2),
+                artifact_hash: Some("artifact-b".to_owned()),
+                workflow_task_queue: "payments".to_owned(),
+                sticky_workflow_build_id: Some("build-b".to_owned()),
+                sticky_workflow_poller_id: Some("poller-b".to_owned()),
+                current_state: Some("charge-card".to_owned()),
+                context: None,
+                artifact_execution: None,
+                status: WorkflowStatus::Running,
+                input: Some(json!({"orderId": 2})),
+                output: None,
+                event_count: 12,
+                last_event_id: Uuid::now_v7(),
+                last_event_type: "ActivityScheduled".to_owned(),
+                updated_at: Utc::now(),
+            })
+            .await?;
+
+        let Json(response) = list_runs(
+            Path("tenant-a".to_owned()),
+            Query(RunListQuery { status: Some("completed".to_owned()), ..RunListQuery::default() }),
+            State(state),
+        )
+        .await
+        .expect("list runs response");
+
+        assert_eq!(response.run_count, 1);
+        assert_eq!(response.items[0].run_id, "run-1");
+        assert_eq!(response.items[0].status, "completed");
+        assert_eq!(response.items[0].current_state.as_deref(), Some("settled"));
+        assert_eq!(response.items[0].last_event_type.as_deref(), Some("WorkflowCompleted"));
+        Ok(())
     }
 }

@@ -18,7 +18,10 @@ use fabrik_events::{
     EventEnvelope, WorkflowEvent, WorkflowIdentity, WorkflowTurnRouting, workflow_turn_routing,
 };
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
-use fabrik_store::{ConsumedSignalRecord, PartitionOwnershipRecord, TaskQueueKind, WorkflowStore};
+use fabrik_store::{
+    ConsumedSignalRecord, PartitionOwnershipRecord, TaskQueueKind, WorkflowActivityStatus,
+    WorkflowStore,
+};
 use fabrik_worker_protocol::activity_worker::{
     CompleteWorkflowTaskRequest, FailWorkflowTaskRequest, PollWorkflowTaskRequest, WorkflowTask,
     workflow_worker_api_client::WorkflowWorkerApiClient,
@@ -4146,6 +4149,105 @@ async fn process_event_with_mark_mode(
         }
         WorkflowEvent::SignalQueued { .. } => {}
         WorkflowEvent::WorkflowCancellationRequested { reason } => {
+            let has_compiled_execution = state.artifact_execution.is_some();
+            let active_activities = if has_compiled_execution {
+                store
+                    .list_activities_for_run(&event.tenant_id, &event.instance_id, &event.run_id)
+                    .await?
+                    .into_iter()
+                    .filter(|activity| {
+                        matches!(
+                            activity.status,
+                            WorkflowActivityStatus::Scheduled | WorkflowActivityStatus::Started
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let open_children = if has_compiled_execution {
+                store
+                    .list_open_children_for_run(&event.tenant_id, &event.instance_id, &event.run_id)
+                    .await?
+            } else {
+                Vec::new()
+            };
+            if has_compiled_execution && (!active_activities.is_empty() || !open_children.is_empty()) {
+                state.apply_event(&event);
+                persist_state_with_mode(
+                    store,
+                    runtime,
+                    debug_state,
+                    lease_state,
+                    lease_snapshot.partition_id,
+                    &mut record,
+                    &state,
+                    persist_mode,
+                )
+                .await?;
+                ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
+                for activity in active_activities {
+                    let mut cancel_requested = EventEnvelope::new(
+                        WorkflowEvent::ActivityTaskCancellationRequested {
+                            activity_id: activity.activity_id.clone(),
+                            attempt: activity.attempt,
+                            reason: reason.clone(),
+                            metadata: None,
+                        }
+                        .event_type(),
+                        source_identity(&event, "executor-service"),
+                        WorkflowEvent::ActivityTaskCancellationRequested {
+                            activity_id: activity.activity_id.clone(),
+                            attempt: activity.attempt,
+                            reason: reason.clone(),
+                            metadata: None,
+                        },
+                    );
+                    cancel_requested.causation_id = Some(event.event_id);
+                    cancel_requested.correlation_id = event.correlation_id.or(Some(event.event_id));
+                    cancel_requested.dedupe_key = Some(format!(
+                        "workflow-cancel-activity:{}:{}",
+                        activity.activity_id, activity.attempt
+                    ));
+                    publisher.publish(&cancel_requested);
+                }
+                for child in open_children {
+                    if let Some(child_run_id) = &child.child_run_id {
+                        emit_parent_close_child_event(
+                            store,
+                            runtime,
+                            debug_state,
+                            lease_state,
+                            publisher,
+                            &event,
+                            &child,
+                            child_run_id,
+                            WorkflowEvent::WorkflowCancellationRequested {
+                                reason: format!(
+                                    "{reason} (propagated from parent run {})",
+                                    event.run_id
+                                ),
+                            },
+                        )
+                        .await?;
+                    } else {
+                        store
+                            .complete_child(
+                                &child.tenant_id,
+                                &child.instance_id,
+                                &child.run_id,
+                                &child.child_id,
+                                "cancelled",
+                                None,
+                                Some("cancel requested before child start"),
+                                event.event_id,
+                                event.occurred_at,
+                            )
+                            .await?;
+                    }
+                }
+                return Ok(());
+            }
             ensure_active_partition_ownership(store, runtime, debug_state, lease_state).await?;
             let mut cancelled = EventEnvelope::new(
                 WorkflowEvent::WorkflowCancelled { reason: reason.clone() }.event_type(),

@@ -180,6 +180,8 @@ struct QueuedActivity {
     state: String,
     scheduled_at: DateTime<Utc>,
     #[serde(default)]
+    cancellation_requested: bool,
+    #[serde(default)]
     lease_epoch: u64,
 }
 
@@ -942,6 +944,13 @@ async fn run_trigger_consumer(
                     error!(error = %error, "unified-runtime failed to handle trigger");
                 }
             }
+            WorkflowEvent::ActivityTaskCancellationRequested { .. } => {
+                if let Err(error) =
+                    handle_activity_cancellation_requested_event(&state, event).await
+                {
+                    error!(error = %error, "unified-runtime failed to handle activity cancellation");
+                }
+            }
             WorkflowEvent::WorkflowUpdateRequested { .. }
             | WorkflowEvent::WorkflowCancellationRequested { .. }
             | WorkflowEvent::SignalQueued { .. } => {
@@ -1076,6 +1085,206 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
     drain_mailbox_for_run(state, &run_key.tenant_id, &run_key.instance_id, &run_key.run_id).await?;
     let mut debug = state.debug.lock().expect("unified debug lock poisoned");
     debug.workflow_triggers_applied = debug.workflow_triggers_applied.saturating_add(1);
+    Ok(())
+}
+
+async fn handle_activity_cancellation_requested_event(
+    state: &AppState,
+    event: EventEnvelope<WorkflowEvent>,
+) -> Result<()> {
+    let WorkflowEvent::ActivityTaskCancellationRequested { activity_id, attempt, reason, metadata } =
+        &event.payload
+    else {
+        return Ok(());
+    };
+
+    if !state
+        .store
+        .request_activity_cancellation(
+            &event.tenant_id,
+            &event.instance_id,
+            &event.run_id,
+            activity_id,
+            *attempt,
+            reason,
+            metadata.as_ref(),
+            event.event_id,
+            &event.event_type,
+            event.occurred_at,
+        )
+        .await?
+    {
+        return Ok(());
+    }
+
+    let run_key = RunKey {
+        tenant_id: event.tenant_id.clone(),
+        instance_id: event.instance_id.clone(),
+        run_id: event.run_id.clone(),
+    };
+    let attempt_key = AttemptKey {
+        tenant_id: event.tenant_id.clone(),
+        instance_id: event.instance_id.clone(),
+        run_id: event.run_id.clone(),
+        activity_id: activity_id.clone(),
+        attempt: *attempt,
+    };
+
+    let mut general = Vec::new();
+    let mut schedules = Vec::new();
+    let mut post_plan = None;
+    let mut notifies = false;
+
+    {
+        let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
+        if let Some(leased) = inner.leased.get_mut(&attempt_key) {
+            leased.task.cancellation_requested = true;
+            mark_runtime_dirty(&mut inner, "activity_cancel_requested", false);
+        } else {
+            let active = inner
+                .instances
+                .get(&run_key)
+                .and_then(|runtime| runtime.active_activities.get(activity_id))
+                .filter(|active| active.attempt == *attempt)
+                .cloned();
+            let Some(active) = active else {
+                return Ok(());
+            };
+            let queue_key = QueueKey {
+                tenant_id: event.tenant_id.clone(),
+                task_queue: active.task_queue.clone(),
+            };
+            let removed = inner.ready.get_mut(&queue_key).and_then(|queue| {
+                queue
+                    .iter()
+                    .position(|task| task.activity_id == *activity_id && task.attempt == *attempt)
+                    .and_then(|index| queue.remove(index))
+            });
+            let Some(queued) = removed else {
+                return Ok(());
+            };
+
+            let runtime = inner.instances.get_mut(&run_key).expect("runtime exists after lookup");
+            runtime.active_activities.remove(activity_id);
+            general.push(PreparedDbAction::Terminal(ActivityTerminalUpdate {
+                tenant_id: event.tenant_id.clone(),
+                instance_id: event.instance_id.clone(),
+                run_id: event.run_id.clone(),
+                activity_id: activity_id.clone(),
+                attempt: *attempt,
+                worker_id: "unified-runtime".to_owned(),
+                worker_build_id: "system".to_owned(),
+                payload: ActivityTerminalPayload::Cancelled {
+                    reason: reason.clone(),
+                    metadata: metadata.clone(),
+                },
+                event_id: Uuid::now_v7(),
+                event_type: "UnifiedActivityCancelled".to_owned(),
+                occurred_at: event.occurred_at,
+            }));
+
+            let wait_state = runtime.instance.current_state.clone();
+            if let Some(wait_state) = wait_state {
+                let cancelled_event = EventEnvelope::new(
+                    WorkflowEvent::ActivityTaskCancelled {
+                        activity_id: activity_id.clone(),
+                        attempt: *attempt,
+                        reason: reason.clone(),
+                        worker_id: "unified-runtime".to_owned(),
+                        worker_build_id: "system".to_owned(),
+                        metadata: metadata.clone(),
+                    }
+                    .event_type(),
+                    WorkflowIdentity::new(
+                        event.tenant_id.clone(),
+                        runtime.instance.definition_id.clone(),
+                        runtime
+                            .instance
+                            .definition_version
+                            .unwrap_or(runtime.artifact.definition_version),
+                        runtime.instance.artifact_hash.clone().unwrap_or_default(),
+                        event.instance_id.clone(),
+                        event.run_id.clone(),
+                        "unified-runtime",
+                    ),
+                    WorkflowEvent::ActivityTaskCancelled {
+                        activity_id: activity_id.clone(),
+                        attempt: *attempt,
+                        reason: reason.clone(),
+                        worker_id: "unified-runtime".to_owned(),
+                        worker_build_id: "system".to_owned(),
+                        metadata: metadata.clone(),
+                    },
+                )
+                .with_occurred_at(event.occurred_at);
+                let execution_state =
+                    runtime.instance.artifact_execution.clone().unwrap_or_default();
+                if let Some((plan, _)) =
+                    runtime.artifact.try_execute_after_step_terminal_batch_with_turn(
+                        &wait_state,
+                        std::slice::from_ref(&cancelled_event),
+                        execution_state,
+                    )?
+                {
+                    apply_compiled_plan(&mut runtime.instance, &plan);
+                    runtime.instance.updated_at = event.occurred_at;
+                    post_plan = Some(PostPlanEffect {
+                        run_key: run_key.clone(),
+                        instance: runtime.instance.clone(),
+                        plan: plan.clone(),
+                        source_event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    });
+                    let scheduled_tasks =
+                        schedule_activities_from_plan(&runtime.instance, &plan, event.occurred_at)?;
+                    let terminal_instance =
+                        runtime.instance.status.is_terminal().then_some(runtime.instance.clone());
+                    for task in &scheduled_tasks {
+                        schedules.push(PreparedDbAction::Schedule(task.clone()));
+                        runtime.active_activities.insert(
+                            task.activity_id.clone(),
+                            ActiveActivityMeta {
+                                attempt: task.attempt,
+                                task_queue: task.task_queue.clone(),
+                                activity_type: task.activity_type.clone(),
+                                wait_state: task.state.clone(),
+                            },
+                        );
+                    }
+                    let _ = runtime;
+                    for task in scheduled_tasks {
+                        inner
+                            .ready
+                            .entry(QueueKey {
+                                tenant_id: task.tenant_id.clone(),
+                                task_queue: task.task_queue.clone(),
+                            })
+                            .or_default()
+                            .push_back(task);
+                        notifies = true;
+                    }
+                    if let Some(instance) = terminal_instance {
+                        general.push(PreparedDbAction::UpsertInstance(instance));
+                        general
+                            .push(PreparedDbAction::CloseRun(run_key.clone(), event.occurred_at));
+                    }
+                }
+            }
+            let _ = queued;
+            mark_runtime_dirty(&mut inner, "activity_cancel_requested", false);
+        }
+    }
+
+    if !general.is_empty() || !schedules.is_empty() {
+        apply_db_actions(state, general, schedules).await?;
+    }
+    if let Some(post_plan) = post_plan {
+        apply_post_plan_child_effects(state, post_plan).await?;
+    }
+    if notifies {
+        state.notify.notify_waiters();
+    }
+    state.persist_notify.notify_one();
     Ok(())
 }
 
@@ -1399,6 +1608,78 @@ async fn dispatch_cancel_mailbox_item_unified(
             item.payload.as_ref().and_then(Value::as_str).unwrap_or("workflow cancelled").to_owned()
         }
     };
+    propagate_cancellation_to_open_children_unified(state, &item.source_event, &reason).await?;
+
+    let unwindable_activities = {
+        let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
+        let Some(runtime) = inner.instances.get_mut(&run_key) else {
+            return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
+        };
+        if runtime.instance.status.is_terminal() {
+            return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
+        }
+        runtime.instance.apply_event(&item.source_event);
+        let unwindable = runtime.instance.artifact_execution.is_some()
+            && !runtime.active_activities.is_empty()
+            && runtime.active_activities.values().all(|active| active.attempt > 0);
+        let activities = if unwindable {
+            runtime
+                .active_activities
+                .iter()
+                .map(|(activity_id, active)| {
+                    (activity_id.clone(), active.attempt, reason.clone(), None::<Value>)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let instance = runtime.instance.clone();
+        mark_runtime_dirty(
+            &mut inner,
+            if unwindable { "mailbox_cancel_requested" } else { "mailbox_cancel" },
+            !unwindable,
+        );
+        (instance, activities)
+    };
+
+    let (instance_after_request, cancellations) = unwindable_activities;
+    if !cancellations.is_empty() {
+        state.store.upsert_instance(&instance_after_request).await?;
+        for (activity_id, attempt, reason, metadata) in cancellations {
+            let payload = WorkflowEvent::ActivityTaskCancellationRequested {
+                activity_id,
+                attempt,
+                reason,
+                metadata,
+            };
+            let mut cancel_event = EventEnvelope::new(
+                payload.event_type(),
+                WorkflowIdentity::new(
+                    item.tenant_id.clone(),
+                    item.source_event.definition_id.clone(),
+                    item.source_event.definition_version,
+                    item.source_event.artifact_hash.clone(),
+                    item.instance_id.clone(),
+                    item.run_id.clone(),
+                    "unified-runtime",
+                ),
+                payload,
+            );
+            cancel_event.occurred_at = item.source_event.occurred_at;
+            cancel_event.causation_id = Some(item.source_event.event_id);
+            cancel_event.correlation_id =
+                item.source_event.correlation_id.or(Some(item.source_event.event_id));
+            handle_activity_cancellation_requested_event(state, cancel_event).await?;
+        }
+        return Ok(MailboxDrainOutcome::Processed {
+            signal: None,
+            accepted_seq: item.accepted_seq,
+            general: Vec::new(),
+            schedules: Vec::new(),
+            notifies: false,
+            post_plan: None,
+        });
+    }
 
     let now = Utc::now();
     let mut cancelled_event = EventEnvelope::new(
@@ -1423,13 +1704,7 @@ async fn dispatch_cancel_mailbox_item_unified(
 
     let terminal_instance = {
         let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
-        let Some(runtime) = inner.instances.get_mut(&run_key) else {
-            return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
-        };
-        if runtime.instance.status.is_terminal() {
-            return Ok(MailboxDrainOutcome::ConsumedNoop { accepted_seq: item.accepted_seq });
-        }
-        runtime.instance.apply_event(&item.source_event);
+        let runtime = inner.instances.get_mut(&run_key).expect("runtime still exists");
         runtime.instance.apply_event(&cancelled_event);
         if let Some(execution) = runtime.instance.artifact_execution.as_mut() {
             execution.active_update = None;
@@ -1438,7 +1713,6 @@ async fn dispatch_cancel_mailbox_item_unified(
         runtime.active_activities.clear();
         let terminal_instance = runtime.instance.clone();
         remove_run_work(&mut inner, &run_key);
-        mark_runtime_dirty(&mut inner, "mailbox_cancel", true);
         terminal_instance
     };
 
@@ -1453,6 +1727,140 @@ async fn dispatch_cancel_mailbox_item_unified(
         notifies: true,
         post_plan: None,
     })
+}
+
+async fn propagate_cancellation_to_open_children_unified(
+    state: &AppState,
+    source_event: &EventEnvelope<WorkflowEvent>,
+    reason: &str,
+) -> Result<()> {
+    let children = state
+        .store
+        .list_open_children_for_run(&source_event.tenant_id, &source_event.instance_id, &source_event.run_id)
+        .await?;
+    if children.is_empty() {
+        return Ok(());
+    }
+    let partition_id = {
+        let ownership = state.ownership.lock().expect("unified ownership lock poisoned");
+        ownership.partition_id
+    };
+    for child in children {
+        let Some(child_run_id) = child.child_run_id.clone() else {
+            state
+                .store
+                .complete_child(
+                    &child.tenant_id,
+                    &child.instance_id,
+                    &child.run_id,
+                    &child.child_id,
+                    "cancelled",
+                    None,
+                    Some("cancel requested before child start"),
+                    source_event.event_id,
+                    source_event.occurred_at,
+                )
+                .await?;
+            continue;
+        };
+
+        let hot_child_instance = {
+            let inner = state.inner.lock().expect("unified runtime lock poisoned");
+            inner
+                .instances
+                .get(&RunKey {
+                    tenant_id: child.tenant_id.clone(),
+                    instance_id: child.child_workflow_id.clone(),
+                    run_id: child_run_id.clone(),
+                })
+                .map(|runtime| runtime.instance.clone())
+        };
+        let stored_child_instance = if hot_child_instance.is_none() {
+            state.store.get_instance(&child.tenant_id, &child.child_workflow_id).await?
+        } else {
+            None
+        };
+        let child_task_queue = hot_child_instance
+            .as_ref()
+            .map(|instance| instance.workflow_task_queue.clone())
+            .or_else(|| stored_child_instance.as_ref().map(|instance| instance.workflow_task_queue.clone()))
+            .unwrap_or_else(|| "default".to_owned());
+        let child_definition_version = hot_child_instance
+            .as_ref()
+            .and_then(|instance| instance.definition_version)
+            .or_else(|| stored_child_instance.as_ref().and_then(|instance| instance.definition_version))
+            .unwrap_or(source_event.definition_version);
+        let child_artifact_hash = hot_child_instance
+            .as_ref()
+            .and_then(|instance| instance.artifact_hash.clone())
+            .or_else(|| stored_child_instance.as_ref().and_then(|instance| instance.artifact_hash.clone()))
+            .unwrap_or_else(|| source_event.artifact_hash.clone());
+
+        let mut cancel_event = EventEnvelope::new(
+            WorkflowEvent::WorkflowCancellationRequested {
+                reason: format!(
+                    "{reason} (propagated from parent run {})",
+                    source_event.run_id
+                ),
+            }
+            .event_type(),
+            WorkflowIdentity::new(
+                child.tenant_id.clone(),
+                child.child_definition_id.clone(),
+                child_definition_version,
+                child_artifact_hash,
+                child.child_workflow_id.clone(),
+                child_run_id.clone(),
+                "unified-runtime",
+            ),
+            WorkflowEvent::WorkflowCancellationRequested {
+                reason: format!(
+                    "{reason} (propagated from parent run {})",
+                    source_event.run_id
+                ),
+            },
+        )
+        .with_occurred_at(source_event.occurred_at);
+        cancel_event.causation_id = Some(source_event.event_id);
+        cancel_event.correlation_id = source_event.correlation_id.or(Some(source_event.event_id));
+        cancel_event.dedupe_key =
+            Some(format!("child-cancel:{}:{}", child.child_id, source_event.event_id));
+        state
+            .store
+            .enqueue_workflow_mailbox_message(
+                partition_id,
+                &child_task_queue,
+                None,
+                &cancel_event,
+                WorkflowMailboxKind::CancelRequest,
+                None,
+                None,
+                None,
+            )
+            .await?;
+        let child_run_key = RunKey {
+            tenant_id: child.tenant_id.clone(),
+            instance_id: child.child_workflow_id.clone(),
+            run_id: child_run_id,
+        };
+        let is_hot = {
+            let inner = state.inner.lock().expect("unified runtime lock poisoned");
+            inner.instances.contains_key(&child_run_key)
+        };
+        if is_hot {
+            let state = state.clone();
+            tokio::spawn(async move {
+                let _ = drain_mailbox_for_run(
+                    &state,
+                    &child_run_key.tenant_id,
+                    &child_run_key.instance_id,
+                    &child_run_key.run_id,
+                )
+                .await;
+            });
+        }
+    }
+    Ok(())
 }
 
 async fn dispatch_update_mailbox_item_unified(
@@ -1615,35 +2023,12 @@ async fn dispatch_update_mailbox_item_unified(
                 },
             );
         }
-        for emission in &plan.emissions {
-            match &emission.event {
-                WorkflowEvent::WorkflowUpdateCompleted { update_id, output, .. } => {
-                    general.push(PreparedDbAction::CompleteUpdate {
-                        tenant_id: run_key.tenant_id.clone(),
-                        instance_id: run_key.instance_id.clone(),
-                        run_id: run_key.run_id.clone(),
-                        update_id: update_id.clone(),
-                        output: Some(output.clone()),
-                        error: None,
-                        completed_event_id: accepted_event.event_id,
-                        completed_at: accepted_event.occurred_at,
-                    });
-                }
-                WorkflowEvent::WorkflowUpdateRejected { update_id, error, .. } => {
-                    general.push(PreparedDbAction::CompleteUpdate {
-                        tenant_id: run_key.tenant_id.clone(),
-                        instance_id: run_key.instance_id.clone(),
-                        run_id: run_key.run_id.clone(),
-                        update_id: update_id.clone(),
-                        output: None,
-                        error: Some(error.clone()),
-                        completed_event_id: accepted_event.event_id,
-                        completed_at: accepted_event.occurred_at,
-                    });
-                }
-                _ => {}
-            }
-        }
+        general.extend(prepared_update_actions_from_plan(
+            &run_key,
+            &plan,
+            accepted_event.event_id,
+            accepted_event.occurred_at,
+        ));
         let terminal_instance =
             runtime.instance.status.is_terminal().then_some(runtime.instance.clone());
         final_instance = Some(runtime.instance.clone());
@@ -1688,8 +2073,12 @@ async fn materialize_child_workflows_from_plan(
     plan: &CompiledExecutionPlan,
     occurred_at: DateTime<Utc>,
     source_event_id: Uuid,
-) -> Result<(Vec<PreparedDbAction>, Vec<PreparedDbAction>, bool, Vec<(RunKey, WorkflowInstanceState)>)>
-{
+) -> Result<(
+    Vec<PreparedDbAction>,
+    Vec<PreparedDbAction>,
+    bool,
+    Vec<(RunKey, WorkflowInstanceState)>,
+)> {
     let mut general = Vec::new();
     let mut schedules = Vec::new();
     let mut notifies = false;
@@ -1712,7 +2101,9 @@ async fn materialize_child_workflows_from_plan(
             .store
             .get_latest_artifact(&parent_instance.tenant_id, child_definition_id)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("child workflow definition {child_definition_id} not found"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("child workflow definition {child_definition_id} not found")
+            })?;
         let child_run_id = format!("run-{}", Uuid::now_v7());
         let workflow_task_queue =
             task_queue.clone().unwrap_or_else(|| parent_instance.workflow_task_queue.clone());
@@ -1794,6 +2185,10 @@ async fn materialize_child_workflows_from_plan(
             occurred_at,
         });
         general.push(PreparedDbAction::UpsertInstance(child_instance.clone()));
+        if child_instance.status.is_terminal() {
+            general
+                .push(PreparedDbAction::CloseRun(child_run_key.clone(), child_instance.updated_at));
+        }
 
         {
             let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
@@ -1860,12 +2255,9 @@ async fn reflect_terminal_children_to_parents(
         };
 
         let (status, output, error, payload_kind) = match child_instance.status {
-            WorkflowStatus::Completed => (
-                "completed".to_owned(),
-                child_instance.output.clone(),
-                None,
-                "completed",
-            ),
+            WorkflowStatus::Completed => {
+                ("completed".to_owned(), child_instance.output.clone(), None, "completed")
+            }
             WorkflowStatus::Failed => (
                 "failed".to_owned(),
                 None,
@@ -2020,7 +2412,7 @@ async fn reflect_terminal_children_to_parents(
             )?
         };
 
-        {
+        let reflected_parent_snapshot = {
             let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
             let Some(parent_runtime) = inner.instances.get_mut(&parent_run_key) else {
                 continue;
@@ -2059,20 +2451,27 @@ async fn reflect_terminal_children_to_parents(
                 notifies = true;
             }
             general.push(PreparedDbAction::UpsertInstance(parent_snapshot.clone()));
+            general.extend(prepared_update_actions_from_plan(
+                &parent_run_key,
+                &plan,
+                reflection_event.event_id,
+                reflection_event.occurred_at,
+            ));
             if parent_terminal {
                 general.push(PreparedDbAction::CloseRun(
                     parent_run_key.clone(),
                     reflection_event.occurred_at,
                 ));
-                pending.push((parent_run_key.clone(), parent_snapshot));
+                pending.push((parent_run_key.clone(), parent_snapshot.clone()));
             }
             mark_runtime_dirty(&mut inner, "child_reflection", false);
-        }
+            parent_snapshot
+        };
 
         let (child_general, child_schedules, child_notifies, terminal_children) =
             materialize_child_workflows_from_plan(
                 state,
-                &parent_instance,
+                &reflected_parent_snapshot,
                 &plan,
                 reflection_event.occurred_at,
                 reflection_event.event_id,
@@ -2087,18 +2486,16 @@ async fn reflect_terminal_children_to_parents(
     Ok((general, schedules, notifies))
 }
 
-async fn apply_post_plan_child_effects(
-    state: &AppState,
-    effect: PostPlanEffect,
-) -> Result<()> {
-    let (general, schedules, mut notifies, terminal_children) = materialize_child_workflows_from_plan(
-        state,
-        &effect.instance,
-        &effect.plan,
-        effect.occurred_at,
-        effect.source_event_id,
-    )
-    .await?;
+async fn apply_post_plan_child_effects(state: &AppState, effect: PostPlanEffect) -> Result<()> {
+    let (general, schedules, mut notifies, terminal_children) =
+        materialize_child_workflows_from_plan(
+            state,
+            &effect.instance,
+            &effect.plan,
+            effect.occurred_at,
+            effect.source_event_id,
+        )
+        .await?;
     if !general.is_empty() || !schedules.is_empty() {
         apply_db_actions(state, general, schedules).await?;
         state.persist_notify.notify_one();
@@ -2534,9 +2931,63 @@ impl ActivityWorkerApi for WorkerApi {
 
     async fn record_activity_heartbeat(
         &self,
-        _request: Request<RecordActivityHeartbeatRequest>,
+        request: Request<RecordActivityHeartbeatRequest>,
     ) -> Result<Response<RecordActivityHeartbeatResponse>, Status> {
-        Ok(Response::new(RecordActivityHeartbeatResponse { cancellation_requested: false }))
+        if current_owner_epoch(&self.state).is_none() {
+            return Err(Status::unavailable("unified-runtime ownership inactive"));
+        }
+        let request = request.into_inner();
+        let attempt_key = AttemptKey {
+            tenant_id: request.tenant_id.clone(),
+            instance_id: request.instance_id.clone(),
+            run_id: request.run_id.clone(),
+            activity_id: request.activity_id.clone(),
+            attempt: request.attempt,
+        };
+        let now = Utc::now();
+        let lease_expires_at = now + chrono::Duration::seconds(DEFAULT_LEASE_TTL_SECS);
+        let in_memory_cancellation_requested = {
+            let mut inner = self.state.inner.lock().expect("unified runtime lock poisoned");
+            let Some(leased) = inner.leased.get_mut(&attempt_key) else {
+                return Ok(Response::new(RecordActivityHeartbeatResponse {
+                    cancellation_requested: false,
+                }));
+            };
+            if leased.owner_epoch != request.owner_epoch
+                || leased.task.lease_epoch != request.lease_epoch
+                || leased.worker_id != request.worker_id
+                || leased.worker_build_id != request.worker_build_id
+            {
+                return Ok(Response::new(RecordActivityHeartbeatResponse {
+                    cancellation_requested: false,
+                }));
+            }
+            leased.lease_expires_at = lease_expires_at;
+            leased.task.cancellation_requested
+        };
+        let heartbeat = self
+            .state
+            .store
+            .record_activity_heartbeat(
+                &request.tenant_id,
+                &request.instance_id,
+                &request.run_id,
+                &request.activity_id,
+                request.attempt,
+                &request.worker_id,
+                &request.worker_build_id,
+                lease_expires_at,
+                Uuid::now_v7(),
+                "UnifiedActivityHeartbeat",
+                now,
+            )
+            .await
+            .map_err(internal_status)?;
+        self.state.persist_notify.notify_one();
+        Ok(Response::new(RecordActivityHeartbeatResponse {
+            cancellation_requested: in_memory_cancellation_requested
+                || heartbeat.cancellation_requested,
+        }))
     }
 
     async fn report_activity_task_cancelled(
@@ -2588,9 +3039,7 @@ impl ActivityWorkerApi for WorkerApi {
             .await
             .map_err(internal_status)?;
         for post_plan in actions.post_plans {
-            apply_post_plan_child_effects(&self.state, post_plan)
-                .await
-                .map_err(internal_status)?;
+            apply_post_plan_child_effects(&self.state, post_plan).await.map_err(internal_status)?;
         }
         if actions.notifies {
             self.state.notify.notify_waiters();
@@ -2976,6 +3425,112 @@ async fn apply_db_actions(
                     .close_run(&run_key.tenant_id, &run_key.instance_id, &run_key.run_id, closed_at)
                     .await?;
             }
+            PreparedDbAction::PutRunStart {
+                tenant_id,
+                instance_id,
+                run_id,
+                definition_id,
+                definition_version,
+                artifact_hash,
+                workflow_task_queue,
+                trigger_event_id,
+                started_at,
+                previous_run_id,
+                triggered_by_run_id,
+            } => {
+                state
+                    .store
+                    .put_run_start(
+                        &tenant_id,
+                        &instance_id,
+                        &run_id,
+                        &definition_id,
+                        definition_version,
+                        artifact_hash.as_deref(),
+                        &workflow_task_queue,
+                        trigger_event_id,
+                        started_at,
+                        previous_run_id.as_deref(),
+                        triggered_by_run_id.as_deref(),
+                    )
+                    .await?;
+            }
+            PreparedDbAction::UpsertChildStartRequested {
+                tenant_id,
+                instance_id,
+                run_id,
+                child_id,
+                child_workflow_id,
+                child_definition_id,
+                parent_close_policy,
+                input,
+                source_event_id,
+                occurred_at,
+            } => {
+                state
+                    .store
+                    .upsert_child_start_requested(
+                        &tenant_id,
+                        &instance_id,
+                        &run_id,
+                        &child_id,
+                        &child_workflow_id,
+                        &child_definition_id,
+                        &parent_close_policy,
+                        &input,
+                        source_event_id,
+                        occurred_at,
+                    )
+                    .await?;
+            }
+            PreparedDbAction::MarkChildStarted {
+                tenant_id,
+                instance_id,
+                run_id,
+                child_id,
+                child_run_id,
+                started_event_id,
+                occurred_at,
+            } => {
+                state
+                    .store
+                    .mark_child_started(
+                        &tenant_id,
+                        &instance_id,
+                        &run_id,
+                        &child_id,
+                        &child_run_id,
+                        started_event_id,
+                        occurred_at,
+                    )
+                    .await?;
+            }
+            PreparedDbAction::CompleteChild {
+                tenant_id,
+                instance_id,
+                run_id,
+                child_id,
+                status,
+                output,
+                error,
+                terminal_event_id,
+                occurred_at,
+            } => {
+                state
+                    .store
+                    .complete_child(
+                        &tenant_id,
+                        &instance_id,
+                        &run_id,
+                        &child_id,
+                        &status,
+                        output.as_ref(),
+                        error.as_deref(),
+                        terminal_event_id,
+                        occurred_at,
+                    )
+                    .await?;
+            }
             PreparedDbAction::CompleteUpdate {
                 tenant_id,
                 instance_id,
@@ -3045,6 +3600,7 @@ fn queued_activity_from_record(record: &fabrik_store::WorkflowActivityRecord) ->
         config: record.config.clone(),
         state: record.state.clone().unwrap_or_default(),
         scheduled_at: record.scheduled_at,
+        cancellation_requested: record.cancellation_requested,
         lease_epoch: 0,
     }
 }
@@ -3106,7 +3662,7 @@ fn activity_proto(leased: &LeasedActivity) -> ActivityTask {
         lease_expires_at_unix_ms: leased.lease_expires_at.timestamp_millis(),
         start_to_close_timeout_ms: 0,
         heartbeat_timeout_ms: 0,
-        cancellation_requested: false,
+        cancellation_requested: leased.task.cancellation_requested,
         schedule_to_start_timeout_ms: 0,
         lease_epoch: leased.task.lease_epoch,
         owner_epoch: leased.owner_epoch,
@@ -3149,6 +3705,7 @@ fn schedule_activities_from_plan(
                     .or_else(|| emission.state.clone())
                     .unwrap_or_else(|| instance.current_state.clone().unwrap_or_default()),
                 scheduled_at,
+                cancellation_requested: false,
                 lease_epoch: 0,
             });
         }
@@ -3190,6 +3747,7 @@ fn build_retry_task(
                 .map(|value| serde_json::to_value(value).expect("step config serializes")),
             state: active.wait_state.clone(),
             scheduled_at: due_at,
+            cancellation_requested: false,
             lease_epoch: 0,
         },
         due_at,
@@ -3484,6 +4042,65 @@ fn unified_failure_allows_retry(attempt: u32, retry: &RetryPolicy, error: &str) 
     attempt < retry.max_attempts && retry_policy_allows_failure_retry(retry, error)
 }
 
+fn unified_child_trigger_event_id(parent_event_id: Uuid, child_id: &str) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("unified-child-trigger:{parent_event_id}:{child_id}").as_bytes(),
+    )
+}
+
+fn unified_child_reflection_event_id(
+    child_event_id: Uuid,
+    parent_run_id: &str,
+    child_id: &str,
+    kind: &str,
+) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("unified-child-reflection:{child_event_id}:{parent_run_id}:{child_id}:{kind}")
+            .as_bytes(),
+    )
+}
+
+fn prepared_update_actions_from_plan(
+    run_key: &RunKey,
+    plan: &CompiledExecutionPlan,
+    completed_event_id: Uuid,
+    completed_at: DateTime<Utc>,
+) -> Vec<PreparedDbAction> {
+    let mut actions = Vec::new();
+    for emission in &plan.emissions {
+        match &emission.event {
+            WorkflowEvent::WorkflowUpdateCompleted { update_id, output, .. } => {
+                actions.push(PreparedDbAction::CompleteUpdate {
+                    tenant_id: run_key.tenant_id.clone(),
+                    instance_id: run_key.instance_id.clone(),
+                    run_id: run_key.run_id.clone(),
+                    update_id: update_id.clone(),
+                    output: Some(output.clone()),
+                    error: None,
+                    completed_event_id,
+                    completed_at,
+                });
+            }
+            WorkflowEvent::WorkflowUpdateRejected { update_id, error, .. } => {
+                actions.push(PreparedDbAction::CompleteUpdate {
+                    tenant_id: run_key.tenant_id.clone(),
+                    instance_id: run_key.instance_id.clone(),
+                    run_id: run_key.run_id.clone(),
+                    update_id: update_id.clone(),
+                    output: None,
+                    error: Some(error.clone()),
+                    completed_event_id,
+                    completed_at,
+                });
+            }
+            _ => {}
+        }
+    }
+    actions
+}
+
 fn apply_compiled_plan(state: &mut WorkflowInstanceState, plan: &CompiledExecutionPlan) {
     state.current_state = Some(plan.final_state.clone());
     state.context = plan.context.clone();
@@ -3512,6 +4129,7 @@ mod tests {
     use fabrik_events::WorkflowIdentity;
     use fabrik_workflow::{
         ArtifactEntrypoint, CompiledStateNode, CompiledUpdateHandler, CompiledWorkflow, Expression,
+        ParentClosePolicy,
     };
     use serde_json::json;
     use std::{
@@ -3521,6 +4139,7 @@ mod tests {
         time::{Duration as StdDuration, Instant},
     };
     use tokio::time::sleep;
+    use tonic::Request;
 
     fn queued_activity(
         activity_id: &str,
@@ -3542,6 +4161,7 @@ mod tests {
             config: None,
             state: "join".to_owned(),
             scheduled_at,
+            cancellation_requested: false,
             lease_epoch: 0,
         }
     }
@@ -3666,28 +4286,144 @@ mod tests {
             "unified-runtime-test",
             ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
             CompiledWorkflow { initial_state: "dispatch".to_owned(), states },
-    )
-}
+        )
+    }
 
-fn unified_child_trigger_event_id(parent_event_id: Uuid, child_id: &str) -> Uuid {
-    Uuid::new_v5(
-        &Uuid::NAMESPACE_URL,
-        format!("unified-child-trigger:{parent_event_id}:{child_id}").as_bytes(),
-    )
-}
+    fn child_parent_artifact() -> CompiledWorkflowArtifact {
+        let workflow = CompiledWorkflow {
+            initial_state: "start_child".to_owned(),
+            states: BTreeMap::from([
+                (
+                    "start_child".to_owned(),
+                    CompiledStateNode::StartChild {
+                        child_definition_id: "childDefinition".to_owned(),
+                        input: Expression::Literal { value: json!({"value": "hello-child"}) },
+                        next: "await_child".to_owned(),
+                        handle_var: Some("child".to_owned()),
+                        workflow_id: Some(Expression::Literal {
+                            value: Value::String("child-instance".to_owned()),
+                        }),
+                        task_queue: None,
+                        parent_close_policy: ParentClosePolicy::Terminate,
+                    },
+                ),
+                (
+                    "await_child".to_owned(),
+                    CompiledStateNode::WaitForChild {
+                        child_ref_var: "child".to_owned(),
+                        next: "done".to_owned(),
+                        output_var: Some("child_result".to_owned()),
+                        on_error: None,
+                    },
+                ),
+                (
+                    "done".to_owned(),
+                    CompiledStateNode::Succeed {
+                        output: Some(Expression::Identifier { name: "child_result".to_owned() }),
+                    },
+                ),
+            ]),
+        };
+        let mut artifact = CompiledWorkflowArtifact::new(
+            "unified-parent-child".to_owned(),
+            1,
+            "unified-runtime-test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            workflow,
+        );
+        artifact.artifact_hash = artifact.hash();
+        artifact
+    }
 
-fn unified_child_reflection_event_id(
-    child_event_id: Uuid,
-    parent_run_id: &str,
-    child_id: &str,
-    kind: &str,
-) -> Uuid {
-    Uuid::new_v5(
-        &Uuid::NAMESPACE_URL,
-        format!("unified-child-reflection:{child_event_id}:{parent_run_id}:{child_id}:{kind}")
-            .as_bytes(),
-    )
-}
+    fn child_leaf_artifact() -> CompiledWorkflowArtifact {
+        let workflow = CompiledWorkflow {
+            initial_state: "done".to_owned(),
+            states: BTreeMap::from([(
+                "done".to_owned(),
+                CompiledStateNode::Succeed {
+                    output: Some(Expression::Member {
+                        object: Box::new(Expression::Identifier { name: "input".to_owned() }),
+                        property: "value".to_owned(),
+                    }),
+                },
+            )]),
+        };
+        let mut artifact = CompiledWorkflowArtifact::new(
+            "childDefinition".to_owned(),
+            1,
+            "unified-runtime-test",
+            ArtifactEntrypoint { module: "child.ts".to_owned(), export: "workflow".to_owned() },
+            workflow,
+        );
+        artifact.artifact_hash = artifact.hash();
+        artifact
+    }
+
+    fn update_child_artifact() -> CompiledWorkflowArtifact {
+        let workflow = CompiledWorkflow {
+            initial_state: "wait_signal".to_owned(),
+            states: BTreeMap::from([(
+                "wait_signal".to_owned(),
+                CompiledStateNode::WaitForEvent {
+                    event_type: "ready".to_owned(),
+                    next: "done".to_owned(),
+                    output_var: None,
+                },
+            )]),
+        };
+        let mut artifact = CompiledWorkflowArtifact::new(
+            "unified-update-child".to_owned(),
+            1,
+            "unified-runtime-test",
+            ArtifactEntrypoint {
+                module: "update-child.ts".to_owned(),
+                export: "workflow".to_owned(),
+            },
+            workflow,
+        );
+        artifact.updates.insert(
+            "approve".to_owned(),
+            CompiledUpdateHandler {
+                arg_name: Some("args".to_owned()),
+                initial_state: "start_child".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "start_child".to_owned(),
+                        CompiledStateNode::StartChild {
+                            child_definition_id: "childDefinition".to_owned(),
+                            input: Expression::Identifier { name: "args".to_owned() },
+                            next: "await_child".to_owned(),
+                            handle_var: Some("child".to_owned()),
+                            workflow_id: Some(Expression::Literal {
+                                value: Value::String("child-instance-update".to_owned()),
+                            }),
+                            task_queue: None,
+                            parent_close_policy: ParentClosePolicy::RequestCancel,
+                        },
+                    ),
+                    (
+                        "await_child".to_owned(),
+                        CompiledStateNode::WaitForChild {
+                            child_ref_var: "child".to_owned(),
+                            next: "finish".to_owned(),
+                            output_var: Some("child_result".to_owned()),
+                            on_error: None,
+                        },
+                    ),
+                    (
+                        "finish".to_owned(),
+                        CompiledStateNode::Succeed {
+                            output: Some(Expression::Identifier {
+                                name: "child_result".to_owned(),
+                            }),
+                        },
+                    ),
+                ]),
+            },
+        );
+        artifact.artifact_hash = artifact.hash();
+        artifact
+    }
 
     fn update_test_artifact() -> CompiledWorkflowArtifact {
         let workflow = CompiledWorkflow {
@@ -4205,7 +4941,7 @@ fn unified_child_reflection_event_id(
         instance.definition_id = artifact.definition_id.clone();
         instance.definition_version = Some(artifact.definition_version);
         instance.artifact_hash = Some(artifact.artifact_hash.clone());
-        instance.artifact_execution = Some(ArtifactExecutionState::default());
+        instance.artifact_execution = None;
         store.upsert_instance(&instance).await?;
 
         let queued = queued_activity_for_run("cancel", "activity-cancel", 1, now);
@@ -4273,6 +5009,419 @@ fn unified_child_reflection_event_id(
             .await?
             .context("stored instance should exist")?;
         assert_eq!(stored.status, WorkflowStatus::Cancelled);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_mailbox_item_unwinds_active_activity_instead_of_force_cancelling_workflow(
+    ) -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = test_artifact("default");
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir =
+            std::env::temp_dir().join(format!("unified-runtime-cancel-unwind-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-cancel-unwind",
+            "run-cancel-unwind",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({"items": [json!({"value": "x"})]}) },
+            Utc::now(),
+        );
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let cancel_requested = test_event(
+            &identity,
+            WorkflowEvent::WorkflowCancellationRequested { reason: "stop".to_owned() },
+            Utc::now(),
+        );
+        let item = mailbox_record(
+            WorkflowMailboxKind::CancelRequest,
+            cancel_requested,
+            None,
+            None,
+            None,
+        );
+
+        let outcome = dispatch_cancel_mailbox_item_unified(&app_state, &item).await?;
+        let MailboxDrainOutcome::Processed { general, schedules, .. } = outcome else {
+            anyhow::bail!("expected processed cancel unwind outcome");
+        };
+        apply_db_actions(&app_state, general, schedules).await?;
+
+        let stored = store
+            .get_instance("tenant", "instance-cancel-unwind")
+            .await?
+            .context("stored instance should exist")?;
+        assert_ne!(stored.status, WorkflowStatus::Cancelled);
+        assert_eq!(stored.status, WorkflowStatus::Completed);
+
+        let activities =
+            store.list_activities_for_run("tenant", "instance-cancel-unwind", "run-cancel-unwind")
+                .await?;
+        assert_eq!(activities.len(), 1);
+        assert_eq!(activities[0].status, fabrik_store::WorkflowActivityStatus::Cancelled);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn activity_cancellation_request_immediately_cancels_scheduled_task() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+        let run_key = run_key_for("activity-cancel");
+        let queued = queued_activity_for_run(&run_key.run_id, "activity-1", 1, now);
+        let mut instance =
+            workflow_instance_for_run(&run_key.run_id, WorkflowStatus::Running, 1, now);
+        instance.current_state = None;
+        store.upsert_instance(&instance).await?;
+        store.upsert_activities_scheduled_batch(&[activity_schedule_update(&queued)]).await?;
+
+        let mut inner = RuntimeInner::default();
+        inner.instances.insert(
+            run_key.clone(),
+            RuntimeWorkflowState {
+                artifact: test_artifact("default"),
+                instance,
+                active_activities: BTreeMap::from([(
+                    "activity-1".to_owned(),
+                    ActiveActivityMeta {
+                        attempt: 1,
+                        task_queue: "default".to_owned(),
+                        activity_type: "benchmark.echo".to_owned(),
+                        wait_state: "join".to_owned(),
+                    },
+                )]),
+            },
+        );
+        inner
+            .ready
+            .entry(QueueKey { tenant_id: "tenant".to_owned(), task_queue: "default".to_owned() })
+            .or_default()
+            .push_back(queued);
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-activity-cancel-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), inner, state_dir.clone());
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            "definition",
+            1,
+            "artifact",
+            &run_key.instance_id,
+            &run_key.run_id,
+            "unified-runtime-test",
+        );
+        let cancel_event = test_event(
+            &identity,
+            WorkflowEvent::ActivityTaskCancellationRequested {
+                activity_id: "activity-1".to_owned(),
+                attempt: 1,
+                reason: "stop".to_owned(),
+                metadata: Some(json!({"source": "test"})),
+            },
+            now,
+        );
+
+        handle_activity_cancellation_requested_event(&app_state, cancel_event).await?;
+
+        let inner = app_state.inner.lock().expect("unified runtime lock poisoned");
+        let runtime = inner.instances.get(&run_key).context("runtime should exist")?;
+        assert!(runtime.active_activities.is_empty());
+        assert!(inner.ready.values().all(VecDeque::is_empty));
+        drop(inner);
+
+        let activity = store
+            .get_activity_attempt("tenant", &run_key.instance_id, &run_key.run_id, "activity-1", 1)
+            .await?
+            .context("cancelled activity should exist")?;
+        assert_eq!(activity.status, fabrik_store::WorkflowActivityStatus::Cancelled);
+        assert_eq!(activity.cancellation_reason.as_deref(), Some("stop"));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn heartbeat_reports_cancellation_for_leased_task() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+        let queued = queued_activity("activity-1", 1, now);
+        store.upsert_activities_scheduled_batch(&[activity_schedule_update(&queued)]).await?;
+        store
+            .mark_activity_started(
+                "tenant",
+                "instance",
+                "run",
+                "activity-1",
+                1,
+                "worker",
+                "build",
+                now + ChronoDuration::seconds(30),
+                Uuid::now_v7(),
+                "test-start",
+                now,
+            )
+            .await?;
+        store
+            .request_activity_cancellation(
+                "tenant",
+                "instance",
+                "run",
+                "activity-1",
+                1,
+                "stop",
+                None,
+                Uuid::now_v7(),
+                "test-cancel-request",
+                now,
+            )
+            .await?;
+
+        let mut inner = RuntimeInner { owner_epoch: 7, ..RuntimeInner::default() };
+        let mut leased_task = queued_activity("activity-1", 1, now);
+        leased_task.lease_epoch = 3;
+        leased_task.cancellation_requested = true;
+        inner.leased.insert(
+            attempt_key_from_task(&leased_task),
+            LeasedActivity {
+                task: leased_task,
+                worker_id: "worker".to_owned(),
+                worker_build_id: "build".to_owned(),
+                lease_expires_at: now + ChronoDuration::seconds(10),
+                owner_epoch: 7,
+            },
+        );
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-heartbeat-cancel-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), inner, state_dir.clone());
+        apply_ownership_record(&app_state, 1, "test-owner", 7, now + ChronoDuration::seconds(30));
+        let worker = WorkerApi { state: app_state.clone() };
+        let response = worker
+            .record_activity_heartbeat(Request::new(RecordActivityHeartbeatRequest {
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance".to_owned(),
+                run_id: "run".to_owned(),
+                activity_id: "activity-1".to_owned(),
+                attempt: 1,
+                worker_id: "worker".to_owned(),
+                worker_build_id: "build".to_owned(),
+                details_json: String::new(),
+                lease_epoch: 3,
+                owner_epoch: 7,
+            }))
+            .await?
+            .into_inner();
+
+        assert!(response.cancellation_requested);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trigger_start_child_completes_child_and_reflects_to_parent() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let parent_artifact = child_parent_artifact();
+        let child_artifact = child_leaf_artifact();
+        store.put_artifact("tenant", &parent_artifact).await?;
+        store.put_artifact("tenant", &child_artifact).await?;
+
+        let state_dir =
+            std::env::temp_dir().join(format!("unified-runtime-child-test-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &parent_artifact.definition_id,
+            parent_artifact.definition_version,
+            parent_artifact.artifact_hash.clone(),
+            "parent-instance",
+            "parent-run",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({"seed": true}) },
+            Utc::now(),
+        );
+
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let parent = store
+            .get_instance("tenant", "parent-instance")
+            .await?
+            .context("parent instance should exist")?;
+        assert_eq!(parent.status, WorkflowStatus::Completed);
+        assert_eq!(parent.output, Some(Value::String("hello-child".to_owned())));
+
+        let child = store
+            .get_instance("tenant", "child-instance")
+            .await?
+            .context("child instance should exist")?;
+        assert_eq!(child.status, WorkflowStatus::Completed);
+        assert_eq!(child.output, Some(Value::String("hello-child".to_owned())));
+
+        let children =
+            store.list_children_for_run("tenant", "parent-instance", "parent-run").await?;
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].child_workflow_id, "child-instance");
+        assert_eq!(children[0].status, "completed");
+        assert_eq!(children[0].output, Some(Value::String("hello-child".to_owned())));
+        assert!(children[0].error.is_none());
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_mailbox_item_can_start_child_and_complete_update() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = update_child_artifact();
+        let child_artifact = child_leaf_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+        store.put_artifact("tenant", &child_artifact).await?;
+
+        let now = Utc::now();
+        let run_key = RunKey {
+            tenant_id: "tenant".to_owned(),
+            instance_id: "instance-update-child".to_owned(),
+            run_id: "update-child-run".to_owned(),
+        };
+        let instance = WorkflowInstanceState {
+            tenant_id: run_key.tenant_id.clone(),
+            instance_id: run_key.instance_id.clone(),
+            run_id: run_key.run_id.clone(),
+            definition_id: artifact.definition_id.clone(),
+            definition_version: Some(artifact.definition_version),
+            artifact_hash: Some(artifact.artifact_hash.clone()),
+            workflow_task_queue: "default".to_owned(),
+            sticky_workflow_build_id: None,
+            sticky_workflow_poller_id: None,
+            current_state: Some("wait_signal".to_owned()),
+            context: None,
+            artifact_execution: Some(ArtifactExecutionState::default()),
+            status: WorkflowStatus::Running,
+            input: Some(json!({"seed": true})),
+            output: None,
+            event_count: 1,
+            last_event_id: Uuid::now_v7(),
+            last_event_type: "WorkflowTriggered".to_owned(),
+            updated_at: now,
+        };
+        store.upsert_instance(&instance).await?;
+        store
+            .queue_update(
+                &run_key.tenant_id,
+                &run_key.instance_id,
+                &run_key.run_id,
+                "update-1",
+                "approve",
+                None,
+                &json!({"value": "hello-child"}),
+                Uuid::now_v7(),
+                now,
+            )
+            .await?;
+
+        let mut inner = RuntimeInner::default();
+        inner.instances.insert(
+            run_key.clone(),
+            RuntimeWorkflowState {
+                artifact: artifact.clone(),
+                instance: instance.clone(),
+                active_activities: BTreeMap::new(),
+            },
+        );
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-update-child-test-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), inner, state_dir.clone());
+        let requested = test_event(
+            &WorkflowIdentity::new(
+                &run_key.tenant_id,
+                &artifact.definition_id,
+                artifact.definition_version,
+                artifact.artifact_hash.clone(),
+                &run_key.instance_id,
+                &run_key.run_id,
+                "unified-runtime-test",
+            ),
+            WorkflowEvent::WorkflowUpdateRequested {
+                update_id: "update-1".to_owned(),
+                update_name: "approve".to_owned(),
+                payload: json!({"value": "hello-child"}),
+            },
+            now,
+        );
+        let item = mailbox_record(
+            WorkflowMailboxKind::Update,
+            requested,
+            Some("update-1"),
+            Some("approve"),
+            Some(json!({"value": "hello-child"})),
+        );
+
+        let outcome = dispatch_update_mailbox_item_unified(&app_state, &item).await?;
+        let MailboxDrainOutcome::Processed { general, schedules, post_plan, .. } = outcome else {
+            anyhow::bail!("expected processed update outcome");
+        };
+        apply_db_actions(&app_state, general, schedules).await?;
+        if let Some(post_plan) = post_plan {
+            apply_post_plan_child_effects(&app_state, post_plan).await?;
+        }
+
+        let update = store
+            .get_update(&run_key.tenant_id, &run_key.instance_id, &run_key.run_id, "update-1")
+            .await?
+            .context("update record should exist")?;
+        assert_eq!(update.status, WorkflowUpdateStatus::Completed);
+        assert_eq!(update.output, Some(Value::String("hello-child".to_owned())));
+
+        let child = store
+            .get_instance(&run_key.tenant_id, "child-instance-update")
+            .await?
+            .context("child instance should exist")?;
+        assert_eq!(child.status, WorkflowStatus::Completed);
+        assert_eq!(child.output, Some(Value::String("hello-child".to_owned())));
+
+        let parent = store
+            .get_instance(&run_key.tenant_id, &run_key.instance_id)
+            .await?
+            .context("parent instance should exist")?;
+        assert_eq!(parent.status, WorkflowStatus::Running);
+
+        let children = store
+            .list_children_for_run(&run_key.tenant_id, &run_key.instance_id, &run_key.run_id)
+            .await?;
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].status, "completed");
+        assert_eq!(children[0].output, Some(Value::String("hello-child".to_owned())));
 
         fs::remove_dir_all(state_dir).ok();
         Ok(())

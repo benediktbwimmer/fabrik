@@ -495,6 +495,31 @@ pub struct WorkflowRunRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowRunSummaryRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub definition_id: String,
+    pub definition_version: Option<u32>,
+    pub artifact_hash: Option<String>,
+    pub workflow_task_queue: String,
+    pub sticky_workflow_build_id: Option<String>,
+    pub sticky_workflow_poller_id: Option<String>,
+    pub sticky_updated_at: Option<DateTime<Utc>>,
+    pub previous_run_id: Option<String>,
+    pub next_run_id: Option<String>,
+    pub continue_reason: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+    pub last_transition_at: DateTime<Utc>,
+    pub status: String,
+    pub current_state: Option<String>,
+    pub last_event_type: Option<String>,
+    pub event_count: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskQueueKind {
@@ -791,6 +816,52 @@ pub struct TaskQueueInspection {
     pub registered_builds: Vec<TaskQueueBuildRecord>,
     pub compatibility_sets: Vec<CompatibilitySetRecord>,
     pub pollers: Vec<QueuePollerRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct WorkflowInstanceFilters {
+    pub status: Option<String>,
+    pub definition_id: Option<String>,
+    pub task_queue: Option<String>,
+    pub updated_after: Option<DateTime<Utc>>,
+    pub query: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct WorkflowRunFilters {
+    pub status: Option<String>,
+    pub definition_id: Option<String>,
+    pub instance_id: Option<String>,
+    pub run_id: Option<String>,
+    pub task_queue: Option<String>,
+    pub query: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct TaskQueueRef {
+    pub tenant_id: String,
+    pub queue_kind: TaskQueueKind,
+    pub task_queue: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowDefinitionSummary {
+    pub tenant_id: String,
+    pub workflow_id: String,
+    pub latest_version: u32,
+    pub active_version: Option<u32>,
+    pub version_count: u64,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowArtifactSummary {
+    pub tenant_id: String,
+    pub workflow_id: String,
+    pub latest_version: u32,
+    pub active_version: Option<u32>,
+    pub version_count: u64,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -3213,6 +3284,394 @@ impl WorkflowStore {
         .transpose()
     }
 
+    pub async fn list_tenants(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT tenant_id
+            FROM (
+                SELECT tenant_id FROM workflow_instances
+                UNION
+                SELECT tenant_id FROM task_queue_builds
+                UNION
+                SELECT tenant_id FROM task_queue_compatibility_sets
+                UNION
+                SELECT tenant_id FROM task_queue_pollers
+                UNION
+                SELECT tenant_id FROM task_queue_throughput_policies
+                UNION
+                SELECT tenant_id FROM workflow_definitions
+                UNION
+                SELECT tenant_id FROM workflow_artifacts
+            ) tenants
+            ORDER BY tenant_id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list tenants")?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| row.try_get::<Option<String>, _>("tenant_id").ok().flatten())
+            .collect())
+    }
+
+    pub async fn count_instances_with_filters(
+        &self,
+        tenant_id: &str,
+        filters: &WorkflowInstanceFilters,
+    ) -> Result<u64> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) AS count
+            FROM workflow_instances
+            WHERE tenant_id = $1
+              AND ($2::text IS NULL OR status = $2)
+              AND ($3::text IS NULL OR workflow_id = $3)
+              AND ($4::text IS NULL OR COALESCE(state->>'workflow_task_queue', 'default') = $4)
+              AND ($5::timestamptz IS NULL OR updated_at >= $5)
+              AND (
+                $6::text IS NULL
+                OR workflow_instance_id ILIKE '%' || $6 || '%'
+                OR workflow_id ILIKE '%' || $6 || '%'
+                OR COALESCE(run_id, '') ILIKE '%' || $6 || '%'
+                OR COALESCE(last_event_type, '') ILIKE '%' || $6 || '%'
+                OR COALESCE(state->>'current_state', '') ILIKE '%' || $6 || '%'
+              )
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(filters.status.as_deref())
+        .bind(filters.definition_id.as_deref())
+        .bind(filters.task_queue.as_deref())
+        .bind(filters.updated_after)
+        .bind(filters.query.as_deref())
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to count workflow instances with filters")?;
+
+        Ok(row.try_get::<i64, _>("count").context("workflow instance count missing")? as u64)
+    }
+
+    pub async fn list_instances_page_with_filters(
+        &self,
+        tenant_id: &str,
+        filters: &WorkflowInstanceFilters,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<WorkflowInstanceState>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT state
+            FROM workflow_instances
+            WHERE tenant_id = $1
+              AND ($2::text IS NULL OR status = $2)
+              AND ($3::text IS NULL OR workflow_id = $3)
+              AND ($4::text IS NULL OR COALESCE(state->>'workflow_task_queue', 'default') = $4)
+              AND ($5::timestamptz IS NULL OR updated_at >= $5)
+              AND (
+                $6::text IS NULL
+                OR workflow_instance_id ILIKE '%' || $6 || '%'
+                OR workflow_id ILIKE '%' || $6 || '%'
+                OR COALESCE(run_id, '') ILIKE '%' || $6 || '%'
+                OR COALESCE(last_event_type, '') ILIKE '%' || $6 || '%'
+                OR COALESCE(state->>'current_state', '') ILIKE '%' || $6 || '%'
+              )
+            ORDER BY updated_at DESC, workflow_instance_id ASC
+            LIMIT $7 OFFSET $8
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(filters.status.as_deref())
+        .bind(filters.definition_id.as_deref())
+        .bind(filters.task_queue.as_deref())
+        .bind(filters.updated_after)
+        .bind(filters.query.as_deref())
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list workflow instances with filters")?;
+
+        rows.into_iter()
+            .map(|row| {
+                row.try_get::<Json<WorkflowInstanceState>, _>("state")
+                    .map(|value| value.0)
+                    .context("failed to decode workflow instance state")
+            })
+            .collect()
+    }
+
+    pub async fn list_task_queue_refs_for_tenant(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Vec<TaskQueueRef>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT tenant_id, queue_kind, task_queue
+            FROM (
+                SELECT tenant_id, 'workflow'::text AS queue_kind, COALESCE(state->>'workflow_task_queue', 'default') AS task_queue
+                FROM workflow_instances
+                WHERE tenant_id = $1
+                UNION
+                SELECT tenant_id, 'workflow'::text AS queue_kind, task_queue
+                FROM workflow_tasks
+                WHERE tenant_id = $1
+                UNION
+                SELECT tenant_id, 'activity'::text AS queue_kind, task_queue
+                FROM workflow_activities
+                WHERE tenant_id = $1
+                UNION
+                SELECT tenant_id, 'activity'::text AS queue_kind, task_queue
+                FROM workflow_bulk_batches
+                WHERE tenant_id = $1
+                UNION
+                SELECT tenant_id, queue_kind, task_queue
+                FROM task_queue_builds
+                WHERE tenant_id = $1
+                UNION
+                SELECT tenant_id, queue_kind, task_queue
+                FROM task_queue_compatibility_sets
+                WHERE tenant_id = $1
+                UNION
+                SELECT tenant_id, queue_kind, task_queue
+                FROM task_queue_pollers
+                WHERE tenant_id = $1
+                UNION
+                SELECT tenant_id, queue_kind, task_queue
+                FROM task_queue_throughput_policies
+                WHERE tenant_id = $1
+            ) task_queues
+            WHERE task_queue <> ''
+            ORDER BY queue_kind ASC, task_queue ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list task queue refs for tenant")?;
+
+        rows.into_iter()
+            .map(|row| {
+                let queue_kind =
+                    TaskQueueKind::from_db(row.try_get::<String, _>("queue_kind")?.as_str())?;
+                Ok(TaskQueueRef {
+                    tenant_id: row
+                        .try_get("tenant_id")
+                        .context("task queue ref tenant_id missing")?,
+                    queue_kind,
+                    task_queue: row
+                        .try_get("task_queue")
+                        .context("task queue ref task_queue missing")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn list_workflow_definition_summaries(
+        &self,
+        tenant_id: &str,
+        query: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<WorkflowDefinitionSummary>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                tenant_id,
+                workflow_id,
+                MAX(version) AS latest_version,
+                MAX(version) FILTER (WHERE is_active) AS active_version,
+                COUNT(*) AS version_count,
+                MAX(created_at) AS updated_at
+            FROM workflow_definitions
+            WHERE tenant_id = $1
+              AND ($2::text IS NULL OR workflow_id ILIKE '%' || $2 || '%')
+            GROUP BY tenant_id, workflow_id
+            ORDER BY workflow_id ASC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(query)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list workflow definition summaries")?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(WorkflowDefinitionSummary {
+                    tenant_id: row
+                        .try_get("tenant_id")
+                        .context("definition summary tenant_id missing")?,
+                    workflow_id: row
+                        .try_get("workflow_id")
+                        .context("definition summary workflow_id missing")?,
+                    latest_version: row
+                        .try_get::<i32, _>("latest_version")
+                        .context("definition summary latest_version missing")?
+                        as u32,
+                    active_version: row
+                        .try_get::<Option<i32>, _>("active_version")
+                        .context("definition summary active_version missing")?
+                        .map(|value| value as u32),
+                    version_count: row
+                        .try_get::<i64, _>("version_count")
+                        .context("definition summary version_count missing")?
+                        as u64,
+                    updated_at: row
+                        .try_get("updated_at")
+                        .context("definition summary updated_at missing")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn count_workflow_definition_summaries(
+        &self,
+        tenant_id: &str,
+        query: Option<&str>,
+    ) -> Result<u64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM (
+                SELECT workflow_id
+                FROM workflow_definitions
+                WHERE tenant_id = $1
+                  AND ($2::text IS NULL OR workflow_id ILIKE '%' || $2 || '%')
+                GROUP BY workflow_id
+            ) definitions
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(query)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to count workflow definition summaries")?;
+
+        Ok(count as u64)
+    }
+
+    pub async fn list_workflow_artifact_summaries(
+        &self,
+        tenant_id: &str,
+        query: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<WorkflowArtifactSummary>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                tenant_id,
+                workflow_id,
+                MAX(version) AS latest_version,
+                MAX(version) FILTER (WHERE is_active) AS active_version,
+                COUNT(*) AS version_count,
+                MAX(created_at) AS updated_at
+            FROM workflow_artifacts
+            WHERE tenant_id = $1
+              AND ($2::text IS NULL OR workflow_id ILIKE '%' || $2 || '%')
+            GROUP BY tenant_id, workflow_id
+            ORDER BY workflow_id ASC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(query)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list workflow artifact summaries")?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(WorkflowArtifactSummary {
+                    tenant_id: row
+                        .try_get("tenant_id")
+                        .context("artifact summary tenant_id missing")?,
+                    workflow_id: row
+                        .try_get("workflow_id")
+                        .context("artifact summary workflow_id missing")?,
+                    latest_version: row
+                        .try_get::<i32, _>("latest_version")
+                        .context("artifact summary latest_version missing")?
+                        as u32,
+                    active_version: row
+                        .try_get::<Option<i32>, _>("active_version")
+                        .context("artifact summary active_version missing")?
+                        .map(|value| value as u32),
+                    version_count: row
+                        .try_get::<i64, _>("version_count")
+                        .context("artifact summary version_count missing")?
+                        as u64,
+                    updated_at: row
+                        .try_get("updated_at")
+                        .context("artifact summary updated_at missing")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn count_workflow_artifact_summaries(
+        &self,
+        tenant_id: &str,
+        query: Option<&str>,
+    ) -> Result<u64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM (
+                SELECT workflow_id
+                FROM workflow_artifacts
+                WHERE tenant_id = $1
+                  AND ($2::text IS NULL OR workflow_id ILIKE '%' || $2 || '%')
+                GROUP BY workflow_id
+            ) artifacts
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(query)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to count workflow artifact summaries")?;
+
+        Ok(count as u64)
+    }
+
+    pub async fn search_task_queue_builds(
+        &self,
+        tenant_id: &str,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<TaskQueueBuildRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT tenant_id, queue_kind, task_queue, build_id, artifact_hashes, metadata, created_at, updated_at
+            FROM task_queue_builds
+            WHERE tenant_id = $1
+              AND (
+                build_id ILIKE '%' || $2 || '%'
+                OR task_queue ILIKE '%' || $2 || '%'
+                OR artifact_hashes::text ILIKE '%' || $2 || '%'
+              )
+            ORDER BY updated_at DESC, build_id ASC
+            LIMIT $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(query)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to search task queue builds")?;
+
+        rows.into_iter().map(Self::decode_task_queue_build_row).collect()
+    }
+
     pub async fn put_run_start(
         &self,
         tenant_id: &str,
@@ -3386,6 +3845,81 @@ impl WorkflowStore {
         Ok(count as u64)
     }
 
+    pub async fn count_runs_with_filters(
+        &self,
+        tenant_id: &str,
+        filters: &WorkflowRunFilters,
+    ) -> Result<u64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            WITH run_summaries AS (
+                SELECT
+                    runs.tenant_id,
+                    runs.workflow_instance_id,
+                    runs.run_id,
+                    runs.workflow_id,
+                    runs.workflow_task_queue,
+                    COALESCE(
+                        instances.status,
+                        snapshots.state->>'status',
+                        CASE
+                            WHEN runs.closed_at IS NULL THEN 'running'
+                            WHEN runs.next_run_id IS NOT NULL THEN 'continued'
+                            ELSE 'closed'
+                        END
+                    ) AS status,
+                    COALESCE(
+                        instances.state->>'current_state',
+                        snapshots.state->>'current_state'
+                    ) AS current_state,
+                    COALESCE(instances.last_event_type, snapshots.last_event_type) AS last_event_type
+                FROM workflow_runs runs
+                LEFT JOIN workflow_instances instances
+                    ON instances.tenant_id = runs.tenant_id
+                   AND instances.workflow_instance_id = runs.workflow_instance_id
+                   AND instances.run_id = runs.run_id
+                LEFT JOIN LATERAL (
+                    SELECT state, last_event_type
+                    FROM workflow_state_snapshots snapshots
+                    WHERE snapshots.tenant_id = runs.tenant_id
+                      AND snapshots.workflow_instance_id = runs.workflow_instance_id
+                      AND snapshots.run_id = runs.run_id
+                    ORDER BY snapshots.updated_at DESC
+                    LIMIT 1
+                ) snapshots ON TRUE
+                WHERE runs.tenant_id = $1
+            )
+            SELECT COUNT(*)
+            FROM run_summaries
+            WHERE ($2::text IS NULL OR status = $2)
+              AND ($3::text IS NULL OR workflow_id = $3)
+              AND ($4::text IS NULL OR workflow_instance_id = $4)
+              AND ($5::text IS NULL OR run_id = $5)
+              AND ($6::text IS NULL OR workflow_task_queue = $6)
+              AND (
+                $7::text IS NULL
+                OR workflow_instance_id ILIKE '%' || $7 || '%'
+                OR workflow_id ILIKE '%' || $7 || '%'
+                OR run_id ILIKE '%' || $7 || '%'
+                OR COALESCE(last_event_type, '') ILIKE '%' || $7 || '%'
+                OR COALESCE(current_state, '') ILIKE '%' || $7 || '%'
+              )
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(filters.status.as_deref())
+        .bind(filters.definition_id.as_deref())
+        .bind(filters.instance_id.as_deref())
+        .bind(filters.run_id.as_deref())
+        .bind(filters.task_queue.as_deref())
+        .bind(filters.query.as_deref())
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to count workflow runs with filters")?;
+
+        Ok(count as u64)
+    }
+
     pub async fn list_runs_for_instance_page(
         &self,
         tenant_id: &str,
@@ -3430,6 +3964,121 @@ impl WorkflowStore {
         .context("failed to load workflow runs for instance")?;
 
         rows.into_iter().map(Self::decode_run_row).collect()
+    }
+
+    pub async fn list_runs_page_with_filters(
+        &self,
+        tenant_id: &str,
+        filters: &WorkflowRunFilters,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<WorkflowRunSummaryRecord>> {
+        let rows = sqlx::query(
+            r#"
+            WITH run_summaries AS (
+                SELECT
+                    runs.tenant_id,
+                    runs.workflow_instance_id,
+                    runs.run_id,
+                    runs.workflow_id,
+                    runs.definition_version,
+                    runs.artifact_hash,
+                    runs.workflow_task_queue,
+                    runs.sticky_workflow_build_id,
+                    runs.sticky_workflow_poller_id,
+                    runs.sticky_updated_at,
+                    runs.previous_run_id,
+                    runs.next_run_id,
+                    runs.continue_reason,
+                    runs.started_at,
+                    runs.closed_at,
+                    runs.updated_at,
+                    COALESCE(instances.updated_at, snapshots.updated_at, runs.updated_at) AS last_transition_at,
+                    COALESCE(
+                        instances.status,
+                        snapshots.state->>'status',
+                        CASE
+                            WHEN runs.closed_at IS NULL THEN 'running'
+                            WHEN runs.next_run_id IS NOT NULL THEN 'continued'
+                            ELSE 'closed'
+                        END
+                    ) AS status,
+                    COALESCE(
+                        instances.state->>'current_state',
+                        snapshots.state->>'current_state'
+                    ) AS current_state,
+                    COALESCE(instances.last_event_type, snapshots.last_event_type) AS last_event_type,
+                    COALESCE(instances.event_count, snapshots.event_count) AS event_count
+                FROM workflow_runs runs
+                LEFT JOIN workflow_instances instances
+                    ON instances.tenant_id = runs.tenant_id
+                   AND instances.workflow_instance_id = runs.workflow_instance_id
+                   AND instances.run_id = runs.run_id
+                LEFT JOIN LATERAL (
+                    SELECT state, event_count, last_event_type, updated_at
+                    FROM workflow_state_snapshots snapshots
+                    WHERE snapshots.tenant_id = runs.tenant_id
+                      AND snapshots.workflow_instance_id = runs.workflow_instance_id
+                      AND snapshots.run_id = runs.run_id
+                    ORDER BY snapshots.updated_at DESC
+                    LIMIT 1
+                ) snapshots ON TRUE
+                WHERE runs.tenant_id = $1
+            )
+            SELECT
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                workflow_id,
+                definition_version,
+                artifact_hash,
+                workflow_task_queue,
+                sticky_workflow_build_id,
+                sticky_workflow_poller_id,
+                sticky_updated_at,
+                previous_run_id,
+                next_run_id,
+                continue_reason,
+                started_at,
+                closed_at,
+                updated_at,
+                last_transition_at,
+                status,
+                current_state,
+                last_event_type,
+                event_count
+            FROM run_summaries
+            WHERE ($2::text IS NULL OR status = $2)
+              AND ($3::text IS NULL OR workflow_id = $3)
+              AND ($4::text IS NULL OR workflow_instance_id = $4)
+              AND ($5::text IS NULL OR run_id = $5)
+              AND ($6::text IS NULL OR workflow_task_queue = $6)
+              AND (
+                $7::text IS NULL
+                OR workflow_instance_id ILIKE '%' || $7 || '%'
+                OR workflow_id ILIKE '%' || $7 || '%'
+                OR run_id ILIKE '%' || $7 || '%'
+                OR COALESCE(last_event_type, '') ILIKE '%' || $7 || '%'
+                OR COALESCE(current_state, '') ILIKE '%' || $7 || '%'
+              )
+            ORDER BY last_transition_at DESC, workflow_instance_id ASC, run_id DESC
+            LIMIT $8 OFFSET $9
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(filters.status.as_deref())
+        .bind(filters.definition_id.as_deref())
+        .bind(filters.instance_id.as_deref())
+        .bind(filters.run_id.as_deref())
+        .bind(filters.task_queue.as_deref())
+        .bind(filters.query.as_deref())
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list workflow runs with filters")?;
+
+        rows.into_iter().map(Self::decode_run_summary_row).collect()
     }
 
     pub async fn get_run_record(
@@ -6160,6 +6809,40 @@ impl WorkflowStore {
         instance_id: &str,
         run_id: &str,
     ) -> Result<Vec<WorkflowUpdateRecord>> {
+        self.list_updates_for_run_page(tenant_id, instance_id, run_id, i64::MAX, 0).await
+    }
+
+    pub async fn count_updates_for_run(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+    ) -> Result<u64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM workflow_updates
+            WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to count workflow updates for run")?;
+
+        Ok(count as u64)
+    }
+
+    pub async fn list_updates_for_run_page(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<WorkflowUpdateRecord>> {
         let rows = sqlx::query(
             r#"
             SELECT tenant_id, workflow_instance_id, run_id, update_id, update_name, request_id,
@@ -6168,11 +6851,15 @@ impl WorkflowStore {
             FROM workflow_updates
             WHERE tenant_id = $1 AND workflow_instance_id = $2 AND run_id = $3
             ORDER BY requested_at ASC, update_id ASC
+            LIMIT $4
+            OFFSET $5
             "#,
         )
         .bind(tenant_id)
         .bind(instance_id)
         .bind(run_id)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await
         .context("failed to list workflow updates")?;
@@ -11428,6 +12115,61 @@ impl WorkflowStore {
             started_at: row.try_get("started_at").context("run started_at missing")?,
             closed_at: row.try_get("closed_at").context("run closed_at missing")?,
             updated_at: row.try_get("updated_at").context("run updated_at missing")?,
+        })
+    }
+
+    fn decode_run_summary_row(row: sqlx::postgres::PgRow) -> Result<WorkflowRunSummaryRecord> {
+        Ok(WorkflowRunSummaryRecord {
+            tenant_id: row.try_get("tenant_id").context("run summary tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("run summary workflow_instance_id missing")?,
+            run_id: row.try_get("run_id").context("run summary run_id missing")?,
+            definition_id: row.try_get("workflow_id").context("run summary workflow_id missing")?,
+            definition_version: row
+                .try_get::<Option<i32>, _>("definition_version")
+                .context("run summary definition_version missing")?
+                .map(|value| value as u32),
+            artifact_hash: row
+                .try_get("artifact_hash")
+                .context("run summary artifact_hash missing")?,
+            workflow_task_queue: row
+                .try_get("workflow_task_queue")
+                .context("run summary workflow_task_queue missing")?,
+            sticky_workflow_build_id: row
+                .try_get("sticky_workflow_build_id")
+                .context("run summary sticky_workflow_build_id missing")?,
+            sticky_workflow_poller_id: row
+                .try_get("sticky_workflow_poller_id")
+                .context("run summary sticky_workflow_poller_id missing")?,
+            sticky_updated_at: row
+                .try_get("sticky_updated_at")
+                .context("run summary sticky_updated_at missing")?,
+            previous_run_id: row
+                .try_get("previous_run_id")
+                .context("run summary previous_run_id missing")?,
+            next_run_id: row
+                .try_get("next_run_id")
+                .context("run summary next_run_id missing")?,
+            continue_reason: row
+                .try_get("continue_reason")
+                .context("run summary continue_reason missing")?,
+            started_at: row
+                .try_get("started_at")
+                .context("run summary started_at missing")?,
+            closed_at: row.try_get("closed_at").context("run summary closed_at missing")?,
+            updated_at: row.try_get("updated_at").context("run summary updated_at missing")?,
+            last_transition_at: row
+                .try_get("last_transition_at")
+                .context("run summary last_transition_at missing")?,
+            status: row.try_get("status").context("run summary status missing")?,
+            current_state: row
+                .try_get("current_state")
+                .context("run summary current_state missing")?,
+            last_event_type: row
+                .try_get("last_event_type")
+                .context("run summary last_event_type missing")?,
+            event_count: row.try_get("event_count").context("run summary event_count missing")?,
         })
     }
 

@@ -180,6 +180,8 @@ pub enum CompiledStateNode {
         next: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_var: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on_error: Option<ErrorTransition>,
     },
     WaitForEvent {
         event_type: String,
@@ -820,7 +822,7 @@ impl CompiledWorkflowArtifact {
             .get(wait_state)
             .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
         match state {
-            CompiledStateNode::WaitForChild { child_ref_var, next, output_var } => {
+            CompiledStateNode::WaitForChild { child_ref_var, next, output_var, .. } => {
                 let bound_child_id = execution_state
                     .bindings
                     .get(child_ref_var)
@@ -852,11 +854,14 @@ impl CompiledWorkflowArtifact {
         turn_context: ExecutionTurnContext,
     ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
         execution_state.turn_context = Some(turn_context);
-        let state = self
-            .state_by_id(wait_state)
+        let states = self
+            .states_for(wait_state, &execution_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
+        let state = states
+            .get(wait_state)
             .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
         match state {
-            CompiledStateNode::WaitForChild { child_ref_var, .. } => {
+            CompiledStateNode::WaitForChild { child_ref_var, on_error, .. } => {
                 let bound_child_id = execution_state
                     .bindings
                     .get(child_ref_var)
@@ -869,6 +874,19 @@ impl CompiledWorkflowArtifact {
                         expected: bound_child_id,
                         received: child_id.to_owned(),
                     });
+                }
+                if let Some(on_error) = on_error {
+                    if let Some(error_var) = &on_error.error_var {
+                        execution_state
+                            .bindings
+                            .insert(error_var.clone(), Value::String(error.to_owned()));
+                    }
+                    return self.execute_from_state_in_graph(
+                        states,
+                        &on_error.next,
+                        execution_state,
+                        false,
+                    );
                 }
                 if let Some(active_update) = &execution_state.active_update {
                     let return_state = active_update.return_state.clone();
@@ -2809,6 +2827,17 @@ pub fn evaluate_expression(
             Ok(Value::Object(object))
         }
         Expression::Call { callee, args } => {
+            if callee == "__temporal_is_cancellation" {
+                if args.len() != 1 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 1,
+                        received: args.len(),
+                    });
+                }
+                let value = evaluate_expression(&args[0], execution_state, helpers)?;
+                return Ok(Value::Bool(is_cancellation_value(&value)));
+            }
             let helper = helpers
                 .get(callee)
                 .ok_or_else(|| CompiledWorkflowError::UnknownHelper(callee.clone()))?;
@@ -2857,6 +2886,40 @@ pub fn evaluate_expression(
             );
             Ok(Value::String(value.to_string()))
         }
+    }
+}
+
+fn is_cancellation_value(value: &Value) -> bool {
+    match value {
+        Value::String(message) => message.to_ascii_lowercase().contains("cancel"),
+        Value::Object(object) => {
+            let field_matches = |field: &str, expected: &[&str]| {
+                object.get(field).and_then(Value::as_str).is_some_and(|value| {
+                    let lower = value.to_ascii_lowercase();
+                    expected.iter().any(|candidate| lower == *candidate)
+                })
+            };
+            object.get("cancelled").and_then(Value::as_bool).unwrap_or(false)
+                || field_matches("status", &["cancelled", "canceled"])
+                || field_matches("terminalStatus", &["cancelled", "canceled"])
+                || field_matches(
+                    "type",
+                    &["cancelledfailure", "canceledfailure", "cancellationerror", "cancellederror"],
+                )
+                || field_matches(
+                    "name",
+                    &["cancelledfailure", "canceledfailure", "cancellationerror", "cancellederror"],
+                )
+                || field_matches(
+                    "errorType",
+                    &["cancelledfailure", "canceledfailure", "cancellationerror", "cancellederror"],
+                )
+                || object
+                    .get("message")
+                    .or_else(|| object.get("reason"))
+                    .is_some_and(is_cancellation_value)
+        }
+        _ => false,
     }
 }
 
@@ -3175,6 +3238,7 @@ mod tests {
                             child_ref_var: "child".to_owned(),
                             next: "finish".to_owned(),
                             output_var: Some("childResult".to_owned()),
+                            on_error: None,
                         },
                     ),
                     (
@@ -3651,6 +3715,111 @@ mod tests {
                 state,
             }) if state.as_deref() == Some("wait_signal")
         ));
+    }
+
+    #[test]
+    fn child_failure_can_follow_wait_for_child_error_transition() {
+        let artifact = CompiledWorkflowArtifact::new(
+            "child-error-recovery",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "await_child".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "await_child".to_owned(),
+                        CompiledStateNode::WaitForChild {
+                            child_ref_var: "child".to_owned(),
+                            next: "done".to_owned(),
+                            output_var: Some("childResult".to_owned()),
+                            on_error: Some(ErrorTransition {
+                                next: "recover".to_owned(),
+                                error_var: Some("childError".to_owned()),
+                            }),
+                        },
+                    ),
+                    (
+                        "recover".to_owned(),
+                        CompiledStateNode::Succeed {
+                            output: Some(Expression::Identifier { name: "childError".to_owned() }),
+                        },
+                    ),
+                    ("done".to_owned(), CompiledStateNode::Succeed { output: None }),
+                ]),
+            },
+        );
+        let mut execution_state = ArtifactExecutionState::default();
+        execution_state.bindings.insert(
+            "child".to_owned(),
+            json!({
+                "child_id": "child-1",
+                "workflow_id": "child-workflow"
+            }),
+        );
+
+        let resumed = artifact
+            .execute_after_child_failure_with_turn(
+                "await_child",
+                "child-1",
+                "child workflow cancelled",
+                execution_state,
+                ExecutionTurnContext { event_id: uuid::Uuid::now_v7(), occurred_at: Utc::now() },
+            )
+            .unwrap();
+
+        assert_eq!(resumed.final_state, "recover");
+        assert_eq!(
+            resumed.execution_state.bindings.get("childError"),
+            Some(&Value::String("child workflow cancelled".to_owned()))
+        );
+        assert!(matches!(
+            resumed.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output == &Value::String("child workflow cancelled".to_owned())
+        ));
+    }
+
+    #[test]
+    fn builtin_is_cancellation_matches_temporal_like_errors() {
+        let helper = HelperFunction {
+            params: vec!["error".to_owned()],
+            body: Expression::Call {
+                callee: "__temporal_is_cancellation".to_owned(),
+                args: vec![Expression::Identifier { name: "error".to_owned() }],
+            },
+        };
+        let helpers = BTreeMap::from([("isCancellation".to_owned(), helper)]);
+        let mut state = ArtifactExecutionState::default();
+        state.bindings.insert("error".to_owned(), json!({"type": "CancelledFailure"}));
+        assert_eq!(
+            evaluate_expression(
+                &Expression::Call {
+                    callee: "isCancellation".to_owned(),
+                    args: vec![Expression::Identifier { name: "error".to_owned() }],
+                },
+                &mut state,
+                &helpers,
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
+
+        state.bindings.insert("error".to_owned(), Value::String("boom".to_owned()));
+        assert_eq!(
+            evaluate_expression(
+                &Expression::Call {
+                    callee: "isCancellation".to_owned(),
+                    args: vec![Expression::Identifier { name: "error".to_owned() }],
+                },
+                &mut state,
+                &helpers,
+            )
+            .unwrap(),
+            Value::Bool(false)
+        );
     }
 
     #[test]

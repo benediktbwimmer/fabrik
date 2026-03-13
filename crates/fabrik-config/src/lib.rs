@@ -125,6 +125,8 @@ pub struct QueryRuntimeConfig {
     pub default_page_size: usize,
     pub max_page_size: usize,
     pub throughput_payload_store: ThroughputPayloadStoreConfig,
+    pub strong_query_unified_url: Option<String>,
+    pub strong_query_executor_url: Option<String>,
     pub history_retention_days: Option<u64>,
     pub run_retention_days: Option<u64>,
     pub activity_retention_days: Option<u64>,
@@ -388,6 +390,14 @@ impl QueryRuntimeConfig {
             default_page_size: read_usize_with_default("QUERY_DEFAULT_PAGE_SIZE", 100)?,
             max_page_size: read_usize_with_default("QUERY_MAX_PAGE_SIZE", 500)?,
             throughput_payload_store: ThroughputPayloadStoreConfig::from_env()?,
+            strong_query_unified_url: Some(read_string_with_default(
+                "QUERY_STRONG_QUERY_UNIFIED_URL",
+                "http://127.0.0.1:3008",
+            )?),
+            strong_query_executor_url: Some(read_string_with_default(
+                "QUERY_STRONG_QUERY_EXECUTOR_URL",
+                "http://127.0.0.1:3002",
+            )?),
             history_retention_days: read_optional_u64("QUERY_HISTORY_RETENTION_DAYS")?,
             run_retention_days: read_optional_u64("QUERY_RUN_RETENTION_DAYS")?,
             activity_retention_days: read_optional_u64("QUERY_ACTIVITY_RETENTION_DAYS")?,

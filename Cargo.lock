@@ -67,6 +67,7 @@ dependencies = [
  "fabrik-events",
  "fabrik-service",
  "fabrik-store",
+ "fabrik-workflow",
  "reqwest",
  "serde",
  "serde_json",

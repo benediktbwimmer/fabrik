@@ -19,5 +19,6 @@ tokio.workspace = true
 
 [dev-dependencies]
 fabrik-events = { path = "../../crates/fabrik-events" }
+fabrik-workflow = { path = "../../crates/fabrik-workflow" }
 tower = "0.5.2"
 uuid.workspace = true

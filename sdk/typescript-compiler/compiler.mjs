@@ -52,8 +52,16 @@ function compilerError(message, node = null) {
 }
 
 function formatNodeLocation(node) {
-  const sourceFile = node.getSourceFile();
-  const { line, character } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+  const sourceFile = node.getSourceFile?.() ?? node.parent?.getSourceFile?.();
+  if (!sourceFile) {
+    return {
+      file: "<generated>",
+      line: 1,
+      column: 1,
+    };
+  }
+  const start = typeof node.getStart === "function" ? node.getStart(sourceFile) : (node.pos ?? 0);
+  const { line, character } = sourceFile.getLineAndCharacterOfPosition(start);
   return {
     file: path.relative(process.cwd(), sourceFile.fileName),
     line: line + 1,
@@ -75,7 +83,17 @@ function shortHash(value) {
 }
 
 function stableNodeKey(node) {
-  const parts = [node.kind, node.getText(node.getSourceFile())];
+  let text = null;
+  try {
+    const sourceFile = node.getSourceFile?.();
+    if (sourceFile) {
+      text = node.getText(sourceFile);
+    }
+  } catch {}
+  if (typeof text !== "string" || text.length === 0) {
+    text = `${node.pos ?? "na"}:${node.end ?? "na"}`;
+  }
+  const parts = [node.kind, text];
   let current = node;
   let depth = 0;
   while (current && depth < 3) {
@@ -128,6 +146,8 @@ function collectTemporalWorkflowApi(sourceFile) {
     sleep: new Set(),
     continueAsNew: new Set(),
     condition: new Set(),
+    cancellationScope: new Set(),
+    isCancellation: new Set(),
     executeChild: new Set(),
     startChild: new Set(),
     defineQuery: new Set(),
@@ -153,6 +173,8 @@ function collectTemporalWorkflowApi(sourceFile) {
       if (importedName === "sleep") api.sleep.add(localName);
       if (importedName === "continueAsNew") api.continueAsNew.add(localName);
       if (importedName === "condition") api.condition.add(localName);
+      if (importedName === "CancellationScope") api.cancellationScope.add(localName);
+      if (importedName === "isCancellation") api.isCancellation.add(localName);
       if (importedName === "executeChild") api.executeChild.add(localName);
       if (importedName === "startChild") api.startChild.add(localName);
       if (importedName === "defineQuery") api.defineQuery.add(localName);
@@ -437,6 +459,21 @@ function collectImportedHelpers(program, sourceFile) {
     }
   }
   return helpers;
+}
+
+function injectTemporalBuiltinHelpers(helpers, temporalApi) {
+  const merged = new Map(Object.entries(helpers));
+  for (const localName of temporalApi.isCancellation) {
+    merged.set(localName, {
+      params: ["error"],
+      body: {
+        kind: "call",
+        callee: "__temporal_is_cancellation",
+        args: [{ kind: "identifier", name: "error" }],
+      },
+    });
+  }
+  return Object.fromEntries(merged.entries());
 }
 
 function extractImportedBindings(importClause) {
@@ -777,6 +814,8 @@ class WorkflowLowerer {
       sleep: new Set(),
       continueAsNew: new Set(),
       condition: new Set(),
+      cancellationScope: new Set(),
+      isCancellation: new Set(),
       executeChild: new Set(),
       startChild: new Set(),
       defineQuery: new Set(),
@@ -1090,12 +1129,6 @@ class WorkflowLowerer {
       throw compilerError(`condition requires an inline function predicate`, callExpression);
     }
     const predicateExpr = compilePureHandlerExpression(predicate, "condition");
-    if (Object.keys(this.signals).length === 0) {
-      throw compilerError(
-        `condition currently requires at least one registered Temporal signal handler`,
-        callExpression,
-      );
-    }
     let continueState = nextState;
     if (targetVar) {
       continueState = this.addState("assign", {
@@ -1157,7 +1190,7 @@ class WorkflowLowerer {
     return id;
   }
 
-  lowerBlock(statements, nextState, breakTarget, continueTarget, errorTarget) {
+  lowerBlock(statements, nextState, breakTarget, continueTarget, errorTarget, returnTarget = null) {
     for (const statement of statements) {
       if (
         ts.isExpressionStatement(statement) &&
@@ -1176,12 +1209,13 @@ class WorkflowLowerer {
         breakTarget,
         continueTarget,
         errorTarget,
+        returnTarget,
       );
     }
     return cursor;
   }
 
-  lowerStatement(statement, nextState, breakTarget, continueTarget, errorTarget) {
+  lowerStatement(statement, nextState, breakTarget, continueTarget, errorTarget, returnTarget = null) {
     if (ts.isExpressionStatement(statement) && ts.isCallExpression(statement.expression)) {
       if (
         ts.isIdentifier(statement.expression.expression) &&
@@ -1277,6 +1311,7 @@ class WorkflowLowerer {
         breakTarget,
         continueTarget,
         errorTarget,
+        returnTarget,
       );
       const elseNext = statement.elseStatement
         ? this.lowerStatementOrBlock(
@@ -1285,6 +1320,7 @@ class WorkflowLowerer {
             breakTarget,
             continueTarget,
             errorTarget,
+            returnTarget,
           )
         : nextState;
       return this.addState("choice", {
@@ -1303,6 +1339,7 @@ class WorkflowLowerer {
         nextState,
         choiceState,
         errorTarget,
+        returnTarget,
       );
       this.states[choiceState] = {
         type: "choice",
@@ -1322,6 +1359,7 @@ class WorkflowLowerer {
         nextState,
         choiceState,
         errorTarget,
+        returnTarget,
       );
       this.states[choiceState] = {
         type: "choice",
@@ -1345,6 +1383,7 @@ class WorkflowLowerer {
         nextState,
         continueState,
         errorTarget,
+        returnTarget,
       );
       if (updateState) {
         this.states[updateState].next = choiceState;
@@ -1407,6 +1446,7 @@ class WorkflowLowerer {
         nextState,
         updateIndex,
         errorTarget,
+        returnTarget,
       );
       this.states[assignLoopVar].next = bodyStart;
       this.states[updateIndex].next = choiceState;
@@ -1447,6 +1487,53 @@ class WorkflowLowerer {
     }
 
     if (ts.isReturnStatement(statement)) {
+      if (returnTarget) {
+        if (!statement.expression) {
+          if (!returnTarget.targetVar) {
+            return returnTarget.next;
+          }
+          return this.addState("assign", {
+            type: "assign",
+            actions: [{ target: returnTarget.targetVar, expr: { kind: "literal", value: null } }],
+            next: returnTarget.next,
+          }, statement);
+        }
+        if (ts.isAwaitExpression(statement.expression)) {
+          return this.lowerAwait(
+            statement.expression,
+            returnTarget.targetVar ?? null,
+            returnTarget.next,
+            errorTarget,
+          );
+        }
+        if (
+          ts.isCallExpression(statement.expression) &&
+          (
+            (ts.isIdentifier(statement.expression.expression) &&
+              this.temporalApi.continueAsNew.has(statement.expression.expression.text)) ||
+            (
+              ts.isPropertyAccessExpression(statement.expression.expression) &&
+              statement.expression.expression.expression.getText() === "ctx"
+            )
+          )
+        ) {
+          throw compilerError(
+            `workflow terminal calls are not allowed inside CancellationScope handlers`,
+            statement.expression,
+          );
+        }
+        if (!returnTarget.targetVar) {
+          return returnTarget.next;
+        }
+        return this.addState("assign", {
+          type: "assign",
+          actions: [{
+            target: returnTarget.targetVar,
+            expr: compileExpression(statement.expression),
+          }],
+          next: returnTarget.next,
+        }, statement);
+      }
       if (!statement.expression) {
         return this.addState("complete", { type: "succeed" }, statement);
       }
@@ -1501,7 +1588,14 @@ class WorkflowLowerer {
 
     if (ts.isTryStatement(statement)) {
       const finallyStart = statement.finallyBlock
-        ? this.lowerBlock(statement.finallyBlock.statements, nextState, breakTarget, continueTarget, errorTarget)
+        ? this.lowerBlock(
+            statement.finallyBlock.statements,
+            nextState,
+            breakTarget,
+            continueTarget,
+            errorTarget,
+            returnTarget,
+          )
         : nextState;
       const catchError = statement.catchClause
         ? {
@@ -1511,6 +1605,7 @@ class WorkflowLowerer {
               breakTarget,
               continueTarget,
               errorTarget,
+              returnTarget,
             ),
             error_var: statement.catchClause.variableDeclaration?.name.getText() ?? "__error",
           }
@@ -1521,20 +1616,42 @@ class WorkflowLowerer {
         breakTarget,
         continueTarget,
         catchError,
+        returnTarget,
       );
     }
 
     if (ts.isBlock(statement)) {
-      return this.lowerBlock(statement.statements, nextState, breakTarget, continueTarget, errorTarget);
+      return this.lowerBlock(
+        statement.statements,
+        nextState,
+        breakTarget,
+        continueTarget,
+        errorTarget,
+        returnTarget,
+      );
     }
 
     throw compilerError(`unsupported statement: ${statement.getText()}`, statement);
   }
 
-  lowerStatementOrBlock(statement, nextState, breakTarget, continueTarget, errorTarget) {
+  lowerStatementOrBlock(statement, nextState, breakTarget, continueTarget, errorTarget, returnTarget = null) {
     return ts.isBlock(statement)
-      ? this.lowerBlock(statement.statements, nextState, breakTarget, continueTarget, errorTarget)
-      : this.lowerStatement(statement, nextState, breakTarget, continueTarget, errorTarget);
+      ? this.lowerBlock(
+          statement.statements,
+          nextState,
+          breakTarget,
+          continueTarget,
+          errorTarget,
+          returnTarget,
+        )
+      : this.lowerStatement(
+          statement,
+          nextState,
+          breakTarget,
+          continueTarget,
+          errorTarget,
+          returnTarget,
+        );
   }
 
   lowerForInitializer(initializer, nextState) {
@@ -1581,10 +1698,81 @@ class WorkflowLowerer {
     throw compilerError(`unsupported for-loop update expression: ${expression.getText()}`, expression);
   }
 
+  parseTemporalCancellationScopeCall(call) {
+    if (
+      !ts.isPropertyAccessExpression(call.expression) ||
+      !ts.isIdentifier(call.expression.expression) ||
+      !this.temporalApi.cancellationScope.has(call.expression.expression.text)
+    ) {
+      return null;
+    }
+    const method = call.expression.name.text;
+    if (method !== "cancellable" && method !== "nonCancellable") {
+      return null;
+    }
+    if (call.arguments.length !== 1) {
+      throw compilerError(`CancellationScope.${method} requires exactly one inline function`, call);
+    }
+    const handler = call.arguments[0];
+    if (!ts.isArrowFunction(handler) && !ts.isFunctionExpression(handler)) {
+      throw compilerError(`CancellationScope.${method} requires an inline function`, handler);
+    }
+    if (!handler.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) {
+      throw compilerError(`CancellationScope.${method} currently requires an async inline function`, handler);
+    }
+    if (handler.parameters.length !== 0) {
+      throw compilerError(`CancellationScope.${method} handlers must not declare parameters`, handler);
+    }
+    return { method, handler };
+  }
+
+  lowerTemporalCancellationScope(scopeCall, targetVar, nextState, errorTarget, originNode) {
+    const statements = ts.isBlock(scopeCall.handler.body)
+      ? scopeCall.handler.body.statements
+      : [
+          ts.setTextRange(
+            ts.factory.createReturnStatement(
+              ts.isAwaitExpression(scopeCall.handler.body)
+                ? scopeCall.handler.body
+                : ts.setTextRange(
+                    ts.factory.createAwaitExpression(scopeCall.handler.body),
+                    scopeCall.handler.body,
+                  ),
+            ),
+            scopeCall.handler.body,
+          ),
+        ];
+    const fallthroughState = targetVar
+      ? this.addState("assign", {
+          type: "assign",
+          actions: [{ target: targetVar, expr: { kind: "literal", value: null } }],
+          next: nextState,
+        }, originNode)
+      : nextState;
+    return this.lowerBlock(
+      statements,
+      fallthroughState,
+      null,
+      null,
+      errorTarget,
+      { next: nextState, targetVar: targetVar ?? null },
+    );
+  }
+
   lowerAwait(awaitExpression, targetVar, nextState, errorTarget) {
     if (!ts.isCallExpression(awaitExpression.expression)) {
       throw compilerError(
         `non-deterministic await detected; all async operations must go through ctx.* methods`,
+        awaitExpression,
+      );
+    }
+    const scopeCall = this.parseTemporalCancellationScopeCall(awaitExpression.expression);
+    if (scopeCall) {
+      return this.lowerTemporalCancellationScope(
+        scopeCall,
+        targetVar,
+        nextState,
+        errorTarget,
         awaitExpression,
       );
     }
@@ -1601,6 +1789,7 @@ class WorkflowLowerer {
           child_ref_var: handleName,
           next: nextState,
           output_var: targetVar ?? undefined,
+          on_error: errorTarget ?? undefined,
         }, awaitExpression);
       }
       if (this.bulkHandleVars.has(handleName)) {
@@ -1676,6 +1865,7 @@ class WorkflowLowerer {
           child_ref_var: handleVar,
           next: nextState,
           output_var: targetVar ?? undefined,
+          on_error: errorTarget ?? undefined,
         }, awaitExpression);
         return this.addState("start_child", {
           type: "start_child",
@@ -2198,9 +2388,10 @@ function walkExpression(expression, visitor) {
 
 function validateArtifactCalls(artifact) {
   const helperNames = new Set(Object.keys(artifact.helpers));
+  const builtinCallNames = new Set(["__temporal_is_cancellation"]);
   const validateExpression = (expression) => {
     walkExpression(expression, (node) => {
-      if (node.kind === "call" && !helperNames.has(node.callee)) {
+      if (node.kind === "call" && !helperNames.has(node.callee) && !builtinCallNames.has(node.callee)) {
         throw compilerError(
           `unsupported function call ${node.callee}; only imported or local pure helpers are allowed`,
         );
@@ -2266,7 +2457,7 @@ async function main() {
   const program = createProgram(args.entry);
   const workflow = findExportedFunction(program, args.exportName);
   const temporalApi = collectTemporalWorkflowApi(workflow.getSourceFile());
-  const helpers = buildHelperRegistry(program, workflow);
+  const helpers = injectTemporalBuiltinHelpers(buildHelperRegistry(program, workflow), temporalApi);
   const lowerer = new WorkflowLowerer(args.definitionId, args.version, workflow, temporalApi);
   const { initialState, states, sourceMap, queries, signals, updates } = lowerer.lower();
 

@@ -6,7 +6,10 @@
     "compile:workflow": "node sdk/typescript-compiler/compiler.mjs",
     "test:compiler": "node --test sdk/typescript-compiler/compiler.test.mjs",
     "test:benchmarks": "node --test benchmarks/temporal-comparison/helpers.test.mjs",
-    "benchmark:compare-temporal": "bash scripts/run-temporal-comparison-benchmark.sh"
+    "benchmark:compare-temporal": "bash scripts/run-temporal-comparison-benchmark.sh",
+    "ui:dev": "npm --prefix apps/fabrik-console run dev",
+    "ui:build": "npm --prefix apps/fabrik-console run build",
+    "ui:test": "npm --prefix apps/fabrik-console run test"
   },
   "dependencies": {
     "@temporalio/activity": "^1.15.0",

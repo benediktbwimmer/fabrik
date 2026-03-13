@@ -93,11 +93,17 @@ Current implemented compatibility slice in the compiler:
   - async signal handlers can await the same supported workflow primitives as other compiled handler bodies
 - a broader Temporal `condition(...)` subset:
   - awaited `condition(() => predicate)` lowers into a first-class `wait_for_condition` state
-  - the condition is re-evaluated after registered compiled signal handlers run and mutate workflow state
+  - the condition is re-evaluated after compiled signal handlers or update handlers run and mutate workflow state
 - a narrow Temporal child-workflow subset:
   - `await startChild(workflow, { args, workflowId, taskQueue, parentClosePolicy })`
   - `await childHandle.result()`
   - `await executeChild(workflow, { args, workflowId, taskQueue, parentClosePolicy })`
+- a narrow Temporal cancellation-scope subset:
+  - `await CancellationScope.cancellable(async () => { ... })`
+  - `await CancellationScope.nonCancellable(async () => { ... })`
+  - `isCancellation(error)` inside compiled workflow expressions and `catch` branches
+  - currently supported scope bodies are straight-line compiled statements that lower to the existing artifact model, including multiple awaited proxy activities or child-workflow waits plus local assignment/return flow
+  - `nonCancellable(...)` is still only a compiler-level wrapper today; it does not yet establish a distinct runtime cancellation shield
 - plain `return value` as workflow completion
 - `return continueAsNew(...)` imported from `@temporalio/workflow`, including multi-argument payload packing
 
@@ -107,8 +113,7 @@ Current non-goals for this slice:
 
 - general `Promise.all(...)` lowering beyond the proxy-activity map pattern
 - general `Promise.allSettled(...)` lowering beyond the proxy-activity map pattern
-- broad Temporal `condition(...)` parity beyond signal-handler-driven state changes
-- Temporal cancellation scopes
+- broad Temporal `condition(...)` parity beyond handler-driven state changes
 - broad Temporal child workflow handles and signal APIs beyond the narrow start/result and execute forms
 - full proxy activity option parity
   - dynamic or computed retry option values are still rejected; retry options must remain static literals
