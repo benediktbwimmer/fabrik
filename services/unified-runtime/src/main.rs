@@ -797,7 +797,18 @@ async fn restore_instance_from_store_snapshot_tail(
     let tail = &history[tail_start..];
 
     if snapshot.state.artifact_execution.is_some() {
-        return replay_unified_compiled_snapshot_tail(&snapshot.state, artifact, tail);
+        match replay_unified_compiled_snapshot_tail(&snapshot.state, artifact, tail) {
+            Ok(replayed) => return Ok(replayed),
+            Err(error) => {
+                warn!(
+                    tenant_id = %snapshot.tenant_id,
+                    instance_id = %snapshot.instance_id,
+                    run_id = %snapshot.run_id,
+                    snapshot_last_event_type = %snapshot.last_event_type,
+                    "snapshot-tail replay failed; falling back to full broker history: {error}"
+                );
+            }
+        }
     }
 
     if matches!(snapshot.state.status, WorkflowStatus::Completed | WorkflowStatus::Failed) {
@@ -8957,6 +8968,142 @@ mod tests {
         let debug_snapshot = debug.lock().expect("unified debug lock poisoned").clone();
         assert!(debug_snapshot.restored_from_snapshot);
         assert_eq!(debug_snapshot.restore_records_applied, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn store_snapshot_restore_falls_back_to_full_history_when_snapshot_tail_is_inconsistent()
+    -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let broker = redpanda.broker.clone();
+
+        let artifact = signal_then_step_artifact();
+        store.put_artifact("tenant-a", &artifact).await?;
+
+        let identity = WorkflowIdentity::new(
+            "tenant-a",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-inconsistent-snapshot",
+            "run-inconsistent-snapshot",
+            "unified-runtime-test",
+        );
+        let trigger_time = Utc::now();
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: Value::Null },
+            trigger_time,
+        );
+        publisher.publish(&trigger, &trigger.partition_key).await?;
+
+        let trigger_plan = artifact.execute_trigger_with_turn(
+            &Value::Null,
+            ExecutionTurnContext { event_id: trigger.event_id, occurred_at: trigger.occurred_at },
+        )?;
+        let mut stale_snapshot = WorkflowInstanceState::try_from(&trigger)?;
+        apply_compiled_plan(&mut stale_snapshot, &trigger_plan);
+
+        let signal_time = trigger_time + ChronoDuration::milliseconds(1);
+        let signal_received = test_event(
+            &identity,
+            WorkflowEvent::SignalReceived {
+                signal_id: "sig-restore".to_owned(),
+                signal_type: "approve".to_owned(),
+                payload: Value::String("approved".to_owned()),
+            },
+            signal_time,
+        );
+        publisher.publish(&signal_received, &signal_received.partition_key).await?;
+
+        stale_snapshot.event_count = 2;
+        stale_snapshot.last_event_id = signal_received.event_id;
+        stale_snapshot.last_event_type = signal_received.event_type.clone();
+        stale_snapshot.updated_at = signal_received.occurred_at;
+        store.upsert_instance(&stale_snapshot).await?;
+        store.put_snapshot(&stale_snapshot).await?;
+
+        let signal_plan = artifact.execute_after_signal_with_turn(
+            "wait_approve",
+            "approve",
+            &Value::String("approved".to_owned()),
+            stale_snapshot.artifact_execution.clone().unwrap_or_default(),
+            ExecutionTurnContext {
+                event_id: signal_received.event_id,
+                occurred_at: signal_received.occurred_at,
+            },
+        )?;
+        let scheduled = schedule_activities_from_plan(
+            &artifact,
+            &{
+                let mut projected = stale_snapshot.clone();
+                projected.apply_event(&signal_received);
+                apply_compiled_plan(&mut projected, &signal_plan);
+                projected
+            },
+            &signal_plan,
+            signal_received.occurred_at,
+        )?;
+
+        let completion_time = signal_time + ChronoDuration::milliseconds(1);
+        let completion = test_event(
+            &identity,
+            WorkflowEvent::ActivityTaskCompleted {
+                activity_id: scheduled[0].activity_id.clone(),
+                attempt: scheduled[0].attempt,
+                output: Value::String("hello approved".to_owned()),
+                worker_id: "worker-a".to_owned(),
+                worker_build_id: "build-a".to_owned(),
+            },
+            completion_time,
+        );
+        publisher.publish(&completion, &completion.partition_key).await?;
+        store
+            .apply_activity_terminal_batch(&[ActivityTerminalUpdate {
+                tenant_id: identity.tenant_id.clone(),
+                instance_id: identity.instance_id.clone(),
+                run_id: identity.run_id.clone(),
+                activity_id: scheduled[0].activity_id.clone(),
+                attempt: scheduled[0].attempt,
+                worker_id: "worker-a".to_owned(),
+                worker_build_id: "build-a".to_owned(),
+                payload: ActivityTerminalPayload::Completed {
+                    output: Value::String("hello approved".to_owned()),
+                },
+                event_id: completion.event_id,
+                event_type: completion.event_type.clone(),
+                occurred_at: completion.occurred_at,
+            }])
+            .await?;
+
+        let restored = restore_runtime_state_from_store(
+            &store,
+            &broker,
+            &Arc::new(StdMutex::new(UnifiedDebugState::default())),
+        )
+        .await?;
+        let runtime = restored
+            .instances
+            .get(&RunKey {
+                tenant_id: identity.tenant_id.clone(),
+                instance_id: identity.instance_id.clone(),
+                run_id: identity.run_id.clone(),
+            })
+            .context("restored runtime state should contain fallback-restored workflow")?;
+
+        assert_eq!(runtime.instance.status, WorkflowStatus::Completed);
+        assert_eq!(runtime.instance.last_event_id, completion.event_id);
+        assert_eq!(runtime.instance.last_event_type, "ActivityTaskCompleted");
+        assert_eq!(runtime.instance.output, Some(Value::String("hello approved".to_owned())));
+        assert!(runtime.active_activities.is_empty());
 
         Ok(())
     }

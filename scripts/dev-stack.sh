@@ -16,6 +16,7 @@ PID_DIR="$STATE_ROOT/pids"
 STATE_DIR="$STATE_ROOT/state"
 CHECKPOINT_DIR="$STATE_ROOT/checkpoints"
 ENV_FILE="$STATE_ROOT/environment.sh"
+LOCK_DIR="$STATE_ROOT/lock"
 
 PROFILE="${DEV_STACK_PROFILE:-debug}"
 if [[ "$PROFILE" == "release" ]]; then
@@ -97,6 +98,22 @@ require_bin() {
   fi
 }
 
+acquire_lock() {
+  local waited=0
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    if (( waited == 0 )); then
+      echo "[dev-stack] waiting for existing dev-stack command to finish" >&2
+    fi
+    waited=1
+    sleep 1
+  done
+  trap release_lock EXIT
+}
+
+release_lock() {
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
 wait_for_port() {
   local host=$1
   local port=$2
@@ -174,6 +191,43 @@ pidfile_for() {
   printf '%s/%s.pid' "$PID_DIR" "$1"
 }
 
+service_ports_for() {
+  case "$1" in
+    matching-service)
+      printf '%s\n%s\n' "$MATCHING_PORT" "$MATCHING_DEBUG_PORT"
+      ;;
+    unified-runtime)
+      printf '%s\n%s\n' "$UNIFIED_RUNTIME_PORT" "$UNIFIED_DEBUG_PORT"
+      ;;
+    ingest-service)
+      printf '%s\n' "$INGEST_PORT"
+      ;;
+    query-service)
+      printf '%s\n' "$QUERY_PORT"
+      ;;
+    api-gateway)
+      printf '%s\n' "$API_GATEWAY_PORT"
+      ;;
+    throughput-runtime)
+      printf '%s\n%s\n' "$THROUGHPUT_RUNTIME_PORT" "$THROUGHPUT_DEBUG_PORT"
+      ;;
+    throughput-projector)
+      printf '%s\n' "$THROUGHPUT_PROJECTOR_PORT"
+      ;;
+    timer-service)
+      printf '%s\n' "$TIMER_PORT"
+      ;;
+    activity-worker-service)
+      printf '%s\n' "$ACTIVITY_WORKER_PORT"
+      ;;
+    activity-worker-service-stream-v2)
+      printf '%s\n' "$STREAM_ACTIVITY_WORKER_PORT"
+      ;;
+    *)
+      ;;
+  esac
+}
+
 service_binary_for() {
   case "$1" in
     activity-worker-service|activity-worker-service-stream-v2)
@@ -218,6 +272,19 @@ stop_service_processes() {
   done < <(matching_service_pids "$name")
 }
 
+stop_service_ports() {
+  local name=$1
+  local port
+  while read -r port; do
+    [[ -n "$port" ]] || continue
+    local pid
+    while read -r pid; do
+      [[ -n "$pid" ]] || continue
+      terminate_pid "$pid"
+    done < <(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)
+  done < <(service_ports_for "$name")
+}
+
 service_running() {
   local name=$1
   local pidfile
@@ -235,6 +302,7 @@ stop_service() {
   pidfile="$(pidfile_for "$name")"
   if ! [[ -f "$pidfile" ]]; then
     stop_service_processes "$name"
+    stop_service_ports "$name"
     return 0
   fi
   local pid
@@ -243,6 +311,7 @@ stop_service() {
     terminate_pid "$pid"
   fi
   stop_service_processes "$name"
+  stop_service_ports "$name"
   rm -f "$pidfile"
 }
 
@@ -271,6 +340,7 @@ start_service() {
     return 0
   fi
   stop_service_processes "$name"
+  stop_service_ports "$name"
   local pidfile
   pidfile="$(pidfile_for "$name")"
   local env_vars=()
@@ -360,6 +430,7 @@ up() {
   require_bin docker
   require_bin python3
   require_bin curl
+  require_bin lsof
 
   echo "[dev-stack] starting docker infra"
   docker compose up -d redpanda postgres minio minio-init >/dev/null
@@ -499,6 +570,7 @@ up() {
 }
 
 down() {
+  require_bin lsof
   for service in "${SERVICES[@]}"; do
     stop_service "$service"
   done
@@ -523,9 +595,18 @@ status() {
 }
 
 case "$COMMAND" in
-  up) up ;;
-  down) down ;;
-  status) status ;;
+  up)
+    acquire_lock
+    up
+    ;;
+  down)
+    acquire_lock
+    down
+    ;;
+  status)
+    acquire_lock
+    status
+    ;;
   *)
     echo "unknown command: $COMMAND" >&2
     exit 1
