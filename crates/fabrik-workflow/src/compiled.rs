@@ -59,6 +59,8 @@ pub struct CompiledWorkflow {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompiledWorkflowParam {
     pub name: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rest: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Expression>,
 }
@@ -318,6 +320,13 @@ pub enum Expression {
         item_name: String,
         expr: Box<Expression>,
     },
+    ArrayReduce {
+        array: Box<Expression>,
+        accumulator_name: String,
+        item_name: String,
+        initial: Box<Expression>,
+        expr: Box<Expression>,
+    },
     Object {
         fields: BTreeMap<String, Expression>,
     },
@@ -353,6 +362,7 @@ pub enum BinaryOp {
     Multiply,
     Divide,
     Remainder,
+    In,
     Equal,
     NotEqual,
     LessThan,
@@ -379,7 +389,17 @@ pub enum LogicalOp {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HelperFunction {
     pub params: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statements: Vec<HelperStatement>,
     pub body: Expression,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HelperStatement {
+    Assign { target: String, expr: Expression },
+    AssignIndex { target: String, index: Expression, expr: Expression },
+    ForRange { index_var: String, start: Expression, end: Expression, body: Vec<HelperStatement> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -782,12 +802,16 @@ impl CompiledWorkflowArtifact {
             value => vec![value.clone()],
         };
         for (index, param) in self.workflow.params.iter().enumerate() {
-            let value = match args.get(index) {
-                Some(value) => value.clone(),
-                None => match &param.default {
-                    Some(default) => evaluate_expression(default, execution_state, &self.helpers)?,
-                    None => Value::Null,
-                },
+            let value = if param.rest {
+                Value::Array(args.iter().skip(index).cloned().collect())
+            } else {
+                match args.get(index) {
+                    Some(value) => value.clone(),
+                    None => match &param.default {
+                        Some(default) => evaluate_expression(default, execution_state, &self.helpers)?,
+                        None => Value::Null,
+                    },
+                }
             };
             execution_state.bindings.insert(param.name.clone(), value);
         }
@@ -3304,6 +3328,37 @@ pub fn evaluate_expression(
             }
             Ok(Value::Array(mapped))
         }
+        Expression::ArrayReduce { array, accumulator_name, item_name, initial, expr } => {
+            let array = evaluate_expression(array, execution_state, helpers)?;
+            let Value::Array(items) = array else {
+                return evaluate_expression(initial, execution_state, helpers);
+            };
+            let previous_accumulator = execution_state.bindings.get(accumulator_name).cloned();
+            let previous_item = execution_state.bindings.get(item_name).cloned();
+            let mut accumulator = evaluate_expression(initial, execution_state, helpers)?;
+            for item in items {
+                execution_state.bindings.insert(accumulator_name.clone(), accumulator);
+                execution_state.bindings.insert(item_name.clone(), item);
+                accumulator = evaluate_expression(expr, execution_state, helpers)?;
+            }
+            match previous_accumulator {
+                Some(value) => {
+                    execution_state.bindings.insert(accumulator_name.clone(), value);
+                }
+                None => {
+                    execution_state.bindings.remove(accumulator_name);
+                }
+            }
+            match previous_item {
+                Some(value) => {
+                    execution_state.bindings.insert(item_name.clone(), value);
+                }
+                None => {
+                    execution_state.bindings.remove(item_name);
+                }
+            }
+            Ok(accumulator)
+        }
         Expression::Object { fields } => {
             let mut object = Map::new();
             for (key, value) in fields {
@@ -3371,6 +3426,151 @@ pub fn evaluate_expression(
                 let joined = items.iter().map(join_fragment).collect::<Vec<_>>().join(&separator);
                 return Ok(Value::String(joined));
             }
+            if callee == "__builtin_array_map_number" {
+                if args.len() != 1 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 1,
+                        received: args.len(),
+                    });
+                }
+                let array = evaluate_expression(&args[0], execution_state, helpers)?;
+                let Value::Array(items) = array else {
+                    return Ok(Value::Array(Vec::new()));
+                };
+                let mapped = items
+                    .into_iter()
+                    .map(|item| number_value(numeric(&item).unwrap_or(0.0)))
+                    .collect::<Vec<_>>();
+                return Ok(Value::Array(mapped));
+            }
+            if callee == "__builtin_string" {
+                if args.len() != 1 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 1,
+                        received: args.len(),
+                    });
+                }
+                let value = evaluate_expression(&args[0], execution_state, helpers)?;
+                return Ok(Value::String(join_stringify_value(&value)));
+            }
+            if callee == "__builtin_math_floor" {
+                if args.len() != 1 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 1,
+                        received: args.len(),
+                    });
+                }
+                let value = evaluate_expression(&args[0], execution_state, helpers)?;
+                return Ok(number_value(numeric(&value)?.floor()));
+            }
+            if callee == "__builtin_math_min" {
+                if args.len() != 2 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 2,
+                        received: args.len(),
+                    });
+                }
+                let left = evaluate_expression(&args[0], execution_state, helpers)?;
+                let right = evaluate_expression(&args[1], execution_state, helpers)?;
+                return Ok(number_value(numeric(&left)?.min(numeric(&right)?)));
+            }
+            if callee == "__builtin_array_fill" {
+                if args.len() != 2 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 2,
+                        received: args.len(),
+                    });
+                }
+                let length = evaluate_expression(&args[0], execution_state, helpers)?;
+                let fill = evaluate_expression(&args[1], execution_state, helpers)?;
+                let length = numeric(&length)?.max(0.0).trunc() as usize;
+                return Ok(Value::Array(vec![fill; length]));
+            }
+            if callee == "__builtin_array_append" {
+                if args.len() != 2 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 2,
+                        received: args.len(),
+                    });
+                }
+                let array = evaluate_expression(&args[0], execution_state, helpers)?;
+                let value = evaluate_expression(&args[1], execution_state, helpers)?;
+                let Value::Array(mut items) = array else {
+                    return Ok(Value::Array(vec![value]));
+                };
+                items.push(value);
+                return Ok(Value::Array(items));
+            }
+            if callee == "__builtin_object_omit" {
+                if args.len() != 2 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 2,
+                        received: args.len(),
+                    });
+                }
+                let object = evaluate_expression(&args[0], execution_state, helpers)?;
+                let key = evaluate_expression(&args[1], execution_state, helpers)?;
+                let key =
+                    key.as_str().map(str::to_owned).unwrap_or_else(|| join_stringify_value(&key));
+                let Value::Object(mut map) = object else {
+                    return Ok(Value::Object(Map::new()));
+                };
+                map.remove(&key);
+                return Ok(Value::Object(map));
+            }
+            if callee == "__builtin_object_set" {
+                if args.len() != 3 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 3,
+                        received: args.len(),
+                    });
+                }
+                let object = evaluate_expression(&args[0], execution_state, helpers)?;
+                let key = evaluate_expression(&args[1], execution_state, helpers)?;
+                let value = evaluate_expression(&args[2], execution_state, helpers)?;
+                let key =
+                    key.as_str().map(str::to_owned).unwrap_or_else(|| join_stringify_value(&key));
+                let Value::Object(mut map) = object else {
+                    let mut map = Map::new();
+                    map.insert(key, value);
+                    return Ok(Value::Object(map));
+                };
+                map.insert(key, value);
+                return Ok(Value::Object(map));
+            }
+            if callee == "__builtin_array_sort_default"
+                || callee == "__builtin_array_sort_numeric_asc"
+            {
+                if args.len() != 1 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 1,
+                        received: args.len(),
+                    });
+                }
+                let array = evaluate_expression(&args[0], execution_state, helpers)?;
+                let Value::Array(mut items) = array else {
+                    return Ok(Value::Array(Vec::new()));
+                };
+                if callee == "__builtin_array_sort_numeric_asc" {
+                    items.sort_by(|left, right| {
+                        let left = numeric(left).unwrap_or(0.0);
+                        let right = numeric(right).unwrap_or(0.0);
+                        left.partial_cmp(&right).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                } else {
+                    items.sort_by_key(join_fragment);
+                }
+                return Ok(Value::Array(items));
+            }
             let helper = helpers
                 .get(callee)
                 .ok_or_else(|| CompiledWorkflowError::UnknownHelper(callee.clone()))?;
@@ -3387,6 +3587,7 @@ pub fn evaluate_expression(
             }
             let mut scoped_state = execution_state.clone();
             scoped_state.bindings = scoped;
+            execute_helper_statements(&helper.statements, &mut scoped_state, helpers)?;
             let result = evaluate_expression(&helper.body, &mut scoped_state, helpers)?;
             execution_state.markers = scoped_state.markers;
             execution_state.version_markers = scoped_state.version_markers;
@@ -3505,6 +3706,76 @@ fn evaluate_timer_delay(
     })
 }
 
+fn execute_helper_statements(
+    statements: &[HelperStatement],
+    execution_state: &mut ArtifactExecutionState,
+    helpers: &BTreeMap<String, HelperFunction>,
+) -> Result<(), CompiledWorkflowError> {
+    for statement in statements {
+        match statement {
+            HelperStatement::Assign { target, expr } => {
+                let value = evaluate_expression(expr, execution_state, helpers)?;
+                execution_state.bindings.insert(target.clone(), value);
+            }
+            HelperStatement::AssignIndex { target, index, expr } => {
+                let current = execution_state.bindings.get(target).cloned().unwrap_or(Value::Null);
+                let index = evaluate_expression(index, execution_state, helpers)?;
+                let value = evaluate_expression(expr, execution_state, helpers)?;
+                let updated = assign_index_value(current, index, value);
+                execution_state.bindings.insert(target.clone(), updated);
+            }
+            HelperStatement::ForRange { index_var, start, end, body } => {
+                let start =
+                    numeric(&evaluate_expression(start, execution_state, helpers)?)?.trunc() as i64;
+                let end =
+                    numeric(&evaluate_expression(end, execution_state, helpers)?)?.trunc() as i64;
+                let previous = execution_state.bindings.get(index_var).cloned();
+                for current in start..end {
+                    execution_state
+                        .bindings
+                        .insert(index_var.clone(), Value::Number(Number::from(current)));
+                    execute_helper_statements(body, execution_state, helpers)?;
+                }
+                if let Some(previous) = previous {
+                    execution_state.bindings.insert(index_var.clone(), previous);
+                } else {
+                    execution_state.bindings.remove(index_var);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn assign_index_value(current: Value, index: Value, value: Value) -> Value {
+    match (current, index) {
+        (Value::Array(mut items), Value::Number(index)) => {
+            let index = index.as_u64().map(|value| value as usize).unwrap_or_default();
+            if index >= items.len() {
+                items.resize(index + 1, Value::Null);
+            }
+            items[index] = value;
+            Value::Array(items)
+        }
+        (Value::Object(mut map), Value::String(key)) => {
+            map.insert(key, value);
+            Value::Object(map)
+        }
+        (Value::Null, Value::String(key)) => {
+            let mut map = Map::new();
+            map.insert(key, value);
+            Value::Object(map)
+        }
+        (Value::Null, Value::Number(index)) => {
+            let index = index.as_u64().map(|value| value as usize).unwrap_or_default();
+            let mut items = vec![Value::Null; index + 1];
+            items[index] = value;
+            Value::Array(items)
+        }
+        (other, _) => other,
+    }
+}
+
 fn is_cancellation_value(value: &Value) -> bool {
     match value {
         Value::String(message) => message.to_ascii_lowercase().contains("cancel"),
@@ -3582,6 +3853,13 @@ fn evaluate_binary(
         BinaryOp::Multiply => Ok(number_value(numeric(&left)? * numeric(&right)?)),
         BinaryOp::Divide => Ok(number_value(numeric(&left)? / numeric(&right)?)),
         BinaryOp::Remainder => Ok(number_value(numeric(&left)? % numeric(&right)?)),
+        BinaryOp::In => Ok(Value::Bool(match (left, right) {
+            (Value::String(key), Value::Object(map)) => map.contains_key(&key),
+            (Value::Number(index), Value::Array(items)) => {
+                index.as_u64().is_some_and(|index| (index as usize) < items.len())
+            }
+            _ => false,
+        })),
         BinaryOp::Equal => Ok(Value::Bool(left == right)),
         BinaryOp::NotEqual => Ok(Value::Bool(left != right)),
         BinaryOp::LessThan => Ok(Value::Bool(numeric(&left)? < numeric(&right)?)),
@@ -3825,6 +4103,7 @@ mod tests {
             "always".to_owned(),
             HelperFunction {
                 params: vec!["value".to_owned()],
+                statements: Vec::new(),
                 body: Expression::Identifier { name: "value".to_owned() },
             },
         );
@@ -3951,9 +4230,7 @@ mod tests {
                         timer_ref: String::new(),
                         timer_expr: Some(Expression::Binary {
                             op: BinaryOp::Multiply,
-                            left: Box::new(Expression::Identifier {
-                                name: "seconds".to_owned(),
-                            }),
+                            left: Box::new(Expression::Identifier { name: "seconds".to_owned() }),
                             right: Box::new(Expression::Literal { value: json!(1000) }),
                         }),
                         next: "done".to_owned(),
@@ -3966,20 +4243,14 @@ mod tests {
                     },
                 ),
             ]),
-            params: vec![CompiledWorkflowParam {
-                name: "seconds".to_owned(),
-                default: None,
-            }],
+            params: vec![CompiledWorkflowParam { name: "seconds".to_owned(), rest: false, default: None }],
             non_cancellable_states: BTreeSet::new(),
         };
         let artifact = CompiledWorkflowArtifact::new(
             "dynamic-timer",
             1,
             "test",
-            ArtifactEntrypoint {
-                module: "workflow.ts".to_owned(),
-                export: "workflow".to_owned(),
-            },
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
             workflow,
         );
 
@@ -3992,10 +4263,7 @@ mod tests {
 
         assert!(matches!(
             plan.emissions.last(),
-            Some(ExecutionEmission {
-                event: WorkflowEvent::TimerScheduled { .. },
-                ..
-            })
+            Some(ExecutionEmission { event: WorkflowEvent::TimerScheduled { .. }, .. })
         ));
     }
 
@@ -4274,9 +4542,10 @@ mod tests {
                     },
                 )]),
                 params: vec![
-                    CompiledWorkflowParam { name: "name".to_owned(), default: None },
+                    CompiledWorkflowParam { name: "name".to_owned(), rest: false, default: None },
                     CompiledWorkflowParam {
                         name: "punctuation".to_owned(),
+                        rest: false,
                         default: Some(Expression::Literal { value: json!("!") }),
                     },
                 ],
@@ -4295,6 +4564,54 @@ mod tests {
                 "name": "fiona",
                 "punctuation": "!",
                 "input": ["fiona"],
+            })
+        ));
+    }
+
+    #[test]
+    fn execute_trigger_binds_rest_workflow_params() {
+        let artifact = CompiledWorkflowArtifact::new(
+            "workflow-rest-params",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "done".to_owned(),
+                states: BTreeMap::from([(
+                    "done".to_owned(),
+                    CompiledStateNode::Succeed {
+                        output: Some(Expression::Object {
+                            fields: BTreeMap::from([
+                                (
+                                    "prefix".to_owned(),
+                                    Expression::Identifier { name: "prefix".to_owned() },
+                                ),
+                                (
+                                    "names".to_owned(),
+                                    Expression::Identifier { name: "names".to_owned() },
+                                ),
+                            ]),
+                        }),
+                    },
+                )]),
+                params: vec![
+                    CompiledWorkflowParam { name: "prefix".to_owned(), rest: false, default: None },
+                    CompiledWorkflowParam { name: "names".to_owned(), rest: true, default: None },
+                ],
+                non_cancellable_states: BTreeSet::new(),
+            },
+        );
+
+        let plan = artifact.execute_trigger(&json!(["team", "a", "b"])).unwrap();
+
+        assert!(matches!(
+            plan.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output == &json!({
+                "prefix": "team",
+                "names": ["a", "b"],
             })
         ));
     }
@@ -4389,6 +4706,81 @@ mod tests {
             &BTreeMap::new(),
         )
         .unwrap();
+        let numeric_keys = evaluate_expression(
+            &Expression::Call {
+                callee: "__builtin_array_sort_numeric_asc".to_owned(),
+                args: vec![Expression::Call {
+                    callee: "__builtin_array_map_number".to_owned(),
+                    args: vec![Expression::Literal { value: json!(["10", "2", "1"]) }],
+                }],
+            },
+            &mut state,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let contains_alpha = evaluate_expression(
+            &Expression::Binary {
+                op: BinaryOp::In,
+                left: Box::new(Expression::Literal { value: json!("alpha") }),
+                right: Box::new(Expression::Literal { value: json!({"alpha": 1, "beta": 2}) }),
+            },
+            &mut state,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let omitted = evaluate_expression(
+            &Expression::Call {
+                callee: "__builtin_object_omit".to_owned(),
+                args: vec![
+                    Expression::Literal { value: json!({"alpha": 1, "beta": 2}) },
+                    Expression::Literal { value: json!("alpha") },
+                ],
+            },
+            &mut state,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let inserted = evaluate_expression(
+            &Expression::Call {
+                callee: "__builtin_object_set".to_owned(),
+                args: vec![
+                    Expression::Literal { value: json!({"beta": 2}) },
+                    Expression::Literal { value: json!("alpha") },
+                    Expression::Literal { value: json!(1) },
+                ],
+            },
+            &mut state,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let reduced = evaluate_expression(
+            &Expression::ArrayReduce {
+                array: Box::new(Expression::Literal { value: json!([1, 2, 3]) }),
+                accumulator_name: "sum".to_owned(),
+                item_name: "value".to_owned(),
+                initial: Box::new(Expression::Literal { value: json!(0) }),
+                expr: Box::new(Expression::Binary {
+                    op: BinaryOp::Add,
+                    left: Box::new(Expression::Identifier { name: "sum".to_owned() }),
+                    right: Box::new(Expression::Identifier { name: "value".to_owned() }),
+                }),
+            },
+            &mut state,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let appended = evaluate_expression(
+            &Expression::Call {
+                callee: "__builtin_array_append".to_owned(),
+                args: vec![
+                    Expression::Literal { value: json!([1, 2]) },
+                    Expression::Literal { value: json!(3) },
+                ],
+            },
+            &mut state,
+            &BTreeMap::new(),
+        )
+        .unwrap();
         let joined = evaluate_expression(
             &Expression::Call {
                 callee: "__builtin_array_join".to_owned(),
@@ -4403,6 +4795,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(keys, json!(["alpha", "beta"]));
+        assert_eq!(numeric_keys, json!([1, 2, 10]));
+        assert_eq!(contains_alpha, json!(true));
+        assert_eq!(omitted, json!({"beta": 2}));
+        assert_eq!(inserted, json!({"alpha": 1, "beta": 2}));
+        assert_eq!(reduced, json!(6));
+        assert_eq!(appended, json!([1, 2, 3]));
         assert_eq!(joined, json!("a\n\nc"));
     }
 
@@ -4635,6 +5033,7 @@ mod tests {
     fn builtin_is_cancellation_matches_temporal_like_errors() {
         let helper = HelperFunction {
             params: vec!["error".to_owned()],
+            statements: Vec::new(),
             body: Expression::Call {
                 callee: "__temporal_is_cancellation".to_owned(),
                 args: vec![Expression::Identifier { name: "error".to_owned() }],
@@ -4669,6 +5068,80 @@ mod tests {
             .unwrap(),
             Value::Bool(false)
         );
+    }
+
+    #[test]
+    fn evaluates_block_bodied_helpers_with_for_range() {
+        let helper = HelperFunction {
+            params: vec!["total".to_owned(), "n".to_owned()],
+            statements: vec![
+                HelperStatement::Assign {
+                    target: "base".to_owned(),
+                    expr: Expression::Call {
+                        callee: "__builtin_math_floor".to_owned(),
+                        args: vec![Expression::Binary {
+                            op: BinaryOp::Divide,
+                            left: Box::new(Expression::Identifier { name: "total".to_owned() }),
+                            right: Box::new(Expression::Identifier { name: "n".to_owned() }),
+                        }],
+                    },
+                },
+                HelperStatement::Assign {
+                    target: "remainder".to_owned(),
+                    expr: Expression::Binary {
+                        op: BinaryOp::Remainder,
+                        left: Box::new(Expression::Identifier { name: "total".to_owned() }),
+                        right: Box::new(Expression::Identifier { name: "n".to_owned() }),
+                    },
+                },
+                HelperStatement::Assign {
+                    target: "partitions".to_owned(),
+                    expr: Expression::Call {
+                        callee: "__builtin_array_fill".to_owned(),
+                        args: vec![
+                            Expression::Identifier { name: "n".to_owned() },
+                            Expression::Identifier { name: "base".to_owned() },
+                        ],
+                    },
+                },
+                HelperStatement::ForRange {
+                    index_var: "i".to_owned(),
+                    start: Expression::Literal { value: json!(0) },
+                    end: Expression::Identifier { name: "remainder".to_owned() },
+                    body: vec![HelperStatement::AssignIndex {
+                        target: "partitions".to_owned(),
+                        index: Expression::Identifier { name: "i".to_owned() },
+                        expr: Expression::Binary {
+                            op: BinaryOp::Add,
+                            left: Box::new(Expression::Index {
+                                object: Box::new(Expression::Identifier {
+                                    name: "partitions".to_owned(),
+                                }),
+                                index: Box::new(Expression::Identifier { name: "i".to_owned() }),
+                            }),
+                            right: Box::new(Expression::Literal { value: json!(1) }),
+                        },
+                    }],
+                },
+            ],
+            body: Expression::Identifier { name: "partitions".to_owned() },
+        };
+        let helpers = BTreeMap::from([("divideIntoPartitions".to_owned(), helper)]);
+        let mut state = ArtifactExecutionState::default();
+        let value = evaluate_expression(
+            &Expression::Call {
+                callee: "divideIntoPartitions".to_owned(),
+                args: vec![
+                    Expression::Literal { value: json!(10) },
+                    Expression::Literal { value: json!(3) },
+                ],
+            },
+            &mut state,
+            &helpers,
+        )
+        .unwrap();
+
+        assert_eq!(value, json!([4, 3, 3]));
     }
 
     #[test]

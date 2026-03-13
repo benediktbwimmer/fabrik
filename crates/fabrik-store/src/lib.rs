@@ -3382,6 +3382,16 @@ impl WorkflowStore {
                 last_event_type = EXCLUDED.last_event_type,
                 updated_at = EXCLUDED.updated_at,
                 state = EXCLUDED.state
+            WHERE workflow_instances.event_count < EXCLUDED.event_count
+               OR (
+                    workflow_instances.event_count = EXCLUDED.event_count
+                AND workflow_instances.updated_at < EXCLUDED.updated_at
+               )
+               OR (
+                    workflow_instances.event_count = EXCLUDED.event_count
+                AND workflow_instances.updated_at = EXCLUDED.updated_at
+                AND workflow_instances.last_event_id <> EXCLUDED.last_event_id
+               )
             "#,
         )
         .bind(&persisted_state.tenant_id)
@@ -14394,6 +14404,73 @@ mod tests {
             .get_instance(&expected.tenant_id, &expected.instance_id)
             .await?
             .context("stored workflow instance should exist")?;
+        assert_eq!(restored, expected);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workflow_instance_upsert_ignores_stale_snapshot() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+
+        let tenant_id = "tenant-a".to_owned();
+        let instance_id = "wf-stale-instance".to_owned();
+        let run_id = "run-stale-instance".to_owned();
+        let base_time = Utc::now();
+
+        let newer = WorkflowInstanceState {
+            tenant_id: tenant_id.clone(),
+            instance_id: instance_id.clone(),
+            run_id: run_id.clone(),
+            definition_id: "demo".to_owned(),
+            definition_version: Some(1),
+            artifact_hash: Some("artifact-a".to_owned()),
+            workflow_task_queue: "default".to_owned(),
+            sticky_workflow_build_id: None,
+            sticky_workflow_poller_id: None,
+            current_state: Some("join".to_owned()),
+            context: Some(json!({"pending": 0})),
+            artifact_execution: Some(ArtifactExecutionState {
+                bindings: BTreeMap::from([(
+                    "fanout".to_owned(),
+                    json!({
+                        "origin_state": "dispatch",
+                        "wait_state": "join",
+                        "pending_count": 0
+                    }),
+                )]),
+                ..ArtifactExecutionState::default()
+            }),
+            status: WorkflowStatus::Completed,
+            input: Some(json!({"items": [1, 2, 3]})),
+            memo: None,
+            search_attributes: None,
+            output: Some(json!({"ok": true})),
+            event_count: 12,
+            last_event_id: Uuid::now_v7(),
+            last_event_type: "ActivityTaskCompleted".to_owned(),
+            updated_at: base_time + chrono::Duration::milliseconds(5),
+        };
+        let mut stale = newer.clone();
+        stale.status = WorkflowStatus::Running;
+        stale.context = Some(json!({"pending": 32}));
+        stale.output = None;
+        stale.event_count = 11;
+        stale.last_event_id = Uuid::now_v7();
+        stale.updated_at = base_time;
+
+        store.upsert_instance(&newer).await?;
+        store.upsert_instance(&stale).await?;
+
+        let restored = store
+            .get_instance(&tenant_id, &instance_id)
+            .await?
+            .context("stored workflow instance should exist")?;
+        let mut expected = newer.clone();
+        expected.expand_after_persistence();
         assert_eq!(restored, expected);
 
         Ok(())

@@ -8,22 +8,22 @@ use std::{
 
 use anyhow::{Context, Result};
 use axum::{
-    Json,
     extract::Path as AxumPath,
     extract::State as AxumState,
     http::StatusCode,
     routing::{get, post},
+    Json,
 };
 use chrono::{DateTime, Utc};
 use fabrik_broker::{
-    BrokerConfig, WorkflowHistoryFilter, WorkflowPublisher, build_workflow_consumer,
-    decode_consumed_workflow_event, partition_for_instance, read_workflow_history,
+    build_workflow_consumer, decode_consumed_workflow_event, partition_for_instance,
+    read_workflow_history, BrokerConfig, WorkflowHistoryFilter, WorkflowPublisher,
 };
 use fabrik_config::{
     ExecutorRuntimeConfig, GrpcServiceConfig, HttpServiceConfig, PostgresConfig, RedpandaConfig,
 };
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
-use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
+use fabrik_service::{default_router, init_tracing, serve, ServiceInfo};
 use fabrik_store::{
     ActivityScheduleUpdate, ActivityStartUpdate, ActivityTerminalPayload, ActivityTerminalUpdate,
     BulkChunkTerminalPayload, BulkChunkTerminalUpdate, ConsumedSignalRecord, TaskQueueKind,
@@ -31,31 +31,33 @@ use fabrik_store::{
     WorkflowStore,
 };
 use fabrik_throughput::{
-    ADMISSION_POLICY_VERSION, ThroughputBackend, bulk_reducer_class, bulk_reducer_is_mergeable,
-    bulk_reducer_materializes_results, decode_cbor, encode_cbor, planned_reduction_tree_depth,
-    stream_v2_fast_lane_enabled,
+    bulk_reducer_class, bulk_reducer_is_mergeable, bulk_reducer_materializes_results, decode_cbor,
+    encode_cbor, planned_reduction_tree_depth, stream_v2_fast_lane_enabled, ThroughputBackend,
+    ADMISSION_POLICY_VERSION,
 };
 use fabrik_worker_protocol::activity_worker::{
+    activity_task_result,
+    activity_worker_api_server::{ActivityWorkerApi, ActivityWorkerApiServer},
     Ack, ActivityTask, ActivityTaskCancelledResult, ActivityTaskCompletedResult,
     ActivityTaskFailedResult, ActivityTaskResult, BulkActivityTask, BulkActivityTaskResult,
     PollActivityTaskRequest, PollActivityTaskResponse, PollActivityTasksRequest,
     PollActivityTasksResponse, PollBulkActivityTaskRequest, PollBulkActivityTaskResponse,
     RecordActivityHeartbeatRequest, RecordActivityHeartbeatResponse,
     ReportActivityTaskCancelledRequest, ReportActivityTaskResultsRequest,
-    ReportBulkActivityTaskResultsRequest, activity_task_result,
-    activity_worker_api_server::{ActivityWorkerApi, ActivityWorkerApiServer},
+    ReportBulkActivityTaskResultsRequest,
 };
 use fabrik_workflow::{
-    ArtifactExecutionState, CompiledExecutionPlan, CompiledWorkflowArtifact, ExecutionTurnContext,
-    RetryPolicy, WorkflowInstanceState, WorkflowStatus, execution_state_for_event, parse_timer_ref,
-    replay_compiled_history_trace, replay_compiled_history_trace_from_snapshot,
-    replay_history_trace_from_snapshot, retry_policy_allows_failure_retry,
+    execution_state_for_event, parse_timer_ref, replay_compiled_history_trace,
+    replay_compiled_history_trace_from_snapshot, replay_history_trace_from_snapshot,
+    retry_policy_allows_failure_retry, ArtifactExecutionState, CompiledExecutionPlan,
+    CompiledWorkflowArtifact, ExecutionTurnContext, RetryPolicy, WorkflowInstanceState,
+    WorkflowStatus,
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, Notify};
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{transport::Server, Request, Response, Status};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -7282,6 +7284,7 @@ mod tests {
                         "wait".to_owned(),
                         CompiledStateNode::WaitForTimer {
                             timer_ref: "1s".to_owned(),
+                            timer_expr: None,
                             next: "done".to_owned(),
                         },
                     ),
@@ -7526,12 +7529,16 @@ mod tests {
         assert!(inner.ready.values().flatten().any(|task| task.run_id == "active"));
         assert!(inner.leased.values().all(|leased| leased.task.run_id != "terminal"));
         assert!(inner.leased.values().any(|leased| leased.task.run_id == "active"));
-        assert!(
-            inner.delayed_retries.values().flatten().all(|retry| retry.task.run_id != "terminal")
-        );
-        assert!(
-            inner.delayed_retries.values().flatten().any(|retry| retry.task.run_id == "active")
-        );
+        assert!(inner
+            .delayed_retries
+            .values()
+            .flatten()
+            .all(|retry| retry.task.run_id != "terminal"));
+        assert!(inner
+            .delayed_retries
+            .values()
+            .flatten()
+            .any(|retry| retry.task.run_id == "active"));
     }
 
     fn test_artifact(task_queue: &str) -> CompiledWorkflowArtifact {
@@ -8733,8 +8740,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_mailbox_item_unwinds_active_activity_instead_of_force_cancelling_workflow()
-    -> Result<()> {
+    async fn cancel_mailbox_item_unwinds_active_activity_instead_of_force_cancelling_workflow(
+    ) -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
         };
@@ -10060,6 +10067,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn out_of_order_post_plan_persistence_does_not_regress_fanout_completion() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = fanout_artifact_with_reducer(Some("collect_results"));
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir =
+            std::env::temp_dir().join(format!("unified-runtime-fanout-race-{}", Uuid::now_v7()));
+        let app_state = test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone());
+        apply_ownership_record(
+            &app_state,
+            1,
+            "test-owner",
+            5,
+            Utc::now() + ChronoDuration::seconds(30),
+        );
+
+        let payload = "x".repeat(1024);
+        let items =
+            (0..4).map(|index| json!({ "index": index, "payload": payload })).collect::<Vec<_>>();
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-fanout-race",
+            "run-fanout-race-1",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({ "items": items }) },
+            Utc::now(),
+        );
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let leased = {
+            let mut inner = app_state.inner.lock().expect("unified runtime lock poisoned");
+            lease_ready_tasks(
+                &mut inner,
+                &QueueKey { tenant_id: "tenant".to_owned(), task_queue: "default".to_owned() },
+                "worker-a",
+                "build-a",
+                4,
+            )
+        };
+        assert_eq!(leased.len(), 4);
+
+        let completed_result =
+            |task: &LeasedActivity, index: usize| -> Result<ActivityTaskResult> {
+                Ok(ActivityTaskResult {
+                    tenant_id: task.task.tenant_id.clone(),
+                    instance_id: task.task.instance_id.clone(),
+                    run_id: task.task.run_id.clone(),
+                    activity_id: task.task.activity_id.clone(),
+                    attempt: task.task.attempt,
+                    worker_id: task.worker_id.clone(),
+                    worker_build_id: task.worker_build_id.clone(),
+                    lease_epoch: task.task.lease_epoch,
+                    owner_epoch: task.owner_epoch,
+                    result: Some(activity_task_result::Result::Completed(
+                        ActivityTaskCompletedResult {
+                            output_json: serde_json::to_string(&json!({
+                                "index": index,
+                                "payload": format!("done-{index}"),
+                            }))
+                            .context("serialize activity result output")?,
+                            output_cbor: Vec::new(),
+                        },
+                    )),
+                })
+            };
+
+        let first_batch_at = Utc::now();
+        let first_actions = prepare_result_application(
+            &app_state,
+            vec![completed_result(&leased[0], 0)?, completed_result(&leased[1], 1)?],
+            first_batch_at,
+        )?;
+        assert!(!first_actions.post_plans.is_empty());
+        let first_post_plan = first_actions
+            .post_plans
+            .iter()
+            .min_by_key(|effect| effect.instance.event_count)
+            .cloned()
+            .context("first batch should produce a post-plan snapshot")?;
+        apply_db_actions(&app_state, first_actions.general, first_actions.schedules).await?;
+
+        let second_batch_at = first_batch_at + ChronoDuration::milliseconds(1);
+        let second_actions = prepare_result_application(
+            &app_state,
+            vec![completed_result(&leased[2], 2)?, completed_result(&leased[3], 3)?],
+            second_batch_at,
+        )?;
+        let second_post_plan = second_actions
+            .post_plans
+            .iter()
+            .find(|effect| effect.instance.status.is_terminal())
+            .cloned()
+            .context("second batch should produce a final post-plan snapshot")?;
+        assert!(second_post_plan.instance.status.is_terminal());
+        assert!(second_post_plan.instance.event_count > first_post_plan.instance.event_count);
+
+        apply_db_actions(&app_state, second_actions.general, second_actions.schedules).await?;
+        apply_post_plan_effects_with_options(&app_state, second_post_plan.clone(), true).await?;
+
+        let stored_after_final = store
+            .get_instance("tenant", "instance-fanout-race")
+            .await?
+            .context("final workflow instance should be stored")?;
+        assert_eq!(stored_after_final.status, WorkflowStatus::Completed);
+        assert_eq!(stored_after_final.event_count, second_post_plan.instance.event_count);
+        assert_eq!(stored_after_final.last_event_id, second_post_plan.instance.last_event_id);
+        assert_eq!(stored_after_final.output, second_post_plan.instance.output);
+
+        apply_post_plan_effects_with_options(&app_state, first_post_plan, true).await?;
+
+        let stored_after_stale = store
+            .get_instance("tenant", "instance-fanout-race")
+            .await?
+            .context("stale post-plan should not remove the stored workflow instance")?;
+        assert_eq!(stored_after_stale.status, WorkflowStatus::Completed);
+        assert_eq!(stored_after_stale.event_count, second_post_plan.instance.event_count);
+        assert_eq!(stored_after_stale.last_event_id, second_post_plan.instance.last_event_id);
+        assert_eq!(stored_after_stale.output, second_post_plan.instance.output);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn hot_signal_and_activity_completion_are_published_to_broker_history() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
@@ -10623,8 +10763,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_snapshot_restore_falls_back_to_full_history_when_snapshot_tail_is_inconsistent()
-    -> Result<()> {
+    async fn store_snapshot_restore_falls_back_to_full_history_when_snapshot_tail_is_inconsistent(
+    ) -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
         };
@@ -10759,8 +10899,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_snapshot_restore_preserves_alpha_queue_memo_and_search_attributes_after_handoff()
-    -> Result<()> {
+    async fn store_snapshot_restore_preserves_alpha_queue_memo_and_search_attributes_after_handoff(
+    ) -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
         };

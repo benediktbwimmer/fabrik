@@ -724,6 +724,7 @@ fn benchmark_artifact(
                 "wait_timer".to_owned(),
                 CompiledStateNode::WaitForTimer {
                     timer_ref: format!("{}s", args.timer_secs.max(1)),
+                    timer_expr: None,
                     next: "dispatch".to_owned(),
                 },
             );

@@ -1,5 +1,66 @@
 {
   "profiles": {
+    "gate": [
+      {
+        "name": "fanout-baseline",
+        "description": "Compact baseline gate for balanced fan-out/fan-in throughput.",
+        "workflowCount": 6,
+        "activitiesPerWorkflow": 64,
+        "payloadSize": 256,
+        "workerCount": 6,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timeoutSecs": 120
+      },
+      {
+        "name": "fanout-payload-heavy",
+        "description": "Smaller payload-heavy gate to catch serialization and persistence regressions.",
+        "workflowCount": 4,
+        "activitiesPerWorkflow": 48,
+        "payloadSize": 4096,
+        "workerCount": 6,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timeoutSecs": 120
+      },
+      {
+        "name": "timer-gated-fanout",
+        "description": "Single-timer gate to keep timer-path compatibility under coverage.",
+        "kind": "timer_gate",
+        "workflowCount": 4,
+        "activitiesPerWorkflow": 48,
+        "payloadSize": 256,
+        "workerCount": 6,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timerSecs": 1,
+        "timeoutSecs": 120
+      },
+      {
+        "name": "update-gated-fanout",
+        "description": "Update-gated fan-out gate to catch workflow-task coordination regressions.",
+        "kind": "update_gate",
+        "workflowCount": 4,
+        "activitiesPerWorkflow": 48,
+        "payloadSize": 256,
+        "workerCount": 6,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timeoutSecs": 120
+      },
+      {
+        "name": "child-workflow-gated-fanout",
+        "description": "Parent/child gate that keeps child-start and completion reflection under coverage.",
+        "kind": "child_workflow",
+        "workflowCount": 4,
+        "activitiesPerWorkflow": 48,
+        "payloadSize": 256,
+        "workerCount": 6,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timeoutSecs": 120
+      }
+    ],
     "smoke": [
       {
         "name": "fanout-baseline",

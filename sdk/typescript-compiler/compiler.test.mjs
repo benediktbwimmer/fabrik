@@ -329,6 +329,8 @@ test("compiler lowers Date.now, Object.keys, and array join expressions", async 
 
   assert.match(serialized, /"kind":"now"/);
   assert.match(serialized, /"callee":"__builtin_object_keys"/);
+  assert.match(serialized, /"callee":"__builtin_array_map_number"/);
+  assert.match(serialized, /"callee":"__builtin_array_sort_numeric_asc"/);
   assert.match(serialized, /"callee":"__builtin_array_join"/);
 });
 
@@ -353,6 +355,190 @@ test("compiler lowers dynamic Temporal sleep durations", async () => {
   assert.match(serialized, /"type":"wait_for_timer"/);
   assert.match(serialized, /"timer_expr"/);
   assert.match(serialized, /"op":"coalesce"/);
+});
+
+test("compiler lowers Temporal signal handler increment statements", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-signal-counter-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalSignalCounterWorkflow",
+    "--definition-id",
+    "temporal-signal-counter-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serializedSignals = JSON.stringify(artifact.signals.tick.states);
+
+  assert.match(serializedSignals, /"target":"progress"/);
+  assert.match(serializedSignals, /"op":"add"/);
+});
+
+test("compiler lowers Temporal delete statements into object-omit assignments", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-delete-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalDeleteWorkflow",
+    "--definition-id",
+    "temporal-delete-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serializedSignals = JSON.stringify(artifact.signals.clear.states);
+
+  assert.match(serializedSignals, /"op":"in"/);
+  assert.match(serializedSignals, /"callee":"__builtin_object_omit"/);
+  assert.match(serializedSignals, /"target":"records"/);
+});
+
+test("compiler lowers bare awaited Temporal startChild calls", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-start-child-bare-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalStartChildBareWorkflow",
+    "--definition-id",
+    "temporal-start-child-bare-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"start_child"/);
+  assert.doesNotMatch(serialized, /"handle_var"/);
+});
+
+test("compiler lowers indexed object assignments into object-set calls", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-object-set-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalObjectSetWorkflow",
+    "--definition-id",
+    "temporal-object-set-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serializedSignals = JSON.stringify(artifact.signals.mark.states);
+
+  assert.match(serializedSignals, /"callee":"__builtin_object_set"/);
+  assert.match(serializedSignals, /"target":"records"/);
+});
+
+test("compiler lowers block-bodied pure helpers with for-range statements", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-helper-block-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalHelperBlockWorkflow",
+    "--definition-id",
+    "temporal-helper-block-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const helper = artifact.helpers.divideIntoPartitions;
+  const serializedHelper = JSON.stringify(helper);
+
+  assert.match(serializedHelper, /"type":"for_range"/);
+  assert.match(serializedHelper, /"type":"assign_index"/);
+  assert.match(serializedHelper, /"callee":"__builtin_math_floor"/);
+  assert.match(serializedHelper, /"callee":"__builtin_array_fill"/);
+});
+
+test("compiler lowers array reduce expressions", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-array-reduce-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalArrayReduceWorkflow",
+    "--definition-id",
+    "temporal-array-reduce-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"kind":"array_reduce"/);
+  assert.match(serialized, /"accumulator_name":"sum"/);
+  assert.match(serialized, /"item_name":"value"/);
+});
+
+test("compiler lowers local child promise arrays awaited with Promise.all", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-child-promise-all-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalChildPromiseAllWorkflow",
+    "--definition-id",
+    "temporal-child-promise-all-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"start_child"/);
+  assert.match(serialized, /"callee":"__builtin_array_append"/);
+  assert.match(serialized, /"type":"wait_for_child"/);
+});
+
+test("compiler lowers mapped executeChild Promise.all joins", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-child-promise-all-map-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalChildPromiseAllMapWorkflow",
+    "--definition-id",
+    "temporal-child-promise-all-map-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"start_child"/);
+  assert.match(serialized, /"callee":"__builtin_array_append"/);
+  assert.match(serialized, /"type":"wait_for_child"/);
+  assert.match(serialized, /"property":"length"/);
 });
 
 test("compiler lowers Temporal Promise.all proxy activity maps into fan-out plus barrier", async () => {
@@ -832,6 +1018,29 @@ test("compiler emits workflow parameter metadata for Temporal workflow entrypoin
   assert.match(serialized, /"input":\{"kind":"array"/);
   assert.match(serialized, /"name":"name"/);
   assert.match(serialized, /"name":"punctuation"/);
+});
+
+test("compiler emits rest workflow parameter metadata", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-rest-params-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalRestParamsWorkflow",
+    "--definition-id",
+    "temporal-rest-params",
+    "--version",
+    "1",
+  ]);
+
+  const artifact = JSON.parse(stdout);
+  assert.deepEqual(artifact.workflow.params, [
+    { name: "prefix" },
+    { name: "names", rest: true },
+  ]);
 });
 
 test("compiler rejects forbidden global access with source location", async () => {

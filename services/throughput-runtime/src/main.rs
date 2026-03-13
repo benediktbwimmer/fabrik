@@ -1923,7 +1923,7 @@ async fn build_stream_projection_records(
         activity_type,
         task_queue,
         items,
-        input_handle: _,
+        input_handle,
         result_handle,
         chunk_size,
         max_attempts,
@@ -1938,6 +1938,9 @@ async fn build_stream_projection_records(
     else {
         anyhow::bail!("expected BulkActivityBatchScheduled event");
     };
+
+    let (items, batch_input_handle) =
+        resolve_stream_batch_input(&app_state.payload_store, batch_id, items, input_handle).await?;
 
     let chunk_size_usize =
         usize::try_from((*chunk_size).max(1)).context("bulk chunk size exceeds usize")?;
@@ -1973,7 +1976,6 @@ async fn build_stream_projection_records(
     );
     let aggregation_tree_depth =
         planned_reduction_tree_depth(chunk_count, effective_group_count, reducer.as_deref());
-    let batch_input_handle = externalize_batch_input(app_state, batch_id, items).await?;
     let batch_result_handle = maybe_initialize_batch_result_manifest(
         app_state,
         batch_id,
@@ -2260,13 +2262,28 @@ fn reconstruct_missing_stream_chunks(
     Ok(chunks)
 }
 
+async fn resolve_stream_batch_input(
+    payload_store: &PayloadStore,
+    batch_id: &str,
+    items: &[Value],
+    input_handle: &Value,
+) -> Result<(Vec<Value>, PayloadHandle)> {
+    if !items.is_empty() {
+        let handle = externalize_batch_input(payload_store, batch_id, items).await?;
+        return Ok((items.to_vec(), handle));
+    }
+    let handle = serde_json::from_value::<PayloadHandle>(input_handle.clone())
+        .context("failed to decode stream batch input handle")?;
+    let items = payload_store.read_items(&handle).await?;
+    Ok((items, handle))
+}
+
 async fn externalize_batch_input(
-    state: &AppState,
+    payload_store: &PayloadStore,
     batch_id: &str,
     items: &[Value],
 ) -> Result<PayloadHandle> {
-    state
-        .payload_store
+    payload_store
         .write_value(&format!("batches/{batch_id}/input"), &Value::Array(items.to_vec()))
         .await
 }
@@ -3630,6 +3647,41 @@ mod tests {
 
         assert_eq!(actual_handle, result_handle);
         assert_eq!(output, Some(vec![serde_json::json!({"ok": true})]));
+    }
+
+    #[tokio::test]
+    async fn resolve_stream_batch_input_reads_manifest_handles() -> Result<()> {
+        let payload_root = temp_path("throughput-runtime-payload-store");
+        let payload_store = PayloadStore::from_config(PayloadStoreConfig {
+            default_store: PayloadStoreKind::LocalFilesystem,
+            local_dir: payload_root.display().to_string(),
+            s3_bucket: None,
+            s3_region: "us-east-1".to_owned(),
+            s3_endpoint: None,
+            s3_access_key_id: None,
+            s3_secret_access_key: None,
+            s3_force_path_style: false,
+            s3_key_prefix: "throughput".to_owned(),
+        })
+        .await?;
+        let items = vec![serde_json::json!({"value": "x"}), serde_json::json!({"value": "y"})];
+        let handle = payload_store
+            .write_value("batches/batch-a/input", &Value::Array(items.clone()))
+            .await?;
+
+        let (resolved_items, resolved_handle) = resolve_stream_batch_input(
+            &payload_store,
+            "batch-a",
+            &[],
+            &serde_json::to_value(&handle)?,
+        )
+        .await?;
+
+        assert_eq!(resolved_items, items);
+        assert_eq!(resolved_handle, handle);
+
+        fs::remove_dir_all(payload_root).ok();
+        Ok(())
     }
 
     #[test]

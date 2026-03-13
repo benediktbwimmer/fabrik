@@ -629,6 +629,7 @@ function injectTemporalBuiltinHelpers(helpers, temporalApi) {
   for (const localName of temporalApi.isCancellation) {
     merged.set(localName, {
       params: ["error"],
+      statements: [],
       body: {
         kind: "call",
         callee: "__temporal_is_cancellation",
@@ -701,27 +702,226 @@ function compileHelperFunction(name, declaration) {
   }
   const params = declaration.parameters.map((parameter) => parameter.name.getText());
   if (ts.isBlock(declaration.body)) {
-    if (
-      declaration.body.statements.length !== 1 ||
-      !ts.isReturnStatement(declaration.body.statements[0]) ||
-      !declaration.body.statements[0].expression
-    ) {
-      throw compilerError(`helper ${name} must be a single return expression`, declaration.body);
+    const last = declaration.body.statements.at(-1);
+    if (!last || !ts.isReturnStatement(last) || !last.expression) {
+      throw compilerError(`helper ${name} must end with a return expression`, declaration.body);
     }
-    return { params, body: compileExpression(declaration.body.statements[0].expression) };
+    return {
+      params,
+      statements: compileHelperStatements(declaration.body.statements.slice(0, -1)),
+      body: compileExpression(last.expression),
+    };
   }
-  return { params, body: compileExpression(declaration.body) };
+  return { params, statements: [], body: compileExpression(declaration.body) };
+}
+
+function compileHelperStatements(statements) {
+  const compiled = [];
+  for (const statement of statements) {
+    if (ts.isEmptyStatement(statement)) {
+      continue;
+    }
+    if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations) {
+        if (!ts.isIdentifier(declaration.name) || !declaration.initializer) {
+          throw compilerError(`unsupported helper declaration: ${statement.getText()}`, declaration);
+        }
+        compiled.push({
+          type: "assign",
+          target: declaration.name.text,
+          expr: compileExpression(declaration.initializer),
+        });
+      }
+      continue;
+    }
+    if (ts.isExpressionStatement(statement)) {
+      if (
+        ts.isBinaryExpression(statement.expression) &&
+        (statement.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken ||
+          statement.expression.operatorToken.kind === ts.SyntaxKind.PlusEqualsToken)
+      ) {
+        compiled.push(
+          compileHelperAssignmentStatement(
+            statement,
+            statement.expression.left,
+            statement.expression.operatorToken.kind,
+            statement.expression.right,
+          ),
+        );
+        continue;
+      }
+      throw compilerError(`unsupported helper expression statement: ${statement.getText()}`, statement);
+    }
+    if (ts.isForStatement(statement)) {
+      compiled.push(compileHelperForStatement(statement));
+      continue;
+    }
+    throw compilerError(`unsupported helper statement: ${statement.getText()}`, statement);
+  }
+  return compiled;
+}
+
+function compileHelperAssignmentStatement(statement, left, operatorKind, right) {
+  if (ts.isIdentifier(left)) {
+    if (operatorKind === ts.SyntaxKind.EqualsToken) {
+      return { type: "assign", target: left.text, expr: compileExpression(right) };
+    }
+    return {
+      type: "assign",
+      target: left.text,
+      expr: {
+        kind: "binary",
+        op: "add",
+        left: { kind: "identifier", name: left.text },
+        right: compileExpression(right),
+      },
+    };
+  }
+  if (ts.isElementAccessExpression(left) && ts.isIdentifier(left.expression)) {
+    const expr =
+      operatorKind === ts.SyntaxKind.EqualsToken
+        ? compileExpression(right)
+        : {
+            kind: "binary",
+            op: "add",
+            left: {
+              kind: "index",
+              object: { kind: "identifier", name: left.expression.text },
+              index: compileExpression(left.argumentExpression),
+            },
+            right: compileExpression(right),
+          };
+    return {
+      type: "assign_index",
+      target: left.expression.text,
+      index: compileExpression(left.argumentExpression),
+      expr,
+    };
+  }
+  throw compilerError(`unsupported helper assignment target: ${statement.getText()}`, statement);
+}
+
+function compileHelperForStatement(statement) {
+  if (!statement.initializer || !ts.isVariableDeclarationList(statement.initializer)) {
+    throw compilerError(`helper for-loops require a variable initializer`, statement);
+  }
+  if (statement.initializer.declarations.length !== 1) {
+    throw compilerError(`helper for-loops require exactly one initializer`, statement.initializer);
+  }
+  const declaration = statement.initializer.declarations[0];
+  if (!ts.isIdentifier(declaration.name) || !declaration.initializer) {
+    throw compilerError(`helper for-loop initializer must bind one identifier`, declaration);
+  }
+  if (
+    !statement.condition ||
+    !ts.isBinaryExpression(statement.condition) ||
+    statement.condition.operatorToken.kind !== ts.SyntaxKind.LessThanToken ||
+    !ts.isIdentifier(statement.condition.left) ||
+    statement.condition.left.text !== declaration.name.text
+  ) {
+    throw compilerError(`helper for-loops must use ${declaration.name.text} < end`, statement);
+  }
+  if (
+    !statement.incrementor ||
+    !(
+      (ts.isPostfixUnaryExpression(statement.incrementor) || ts.isPrefixUnaryExpression(statement.incrementor)) &&
+      ts.isIdentifier(statement.incrementor.operand) &&
+      statement.incrementor.operand.text === declaration.name.text &&
+      statement.incrementor.operator === ts.SyntaxKind.PlusPlusToken
+    )
+  ) {
+    throw compilerError(`helper for-loops must increment ${declaration.name.text} with ++`, statement);
+  }
+  const bodyStatements = ts.isBlock(statement.statement)
+    ? statement.statement.statements
+    : [statement.statement];
+  return {
+    type: "for_range",
+    index_var: declaration.name.text,
+    start: compileExpression(declaration.initializer),
+    end: compileExpression(statement.condition.right),
+    body: compileHelperStatements(bodyStatements),
+  };
+}
+
+function compileDeleteAssignment(statement, expression) {
+  if (!ts.isElementAccessExpression(expression.expression)) {
+    throw compilerError(`unsupported delete target: ${statement.getText()}`, statement);
+  }
+  if (!ts.isIdentifier(expression.expression.expression)) {
+    throw compilerError(`unsupported delete target: ${statement.getText()}`, statement);
+  }
+  return {
+    target: expression.expression.expression.text,
+    expr: {
+      kind: "call",
+      callee: "__builtin_object_omit",
+      args: [
+        { kind: "identifier", name: expression.expression.expression.text },
+        compileExpression(expression.expression.argumentExpression),
+      ],
+    },
+  };
+}
+
+function compileAssignmentAction(statement, left, operatorKind, right) {
+  if (ts.isIdentifier(left)) {
+    if (operatorKind === ts.SyntaxKind.EqualsToken) {
+      return {
+        target: left.text,
+        expr: compileExpression(right),
+      };
+    }
+    return {
+      target: left.text,
+      expr: {
+        kind: "binary",
+        op: "add",
+        left: { kind: "identifier", name: left.text },
+        right: compileExpression(right),
+      },
+    };
+  }
+  if (
+    ts.isElementAccessExpression(left) &&
+    ts.isIdentifier(left.expression)
+  ) {
+    const expr =
+      operatorKind === ts.SyntaxKind.EqualsToken
+        ? compileExpression(right)
+        : {
+            kind: "binary",
+            op: "add",
+            left: {
+              kind: "index",
+              object: { kind: "identifier", name: left.expression.text },
+              index: compileExpression(left.argumentExpression),
+            },
+            right: compileExpression(right),
+          };
+    return {
+      target: left.expression.text,
+      expr: {
+        kind: "call",
+        callee: "__builtin_object_set",
+        args: [
+          { kind: "identifier", name: left.expression.text },
+          compileExpression(left.argumentExpression),
+          expr,
+        ],
+      },
+    };
+  }
+  throw compilerError(`unsupported assignment target: ${statement.getText()}`, statement);
 }
 
 function compileWorkflowParam(parameter) {
-  if (parameter.dotDotDotToken) {
-    throw compilerError(`workflow parameters must not use rest arguments`, parameter);
-  }
   if (!ts.isIdentifier(parameter.name)) {
     throw compilerError(`workflow parameters must be plain identifiers`, parameter.name);
   }
   return {
     name: parameter.name.text,
+    rest: Boolean(parameter.dotDotDotToken) || undefined,
     default: parameter.initializer ? compileExpression(parameter.initializer) : undefined,
   };
 }
@@ -757,6 +957,28 @@ function compileArrayMethodHandler(method, handler) {
   };
 }
 
+function compileArrayReduceHandler(handler) {
+  if (!ts.isArrowFunction(handler) && !ts.isFunctionExpression(handler)) {
+    throw compilerError(`reduce requires an inline function handler`, handler);
+  }
+  if (
+    handler.parameters.length !== 2 ||
+    !ts.isIdentifier(handler.parameters[0].name) ||
+    !ts.isIdentifier(handler.parameters[1].name)
+  ) {
+    throw compilerError(`reduce handlers must declare accumulator and item identifier parameters`, handler);
+  }
+  const expression = functionBodyExpression(handler.body);
+  if (!expression) {
+    throw compilerError(`reduce handlers must be a single return expression`, handler.body);
+  }
+  return {
+    accumulatorName: handler.parameters[0].name.text,
+    itemName: handler.parameters[1].name.text,
+    expr: compileExpression(expression),
+  };
+}
+
 function compileSignalHandlerActions(handler) {
   if (!ts.isArrowFunction(handler) && !ts.isFunctionExpression(handler)) {
     throw compilerError(`Temporal signal setHandler requires an inline function handler`, handler);
@@ -779,12 +1001,47 @@ function compileSignalHandlerActions(handler) {
     if (
       ts.isExpressionStatement(statement) &&
       ts.isBinaryExpression(statement.expression) &&
-      statement.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-      ts.isIdentifier(statement.expression.left)
+      (
+        statement.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken ||
+        statement.expression.operatorToken.kind === ts.SyntaxKind.PlusEqualsToken
+      )
     ) {
+      actions.push(
+        compileAssignmentAction(
+          statement,
+          statement.expression.left,
+          statement.expression.operatorToken.kind,
+          statement.expression.right,
+        ),
+      );
+      continue;
+    }
+    if (
+      ts.isExpressionStatement(statement) &&
+      ts.isDeleteExpression(statement.expression)
+    ) {
+      actions.push(compileDeleteAssignment(statement, statement.expression));
+      continue;
+    }
+    if (
+      ts.isExpressionStatement(statement) &&
+      (ts.isPostfixUnaryExpression(statement.expression) || ts.isPrefixUnaryExpression(statement.expression)) &&
+      ts.isIdentifier(statement.expression.operand) &&
+      (
+        statement.expression.operator === ts.SyntaxKind.PlusPlusToken ||
+        statement.expression.operator === ts.SyntaxKind.MinusMinusToken
+      )
+    ) {
+      const op =
+        statement.expression.operator === ts.SyntaxKind.PlusPlusToken ? "add" : "subtract";
       actions.push({
-        target: statement.expression.left.text,
-        expr: compileExpression(statement.expression.right),
+        target: statement.expression.operand.text,
+        expr: {
+          kind: "binary",
+          op,
+          left: { kind: "identifier", name: statement.expression.operand.text },
+          right: { kind: "literal", value: 1 },
+        },
       });
       continue;
     }
@@ -934,6 +1191,7 @@ function compileExpression(expression) {
       [ts.SyntaxKind.PercentToken, "remainder"],
       [ts.SyntaxKind.EqualsEqualsEqualsToken, "equal"],
       [ts.SyntaxKind.ExclamationEqualsEqualsToken, "not_equal"],
+      [ts.SyntaxKind.InKeyword, "in"],
       [ts.SyntaxKind.LessThanToken, "less_than"],
       [ts.SyntaxKind.LessThanEqualsToken, "less_than_or_equal"],
       [ts.SyntaxKind.GreaterThanToken, "greater_than"],
@@ -961,6 +1219,27 @@ function compileExpression(expression) {
     };
   }
   if (ts.isCallExpression(expression)) {
+    if (
+      ts.isPropertyAccessExpression(expression.expression) &&
+      ts.isIdentifier(expression.expression.expression) &&
+      expression.expression.expression.text === "Math" &&
+      (expression.expression.name.text === "floor" || expression.expression.name.text === "min")
+    ) {
+      if (
+        (expression.expression.name.text === "floor" && expression.arguments.length !== 1) ||
+        (expression.expression.name.text === "min" && expression.arguments.length !== 2)
+      ) {
+        throw compilerError(`Math.${expression.expression.name.text}() has unsupported arity`, expression);
+      }
+      return {
+        kind: "call",
+        callee:
+          expression.expression.name.text === "floor"
+            ? "__builtin_math_floor"
+            : "__builtin_math_min",
+        args: expression.arguments.map(compileExpression),
+      };
+    }
     if (
       ts.isPropertyAccessExpression(expression.expression) &&
       ts.isIdentifier(expression.expression.expression) &&
@@ -1021,6 +1300,27 @@ function compileExpression(expression) {
     }
     if (ts.isPropertyAccessExpression(expression.expression)) {
       const method = expression.expression.name.text;
+      if (
+        method === "fill" &&
+        ts.isNewExpression(expression.expression.expression) &&
+        ts.isIdentifier(expression.expression.expression.expression) &&
+        expression.expression.expression.expression.text === "Array"
+      ) {
+        if (
+          expression.expression.expression.arguments?.length !== 1 ||
+          expression.arguments.length !== 1
+        ) {
+          throw compilerError(`new Array(...).fill(...) requires one length and one fill value`, expression);
+        }
+        return {
+          kind: "call",
+          callee: "__builtin_array_fill",
+          args: [
+            compileExpression(expression.expression.expression.arguments[0]),
+            compileExpression(expression.arguments[0]),
+          ],
+        };
+      }
       if (method === "join") {
         if (expression.arguments.length > 1) {
           throw compilerError(`join() supports at most one separator argument`, expression);
@@ -1036,10 +1336,75 @@ function compileExpression(expression) {
           ],
         };
       }
+      if (method === "reduce") {
+        const handler = expression.arguments[0];
+        const initial = expression.arguments[1];
+        if (!handler || !initial) {
+          throw compilerError(`reduce requires a reducer function and initial value`, expression);
+        }
+        const compiled = compileArrayReduceHandler(handler);
+        return {
+          kind: "array_reduce",
+          array: compileExpression(expression.expression.expression),
+          accumulator_name: compiled.accumulatorName,
+          item_name: compiled.itemName,
+          initial: compileExpression(initial),
+          expr: compiled.expr,
+        };
+      }
+      if (method === "sort") {
+        if (expression.arguments.length === 0) {
+          return {
+            kind: "call",
+            callee: "__builtin_array_sort_default",
+            args: [compileExpression(expression.expression.expression)],
+          };
+        }
+        if (
+          expression.arguments.length === 1 &&
+          (ts.isArrowFunction(expression.arguments[0]) || ts.isFunctionExpression(expression.arguments[0]))
+        ) {
+          const handler = expression.arguments[0];
+          if (
+            handler.parameters.length === 2 &&
+            ts.isIdentifier(handler.parameters[0].name) &&
+            ts.isIdentifier(handler.parameters[1].name)
+          ) {
+            const comparatorBody = functionBodyExpression(handler.body);
+            if (
+              comparatorBody &&
+              ts.isBinaryExpression(comparatorBody) &&
+              comparatorBody.operatorToken.kind === ts.SyntaxKind.MinusToken &&
+              ts.isIdentifier(comparatorBody.left) &&
+              ts.isIdentifier(comparatorBody.right) &&
+              comparatorBody.left.text === handler.parameters[0].name.text &&
+              comparatorBody.right.text === handler.parameters[1].name.text
+            ) {
+              return {
+                kind: "call",
+                callee: "__builtin_array_sort_numeric_asc",
+                args: [compileExpression(expression.expression.expression)],
+              };
+            }
+          }
+        }
+        throw compilerError(`sort() only supports no-arg default sorting or (a, b) => a - b`, expression);
+      }
       if (method === "find" || method === "map") {
         const handler = expression.arguments[0];
         if (!handler) {
           throw compilerError(`${method} requires a function handler`, expression);
+        }
+        if (
+          method === "map" &&
+          ts.isIdentifier(handler) &&
+          handler.text === "Number"
+        ) {
+          return {
+            kind: "call",
+            callee: "__builtin_array_map_number",
+            args: [compileExpression(expression.expression.expression)],
+          };
         }
         const compiled = compileArrayMethodHandler(method, handler);
         if (method === "find") {
@@ -1102,6 +1467,16 @@ function compileExpression(expression) {
       );
     }
     if (ts.isIdentifier(expression.expression)) {
+      if (expression.expression.text === "String") {
+        if (expression.arguments.length !== 1) {
+          throw compilerError(`String() requires exactly one argument`, expression);
+        }
+        return {
+          kind: "call",
+          callee: "__builtin_string",
+          args: [compileExpression(expression.arguments[0])],
+        };
+      }
       return {
         kind: "call",
         callee: expression.expression.text,
@@ -1166,6 +1541,7 @@ class WorkflowLowerer {
     this.updates = {};
     this.nonCancellableStates = new Set();
     this.childHandleVars = new Set();
+    this.childPromiseArrayVars = new Set();
     this.externalHandleVars = new Map();
     this.bulkHandleVars = new Set();
     this.temporalSignalHandlers = new Map();
@@ -1372,6 +1748,31 @@ class WorkflowLowerer {
         ) {
           this.childHandleVars.add(current.name.text);
         }
+      }
+      if (
+        ts.isExpressionStatement(current) &&
+        ts.isCallExpression(current.expression) &&
+        ts.isPropertyAccessExpression(current.expression.expression) &&
+        current.expression.expression.name.text === "push" &&
+        ts.isIdentifier(current.expression.expression.expression) &&
+        current.expression.arguments.length === 1 &&
+        ts.isCallExpression(current.expression.arguments[0]) &&
+        (
+          temporalImportedCallMatches(
+            current.expression.arguments[0],
+            this.temporalApi.executeChild,
+            "executeChild",
+            this.temporalApi,
+          ) ||
+          temporalImportedCallMatches(
+            current.expression.arguments[0],
+            this.temporalApi.startChild,
+            "startChild",
+            this.temporalApi,
+          )
+        )
+      ) {
+        this.childPromiseArrayVars.add(current.expression.expression.expression.text);
       }
       ts.forEachChild(current, visit);
     };
@@ -1612,6 +2013,10 @@ class WorkflowLowerer {
         this.registerTemporalNamedHandler(statement.expression);
         return nextState;
       }
+      const pushedChildState = this.lowerTemporalChildPromisePush(statement.expression, nextState, statement);
+      if (pushedChildState) {
+        return pushedChildState;
+      }
       if (temporalLogCallMatches(statement.expression, this.temporalApi)) {
         return nextState;
       }
@@ -1681,13 +2086,26 @@ class WorkflowLowerer {
         return this.lowerAwait(statement.expression, null, nextState, errorTarget);
       }
       if (
-        ts.isBinaryExpression(statement.expression) &&
-        statement.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken
+        (ts.isPostfixUnaryExpression(statement.expression) || ts.isPrefixUnaryExpression(statement.expression)) &&
+        ts.isIdentifier(statement.expression.operand) &&
+        (
+          statement.expression.operator === ts.SyntaxKind.PlusPlusToken ||
+          statement.expression.operator === ts.SyntaxKind.MinusMinusToken
+        )
       ) {
-        if (!ts.isIdentifier(statement.expression.left)) {
-          throw compilerError(`unsupported assignment target: ${statement.getText()}`, statement);
-        }
+        return this.lowerSyntheticExpression(statement.expression, nextState);
+      }
+      if (
+        ts.isBinaryExpression(statement.expression) &&
+        (
+          statement.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken ||
+          statement.expression.operatorToken.kind === ts.SyntaxKind.PlusEqualsToken
+        )
+      ) {
         if (ts.isAwaitExpression(statement.expression.right)) {
+          if (!ts.isIdentifier(statement.expression.left)) {
+            throw compilerError(`unsupported assignment target: ${statement.getText()}`, statement);
+          }
           return this.lowerAwait(
             statement.expression.right,
             statement.expression.left.text,
@@ -1698,11 +2116,20 @@ class WorkflowLowerer {
         return this.addState("assign", {
           type: "assign",
           actions: [
-            {
-              target: statement.expression.left.text,
-              expr: compileExpression(statement.expression.right),
-            },
+            compileAssignmentAction(
+              statement,
+              statement.expression.left,
+              statement.expression.operatorToken.kind,
+              statement.expression.right,
+            ),
           ],
+          next: nextState,
+        }, statement);
+      }
+      if (ts.isDeleteExpression(statement.expression)) {
+        return this.addState("assign", {
+          type: "assign",
+          actions: [compileDeleteAssignment(statement, statement.expression)],
           next: nextState,
         }, statement);
       }
@@ -2086,6 +2513,71 @@ class WorkflowLowerer {
     throw compilerError(`unsupported statement: ${statement.getText()}`, statement);
   }
 
+  lowerTemporalChildPromisePush(callExpression, nextState, node) {
+    if (
+      !ts.isPropertyAccessExpression(callExpression.expression) ||
+      callExpression.expression.name.text !== "push" ||
+      !ts.isIdentifier(callExpression.expression.expression) ||
+      callExpression.arguments.length !== 1 ||
+      !ts.isCallExpression(callExpression.arguments[0])
+    ) {
+      return null;
+    }
+    const arrayVar = callExpression.expression.expression.text;
+    const pushedCall = callExpression.arguments[0];
+    const pushHandleToArray = (childDefinition, options) => {
+      const handleVar = this.nextId("child_handle", pushedCall);
+      this.childHandleVars.add(handleVar);
+      this.childPromiseArrayVars.add(arrayVar);
+      const appendState = this.addState("assign", {
+        type: "assign",
+        actions: [{
+          target: arrayVar,
+          expr: {
+            kind: "call",
+            callee: "__builtin_array_append",
+            args: [
+              { kind: "identifier", name: arrayVar },
+              { kind: "identifier", name: handleVar },
+            ],
+          },
+        }],
+        next: nextState,
+      }, node);
+      return this.addState("start_child", {
+        type: "start_child",
+        child_definition_id: childDefinition,
+        input: options.input,
+        next: appendState,
+        handle_var: handleVar,
+        workflow_id: options.workflow_id,
+        task_queue: options.task_queue,
+        parent_close_policy: options.parent_close_policy ?? "TERMINATE",
+      }, pushedCall);
+    };
+    if (temporalImportedCallMatches(pushedCall, this.temporalApi.executeChild, "executeChild", this.temporalApi)) {
+      const childDefinition = literalIdentifierOrString(
+        pushedCall.arguments[0],
+        "executeChild workflow",
+      );
+      const options = pushedCall.arguments[1]
+        ? compileTemporalChildOptions(pushedCall.arguments[1], "executeChild")
+        : { input: { kind: "literal", value: null } };
+      return pushHandleToArray(childDefinition, options);
+    }
+    if (temporalImportedCallMatches(pushedCall, this.temporalApi.startChild, "startChild", this.temporalApi)) {
+      const childDefinition = literalIdentifierOrString(
+        pushedCall.arguments[0],
+        "startChild workflow",
+      );
+      const options = pushedCall.arguments[1]
+        ? compileTemporalChildOptions(pushedCall.arguments[1], "startChild")
+        : { input: { kind: "literal", value: null } };
+      return pushHandleToArray(childDefinition, options);
+    }
+    return null;
+  }
+
   lowerStatementOrBlock(statement, nextState, breakTarget, continueTarget, errorTarget, returnTarget = null) {
     return ts.isBlock(statement)
       ? this.lowerBlock(
@@ -2120,12 +2612,21 @@ class WorkflowLowerer {
   lowerSyntheticExpression(expression, nextState) {
     if (
       ts.isBinaryExpression(expression) &&
-      expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-      ts.isIdentifier(expression.left)
+      (
+        expression.operatorToken.kind === ts.SyntaxKind.EqualsToken ||
+        expression.operatorToken.kind === ts.SyntaxKind.PlusEqualsToken
+      )
     ) {
       return this.addState("assign", {
         type: "assign",
-        actions: [{ target: expression.left.text, expr: compileExpression(expression.right) }],
+        actions: [
+          compileAssignmentAction(
+            expression,
+            expression.left,
+            expression.operatorToken.kind,
+            expression.right,
+          ),
+        ],
         next: nextState,
       }, expression);
     }
@@ -2245,6 +2746,26 @@ class WorkflowLowerer {
       );
     }
     const call = awaitExpression.expression;
+    const localChildPromiseAll = this.resolveLocalChildPromiseAll(call);
+    if (localChildPromiseAll) {
+      return this.lowerLocalChildPromiseAll(
+        localChildPromiseAll.arrayVar,
+        targetVar,
+        nextState,
+        errorTarget,
+        awaitExpression,
+      );
+    }
+    const mappedChildPromiseAll = this.resolveMappedChildPromiseAll(call);
+    if (mappedChildPromiseAll) {
+      return this.lowerMappedChildPromiseAll(
+        mappedChildPromiseAll,
+        targetVar,
+        nextState,
+        errorTarget,
+        awaitExpression,
+      );
+    }
     if (
       ts.isPropertyAccessExpression(call.expression) &&
       call.expression.name.text === "result" &&
@@ -2444,20 +2965,19 @@ class WorkflowLowerer {
         }, awaitExpression);
       }
       if (temporalImportedCallMatches(call, this.temporalApi.startChild, "startChild", this.temporalApi)) {
-        if (!targetVar) {
-          throw compilerError(`await startChild(...) must be assigned to a handle variable`, awaitExpression);
-        }
         const childDefinition = call.arguments[0];
         const options = call.arguments[1]
           ? compileTemporalChildOptions(call.arguments[1], "startChild")
           : { input: { kind: "literal", value: null } };
-        this.childHandleVars.add(targetVar);
+        if (targetVar) {
+          this.childHandleVars.add(targetVar);
+        }
         return this.addState("start_child", {
           type: "start_child",
           child_definition_id: literalIdentifierOrString(childDefinition, "startChild workflow"),
           input: options.input,
           next: nextState,
-          handle_var: targetVar,
+          handle_var: targetVar ?? undefined,
           workflow_id: options.workflow_id,
           task_queue: options.task_queue,
           parent_close_policy: options.parent_close_policy ?? "TERMINATE",
@@ -2550,6 +3070,239 @@ class WorkflowLowerer {
       }, awaitExpression);
     }
     throw compilerError(`unsupported ctx method ctx.${method}`, call.expression.name);
+  }
+
+  resolveLocalChildPromiseAll(call) {
+    if (
+      !ts.isPropertyAccessExpression(call.expression) ||
+      !ts.isIdentifier(call.expression.expression) ||
+      call.expression.expression.text !== "Promise" ||
+      call.expression.name.text !== "all" ||
+      call.arguments.length !== 1 ||
+      !ts.isIdentifier(call.arguments[0])
+    ) {
+      return null;
+    }
+    const arrayVar = call.arguments[0].text;
+    return this.childPromiseArrayVars.has(arrayVar) ? { arrayVar } : null;
+  }
+
+  resolveMappedChildPromiseAll(call) {
+    if (
+      !ts.isPropertyAccessExpression(call.expression) ||
+      !ts.isIdentifier(call.expression.expression) ||
+      call.expression.expression.text !== "Promise" ||
+      call.expression.name.text !== "all" ||
+      call.arguments.length !== 1
+    ) {
+      return null;
+    }
+    const mapCall = call.arguments[0];
+    if (
+      !ts.isCallExpression(mapCall) ||
+      !ts.isPropertyAccessExpression(mapCall.expression) ||
+      mapCall.expression.name.text !== "map" ||
+      mapCall.arguments.length !== 1
+    ) {
+      return null;
+    }
+    const mapper = mapCall.arguments[0];
+    if (!ts.isArrowFunction(mapper) && !ts.isFunctionExpression(mapper)) {
+      return null;
+    }
+    if (mapper.parameters.length !== 1 || !ts.isIdentifier(mapper.parameters[0].name)) {
+      return null;
+    }
+    const mappedExpression = functionBodyExpression(mapper.body);
+    if (!mappedExpression || !ts.isCallExpression(mappedExpression)) {
+      return null;
+    }
+    if (
+      !temporalImportedCallMatches(
+        mappedExpression,
+        this.temporalApi.executeChild,
+        "executeChild",
+        this.temporalApi,
+      )
+    ) {
+      return null;
+    }
+    const childDefinition = mappedExpression.arguments[0];
+    if (!childDefinition) {
+      return null;
+    }
+    const options = mappedExpression.arguments[1]
+      ? compileTemporalChildOptions(mappedExpression.arguments[1], "executeChild")
+      : { input: { kind: "literal", value: null } };
+    return {
+      itemsExpr: compileExpression(mapCall.expression.expression),
+      mapperVar: mapper.parameters[0].name.text,
+      childDefinition: literalIdentifierOrString(childDefinition, "executeChild workflow"),
+      options,
+    };
+  }
+
+  lowerLocalChildPromiseAll(arrayVar, targetVar, nextState, errorTarget, node) {
+    const indexVar = this.nextId("child_join_index", node);
+    const handleVar = this.nextId("child_join_handle", node);
+    const resultVar = this.nextId("child_join_result", node);
+    this.childHandleVars.add(handleVar);
+    const choiceState = this.nextId("child_join_choice", node);
+    const incrementState = this.addState("assign", {
+      type: "assign",
+      actions: [{ target: indexVar, expr: {
+        kind: "binary",
+        op: "add",
+        left: { kind: "identifier", name: indexVar },
+        right: { kind: "literal", value: 1 },
+      } }],
+      next: choiceState,
+    }, node);
+    const collectState = targetVar
+      ? this.addState("assign", {
+          type: "assign",
+          actions: [{
+            target: targetVar,
+            expr: {
+              kind: "call",
+              callee: "__builtin_array_append",
+              args: [
+                { kind: "identifier", name: targetVar },
+                { kind: "identifier", name: resultVar },
+              ],
+            },
+          }],
+          next: incrementState,
+        }, node)
+      : incrementState;
+    const waitState = this.addState("wait_child", {
+      type: "wait_for_child",
+      child_ref_var: handleVar,
+      next: collectState,
+      output_var: targetVar ? resultVar : undefined,
+      on_error: errorTarget ?? undefined,
+    }, node);
+    const assignHandleState = this.addState("assign", {
+      type: "assign",
+      actions: [{
+        target: handleVar,
+        expr: {
+          kind: "index",
+          object: { kind: "identifier", name: arrayVar },
+          index: { kind: "identifier", name: indexVar },
+        },
+      }],
+      next: waitState,
+    }, node);
+    this.states[choiceState] = {
+      type: "choice",
+      condition: {
+        kind: "binary",
+        op: "less_than",
+        left: { kind: "identifier", name: indexVar },
+        right: {
+          kind: "member",
+          object: { kind: "identifier", name: arrayVar },
+          property: "length",
+        },
+      },
+      then_next: assignHandleState,
+      else_next: nextState,
+    };
+    this.sourceMap[choiceState] = sourceLocation(node);
+    const initActions = [{ target: indexVar, expr: { kind: "literal", value: 0 } }];
+    if (targetVar) {
+      initActions.push({ target: targetVar, expr: { kind: "literal", value: [] } });
+    }
+    return this.addState("assign", {
+      type: "assign",
+      actions: initActions,
+      next: choiceState,
+    }, node);
+  }
+
+  lowerMappedChildPromiseAll(mappedChildPromiseAll, targetVar, nextState, errorTarget, node) {
+    const handleArrayVar = this.nextId("child_handle_array", node);
+    const indexVar = this.nextId("child_start_index", node);
+    const handleVar = this.nextId("child_start_handle", node);
+    this.childHandleVars.add(handleVar);
+    this.childPromiseArrayVars.add(handleArrayVar);
+    const joinState = this.lowerLocalChildPromiseAll(handleArrayVar, targetVar, nextState, errorTarget, node);
+    const choiceState = this.nextId("child_start_choice", node);
+    const incrementState = this.addState("assign", {
+      type: "assign",
+      actions: [{
+        target: indexVar,
+        expr: {
+          kind: "binary",
+          op: "add",
+          left: { kind: "identifier", name: indexVar },
+          right: { kind: "literal", value: 1 },
+        },
+      }],
+      next: choiceState,
+    }, node);
+    const appendState = this.addState("assign", {
+      type: "assign",
+      actions: [{
+        target: handleArrayVar,
+        expr: {
+          kind: "call",
+          callee: "__builtin_array_append",
+          args: [
+            { kind: "identifier", name: handleArrayVar },
+            { kind: "identifier", name: handleVar },
+          ],
+        },
+      }],
+      next: incrementState,
+    }, node);
+    const startState = this.addState("start_child", {
+      type: "start_child",
+      child_definition_id: mappedChildPromiseAll.childDefinition,
+      input: mappedChildPromiseAll.options.input,
+      next: appendState,
+      handle_var: handleVar,
+      workflow_id: mappedChildPromiseAll.options.workflow_id,
+      task_queue: mappedChildPromiseAll.options.task_queue,
+      parent_close_policy: mappedChildPromiseAll.options.parent_close_policy ?? "TERMINATE",
+    }, node);
+    const assignMapperState = this.addState("assign", {
+      type: "assign",
+      actions: [{
+        target: mappedChildPromiseAll.mapperVar,
+        expr: {
+          kind: "index",
+          object: mappedChildPromiseAll.itemsExpr,
+          index: { kind: "identifier", name: indexVar },
+        },
+      }],
+      next: startState,
+    }, node);
+    this.states[choiceState] = {
+      type: "choice",
+      condition: {
+        kind: "binary",
+        op: "less_than",
+        left: { kind: "identifier", name: indexVar },
+        right: {
+          kind: "member",
+          object: mappedChildPromiseAll.itemsExpr,
+          property: "length",
+        },
+      },
+      then_next: assignMapperState,
+      else_next: joinState,
+    };
+    this.sourceMap[choiceState] = sourceLocation(node);
+    return this.addState("assign", {
+      type: "assign",
+      actions: [
+        { target: indexVar, expr: { kind: "literal", value: 0 } },
+        { target: handleArrayVar, expr: { kind: "literal", value: [] } },
+      ],
+      next: choiceState,
+    }, node);
   }
 
   lowerTerminalCall(callExpression) {
@@ -2961,6 +3714,11 @@ function walkExpression(expression, visitor) {
       walkExpression(expression.array, visitor);
       walkExpression(expression.expr, visitor);
       break;
+    case "array_reduce":
+      walkExpression(expression.array, visitor);
+      walkExpression(expression.initial, visitor);
+      walkExpression(expression.expr, visitor);
+      break;
     case "object":
       Object.values(expression.fields).forEach((field) => walkExpression(field, visitor));
       break;
@@ -2980,7 +3738,17 @@ function validateArtifactCalls(artifact) {
   const builtinCallNames = new Set([
     "__temporal_is_cancellation",
     "__builtin_array_join",
+    "__builtin_array_fill",
+    "__builtin_array_append",
+    "__builtin_array_map_number",
+    "__builtin_array_sort_default",
+    "__builtin_array_sort_numeric_asc",
+    "__builtin_math_floor",
+    "__builtin_math_min",
+    "__builtin_object_omit",
+    "__builtin_object_set",
     "__builtin_object_keys",
+    "__builtin_string",
   ]);
   const validateExpression = (expression) => {
     walkExpression(expression, (node) => {
@@ -2991,8 +3759,29 @@ function validateArtifactCalls(artifact) {
       }
     });
   };
+  const validateHelperStatements = (statements) => {
+    for (const statement of statements ?? []) {
+      if (statement.type === "assign") {
+        validateExpression(statement.expr);
+        continue;
+      }
+      if (statement.type === "assign_index") {
+        validateExpression(statement.index);
+        validateExpression(statement.expr);
+        continue;
+      }
+      if (statement.type === "for_range") {
+        validateExpression(statement.start);
+        validateExpression(statement.end);
+        validateHelperStatements(statement.body);
+      }
+    }
+  };
 
-  Object.values(artifact.helpers).forEach((helper) => validateExpression(helper.body));
+  Object.values(artifact.helpers).forEach((helper) => {
+    validateHelperStatements(helper.statements);
+    validateExpression(helper.body);
+  });
   Object.values(artifact.workflow.states).forEach((state) => validateCompiledState(state, validateExpression));
   Object.values(artifact.signals ?? {}).forEach((signal) => {
     Object.values(signal.states).forEach((state) => validateCompiledState(state, validateExpression));
