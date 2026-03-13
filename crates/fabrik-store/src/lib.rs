@@ -172,6 +172,29 @@ pub struct ActivityStartUpdate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActivityScheduleUpdate {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub definition_id: String,
+    pub definition_version: Option<u32>,
+    pub artifact_hash: Option<String>,
+    pub activity_id: String,
+    pub attempt: u32,
+    pub activity_type: String,
+    pub task_queue: String,
+    pub state: Option<String>,
+    pub input: Value,
+    pub config: Option<Value>,
+    pub schedule_to_start_timeout_ms: Option<u64>,
+    pub start_to_close_timeout_ms: Option<u64>,
+    pub heartbeat_timeout_ms: Option<u64>,
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub occurred_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppliedActivityStartUpdate {
     pub record: WorkflowActivityRecord,
     pub event_id: Uuid,
@@ -7171,6 +7194,177 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to upsert scheduled workflow activity")?;
+
+        Ok(())
+    }
+
+    pub async fn upsert_activities_scheduled_batch(
+        &self,
+        updates: &[ActivityScheduleUpdate],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let mut query = QueryBuilder::<Postgres>::new(
+            r#"
+            WITH updates (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                workflow_id,
+                workflow_version,
+                artifact_hash,
+                activity_id,
+                attempt,
+                activity_type,
+                task_queue,
+                state,
+                input,
+                config,
+                scheduled_at,
+                schedule_to_start_timeout_ms,
+                start_to_close_timeout_ms,
+                heartbeat_timeout_ms,
+                last_event_id,
+                last_event_type,
+                updated_at
+            ) AS (
+            "#,
+        );
+
+        query.push_values(updates, |mut builder, update| {
+            builder
+                .push_bind(&update.tenant_id)
+                .push_bind(&update.instance_id)
+                .push_bind(&update.run_id)
+                .push_bind(&update.definition_id)
+                .push_bind(update.definition_version.map(|value| value as i32))
+                .push_bind(update.artifact_hash.as_deref())
+                .push_bind(&update.activity_id)
+                .push_bind(i32::try_from(update.attempt).expect("activity attempt exceeds i32"))
+                .push_bind(&update.activity_type)
+                .push_bind(&update.task_queue)
+                .push_bind(update.state.as_deref())
+                .push_bind(Json(&update.input))
+                .push_bind(update.config.as_ref().map(Json))
+                .push_bind(update.occurred_at)
+                .push_bind(update.schedule_to_start_timeout_ms.map(|value| value as i64))
+                .push_bind(update.start_to_close_timeout_ms.map(|value| value as i64))
+                .push_bind(update.heartbeat_timeout_ms.map(|value| value as i64))
+                .push_bind(update.event_id)
+                .push_bind(&update.event_type)
+                .push_bind(update.occurred_at);
+        });
+
+        query.push(
+            r#"
+            )
+            INSERT INTO workflow_activities (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                workflow_id,
+                workflow_version,
+                artifact_hash,
+                activity_id,
+                attempt,
+                activity_type,
+                task_queue,
+                state,
+                status,
+                input,
+                config,
+                output,
+                error,
+                cancellation_requested,
+                cancellation_reason,
+                cancellation_metadata,
+                worker_id,
+                worker_build_id,
+                scheduled_at,
+                started_at,
+                last_heartbeat_at,
+                lease_expires_at,
+                completed_at,
+                schedule_to_start_timeout_ms,
+                start_to_close_timeout_ms,
+                heartbeat_timeout_ms,
+                last_event_id,
+                last_event_type,
+                updated_at
+            )
+            SELECT
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                workflow_id,
+                workflow_version,
+                artifact_hash,
+                activity_id,
+                attempt,
+                activity_type,
+                task_queue,
+                state,
+                'scheduled',
+                input,
+                config,
+                NULL,
+                NULL,
+                FALSE,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                scheduled_at,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                schedule_to_start_timeout_ms,
+                start_to_close_timeout_ms,
+                heartbeat_timeout_ms,
+                last_event_id,
+                last_event_type,
+                updated_at
+            FROM updates
+            ON CONFLICT (tenant_id, workflow_instance_id, run_id, activity_id, attempt)
+            DO UPDATE SET
+                workflow_id = EXCLUDED.workflow_id,
+                workflow_version = EXCLUDED.workflow_version,
+                artifact_hash = EXCLUDED.artifact_hash,
+                activity_type = EXCLUDED.activity_type,
+                task_queue = EXCLUDED.task_queue,
+                state = EXCLUDED.state,
+                status = EXCLUDED.status,
+                input = EXCLUDED.input,
+                config = EXCLUDED.config,
+                output = NULL,
+                error = NULL,
+                cancellation_requested = FALSE,
+                cancellation_reason = NULL,
+                cancellation_metadata = NULL,
+                worker_id = NULL,
+                worker_build_id = NULL,
+                scheduled_at = EXCLUDED.scheduled_at,
+                started_at = NULL,
+                last_heartbeat_at = NULL,
+                lease_expires_at = NULL,
+                completed_at = NULL,
+                schedule_to_start_timeout_ms = EXCLUDED.schedule_to_start_timeout_ms,
+                start_to_close_timeout_ms = EXCLUDED.start_to_close_timeout_ms,
+                heartbeat_timeout_ms = EXCLUDED.heartbeat_timeout_ms,
+                last_event_id = EXCLUDED.last_event_id,
+                last_event_type = EXCLUDED.last_event_type,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        );
+
+        query
+            .build()
+            .execute(&self.pool)
+            .await
+            .context("failed to batch upsert scheduled workflow activities")?;
 
         Ok(())
     }

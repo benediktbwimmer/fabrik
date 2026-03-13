@@ -16,7 +16,8 @@ use fabrik_config::{GrpcServiceConfig, HttpServiceConfig, PostgresConfig, Redpan
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
-    ActivityStartUpdate, ActivityTerminalPayload, ActivityTerminalUpdate, WorkflowStore,
+    ActivityScheduleUpdate, ActivityStartUpdate, ActivityTerminalPayload, ActivityTerminalUpdate,
+    WorkflowStore,
 };
 use fabrik_worker_protocol::activity_worker::{
     Ack, ActivityTask, ActivityTaskCancelledResult, ActivityTaskCompletedResult,
@@ -69,6 +70,10 @@ struct UnifiedDebugState {
     restore_records_applied: u64,
     workflow_triggers_applied: u64,
     duplicate_triggers_ignored: u64,
+    ignored_missing_instance_reports: u64,
+    ignored_terminal_instance_reports: u64,
+    ignored_missing_activity_reports: u64,
+    ignored_stale_attempt_reports: u64,
     poll_requests: u64,
     poll_responses: u64,
     leased_tasks: u64,
@@ -396,6 +401,17 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
     };
     apply_compiled_plan(&mut instance, &plan);
     let queued = schedule_activities_from_plan(&instance, &plan, event.occurred_at)?;
+    let schedule_actions = queued
+        .iter()
+        .cloned()
+        .map(PreparedDbAction::Schedule)
+        .collect::<Vec<_>>();
+    apply_db_actions(
+        state,
+        vec![PreparedDbAction::UpsertInstance(instance.clone())],
+        schedule_actions,
+    )
+        .await?;
     {
         let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
         let runtime = RuntimeWorkflowState {
@@ -429,9 +445,6 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
         }
         mark_runtime_dirty(&mut inner, "trigger", true);
     }
-    let schedule_actions = queued.into_iter().map(PreparedDbAction::Schedule).collect::<Vec<_>>();
-    apply_db_actions(state, vec![PreparedDbAction::UpsertInstance(instance)], schedule_actions)
-        .await?;
     state.notify.notify_waiters();
     state.persist_notify.notify_one();
     let mut debug = state.debug.lock().expect("unified debug lock poisoned");
@@ -459,28 +472,35 @@ async fn run_retry_release_loop(state: AppState) {
                 Vec::new()
             } else {
                 inner.delayed_retries = remaining;
-                for task in &released {
-                    inner
-                        .ready
-                        .entry(QueueKey {
-                            tenant_id: task.tenant_id.clone(),
-                            task_queue: task.task_queue.clone(),
-                        })
-                        .or_default()
-                        .push_back(task.clone());
-                }
-                mark_runtime_dirty(&mut inner, "retry_release", false);
                 released
             }
         };
         if released.is_empty() {
             continue;
         }
-        let actions = released.into_iter().map(PreparedDbAction::Schedule).collect::<Vec<_>>();
+        let actions = released
+            .iter()
+            .cloned()
+            .map(PreparedDbAction::Schedule)
+            .collect::<Vec<_>>();
         let released_count = actions.len() as u64;
         if let Err(error) = apply_db_actions(&state, Vec::new(), actions).await {
             error!(error = %error, "unified-runtime failed to release retries");
             continue;
+        }
+        {
+            let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
+            for task in &released {
+                inner
+                    .ready
+                    .entry(QueueKey {
+                        tenant_id: task.tenant_id.clone(),
+                        task_queue: task.task_queue.clone(),
+                    })
+                    .or_default()
+                    .push_back(task.clone());
+            }
+            mark_runtime_dirty(&mut inner, "retry_release", false);
         }
         state.notify.notify_waiters();
         state.persist_notify.notify_one();
@@ -505,18 +525,9 @@ async fn run_lease_requeue_loop(state: AppState) {
             if expired.is_empty() {
                 Vec::new()
             } else {
-                for (key, task) in &expired {
+                for (key, _) in &expired {
                     inner.leased.remove(key);
-                    inner
-                        .ready
-                        .entry(QueueKey {
-                            tenant_id: task.tenant_id.clone(),
-                            task_queue: task.task_queue.clone(),
-                        })
-                        .or_default()
-                        .push_back(task.clone());
                 }
-                mark_runtime_dirty(&mut inner, "lease_requeue", false);
                 expired
             }
         };
@@ -538,6 +549,20 @@ async fn run_lease_requeue_loop(state: AppState) {
             {
                 error!(error = %error, activity_id = %key.activity_id, "failed to requeue leased activity");
             }
+        }
+        {
+            let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
+            for (_, task) in &requeued {
+                inner
+                    .ready
+                    .entry(QueueKey {
+                        tenant_id: task.tenant_id.clone(),
+                        task_queue: task.task_queue.clone(),
+                    })
+                    .or_default()
+                    .push_back(task.clone());
+            }
+            mark_runtime_dirty(&mut inner, "lease_requeue", false);
         }
         state.notify.notify_waiters();
         state.persist_notify.notify_one();
@@ -808,6 +833,18 @@ impl ActivityWorkerApi for WorkerApi {
         debug.report_batches_applied = debug.report_batches_applied.saturating_add(1);
         debug.retries_scheduled = debug.retries_scheduled.saturating_add(actions.retries_scheduled);
         debug.instance_terminals = debug.instance_terminals.saturating_add(actions.instance_terminals);
+        debug.ignored_missing_instance_reports = debug
+            .ignored_missing_instance_reports
+            .saturating_add(actions.ignored_missing_instances);
+        debug.ignored_terminal_instance_reports = debug
+            .ignored_terminal_instance_reports
+            .saturating_add(actions.ignored_terminal_instances);
+        debug.ignored_missing_activity_reports = debug
+            .ignored_missing_activity_reports
+            .saturating_add(actions.ignored_missing_activities);
+        debug.ignored_stale_attempt_reports = debug
+            .ignored_stale_attempt_reports
+            .saturating_add(actions.ignored_stale_attempts);
         Ok(Response::new(Ack {}))
     }
 
@@ -825,6 +862,10 @@ struct PreparedActions {
     notifies: bool,
     retries_scheduled: u64,
     instance_terminals: u64,
+    ignored_missing_instances: u64,
+    ignored_terminal_instances: u64,
+    ignored_missing_activities: u64,
+    ignored_stale_attempts: u64,
 }
 
 fn prepare_result_application(
@@ -836,6 +877,10 @@ fn prepare_result_application(
     let mut schedules = Vec::new();
     let mut retries_scheduled = 0_u64;
     let mut instance_terminals = 0_u64;
+    let mut ignored_missing_instances = 0_u64;
+    let mut ignored_terminal_instances = 0_u64;
+    let mut ignored_missing_activities = 0_u64;
+    let mut ignored_stale_attempts = 0_u64;
     let mut notifies = false;
     let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
     let mut grouped = HashMap::<RunKey, Vec<EventEnvelope<WorkflowEvent>>>::new();
@@ -855,12 +900,19 @@ fn prepare_result_application(
         };
         inner.leased.remove(&attempt_key);
         let Some(runtime) = inner.instances.get_mut(&run_key) else {
+            ignored_missing_instances = ignored_missing_instances.saturating_add(1);
             continue;
         };
+        if runtime.instance.status.is_terminal() {
+            ignored_terminal_instances = ignored_terminal_instances.saturating_add(1);
+            continue;
+        }
         let Some(active) = runtime.active_activities.get(&result.activity_id).cloned() else {
+            ignored_missing_activities = ignored_missing_activities.saturating_add(1);
             continue;
         };
-        if active.attempt != result.attempt {
+        if !result_matches_active_attempt(&runtime.active_activities, &runtime.instance.status, &result) {
+            ignored_stale_attempts = ignored_stale_attempts.saturating_add(1);
             continue;
         }
 
@@ -1045,6 +1097,10 @@ fn prepare_result_application(
         notifies,
         retries_scheduled,
         instance_terminals,
+        ignored_missing_instances,
+        ignored_terminal_instances,
+        ignored_missing_activities,
+        ignored_stale_attempts,
     })
 }
 
@@ -1055,44 +1111,32 @@ async fn apply_db_actions(
 ) -> Result<()> {
     let mut terminal_updates = Vec::new();
     let mut other_general = Vec::new();
+    let mut schedule_updates = Vec::new();
     for action in general {
         match action {
             PreparedDbAction::Terminal(update) => terminal_updates.push(update),
             other => other_general.push(other),
         }
     }
+    for action in schedules {
+        match action {
+            PreparedDbAction::Schedule(task) => schedule_updates.push(activity_schedule_update(&task)),
+            other => other_general.push(other),
+        }
+    }
     if !terminal_updates.is_empty() {
         state.store.apply_activity_terminal_batch(&terminal_updates).await?;
     }
-    for action in other_general.into_iter().chain(schedules) {
+    if !schedule_updates.is_empty() {
+        state
+            .store
+            .upsert_activities_scheduled_batch(&schedule_updates)
+            .await?;
+    }
+    for action in other_general {
         match action {
             PreparedDbAction::Terminal(_) => unreachable!("terminal updates are batched"),
-            PreparedDbAction::Schedule(task) => {
-                state
-                    .store
-                    .upsert_activity_scheduled(
-                        &task.tenant_id,
-                        &task.instance_id,
-                        &task.run_id,
-                        &task.definition_id,
-                        Some(task.definition_version),
-                        Some(&task.artifact_hash),
-                        &task.activity_id,
-                        task.attempt,
-                        &task.activity_type,
-                        &task.task_queue,
-                        Some(&task.state),
-                        &task.input,
-                        task.config.as_ref(),
-                        None,
-                        None,
-                        None,
-                        Uuid::now_v7(),
-                        "UnifiedActivityScheduled",
-                        task.scheduled_at,
-                    )
-                    .await?;
-            }
+            PreparedDbAction::Schedule(_) => unreachable!("schedule updates are batched"),
             PreparedDbAction::UpsertInstance(instance) => {
                 state.store.upsert_instance(&instance).await?;
             }
@@ -1105,6 +1149,30 @@ async fn apply_db_actions(
         }
     }
     Ok(())
+}
+
+fn activity_schedule_update(task: &QueuedActivity) -> ActivityScheduleUpdate {
+    ActivityScheduleUpdate {
+        tenant_id: task.tenant_id.clone(),
+        instance_id: task.instance_id.clone(),
+        run_id: task.run_id.clone(),
+        definition_id: task.definition_id.clone(),
+        definition_version: Some(task.definition_version),
+        artifact_hash: Some(task.artifact_hash.clone()),
+        activity_id: task.activity_id.clone(),
+        attempt: task.attempt,
+        activity_type: task.activity_type.clone(),
+        task_queue: task.task_queue.clone(),
+        state: Some(task.state.clone()),
+        input: task.input.clone(),
+        config: task.config.clone(),
+        schedule_to_start_timeout_ms: None,
+        start_to_close_timeout_ms: None,
+        heartbeat_timeout_ms: None,
+        event_id: Uuid::now_v7(),
+        event_type: "UnifiedActivityScheduled".to_owned(),
+        occurred_at: task.scheduled_at,
+    }
 }
 
 fn lease_ready_tasks(
@@ -1291,6 +1359,19 @@ fn runtime_execution_state(runtime: &RuntimeWorkflowState) -> &ArtifactExecution
         .expect("unified runtime requires artifact execution state")
 }
 
+fn result_matches_active_attempt(
+    active_activities: &BTreeMap<String, ActiveActivityMeta>,
+    status: &WorkflowStatus,
+    result: &ActivityTaskResult,
+) -> bool {
+    if status.is_terminal() {
+        return false;
+    }
+    active_activities
+        .get(&result.activity_id)
+        .is_some_and(|active| active.attempt == result.attempt)
+}
+
 fn attempt_key_from_task(task: &QueuedActivity) -> AttemptKey {
     AttemptKey {
         tenant_id: task.tenant_id.clone(),
@@ -1374,6 +1455,13 @@ fn restore_runtime_state(
     let Some(restored) = restored else {
         return Ok(None);
     };
+    Ok(Some(runtime_inner_from_persisted(restored, debug)))
+}
+
+fn runtime_inner_from_persisted(
+    restored: PersistedRuntimeState,
+    debug: &Arc<StdMutex<UnifiedDebugState>>,
+) -> RuntimeInner {
     let mut inner = RuntimeInner { next_seq: restored.seq, ..RuntimeInner::default() };
     for runtime in restored.instances {
         inner.instances.insert(
@@ -1385,7 +1473,10 @@ fn restore_runtime_state(
             runtime,
         );
     }
+
+    let mut seen_attempts = HashSet::new();
     for task in restored.ready {
+        seen_attempts.insert(attempt_key_from_task(&task));
         inner
             .ready
             .entry(QueueKey {
@@ -1395,14 +1486,45 @@ fn restore_runtime_state(
             .or_default()
             .push_back(task);
     }
+
+    // Owner crash invalidates in-flight leases. Requeue them immediately on restore.
     for leased in restored.leased {
-        inner.leased.insert(attempt_key_from_task(&leased.task), leased);
+        let key = attempt_key_from_task(&leased.task);
+        if seen_attempts.insert(key) {
+            inner
+                .ready
+                .entry(QueueKey {
+                    tenant_id: leased.task.tenant_id.clone(),
+                    task_queue: leased.task.task_queue.clone(),
+                })
+                .or_default()
+                .push_back(leased.task);
+        }
     }
-    inner.delayed_retries = restored.delayed_retries;
+
+    let now = Utc::now();
+    for retry in restored.delayed_retries {
+        let key = attempt_key_from_task(&retry.task);
+        if retry.due_at <= now {
+            if seen_attempts.insert(key) {
+                inner
+                    .ready
+                    .entry(QueueKey {
+                        tenant_id: retry.task.tenant_id.clone(),
+                        task_queue: retry.task.task_queue.clone(),
+                    })
+                    .or_default()
+                    .push_back(retry.task);
+            }
+        } else {
+            inner.delayed_retries.push(retry);
+        }
+    }
+
     let mut debug = debug.lock().expect("unified debug lock poisoned");
     debug.restored_from_snapshot = true;
     debug.restore_records_applied = inner.instances.len() as u64;
-    Ok(Some(inner))
+    inner
 }
 
 fn runtime_snapshot_path(persistence: &PersistenceConfig) -> PathBuf {
@@ -1471,5 +1593,164 @@ fn apply_compiled_plan(state: &mut WorkflowInstanceState, plan: &CompiledExecuti
             WorkflowEvent::WorkflowTerminated { .. } => state.status = WorkflowStatus::Terminated,
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+
+    fn queued_activity(activity_id: &str, attempt: u32, scheduled_at: DateTime<Utc>) -> QueuedActivity {
+        QueuedActivity {
+            tenant_id: "tenant".to_owned(),
+            definition_id: "definition".to_owned(),
+            definition_version: 1,
+            artifact_hash: "artifact".to_owned(),
+            instance_id: "instance".to_owned(),
+            run_id: "run".to_owned(),
+            activity_id: activity_id.to_owned(),
+            activity_type: "benchmark.echo".to_owned(),
+            task_queue: "default".to_owned(),
+            attempt,
+            input: Value::Null,
+            config: None,
+            state: "join".to_owned(),
+            scheduled_at,
+        }
+    }
+
+    fn persistence_config_for(path: PathBuf) -> PersistenceConfig {
+        PersistenceConfig {
+            state_dir: path,
+            snapshot_every: 16,
+            flush_interval_ms: 200,
+        }
+    }
+
+    #[test]
+    fn result_matching_rejects_stale_duplicate_and_terminal_reports() {
+        let mut active = BTreeMap::new();
+        active.insert(
+            "activity-1".to_owned(),
+            ActiveActivityMeta {
+                attempt: 2,
+                task_queue: "default".to_owned(),
+                activity_type: "benchmark.echo".to_owned(),
+                wait_state: "join".to_owned(),
+            },
+        );
+
+        let matching = ActivityTaskResult {
+            tenant_id: "tenant".to_owned(),
+            instance_id: "instance".to_owned(),
+            run_id: "run".to_owned(),
+            activity_id: "activity-1".to_owned(),
+            attempt: 2,
+            worker_id: "worker".to_owned(),
+            worker_build_id: "build".to_owned(),
+            result: None,
+        };
+        let stale = ActivityTaskResult { attempt: 1, ..matching.clone() };
+        let duplicate_unknown = ActivityTaskResult {
+            activity_id: "missing".to_owned(),
+            ..matching.clone()
+        };
+
+        assert!(result_matches_active_attempt(&active, &WorkflowStatus::Running, &matching));
+        assert!(!result_matches_active_attempt(&active, &WorkflowStatus::Running, &stale));
+        assert!(!result_matches_active_attempt(
+            &active,
+            &WorkflowStatus::Completed,
+            &matching
+        ));
+        assert!(!result_matches_active_attempt(
+            &active,
+            &WorkflowStatus::Running,
+            &duplicate_unknown
+        ));
+    }
+
+    #[test]
+    fn restore_requeues_leased_and_due_retry_tasks() {
+        let now = Utc::now();
+        let ready_task = queued_activity("ready", 1, now);
+        let leased_task = queued_activity("leased", 1, now);
+        let due_retry_task = queued_activity("retry-due", 2, now);
+        let future_retry_task = queued_activity("retry-future", 2, now + ChronoDuration::seconds(30));
+        let debug = Arc::new(StdMutex::new(UnifiedDebugState::default()));
+
+        let restored = PersistedRuntimeState {
+            seq: 7,
+            instances: Vec::new(),
+            ready: vec![ready_task.clone()],
+            leased: vec![LeasedActivity {
+                task: leased_task.clone(),
+                worker_id: "worker".to_owned(),
+                worker_build_id: "build".to_owned(),
+                lease_expires_at: now + ChronoDuration::seconds(15),
+            }],
+            delayed_retries: vec![
+                DelayedRetryTask { task: due_retry_task.clone(), due_at: now - ChronoDuration::seconds(1) },
+                DelayedRetryTask { task: future_retry_task.clone(), due_at: now + ChronoDuration::seconds(30) },
+            ],
+        };
+
+        let inner = runtime_inner_from_persisted(restored, &debug);
+        let ready_tasks = inner.ready.values().flat_map(|queue| queue.iter()).collect::<Vec<_>>();
+
+        assert_eq!(inner.leased.len(), 0);
+        assert_eq!(inner.delayed_retries.len(), 1);
+        assert_eq!(ready_tasks.len(), 3);
+        assert!(ready_tasks.iter().any(|task| task.activity_id == ready_task.activity_id));
+        assert!(ready_tasks.iter().any(|task| task.activity_id == leased_task.activity_id));
+        assert!(ready_tasks.iter().any(|task| task.activity_id == due_retry_task.activity_id));
+        assert_eq!(inner.delayed_retries[0].task.activity_id, future_retry_task.activity_id);
+    }
+
+    #[test]
+    fn restore_prefers_newer_log_state_over_snapshot() {
+        let temp_dir = std::env::temp_dir().join(format!("unified-runtime-test-{}", Uuid::now_v7()));
+        fs::create_dir_all(&temp_dir).expect("create temp dir");
+        let persistence = persistence_config_for(temp_dir.clone());
+        let debug = Arc::new(StdMutex::new(UnifiedDebugState::default()));
+
+        let snapshot_state = PersistedRuntimeState {
+            seq: 1,
+            instances: Vec::new(),
+            ready: vec![queued_activity("snapshot-task", 1, Utc::now())],
+            leased: Vec::new(),
+            delayed_retries: Vec::new(),
+        };
+        write_json_atomically(&runtime_snapshot_path(&persistence), &snapshot_state)
+            .expect("write snapshot");
+
+        let log_state = PersistedRuntimeState {
+            seq: 2,
+            instances: Vec::new(),
+            ready: vec![queued_activity("log-task", 1, Utc::now())],
+            leased: Vec::new(),
+            delayed_retries: Vec::new(),
+        };
+        append_json_line(
+            &runtime_log_path(&persistence),
+            &PersistedLogRecord {
+                seq: 2,
+                reason: "report_batch".to_owned(),
+                state: log_state,
+            },
+        )
+        .expect("append log");
+
+        let restored = restore_runtime_state(&persistence, &debug)
+            .expect("restore state")
+            .expect("restored runtime");
+        let ready_tasks = restored.ready.values().flat_map(|queue| queue.iter()).collect::<Vec<_>>();
+
+        assert_eq!(restored.next_seq, 2);
+        assert_eq!(ready_tasks.len(), 1);
+        assert_eq!(ready_tasks[0].activity_id, "log-task");
+
+        fs::remove_dir_all(temp_dir).expect("cleanup temp dir");
     }
 }
