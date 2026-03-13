@@ -4269,9 +4269,9 @@ impl ActivityWorkerApi for WorkerApi {
                         attempt: update.record.attempt,
                     })
                     .collect::<HashSet<_>>();
-                let tasks = {
+                let accepted = {
                     let mut inner = self.state.inner.lock().expect("unified runtime lock poisoned");
-                    let mut tasks = Vec::new();
+                    let mut accepted = Vec::new();
                     for leased_task in leased {
                         let key = attempt_key_from_task(&leased_task.task);
                         if !applied_keys.contains(&key) {
@@ -4286,10 +4286,14 @@ impl ActivityWorkerApi for WorkerApi {
                                 .push_front(leased_task.task.clone());
                             continue;
                         }
-                        tasks.push(activity_proto(&leased_task, request.supports_cbor));
+                        accepted.push(leased_task);
                     }
-                    tasks
+                    accepted
                 };
+                let tasks = accepted
+                    .iter()
+                    .map(|leased_task| activity_proto(leased_task, request.supports_cbor))
+                    .collect::<Vec<_>>();
                 let mut debug = self.state.debug.lock().expect("unified debug lock poisoned");
                 debug.poll_responses = debug.poll_responses.saturating_add(1);
                 debug.leased_tasks = debug.leased_tasks.saturating_add(tasks.len() as u64);
@@ -5173,21 +5177,29 @@ fn activity_proto(leased: &LeasedActivity, supports_cbor: bool) -> ActivityTask 
         activity_type: leased.task.activity_type.clone(),
         task_queue: leased.task.task_queue.clone(),
         attempt: leased.task.attempt,
-        input_json: serde_json::to_string(&leased.task.input).unwrap_or_else(|_| "null".to_owned()),
+        input_json: if supports_cbor {
+            String::new()
+        } else {
+            serde_json::to_string(&leased.task.input).unwrap_or_else(|_| "null".to_owned())
+        },
         input_cbor: if supports_cbor {
             encode_cbor(&leased.task.input, "activity task input").unwrap_or_default()
         } else {
             Vec::new()
         },
-        config_json: leased
-            .task
-            .config
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .ok()
-            .flatten()
-            .unwrap_or_default(),
+        config_json: if supports_cbor {
+            String::new()
+        } else {
+            leased
+                .task
+                .config
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .ok()
+                .flatten()
+                .unwrap_or_default()
+        },
         config_cbor: if supports_cbor {
             leased
                 .task
@@ -6491,6 +6503,8 @@ mod tests {
         let proto = activity_proto(&leased, true);
 
         assert!(proto.prefer_cbor);
+        assert!(proto.input_json.is_empty());
+        assert!(proto.config_json.is_empty());
         assert!(!proto.input_cbor.is_empty());
         assert!(!proto.config_cbor.is_empty());
     }

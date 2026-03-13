@@ -1,6 +1,7 @@
 import { Navigate, Route, Routes } from "react-router-dom";
 
 import { AppShell } from "./components/app-shell";
+import { BuildsPage } from "./pages/builds-page";
 import { OverviewPage } from "./pages/overview-page";
 import { RunsPage } from "./pages/runs-page";
 import { TaskQueuesPage } from "./pages/task-queues-page";
@@ -18,6 +19,7 @@ export function App() {
         <Route path="runs" element={<RunsPage />} />
         <Route path="runs/:instanceId" element={<WorkflowDetailPage />} />
         <Route path="runs/:instanceId/:runId" element={<WorkflowDetailPage />} />
+        <Route path="builds" element={<BuildsPage />} />
         <Route path="task-queues" element={<TaskQueuesPage />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
+import { toast } from "sonner";
 
 import { WorkflowGraphExplorer } from "../components/graph/workflow-graph-explorer";
 import { Badge, Panel } from "../components/ui";
@@ -15,6 +16,10 @@ export function WorkflowDefinitionDetailPage() {
   const { definitionId = "" } = useParams();
   const { tenantId } = useTenant();
   const [activeTab, setActiveTab] = useState<Tab>("graph");
+  const [validation, setValidation] = useState<Awaited<
+    ReturnType<typeof api.validateWorkflowArtifact>
+  > | null>(null);
+  const [validating, setValidating] = useState(false);
 
   const definitionQuery = useQuery({
     queryKey: ["workflow-definition", tenantId, definitionId],
@@ -42,6 +47,24 @@ export function WorkflowDefinitionDetailPage() {
 
   const artifact = artifactQuery.data;
   const definition = definitionQuery.data;
+
+  async function onValidateRollout() {
+    if (!artifact) return;
+    setValidating(true);
+    try {
+      const response = await api.validateWorkflowArtifact(tenantId, artifact);
+      setValidation(response);
+      if (response.compatible) {
+        toast.success("Artifact validated against recent runs");
+      } else {
+        toast.error("Artifact is incompatible with recent runs");
+      }
+    } catch (error) {
+      toast.error(String(error));
+    } finally {
+      setValidating(false);
+    }
+  }
 
   return (
     <div className="page">
@@ -77,6 +100,44 @@ export function WorkflowDefinitionDetailPage() {
               <div>Entrypoint {artifact ? `${artifact.entrypoint.module}::${artifact.entrypoint.export}` : "-"}</div>
               <div>Artifact hash {artifact?.artifact_hash ?? "-"}</div>
               <div>Initial state {definition?.initial_state ?? artifact?.workflow.initial_state ?? "-"}</div>
+            </div>
+          </Panel>
+
+          <Panel>
+            <div className="row space-between">
+              <h3>Rollout validation</h3>
+              <button className="button primary" type="button" disabled={!artifact || validating} onClick={onValidateRollout}>
+                {validating ? "Validating..." : "Validate rollout"}
+              </button>
+            </div>
+            <div className="stack">
+              <div className="muted">Replay the latest artifact against recent captured histories before promoting it.</div>
+              {validation ? (
+                <>
+                  <div className="row">
+                    <Badge value={validation.status} />
+                    <div className="muted">Validated runs {formatNumber(validation.validation.validated_run_count)}</div>
+                    <div className="muted">Skipped {formatNumber(validation.validation.skipped_run_count)}</div>
+                    <div className="muted">Failures {formatNumber(validation.validation.failed_run_count)}</div>
+                  </div>
+                  {validation.validation.failures.length > 0 ? (
+                    <div className="stack">
+                      {validation.validation.failures.map((failure) => (
+                        <div key={`${failure.instance_id}:${failure.run_id}`} className="subtle-block">
+                          <strong>
+                            {failure.instance_id} / {failure.run_id}
+                          </strong>
+                          <div className="muted">{failure.message}</div>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="muted">No replay divergences were found in the sampled runs.</div>
+                  )}
+                </>
+              ) : (
+                <div className="muted">No dry-run validation has been executed for the current artifact.</div>
+              )}
             </div>
           </Panel>
 

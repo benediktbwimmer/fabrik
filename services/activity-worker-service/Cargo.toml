@@ -12,6 +12,7 @@ fabrik-throughput = { path = "../../crates/fabrik-throughput" }
 fabrik-worker-protocol = { path = "../../crates/fabrik-worker-protocol" }
 fabrik-workflow = { path = "../../crates/fabrik-workflow" }
 reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tonic.workspace = true

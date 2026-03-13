@@ -981,8 +981,9 @@ pub fn replay_compiled_history_trace(
         })
         .context("compiled workflow history is missing WorkflowTriggered")?;
     let mut replayed = WorkflowInstanceState::try_from(trigger.0)?;
-    let mut execution = artifact.execute_trigger_with_turn(
+    let mut execution = artifact.execute_trigger_with_state_and_turn(
         &trigger.1,
+        preload_recorded_markers(history),
         ExecutionTurnContext { event_id: trigger.0.event_id, occurred_at: trigger.0.occurred_at },
     )?;
     replayed.current_state = Some(execution.final_state.clone());
@@ -1490,6 +1491,22 @@ fn is_internal_control_timer(timer_id: &str) -> bool {
     timer_id.starts_with("retry:")
 }
 
+fn preload_recorded_markers(history: &[EventEnvelope<WorkflowEvent>]) -> ArtifactExecutionState {
+    let mut execution = ArtifactExecutionState::default();
+    for event in history {
+        match &event.payload {
+            WorkflowEvent::MarkerRecorded { marker_id, value } => {
+                execution.markers.insert(marker_id.clone(), value.clone());
+            }
+            WorkflowEvent::VersionMarkerRecorded { change_id, version } => {
+                execution.version_markers.insert(change_id.clone(), *version);
+            }
+            _ => {}
+        }
+    }
+    execution
+}
+
 fn replay_checkpoint(state: &WorkflowInstanceState) -> ReplayCheckpoint {
     ReplayCheckpoint {
         run_id: state.run_id.clone(),
@@ -1573,6 +1590,75 @@ pub fn first_transition_divergence(
             event_id: extra.map(|entry| entry.event_id),
             event_type: extra.map(|entry| entry.event_type.clone()),
             message: "snapshot-backed replay produced a different transition count".to_owned(),
+            fields: vec![ReplayFieldMismatch {
+                field: "transition_count".to_owned(),
+                expected: Value::from(expected.len() as u64),
+                actual: Value::from(actual.len() as u64),
+            }],
+        });
+    }
+
+    None
+}
+
+pub fn validate_compiled_artifact_history_compatibility(
+    history: &[EventEnvelope<WorkflowEvent>],
+    pinned_artifact: &CompiledWorkflowArtifact,
+    candidate_artifact: &CompiledWorkflowArtifact,
+) -> Result<Vec<ReplayDivergence>> {
+    let expected = replay_compiled_history_trace(history, pinned_artifact)?;
+    let actual = replay_compiled_history_trace(history, candidate_artifact)?;
+    let mut divergences = Vec::new();
+
+    if let Some(divergence) =
+        first_history_compatibility_divergence(&expected.transitions, &actual.transitions)
+    {
+        divergences.push(divergence);
+    } else if !same_projection(&expected.final_state, &actual.final_state) {
+        divergences.push(ReplayDivergence {
+            kind: ReplayDivergenceKind::ProjectionMismatch,
+            event_id: history.last().map(|event| event.event_id),
+            event_type: history.last().map(|event| event.event_type.clone()),
+            message: "candidate artifact replay produced a different final state".to_owned(),
+            fields: projection_mismatches(&expected.final_state, &actual.final_state),
+        });
+    }
+
+    Ok(divergences)
+}
+
+fn first_history_compatibility_divergence(
+    expected: &[ReplayTransitionTraceEntry],
+    actual: &[ReplayTransitionTraceEntry],
+) -> Option<ReplayDivergence> {
+    for (expected_entry, actual_entry) in expected.iter().zip(actual.iter()) {
+        let fields =
+            checkpoint_mismatches(&expected_entry.checkpoint_after, &actual_entry.checkpoint_after);
+        if !fields.is_empty() {
+            return Some(ReplayDivergence {
+                kind: ReplayDivergenceKind::ProjectionMismatch,
+                event_id: Some(actual_entry.event_id),
+                event_type: Some(actual_entry.event_type.clone()),
+                message: format!(
+                    "candidate artifact replay diverged after event {} ({})",
+                    actual_entry.event_id, actual_entry.event_type
+                ),
+                fields,
+            });
+        }
+    }
+
+    if expected.len() != actual.len() {
+        let extra = if actual.len() > expected.len() {
+            actual.get(expected.len())
+        } else {
+            expected.get(actual.len())
+        };
+        return Some(ReplayDivergence {
+            kind: ReplayDivergenceKind::ProjectionMismatch,
+            event_id: extra.map(|entry| entry.event_id),
+            event_type: extra.map(|entry| entry.event_type.clone()),
+            message: "candidate artifact replay produced a different transition count".to_owned(),
             fields: vec![ReplayFieldMismatch {
                 field: "transition_count".to_owned(),
                 expected: Value::from(expected.len() as u64),
@@ -1675,7 +1761,7 @@ pub enum WorkflowProjectionError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use chrono::Utc;
     use fabrik_events::{EventEnvelope, WorkflowEvent};
@@ -1683,16 +1769,17 @@ mod tests {
     use uuid::Uuid;
 
     use crate::compiled::{
-        ArtifactEntrypoint, CompiledStateNode, CompiledWorkflow, CompiledWorkflowArtifact,
-        Expression,
+        ArtifactEntrypoint, BinaryOp, CompiledStateNode, CompiledWorkflow,
+        CompiledWorkflowArtifact, Expression,
     };
 
     use super::{
-        ActiveUpdateState, ArtifactExecutionState, ExecutionEmission, HttpRequestConfig,
-        ReplaySource, RetryPolicy, StateNode, StepConfig, WorkflowDefinition,
+        ActiveUpdateState, ArtifactExecutionState, Assignment, ExecutionEmission,
+        HttpRequestConfig, ReplaySource, RetryPolicy, StateNode, StepConfig, WorkflowDefinition,
         WorkflowInstanceState, WorkflowProjectionError, WorkflowStatus, WorkflowValidationError,
         replay_compiled_history_trace, replay_compiled_history_trace_from_snapshot,
         replay_history_trace, replay_history_trace_from_snapshot,
+        validate_compiled_artifact_history_compatibility,
     };
 
     fn test_event(
@@ -1810,6 +1897,84 @@ mod tests {
                 non_cancellable_states: std::collections::BTreeSet::new(),
             },
         )
+    }
+
+    fn versioned_legacy_artifact(version: u32, max_supported: u32) -> CompiledWorkflowArtifact {
+        let workflow = CompiledWorkflow {
+            initial_state: "assign_gate".to_owned(),
+            states: BTreeMap::from([
+                (
+                    "assign_gate".to_owned(),
+                    CompiledStateNode::Assign {
+                        actions: vec![Assignment {
+                            target: "gate".to_owned(),
+                            expr: Expression::Version {
+                                change_id: "feature-x".to_owned(),
+                                min_supported: 1,
+                                max_supported,
+                            },
+                        }],
+                        next: "choose".to_owned(),
+                    },
+                ),
+                (
+                    "choose".to_owned(),
+                    CompiledStateNode::Choice {
+                        condition: Expression::Binary {
+                            op: BinaryOp::Equal,
+                            left: Box::new(Expression::Identifier { name: "gate".to_owned() }),
+                            right: Box::new(Expression::Literal { value: json!(1) }),
+                        },
+                        then_next: "legacy".to_owned(),
+                        else_next: "modern".to_owned(),
+                    },
+                ),
+                (
+                    "legacy".to_owned(),
+                    CompiledStateNode::Succeed {
+                        output: Some(Expression::Literal { value: json!({"mode": "legacy"}) }),
+                    },
+                ),
+                (
+                    "modern".to_owned(),
+                    CompiledStateNode::Succeed {
+                        output: Some(Expression::Literal { value: json!({"mode": "modern"}) }),
+                    },
+                ),
+            ]),
+            non_cancellable_states: BTreeSet::new(),
+        };
+        let mut artifact = CompiledWorkflowArtifact::new(
+            "compat-demo".to_owned(),
+            version,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            workflow,
+        );
+        artifact.artifact_hash = artifact.hash();
+        artifact
+    }
+
+    fn unversioned_modern_artifact(version: u32) -> CompiledWorkflowArtifact {
+        let workflow = CompiledWorkflow {
+            initial_state: "done".to_owned(),
+            states: BTreeMap::from([(
+                "done".to_owned(),
+                CompiledStateNode::Succeed {
+                    output: Some(Expression::Literal { value: json!({"mode": "modern"}) }),
+                },
+            )]),
+            non_cancellable_states: BTreeSet::new(),
+        };
+        let mut artifact = CompiledWorkflowArtifact::new(
+            "compat-demo".to_owned(),
+            version,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            workflow,
+        );
+        artifact.artifact_hash = artifact.hash();
+        artifact
     }
 
     #[test]
@@ -2419,6 +2584,87 @@ mod tests {
         assert_eq!(trace.transitions.len(), 10);
         assert_eq!(trace.final_state.event_count, 10);
         assert_eq!(trace.final_state.current_state, Some("done".to_owned()));
+    }
+
+    #[test]
+    fn compiled_artifact_compatibility_accepts_version_marker_guarded_change() {
+        let pinned = versioned_legacy_artifact(1, 1);
+        let candidate = versioned_legacy_artifact(2, 2);
+        let history = vec![
+            test_event(
+                "WorkflowTriggered",
+                "run-compat",
+                WorkflowEvent::WorkflowTriggered { input: json!({}) },
+                &[],
+            ),
+            test_event(
+                "WorkflowStarted",
+                "run-compat",
+                WorkflowEvent::WorkflowStarted,
+                &[("state", "legacy")],
+            ),
+            test_event(
+                "VersionMarkerRecorded",
+                "run-compat",
+                WorkflowEvent::VersionMarkerRecorded {
+                    change_id: "feature-x".to_owned(),
+                    version: 1,
+                },
+                &[],
+            ),
+            test_event(
+                "WorkflowCompleted",
+                "run-compat",
+                WorkflowEvent::WorkflowCompleted { output: json!({"mode": "legacy"}) },
+                &[("state", "legacy")],
+            ),
+        ];
+
+        let divergences =
+            validate_compiled_artifact_history_compatibility(&history, &pinned, &candidate)
+                .unwrap();
+        assert!(divergences.is_empty());
+    }
+
+    #[test]
+    fn compiled_artifact_compatibility_rejects_unversioned_change() {
+        let pinned = versioned_legacy_artifact(1, 1);
+        let candidate = unversioned_modern_artifact(2);
+        let history = vec![
+            test_event(
+                "WorkflowTriggered",
+                "run-compat",
+                WorkflowEvent::WorkflowTriggered { input: json!({}) },
+                &[],
+            ),
+            test_event(
+                "WorkflowStarted",
+                "run-compat",
+                WorkflowEvent::WorkflowStarted,
+                &[("state", "legacy")],
+            ),
+            test_event(
+                "VersionMarkerRecorded",
+                "run-compat",
+                WorkflowEvent::VersionMarkerRecorded {
+                    change_id: "feature-x".to_owned(),
+                    version: 1,
+                },
+                &[],
+            ),
+            test_event(
+                "WorkflowCompleted",
+                "run-compat",
+                WorkflowEvent::WorkflowCompleted { output: json!({"mode": "legacy"}) },
+                &[("state", "legacy")],
+            ),
+        ];
+
+        let divergences =
+            validate_compiled_artifact_history_compatibility(&history, &pinned, &candidate)
+                .unwrap();
+        assert_eq!(divergences.len(), 1);
+        assert!(divergences[0].message.contains("candidate artifact replay diverged"));
     }
 
     #[test]

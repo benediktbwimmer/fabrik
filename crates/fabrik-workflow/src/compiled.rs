@@ -700,6 +700,17 @@ impl CompiledWorkflowArtifact {
         self.execute_from_state(&self.workflow.initial_state, execution_state, true)
     }
 
+    pub fn execute_trigger_with_state_and_turn(
+        &self,
+        input: &Value,
+        mut execution_state: ArtifactExecutionState,
+        turn_context: ExecutionTurnContext,
+    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
+        execution_state.bindings.insert("input".to_owned(), input.clone());
+        execution_state.turn_context = Some(turn_context);
+        self.execute_from_state(&self.workflow.initial_state, execution_state, true)
+    }
+
     pub fn execute_after_signal(
         &self,
         wait_state: &str,

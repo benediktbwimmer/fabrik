@@ -1,4 +1,4 @@
-import { Activity, Home, Radar, Search, Workflow } from "lucide-react";
+import { Activity, GitBranch, Home, Radar, Search, Workflow } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 
@@ -10,6 +10,7 @@ const NAV_ITEMS = [
   { to: "/", label: "Home", icon: Home, chord: "G H" },
   { to: "/workflows", label: "Workflows", icon: Workflow, chord: "G W" },
   { to: "/runs", label: "Runs", icon: Activity, chord: "G R" },
+  { to: "/builds", label: "Builds", icon: GitBranch, chord: "G B" },
   { to: "/task-queues", label: "Task Queues", icon: Radar, chord: "G Q" }
 ];
 
@@ -44,6 +45,7 @@ export function AppShell() {
             h: "/",
             w: "/workflows",
             r: "/runs",
+            b: "/builds",
             q: "/task-queues",
           }[next.key.toLowerCase()];
           if (nav) navigate(nav);

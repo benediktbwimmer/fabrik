@@ -332,6 +332,37 @@ const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       { status: 200 }
     );
   }
+  if (url.includes("/tenants/tenant-a/workflow-artifacts/validate")) {
+    return new Response(
+      JSON.stringify({
+        tenant_id: "tenant-a",
+        definition_id: "payments",
+        version: 2,
+        artifact_hash: "artifact-b",
+        compatible: false,
+        status: "incompatible",
+        validation: {
+          enabled: true,
+          validated_run_count: 2,
+          skipped_run_count: 1,
+          failed_run_count: 1,
+          failures: [
+            {
+              instance_id: "instance-legacy",
+              run_id: "run-17",
+              message: "candidate artifact replay diverged after event evt-17 (WorkflowCompleted)",
+              divergence: {
+                kind: "projection_mismatch",
+                message: "candidate artifact replay diverged after event evt-17 (WorkflowCompleted)",
+                fields: [{ field: "output" }]
+              }
+            }
+          ]
+        }
+      }),
+      { status: 200 }
+    );
+  }
   if (url.includes("/tenants/tenant-a/runs") && url.includes("instance_id=instance-1")) {
     return new Response(
       JSON.stringify({
@@ -672,8 +703,17 @@ test("renders runs index rows", async () => {
 test("supports routing-status run filtering in the runs view", async () => {
   renderApp("/runs?routing_status=sticky_active");
 
-  await waitFor(() => expect(screen.getByDisplayValue("sticky_active")).toBeInTheDocument());
-  expect(screen.getByText("sticky_active")).toBeInTheDocument();
+  await waitFor(() => expect(screen.getByRole("link", { name: "Inspect" })).toBeInTheDocument());
+  expect(screen.getByDisplayValue("sticky_active")).toBeInTheDocument();
+  expect(screen.getAllByText("sticky_active").length).toBeGreaterThan(0);
+  expect(screen.getByRole("link", { name: "Queue" })).toHaveAttribute(
+    "href",
+    "/task-queues?queue_kind=workflow&task_queue=payments"
+  );
+  expect(screen.getByRole("link", { name: "Builds" })).toHaveAttribute(
+    "href",
+    "/builds?queue_kind=workflow&task_queue=payments"
+  );
 });
 
 test("shows routing status on overview recent failures", async () => {
@@ -715,4 +755,18 @@ test("renders workflow definition graph explorer", async () => {
   await waitFor(() => expect(screen.getByText("Graph Explorer")).toBeInTheDocument());
   expect(screen.getByRole("button", { name: "Semantic Map" })).toBeInTheDocument();
   expect(screen.getByText("Entry")).toBeInTheDocument();
+});
+
+test("runs dry-run rollout validation from workflow definition detail", async () => {
+  renderApp("/workflows/payments");
+
+  await waitFor(() => expect(screen.getByRole("button", { name: "overview" })).toBeInTheDocument());
+  await userEvent.click(screen.getByRole("button", { name: "overview" }));
+  await userEvent.click(screen.getByRole("button", { name: "Validate rollout" }));
+
+  await waitFor(() => expect(screen.getByText("incompatible")).toBeInTheDocument());
+  expect(screen.getByText("Validated runs 2")).toBeInTheDocument();
+  expect(screen.getByText("Skipped 1")).toBeInTheDocument();
+  expect(screen.getByText("Failures 1")).toBeInTheDocument();
+  expect(screen.getByText("instance-legacy / run-17")).toBeInTheDocument();
 });

@@ -242,6 +242,10 @@ fn build_app(state: AppState, service_name: String) -> Router {
         get(proxy_to_query_get),
     )
     .route(
+        "/tenants/{tenant_id}/workflow-artifacts/validate",
+        post(proxy_to_ingest),
+    )
+    .route(
         "/tenants/{tenant_id}/workflow-artifacts",
         get(proxy_to_query_get),
     )
@@ -959,12 +963,29 @@ mod tests {
         };
         let store = postgres.connect_store().await?;
 
-        let ingest = TestHttpServer::start(Router::new().route(
-            "/workflows/demo/trigger",
-            post(|| async {
-                (StatusCode::ACCEPTED, Json(json!({"service": "ingest"}))).into_response()
-            }),
-        ))
+        let ingest = TestHttpServer::start(
+            Router::new()
+                .route(
+                    "/workflows/demo/trigger",
+                    post(|| async {
+                        (StatusCode::ACCEPTED, Json(json!({"service": "ingest"}))).into_response()
+                    }),
+                )
+                .route(
+                    "/tenants/tenant-a/workflow-artifacts/validate",
+                    post(|| async {
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "service": "ingest",
+                                "compatible": false,
+                                "status": "incompatible"
+                            })),
+                        )
+                            .into_response()
+                    }),
+                ),
+        )
         .await?;
         let query = TestHttpServer::start(Router::new().route(
             "/tenants/tenant-a/workflows/instance-1",
@@ -1020,6 +1041,21 @@ mod tests {
         assert_eq!(query_response.status(), StatusCode::OK);
         let query_body = to_bytes(query_response.into_body(), usize::MAX).await?;
         assert_eq!(serde_json::from_slice::<Value>(&query_body)?["service"], "query");
+
+        let validate_response = app
+            .clone()
+            .oneshot(
+                Request::post("/tenants/tenant-a/workflow-artifacts/validate?validation_run_limit=3")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"definition_id":"demo","definition_version":2,"compiler_version":"test","source_language":"ts","entrypoint":{"module":"workflow.ts","export":"workflow"},"workflow":{"initial_state":"done","states":{"done":{"type":"succeed"}}},"artifact_hash":"artifact-2"}"#))
+                    .expect("validate request"),
+            )
+            .await?;
+        assert_eq!(validate_response.status(), StatusCode::OK);
+        let validate_body = to_bytes(validate_response.into_body(), usize::MAX).await?;
+        let validate_json = serde_json::from_slice::<Value>(&validate_body)?;
+        assert_eq!(validate_json["service"], "ingest");
+        assert_eq!(validate_json["status"], "incompatible");
 
         let debug_response = app
             .clone()

@@ -15,6 +15,7 @@ use fabrik_worker_protocol::activity_worker::{
 };
 use fabrik_workflow::{StepConfig, execute_handler};
 use reqwest::{Client, Method, Response};
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinSet;
@@ -23,7 +24,7 @@ use uuid::Uuid;
 
 const RESULT_BATCH_MAX_ITEMS: usize = 256;
 const RESULT_BATCH_MAX_BYTES: usize = 1_048_576;
-const RESULT_BATCH_FLUSH_INTERVAL_MS: u64 = 5;
+const DEFAULT_RESULT_BATCH_FLUSH_INTERVAL_MS: u64 = 5;
 const DEFAULT_ACTIVITY_WORKER_CONCURRENCY: usize = 8;
 const DEFAULT_RESULT_FLUSHER_CONCURRENCY: usize = 2;
 const DEFAULT_ACTIVITY_POLL_MAX_TASKS: u32 = 8;
@@ -63,6 +64,11 @@ async fn main() -> Result<()> {
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_RESULT_FLUSHER_CONCURRENCY)
         .min(concurrency);
+    let result_batch_flush_interval_ms = env::var("ACTIVITY_RESULT_BATCH_FLUSH_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_RESULT_BATCH_FLUSH_INTERVAL_MS);
     let bulk_poll_max_tasks = env::var("ACTIVITY_BULK_POLL_MAX_TASKS")
         .ok()
         .and_then(|value| value.parse::<u32>().ok())
@@ -87,6 +93,7 @@ async fn main() -> Result<()> {
         worker_build_id = %worker_build_id,
         concurrency,
         result_flusher_concurrency,
+        result_batch_flush_interval_ms,
         activity_poll_max_tasks,
         bulk_poll_max_tasks,
         enable_activity_lanes,
@@ -104,6 +111,7 @@ async fn main() -> Result<()> {
             workers.spawn(run_result_flusher(
                 endpoint.clone(),
                 format!("result-flusher-{flusher_index}"),
+                result_batch_flush_interval_ms,
                 result_rx,
             ));
             result_txs.push(result_tx);
@@ -117,6 +125,7 @@ async fn main() -> Result<()> {
             workers.spawn(run_bulk_result_flusher(
                 bulk_endpoint.clone(),
                 format!("bulk-result-flusher-{flusher_index}"),
+                result_batch_flush_interval_ms,
                 payload_store.clone(),
                 bulk_endpoint != endpoint,
                 bulk_result_rx,
@@ -177,12 +186,13 @@ fn should_flush_results(
     pending_results: &[ActivityTaskResult],
     pending_result_bytes: usize,
     first_pending_at: Option<std::time::Instant>,
+    flush_interval_ms: u64,
 ) -> bool {
     !pending_results.is_empty()
         && (pending_results.len() >= RESULT_BATCH_MAX_ITEMS
             || pending_result_bytes >= RESULT_BATCH_MAX_BYTES
             || first_pending_at.is_some_and(|started| {
-                started.elapsed() >= Duration::from_millis(RESULT_BATCH_FLUSH_INTERVAL_MS)
+                started.elapsed() >= Duration::from_millis(flush_interval_ms)
             }))
 }
 
@@ -295,6 +305,7 @@ async fn flush_bulk_results(
 async fn run_result_flusher(
     endpoint: String,
     flusher_id: String,
+    flush_interval_ms: u64,
     mut result_rx: UnboundedReceiver<ActivityTaskResult>,
 ) -> Result<()> {
     let mut worker = connect_activity_worker_with_retry(&endpoint, &flusher_id).await;
@@ -313,7 +324,12 @@ async fn run_result_flusher(
             first_pending_at.get_or_insert_with(std::time::Instant::now);
         }
 
-        if should_flush_results(&pending_results, pending_result_bytes, first_pending_at) {
+        if should_flush_results(
+            &pending_results,
+            pending_result_bytes,
+            first_pending_at,
+            flush_interval_ms,
+        ) {
             flush_results(
                 &mut worker,
                 &mut pending_results,
@@ -326,10 +342,10 @@ async fn run_result_flusher(
 
         let wait = first_pending_at
             .map(|started| {
-                Duration::from_millis(RESULT_BATCH_FLUSH_INTERVAL_MS)
+                Duration::from_millis(flush_interval_ms)
                     .saturating_sub(started.elapsed())
             })
-            .unwrap_or_else(|| Duration::from_millis(RESULT_BATCH_FLUSH_INTERVAL_MS));
+            .unwrap_or_else(|| Duration::from_millis(flush_interval_ms));
 
         match tokio::time::timeout(wait, result_rx.recv()).await {
             Ok(Some(result)) => {
@@ -363,6 +379,7 @@ async fn run_result_flusher(
 async fn run_bulk_result_flusher(
     endpoint: String,
     flusher_id: String,
+    flush_interval_ms: u64,
     payload_store: Arc<PayloadStore>,
     externalize_outputs: bool,
     mut result_rx: UnboundedReceiver<BulkActivityTaskResult>,
@@ -387,7 +404,7 @@ async fn run_bulk_result_flusher(
             && (pending_results.len() >= RESULT_BATCH_MAX_ITEMS
                 || pending_result_bytes >= RESULT_BATCH_MAX_BYTES
                 || first_pending_at.is_some_and(|started| {
-                    started.elapsed() >= Duration::from_millis(RESULT_BATCH_FLUSH_INTERVAL_MS)
+                    started.elapsed() >= Duration::from_millis(flush_interval_ms)
                 }))
         {
             flush_bulk_results(
@@ -405,10 +422,10 @@ async fn run_bulk_result_flusher(
 
         let wait = first_pending_at
             .map(|started| {
-                Duration::from_millis(RESULT_BATCH_FLUSH_INTERVAL_MS)
+                Duration::from_millis(flush_interval_ms)
                     .saturating_sub(started.elapsed())
             })
-            .unwrap_or_else(|| Duration::from_millis(RESULT_BATCH_FLUSH_INTERVAL_MS));
+            .unwrap_or_else(|| Duration::from_millis(flush_interval_ms));
 
         match tokio::time::timeout(wait, result_rx.recv()).await {
             Ok(Some(result)) => {
@@ -611,14 +628,18 @@ async fn execute_activity_task(
     worker_id: String,
     worker_build_id: String,
 ) -> Result<ActivityTaskResult> {
-    let result = execute_activity(
-        client,
-        &task.activity_type,
-        task.attempt,
-        parse_activity_task_config(&task)?,
-        &parse_activity_task_input(&task)?,
-    )
-    .await;
+    let result = if task.activity_type == "benchmark.echo" && task.omit_success_output {
+        execute_benchmark_echo_task_without_output(&task).map(|()| Value::Null)
+    } else {
+        execute_activity(
+            client,
+            &task.activity_type,
+            task.attempt,
+            parse_activity_task_config(&task)?,
+            &parse_activity_task_input(&task)?,
+        )
+        .await
+    };
 
     Ok(match result {
         Ok(output) => ActivityTaskResult {
@@ -670,6 +691,43 @@ async fn execute_activity_task(
             })),
         },
     })
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct BenchmarkEchoTaskInput {
+    #[serde(default)]
+    cancel: bool,
+    #[serde(default)]
+    fail_until_attempt: u32,
+}
+
+fn execute_benchmark_echo_task_without_output(
+    task: &fabrik_worker_protocol::activity_worker::ActivityTask,
+) -> Result<()> {
+    let input = match parse_benchmark_echo_task_input(task) {
+        Ok(input) => input,
+        Err(_) => {
+            let input = parse_activity_task_input(task)?;
+            execute_benchmark_echo(task.attempt, &input)?;
+            return Ok(());
+        }
+    };
+    if input.cancel {
+        anyhow::bail!("activity cancelled");
+    }
+    if task.attempt <= input.fail_until_attempt {
+        anyhow::bail!("benchmark configured failure on attempt {}", task.attempt);
+    }
+    Ok(())
+}
+
+fn parse_benchmark_echo_task_input(
+    task: &fabrik_worker_protocol::activity_worker::ActivityTask,
+) -> Result<BenchmarkEchoTaskInput> {
+    if !task.input_cbor.is_empty() {
+        return decode_cbor(&task.input_cbor, "benchmark echo activity task input");
+    }
+    serde_json::from_str(&task.input_json).map_err(anyhow::Error::from)
 }
 
 fn parse_activity_task_input(
@@ -1217,5 +1275,36 @@ mod tests {
 
         assert!(completed.output_json.is_empty());
         assert!(completed.output_cbor.is_empty());
+    }
+
+    #[test]
+    fn benchmark_echo_fast_path_reads_only_control_fields_from_cbor() {
+        let task = ActivityTask {
+            attempt: 2,
+            input_cbor: encode_cbor(
+                &serde_json::json!({
+                    "payload": "x".repeat(4096),
+                    "fail_until_attempt": 1,
+                    "cancel": false
+                }),
+                "benchmark echo task input",
+            )
+            .expect("encode benchmark echo task"),
+            ..ActivityTask::default()
+        };
+
+        execute_benchmark_echo_task_without_output(&task).expect("benchmark echo succeeds");
+    }
+
+    #[test]
+    fn benchmark_echo_fast_path_preserves_retry_failures() {
+        let task = ActivityTask {
+            attempt: 1,
+            input_json: "{\"fail_until_attempt\":1,\"payload\":\"ignored\"}".to_owned(),
+            ..ActivityTask::default()
+        };
+
+        let error = execute_benchmark_echo_task_without_output(&task).expect_err("task should fail");
+        assert_eq!(error.to_string(), "benchmark configured failure on attempt 1");
     }
 }

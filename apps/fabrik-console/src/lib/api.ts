@@ -341,6 +341,29 @@ export type CompiledWorkflowArtifact = {
   artifact_hash: string;
 };
 
+export type ArtifactValidationFailure = {
+  instance_id: string;
+  run_id: string;
+  message: string;
+  divergence: { kind: string; message: string; fields?: Array<{ field: string }> } | null;
+};
+
+export type ValidateWorkflowArtifactResponse = {
+  tenant_id: string;
+  definition_id: string;
+  version: number;
+  artifact_hash: string;
+  compatible: boolean;
+  status: string;
+  validation: {
+    enabled: boolean;
+    validated_run_count: number;
+    skipped_run_count: number;
+    failed_run_count: number;
+    failures: ArtifactValidationFailure[];
+  };
+};
+
 export type WorkflowGraphSourceAnchor = {
   file: string;
   line: number;
@@ -585,6 +608,14 @@ export const api = {
     request<WorkflowGraphResponse>(`/tenants/${tenantId}/workflow-definitions/${definitionId}/graph`),
   getLatestArtifact: (tenantId: string, definitionId: string) =>
     request<CompiledWorkflowArtifact>(`/tenants/${tenantId}/workflow-artifacts/${definitionId}/latest`),
+  validateWorkflowArtifact: (tenantId: string, artifact: CompiledWorkflowArtifact, validationRunLimit = 10) =>
+    request<ValidateWorkflowArtifactResponse>(
+      `/tenants/${tenantId}/workflow-artifacts/validate?validation_run_limit=${validationRunLimit}`,
+      {
+        method: "POST",
+        body: JSON.stringify(artifact)
+      }
+    ),
   getRunGraph: (tenantId: string, instanceId: string, runId: string) =>
     request<WorkflowGraphResponse>(`/tenants/${tenantId}/workflows/${instanceId}/runs/${runId}/graph`),
   signalWorkflow: (tenantId: string, instanceId: string, signalType: string, payload: unknown) =>

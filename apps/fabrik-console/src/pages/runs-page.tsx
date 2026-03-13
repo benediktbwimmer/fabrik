@@ -185,6 +185,7 @@ export function RunsPage() {
               <th>Routing</th>
               <th>Current step</th>
               <th>Queue</th>
+              <th>Triage</th>
               <th>Started</th>
               <th>Last transition</th>
               <th>Duration</th>
@@ -211,6 +212,22 @@ export function RunsPage() {
                   <div className="muted">{item.last_event_type ?? "no event projection"}</div>
                 </td>
                 <td>{item.workflow_task_queue}</td>
+                <td>
+                  <div className="stack">
+                    <Link
+                      className="button ghost"
+                      to={`/task-queues?queue_kind=workflow&task_queue=${encodeURIComponent(item.workflow_task_queue)}`}
+                    >
+                      Queue
+                    </Link>
+                    <Link
+                      className="button ghost"
+                      to={`/builds?queue_kind=workflow&task_queue=${encodeURIComponent(item.workflow_task_queue)}`}
+                    >
+                      Builds
+                    </Link>
+                  </div>
+                </td>
                 <td>{formatDate(item.started_at)}</td>
                 <td>{formatDate(item.last_transition_at)}</td>
                 <td>{formatDuration(item.started_at, item.closed_at)}</td>

@@ -1,17 +1,20 @@
 use anyhow::Result;
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::post,
 };
-use fabrik_broker::{BrokerConfig, WorkflowPublisher};
+use fabrik_broker::{
+    BrokerConfig, WorkflowHistoryFilter, WorkflowPublisher, read_workflow_history,
+};
 use fabrik_config::{HttpServiceConfig, PostgresConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
-use fabrik_store::WorkflowStore;
+use fabrik_store::{WorkflowRunFilters, WorkflowStore};
 use fabrik_workflow::{
-    CompiledWorkflowArtifact, WorkflowDefinition, WorkflowStatus, artifact_hash,
+    CompiledWorkflowArtifact, ReplayDivergence, WorkflowDefinition, WorkflowStatus, artifact_hash,
+    validate_compiled_artifact_history_compatibility,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -19,8 +22,13 @@ use tokio::time::{Duration, Instant};
 use tracing::info;
 use uuid::Uuid;
 
+const DEFAULT_ARTIFACT_VALIDATION_RUN_LIMIT: usize = 10;
+const HISTORY_IDLE_TIMEOUT_MS: u64 = 1_000;
+const HISTORY_MAX_SCAN_MS: u64 = 10_000;
+
 #[derive(Clone)]
 struct AppState {
+    broker: BrokerConfig,
     publisher: WorkflowPublisher,
     store: WorkflowStore,
 }
@@ -159,6 +167,42 @@ struct PublishWorkflowArtifactResponse {
     version: u32,
     artifact_hash: String,
     status: &'static str,
+    validation: ArtifactValidationSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct ValidateWorkflowArtifactResponse {
+    tenant_id: String,
+    definition_id: String,
+    version: u32,
+    artifact_hash: String,
+    compatible: bool,
+    status: &'static str,
+    validation: ArtifactValidationSummary,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PublishWorkflowArtifactQuery {
+    #[serde(default)]
+    validate_existing_runs: Option<bool>,
+    validation_run_limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactValidationSummary {
+    enabled: bool,
+    validated_run_count: usize,
+    skipped_run_count: usize,
+    failed_run_count: usize,
+    failures: Vec<ArtifactValidationFailure>,
+}
+
+#[derive(Debug, Serialize)]
+struct ArtifactValidationFailure {
+    instance_id: String,
+    run_id: String,
+    message: String,
+    divergence: Option<ReplayDivergence>,
 }
 
 #[tokio::main]
@@ -183,6 +227,7 @@ async fn main() -> Result<()> {
     ))
     .route("/tenants/{tenant_id}/workflow-definitions", post(publish_workflow_definition))
     .route("/tenants/{tenant_id}/workflow-artifacts", post(publish_workflow_artifact))
+    .route("/tenants/{tenant_id}/workflow-artifacts/validate", post(validate_workflow_artifact))
     .route("/workflows/{workflow_id}/trigger", post(trigger_workflow))
     .route(
         "/tenants/{tenant_id}/workflows/{workflow_instance_id}/signals/{signal_type}",
@@ -205,6 +250,7 @@ async fn main() -> Result<()> {
         post(cancel_activity),
     )
     .with_state(AppState {
+        broker: broker.clone(),
         publisher: WorkflowPublisher::new(&broker, "ingest-service").await?,
         store,
     });
@@ -214,10 +260,46 @@ async fn main() -> Result<()> {
 
 async fn publish_workflow_artifact(
     Path(tenant_id): Path<String>,
+    Query(query): Query<PublishWorkflowArtifactQuery>,
     State(state): State<AppState>,
     Json(artifact): Json<CompiledWorkflowArtifact>,
 ) -> Result<(StatusCode, Json<PublishWorkflowArtifactResponse>), (StatusCode, String)> {
     artifact.validate().map_err(validation_error)?;
+
+    let validation = if query.validate_existing_runs.unwrap_or(true) {
+        validate_artifact_against_recent_runs(
+            &state,
+            &tenant_id,
+            &artifact,
+            query.validation_run_limit.unwrap_or(DEFAULT_ARTIFACT_VALIDATION_RUN_LIMIT),
+        )
+        .await?
+    } else {
+        ArtifactValidationSummary {
+            enabled: false,
+            validated_run_count: 0,
+            skipped_run_count: 0,
+            failed_run_count: 0,
+            failures: Vec::new(),
+        }
+    };
+    if validation.failed_run_count > 0 {
+        let failure = &validation.failures[0];
+        let sample = validation
+            .failures
+            .iter()
+            .take(3)
+            .map(|failure| format!("{}/{}", failure.instance_id, failure.run_id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "artifact rollout validation failed for {} run(s); sample: {}; first issue: {}",
+                validation.failed_run_count, sample, failure.message
+            ),
+        ));
+    }
 
     state.store.put_artifact(&tenant_id, &artifact).await.map_err(internal_error)?;
 
@@ -229,8 +311,129 @@ async fn publish_workflow_artifact(
             version: artifact.definition_version,
             artifact_hash: artifact.artifact_hash.clone(),
             status: "stored",
+            validation,
         }),
     ))
+}
+
+async fn validate_workflow_artifact(
+    Path(tenant_id): Path<String>,
+    Query(query): Query<PublishWorkflowArtifactQuery>,
+    State(state): State<AppState>,
+    Json(artifact): Json<CompiledWorkflowArtifact>,
+) -> Result<Json<ValidateWorkflowArtifactResponse>, (StatusCode, String)> {
+    artifact.validate().map_err(validation_error)?;
+    let validation = if query.validate_existing_runs.unwrap_or(true) {
+        validate_artifact_against_recent_runs(
+            &state,
+            &tenant_id,
+            &artifact,
+            query.validation_run_limit.unwrap_or(DEFAULT_ARTIFACT_VALIDATION_RUN_LIMIT),
+        )
+        .await?
+    } else {
+        ArtifactValidationSummary {
+            enabled: false,
+            validated_run_count: 0,
+            skipped_run_count: 0,
+            failed_run_count: 0,
+            failures: Vec::new(),
+        }
+    };
+
+    Ok(Json(ValidateWorkflowArtifactResponse {
+        tenant_id,
+        definition_id: artifact.definition_id.clone(),
+        version: artifact.definition_version,
+        artifact_hash: artifact.artifact_hash.clone(),
+        compatible: validation.failed_run_count == 0,
+        status: if validation.failed_run_count == 0 { "validated" } else { "incompatible" },
+        validation,
+    }))
+}
+
+async fn validate_artifact_against_recent_runs(
+    state: &AppState,
+    tenant_id: &str,
+    artifact: &CompiledWorkflowArtifact,
+    run_limit: usize,
+) -> Result<ArtifactValidationSummary, (StatusCode, String)> {
+    let runs = state
+        .store
+        .list_runs_page_with_filters(
+            tenant_id,
+            &WorkflowRunFilters {
+                definition_id: Some(artifact.definition_id.clone()),
+                ..WorkflowRunFilters::default()
+            },
+            i64::try_from(run_limit).map_err(|error| validation_error(error))?,
+            0,
+        )
+        .await
+        .map_err(internal_error)?;
+    let mut summary = ArtifactValidationSummary {
+        enabled: true,
+        validated_run_count: 0,
+        skipped_run_count: 0,
+        failed_run_count: 0,
+        failures: Vec::new(),
+    };
+
+    for run in runs {
+        let history = read_workflow_history(
+            &state.broker,
+            "ingest-artifact-validator",
+            &WorkflowHistoryFilter::new(tenant_id, &run.instance_id, &run.run_id),
+            Duration::from_millis(HISTORY_IDLE_TIMEOUT_MS),
+            Duration::from_millis(HISTORY_MAX_SCAN_MS),
+        )
+        .await
+        .map_err(internal_error)?;
+        if history.is_empty() {
+            summary.skipped_run_count = summary.skipped_run_count.saturating_add(1);
+            continue;
+        }
+
+        let Some(version) = run.definition_version else {
+            summary.skipped_run_count = summary.skipped_run_count.saturating_add(1);
+            continue;
+        };
+        let Some(pinned_artifact) = state
+            .store
+            .get_artifact_version(tenant_id, &artifact.definition_id, version)
+            .await
+            .map_err(internal_error)?
+        else {
+            summary.skipped_run_count = summary.skipped_run_count.saturating_add(1);
+            continue;
+        };
+
+        let divergences =
+            validate_compiled_artifact_history_compatibility(&history, &pinned_artifact, artifact)
+                .map_err(|error| {
+                    (
+                        StatusCode::CONFLICT,
+                        format!(
+                            "artifact replay validation failed for {}/{}: {error}",
+                            run.instance_id, run.run_id
+                        ),
+                    )
+                })?;
+        if let Some(divergence) = divergences.into_iter().next() {
+            summary.failed_run_count = summary.failed_run_count.saturating_add(1);
+            summary.failures.push(ArtifactValidationFailure {
+                instance_id: run.instance_id.clone(),
+                run_id: run.run_id.clone(),
+                message: divergence.message.clone(),
+                divergence: Some(divergence),
+            });
+            continue;
+        }
+
+        summary.validated_run_count = summary.validated_run_count.saturating_add(1);
+    }
+
+    Ok(summary)
 }
 
 async fn publish_workflow_definition(
