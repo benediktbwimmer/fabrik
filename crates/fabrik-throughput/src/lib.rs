@@ -204,7 +204,9 @@ pub struct ActivityCapabilityRegistry {
 }
 
 impl ActivityCapabilityRegistry {
-    pub fn is_empty(&self) -> bool { self.by_task_queue.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.by_task_queue.is_empty()
+    }
 
     pub fn entry_count(&self) -> usize {
         self.by_task_queue.values().map(BTreeMap::len).sum()
@@ -218,7 +220,9 @@ impl ActivityCapabilityRegistry {
         self.by_task_queue
             .get(task_queue)
             .and_then(|activities| activities.get(activity_type))
-            .or_else(|| self.by_task_queue.get("").and_then(|activities| activities.get(activity_type)))
+            .or_else(|| {
+                self.by_task_queue.get("").and_then(|activities| activities.get(activity_type))
+            })
     }
 
     pub fn insert(
@@ -274,8 +278,11 @@ pub fn load_activity_capability_registry_from_worker_packages(
                 .with_context(|| format!("failed to read {}", activity_manifest_path.display()))?,
         )
         .with_context(|| format!("failed to parse {}", activity_manifest_path.display()))?;
-        let task_queue =
-            manifest.task_queue.as_deref().or(package.task_queue.as_deref()).filter(|value| !value.is_empty());
+        let task_queue = manifest
+            .task_queue
+            .as_deref()
+            .or(package.task_queue.as_deref())
+            .filter(|value| !value.is_empty());
         for activity in manifest.activities {
             registry.insert(task_queue, &activity.activity_type, activity.capabilities);
         }
@@ -2048,18 +2055,9 @@ mod tests {
     fn core_activities_are_fast_lane_eligible_when_outputs_can_be_omitted() {
         let items = vec![serde_json::json!({"value": 1}), serde_json::json!({"value": 2})];
 
-        assert!(activity_can_short_circuit_omitted_success_output(
-            CORE_ECHO_ACTIVITY,
-            None,
-        ));
-        assert!(activity_can_short_circuit_omitted_success_output(
-            CORE_NOOP_ACTIVITY,
-            None,
-        ));
-        assert!(activity_can_short_circuit_omitted_success_output(
-            CORE_ACCEPT_ACTIVITY,
-            None,
-        ));
+        assert!(activity_can_short_circuit_omitted_success_output(CORE_ECHO_ACTIVITY, None,));
+        assert!(activity_can_short_circuit_omitted_success_output(CORE_NOOP_ACTIVITY, None,));
+        assert!(activity_can_short_circuit_omitted_success_output(CORE_ACCEPT_ACTIVITY, None,));
         assert!(can_use_payloadless_bulk_transport(
             CORE_ECHO_ACTIVITY,
             None,

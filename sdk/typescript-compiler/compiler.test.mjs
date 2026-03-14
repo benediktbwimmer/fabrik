@@ -1028,6 +1028,8 @@ test("compiler lowers recursive async helpers and Promise.all helper joins", asy
 
   assert.match(serializedStates, /"type":"call_async_helper"/);
   assert.match(serializedStates, /"type":"return_async_helper"/);
+  assert.match(serializedStates, /"type":"succeed"/);
+  assert.doesNotMatch(serializedStates, /workflow terminated without explicit completion/);
   assert.match(serializedHelpers, /"execute"/);
 });
 

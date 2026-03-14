@@ -2266,30 +2266,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "matching-service"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum 0.8.8",
- "chrono",
- "fabrik-broker",
- "fabrik-config",
- "fabrik-events",
- "fabrik-service",
- "fabrik-store",
- "fabrik-throughput",
- "fabrik-worker-protocol",
- "futures-util",
- "prost",
- "serde",
- "serde_json",
- "tokio",
- "tonic",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "matchit"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

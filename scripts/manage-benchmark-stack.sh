@@ -247,7 +247,6 @@ stop_existing_local_services() {
     return 0
   fi
   local patterns=(
-    'target/release/matching-service'
     'target/release/ingest-service'
     'target/release/throughput-runtime'
     'target/release/throughput-projector'
@@ -384,8 +383,6 @@ while IFS= read -r port; do
   PORTS+=("$port")
 done < <(reserve_ports)
 INGEST_PORT="${INGEST_SERVICE_PORT:-${PORTS[0]}}"
-MATCHING_PORT="${MATCHING_SERVICE_PORT:-${PORTS[1]}}"
-MATCHING_DEBUG_PORT="${MATCHING_DEBUG_PORT:-${PORTS[2]}}"
 THROUGHPUT_RUNTIME_PORT="${THROUGHPUT_RUNTIME_PORT:-${PORTS[3]}}"
 THROUGHPUT_DEBUG_PORT="${THROUGHPUT_DEBUG_PORT:-${PORTS[4]}}"
 THROUGHPUT_PROJECTOR_PORT="${THROUGHPUT_PROJECTOR_PORT:-${PORTS[5]}}"
@@ -508,7 +505,6 @@ if [[ "$BUILD_RELEASE" == "1" ]]; then
   cargo build --release \
     -p benchmark-runner \
     -p ingest-service \
-    -p matching-service \
     -p unified-runtime \
     -p throughput-runtime \
     -p throughput-projector \
@@ -584,7 +580,6 @@ if [[ "$EXECUTION_MODE" == "unified" ]]; then
     "${COMMON_ENV[@]}" \
     "ACTIVITY_WORKER_SERVICE_PORT=$ACTIVITY_WORKER_SERVICE_PORT" \
     "UNIFIED_RUNTIME_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
-    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
     "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
     "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
     "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \
@@ -595,15 +590,6 @@ if [[ "$EXECUTION_MODE" == "unified" ]]; then
     -- \
     target/release/activity-worker-service
 else
-  echo "[benchmark-stack] starting matching-service"
-  start_service "$LOG_DIR/matching-service.log" \
-    "${COMMON_ENV[@]}" \
-    "MATCHING_SERVICE_PORT=$MATCHING_PORT" \
-    "MATCHING_DEBUG_PORT=$MATCHING_DEBUG_PORT" \
-    -- \
-    target/release/matching-service
-  wait_for_port 127.0.0.1 "$MATCHING_PORT" "matching-service"
-
   echo "[benchmark-stack] starting throughput-runtime"
   start_service "$LOG_DIR/throughput-runtime.log" \
     "${COMMON_ENV[@]}" \
@@ -627,8 +613,7 @@ else
     "${COMMON_ENV[@]}" \
     "ACTIVITY_WORKER_SERVICE_PORT=$ACTIVITY_WORKER_SERVICE_PORT" \
     "UNIFIED_RUNTIME_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
-    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
-    "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
+    "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
     "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
     "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \
     "ACTIVITY_WORKER_CONCURRENCY=${ACTIVITY_WORKER_CONCURRENCY:-8}" \
@@ -643,7 +628,6 @@ else
     "${COMMON_ENV[@]}" \
     "ACTIVITY_WORKER_SERVICE_PORT=$STREAM_ACTIVITY_WORKER_SERVICE_PORT" \
     "UNIFIED_RUNTIME_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
-    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
     "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$THROUGHPUT_RUNTIME_PORT" \
     "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
     "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \

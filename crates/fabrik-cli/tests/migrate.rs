@@ -235,8 +235,7 @@ fn static_data_converter_factory_usage_is_qualified_for_alpha() {
 #[test]
 fn interceptor_workflow_modules_do_not_register_helper_exports_as_workflows() {
     let output_dir = temp_output_dir("interceptor-pressure");
-    let (status, report) =
-        run_cli(&fixture("temporal-interceptor-pressure"), &output_dir, &[]);
+    let (status, report) = run_cli(&fixture("temporal-interceptor-pressure"), &output_dir, &[]);
     assert!(status.success(), "report: {report:?}");
     assert_eq!(report["status"], "compatible_ready_not_deployed");
     assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
@@ -449,16 +448,8 @@ fn monorepo_multiworker_packages_do_not_collide_on_shared_worker_filenames() {
         .map(|worker| worker["package_dir"].as_str().expect("package dir"))
         .collect::<Vec<_>>();
     assert_ne!(package_dirs[0], package_dirs[1]);
-    assert!(
-        package_dirs
-            .iter()
-            .any(|dir| dir.contains("apps-orders-worker-src-worker-1"))
-    );
-    assert!(
-        package_dirs
-            .iter()
-            .any(|dir| dir.contains("apps-reports-worker-src-worker-1"))
-    );
+    assert!(package_dirs.iter().any(|dir| dir.contains("apps-orders-worker-src-worker-1")));
+    assert!(package_dirs.iter().any(|dir| dir.contains("apps-reports-worker-src-worker-1")));
 }
 
 #[test]

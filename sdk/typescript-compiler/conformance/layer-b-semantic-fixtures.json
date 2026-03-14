@@ -161,6 +161,20 @@
           "\"handler\":\"greet\""
         ]
       }
+    },
+    {
+      "id": "recursive-async-helper-runtime-semantics",
+      "kind": "command",
+      "command": "cargo",
+      "args": [
+        "test",
+        "-p",
+        "fabrik-workflow",
+        "recursive_async_helper_joins_complete_void_workflow_in_depth_first_order"
+      ],
+      "expect": {
+        "executed_tests_exact": 1
+      }
     }
   ]
 }

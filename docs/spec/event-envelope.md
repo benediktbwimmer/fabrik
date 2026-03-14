@@ -40,7 +40,6 @@ Every workflow event must carry:
 `producer` must identify the emitting runtime component, for example:
 
 - `api-gateway`
-- `matching-service`
 - `unified-runtime`
 - `activity-worker`
 - `timer-service`

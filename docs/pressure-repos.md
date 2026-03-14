@@ -18,6 +18,7 @@ They exist to exercise the remaining trust and packaging surfaces once the offic
   - caveat: pre-normalize query assertions currently validate only workflow phase, not copied input-field reflection
 - `crates/fabrik-cli/test-fixtures/temporal-monorepo-multiworker-pressure`
   - purpose: multi-worker monorepo packaging, workspace resolution, and tsconfig-path handling
+  - passing drill bundle: `target/alpha-drills/temporal-monorepo-multiworker-pressure/monorepo-multiworker-pressure-drill-report.json`
 - `crates/fabrik-cli/test-fixtures/temporal-versioning-upgrade-pressure`
   - purpose: versioning behavior, patch markers, and mixed-build drill preparation
   - passing drill bundle: `target/alpha-drills/temporal-versioning-upgrade-pressure/versioning-pressure-mixed-build-drill-report.json`

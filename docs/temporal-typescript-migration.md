@@ -105,7 +105,7 @@ Relevant environment variables:
 
 - `FABRIK_API_URL`
 - `FABRIK_TENANT_ID`
-- `FABRIK_MATCHING_ENDPOINT`
+- `FABRIK_UNIFIED_RUNTIME_ENDPOINT`
 - `FABRIK_ACTIVITY_WORKER_BIN` to override the worker executable path
 - `FABRIK_ACTIVITY_POLLER_WAIT_MS` to tune poller wait time
 

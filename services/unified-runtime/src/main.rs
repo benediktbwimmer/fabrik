@@ -35,14 +35,12 @@ use fabrik_store::{
 };
 use fabrik_throughput::{
     ADMISSION_POLICY_VERSION, ActivityCapabilityRegistry, ActivityExecutionCapabilities,
-    PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
-    StartThroughputRunCommand, ThroughputBackend, ThroughputCommand, ThroughputCommandEnvelope,
-    ThroughputExecutionPath, TinyWorkflowExecutionMode, TinyWorkflowStartItem,
-    bulk_reducer_class, bulk_reducer_is_mergeable,
-    bulk_reducer_materializes_results, can_inline_durable_tiny_fanout,
+    PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind, StartThroughputRunCommand,
+    ThroughputBackend, ThroughputCommand, ThroughputCommandEnvelope, ThroughputExecutionPath,
+    TinyWorkflowExecutionMode, TinyWorkflowStartItem, bulk_reducer_class,
+    bulk_reducer_is_mergeable, bulk_reducer_materializes_results, can_inline_durable_tiny_fanout,
     can_use_payloadless_bulk_transport, decode_cbor, encode_cbor,
-    load_activity_capability_registry_from_env,
-    parse_benchmark_compact_input_meta_from_handle,
+    load_activity_capability_registry_from_env, parse_benchmark_compact_input_meta_from_handle,
     parse_benchmark_compact_total_items_from_handle, planned_reduction_tree_depth,
     resolve_activity_capabilities, stream_v2_fast_lane_enabled, throughput_partition_key,
 };
@@ -1791,8 +1789,7 @@ fn try_inline_durable_tiny_workflow_completion(
                 if *attempt != 1 {
                     return Ok(false);
                 }
-                scheduled_task_queue
-                    .get_or_insert_with(|| task_queue.clone());
+                scheduled_task_queue.get_or_insert_with(|| task_queue.clone());
                 scheduled.push((activity_id.clone(), input.clone()));
             }
             _ => return Ok(false),
@@ -1845,6 +1842,7 @@ fn try_inline_durable_tiny_workflow_completion(
     Ok(instance.status.is_terminal())
 }
 
+#[cfg(test)]
 async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEvent>) -> Result<()> {
     let total_started_at = Instant::now();
     let WorkflowEvent::WorkflowTriggered { input } = &event.payload else {
@@ -1914,8 +1912,8 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
         status: WorkflowStatus::Running,
         input: Some(input.clone()),
         persisted_input_handle: None,
-        memo: None,
-        search_attributes: None,
+        memo: projected.memo.clone(),
+        search_attributes: projected.search_attributes.clone(),
         output: plan.output.clone(),
         event_count: 1,
         last_event_id: event.event_id,
@@ -2057,6 +2055,21 @@ struct PreparedInlineTriggerCompletion {
     total_micros_without_db: u64,
 }
 
+struct PreparedDurableTriggerStart {
+    run_key: RunKey,
+    artifact: CompiledWorkflowArtifact,
+    instance: WorkflowInstanceState,
+    queued: Vec<QueuedActivity>,
+    persisted_instance: Option<WorkflowInstanceState>,
+    plan: CompiledExecutionPlan,
+    source_event_id: Uuid,
+    occurred_at: DateTime<Utc>,
+    artifact_load_micros: u64,
+    plan_micros: u64,
+    state_apply_micros: u64,
+    total_micros_without_db: u64,
+}
+
 async fn handle_trigger_event_batch(
     state: &AppState,
     events: Vec<EventEnvelope<WorkflowEvent>>,
@@ -2094,9 +2107,162 @@ async fn handle_trigger_event_batch(
             debug.trigger_db_apply_micros.saturating_add(db_apply_micros);
     }
 
+    let mut prepared_durable = Vec::new();
     for event in fallback_events {
-        handle_trigger_event(state, event).await?;
+        if let Some(prepared) = prepare_durable_trigger_start(state, &event).await? {
+            prepared_durable.push(prepared);
+        }
     }
+
+    if prepared_durable.is_empty() {
+        return Ok(());
+    }
+
+    let general = prepared_durable
+        .iter()
+        .map(|prepared| {
+            prepared
+                .persisted_instance
+                .clone()
+                .map(PreparedDbAction::UpsertPersistedInstance)
+                .unwrap_or_else(|| PreparedDbAction::UpsertInstance(prepared.instance.clone()))
+        })
+        .collect::<Vec<_>>();
+    let schedules = prepared_durable
+        .iter()
+        .flat_map(|prepared| prepared.queued.iter().cloned().map(PreparedDbAction::Schedule))
+        .collect::<Vec<_>>();
+
+    {
+        let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
+        for prepared in &prepared_durable {
+            let runtime = RuntimeWorkflowState {
+                artifact: prepared.artifact.clone(),
+                instance: prepared.instance.clone(),
+                active_activities: prepared
+                    .queued
+                    .iter()
+                    .map(|task| {
+                        (
+                            task.activity_id.clone(),
+                            ActiveActivityMeta {
+                                attempt: task.attempt,
+                                task_queue: task.task_queue.clone(),
+                                activity_type: task.activity_type.clone(),
+                                activity_capabilities: task.activity_capabilities.clone(),
+                                wait_state: task.state.clone(),
+                                omit_success_output: task.omit_success_output,
+                            },
+                        )
+                    })
+                    .collect(),
+            };
+            inner.instances.insert(prepared.run_key.clone(), runtime);
+            for task in &prepared.queued {
+                inner
+                    .ready
+                    .entry(QueueKey {
+                        tenant_id: task.tenant_id.clone(),
+                        task_queue: task.task_queue.clone(),
+                    })
+                    .or_default()
+                    .push_back(task.clone());
+            }
+        }
+        mark_runtime_dirty(&mut inner, "trigger_batch", true);
+    }
+
+    let db_apply_started_at = Instant::now();
+    apply_db_actions(state, general, schedules).await?;
+    let db_apply_micros = elapsed_micros(db_apply_started_at);
+
+    let pending_mailbox_runs = state
+        .store
+        .list_runs_with_pending_mailbox_backlog(
+            &prepared_durable
+                .iter()
+                .map(|prepared| {
+                    (
+                        prepared.run_key.tenant_id.as_str(),
+                        prepared.run_key.instance_id.as_str(),
+                        prepared.run_key.run_id.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
+    let mut post_plan_micros = 0_u64;
+    let mut cancel_check_micros = 0_u64;
+    let mut mailbox_drain_micros = 0_u64;
+    for prepared in &prepared_durable {
+        let post_plan_started_at = Instant::now();
+        apply_post_plan_effects_with_options(
+            state,
+            PostPlanEffect {
+                run_key: prepared.run_key.clone(),
+                artifact: prepared.artifact.clone(),
+                instance: prepared.instance.clone(),
+                plan: prepared.plan.clone(),
+                source_event_id: prepared.source_event_id,
+                occurred_at: prepared.occurred_at,
+            },
+            false,
+        )
+        .await?;
+        post_plan_micros = post_plan_micros.saturating_add(elapsed_micros(post_plan_started_at));
+
+        let cancel_check_started_at = Instant::now();
+        maybe_enact_pending_workflow_cancellation_unified(
+            state,
+            &prepared.run_key,
+            prepared.source_event_id,
+            prepared.occurred_at,
+        )
+        .await?;
+        cancel_check_micros =
+            cancel_check_micros.saturating_add(elapsed_micros(cancel_check_started_at));
+
+        if pending_mailbox_runs.contains(&(
+            prepared.run_key.tenant_id.clone(),
+            prepared.run_key.instance_id.clone(),
+            prepared.run_key.run_id.clone(),
+        )) {
+            let mailbox_drain_started_at = Instant::now();
+            drain_mailbox_for_run(
+                state,
+                &prepared.run_key.tenant_id,
+                &prepared.run_key.instance_id,
+                &prepared.run_key.run_id,
+            )
+            .await?;
+            mailbox_drain_micros =
+                mailbox_drain_micros.saturating_add(elapsed_micros(mailbox_drain_started_at));
+        }
+    }
+
+    state.notify.notify_waiters();
+    state.persist_notify.notify_one();
+
+    let mut debug = state.debug.lock().expect("unified debug lock poisoned");
+    for prepared in &prepared_durable {
+        debug.workflow_triggers_applied = debug.workflow_triggers_applied.saturating_add(1);
+        debug.trigger_artifact_load_micros =
+            debug.trigger_artifact_load_micros.saturating_add(prepared.artifact_load_micros);
+        debug.trigger_plan_micros = debug.trigger_plan_micros.saturating_add(prepared.plan_micros);
+        debug.trigger_state_apply_micros =
+            debug.trigger_state_apply_micros.saturating_add(prepared.state_apply_micros);
+        debug.trigger_total_micros =
+            debug.trigger_total_micros.saturating_add(prepared.total_micros_without_db);
+    }
+    debug.trigger_db_apply_micros = debug.trigger_db_apply_micros.saturating_add(db_apply_micros);
+    debug.trigger_post_plan_micros =
+        debug.trigger_post_plan_micros.saturating_add(post_plan_micros);
+    debug.trigger_cancel_check_micros =
+        debug.trigger_cancel_check_micros.saturating_add(cancel_check_micros);
+    debug.trigger_mailbox_drain_micros =
+        debug.trigger_mailbox_drain_micros.saturating_add(mailbox_drain_micros);
+
     Ok(())
 }
 
@@ -2161,8 +2327,8 @@ async fn prepare_inline_trigger_completion(
         status: WorkflowStatus::Running,
         input: Some(input.clone()),
         persisted_input_handle: None,
-        memo: None,
-        search_attributes: None,
+        memo: projected.memo.clone(),
+        search_attributes: projected.search_attributes.clone(),
         output: plan.output.clone(),
         event_count: 1,
         last_event_id: event.event_id,
@@ -2184,6 +2350,110 @@ async fn prepare_inline_trigger_completion(
     let state_apply_micros = elapsed_micros(state_apply_started_at);
     Ok(Some(PreparedInlineTriggerCompletion {
         instance,
+        artifact_load_micros,
+        plan_micros,
+        state_apply_micros,
+        total_micros_without_db: elapsed_micros(total_started_at),
+    }))
+}
+
+async fn prepare_durable_trigger_start(
+    state: &AppState,
+    event: &EventEnvelope<WorkflowEvent>,
+) -> Result<Option<PreparedDurableTriggerStart>> {
+    let total_started_at = Instant::now();
+    let WorkflowEvent::WorkflowTriggered { input } = &event.payload else {
+        return Ok(None);
+    };
+    let run_key = RunKey {
+        tenant_id: event.tenant_id.clone(),
+        instance_id: event.instance_id.clone(),
+        run_id: event.run_id.clone(),
+    };
+    if state.inner.lock().expect("unified runtime lock poisoned").instances.contains_key(&run_key) {
+        return Ok(None);
+    }
+
+    let artifact_started_at = Instant::now();
+    let artifact = load_compiled_artifact_version(
+        state,
+        &event.tenant_id,
+        &event.definition_id,
+        event.definition_version,
+    )
+    .await?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing artifact {} v{} for tenant {}",
+            event.definition_id,
+            event.definition_version,
+            event.tenant_id
+        )
+    })?;
+    let artifact_load_micros = elapsed_micros(artifact_started_at);
+
+    let plan_started_at = Instant::now();
+    let projected = WorkflowInstanceState::try_from(event)
+        .context("trigger event did not project workflow state")?;
+    let plan = artifact.execute_trigger_with_state_and_turn(
+        input,
+        execution_state_for_event(&projected, Some(event)),
+        ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at },
+    )?;
+    let plan_micros = elapsed_micros(plan_started_at);
+
+    let workflow_task_queue =
+        event.metadata.get("workflow_task_queue").cloned().unwrap_or_else(|| "default".to_owned());
+    let mut instance = WorkflowInstanceState {
+        tenant_id: event.tenant_id.clone(),
+        instance_id: event.instance_id.clone(),
+        run_id: event.run_id.clone(),
+        definition_id: event.definition_id.clone(),
+        definition_version: Some(event.definition_version),
+        artifact_hash: Some(event.artifact_hash.clone()),
+        workflow_task_queue,
+        sticky_workflow_build_id: None,
+        sticky_workflow_poller_id: None,
+        current_state: Some(plan.final_state.clone()),
+        context: plan.context.clone(),
+        artifact_execution: Some(plan.execution_state.clone()),
+        status: WorkflowStatus::Running,
+        input: Some(input.clone()),
+        persisted_input_handle: None,
+        memo: projected.memo.clone(),
+        search_attributes: projected.search_attributes.clone(),
+        output: plan.output.clone(),
+        event_count: 1,
+        last_event_id: event.event_id,
+        last_event_type: event.event_type.clone(),
+        updated_at: event.occurred_at,
+    };
+    apply_compiled_plan(&mut instance, &plan);
+    let state_apply_started_at = Instant::now();
+    if try_inline_stream_v2_microbatch_trigger_completion(
+        state.activity_capability_registry.as_ref(),
+        &artifact,
+        &mut instance,
+        &plan,
+        event.event_id,
+        event.occurred_at,
+    )? {
+        return Ok(None);
+    }
+    let queued = schedule_activities_from_plan(&artifact, &instance, &plan, event.occurred_at)?;
+    let persisted_instance =
+        prepare_stream_v2_trigger_persisted_instance(&artifact, &instance, &plan)?;
+    let state_apply_micros = elapsed_micros(state_apply_started_at);
+
+    Ok(Some(PreparedDurableTriggerStart {
+        run_key,
+        artifact,
+        instance,
+        queued,
+        persisted_instance,
+        plan,
+        source_event_id: event.event_id,
+        occurred_at: event.occurred_at,
         artifact_load_micros,
         plan_micros,
         state_apply_micros,
@@ -6188,7 +6458,8 @@ impl ActivityWorkerApi for WorkerApi {
                     HashMap::new();
                 let mut tasks = Vec::with_capacity(leased.len());
                 for record in &leased {
-                    let capabilities = if let Some(capabilities) = batch_capabilities.get(&record.batch_id)
+                    let capabilities = if let Some(capabilities) =
+                        batch_capabilities.get(&record.batch_id)
                     {
                         capabilities.clone()
                     } else {
@@ -6676,7 +6947,10 @@ fn prepare_result_application(
                                     attempt: retry_task.task.attempt,
                                     task_queue: retry_task.task.task_queue.clone(),
                                     activity_type: retry_task.task.activity_type.clone(),
-                                    activity_capabilities: retry_task.task.activity_capabilities.clone(),
+                                    activity_capabilities: retry_task
+                                        .task
+                                        .activity_capabilities
+                                        .clone(),
                                     wait_state: retry_task.task.state.clone(),
                                     omit_success_output: retry_task.task.omit_success_output,
                                 },
@@ -6912,6 +7186,7 @@ async fn apply_db_actions(
     let mut terminal_updates = Vec::new();
     let mut instance_updates = Vec::new();
     let mut persisted_instance_updates = Vec::new();
+    let mut close_run_updates = Vec::new();
     let mut other_general = Vec::new();
     let mut schedule_updates = Vec::new();
     for action in general {
@@ -6920,6 +7195,9 @@ async fn apply_db_actions(
             PreparedDbAction::UpsertInstance(instance) => instance_updates.push(instance),
             PreparedDbAction::UpsertPersistedInstance(instance) => {
                 persisted_instance_updates.push(instance)
+            }
+            PreparedDbAction::CloseRun(run_key, closed_at) => {
+                close_run_updates.push((run_key, closed_at));
             }
             other => other_general.push(other),
         }
@@ -6944,6 +7222,24 @@ async fn apply_db_actions(
     if !persisted_instance_updates.is_empty() {
         state.store.upsert_persisted_instances_batch(&persisted_instance_updates).await?;
     }
+    if !close_run_updates.is_empty() {
+        state
+            .store
+            .close_runs_batch(
+                &close_run_updates
+                    .iter()
+                    .map(|(run_key, closed_at)| {
+                        (
+                            run_key.tenant_id.as_str(),
+                            run_key.instance_id.as_str(),
+                            run_key.run_id.as_str(),
+                            *closed_at,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+    }
     for action in other_general {
         match action {
             PreparedDbAction::Terminal(_) => unreachable!("terminal updates are batched"),
@@ -6952,12 +7248,7 @@ async fn apply_db_actions(
             PreparedDbAction::UpsertPersistedInstance(_) => {
                 unreachable!("persisted instance upserts are batched")
             }
-            PreparedDbAction::CloseRun(run_key, closed_at) => {
-                state
-                    .store
-                    .close_run(&run_key.tenant_id, &run_key.instance_id, &run_key.run_id, closed_at)
-                    .await?;
-            }
+            PreparedDbAction::CloseRun(_, _) => unreachable!("run closes are batched"),
             PreparedDbAction::PutRunStart {
                 tenant_id,
                 instance_id,
@@ -7189,7 +7480,8 @@ fn bulk_chunk_to_proto(
         activity_capabilities_json: if supports_cbor {
             String::new()
         } else {
-            serde_json::to_string(&activity_capabilities).expect("bulk activity capabilities serialize")
+            serde_json::to_string(&activity_capabilities)
+                .expect("bulk activity capabilities serialize")
         },
         task_queue: record.task_queue.clone(),
         attempt: record.attempt,

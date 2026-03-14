@@ -12,7 +12,6 @@ members = [
     "services/activity-worker-service",
     "services/api-gateway",
     "services/ingest-service",
-    "services/matching-service",
     "services/benchmark-runner",
     "services/query-service",
     "services/replay-tool",

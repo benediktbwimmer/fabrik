@@ -12,10 +12,10 @@ use fabrik_config::{GrpcServiceConfig, ThroughputPayloadStoreConfig, ThroughputP
 use fabrik_throughput::{
     ActivityExecutionCapabilities, BENCHMARK_ECHO_ACTIVITY, CORE_ACCEPT_ACTIVITY,
     CORE_ECHO_ACTIVITY, CORE_NOOP_ACTIVITY, PayloadHandle, PayloadStore, PayloadStoreConfig,
-    PayloadStoreKind,
-    activity_can_short_circuit_omitted_success_output, benchmark_echo_item_requires_output,
-    can_complete_payloadless_bulk_chunk, decode_cbor, encode_cbor, execute_benchmark_echo,
-    parse_benchmark_compact_input_meta_from_handle, synthesize_benchmark_echo_items,
+    PayloadStoreKind, activity_can_short_circuit_omitted_success_output,
+    benchmark_echo_item_requires_output, can_complete_payloadless_bulk_chunk, decode_cbor,
+    encode_cbor, execute_benchmark_echo, parse_benchmark_compact_input_meta_from_handle,
+    synthesize_benchmark_echo_items,
 };
 use fabrik_worker_protocol::activity_worker::{
     ActivityTaskCancelledResult, ActivityTaskCompletedResult, ActivityTaskFailedResult,
@@ -64,7 +64,6 @@ async fn main() -> Result<()> {
     fabrik_service::init_tracing(&config.log_filter);
 
     let endpoint = env::var("UNIFIED_RUNTIME_ENDPOINT")
-        .or_else(|_| env::var("MATCHING_SERVICE_ENDPOINT"))
         .unwrap_or_else(|_| "http://127.0.0.1:50054".to_owned());
     let bulk_endpoint = env::var("BULK_ACTIVITY_ENDPOINT").unwrap_or_else(|_| endpoint.clone());
     let task_queue = env::var("ACTIVITY_TASK_QUEUE").unwrap_or_else(|_| "default".to_owned());
@@ -597,7 +596,7 @@ async fn run_activity_lane(
             pending_tasks = match response {
                 Ok(tasks) => tasks,
                 Err(error) => {
-                    error!(error = %error, worker_id = %worker_id, "failed to poll matching-service");
+                    error!(error = %error, worker_id = %worker_id, "failed to poll unified-runtime");
                     worker = connect_activity_worker_with_retry(&endpoint, &worker_id).await;
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     continue;
@@ -654,7 +653,7 @@ async fn run_bulk_activity_lane(
         let tasks = match response {
             Ok(response) => response.into_inner().tasks,
             Err(error) => {
-                error!(error = %error, worker_id = %worker_id, "failed to poll matching-service for bulk task");
+                error!(error = %error, worker_id = %worker_id, "failed to poll unified-runtime for bulk task");
                 worker = connect_activity_worker_with_retry(&endpoint, &worker_id).await;
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
@@ -713,7 +712,7 @@ async fn connect_activity_worker_with_retry(
                 error!(
                     error = %error,
                     worker_id = %worker_id,
-                    "failed to connect to matching-service"
+                    "failed to connect to unified-runtime"
                 );
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
@@ -733,8 +732,7 @@ async fn execute_activity_task(
         && activity_can_short_circuit_omitted_success_output(
             &task.activity_type,
             activity_capabilities.as_ref(),
-        )
-    {
+        ) {
         execute_activity_task_without_output(&task, activity_capabilities.as_ref())
             .map(|()| Value::Null)
     } else {
@@ -813,8 +811,14 @@ fn execute_activity_task_without_output(
     task: &fabrik_worker_protocol::activity_worker::ActivityTask,
     activity_capabilities: Option<&ActivityExecutionCapabilities>,
 ) -> Result<()> {
-    if !activity_can_short_circuit_omitted_success_output(&task.activity_type, activity_capabilities) {
-        anyhow::bail!("activity {} cannot short-circuit omitted success output", task.activity_type);
+    if !activity_can_short_circuit_omitted_success_output(
+        &task.activity_type,
+        activity_capabilities,
+    ) {
+        anyhow::bail!(
+            "activity {} cannot short-circuit omitted success output",
+            task.activity_type
+        );
     }
     if task.activity_type == BENCHMARK_ECHO_ACTIVITY {
         let input = match parse_benchmark_echo_task_input(task) {

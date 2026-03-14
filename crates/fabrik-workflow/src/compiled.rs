@@ -8965,6 +8965,215 @@ mod tests {
     }
 
     #[test]
+    fn recursive_async_helper_joins_complete_void_workflow_in_depth_first_order() {
+        let artifact = CompiledWorkflowArtifact::new(
+            "recursive-async-helper",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "call_root".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "call_root".to_owned(),
+                        CompiledStateNode::CallAsyncHelper {
+                            helper_name: "execute".to_owned(),
+                            args: vec![Expression::Identifier { name: "input".to_owned() }],
+                            next: "complete".to_owned(),
+                            output_var: None,
+                            on_error: None,
+                        },
+                    ),
+                    ("complete".to_owned(), CompiledStateNode::Succeed { output: None }),
+                    (
+                        "choice_children".to_owned(),
+                        CompiledStateNode::Choice {
+                            condition: Expression::Member {
+                                object: Box::new(Expression::Identifier { name: "node".to_owned() }),
+                                property: "children".to_owned(),
+                            },
+                            then_next: "init_join_index".to_owned(),
+                            else_next: "step_leaf".to_owned(),
+                        },
+                    ),
+                    (
+                        "init_join_index".to_owned(),
+                        CompiledStateNode::Assign {
+                            actions: vec![Assignment {
+                                target: "join_index".to_owned(),
+                                expr: Expression::Literal { value: json!(0) },
+                            }],
+                            next: "join_choice".to_owned(),
+                        },
+                    ),
+                    (
+                        "join_choice".to_owned(),
+                        CompiledStateNode::Choice {
+                            condition: Expression::Binary {
+                                op: "less_than".to_owned(),
+                                left: Box::new(Expression::Identifier { name: "join_index".to_owned() }),
+                                right: Box::new(Expression::Member {
+                                    object: Box::new(Expression::Member {
+                                        object: Box::new(Expression::Identifier { name: "node".to_owned() }),
+                                        property: "children".to_owned(),
+                                    }),
+                                    property: "length".to_owned(),
+                                }),
+                            },
+                            then_next: "assign_child".to_owned(),
+                            else_next: "helper_return".to_owned(),
+                        },
+                    ),
+                    (
+                        "assign_child".to_owned(),
+                        CompiledStateNode::Assign {
+                            actions: vec![Assignment {
+                                target: "child".to_owned(),
+                                expr: Expression::Index {
+                                    object: Box::new(Expression::Member {
+                                        object: Box::new(Expression::Identifier { name: "node".to_owned() }),
+                                        property: "children".to_owned(),
+                                    }),
+                                    index: Box::new(Expression::Identifier { name: "join_index".to_owned() }),
+                                },
+                            }],
+                            next: "call_child".to_owned(),
+                        },
+                    ),
+                    (
+                        "call_child".to_owned(),
+                        CompiledStateNode::CallAsyncHelper {
+                            helper_name: "execute".to_owned(),
+                            args: vec![Expression::Identifier { name: "child".to_owned() }],
+                            next: "increment_join_index".to_owned(),
+                            output_var: None,
+                            on_error: None,
+                        },
+                    ),
+                    (
+                        "increment_join_index".to_owned(),
+                        CompiledStateNode::Assign {
+                            actions: vec![Assignment {
+                                target: "join_index".to_owned(),
+                                expr: Expression::Binary {
+                                    op: "add".to_owned(),
+                                    left: Box::new(Expression::Identifier { name: "join_index".to_owned() }),
+                                    right: Box::new(Expression::Literal { value: json!(1) }),
+                                },
+                            }],
+                            next: "join_choice".to_owned(),
+                        },
+                    ),
+                    (
+                        "step_leaf".to_owned(),
+                        CompiledStateNode::Step {
+                            handler: "greet".to_owned(),
+                            input: Expression::Logical {
+                                op: "coalesce".to_owned(),
+                                left: Box::new(Expression::Member {
+                                    object: Box::new(Expression::Identifier { name: "node".to_owned() }),
+                                    property: "value".to_owned(),
+                                }),
+                                right: Box::new(Expression::Literal { value: json!("leaf") }),
+                            },
+                            next: Some("helper_return".to_owned()),
+                            task_queue: None,
+                            retry: None,
+                            config: None,
+                            schedule_to_start_timeout_ms: None,
+                            schedule_to_close_timeout_ms: None,
+                            start_to_close_timeout_ms: Some(60_000),
+                            heartbeat_timeout_ms: None,
+                            output_var: None,
+                            on_error: None,
+                        },
+                    ),
+                    (
+                        "helper_return".to_owned(),
+                        CompiledStateNode::ReturnAsyncHelper { output: None },
+                    ),
+                ]),
+                async_helpers: BTreeMap::from([(
+                    "execute".to_owned(),
+                    CompiledAsyncHelper {
+                        entry_state: "choice_children".to_owned(),
+                        params: vec![CompiledWorkflowParam {
+                            name: "node".to_owned(),
+                            rest: false,
+                            default: None,
+                        }],
+                        scoped_bindings: vec![
+                            "node".to_owned(),
+                            "child".to_owned(),
+                            "join_index".to_owned(),
+                        ],
+                    },
+                )]),
+                params: vec![CompiledWorkflowParam {
+                    name: "input".to_owned(),
+                    rest: false,
+                    default: None,
+                }],
+                non_cancellable_states: BTreeSet::new(),
+            },
+        );
+
+        let input = json!({
+            "children": [
+                { "value": "left" },
+                { "children": [{ "value": "mid1" }, { "value": "mid2" }] },
+                { "value": "right" }
+            ]
+        });
+
+        let mut plan = artifact
+            .execute_trigger_with_turn(
+                &input,
+                CompiledWorkflowArtifact::synthetic_turn_context("recursive-async-helper-trigger"),
+            )
+            .unwrap();
+        let expected_inputs = ["left", "mid1", "mid2", "right"];
+
+        for (index, expected_input) in expected_inputs.iter().enumerate() {
+            let scheduled_inputs = plan
+                .emissions
+                .iter()
+                .filter_map(|emission| match &emission.event {
+                    WorkflowEvent::ActivityTaskScheduled { activity_type, input, .. }
+                        if activity_type == "greet" =>
+                    {
+                        Some(input.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(scheduled_inputs, vec![json!(expected_input)]);
+            assert_eq!(plan.final_state, "step_leaf");
+
+            plan = artifact
+                .execute_after_step_completion_with_turn(
+                    "step_leaf",
+                    "step_leaf",
+                    &json!(format!("hello:{expected_input}")),
+                    plan.execution_state,
+                    CompiledWorkflowArtifact::synthetic_turn_context(&format!(
+                        "recursive-async-helper-completion-{index}"
+                    )),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(plan.final_state, "complete");
+        assert!(plan
+            .emissions
+            .iter()
+            .any(|emission| matches!(emission.event, WorkflowEvent::WorkflowCompleted { .. })));
+        assert!(plan.execution_state.async_frames.is_empty());
+        assert!(!plan.execution_state.bindings.contains_key("child"));
+        assert!(!plan.execution_state.bindings.contains_key("join_index"));
+    }
+
+    #[test]
     fn wait_for_condition_timeout_schedules_timer_and_returns_false_on_fire() {
         let artifact = CompiledWorkflowArtifact::new(
             "condition-timeout",

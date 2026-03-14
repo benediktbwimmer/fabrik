@@ -152,6 +152,16 @@ Its current passing evidence bundle is:
 
 - `target/alpha-drills/temporal-converter-trust-pressure/converter-pressure-drill-report.json`
 
+Run the multi-worker monorepo replay/restart drill with:
+
+```bash
+scripts/run-monorepo-multiworker-pressure-drill.sh
+```
+
+Its current passing evidence bundle is:
+
+- `target/alpha-drills/temporal-monorepo-multiworker-pressure/monorepo-multiworker-pressure-drill-report.json`
+
 Run the mixed-build upgrade drill for the payload-path slice with:
 
 ```bash

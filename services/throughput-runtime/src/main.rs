@@ -1,10 +1,10 @@
 mod local_state;
 
 use std::{
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     io::Write,
     process::{Command, Stdio},
-    collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
@@ -41,17 +41,16 @@ use fabrik_throughput::{
     PayloadStoreConfig, PayloadStoreKind, StartThroughputRunCommand, ThroughputBackend,
     ThroughputBatchIdentity, ThroughputChangelogEntry, ThroughputChangelogPayload,
     ThroughputChunkReport, ThroughputChunkReportPayload, ThroughputCommand,
-    ThroughputCommandEnvelope, WorkerActivityManifest, benchmark_echo_item_requires_output, bulk_reducer_class,
-    bulk_reducer_name, bulk_reducer_settles, bulk_reducer_summary_field_name,
+    ThroughputCommandEnvelope, WorkerActivityManifest, benchmark_echo_item_requires_output,
+    bulk_reducer_class, bulk_reducer_name, bulk_reducer_settles, bulk_reducer_summary_field_name,
     can_complete_payloadless_bulk_chunk, can_use_payloadless_bulk_transport, decode_cbor,
     effective_aggregation_group_count, encode_cbor, execute_benchmark_echo,
-    group_id_for_chunk_index, parse_benchmark_compact_input_meta_from_handle,
-    load_activity_capability_registry_from_env,
+    group_id_for_chunk_index, load_activity_capability_registry_from_env,
+    parse_benchmark_compact_input_meta_from_handle,
     parse_benchmark_compact_total_items_from_handle, planned_reduction_tree_depth,
-    resolve_activity_capabilities,
-    stream_v2_fast_lane_enabled, synthesize_benchmark_echo_items, throughput_execution_mode,
-    throughput_partition_key, throughput_reducer_execution_path, throughput_reducer_version,
-    throughput_routing_reason,
+    resolve_activity_capabilities, stream_v2_fast_lane_enabled, synthesize_benchmark_echo_items,
+    throughput_execution_mode, throughput_partition_key, throughput_reducer_execution_path,
+    throughput_reducer_version, throughput_routing_reason,
 };
 use fabrik_worker_protocol::activity_worker::{
     Ack, BulkActivityTask, BulkActivityTaskResult, PollBulkActivityTaskRequest,
@@ -98,7 +97,9 @@ impl LocalActivityExecutorRegistry {
         self.by_task_queue
             .get(task_queue)
             .and_then(|activities| activities.get(activity_type))
-            .or_else(|| self.by_task_queue.get("").and_then(|activities| activities.get(activity_type)))
+            .or_else(|| {
+                self.by_task_queue.get("").and_then(|activities| activities.get(activity_type))
+            })
             .map(String::as_str)
     }
 
@@ -1896,8 +1897,11 @@ async fn execute_local_fastlane_activity(
         }
         _ => {}
     }
-    let Some(bootstrap_path) = state.activity_executor_registry.lookup(task_queue, activity_type) else {
-        anyhow::bail!("activity {activity_type} has no local fastlane executor for task queue {task_queue}");
+    let Some(bootstrap_path) = state.activity_executor_registry.lookup(task_queue, activity_type)
+    else {
+        anyhow::bail!(
+            "activity {activity_type} has no local fastlane executor for task queue {task_queue}"
+        );
     };
     execute_packaged_node_activity(bootstrap_path, activity_type, input, None)
 }
@@ -1923,7 +1927,8 @@ fn execute_packaged_node_activity(
             format!("failed to start packaged activity bootstrap {}", bootstrap_path)
         })?;
     {
-        let stdin = child.stdin.as_mut().context("packaged activity bootstrap stdin unavailable")?;
+        let stdin =
+            child.stdin.as_mut().context("packaged activity bootstrap stdin unavailable")?;
         stdin.write_all(&envelope)?;
     }
     let output = child.wait_with_output()?;
@@ -4628,7 +4633,8 @@ fn bulk_chunk_to_proto(
         activity_capabilities_json: if supports_cbor {
             String::new()
         } else {
-            serde_json::to_string(&record.activity_capabilities).expect("bulk activity capabilities serialize")
+            serde_json::to_string(&record.activity_capabilities)
+                .expect("bulk activity capabilities serialize")
         },
         task_queue: record.task_queue.clone(),
         attempt: record.attempt,
@@ -4665,11 +4671,8 @@ fn bulk_chunk_to_proto(
             Vec::new()
         },
         activity_capabilities_cbor: if supports_cbor {
-            encode_cbor(
-                &record.activity_capabilities,
-                "bulk activity capabilities",
-            )
-            .expect("bulk activity capabilities encode")
+            encode_cbor(&record.activity_capabilities, "bulk activity capabilities")
+                .expect("bulk activity capabilities encode")
         } else {
             Vec::new()
         },

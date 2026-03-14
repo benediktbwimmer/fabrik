@@ -59,6 +59,7 @@ The latest compiler, runtime, and packaging passes materially shifted the remain
   - `temporal-interceptor-pressure` now has a passing replay/restart drill in `target/alpha-drills/temporal-interceptor-pressure/interceptor-pressure-drill-report.json`
   - `temporal-sinks-pressure` now has a passing replay/restart drill in `target/alpha-drills/temporal-sinks-pressure/sinks-pressure-drill-report.json`
   - `temporal-converter-trust-pressure` now has a passing replay/restart drill in `target/alpha-drills/temporal-converter-trust-pressure/converter-pressure-drill-report.json`
+  - `temporal-monorepo-multiworker-pressure` now has a passing replay/restart drill in `target/alpha-drills/temporal-monorepo-multiworker-pressure/monorepo-multiworker-pressure-drill-report.json`
   - `temporal-versioning-upgrade-pressure` now also has a passing mixed-build/restart/rollback drill in `target/alpha-drills/temporal-versioning-upgrade-pressure/versioning-pressure-mixed-build-drill-report.json`
 - The remaining explicit unsupported-import census is now dominated by:
   - `WorkflowInterceptors`: `1`

@@ -105,49 +105,6 @@ message PollBulkActivityTaskResponse {
   repeated BulkActivityTask tasks = 1;
 }
 
-message PollWorkflowTaskRequest {
-  int32 partition_id = 1;
-  string worker_id = 2;
-  string worker_build_id = 3;
-  uint64 poll_timeout_ms = 4;
-}
-
-message WorkflowTask {
-  string task_id = 1;
-  string tenant_id = 2;
-  string definition_id = 3;
-  uint32 definition_version = 4;
-  string artifact_hash = 5;
-  string instance_id = 6;
-  string run_id = 7;
-  int32 partition_id = 8;
-  string task_queue = 9;
-  string preferred_build_id = 10;
-  uint64 mailbox_consumed_seq = 11;
-  uint64 resume_consumed_seq = 12;
-  uint64 mailbox_backlog = 13;
-  uint64 resume_backlog = 14;
-  uint32 attempt_count = 15;
-  int64 created_at_unix_ms = 16;
-}
-
-message PollWorkflowTaskResponse {
-  WorkflowTask task = 1;
-}
-
-message CompleteWorkflowTaskRequest {
-  string task_id = 1;
-  string worker_id = 2;
-  string worker_build_id = 3;
-}
-
-message FailWorkflowTaskRequest {
-  string task_id = 1;
-  string worker_id = 2;
-  string worker_build_id = 3;
-  string error = 4;
-}
-
 message CompleteActivityTaskRequest {
   string tenant_id = 1;
   string instance_id = 2;
@@ -298,10 +255,4 @@ service ActivityWorkerApi {
   rpc ReportActivityTaskCancelled(ReportActivityTaskCancelledRequest) returns (Ack);
   rpc ReportActivityTaskResults(ReportActivityTaskResultsRequest) returns (Ack);
   rpc ReportBulkActivityTaskResults(ReportBulkActivityTaskResultsRequest) returns (Ack);
-}
-
-service WorkflowWorkerApi {
-  rpc PollWorkflowTask(PollWorkflowTaskRequest) returns (PollWorkflowTaskResponse);
-  rpc CompleteWorkflowTask(CompleteWorkflowTaskRequest) returns (Ack);
-  rpc FailWorkflowTask(FailWorkflowTaskRequest) returns (Ack);
 }

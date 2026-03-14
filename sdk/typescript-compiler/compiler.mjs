@@ -4372,11 +4372,42 @@ class WorkflowLowerer {
       : `${this.statePrefix}${prefix}_${stableNodeKey(node)}_${count}`;
   }
 
+  workflowFallsThroughAsSuccess() {
+    if (!this.typeChecker || !this.workflowDeclaration) {
+      return false;
+    }
+    const signature = this.typeChecker.getSignatureFromDeclaration(this.workflowDeclaration);
+    if (!signature) {
+      return false;
+    }
+    return this.isVoidLikeReturnType(this.typeChecker.getReturnTypeOfSignature(signature));
+  }
+
+  isVoidLikeReturnType(type) {
+    if (!type) {
+      return false;
+    }
+    if ((type.flags & ts.TypeFlags.Void) !== 0 || (type.flags & ts.TypeFlags.Undefined) !== 0) {
+      return true;
+    }
+    if ((type.flags & ts.TypeFlags.Union) !== 0 && Array.isArray(type.types)) {
+      return type.types.every((member) => this.isVoidLikeReturnType(member));
+    }
+    const promised = this.typeChecker.getPromisedTypeOfPromise?.(type);
+    if (promised) {
+      return this.isVoidLikeReturnType(promised);
+    }
+    const rendered = this.typeChecker.typeToString(type);
+    return rendered === "void" || rendered === "undefined" || rendered === "Promise<void>" || rendered === "Promise<undefined>";
+  }
+
   lower() {
-    const terminalFail = this.addState("fail_terminal", {
-      type: "fail",
-      reason: { kind: "literal", value: "workflow terminated without explicit completion" },
-    });
+    const terminalFail = this.workflowFallsThroughAsSuccess()
+      ? this.addState("complete_terminal", { type: "succeed" })
+      : this.addState("fail_terminal", {
+          type: "fail",
+          reason: { kind: "literal", value: "workflow terminated without explicit completion" },
+        });
     const { params, preambleActions } = this.compileWorkflowParams();
     let initialState = this.lowerBlock(
       this.workflowDeclaration.body.statements,

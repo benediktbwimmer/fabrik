@@ -35,12 +35,10 @@ MINIO_CONSOLE_PORT="${MINIO_CONSOLE_PORT:-9001}"
 API_GATEWAY_PORT="${API_GATEWAY_PORT:-3000}"
 INGEST_PORT="${INGEST_SERVICE_PORT:-3001}"
 TIMER_PORT="${TIMER_SERVICE_PORT:-3003}"
-MATCHING_DEBUG_PORT="${MATCHING_DEBUG_PORT:-3004}"
 QUERY_PORT="${QUERY_SERVICE_PORT:-3005}"
 THROUGHPUT_DEBUG_PORT="${THROUGHPUT_DEBUG_PORT:-3006}"
 THROUGHPUT_PROJECTOR_PORT="${THROUGHPUT_PROJECTOR_PORT:-3007}"
 UNIFIED_DEBUG_PORT="${UNIFIED_DEBUG_PORT:-3008}"
-MATCHING_PORT="${MATCHING_SERVICE_PORT:-50051}"
 ACTIVITY_WORKER_PORT="${ACTIVITY_WORKER_SERVICE_PORT:-50052}"
 THROUGHPUT_RUNTIME_PORT="${THROUGHPUT_RUNTIME_PORT:-50053}"
 UNIFIED_RUNTIME_PORT="${UNIFIED_RUNTIME_PORT:-50054}"
@@ -52,6 +50,8 @@ WORKFLOW_PARTITIONS="${WORKFLOW_PARTITIONS:-0,1,2,3}"
 THROUGHPUT_PARTITIONS="${THROUGHPUT_OWNERSHIP_PARTITIONS:-}"
 THROUGHPUT_OWNERSHIP_PARTITION_ID_OFFSET="${THROUGHPUT_OWNERSHIP_PARTITION_ID_OFFSET:-2000000}"
 POSTGRES_URL="${POSTGRES_URL:-postgres://fabrik:fabrik@localhost:${POSTGRES_HOST_PORT}/fabrik}"
+DEV_STACK_SERVICE_RETRIES="${DEV_STACK_SERVICE_RETRIES:-3}"
+DEV_STACK_SERVICE_RETRY_DELAY_SECONDS="${DEV_STACK_SERVICE_RETRY_DELAY_SECONDS:-2}"
 
 COMMON_ENV=(
   "POSTGRES_URL=$POSTGRES_URL"
@@ -77,7 +77,6 @@ if [[ -n "$THROUGHPUT_PARTITIONS" ]]; then
 fi
 
 SERVICES=(
-  "matching-service"
   "unified-runtime"
   "ingest-service"
   "query-service"
@@ -118,13 +117,14 @@ wait_for_port() {
   local host=$1
   local port=$2
   local label=$3
-  python3 - "$host" "$port" "$label" <<'PY'
+  local timeout_seconds=${4:-90}
+  python3 - "$host" "$port" "$label" "$timeout_seconds" <<'PY'
 import socket
 import sys
 import time
 
-host, port, label = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-deadline = time.time() + 90
+host, port, label, timeout_seconds = sys.argv[1], int(sys.argv[2]), sys.argv[3], float(sys.argv[4])
+deadline = time.time() + timeout_seconds
 while time.time() < deadline:
     sock = socket.socket()
     sock.settimeout(0.25)
@@ -193,9 +193,6 @@ pidfile_for() {
 
 service_ports_for() {
   case "$1" in
-    matching-service)
-      printf '%s\n%s\n' "$MATCHING_PORT" "$MATCHING_DEBUG_PORT"
-      ;;
     unified-runtime)
       printf '%s\n%s\n' "$UNIFIED_RUNTIME_PORT" "$UNIFIED_DEBUG_PORT"
       ;;
@@ -290,7 +287,10 @@ service_running() {
   local pid
   pid="$(cat "$pidfile" 2>/dev/null || true)"
   [[ -n "$pid" ]] || return 1
-  kill -0 "$pid" >/dev/null 2>&1
+  kill -0 "$pid" >/dev/null 2>&1 || return 1
+  local binary
+  binary="$(service_binary_for "$name")"
+  ps -p "$pid" -o command= 2>/dev/null | grep -F "$binary" >/dev/null 2>&1
 }
 
 stop_service() {
@@ -316,15 +316,48 @@ assert_service_alive() {
   local name=$1
   local pidfile=$2
   local log_file=$3
-  local pid
-  pid="$(cat "$pidfile" 2>/dev/null || true)"
-  if [[ -z "$pid" ]] || ! kill -0 "$pid" >/dev/null 2>&1; then
+  if ! service_running "$name"; then
     echo "[dev-stack] $name exited during startup" >&2
     if [[ -f "$log_file" ]]; then
       tail -n 40 "$log_file" >&2 || true
     fi
     return 1
   fi
+}
+
+retry_service_start() {
+  local name=$1
+  local log_file=$2
+  local wait_port=${3:-}
+  local extra_ports_csv=${4:-}
+  shift 4
+  local attempt
+  for attempt in $(seq 1 "$DEV_STACK_SERVICE_RETRIES"); do
+    if start_service "$name" "$log_file" "$wait_port" "$@"; then
+      local ports_ok=1
+      if [[ -n "$extra_ports_csv" ]]; then
+        local extra_port
+        IFS=, read -r -a extra_ports <<<"$extra_ports_csv"
+        for extra_port in "${extra_ports[@]}"; do
+          [[ -n "$extra_port" ]] || continue
+          if ! wait_for_port 127.0.0.1 "$extra_port" "$name:$extra_port"; then
+            ports_ok=0
+            break
+          fi
+        done
+      fi
+      if (( ports_ok == 1 )); then
+        return 0
+      fi
+    fi
+    stop_service "$name"
+    if (( attempt < DEV_STACK_SERVICE_RETRIES )); then
+      echo "[dev-stack] retrying $name startup ($attempt/$DEV_STACK_SERVICE_RETRIES)" >&2
+      sleep "$DEV_STACK_SERVICE_RETRY_DELAY_SECONDS"
+    fi
+  done
+  echo "[dev-stack] $name failed to start after $DEV_STACK_SERVICE_RETRIES attempts" >&2
+  return 1
 }
 
 start_service() {
@@ -394,8 +427,6 @@ write_env_file() {
 export API_GATEWAY_URL=http://127.0.0.1:${API_GATEWAY_PORT}
 export INGEST_SERVICE_URL=http://127.0.0.1:${INGEST_PORT}
 export QUERY_SERVICE_URL=http://127.0.0.1:${QUERY_PORT}
-export MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:${UNIFIED_RUNTIME_PORT}
-export MATCHING_DEBUG_URL=http://127.0.0.1:${MATCHING_DEBUG_PORT}
 export UNIFIED_RUNTIME_ENDPOINT=http://127.0.0.1:${UNIFIED_RUNTIME_PORT}
 export UNIFIED_RUNTIME_DEBUG_URL=http://127.0.0.1:${UNIFIED_DEBUG_PORT}
 export THROUGHPUT_RUNTIME_ENDPOINT=http://127.0.0.1:${THROUGHPUT_RUNTIME_PORT}
@@ -415,7 +446,6 @@ build_services() {
     -p api-gateway \
     -p ingest-service \
     -p unified-runtime \
-    -p matching-service \
     -p query-service \
     -p throughput-runtime \
     -p throughput-projector \
@@ -442,46 +472,36 @@ up() {
 
   write_env_file
 
-  echo "[dev-stack] starting matching-service"
-  start_service \
-    matching-service \
-    "$LOG_DIR/matching-service.log" \
-    "$MATCHING_PORT" \
-    "${COMMON_ENV[@]}" \
-    "MATCHING_SERVICE_PORT=$MATCHING_PORT" \
-    "MATCHING_DEBUG_PORT=$MATCHING_DEBUG_PORT" \
-    -- \
-    "$BIN_DIR/matching-service"
-  wait_for_port 127.0.0.1 "$MATCHING_DEBUG_PORT" "matching-service-debug"
-
   echo "[dev-stack] starting unified-runtime"
-  start_service \
+  retry_service_start \
     unified-runtime \
     "$LOG_DIR/unified-runtime.log" \
     "$UNIFIED_RUNTIME_PORT" \
+    "$UNIFIED_DEBUG_PORT" \
     "${COMMON_ENV[@]}" \
     "UNIFIED_RUNTIME_PORT=$UNIFIED_RUNTIME_PORT" \
     "UNIFIED_DEBUG_PORT=$UNIFIED_DEBUG_PORT" \
     "UNIFIED_RUNTIME_STATE_DIR=$STATE_DIR/unified-runtime" \
     -- \
     "$BIN_DIR/unified-runtime"
-  wait_for_port 127.0.0.1 "$UNIFIED_DEBUG_PORT" "unified-runtime-debug"
 
   echo "[dev-stack] starting ingest-service"
-  start_service \
+  retry_service_start \
     ingest-service \
     "$LOG_DIR/ingest-service.log" \
     "$INGEST_PORT" \
+    "" \
     "${COMMON_ENV[@]}" \
     "INGEST_SERVICE_PORT=$INGEST_PORT" \
     -- \
     "$BIN_DIR/ingest-service"
 
   echo "[dev-stack] starting query-service"
-  start_service \
+  retry_service_start \
     query-service \
     "$LOG_DIR/query-service.log" \
     "$QUERY_PORT" \
+    "" \
     "${COMMON_ENV[@]}" \
     "QUERY_SERVICE_PORT=$QUERY_PORT" \
     "QUERY_STRONG_QUERY_UNIFIED_URL=http://127.0.0.1:$UNIFIED_DEBUG_PORT" \
@@ -489,59 +509,61 @@ up() {
     "$BIN_DIR/query-service"
 
   echo "[dev-stack] starting api-gateway"
-  start_service \
+  retry_service_start \
     api-gateway \
     "$LOG_DIR/api-gateway.log" \
     "$API_GATEWAY_PORT" \
+    "" \
     "${COMMON_ENV[@]}" \
     "API_GATEWAY_PORT=$API_GATEWAY_PORT" \
     "INGEST_SERVICE_URL=http://127.0.0.1:$INGEST_PORT" \
     "QUERY_SERVICE_URL=http://127.0.0.1:$QUERY_PORT" \
-    "MATCHING_DEBUG_URL=http://127.0.0.1:$MATCHING_DEBUG_PORT" \
     -- \
     "$BIN_DIR/api-gateway"
 
   echo "[dev-stack] starting throughput-runtime"
-  start_service \
+  retry_service_start \
     throughput-runtime \
     "$LOG_DIR/throughput-runtime.log" \
     "$THROUGHPUT_RUNTIME_PORT" \
+    "$THROUGHPUT_DEBUG_PORT" \
     "${COMMON_ENV[@]}" \
     "THROUGHPUT_RUNTIME_PORT=$THROUGHPUT_RUNTIME_PORT" \
     "THROUGHPUT_DEBUG_PORT=$THROUGHPUT_DEBUG_PORT" \
     -- \
     "$BIN_DIR/throughput-runtime"
-  wait_for_port 127.0.0.1 "$THROUGHPUT_DEBUG_PORT" "throughput-runtime-debug"
 
   echo "[dev-stack] starting throughput-projector"
-  start_service \
+  retry_service_start \
     throughput-projector \
     "$LOG_DIR/throughput-projector.log" \
     "$THROUGHPUT_PROJECTOR_PORT" \
+    "" \
     "${COMMON_ENV[@]}" \
     "THROUGHPUT_PROJECTOR_PORT=$THROUGHPUT_PROJECTOR_PORT" \
     -- \
     "$BIN_DIR/throughput-projector"
 
   echo "[dev-stack] starting timer-service"
-  start_service \
+  retry_service_start \
     timer-service \
     "$LOG_DIR/timer-service.log" \
     "$TIMER_PORT" \
+    "" \
     "${COMMON_ENV[@]}" \
     "TIMER_SERVICE_PORT=$TIMER_PORT" \
     -- \
     "$BIN_DIR/timer-service"
 
   echo "[dev-stack] starting activity-worker-service (unified-runtime)"
-  start_service \
+  retry_service_start \
     activity-worker-service \
     "$LOG_DIR/activity-worker-service.log" \
+    "" \
     "" \
     "${COMMON_ENV[@]}" \
     "ACTIVITY_WORKER_SERVICE_PORT=$ACTIVITY_WORKER_PORT" \
     "UNIFIED_RUNTIME_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
-    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
     "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
     "ACTIVITY_WORKER_TENANT_ID=$DEV_STACK_TENANT_ID" \
     "ACTIVITY_TASK_QUEUE=$DEV_STACK_TASK_QUEUE" \
@@ -549,14 +571,14 @@ up() {
     "$BIN_DIR/activity-worker-service"
 
   echo "[dev-stack] starting activity-worker-service (stream-v2)"
-  start_service \
+  retry_service_start \
     activity-worker-service-stream-v2 \
     "$LOG_DIR/activity-worker-service-stream-v2.log" \
+    "" \
     "" \
     "${COMMON_ENV[@]}" \
     "ACTIVITY_WORKER_SERVICE_PORT=$STREAM_ACTIVITY_WORKER_PORT" \
     "UNIFIED_RUNTIME_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
-    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
     "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$THROUGHPUT_RUNTIME_PORT" \
     "ACTIVITY_WORKER_TENANT_ID=$DEV_STACK_TENANT_ID" \
     "ACTIVITY_TASK_QUEUE=$DEV_STACK_TASK_QUEUE" \

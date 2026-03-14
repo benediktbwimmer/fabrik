@@ -37,7 +37,6 @@ struct AppState {
     client: Client,
     ingest_base: String,
     query_base: String,
-    matching_base: String,
     store: WorkflowStore,
     admission: AdmissionDebugConfig,
 }
@@ -248,8 +247,6 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|_| "http://127.0.0.1:3001".to_owned()),
         query_base: env::var("QUERY_SERVICE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:3005".to_owned()),
-        matching_base: env::var("MATCHING_DEBUG_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:3004".to_owned()),
         store,
         admission,
     };
@@ -484,7 +481,6 @@ fn build_app(state: AppState, service_name: String) -> Router {
         "/admin/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs/{run_id}/bulk-batches/{batch_id}/runtime-control",
         put(upsert_bulk_batch_runtime_control),
     )
-    .route("/admin/debug/matching/activity-results", get(proxy_to_matching_get))
     .with_state(state)
 }
 
@@ -509,14 +505,6 @@ async fn proxy_to_query_post(
     body: Bytes,
 ) -> Result<(StatusCode, Bytes), (StatusCode, String)> {
     proxy_request(state.client.clone(), state.query_base.clone(), uri, Some(body)).await
-}
-
-async fn proxy_to_matching_get(
-    State(state): State<AppState>,
-    _uri: OriginalUri,
-) -> Result<(StatusCode, Bytes), (StatusCode, String)> {
-    proxy_get_path(state.client.clone(), state.matching_base.clone(), "/debug/activity-results")
-        .await
 }
 
 async fn register_build(
@@ -2062,25 +2050,6 @@ async fn proxy_request(
     Ok((status, bytes))
 }
 
-async fn proxy_get_path(
-    client: Client,
-    base_url: String,
-    path: &str,
-) -> Result<(StatusCode, Bytes), (StatusCode, String)> {
-    let url = format!("{base_url}{path}");
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .with_context(|| format!("failed to proxy request to {url}"))
-        .map_err(internal_error)?;
-    let status = StatusCode::from_u16(response.status().as_u16())
-        .map_err(|error| internal_error(anyhow::anyhow!(error.to_string())))?;
-    let bytes =
-        response.bytes().await.map_err(|error| internal_error(anyhow::Error::from(error)))?;
-    Ok((status, bytes))
-}
-
 async fn proxy_post_path(
     client: Client,
     base_url: String,
@@ -2495,7 +2464,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gateway_proxies_workflow_front_door_and_matching_debug() -> Result<()> {
+    async fn gateway_proxies_workflow_front_door() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
         };
@@ -2530,20 +2499,11 @@ mod tests {
             get(|| async { Json(json!({"service": "query"})).into_response() }),
         ))
         .await?;
-        let matching = TestHttpServer::start(Router::new().route(
-            "/debug/activity-results",
-            get(|| async {
-                Json(json!({"applied_batches": 2, "applied_results": 8})).into_response()
-            }),
-        ))
-        .await?;
-
         let app = build_app(
             AppState {
                 client: Client::new(),
                 ingest_base: ingest.base_url.clone(),
                 query_base: query.base_url.clone(),
-                matching_base: matching.base_url.clone(),
                 store,
                 admission: test_admission_config(),
             },
@@ -2590,20 +2550,8 @@ mod tests {
         assert_eq!(validate_json["service"], "ingest");
         assert_eq!(validate_json["status"], "incompatible");
 
-        let matching_debug_response = app
-            .oneshot(
-                Request::get("/admin/debug/matching/activity-results")
-                    .body(Body::empty())
-                    .expect("matching debug request"),
-            )
-            .await?;
-        assert_eq!(matching_debug_response.status(), StatusCode::OK);
-        let matching_debug_body = to_bytes(matching_debug_response.into_body(), usize::MAX).await?;
-        assert_eq!(serde_json::from_slice::<Value>(&matching_debug_body)?["applied_results"], 8);
-
         ingest.stop().await;
         query.stop().await;
-        matching.stop().await;
         Ok(())
     }
 
@@ -2618,7 +2566,6 @@ mod tests {
                 client: Client::new(),
                 ingest_base: "http://127.0.0.1:1".to_owned(),
                 query_base: "http://127.0.0.1:1".to_owned(),
-                matching_base: "http://127.0.0.1:1".to_owned(),
                 store: store.clone(),
                 admission: test_admission_config(),
             },
@@ -2787,7 +2734,6 @@ mod tests {
                 client: Client::new(),
                 ingest_base: ingest.base_url.clone(),
                 query_base: "http://127.0.0.1:1".to_owned(),
-                matching_base: "http://127.0.0.1:1".to_owned(),
                 store: store.clone(),
                 admission: test_admission_config(),
             },
@@ -3026,7 +2972,6 @@ mod tests {
                 client: Client::new(),
                 ingest_base: "http://127.0.0.1:1".to_owned(),
                 query_base: "http://127.0.0.1:1".to_owned(),
-                matching_base: "http://127.0.0.1:1".to_owned(),
                 store: store.clone(),
                 admission: test_admission_config(),
             },
@@ -3219,7 +3164,6 @@ mod tests {
                 client: Client::new(),
                 ingest_base: "http://127.0.0.1:1".to_owned(),
                 query_base: "http://127.0.0.1:1".to_owned(),
-                matching_base: "http://127.0.0.1:1".to_owned(),
                 store,
                 admission: test_admission_config(),
             }),

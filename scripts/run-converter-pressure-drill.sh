@@ -77,12 +77,12 @@ json_post() {
 
 relaunch_managed_workers() {
   local workspace_dir=$1
-  local matching_endpoint=${FABRIK_UNIFIED_RUNTIME_ENDPOINT:-http://127.0.0.1:50054}
-  python3 - "$workspace_dir" "$TENANT_ID" "$matching_endpoint" <<'PY'
+  local runtime_endpoint=${FABRIK_UNIFIED_RUNTIME_ENDPOINT:-http://127.0.0.1:50054}
+  python3 - "$workspace_dir" "$TENANT_ID" "$runtime_endpoint" <<'PY'
 import json, os, pathlib, subprocess, sys
 workspace_dir = pathlib.Path(sys.argv[1])
 tenant_id = sys.argv[2]
-matching_endpoint = sys.argv[3]
+runtime_endpoint = sys.argv[3]
 for package_path in sorted(workspace_dir.glob("workers/*/worker-package.json")):
     package = json.loads(package_path.read_text(encoding="utf-8"))
     pid_path = pathlib.Path(package["pid_path"])
@@ -93,7 +93,7 @@ for package_path in sorted(workspace_dir.glob("workers/*/worker-package.json")):
     env = os.environ.copy()
     env.update({
         "ACTIVITY_WORKER_SERVICE_PORT": "0",
-        "MATCHING_SERVICE_ENDPOINT": matching_endpoint,
+        "UNIFIED_RUNTIME_ENDPOINT": runtime_endpoint,
         "ACTIVITY_TASK_QUEUE": task_queue,
         "ACTIVITY_WORKER_TENANT_ID": tenant_id,
         "ACTIVITY_WORKER_BUILD_ID": build_id,
@@ -268,12 +268,13 @@ def qvalue(payload):
 pre_value = qvalue(query_pre_signal)
 restart_value = qvalue(query_post_restart)
 complete_value = qvalue(query_post_complete)
+expected_waiting = {"phase": "waiting", "id": "order-7", "tags": ["vip", "alpha"]}
 checks = {
     "deploy_succeeded": True,
     "workflow_running_before_normalize": True,
-    "query_before_normalize_shows_waiting_state": pre_value.get("phase") == "waiting",
+    "query_before_normalize_shows_waiting_state": pre_value == expected_waiting,
     "workflow_preserved_artifact_after_restart": workflow_post_restart.get("artifact_hash") == meta["artifact_hash"],
-    "query_after_restart_preserves_waiting_state": restart_value.get("phase") == "waiting",
+    "query_after_restart_preserves_waiting_state": restart_value == expected_waiting,
     "activity_pollers_present_after_restart": len(activity_queue.get("pollers", [])) > 0,
     "replay_clean_after_restart": replay_post_restart.get("projection_matches_store") is True and replay_post_restart.get("divergence_count") == 0,
     "workflow_completed_with_normalized_output": workflow_post_complete.get("status") == "completed" and workflow_post_complete.get("output") == "order-7:VIP,ALPHA",

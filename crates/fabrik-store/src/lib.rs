@@ -3,11 +3,11 @@ use chrono::{DateTime, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_throughput::{
     ADMISSION_POLICY_VERSION, ActivityExecutionCapabilities, ThroughputBackend,
-    ThroughputChunkReport, ThroughputCommandEnvelope,
-    bulk_reducer_default_summary_value, bulk_reducer_name, bulk_reducer_reduce_errors,
-    bulk_reducer_reduce_values, bulk_reducer_requires_error_outputs,
-    bulk_reducer_requires_success_outputs, bulk_reducer_settles, throughput_execution_mode,
-    throughput_reducer_execution_path, throughput_reducer_version, throughput_routing_reason,
+    ThroughputChunkReport, ThroughputCommandEnvelope, bulk_reducer_default_summary_value,
+    bulk_reducer_name, bulk_reducer_reduce_errors, bulk_reducer_reduce_values,
+    bulk_reducer_requires_error_outputs, bulk_reducer_requires_success_outputs,
+    bulk_reducer_settles, throughput_execution_mode, throughput_reducer_execution_path,
+    throughput_reducer_version, throughput_routing_reason,
 };
 use fabrik_workflow::{CompiledWorkflowArtifact, WorkflowDefinition, WorkflowInstanceState};
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,7 @@ use sqlx::{
     postgres::{PgPoolOptions, Postgres},
     types::Json,
 };
+use std::collections::HashSet;
 use uuid::Uuid;
 
 const WORKFLOW_INSTANCE_UPSERT_BATCH_SIZE: usize = 256;
@@ -6617,6 +6618,46 @@ impl WorkflowStore {
         Ok(())
     }
 
+    pub async fn close_runs_batch<'a>(
+        &self,
+        runs: &[(&'a str, &'a str, &'a str, DateTime<Utc>)],
+    ) -> Result<()> {
+        if runs.is_empty() {
+            return Ok(());
+        }
+
+        let tenant_ids = runs.iter().map(|(tenant_id, _, _, _)| *tenant_id).collect::<Vec<_>>();
+        let instance_ids =
+            runs.iter().map(|(_, instance_id, _, _)| *instance_id).collect::<Vec<_>>();
+        let run_ids = runs.iter().map(|(_, _, run_id, _)| *run_id).collect::<Vec<_>>();
+        let closed_ats = runs.iter().map(|(_, _, _, closed_at)| *closed_at).collect::<Vec<_>>();
+
+        sqlx::query(
+            r#"
+            WITH updates(tenant_id, workflow_instance_id, run_id, closed_at) AS (
+                SELECT *
+                FROM UNNEST($1::text[], $2::text[], $3::text[], $4::timestamptz[])
+            )
+            UPDATE workflow_runs AS runs
+            SET closed_at = COALESCE(runs.closed_at, updates.closed_at),
+                updated_at = updates.closed_at
+            FROM updates
+            WHERE runs.tenant_id = updates.tenant_id
+              AND runs.workflow_instance_id = updates.workflow_instance_id
+              AND runs.run_id = updates.run_id
+            "#,
+        )
+        .bind(&tenant_ids)
+        .bind(&instance_ids)
+        .bind(&run_ids)
+        .bind(&closed_ats)
+        .execute(&self.pool)
+        .await
+        .context("failed to close workflow runs in batch")?;
+
+        Ok(())
+    }
+
     pub async fn update_run_workflow_sticky(
         &self,
         tenant_id: &str,
@@ -9199,6 +9240,55 @@ impl WorkflowStore {
         .context("failed to load workflow mailbox batch")?;
 
         rows.into_iter().map(Self::decode_workflow_mailbox_row).collect()
+    }
+
+    pub async fn list_runs_with_pending_mailbox_backlog<'a>(
+        &self,
+        run_keys: &[(&'a str, &'a str, &'a str)],
+    ) -> Result<HashSet<(String, String, String)>> {
+        if run_keys.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let tenant_ids = run_keys.iter().map(|(tenant_id, _, _)| *tenant_id).collect::<Vec<_>>();
+        let instance_ids =
+            run_keys.iter().map(|(_, instance_id, _)| *instance_id).collect::<Vec<_>>();
+        let run_ids = run_keys.iter().map(|(_, _, run_id)| *run_id).collect::<Vec<_>>();
+        let rows = sqlx::query(
+            r#"
+            WITH requested(tenant_id, workflow_instance_id, run_id) AS (
+                SELECT *
+                FROM UNNEST($1::text[], $2::text[], $3::text[])
+            )
+            SELECT DISTINCT
+                tasks.tenant_id,
+                tasks.workflow_instance_id,
+                tasks.run_id
+            FROM workflow_tasks tasks
+            INNER JOIN requested
+                ON requested.tenant_id = tasks.tenant_id
+               AND requested.workflow_instance_id = tasks.workflow_instance_id
+               AND requested.run_id = tasks.run_id
+            WHERE tasks.mailbox_backlog > 0
+            "#,
+        )
+        .bind(&tenant_ids)
+        .bind(&instance_ids)
+        .bind(&run_ids)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list runs with pending mailbox backlog")?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("tenant_id").context("workflow task tenant_id missing")?,
+                    row.try_get("workflow_instance_id")
+                        .context("workflow task workflow_instance_id missing")?,
+                    row.try_get("run_id").context("workflow task run_id missing")?,
+                ))
+            })
+            .collect()
     }
 
     pub async fn get_next_workflow_resume_item(
@@ -17166,7 +17256,9 @@ impl WorkflowStore {
                 if json.0.is_null() {
                     Ok(None)
                 } else {
-                    serde_json::from_value(json.0).map(Some).context("invalid activity capabilities")
+                    serde_json::from_value(json.0)
+                        .map(Some)
+                        .context("invalid activity capabilities")
                 }
             }
             Ok(None) => Ok(None),
@@ -17244,9 +17336,8 @@ impl WorkflowStore {
         row: &sqlx::postgres::PgRow,
         field_context: &'static str,
     ) -> Result<String> {
-        let admission_mode = row
-            .try_get::<String, _>("admission_mode")
-            .with_context(|| field_context.to_owned())?;
+        let admission_mode =
+            row.try_get::<String, _>("admission_mode").with_context(|| field_context.to_owned())?;
 
         Ok(admission_mode)
     }
@@ -18199,7 +18290,7 @@ impl WorkflowStore {
                 if batch.throughput_backend == "stream-v2" {
                     "throughput-runtime"
                 } else {
-                    "matching-service"
+                    "unified-runtime"
                 },
             ),
             payload,

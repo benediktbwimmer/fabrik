@@ -75,6 +75,10 @@ When external repos are scarce, use the internal pressure-repo set for engineeri
   - current drill status: `passed`
   - replay divergence counts: post-restart `0`, post-complete `0`
   - current caveat: pre-normalize query state is validated only at the phase level, not full copied input fields
+- `temporal-monorepo-multiworker-pressure` now has a passing internal replay/restart drill for the multi-worker monorepo packaging and restore path in:
+  - `target/alpha-drills/temporal-monorepo-multiworker-pressure/monorepo-multiworker-pressure-drill-report.json`
+  - current drill status: `passed`
+  - orders/report replay divergence counts: post-restart `0 / 0`, post-complete `0 / 0`
 
 Current app-style batch signal:
 

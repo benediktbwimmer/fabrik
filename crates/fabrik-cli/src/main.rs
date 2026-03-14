@@ -1178,11 +1178,7 @@ fn build_worker_packages(
             .trim_end_matches(".js")
             .trim_end_matches(".mjs")
             .trim_end_matches(".cjs");
-        let package_name = format!(
-            "{}-{}",
-            sanitize_segment(worker_path_key),
-            worker.worker_index
-        );
+        let package_name = format!("{}-{}", sanitize_segment(worker_path_key), worker.worker_index);
         let package_dir = workers_dir.join(&package_name);
         fs::create_dir_all(&package_dir)?;
         let dist_dir = package_dir.join("dist");
@@ -1788,8 +1784,7 @@ async fn deploy_bundle(
         }
     }
     let mut deployed_workers = Vec::new();
-    let matching_endpoint = env::var("FABRIK_UNIFIED_RUNTIME_ENDPOINT")
-        .or_else(|_| env::var("FABRIK_MATCHING_ENDPOINT"))
+    let runtime_endpoint = env::var("FABRIK_UNIFIED_RUNTIME_ENDPOINT")
         .unwrap_or_else(|_| "http://127.0.0.1:50054".to_owned());
     let poller_wait_ms = env::var("FABRIK_ACTIVITY_POLLER_WAIT_MS")
         .ok()
@@ -1826,28 +1821,24 @@ async fn deploy_bundle(
                 ),
             });
         }
-        let managed_process = match spawn_managed_activity_worker(
-            tenant_id,
-            &matching_endpoint,
-            task_queue,
-            worker,
-        ) {
-            Ok(process) => process,
-            Err(error) => {
-                return Ok(DeploymentSummary {
-                    requested: true,
-                    api_url: Some(api_url.to_owned()),
-                    tenant_id: Some(tenant_id.to_owned()),
-                    published_artifacts,
-                    workers: deployed_workers,
-                    status: "failed".to_owned(),
-                    message: format!(
-                        "failed to launch managed worker {} for {}: {error}",
-                        worker.build_id, task_queue
-                    ),
-                });
-            }
-        };
+        let managed_process =
+            match spawn_managed_activity_worker(tenant_id, &runtime_endpoint, task_queue, worker) {
+                Ok(process) => process,
+                Err(error) => {
+                    return Ok(DeploymentSummary {
+                        requested: true,
+                        api_url: Some(api_url.to_owned()),
+                        tenant_id: Some(tenant_id.to_owned()),
+                        published_artifacts,
+                        workers: deployed_workers,
+                        status: "failed".to_owned(),
+                        message: format!(
+                            "failed to launch managed worker {} for {}: {error}",
+                            worker.build_id, task_queue
+                        ),
+                    });
+                }
+            };
         fs::write(&worker.pid_path, managed_process.pid.to_string())
             .with_context(|| format!("failed to write {}", worker.pid_path))?;
         let poller_count =
@@ -1947,7 +1938,7 @@ fn resolve_managed_activity_worker_command() -> Result<ManagedWorkerCommand> {
 
 fn spawn_managed_activity_worker(
     tenant_id: &str,
-    matching_endpoint: &str,
+    runtime_endpoint: &str,
     task_queue: &str,
     worker: &WorkerPackageRecord,
 ) -> Result<ManagedWorkerProcess> {
@@ -1972,7 +1963,7 @@ fn spawn_managed_activity_worker(
     }
     let child = command
         .env("ACTIVITY_WORKER_SERVICE_PORT", "0")
-        .env("MATCHING_SERVICE_ENDPOINT", matching_endpoint)
+        .env("UNIFIED_RUNTIME_ENDPOINT", runtime_endpoint)
         .env("ACTIVITY_TASK_QUEUE", task_queue)
         .env("ACTIVITY_WORKER_TENANT_ID", tenant_id)
         .env("ACTIVITY_WORKER_BUILD_ID", &worker.build_id)
@@ -2187,11 +2178,7 @@ fn describe_worker_activities(bootstrap_path: &Path, task_queue: Option<&str>) -
                 String::new()
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-                if stderr.is_empty() {
-                    String::new()
-                } else {
-                    format!(" (stderr: {stderr})")
-                }
+                if stderr.is_empty() { String::new() } else { format!(" (stderr: {stderr})") }
             },
         )
     })?;

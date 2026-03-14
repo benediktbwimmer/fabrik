@@ -96,8 +96,8 @@ json_post() {
 
 relaunch_managed_workers() {
   local workspace_dir=$1
-  local matching_endpoint=${FABRIK_UNIFIED_RUNTIME_ENDPOINT:-http://127.0.0.1:50054}
-  python3 - "$workspace_dir" "$TENANT_ID" "$matching_endpoint" <<'PY'
+  local runtime_endpoint=${FABRIK_UNIFIED_RUNTIME_ENDPOINT:-http://127.0.0.1:50054}
+  python3 - "$workspace_dir" "$TENANT_ID" "$runtime_endpoint" <<'PY'
 import json
 import os
 import pathlib
@@ -106,7 +106,7 @@ import sys
 
 workspace_dir = pathlib.Path(sys.argv[1])
 tenant_id = sys.argv[2]
-matching_endpoint = sys.argv[3]
+runtime_endpoint = sys.argv[3]
 
 for package_path in sorted(workspace_dir.glob("workers/*/worker-package.json")):
     package = json.loads(package_path.read_text(encoding="utf-8"))
@@ -118,7 +118,7 @@ for package_path in sorted(workspace_dir.glob("workers/*/worker-package.json")):
     env = os.environ.copy()
     env.update({
         "ACTIVITY_WORKER_SERVICE_PORT": "0",
-        "MATCHING_SERVICE_ENDPOINT": matching_endpoint,
+        "UNIFIED_RUNTIME_ENDPOINT": runtime_endpoint,
         "ACTIVITY_TASK_QUEUE": task_queue,
         "ACTIVITY_WORKER_TENANT_ID": tenant_id,
         "ACTIVITY_WORKER_BUILD_ID": build_id,

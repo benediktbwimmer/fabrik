@@ -26,10 +26,9 @@ use fabrik_store::{
 };
 use fabrik_throughput::{
     ADMISSION_POLICY_VERSION, ActivityCapabilityRegistry, FastPathRejectionReason, PayloadHandle,
-    ThroughputBackend, ThroughputCommand,
-    ThroughputCommandEnvelope, TinyWorkflowExecutionMode, TinyWorkflowStartBatchCommand,
-    TinyWorkflowStartCommand, TinyWorkflowStartItem, WorkflowAdmissionMode,
-    can_inline_durable_tiny_fanout, can_inline_stream_v2_microbatch,
+    ThroughputBackend, ThroughputCommand, ThroughputCommandEnvelope, TinyWorkflowExecutionMode,
+    TinyWorkflowStartBatchCommand, TinyWorkflowStartCommand, TinyWorkflowStartItem,
+    WorkflowAdmissionMode, can_inline_durable_tiny_fanout, can_inline_stream_v2_microbatch,
     load_activity_capability_registry_from_env, parse_benchmark_compact_input_spec,
     parse_benchmark_compact_total_items_from_handle, resolve_activity_capabilities,
     tiny_workflow_routing_decision,
@@ -83,8 +82,8 @@ enum DurableStartAnalysisMode {
 
 impl DurableStartAnalysisMode {
     fn from_env() -> Result<Self> {
-        let mode = env::var("INGEST_DURABLE_FAST_PATH_ANALYSIS")
-            .unwrap_or_else(|_| "sampled".to_owned());
+        let mode =
+            env::var("INGEST_DURABLE_FAST_PATH_ANALYSIS").unwrap_or_else(|_| "sampled".to_owned());
         match mode.as_str() {
             "always" => Ok(Self::Always),
             "off" => Ok(Self::Off),
@@ -1515,8 +1514,8 @@ async fn handle_trigger_workflow(
         }
         return Ok(response);
     }
-    let fast_path_rejection_reason = tiny_routing
-        .and_then(|decision| decision.err().map(|reason| reason.as_str().to_owned()));
+    let fast_path_rejection_reason =
+        tiny_routing.and_then(|decision| decision.err().map(|reason| reason.as_str().to_owned()));
     let payload = WorkflowEvent::WorkflowTriggered { input: request.input.clone() };
     let mut envelope = EventEnvelope::new(
         payload.event_type(),

@@ -703,11 +703,12 @@ impl WorkflowInstanceState {
                     .as_ref()
                     .is_some_and(|execution| execution.waits_on_bulk_activity(state))
             });
-        let elide_input_to_context = self
-            .input
-            .as_ref()
-            .zip(self.context.as_ref())
-            .is_some_and(|(input, context)| !elide_bulk_wait_context && input == context);
+        let elide_input_to_context = self.last_event_type == "WorkflowTriggered"
+            && self
+                .input
+                .as_ref()
+                .zip(self.context.as_ref())
+                .is_some_and(|(input, context)| !elide_bulk_wait_context && input == context);
         let persisted_input =
             if elide_input_to_context { self.context.as_ref() } else { self.input.as_ref() };
         if let Some(execution) = self.artifact_execution.as_mut() {
@@ -3892,9 +3893,63 @@ mod tests {
             None
         );
         assert_eq!(state.memo.as_ref(), Some(&json!({"lane": "monorepo"})));
+        assert_eq!(state.search_attributes.as_ref(), Some(&json!({"PressureGroup": "monorepo"})));
+
+        state.expand_after_persistence();
+        assert_eq!(state.input.as_ref(), Some(&input));
         assert_eq!(
-            state.search_attributes.as_ref(),
-            Some(&json!({"PressureGroup": "monorepo"}))
+            state.artifact_execution.as_ref().and_then(|execution| execution.bindings.get("input")),
+            Some(&input)
+        );
+        assert_eq!(state.memo.as_ref(), Some(&json!({"lane": "monorepo"})));
+        assert_eq!(state.search_attributes.as_ref(), Some(&json!({"PressureGroup": "monorepo"})));
+    }
+
+    #[test]
+    fn workflow_instance_persistence_keeps_nontrigger_input_when_context_matches() {
+        let input = serde_json::json!(["order-42"]);
+        let mut state = WorkflowInstanceState {
+            tenant_id: "tenant".to_owned(),
+            instance_id: "instance".to_owned(),
+            run_id: "run".to_owned(),
+            definition_id: "workflow".to_owned(),
+            definition_version: Some(1),
+            artifact_hash: Some("hash".to_owned()),
+            workflow_task_queue: "default".to_owned(),
+            sticky_workflow_build_id: None,
+            sticky_workflow_poller_id: None,
+            current_state: Some("wait_condition".to_owned()),
+            context: Some(input.clone()),
+            artifact_execution: Some(ArtifactExecutionState {
+                bindings: BTreeMap::from([
+                    ("input".to_owned(), input.clone()),
+                    ("released".to_owned(), json!(false)),
+                ]),
+                workflow_info: Some(json!({
+                    "workflowId": "instance",
+                    "runId": "run",
+                    "memo": {"lane": "monorepo"},
+                    "searchAttributes": {"PressureGroup": "monorepo"},
+                })),
+                ..ArtifactExecutionState::default()
+            }),
+            status: WorkflowStatus::Running,
+            input: Some(input.clone()),
+            persisted_input_handle: None,
+            memo: Some(json!({"lane": "monorepo"})),
+            search_attributes: Some(json!({"PressureGroup": "monorepo"})),
+            output: None,
+            event_count: 2,
+            last_event_id: Uuid::now_v7(),
+            last_event_type: "ActivityTaskCompleted".to_owned(),
+            updated_at: Utc::now(),
+        };
+
+        state.compact_for_persistence();
+        assert_eq!(state.input.as_ref(), Some(&input));
+        assert_eq!(
+            state.artifact_execution.as_ref().and_then(|execution| execution.bindings.get("input")),
+            None
         );
 
         state.expand_after_persistence();
@@ -3904,10 +3959,7 @@ mod tests {
             Some(&input)
         );
         assert_eq!(state.memo.as_ref(), Some(&json!({"lane": "monorepo"})));
-        assert_eq!(
-            state.search_attributes.as_ref(),
-            Some(&json!({"PressureGroup": "monorepo"}))
-        );
+        assert_eq!(state.search_attributes.as_ref(), Some(&json!({"PressureGroup": "monorepo"})));
     }
 
     #[test]
