@@ -3,8 +3,8 @@
   "layer_id": "layer_a_support",
   "title": "Layer A: support fixtures",
   "purpose": "Analyzer, compiler, import, and packaging correctness for the frozen Temporal TS subset.",
-  "case_count": 10,
-  "passed_count": 10,
+  "case_count": 14,
+  "passed_count": 14,
   "failed_count": 0,
   "results": [
     {
@@ -12,7 +12,7 @@
       "title": "analyzer-supported-project",
       "kind": "analyzer",
       "status": "passed",
-      "duration_ms": 876,
+      "duration_ms": 861,
       "summary": "workflows=1 workers=1 hard_blocks=0",
       "observed": {
         "workflow_count": 1,
@@ -30,7 +30,7 @@
       "title": "analyzer-payload-qualified",
       "kind": "analyzer",
       "status": "passed",
-      "duration_ms": 809,
+      "duration_ms": 3473,
       "summary": "workflows=1 workers=1 hard_blocks=0",
       "observed": {
         "workflow_count": 1,
@@ -48,7 +48,7 @@
       "title": "analyzer-payload-path-qualified",
       "kind": "analyzer",
       "status": "passed",
-      "duration_ms": 800,
+      "duration_ms": 2185,
       "summary": "workflows=1 workers=1 hard_blocks=0",
       "observed": {
         "workflow_count": 1,
@@ -66,10 +66,82 @@
       "title": "analyzer-supported-api-qualified",
       "kind": "analyzer",
       "status": "passed",
-      "duration_ms": 770,
+      "duration_ms": 2273,
       "summary": "workflows=2 workers=1 hard_blocks=0",
       "observed": {
         "workflow_count": 2,
+        "worker_count": 1,
+        "hard_block_count": 0,
+        "finding_features": []
+      },
+      "evidence": {
+        "finding_count": 0,
+        "finding_features": []
+      }
+    },
+    {
+      "id": "analyzer-activity-failure-qualified",
+      "title": "analyzer-activity-failure-qualified",
+      "kind": "analyzer",
+      "status": "passed",
+      "duration_ms": 2732,
+      "summary": "workflows=1 workers=1 hard_blocks=0",
+      "observed": {
+        "workflow_count": 1,
+        "worker_count": 1,
+        "hard_block_count": 0,
+        "finding_features": []
+      },
+      "evidence": {
+        "finding_count": 0,
+        "finding_features": []
+      }
+    },
+    {
+      "id": "analyzer-patching-qualified",
+      "title": "analyzer-patching-qualified",
+      "kind": "analyzer",
+      "status": "passed",
+      "duration_ms": 1143,
+      "summary": "workflows=2 workers=1 hard_blocks=0",
+      "observed": {
+        "workflow_count": 2,
+        "worker_count": 1,
+        "hard_block_count": 0,
+        "finding_features": []
+      },
+      "evidence": {
+        "finding_count": 0,
+        "finding_features": []
+      }
+    },
+    {
+      "id": "analyzer-worker-versioning-qualified",
+      "title": "analyzer-worker-versioning-qualified",
+      "kind": "analyzer",
+      "status": "passed",
+      "duration_ms": 897,
+      "summary": "workflows=2 workers=1 hard_blocks=0",
+      "observed": {
+        "workflow_count": 2,
+        "worker_count": 1,
+        "hard_block_count": 0,
+        "finding_features": []
+      },
+      "evidence": {
+        "finding_count": 0,
+        "finding_features": []
+      }
+    },
+    {
+      "id": "analyzer-search-attributes-qualified",
+      "title": "analyzer-search-attributes-qualified",
+      "kind": "analyzer",
+      "status": "passed",
+      "duration_ms": 775,
+      "summary": "workflows=1 workers=1 hard_blocks=0",
+      "observed": {
+        "workflow_count": 1,
         "worker_count": 1,
         "hard_block_count": 0,
         "finding_features": []
@@ -84,7 +156,7 @@
       "title": "analyzer-payload-blocked",
       "kind": "analyzer",
       "status": "passed",
-      "duration_ms": 811,
+      "duration_ms": 789,
       "summary": "workflows=0 workers=1 hard_blocks=2",
       "observed": {
         "workflow_count": 0,
@@ -108,7 +180,7 @@
       "title": "analyzer-visibility-blocked",
       "kind": "analyzer",
       "status": "passed",
-      "duration_ms": 447,
+      "duration_ms": 454,
       "summary": "workflows=0 workers=0 hard_blocks=0",
       "observed": {
         "workflow_count": 0,
@@ -126,7 +198,7 @@
       "title": "analyzer-dynamic-bootstrap-blocked",
       "kind": "analyzer",
       "status": "passed",
-      "duration_ms": 763,
+      "duration_ms": 766,
       "summary": "workflows=0 workers=0 hard_blocks=1",
       "observed": {
         "workflow_count": 0,
@@ -148,7 +220,7 @@
       "title": "analyzer-unsupported-api-blocked",
       "kind": "analyzer",
       "status": "passed",
-      "duration_ms": 668,
+      "duration_ms": 676,
       "summary": "workflows=1 workers=0 hard_blocks=1",
       "observed": {
         "workflow_count": 1,
@@ -170,7 +242,7 @@
       "title": "compiler-valid-source-map",
       "kind": "compiler",
       "status": "passed",
-      "duration_ms": 873,
+      "duration_ms": 1000,
       "summary": "definition=valid-workflow source_files=2",
       "observed": {
         "definition_id": "valid-workflow",
@@ -189,7 +261,7 @@
       "title": "compiler-invalid-global-blocked",
       "kind": "compiler_error",
       "status": "passed",
-      "duration_ms": 882,
+      "duration_ms": 931,
       "summary": "compiler rejection matched expected diagnostics",
       "observed": {
         "rejected": true

@@ -46,6 +46,8 @@ function validateWorkload(workload) {
     kind: "fanout",
     timerSecs: 1,
     continueRounds: 1,
+    startConcurrency: 256,
+    resultConcurrency: 256,
     ...workload,
   };
 }

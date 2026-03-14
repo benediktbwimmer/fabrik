@@ -18,6 +18,8 @@ use sqlx::{
 };
 use uuid::Uuid;
 
+const WORKFLOW_INSTANCE_UPSERT_BATCH_SIZE: usize = 256;
+
 #[derive(Debug, Clone)]
 pub struct ScheduledTimer {
     pub partition_id: i32,
@@ -343,6 +345,7 @@ pub struct ThroughputRunRecord {
     pub artifact_hash: Option<String>,
     pub batch_id: String,
     pub throughput_backend: String,
+    pub execution_path: String,
     pub status: String,
     pub command_dedupe_key: String,
     pub command: ThroughputCommandEnvelope,
@@ -589,9 +592,128 @@ pub struct WorkflowRunRecord {
     pub trigger_event_id: Uuid,
     pub continued_event_id: Option<Uuid>,
     pub triggered_by_run_id: Option<String>,
+    pub execution_path: String,
+    pub fast_path_rejection_reason: Option<String>,
     pub started_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowRunStartRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub definition_id: String,
+    pub definition_version: Option<u32>,
+    pub artifact_hash: Option<String>,
+    pub workflow_task_queue: String,
+    pub memo: Option<Value>,
+    pub search_attributes: Option<Value>,
+    pub trigger_event_id: Uuid,
+    pub started_at: DateTime<Utc>,
+    pub previous_run_id: Option<String>,
+    pub triggered_by_run_id: Option<String>,
+    pub execution_path: Option<String>,
+    pub fast_path_rejection_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowRunRoutingMetadata {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub execution_path: String,
+    pub fast_path_rejection_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowFastStartMode {
+    Throughput,
+    Durable,
+}
+
+impl WorkflowFastStartMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Throughput => "throughput",
+            Self::Durable => "durable",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "throughput" => Ok(Self::Throughput),
+            "durable" => Ok(Self::Durable),
+            other => anyhow::bail!("unknown workflow fast start mode {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowFastStartStatus {
+    Accepted,
+    Completed,
+    Failed,
+}
+
+impl WorkflowFastStartStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "accepted" => Ok(Self::Accepted),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            other => anyhow::bail!("unknown workflow fast start status {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowFastStartRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub request_id: Option<String>,
+    pub definition_id: String,
+    pub definition_version: u32,
+    pub artifact_hash: String,
+    pub workflow_task_queue: String,
+    pub mode: WorkflowFastStartMode,
+    pub execution_path: String,
+    pub status: WorkflowFastStartStatus,
+    pub input: Value,
+    pub memo: Option<Value>,
+    pub search_attributes: Option<Value>,
+    pub trigger_event_id: Uuid,
+    pub terminal_event_id: Option<Uuid>,
+    pub terminal_event_type: Option<String>,
+    pub terminal_payload: Option<Value>,
+    pub accepted_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+    pub fast_path_rejection_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowFastStartTerminalUpdate {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub status: WorkflowFastStartStatus,
+    pub terminal_event_id: Uuid,
+    pub terminal_event_type: String,
+    pub terminal_payload: Value,
+    pub completed_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -611,6 +733,8 @@ pub struct WorkflowRunSummaryRecord {
     pub previous_run_id: Option<String>,
     pub next_run_id: Option<String>,
     pub continue_reason: Option<String>,
+    pub execution_path: String,
+    pub fast_path_rejection_reason: Option<String>,
     pub started_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
@@ -2239,6 +2363,19 @@ impl WorkflowStore {
 
         sqlx::query(
             r#"
+            ALTER TABLE workflow_activities
+            ADD COLUMN IF NOT EXISTS schedule_to_start_timeout_ms BIGINT,
+            ADD COLUMN IF NOT EXISTS schedule_to_close_timeout_ms BIGINT,
+            ADD COLUMN IF NOT EXISTS start_to_close_timeout_ms BIGINT,
+            ADD COLUMN IF NOT EXISTS heartbeat_timeout_ms BIGINT
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to ensure workflow_activities timeout columns")?;
+
+        sqlx::query(
+            r#"
             CREATE TABLE IF NOT EXISTS workflow_bulk_batches (
                 tenant_id TEXT NOT NULL,
                 workflow_instance_id TEXT NOT NULL,
@@ -2446,6 +2583,7 @@ impl WorkflowStore {
                 artifact_hash TEXT,
                 batch_id TEXT NOT NULL,
                 throughput_backend TEXT NOT NULL,
+                execution_path TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL,
                 command_dedupe_key TEXT NOT NULL,
                 command JSONB NOT NULL,
@@ -2471,6 +2609,12 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize throughput_runs backend status index")?;
+        sqlx::query(
+            "ALTER TABLE throughput_runs ADD COLUMN IF NOT EXISTS execution_path TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add throughput_runs.execution_path")?;
 
         sqlx::query(
             r#"
@@ -2797,6 +2941,8 @@ impl WorkflowStore {
                 trigger_event_id UUID NOT NULL,
                 continued_event_id UUID,
                 triggered_by_run_id TEXT,
+                execution_path TEXT NOT NULL DEFAULT '',
+                fast_path_rejection_reason TEXT,
                 started_at TIMESTAMPTZ NOT NULL,
                 closed_at TIMESTAMPTZ,
                 updated_at TIMESTAMPTZ NOT NULL,
@@ -2841,6 +2987,74 @@ impl WorkflowStore {
             .execute(&self.pool)
             .await
             .context("failed to add workflow_runs.search_attributes")?;
+        sqlx::query(
+            "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS execution_path TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add workflow_runs.execution_path")?;
+        sqlx::query(
+            "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS fast_path_rejection_reason TEXT",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add workflow_runs.fast_path_rejection_reason")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS workflow_fast_starts (
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                request_id TEXT,
+                workflow_id TEXT NOT NULL,
+                definition_version INTEGER NOT NULL,
+                artifact_hash TEXT NOT NULL,
+                workflow_task_queue TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                execution_path TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                input JSONB NOT NULL,
+                memo JSONB,
+                search_attributes JSONB,
+                trigger_event_id UUID NOT NULL,
+                terminal_event_id UUID,
+                terminal_event_type TEXT,
+                terminal_payload JSONB,
+                accepted_at TIMESTAMPTZ NOT NULL,
+                completed_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL,
+                fast_path_rejection_reason TEXT,
+                PRIMARY KEY (tenant_id, workflow_instance_id, run_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_fast_starts table")?;
+
+        sqlx::query(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS workflow_fast_starts_request_idx
+            ON workflow_fast_starts (tenant_id, workflow_instance_id, request_id)
+            WHERE request_id IS NOT NULL
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize workflow_fast_starts request index")?;
+        sqlx::query(
+            "ALTER TABLE workflow_fast_starts ADD COLUMN IF NOT EXISTS execution_path TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add workflow_fast_starts.execution_path")?;
+        sqlx::query(
+            "ALTER TABLE workflow_fast_starts ADD COLUMN IF NOT EXISTS fast_path_rejection_reason TEXT",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add workflow_fast_starts.fast_path_rejection_reason")?;
 
         sqlx::query(
             r#"
@@ -4556,6 +4770,17 @@ impl WorkflowStore {
         self.upsert_persisted_instance(&persisted_state).await
     }
 
+    pub async fn upsert_instances_batch(&self, states: &[WorkflowInstanceState]) -> Result<()> {
+        if states.is_empty() {
+            return Ok(());
+        }
+        let mut persisted = states.to_vec();
+        for state in &mut persisted {
+            state.compact_for_persistence();
+        }
+        self.upsert_persisted_instances_batch(&persisted).await
+    }
+
     pub async fn upsert_persisted_instance(
         &self,
         persisted_state: &WorkflowInstanceState,
@@ -4617,6 +4842,82 @@ impl WorkflowStore {
         .await
         .context("failed to upsert workflow instance")?;
 
+        Ok(())
+    }
+
+    pub async fn upsert_persisted_instances_batch(
+        &self,
+        persisted_states: &[WorkflowInstanceState],
+    ) -> Result<()> {
+        if persisted_states.is_empty() {
+            return Ok(());
+        }
+        for batch in persisted_states.chunks(WORKFLOW_INSTANCE_UPSERT_BATCH_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                r#"
+                INSERT INTO workflow_instances (
+                    tenant_id,
+                    workflow_instance_id,
+                    workflow_id,
+                    run_id,
+                    definition_version,
+                    artifact_hash,
+                    status,
+                    event_count,
+                    last_event_id,
+                    last_event_type,
+                    updated_at,
+                    state
+                )
+                "#,
+            );
+            query.push_values(batch, |mut builder, persisted_state| {
+                builder
+                    .push_bind(&persisted_state.tenant_id)
+                    .push_bind(&persisted_state.instance_id)
+                    .push_bind(&persisted_state.definition_id)
+                    .push_bind(&persisted_state.run_id)
+                    .push_bind(persisted_state.definition_version.map(|version| version as i32))
+                    .push_bind(persisted_state.artifact_hash.as_deref())
+                    .push_bind(persisted_state.status.as_str())
+                    .push_bind(persisted_state.event_count)
+                    .push_bind(persisted_state.last_event_id)
+                    .push_bind(persisted_state.last_event_type.as_str())
+                    .push_bind(persisted_state.updated_at)
+                    .push_bind(Json(persisted_state));
+            });
+            query.push(
+                r#"
+                ON CONFLICT (tenant_id, workflow_instance_id)
+                DO UPDATE SET
+                    workflow_id = EXCLUDED.workflow_id,
+                    run_id = EXCLUDED.run_id,
+                    definition_version = EXCLUDED.definition_version,
+                    artifact_hash = EXCLUDED.artifact_hash,
+                    status = EXCLUDED.status,
+                    event_count = EXCLUDED.event_count,
+                    last_event_id = EXCLUDED.last_event_id,
+                    last_event_type = EXCLUDED.last_event_type,
+                    updated_at = EXCLUDED.updated_at,
+                    state = EXCLUDED.state
+                WHERE workflow_instances.event_count < EXCLUDED.event_count
+                   OR (
+                        workflow_instances.event_count = EXCLUDED.event_count
+                    AND workflow_instances.updated_at < EXCLUDED.updated_at
+                   )
+                   OR (
+                        workflow_instances.event_count = EXCLUDED.event_count
+                    AND workflow_instances.updated_at = EXCLUDED.updated_at
+                    AND workflow_instances.last_event_id <> EXCLUDED.last_event_id
+                   )
+                "#,
+            );
+            query
+                .build()
+                .execute(&self.pool)
+                .await
+                .context("failed to batch upsert workflow instances")?;
+        }
         Ok(())
     }
 
@@ -5115,12 +5416,14 @@ impl WorkflowStore {
                 trigger_event_id,
                 continued_event_id,
                 triggered_by_run_id,
+                execution_path,
+                fast_path_rejection_reason,
                 started_at,
                 closed_at,
                 updated_at
             )
             VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, NULL, $10, NULL, NULL, $11, NULL, $12, $13, NULL, $13
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, NULL, $10, NULL, NULL, $11, NULL, $12, $13, $14, $15, NULL, $15
             )
             ON CONFLICT (tenant_id, workflow_instance_id, run_id)
             DO UPDATE SET
@@ -5133,6 +5436,8 @@ impl WorkflowStore {
                 previous_run_id = EXCLUDED.previous_run_id,
                 trigger_event_id = EXCLUDED.trigger_event_id,
                 triggered_by_run_id = EXCLUDED.triggered_by_run_id,
+                execution_path = EXCLUDED.execution_path,
+                fast_path_rejection_reason = EXCLUDED.fast_path_rejection_reason,
                 started_at = EXCLUDED.started_at,
                 updated_at = EXCLUDED.updated_at
             "#,
@@ -5149,12 +5454,577 @@ impl WorkflowStore {
         .bind(previous_run_id)
         .bind(trigger_event_id)
         .bind(triggered_by_run_id)
+        .bind("")
+        .bind(Option::<&str>::None)
         .bind(started_at)
         .execute(&self.pool)
         .await
         .context("failed to persist workflow run start")?;
 
         Ok(())
+    }
+
+    pub async fn put_run_starts_batch(&self, records: &[WorkflowRunStartRecord]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        for batch in records.chunks(WORKFLOW_INSTANCE_UPSERT_BATCH_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                r#"
+                INSERT INTO workflow_runs (
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    workflow_id,
+                    definition_version,
+                    artifact_hash,
+                    workflow_task_queue,
+                    memo,
+                    search_attributes,
+                    sticky_workflow_build_id,
+                    sticky_workflow_poller_id,
+                    sticky_updated_at,
+                    previous_run_id,
+                    next_run_id,
+                    continue_reason,
+                    trigger_event_id,
+                    continued_event_id,
+                    triggered_by_run_id,
+                    execution_path,
+                    fast_path_rejection_reason,
+                    started_at,
+                    closed_at,
+                    updated_at
+                )
+                "#,
+            );
+            query.push_values(batch, |mut builder, record| {
+                builder
+                    .push_bind(&record.tenant_id)
+                    .push_bind(&record.instance_id)
+                    .push_bind(&record.run_id)
+                    .push_bind(&record.definition_id)
+                    .push_bind(record.definition_version.map(|version| version as i32))
+                    .push_bind(record.artifact_hash.as_deref())
+                    .push_bind(&record.workflow_task_queue)
+                    .push_bind(record.memo.as_ref().map(|value| Json(value.clone())))
+                    .push_bind(
+                        record.search_attributes.as_ref().map(|value| Json(value.clone())),
+                    )
+                    .push("NULL")
+                    .push("NULL")
+                    .push("NULL")
+                    .push_bind(record.previous_run_id.as_deref())
+                    .push("NULL")
+                    .push("NULL")
+                    .push_bind(record.trigger_event_id)
+                    .push("NULL")
+                    .push_bind(record.triggered_by_run_id.as_deref())
+                    .push_bind(record.execution_path.as_deref().unwrap_or_default())
+                    .push_bind(record.fast_path_rejection_reason.as_deref())
+                    .push_bind(record.started_at)
+                    .push("NULL")
+                    .push_bind(record.started_at);
+            });
+            query.push(
+                r#"
+                ON CONFLICT (tenant_id, workflow_instance_id, run_id)
+                DO UPDATE SET
+                    workflow_id = EXCLUDED.workflow_id,
+                    definition_version = EXCLUDED.definition_version,
+                    artifact_hash = EXCLUDED.artifact_hash,
+                    workflow_task_queue = EXCLUDED.workflow_task_queue,
+                    memo = EXCLUDED.memo,
+                    search_attributes = EXCLUDED.search_attributes,
+                    previous_run_id = EXCLUDED.previous_run_id,
+                    trigger_event_id = EXCLUDED.trigger_event_id,
+                    triggered_by_run_id = EXCLUDED.triggered_by_run_id,
+                    execution_path = EXCLUDED.execution_path,
+                    fast_path_rejection_reason = EXCLUDED.fast_path_rejection_reason,
+                    started_at = EXCLUDED.started_at,
+                    updated_at = EXCLUDED.updated_at
+                "#,
+            );
+            query
+                .build()
+                .execute(&self.pool)
+                .await
+                .context("failed to persist workflow run starts in batch")?;
+        }
+        Ok(())
+    }
+
+    pub async fn update_workflow_run_routing_metadata(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        execution_path: &str,
+        fast_path_rejection_reason: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE workflow_runs
+            SET execution_path = $4,
+                fast_path_rejection_reason = $5,
+                updated_at = GREATEST(updated_at, NOW())
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(execution_path)
+        .bind(fast_path_rejection_reason)
+        .execute(&self.pool)
+        .await
+        .context("failed to update workflow run routing metadata")?;
+        Ok(())
+    }
+
+    pub async fn update_workflow_run_routing_metadata_batch(
+        &self,
+        records: &[WorkflowRunRoutingMetadata],
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        for batch in records.chunks(WORKFLOW_INSTANCE_UPSERT_BATCH_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                r#"
+                UPDATE workflow_runs AS runs
+                SET execution_path = payload.execution_path,
+                    fast_path_rejection_reason = payload.fast_path_rejection_reason,
+                    updated_at = GREATEST(runs.updated_at, NOW())
+                FROM (
+                "#,
+            );
+            query.push_values(batch, |mut builder, record| {
+                builder
+                    .push_bind(&record.tenant_id)
+                    .push_bind(&record.instance_id)
+                    .push_bind(&record.run_id)
+                    .push_bind(&record.execution_path)
+                    .push_bind(record.fast_path_rejection_reason.as_deref());
+            });
+            query.push(
+                r#"
+                ) AS payload(
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    execution_path,
+                    fast_path_rejection_reason
+                )
+                WHERE runs.tenant_id = payload.tenant_id
+                  AND runs.workflow_instance_id = payload.workflow_instance_id
+                  AND runs.run_id = payload.run_id
+                "#,
+            );
+            query
+                .build()
+                .execute(&self.pool)
+                .await
+                .context("failed to update workflow run routing metadata in batch")?;
+        }
+        Ok(())
+    }
+
+    pub async fn upsert_workflow_fast_starts(
+        &self,
+        records: &[WorkflowFastStartRecord],
+    ) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        for batch in records.chunks(WORKFLOW_INSTANCE_UPSERT_BATCH_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                r#"
+                INSERT INTO workflow_fast_starts (
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    request_id,
+                    workflow_id,
+                    definition_version,
+                    artifact_hash,
+                    workflow_task_queue,
+                    mode,
+                    execution_path,
+                    status,
+                    input,
+                    memo,
+                    search_attributes,
+                    trigger_event_id,
+                    terminal_event_id,
+                    terminal_event_type,
+                    terminal_payload,
+                    accepted_at,
+                    completed_at,
+                    updated_at,
+                    fast_path_rejection_reason
+                )
+                "#,
+            );
+            query.push_values(batch, |mut builder, record| {
+                builder
+                    .push_bind(&record.tenant_id)
+                    .push_bind(&record.instance_id)
+                    .push_bind(&record.run_id)
+                    .push_bind(record.request_id.as_deref())
+                    .push_bind(&record.definition_id)
+                    .push_bind(i32::try_from(record.definition_version).expect("version fits i32"))
+                    .push_bind(&record.artifact_hash)
+                    .push_bind(&record.workflow_task_queue)
+                    .push_bind(record.mode.as_str())
+                    .push_bind(&record.execution_path)
+                    .push_bind(record.status.as_str())
+                    .push_bind(Json(&record.input))
+                    .push_bind(record.memo.as_ref().map(|value| Json(value.clone())))
+                    .push_bind(
+                        record.search_attributes.as_ref().map(|value| Json(value.clone())),
+                    )
+                    .push_bind(record.trigger_event_id)
+                    .push_bind(record.terminal_event_id)
+                    .push_bind(record.terminal_event_type.as_deref())
+                    .push_bind(record.terminal_payload.as_ref().map(|value| Json(value.clone())))
+                    .push_bind(record.accepted_at)
+                    .push_bind(record.completed_at)
+                    .push_bind(record.updated_at)
+                    .push_bind(record.fast_path_rejection_reason.as_deref());
+            });
+            query.push(
+                r#"
+                ON CONFLICT (tenant_id, workflow_instance_id, run_id)
+                DO UPDATE SET
+                    request_id = EXCLUDED.request_id,
+                    workflow_id = EXCLUDED.workflow_id,
+                    definition_version = EXCLUDED.definition_version,
+                    artifact_hash = EXCLUDED.artifact_hash,
+                    workflow_task_queue = EXCLUDED.workflow_task_queue,
+                    mode = EXCLUDED.mode,
+                    execution_path = EXCLUDED.execution_path,
+                    status = EXCLUDED.status,
+                    input = EXCLUDED.input,
+                    memo = EXCLUDED.memo,
+                    search_attributes = EXCLUDED.search_attributes,
+                    trigger_event_id = EXCLUDED.trigger_event_id,
+                    terminal_event_id = COALESCE(EXCLUDED.terminal_event_id, workflow_fast_starts.terminal_event_id),
+                    terminal_event_type = COALESCE(EXCLUDED.terminal_event_type, workflow_fast_starts.terminal_event_type),
+                    terminal_payload = COALESCE(EXCLUDED.terminal_payload, workflow_fast_starts.terminal_payload),
+                    accepted_at = EXCLUDED.accepted_at,
+                    completed_at = COALESCE(EXCLUDED.completed_at, workflow_fast_starts.completed_at),
+                    updated_at = EXCLUDED.updated_at,
+                    fast_path_rejection_reason = EXCLUDED.fast_path_rejection_reason
+                "#,
+            );
+            query
+                .build()
+                .execute(&self.pool)
+                .await
+                .context("failed to upsert workflow fast starts")?;
+        }
+        Ok(())
+    }
+
+    pub async fn mark_workflow_fast_starts_terminal(
+        &self,
+        updates: &[WorkflowFastStartTerminalUpdate],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        for batch in updates.chunks(WORKFLOW_INSTANCE_UPSERT_BATCH_SIZE) {
+            let mut query = QueryBuilder::<Postgres>::new(
+                r#"
+                UPDATE workflow_fast_starts AS fast
+                SET
+                    status = payload.status,
+                    terminal_event_id = payload.terminal_event_id,
+                    terminal_event_type = payload.terminal_event_type,
+                    terminal_payload = payload.terminal_payload,
+                    completed_at = payload.completed_at,
+                    updated_at = payload.completed_at
+                FROM (
+                "#,
+            );
+            query.push_values(batch, |mut builder, update| {
+                builder
+                    .push_bind(&update.tenant_id)
+                    .push_bind(&update.instance_id)
+                    .push_bind(&update.run_id)
+                    .push_bind(update.status.as_str())
+                    .push_bind(update.terminal_event_id)
+                    .push_bind(&update.terminal_event_type)
+                    .push_bind(Json(&update.terminal_payload))
+                    .push_bind(update.completed_at);
+            });
+            query.push(
+                r#"
+                ) AS payload(
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    status,
+                    terminal_event_id,
+                    terminal_event_type,
+                    terminal_payload,
+                    completed_at
+                )
+                WHERE fast.tenant_id = payload.tenant_id
+                  AND fast.workflow_instance_id = payload.workflow_instance_id
+                  AND fast.run_id = payload.run_id
+                "#,
+            );
+            query
+                .build()
+                .execute(&self.pool)
+                .await
+                .context("failed to mark workflow fast starts terminal")?;
+        }
+        Ok(())
+    }
+
+    pub async fn commit_inline_tiny_workflow_completion(
+        &self,
+        fast_start: &WorkflowFastStartRecord,
+        run_start: &WorkflowRunStartRecord,
+        instance: &WorkflowInstanceState,
+        terminal: &WorkflowFastStartTerminalUpdate,
+    ) -> Result<()> {
+        let mut persisted_instance = instance.clone();
+        persisted_instance.compact_for_persistence();
+        let mut tx = self.pool.begin().await.context("failed to begin tiny workflow transaction")?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO workflow_runs (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                workflow_id,
+                definition_version,
+                artifact_hash,
+                workflow_task_queue,
+                memo,
+                search_attributes,
+                sticky_workflow_build_id,
+                sticky_workflow_poller_id,
+                sticky_updated_at,
+                previous_run_id,
+                next_run_id,
+                continue_reason,
+                trigger_event_id,
+                continued_event_id,
+                triggered_by_run_id,
+                execution_path,
+                fast_path_rejection_reason,
+                started_at,
+                closed_at,
+                updated_at
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, NULL, $10, NULL, NULL, $11, NULL, $12, $13, $14, $15, NULL, $13
+            )
+            ON CONFLICT (tenant_id, workflow_instance_id, run_id)
+            DO UPDATE SET
+                workflow_id = EXCLUDED.workflow_id,
+                definition_version = EXCLUDED.definition_version,
+                artifact_hash = EXCLUDED.artifact_hash,
+                workflow_task_queue = EXCLUDED.workflow_task_queue,
+                memo = EXCLUDED.memo,
+                search_attributes = EXCLUDED.search_attributes,
+                previous_run_id = EXCLUDED.previous_run_id,
+                trigger_event_id = EXCLUDED.trigger_event_id,
+                triggered_by_run_id = EXCLUDED.triggered_by_run_id,
+                execution_path = EXCLUDED.execution_path,
+                fast_path_rejection_reason = EXCLUDED.fast_path_rejection_reason,
+                started_at = EXCLUDED.started_at,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(&run_start.tenant_id)
+        .bind(&run_start.instance_id)
+        .bind(&run_start.run_id)
+        .bind(&run_start.definition_id)
+        .bind(run_start.definition_version.map(|version| version as i32))
+        .bind(run_start.artifact_hash.as_deref())
+        .bind(&run_start.workflow_task_queue)
+        .bind(run_start.memo.as_ref().map(|value| Json(value.clone())))
+        .bind(run_start.search_attributes.as_ref().map(|value| Json(value.clone())))
+        .bind(run_start.previous_run_id.as_deref())
+        .bind(run_start.trigger_event_id)
+        .bind(run_start.triggered_by_run_id.as_deref())
+        .bind(run_start.execution_path.as_deref().unwrap_or_default())
+        .bind(run_start.fast_path_rejection_reason.as_deref())
+        .bind(run_start.started_at)
+        .execute(&mut *tx)
+        .await
+        .context("failed to persist tiny workflow run start")?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO workflow_instances (
+                tenant_id,
+                workflow_instance_id,
+                workflow_id,
+                run_id,
+                definition_version,
+                artifact_hash,
+                status,
+                event_count,
+                last_event_id,
+                last_event_type,
+                updated_at,
+                state
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            ON CONFLICT (tenant_id, workflow_instance_id)
+            DO UPDATE SET
+                workflow_id = EXCLUDED.workflow_id,
+                run_id = EXCLUDED.run_id,
+                definition_version = EXCLUDED.definition_version,
+                artifact_hash = EXCLUDED.artifact_hash,
+                status = EXCLUDED.status,
+                event_count = EXCLUDED.event_count,
+                last_event_id = EXCLUDED.last_event_id,
+                last_event_type = EXCLUDED.last_event_type,
+                updated_at = EXCLUDED.updated_at,
+                state = EXCLUDED.state
+            WHERE workflow_instances.event_count < EXCLUDED.event_count
+               OR (
+                    workflow_instances.event_count = EXCLUDED.event_count
+                AND workflow_instances.updated_at < EXCLUDED.updated_at
+               )
+               OR (
+                    workflow_instances.event_count = EXCLUDED.event_count
+                AND workflow_instances.updated_at = EXCLUDED.updated_at
+                AND workflow_instances.last_event_id <> EXCLUDED.last_event_id
+               )
+            "#,
+        )
+        .bind(&persisted_instance.tenant_id)
+        .bind(&persisted_instance.instance_id)
+        .bind(&persisted_instance.definition_id)
+        .bind(&persisted_instance.run_id)
+        .bind(persisted_instance.definition_version.map(|version| version as i32))
+        .bind(persisted_instance.artifact_hash.as_deref())
+        .bind(persisted_instance.status.as_str())
+        .bind(persisted_instance.event_count)
+        .bind(persisted_instance.last_event_id)
+        .bind(persisted_instance.last_event_type.as_str())
+        .bind(persisted_instance.updated_at)
+        .bind(Json(&persisted_instance))
+        .execute(&mut *tx)
+        .await
+        .context("failed to upsert tiny workflow instance")?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO workflow_fast_starts (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                request_id,
+                workflow_id,
+                definition_version,
+                artifact_hash,
+                workflow_task_queue,
+                mode,
+                execution_path,
+                status,
+                input,
+                memo,
+                search_attributes,
+                trigger_event_id,
+                terminal_event_id,
+                terminal_event_type,
+                terminal_payload,
+                accepted_at,
+                completed_at,
+                updated_at,
+                fast_path_rejection_reason
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $19, $20
+            )
+            ON CONFLICT (tenant_id, workflow_instance_id, run_id)
+            DO UPDATE SET
+                request_id = EXCLUDED.request_id,
+                workflow_id = EXCLUDED.workflow_id,
+                definition_version = EXCLUDED.definition_version,
+                artifact_hash = EXCLUDED.artifact_hash,
+                workflow_task_queue = EXCLUDED.workflow_task_queue,
+                mode = EXCLUDED.mode,
+                execution_path = EXCLUDED.execution_path,
+                status = EXCLUDED.status,
+                input = EXCLUDED.input,
+                memo = EXCLUDED.memo,
+                search_attributes = EXCLUDED.search_attributes,
+                trigger_event_id = EXCLUDED.trigger_event_id,
+                terminal_event_id = EXCLUDED.terminal_event_id,
+                terminal_event_type = EXCLUDED.terminal_event_type,
+                terminal_payload = EXCLUDED.terminal_payload,
+                accepted_at = EXCLUDED.accepted_at,
+                completed_at = EXCLUDED.completed_at,
+                updated_at = EXCLUDED.updated_at,
+                fast_path_rejection_reason = EXCLUDED.fast_path_rejection_reason
+            "#,
+        )
+        .bind(&fast_start.tenant_id)
+        .bind(&fast_start.instance_id)
+        .bind(&fast_start.run_id)
+        .bind(fast_start.request_id.as_deref())
+        .bind(&fast_start.definition_id)
+        .bind(i32::try_from(fast_start.definition_version).expect("version fits i32"))
+        .bind(&fast_start.artifact_hash)
+        .bind(&fast_start.workflow_task_queue)
+        .bind(fast_start.mode.as_str())
+        .bind(&fast_start.execution_path)
+        .bind(terminal.status.as_str())
+        .bind(Json(&fast_start.input))
+        .bind(fast_start.memo.as_ref().map(|value| Json(value.clone())))
+        .bind(fast_start.search_attributes.as_ref().map(|value| Json(value.clone())))
+        .bind(fast_start.trigger_event_id)
+        .bind(terminal.terminal_event_id)
+        .bind(&terminal.terminal_event_type)
+        .bind(Json(&terminal.terminal_payload))
+        .bind(fast_start.accepted_at)
+        .bind(terminal.completed_at)
+        .bind(fast_start.fast_path_rejection_reason.as_deref())
+        .execute(&mut *tx)
+        .await
+        .context("failed to upsert tiny workflow fast start")?;
+
+        tx.commit().await.context("failed to commit tiny workflow transaction")?;
+        Ok(())
+    }
+
+    pub async fn get_workflow_fast_start(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+    ) -> Result<Option<WorkflowFastStartRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT *
+            FROM workflow_fast_starts
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load workflow fast start")?;
+
+        row.map(Self::decode_workflow_fast_start_row).transpose()
     }
 
     pub async fn record_run_continuation(
@@ -5382,6 +6252,8 @@ impl WorkflowStore {
                 trigger_event_id,
                 continued_event_id,
                 triggered_by_run_id,
+                execution_path,
+                fast_path_rejection_reason,
                 started_at,
                 closed_at,
                 updated_at
@@ -5428,6 +6300,8 @@ impl WorkflowStore {
                     runs.previous_run_id,
                     runs.next_run_id,
                     runs.continue_reason,
+                    COALESCE(NULLIF(runs.execution_path, ''), 'unrecorded') AS execution_path,
+                    runs.fast_path_rejection_reason,
                     runs.started_at,
                     runs.closed_at,
                     runs.updated_at,
@@ -5479,6 +6353,8 @@ impl WorkflowStore {
                 previous_run_id,
                 next_run_id,
                 continue_reason,
+                execution_path,
+                fast_path_rejection_reason,
                 started_at,
                 closed_at,
                 updated_at,
@@ -5566,6 +6442,8 @@ impl WorkflowStore {
                 trigger_event_id,
                 continued_event_id,
                 triggered_by_run_id,
+                execution_path,
+                fast_path_rejection_reason,
                 started_at,
                 closed_at,
                 updated_at
@@ -8986,16 +9864,26 @@ impl WorkflowStore {
                 COUNT(*) FILTER (WHERE status = 'failed') AS failed,
                 COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled,
                 COUNT(*) FILTER (WHERE status = 'timed_out') AS timed_out,
-                AVG(EXTRACT(EPOCH FROM (started_at - scheduled_at)) * 1000)
-                    FILTER (WHERE started_at IS NOT NULL) AS avg_schedule_to_start_latency_ms,
-                MAX(EXTRACT(EPOCH FROM (started_at - scheduled_at)) * 1000)
-                    FILTER (WHERE started_at IS NOT NULL) AS max_schedule_to_start_latency_ms,
-                AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)
-                    FILTER (WHERE completed_at IS NOT NULL AND started_at IS NOT NULL)
-                    AS avg_start_to_close_latency_ms,
-                MAX(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)
-                    FILTER (WHERE completed_at IS NOT NULL AND started_at IS NOT NULL)
-                    AS max_start_to_close_latency_ms
+                COALESCE(
+                    AVG(EXTRACT(EPOCH FROM (started_at - scheduled_at)) * 1000)
+                        FILTER (WHERE started_at IS NOT NULL),
+                    0
+                )::DOUBLE PRECISION AS avg_schedule_to_start_latency_ms,
+                COALESCE(
+                    MAX(EXTRACT(EPOCH FROM (started_at - scheduled_at)) * 1000)
+                        FILTER (WHERE started_at IS NOT NULL),
+                    0
+                )::DOUBLE PRECISION AS max_schedule_to_start_latency_ms,
+                COALESCE(
+                    AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)
+                        FILTER (WHERE completed_at IS NOT NULL AND started_at IS NOT NULL),
+                    0
+                )::DOUBLE PRECISION AS avg_start_to_close_latency_ms,
+                COALESCE(
+                    MAX(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)
+                        FILTER (WHERE completed_at IS NOT NULL AND started_at IS NOT NULL),
+                    0
+                )::DOUBLE PRECISION AS max_start_to_close_latency_ms
             FROM workflow_activities
             WHERE tenant_id = $1 AND task_queue = $2
             "#,
@@ -9015,21 +9903,17 @@ impl WorkflowStore {
             timed_out: row.try_get::<i64, _>("timed_out").context("timed_out count missing")?
                 as u64,
             avg_schedule_to_start_latency_ms: row
-                .try_get::<Option<f64>, _>("avg_schedule_to_start_latency_ms")
-                .context("avg schedule-to-start latency missing")?
-                .unwrap_or(0.0),
+                .try_get::<f64, _>("avg_schedule_to_start_latency_ms")
+                .context("avg schedule-to-start latency missing")?,
             max_schedule_to_start_latency_ms: row
-                .try_get::<Option<f64>, _>("max_schedule_to_start_latency_ms")
-                .context("max schedule-to-start latency missing")?
-                .unwrap_or(0.0) as u64,
+                .try_get::<f64, _>("max_schedule_to_start_latency_ms")
+                .context("max schedule-to-start latency missing")? as u64,
             avg_start_to_close_latency_ms: row
-                .try_get::<Option<f64>, _>("avg_start_to_close_latency_ms")
-                .context("avg start-to-close latency missing")?
-                .unwrap_or(0.0),
+                .try_get::<f64, _>("avg_start_to_close_latency_ms")
+                .context("avg start-to-close latency missing")?,
             max_start_to_close_latency_ms: row
-                .try_get::<Option<f64>, _>("max_start_to_close_latency_ms")
-                .context("max start-to-close latency missing")?
-                .unwrap_or(0.0) as u64,
+                .try_get::<f64, _>("max_start_to_close_latency_ms")
+                .context("max start-to-close latency missing")? as u64,
         }))
     }
 
@@ -13089,6 +13973,7 @@ impl WorkflowStore {
                 artifact_hash,
                 batch_id,
                 throughput_backend,
+                execution_path,
                 status,
                 command_dedupe_key,
                 command,
@@ -13099,7 +13984,7 @@ impl WorkflowStore {
                 updated_at
             )
             VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
             )
             ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id)
             DO UPDATE SET
@@ -13107,6 +13992,7 @@ impl WorkflowStore {
                 workflow_version = EXCLUDED.workflow_version,
                 artifact_hash = EXCLUDED.artifact_hash,
                 throughput_backend = EXCLUDED.throughput_backend,
+                execution_path = EXCLUDED.execution_path,
                 command_dedupe_key = EXCLUDED.command_dedupe_key,
                 command = EXCLUDED.command,
                 command_published_at =
@@ -13124,6 +14010,7 @@ impl WorkflowStore {
         .bind(&run.artifact_hash)
         .bind(&run.batch_id)
         .bind(&run.throughput_backend)
+        .bind(&run.execution_path)
         .bind(&run.status)
         .bind(&run.command_dedupe_key)
         .bind(Json(&run.command))
@@ -16105,9 +16992,82 @@ impl WorkflowStore {
             triggered_by_run_id: row
                 .try_get("triggered_by_run_id")
                 .context("run triggered_by_run_id missing")?,
+            execution_path: row
+                .try_get("execution_path")
+                .context("run execution_path missing")?,
+            fast_path_rejection_reason: row
+                .try_get("fast_path_rejection_reason")
+                .context("run fast_path_rejection_reason missing")?,
             started_at: row.try_get("started_at").context("run started_at missing")?,
             closed_at: row.try_get("closed_at").context("run closed_at missing")?,
             updated_at: row.try_get("updated_at").context("run updated_at missing")?,
+        })
+    }
+
+    fn decode_workflow_fast_start_row(
+        row: sqlx::postgres::PgRow,
+    ) -> Result<WorkflowFastStartRecord> {
+        Ok(WorkflowFastStartRecord {
+            tenant_id: row.try_get("tenant_id").context("workflow_fast_starts.tenant_id")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("workflow_fast_starts.workflow_instance_id")?,
+            run_id: row.try_get("run_id").context("workflow_fast_starts.run_id")?,
+            request_id: row.try_get("request_id").context("workflow_fast_starts.request_id")?,
+            definition_id: row.try_get("workflow_id").context("workflow_fast_starts.workflow_id")?,
+            definition_version: row
+                .try_get::<i32, _>("definition_version")
+                .context("workflow_fast_starts.definition_version")?
+                as u32,
+            artifact_hash: row
+                .try_get("artifact_hash")
+                .context("workflow_fast_starts.artifact_hash")?,
+            workflow_task_queue: row
+                .try_get("workflow_task_queue")
+                .context("workflow_fast_starts.workflow_task_queue")?,
+            mode: WorkflowFastStartMode::from_db(
+                &row.try_get::<String, _>("mode").context("workflow_fast_starts.mode")?,
+            )?,
+            execution_path: row
+                .try_get("execution_path")
+                .context("workflow_fast_starts.execution_path")?,
+            status: WorkflowFastStartStatus::from_db(
+                &row.try_get::<String, _>("status").context("workflow_fast_starts.status")?,
+            )?,
+            input: row
+                .try_get::<Json<Value>, _>("input")
+                .context("workflow_fast_starts.input")?
+                .0,
+            memo: row.try_get::<Option<Json<Value>>, _>("memo").context("workflow_fast_starts.memo")?.map(|v| v.0),
+            search_attributes: row
+                .try_get::<Option<Json<Value>>, _>("search_attributes")
+                .context("workflow_fast_starts.search_attributes")?
+                .map(|v| v.0),
+            trigger_event_id: row
+                .try_get("trigger_event_id")
+                .context("workflow_fast_starts.trigger_event_id")?,
+            terminal_event_id: row
+                .try_get("terminal_event_id")
+                .context("workflow_fast_starts.terminal_event_id")?,
+            terminal_event_type: row
+                .try_get("terminal_event_type")
+                .context("workflow_fast_starts.terminal_event_type")?,
+            terminal_payload: row
+                .try_get::<Option<Json<Value>>, _>("terminal_payload")
+                .context("workflow_fast_starts.terminal_payload")?
+                .map(|v| v.0),
+            accepted_at: row
+                .try_get("accepted_at")
+                .context("workflow_fast_starts.accepted_at")?,
+            completed_at: row
+                .try_get("completed_at")
+                .context("workflow_fast_starts.completed_at")?,
+            updated_at: row
+                .try_get("updated_at")
+                .context("workflow_fast_starts.updated_at")?,
+            fast_path_rejection_reason: row
+                .try_get("fast_path_rejection_reason")
+                .context("workflow_fast_starts.fast_path_rejection_reason")?,
         })
     }
 
@@ -16149,6 +17109,12 @@ impl WorkflowStore {
             continue_reason: row
                 .try_get("continue_reason")
                 .context("run summary continue_reason missing")?,
+            execution_path: row
+                .try_get("execution_path")
+                .context("run summary execution_path missing")?,
+            fast_path_rejection_reason: row
+                .try_get("fast_path_rejection_reason")
+                .context("run summary fast_path_rejection_reason missing")?,
             started_at: row.try_get("started_at").context("run summary started_at missing")?,
             closed_at: row.try_get("closed_at").context("run summary closed_at missing")?,
             updated_at: row.try_get("updated_at").context("run summary updated_at missing")?,
@@ -17149,6 +18115,9 @@ impl WorkflowStore {
             throughput_backend: row
                 .try_get("throughput_backend")
                 .context("throughput run throughput_backend missing")?,
+            execution_path: row
+                .try_get("execution_path")
+                .context("throughput run execution_path missing")?,
             status: row.try_get("status").context("throughput run status missing")?,
             command_dedupe_key: row
                 .try_get("command_dedupe_key")
@@ -17669,6 +18638,7 @@ mod tests {
             CompiledWorkflow {
                 initial_state: "done".to_owned(),
                 states,
+                async_helpers: BTreeMap::new(),
                 params: Vec::new(),
                 non_cancellable_states: BTreeSet::new(),
             },
@@ -19935,6 +20905,7 @@ mod tests {
                 artifact_hash: Some("artifact-a".to_owned()),
                 batch_id: "batch-a".to_owned(),
                 throughput_backend: "stream-v2".to_owned(),
+                execution_path: "native_stream_v2".to_owned(),
                 status: "scheduled".to_owned(),
                 command_dedupe_key: command.dedupe_key.clone(),
                 command: command.clone(),
@@ -20189,6 +21160,7 @@ mod tests {
                 artifact_hash: Some("artifact-a".to_owned()),
                 batch_id: "batch-a".to_owned(),
                 throughput_backend: "stream-v2".to_owned(),
+                execution_path: "native_stream_v2".to_owned(),
                 status: "running".to_owned(),
                 command_dedupe_key: command.dedupe_key.clone(),
                 command,

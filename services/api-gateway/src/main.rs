@@ -269,6 +269,7 @@ fn build_app(state: AppState, service_name: String) -> Router {
     .route("/tenants/{tenant_id}/workflows", get(proxy_to_query_get))
     .route("/tenants/{tenant_id}/runs", get(proxy_to_query_get))
     .route("/workflows/{workflow_id}/trigger", post(proxy_to_ingest))
+    .route("/workflows/{workflow_id}/trigger-batch", post(proxy_to_ingest))
     .route(
         "/tenants/{tenant_id}/workflows/{workflow_instance_id}/signals/{signal_type}",
         post(proxy_to_ingest),
@@ -660,20 +661,19 @@ async fn get_task_queue_inspection(
     let queue_kind = parse_queue_kind(&queue_kind)?;
     let inspection = state
         .store
-        .inspect_task_queue(&tenant_id, queue_kind, &task_queue, Utc::now())
+        .inspect_task_queue(&tenant_id, queue_kind.clone(), &task_queue, Utc::now())
         .await
         .map_err(internal_error)?;
     let persisted_backend =
         inspection.throughput_policy.as_ref().map(|policy| policy.backend.clone());
     let mut payload = serde_json::to_value(inspection).expect("inspection serializes");
-    let admission = task_queue_admission_snapshot(
-        &state,
-        &tenant_id,
-        &task_queue,
-        persisted_backend.as_deref(),
-    )
-    .await
-    .map_err(internal_error)?;
+    let admission = if matches!(queue_kind, TaskQueueKind::Workflow) {
+        task_queue_admission_snapshot(&state, &tenant_id, &task_queue, persisted_backend.as_deref())
+            .await
+            .map_err(internal_error)?
+    } else {
+        Value::Null
+    };
     payload["admission"] = admission;
     payload["watch_cursor"] = Value::String(Utc::now().to_rfc3339());
     Ok(Json(payload))
@@ -697,14 +697,18 @@ async fn list_task_queues(
             )
             .await
             .map_err(internal_error)?;
-        let admission = task_queue_admission_snapshot(
-            &state,
-            &tenant_id,
-            &inspection.task_queue,
-            inspection.throughput_policy.as_ref().map(|policy| policy.backend.as_str()),
-        )
-        .await
-        .map_err(internal_error)?;
+        let admission = if matches!(inspection.queue_kind, TaskQueueKind::Workflow) {
+            task_queue_admission_snapshot(
+                &state,
+                &tenant_id,
+                &inspection.task_queue,
+                inspection.throughput_policy.as_ref().map(|policy| policy.backend.as_str()),
+            )
+            .await
+            .map_err(internal_error)?
+        } else {
+            Value::Null
+        };
         items.push(json!({
             "tenant_id": inspection.tenant_id,
             "queue_kind": queue_kind_label(&inspection.queue_kind),

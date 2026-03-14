@@ -173,7 +173,18 @@ function collectImportInfo(sourceFile) {
     }
     const moduleName = statement.moduleSpecifier.text;
     const bindings = statement.importClause.namedBindings;
-    if (!bindings || !ts.isNamedImports(bindings)) {
+    if (!bindings) {
+      continue;
+    }
+    if (ts.isNamespaceImport(bindings)) {
+      const localName = bindings.name.text;
+      if (moduleName === "@temporalio/workflow") workflowImports.set(localName, "*");
+      if (moduleName === "@temporalio/worker") workerImports.set(localName, "*");
+      if (moduleName === "@temporalio/client") clientImports.set(localName, "*");
+      if (moduleName === "@temporalio/common") commonImports.set(localName, "*");
+      continue;
+    }
+    if (!ts.isNamedImports(bindings)) {
       continue;
     }
     for (const element of bindings.elements) {
@@ -187,6 +198,20 @@ function collectImportInfo(sourceFile) {
   }
 
   return { workflowImports, workerImports, clientImports, commonImports };
+}
+
+function resolveImportedTemporalName(expression, importMap) {
+  if (ts.isIdentifier(expression)) {
+    return importMap.get(expression.text) ?? null;
+  }
+  if (
+    ts.isPropertyAccessExpression(expression) &&
+    ts.isIdentifier(expression.expression) &&
+    importMap.get(expression.expression.text) === "*"
+  ) {
+    return expression.name.text;
+  }
+  return null;
 }
 
 function findStaticString(expression, bindings = null, checker = null) {
@@ -639,6 +664,12 @@ function evaluateStaticValue(node, bindings, checker = null, seen = new Set()) {
   if (isFileUrlToPathCall(node) && node.arguments.length === 1) {
     const value = evaluateStaticValue(node.arguments[0], bindings, checker, seen);
     return typeof value === "string" ? value : undefined;
+  }
+  if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === "getenv") {
+    if (node.arguments.length >= 2) {
+      return evaluateStaticValue(node.arguments[1], bindings, checker, seen);
+    }
+    return undefined;
   }
   if (
     ts.isNewExpression(node) &&
@@ -1179,8 +1210,7 @@ function collectWorkflowOptionAnnotations(sourceFile, workflowImports) {
     if (
       !ts.isExpressionStatement(statement) ||
       !ts.isCallExpression(statement.expression) ||
-      !ts.isIdentifier(statement.expression.expression) ||
-      workflowImports.get(statement.expression.expression.text) !== "setWorkflowOptions" ||
+      resolveImportedTemporalName(statement.expression.expression, workflowImports) !== "setWorkflowOptions" ||
       statement.expression.arguments.length !== 2
     ) {
       continue;
@@ -1288,6 +1318,10 @@ async function main() {
     const fileUses = new Set();
 
     for (const [localName, importedName] of workflowImports) {
+      if (importedName === "*") {
+        temporalImports.push(`@temporalio/workflow:* as ${localName}`);
+        continue;
+      }
       temporalImports.push(`@temporalio/workflow:${importedName} as ${localName}`);
       if (WORKFLOW_SUPPORTED_IMPORTS.has(importedName)) {
         if (importedName === "proxyActivities" || importedName === "proxyLocalActivities") {
@@ -1359,9 +1393,9 @@ async function main() {
           ? createSourceBindings(scopeBindings, node, projectRoot, program)
           : ts.isBlock(node) || ts.isModuleBlock(node)
             ? createScopeBindings(scopeBindings, node)
-          : scopeBindings;
-      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
-        const importedWorkflowName = workflowImports.get(node.expression.text);
+            : scopeBindings;
+      if (ts.isCallExpression(node)) {
+        const importedWorkflowName = resolveImportedTemporalName(node.expression, workflowImports);
         if (importedWorkflowName === "proxyActivities" || importedWorkflowName === "proxyLocalActivities") {
           fileUses.add("proxy_activities");
           fileUses.add("activity_options_and_retries");
@@ -1620,8 +1654,8 @@ async function main() {
         }
       }
 
-      if (ts.isPropertyAccessExpression(node) && ts.isIdentifier(node.expression)) {
-        if (workflowImports.get(node.expression.text) === "CancellationScope") {
+      if (ts.isPropertyAccessExpression(node)) {
+        if (resolveImportedTemporalName(node, workflowImports) === "CancellationScope") {
           fileUses.add("cancellation_scopes");
         }
       }

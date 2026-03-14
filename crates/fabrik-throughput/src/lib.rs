@@ -38,8 +38,75 @@ pub const BULK_REDUCER_ERROR_SAMPLE_LIMIT: usize = 8;
 pub const DEFAULT_AGGREGATION_GROUP_COUNT: u32 = 1;
 pub const DEFAULT_GROUP_ID: u32 = 0;
 pub const INITIAL_OWNER_EPOCH: u64 = 1;
+pub const TINY_WORKFLOW_MAX_ITEMS: usize = 32;
 const REDUCTION_GROUP_LEVEL_SHIFT: u32 = 24;
 const REDUCTION_GROUP_SLOT_MASK: u32 = (1 << REDUCTION_GROUP_LEVEL_SHIFT) - 1;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowExecutionPath {
+    TinyWorkflowEngine,
+    NativeStreamV2,
+    LegacyWorkflow,
+}
+
+impl WorkflowExecutionPath {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::TinyWorkflowEngine => "tiny_workflow_engine",
+            Self::NativeStreamV2 => "native_stream_v2",
+            Self::LegacyWorkflow => "legacy_workflow",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum FastPathRejectionReason {
+    NotTinyWorkflow,
+    UnsupportedReducer,
+    UnsupportedActivity,
+    RetriesRequired,
+    UnsupportedBackend,
+    RequiresInteractiveFeatures,
+}
+
+impl FastPathRejectionReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotTinyWorkflow => "not_tiny_workflow",
+            Self::UnsupportedReducer => "unsupported_reducer",
+            Self::UnsupportedActivity => "unsupported_activity",
+            Self::RetriesRequired => "retries_required",
+            Self::UnsupportedBackend => "unsupported_backend",
+            Self::RequiresInteractiveFeatures => "requires_interactive_features",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorizedBulkActivityCapability {
+    None,
+    PayloadlessTransport,
+    TinyInlineCompletion,
+}
+
+impl VectorizedBulkActivityCapability {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::PayloadlessTransport => "payloadless_transport",
+            Self::TinyInlineCompletion => "tiny_inline_completion",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TinyWorkflowRoutingDecision {
+    pub execution_path: WorkflowExecutionPath,
+    pub execution_mode: TinyWorkflowExecutionMode,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -142,10 +209,15 @@ pub fn can_use_payloadless_benchmark_transport(
     max_attempts: u32,
     items: &[Value],
 ) -> bool {
-    if activity_type == BENCHMARK_FAST_COUNT_ACTIVITY {
+    if vectorized_bulk_activity_capability(activity_type)
+        == VectorizedBulkActivityCapability::TinyInlineCompletion
+    {
         return true;
     }
-    if activity_type != BENCHMARK_ECHO_ACTIVITY || max_attempts > 1 {
+    if vectorized_bulk_activity_capability(activity_type)
+        != VectorizedBulkActivityCapability::PayloadlessTransport
+        || max_attempts > 1
+    {
         return false;
     }
     if bulk_reducer_requires_success_outputs(reducer)
@@ -174,10 +246,96 @@ pub fn can_complete_payloadless_benchmark_chunk(
     if cancellation_requested || !omit_success_output || item_count == 0 {
         return false;
     }
-    if activity_type == BENCHMARK_FAST_COUNT_ACTIVITY {
+    if vectorized_bulk_activity_capability(activity_type)
+        == VectorizedBulkActivityCapability::TinyInlineCompletion
+    {
         return true;
     }
-    activity_type == BENCHMARK_ECHO_ACTIVITY && !has_inline_items && !has_input_handle
+    vectorized_bulk_activity_capability(activity_type)
+        == VectorizedBulkActivityCapability::PayloadlessTransport
+        && !has_inline_items
+        && !has_input_handle
+}
+
+pub fn can_inline_stream_v2_microbatch(
+    activity_type: &str,
+    reducer: Option<&str>,
+    max_attempts: u32,
+    items: &[Value],
+    total_items: usize,
+    chunk_count: u32,
+) -> bool {
+    chunk_count == 1
+        && total_items > 0
+        && total_items <= TINY_WORKFLOW_MAX_ITEMS
+        && matches!(reducer.unwrap_or(BULK_REDUCER_COLLECT_RESULTS), BULK_REDUCER_ALL_SETTLED | BULK_REDUCER_COUNT)
+        && can_use_payloadless_benchmark_transport(activity_type, reducer, max_attempts, items)
+}
+
+pub fn can_inline_durable_tiny_fanout(
+    activity_type: &str,
+    reducer: Option<&str>,
+    max_attempts: u32,
+    items: &[Value],
+) -> bool {
+    !items.is_empty()
+        && items.len() <= TINY_WORKFLOW_MAX_ITEMS
+        && matches!(reducer.unwrap_or(BULK_REDUCER_COLLECT_RESULTS), BULK_REDUCER_ALL_SETTLED | BULK_REDUCER_COUNT)
+        && can_use_payloadless_benchmark_transport(activity_type, reducer, max_attempts, items)
+}
+
+pub fn vectorized_bulk_activity_capability(
+    activity_type: &str,
+) -> VectorizedBulkActivityCapability {
+    match activity_type {
+        BENCHMARK_FAST_COUNT_ACTIVITY => VectorizedBulkActivityCapability::TinyInlineCompletion,
+        BENCHMARK_ECHO_ACTIVITY => VectorizedBulkActivityCapability::PayloadlessTransport,
+        _ => VectorizedBulkActivityCapability::None,
+    }
+}
+
+pub fn tiny_workflow_routing_decision(
+    activity_type: &str,
+    reducer: Option<&str>,
+    throughput_backend: Option<&str>,
+    max_attempts: u32,
+    items: &[Value],
+    total_items: usize,
+    chunk_count: u32,
+) -> std::result::Result<TinyWorkflowRoutingDecision, FastPathRejectionReason> {
+    if max_attempts > 1 {
+        return Err(FastPathRejectionReason::RetriesRequired);
+    }
+    if !matches!(bulk_reducer_name(reducer), BULK_REDUCER_ALL_SETTLED | BULK_REDUCER_COUNT) {
+        return Err(FastPathRejectionReason::UnsupportedReducer);
+    }
+    if vectorized_bulk_activity_capability(activity_type) == VectorizedBulkActivityCapability::None {
+        return Err(FastPathRejectionReason::UnsupportedActivity);
+    }
+    if total_items == 0 || total_items > TINY_WORKFLOW_MAX_ITEMS {
+        return Err(FastPathRejectionReason::NotTinyWorkflow);
+    }
+    if let Some(backend) = throughput_backend {
+        if backend != STREAM_V2_BACKEND {
+            return Err(FastPathRejectionReason::UnsupportedBackend);
+        }
+        if chunk_count != 1
+            || !can_use_payloadless_benchmark_transport(activity_type, reducer, max_attempts, items)
+        {
+            return Err(FastPathRejectionReason::NotTinyWorkflow);
+        }
+        return Ok(TinyWorkflowRoutingDecision {
+            execution_path: WorkflowExecutionPath::TinyWorkflowEngine,
+            execution_mode: TinyWorkflowExecutionMode::Throughput,
+        });
+    }
+    if !can_use_payloadless_benchmark_transport(activity_type, reducer, max_attempts, items) {
+        return Err(FastPathRejectionReason::NotTinyWorkflow);
+    }
+    Ok(TinyWorkflowRoutingDecision {
+        execution_path: WorkflowExecutionPath::TinyWorkflowEngine,
+        execution_mode: TinyWorkflowExecutionMode::Durable,
+    })
 }
 
 pub fn benchmark_echo_item_requires_output(item: &Value) -> bool {
@@ -641,6 +799,58 @@ pub struct ThroughputBatchIdentity {
     pub batch_id: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TinyWorkflowExecutionMode {
+    Throughput,
+    Durable,
+}
+
+impl TinyWorkflowExecutionMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Throughput => "throughput",
+            Self::Durable => "durable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TinyWorkflowStartItem {
+    pub instance_id: String,
+    pub run_id: String,
+    pub request_id: Option<String>,
+    pub trigger_event_id: Uuid,
+    pub accepted_at: DateTime<Utc>,
+    pub input: Value,
+    pub memo: Option<Value>,
+    pub search_attributes: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TinyWorkflowStartCommand {
+    pub dedupe_key: String,
+    pub tenant_id: String,
+    pub definition_id: String,
+    pub definition_version: u32,
+    pub artifact_hash: String,
+    pub workflow_task_queue: String,
+    pub execution_mode: TinyWorkflowExecutionMode,
+    pub item: TinyWorkflowStartItem,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TinyWorkflowStartBatchCommand {
+    pub dedupe_key: String,
+    pub tenant_id: String,
+    pub definition_id: String,
+    pub definition_version: u32,
+    pub artifact_hash: String,
+    pub workflow_task_queue: String,
+    pub execution_mode: TinyWorkflowExecutionMode,
+    pub items: Vec<TinyWorkflowStartItem>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StartThroughputRunCommand {
     pub dedupe_key: String,
@@ -734,6 +944,8 @@ impl CreateBatchCommand {
 pub enum ThroughputCommand {
     StartThroughputRun(StartThroughputRunCommand),
     CreateBatch(CreateBatchCommand),
+    TinyWorkflowStart(TinyWorkflowStartCommand),
+    TinyWorkflowStartBatch(TinyWorkflowStartBatchCommand),
     CancelBatch { identity: ThroughputBatchIdentity, reason: String },
     TimeoutBatch { identity: ThroughputBatchIdentity, reason: String },
     ReplanGroups { identity: ThroughputBatchIdentity, aggregation_group_count: u32 },

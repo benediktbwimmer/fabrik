@@ -242,9 +242,6 @@ service_binary_for() {
 matching_service_pids() {
   local binary
   binary="$(service_binary_for "$1")"
-  if [[ "$1" == "activity-worker-service" || "$1" == "activity-worker-service-stream-v2" ]]; then
-    return 0
-  fi
   pgrep -f "$binary" || true
 }
 

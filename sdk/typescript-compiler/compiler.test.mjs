@@ -1395,6 +1395,29 @@ test("compiler emits real compiled signal handler graphs for async Temporal sign
   assert.match(serializedSignals, /"output_var":"echoed"/);
 });
 
+test("compiler lowers void mutating collection calls inside Temporal signal handlers", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-void-push-signal-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalVoidPushSignalWorkflow",
+    "--definition-id",
+    "temporal-void-push-signal-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serializedSignals = JSON.stringify(artifact.signals);
+
+  assert.ok(artifact.signals.addItem);
+  assert.match(serializedSignals, /"type":"assign"/);
+  assert.match(serializedSignals, /"callee":"__builtin_array_append"/);
+});
+
 test("compiler lowers awaited reassignment statements", async () => {
   const fixture = path.join(
     root,

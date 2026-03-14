@@ -2004,6 +2004,32 @@ function compileMutatingCollectionAction(callExpression) {
   }
   const receiver = callExpression.expression.expression;
   const method = callExpression.expression.name.text;
+  if (ts.isIdentifier(receiver) && method === "push" && callExpression.arguments.length === 1) {
+    return {
+      target: receiver.text,
+      expr: {
+        kind: "call",
+        callee: "__builtin_array_append",
+        args: [
+          { kind: "identifier", name: receiver.text },
+          compileExpression(callExpression.arguments[0]),
+        ],
+      },
+    };
+  }
+  if (ts.isIdentifier(receiver) && method === "unshift" && callExpression.arguments.length === 1) {
+    return {
+      target: receiver.text,
+      expr: {
+        kind: "call",
+        callee: "__builtin_array_prepend",
+        args: [
+          { kind: "identifier", name: receiver.text },
+          compileExpression(callExpression.arguments[0]),
+        ],
+      },
+    };
+  }
   if (ts.isIdentifier(receiver) && method === "set" && callExpression.arguments.length === 2) {
     return {
       target: receiver.text,
@@ -2267,6 +2293,7 @@ function compileArrayUnshiftAction(statement, callExpression) {
 }
 
 function resolveArrayShiftCall(callExpression) {
+  callExpression = unwrapExpressionWrappers(callExpression);
   if (
     !ts.isPropertyAccessExpression(callExpression.expression) ||
     callExpression.expression.name.text !== "shift" ||
@@ -2378,7 +2405,7 @@ function tryCompileSignalHandlerActions(handler) {
   }
 }
 
-function compileExpression(expression) {
+function unwrapExpressionWrappers(expression) {
   while (
     ts.isParenthesizedExpression(expression) ||
     ts.isAsExpression(expression) ||
@@ -2388,6 +2415,11 @@ function compileExpression(expression) {
   ) {
     expression = expression.expression;
   }
+  return expression;
+}
+
+function compileExpression(expression) {
+  expression = unwrapExpressionWrappers(expression);
   assertAllowedRootIdentifier(expression);
   if (ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)) {
     return { kind: "literal", value: expression.text };
@@ -2918,6 +2950,12 @@ function compileExpression(expression) {
       );
     }
     if (ts.isIdentifier(expression.expression)) {
+      if (expression.expression.text === "Array") {
+        if (expression.arguments.length !== 0) {
+          throw compilerError(`Array() currently supports only the zero-argument form`, expression);
+        }
+        return { kind: "array", items: [] };
+      }
       if (expression.expression.text === "String") {
         if (expression.arguments.length !== 1) {
           throw compilerError(`String() requires exactly one argument`, expression);
@@ -4399,50 +4437,52 @@ class WorkflowLowerer {
       if (
         declarations.length === 1 &&
         ts.isIdentifier(declarations[0].name) &&
-        declarations[0].initializer &&
-        ts.isCallExpression(declarations[0].initializer)
+        declarations[0].initializer
       ) {
-        const scopeCall = this.parseTemporalCancellationScopeCall(declarations[0].initializer);
-        if (scopeCall) {
-          this.inlineAsyncResultVars.add(declarations[0].name.text);
-          return this.lowerTemporalCancellationScope(
-            scopeCall,
-            declarations[0].name.text,
-            nextState,
-            errorTarget,
-            declarations[0].initializer,
-          );
-        }
-        const backgroundHandle = this.resolveBackgroundHandleInitializer(declarations[0].initializer);
-        if (backgroundHandle) {
-          const handleName = declarations[0].name.text;
-          if (backgroundHandle.kind === "timer") {
-            this.timerHandleVars.add(handleName);
+        const initializer = unwrapExpressionWrappers(declarations[0].initializer);
+        if (ts.isCallExpression(initializer)) {
+          const scopeCall = this.parseTemporalCancellationScopeCall(initializer);
+          if (scopeCall) {
+            this.inlineAsyncResultVars.add(declarations[0].name.text);
+            return this.lowerTemporalCancellationScope(
+              scopeCall,
+              declarations[0].name.text,
+              nextState,
+              errorTarget,
+              declarations[0].initializer,
+            );
+          }
+          const backgroundHandle = this.resolveBackgroundHandleInitializer(initializer);
+          if (backgroundHandle) {
+            const handleName = declarations[0].name.text;
+            if (backgroundHandle.kind === "timer") {
+              this.timerHandleVars.add(handleName);
+              if (backgroundHandle.scopeVar) {
+                const handles = this.scopeHandleVars.get(backgroundHandle.scopeVar) ?? new Set();
+                handles.add(handleName);
+                this.scopeHandleVars.set(backgroundHandle.scopeVar, handles);
+              }
+              return this.addState("start_timer_handle", {
+                type: "start_timer_handle",
+                ...backgroundHandle.timer,
+                handle_var: handleName,
+                next: nextState,
+              }, declarations[0].initializer);
+            }
+            this.stepHandleVars.add(handleName);
             if (backgroundHandle.scopeVar) {
               const handles = this.scopeHandleVars.get(backgroundHandle.scopeVar) ?? new Set();
               handles.add(handleName);
               this.scopeHandleVars.set(backgroundHandle.scopeVar, handles);
             }
-            return this.addState("start_timer_handle", {
-              type: "start_timer_handle",
-              ...backgroundHandle.timer,
+            return this.addState("start_step_handle", {
+              type: "start_step_handle",
+              descriptor: backgroundHandle.descriptor,
               handle_var: handleName,
               next: nextState,
+              completion_actions: backgroundHandle.completionActions,
             }, declarations[0].initializer);
           }
-          this.stepHandleVars.add(handleName);
-          if (backgroundHandle.scopeVar) {
-            const handles = this.scopeHandleVars.get(backgroundHandle.scopeVar) ?? new Set();
-            handles.add(handleName);
-            this.scopeHandleVars.set(backgroundHandle.scopeVar, handles);
-          }
-          return this.addState("start_step_handle", {
-            type: "start_step_handle",
-            descriptor: backgroundHandle.descriptor,
-            handle_var: handleName,
-            next: nextState,
-            completion_actions: backgroundHandle.completionActions,
-          }, declarations[0].initializer);
         }
         const shiftedArray = resolveArrayShiftCall(declarations[0].initializer);
         if (shiftedArray) {
@@ -4529,6 +4569,16 @@ class WorkflowLowerer {
         ts.isCallExpression(statement.expression.expression)
       ) {
         const mutatingCollectionAction = compileMutatingCollectionAction(statement.expression.expression);
+        if (mutatingCollectionAction) {
+          return this.addState("assign", {
+            type: "assign",
+            actions: [mutatingCollectionAction],
+            next: nextState,
+          }, statement);
+        }
+      }
+      if (ts.isCallExpression(statement.expression)) {
+        const mutatingCollectionAction = compileMutatingCollectionAction(statement.expression);
         if (mutatingCollectionAction) {
           return this.addState("assign", {
             type: "assign",

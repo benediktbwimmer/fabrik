@@ -133,11 +133,6 @@ wait_for_temporal_namespace() {
 
 ensure_temporal_namespace() {
   local namespace=$1
-  if [[ "$namespace" == "default" ]]; then
-    wait_for_temporal_namespace "$namespace" 120
-    return 0
-  fi
-
   if ! docker exec "$TEMPORAL_CONTAINER" \
     temporal operator namespace describe \
     --address temporal:7233 \

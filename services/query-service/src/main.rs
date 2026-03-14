@@ -235,6 +235,8 @@ struct WorkflowListItem {
     sticky_workflow_build_id: Option<String>,
     sticky_workflow_poller_id: Option<String>,
     routing_status: String,
+    execution_path: Option<String>,
+    fast_path_rejection_reason: Option<String>,
     current_state: Option<String>,
     status: String,
     event_count: i64,
@@ -269,6 +271,8 @@ struct RunListItem {
     sticky_workflow_build_id: Option<String>,
     sticky_workflow_poller_id: Option<String>,
     routing_status: String,
+    execution_path: String,
+    fast_path_rejection_reason: Option<String>,
     sticky_updated_at: Option<DateTime<Utc>>,
     previous_run_id: Option<String>,
     next_run_id: Option<String>,
@@ -1700,7 +1704,7 @@ async fn get_workflow_run_graph(
     })?;
     let current_instance =
         state.store.get_instance(&tenant_id, &instance_id).await.map_err(internal_error)?;
-    let history = read_history(&state.broker, &tenant_id, &instance_id, &run_id)
+    let history = read_history(&state, &tenant_id, &instance_id, &run_id)
         .await
         .map_err(internal_error)?;
     let activities = state
@@ -3374,6 +3378,9 @@ async fn workflow_list_item_from_state(
     store: &WorkflowStore,
     state: WorkflowInstanceState,
 ) -> Result<WorkflowListItem> {
+    let run_metadata = store
+        .get_run_record(&state.tenant_id, &state.instance_id, &state.run_id)
+        .await?;
     let routing_status = compute_routing_status(
         store,
         &state.tenant_id,
@@ -3395,6 +3402,10 @@ async fn workflow_list_item_from_state(
         sticky_workflow_build_id: state.sticky_workflow_build_id,
         sticky_workflow_poller_id: state.sticky_workflow_poller_id,
         routing_status,
+        execution_path: run_metadata.as_ref().map(|run| run.execution_path.clone()),
+        fast_path_rejection_reason: run_metadata
+            .as_ref()
+            .and_then(|run| run.fast_path_rejection_reason.clone()),
         current_state: state.current_state,
         status: state.status.as_str().to_owned(),
         event_count: state.event_count,
@@ -3431,6 +3442,8 @@ async fn run_list_item_from_record(
         sticky_workflow_build_id: record.sticky_workflow_build_id,
         sticky_workflow_poller_id: record.sticky_workflow_poller_id,
         routing_status,
+        execution_path: record.execution_path,
+        fast_path_rejection_reason: record.fast_path_rejection_reason,
         sticky_updated_at: record.sticky_updated_at,
         previous_run_id: record.previous_run_id,
         next_run_id: record.next_run_id,
@@ -3562,7 +3575,7 @@ async fn load_workflow_history(
     run_id: &str,
     pagination: PaginationQuery,
 ) -> Result<WorkflowHistoryResponse> {
-    let history = read_history(&state.broker, tenant_id, instance_id, run_id).await?;
+    let history = read_history(state, tenant_id, instance_id, run_id).await?;
     let first_event = history.first().ok_or_else(|| {
         anyhow::anyhow!(
             "no workflow history found for tenant={tenant_id}, instance_id={instance_id}, run_id={run_id}"
@@ -4351,7 +4364,7 @@ async fn replay_workflow_run(
     run_id: &str,
 ) -> Result<WorkflowReplayResponse> {
     let history = read_history(
-        &state.broker,
+        state,
         &current_instance.tenant_id,
         &current_instance.instance_id,
         run_id,
@@ -4512,8 +4525,15 @@ async fn replay_workflow_run(
         .store
         .list_activities_for_run(&current_instance.tenant_id, &current_instance.instance_id, run_id)
         .await?;
-    let mut projection_matches_store = (current_instance.run_id == active_trace.final_state.run_id)
-        .then(|| same_projection(current_instance, &active_trace.final_state));
+    let comparison_state = {
+        let mut state = active_trace.final_state.clone();
+        state.compact_terminal_for_persistence();
+        state
+    };
+    let mut projection_matches_store =
+        (current_instance.run_id == comparison_state.run_id).then(|| {
+            same_projection(current_instance, &comparison_state)
+        });
     if matches!(projection_matches_store, Some(false)) {
         divergences.push(ReplayDivergence {
             kind: ReplayDivergenceKind::ProjectionMismatch,
@@ -4521,7 +4541,7 @@ async fn replay_workflow_run(
             event_type: Some(active_trace.final_state.last_event_type.clone()),
             message: "replayed final state does not match the stored workflow projection"
                 .to_owned(),
-            fields: projection_mismatches(current_instance, &active_trace.final_state),
+            fields: projection_mismatches(current_instance, &comparison_state),
         });
     }
     if projection_matches_store.is_some() && !divergences.is_empty() {
@@ -4565,19 +4585,90 @@ fn snapshot_summary(snapshot: &WorkflowStateSnapshot) -> ReplaySnapshotSummary {
 }
 
 async fn read_history(
-    broker: &BrokerConfig,
+    state: &AppState,
     tenant_id: &str,
     instance_id: &str,
     run_id: &str,
 ) -> Result<Vec<EventEnvelope<WorkflowEvent>>> {
-    read_workflow_history(
-        broker,
+    let history = read_workflow_history(
+        &state.broker,
         "query-service",
         &WorkflowHistoryFilter::new(tenant_id, instance_id, run_id),
         Duration::from_millis(HISTORY_IDLE_TIMEOUT_MS),
         Duration::from_millis(HISTORY_MAX_SCAN_MS),
     )
-    .await
+    .await?;
+    if !history.is_empty() {
+        return Ok(history);
+    }
+    if let Some(fast_start) = state.store.get_workflow_fast_start(tenant_id, instance_id, run_id).await?
+    {
+        return build_fast_start_history(&fast_start);
+    }
+    Ok(history)
+}
+
+fn build_fast_start_history(
+    fast_start: &fabrik_store::WorkflowFastStartRecord,
+) -> Result<Vec<EventEnvelope<WorkflowEvent>>> {
+    let identity = fabrik_events::WorkflowIdentity::new(
+        fast_start.tenant_id.clone(),
+        fast_start.definition_id.clone(),
+        fast_start.definition_version,
+        fast_start.artifact_hash.clone(),
+        fast_start.instance_id.clone(),
+        fast_start.run_id.clone(),
+        "tiny-workflow-engine",
+    );
+    let mut trigger = EventEnvelope::new(
+        WorkflowEvent::WorkflowTriggered { input: fast_start.input.clone() }.event_type(),
+        identity.clone(),
+        WorkflowEvent::WorkflowTriggered { input: fast_start.input.clone() },
+    );
+    trigger.event_id = fast_start.trigger_event_id;
+    trigger.occurred_at = fast_start.accepted_at;
+    trigger
+        .metadata
+        .insert("workflow_task_queue".to_owned(), fast_start.workflow_task_queue.clone());
+    if let Some(memo) = fast_start.memo.as_ref() {
+        trigger.metadata.insert(
+            "memo_json".to_owned(),
+            serde_json::to_string(memo).context("failed to encode fast-start memo")?,
+        );
+    }
+    if let Some(search_attributes) = fast_start.search_attributes.as_ref() {
+        trigger.metadata.insert(
+            "search_attributes_json".to_owned(),
+            serde_json::to_string(search_attributes)
+                .context("failed to encode fast-start search attributes")?,
+        );
+    }
+    let mut history = vec![trigger];
+    if let (Some(event_id), Some(event_type), Some(payload), Some(completed_at)) = (
+        fast_start.terminal_event_id,
+        fast_start.terminal_event_type.as_deref(),
+        fast_start.terminal_payload.as_ref(),
+        fast_start.completed_at,
+    ) {
+        let terminal_payload = match event_type {
+            "WorkflowCompleted" => WorkflowEvent::WorkflowCompleted {
+                output: payload.get("output").cloned().unwrap_or(Value::Null),
+            },
+            "WorkflowFailed" => WorkflowEvent::WorkflowFailed {
+                reason: payload
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("workflow failed")
+                    .to_owned(),
+            },
+            other => anyhow::bail!("unsupported fast-start terminal event type {other}"),
+        };
+        let mut terminal = EventEnvelope::new(terminal_payload.event_type(), identity, terminal_payload);
+        terminal.event_id = event_id;
+        terminal.occurred_at = completed_at;
+        history.push(terminal);
+    }
+    Ok(history)
 }
 
 async fn run_retention_sweeper(

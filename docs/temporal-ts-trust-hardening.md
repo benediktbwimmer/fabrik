@@ -36,6 +36,37 @@ Current compatibility snapshot:
   - add replay/failover coverage for static factory helpers and static `payloadConverterPath` modules
   - keep full transport parity out of scope unless a real repo forces it
 
+## Real Repo Qualification
+
+Use the external qualification flow to turn this trust work into repo-level evidence:
+
+```bash
+scripts/run-external-repo-qualification.sh <repo-a> <repo-b> <repo-c>
+```
+
+The generated summaries live at:
+
+- `target/external-repo-qualification/summary.json`
+- `target/external-repo-qualification/summary.md`
+
+Current app-style batch signal:
+
+- `worker-versioning-replay-demo` qualifies as `qualified_with_caveats` in:
+  - `target/external-repo-qualification/app-batch/worker-versioning-replay-demo/migration-report.json`
+- `worker-versioning-replay-demo` now has a passing non-sample replay/restart/build-routing drill in:
+  - `target/alpha-drills/worker-versioning-replay-demo/worker-versioning-replay-demo-drill-report.json`
+  - current drill status: `passed`
+  - replay divergence counts: pre-restart `0`, post-restart `0`, post-complete `0`
+- `temporal-worker-versioning-typescript` is blocked by a single compile failure:
+  - top-level side effects in `src/commit-b/workflows.ts`
+  - report path: `target/external-repo-qualification/app-batch/temporal-worker-versioning-typescript/migration-report.json`
+- Recommendation:
+  - use `worker-versioning-replay-demo` as the first completed non-sample trust proof
+  - treat `temporal-worker-versioning-typescript` as a narrow follow-up parity bug, not a design-partner candidate yet
+- Replay/restart/build-routing drill for the first non-sample target:
+  - `scripts/run-worker-versioning-replay-demo-drill.sh`
+  - output bundle: `target/alpha-drills/worker-versioning-replay-demo`
+
 ## Exit Criteria
 
 - each caveated supported slice has explicit semantic fixtures

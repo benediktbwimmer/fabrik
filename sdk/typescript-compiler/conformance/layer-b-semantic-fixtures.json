@@ -144,6 +144,23 @@
           "\"max_supported\":3"
         ]
       }
+    },
+    {
+      "id": "recursive-async-helper-joins",
+      "kind": "compiler",
+      "entry": "sdk/typescript-compiler/test-fixtures/temporal-recursive-async-helper-workflow.ts",
+      "export_name": "temporalRecursiveAsyncHelperWorkflow",
+      "definition_id": "temporal-recursive-async-helper-workflow",
+      "version": 1,
+      "expect": {
+        "serialized_matches": [
+          "\"type\":\"call_async_helper\"",
+          "\"type\":\"return_async_helper\"",
+          "\"async_helpers\"",
+          "\"execute\"",
+          "\"handler\":\"greet\""
+        ]
+      }
     }
   ]
 }

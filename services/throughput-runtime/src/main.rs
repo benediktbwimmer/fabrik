@@ -634,6 +634,9 @@ async fn handle_throughput_command(
             command.batch_id.as_str(),
             command.throughput_backend.as_str(),
         ),
+        ThroughputCommand::TinyWorkflowStart(_) | ThroughputCommand::TinyWorkflowStartBatch(_) => {
+            return Ok(());
+        }
         _ => return Ok(()),
     };
     if throughput_backend != ThroughputBackend::StreamV2.as_str() {
@@ -651,6 +654,9 @@ async fn handle_throughput_command(
         ThroughputCommand::CreateBatch(_) => {
             let event = workflow_event_from_throughput_command(&command)?;
             activate_stream_batch(&state, &event).await
+        }
+        ThroughputCommand::TinyWorkflowStart(_) | ThroughputCommand::TinyWorkflowStartBatch(_) => {
+            Ok(())
         }
         _ => Ok(()),
     }

@@ -51,6 +51,10 @@ test("migration analyzer supports default-compatible payload converters and bloc
     root,
     "crates/fabrik-cli/test-fixtures/temporal-bootstrap-self-file-qualified",
   );
+  const namespaceWorkflowQualifiedFixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-namespace-workflow-qualified",
+  );
   const activityFactoryQualifiedFixture = path.join(
     root,
     "crates/fabrik-cli/test-fixtures/temporal-activity-factory-qualified",
@@ -103,6 +107,7 @@ test("migration analyzer supports default-compatible payload converters and bloc
   );
   const bootstrapEsmQualified = await analyze(bootstrapEsmQualifiedFixture);
   const bootstrapSelfFileQualified = await analyze(bootstrapSelfFileQualifiedFixture);
+  const namespaceWorkflowQualified = await analyze(namespaceWorkflowQualifiedFixture);
   const activityFactoryQualified = await analyze(activityFactoryQualifiedFixture);
   const testWorkerQualified = await analyze(testWorkerQualifiedFixture);
   const payloadPathQualified = await analyze(payloadPathQualifiedFixture);
@@ -136,6 +141,14 @@ test("migration analyzer supports default-compatible payload converters and bloc
   assert.match(
     bootstrapSelfFileQualified.workers[0].workflows_path,
     /src\/worker\.ts$/,
+  );
+  assert.equal(namespaceWorkflowQualified.summary.hard_block_count, 0);
+  assert.equal(namespaceWorkflowQualified.summary.workflow_count, 1);
+  assert.equal(namespaceWorkflowQualified.workflows[0].export_name, "namespaceWorkflow");
+  assert.ok(
+    namespaceWorkflowQualified.files.some((file) =>
+      file.temporal_imports.includes("@temporalio/workflow:* as workflow"),
+    ),
   );
   assert.equal(activityFactoryQualified.summary.hard_block_count, 0);
   assert.equal(activityFactoryQualified.workers[0].task_queue, "activity-factory-qualified");

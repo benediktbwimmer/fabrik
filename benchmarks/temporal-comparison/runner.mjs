@@ -187,11 +187,15 @@ async function runTemporalWorkload({
     cancelled: 0,
     running: 0,
   };
+  const workflowLatenciesMs = [];
 
   await worker.runUntil(async () => {
-    const handles = await Promise.all(
-      Array.from({ length: workload.workflowCount }, (_, workflowIndex) =>
-        client.workflow.start(workflowTypeFor(workload), {
+    const handles = await mapWithConcurrency(
+      Array.from({ length: workload.workflowCount }, (_, workflowIndex) => workflowIndex),
+      workload.startConcurrency ?? 256,
+      async (workflowIndex) => {
+        const requestStarted = Date.now();
+        const handle = await client.workflow.start(workflowTypeFor(workload), {
           args: [
             buildWorkflowInput(
               workload,
@@ -205,16 +209,17 @@ async function runTemporalWorkload({
           taskQueue,
           workflowId: `${workflowIdPrefix}-${workflowIndex.toString().padStart(4, "0")}`,
           workflowExecutionTimeout: `${workload.timeoutSecs}s`,
-        }),
-      ),
+        });
+        return { handle, requestStarted };
+      },
     );
 
     if (workload.kind === "signal_gate") {
-      await Promise.all(handles.map((handle) => handle.signal("approve", { approved: true })));
+      await Promise.all(handles.map(({ handle }) => handle.signal("approve", { approved: true })));
     }
     if (workload.kind === "update_gate") {
       await Promise.all(
-        handles.map((handle) =>
+        handles.map(({ handle }) =>
           handle.executeUpdate("setValue", {
             args: [1],
           }),
@@ -222,8 +227,10 @@ async function runTemporalWorkload({
       );
     }
 
-    await Promise.all(
-      handles.map(async (handle) => {
+    await mapWithConcurrency(
+      handles,
+      workload.resultConcurrency ?? workload.startConcurrency ?? 256,
+      async ({ handle, requestStarted }) => {
         try {
           await handle.result();
           workflowOutcomes.completed += 1;
@@ -233,8 +240,10 @@ async function runTemporalWorkload({
           } else {
             workflowOutcomes.failed += 1;
           }
+        } finally {
+          workflowLatenciesMs.push(Date.now() - requestStarted);
         }
-      }),
+      },
     );
   });
 
@@ -262,6 +271,7 @@ async function runTemporalWorkload({
     retryRate: workload.retryRate,
     cancelRate: workload.cancelRate,
     workflowOutcomes,
+    requestLatencyMetrics: summarizeLatencies(workflowLatenciesMs),
     activityMetrics: tracker.toActivityMetrics(
       durationMs,
       workload.workflowCount * workload.activitiesPerWorkflow,
@@ -274,6 +284,55 @@ async function runTemporalWorkload({
     ...report,
     reportPath: outputPath,
   };
+}
+
+function summarizeLatencies(latenciesMs) {
+  if (!latenciesMs.length) {
+    return {
+      requestCount: 0,
+      avgRequestLatencyMs: 0,
+      p50RequestLatencyMs: 0,
+      p95RequestLatencyMs: 0,
+      p99RequestLatencyMs: 0,
+      maxRequestLatencyMs: 0,
+    };
+  }
+  const sorted = [...latenciesMs].sort((left, right) => left - right);
+  const percentile = (ratio) => {
+    const index = Math.min(sorted.length - 1, Math.floor(ratio * sorted.length));
+    return sorted[index];
+  };
+  const avgRequestLatencyMs =
+    latenciesMs.reduce((sum, value) => sum + value, 0) / latenciesMs.length;
+  return {
+    requestCount: latenciesMs.length,
+    avgRequestLatencyMs,
+    p50RequestLatencyMs: percentile(0.50),
+    p95RequestLatencyMs: percentile(0.95),
+    p99RequestLatencyMs: percentile(0.99),
+    maxRequestLatencyMs: sorted.at(-1) ?? 0,
+  };
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const limit = Math.max(1, Math.min(concurrency, items.length || 1));
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  await Promise.all(
+    Array.from({ length: limit }, async () => {
+      while (true) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        if (currentIndex >= items.length) {
+          return;
+        }
+        results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+      }
+    }),
+  );
+
+  return results;
 }
 
 function createActivityTracker() {

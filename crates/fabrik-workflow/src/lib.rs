@@ -684,6 +684,17 @@ pub struct WorkflowInstanceState {
 }
 
 impl WorkflowInstanceState {
+    pub fn compact_terminal_for_persistence(&mut self) -> bool {
+        if !self.status.is_terminal() {
+            return false;
+        }
+        self.context = None;
+        self.artifact_execution = None;
+        self.input = None;
+        self.persisted_input_handle = None;
+        true
+    }
+
     pub fn compact_for_persistence(&mut self) {
         let elide_bulk_wait_context = self.last_event_type == "WorkflowTriggered"
             && self.current_state.as_deref().is_some_and(|state| {
@@ -717,6 +728,7 @@ impl WorkflowInstanceState {
         if elide_input_to_context || elide_input_to_binding {
             self.input = None;
         }
+        self.compact_terminal_for_persistence();
     }
 
     pub fn compact_trigger_bulk_wait_for_replayable_restore(&mut self) -> bool {
@@ -1252,148 +1264,206 @@ pub fn replay_compiled_history_trace(
             });
             continue;
         }
-        let skip_semantic = should_skip_replay_event(event, &mut seen_dedupe_keys);
         let mut advanced = false;
-        if !skip_semantic {
-            match &event.payload {
-                WorkflowEvent::WorkflowCancellationRequested { reason } => {
-                    execution = artifact.execute_after_workflow_cancellation_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        reason,
-                        execution_state_for_event(&replayed, Some(event)),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    advanced = true;
-                }
-                WorkflowEvent::SignalReceived { signal_id, signal_type, payload } => {
-                    let current_state = replayed.current_state.as_deref().unwrap_or_default();
-                    let turn_context = ExecutionTurnContext {
+        match &event.payload {
+            WorkflowEvent::WorkflowCancellationRequested { reason } => {
+                execution = artifact.execute_after_workflow_cancellation_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    reason,
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
                         event_id: event.event_id,
                         occurred_at: event.occurred_at,
-                    };
-                    let execution_state = execution_state_for_event(&replayed, Some(event));
-                    execution = if artifact
-                        .expected_signal_type(current_state)?
-                        .is_some_and(|expected| expected == signal_type)
-                    {
-                        artifact.execute_after_signal_with_turn(
-                            current_state,
-                            signal_type,
-                            payload,
-                            execution_state,
-                            turn_context,
-                        )?
-                    } else if artifact.has_signal_handler(signal_type) {
-                        artifact.execute_signal_handler_with_turn(
-                            current_state,
-                            signal_id,
-                            signal_type,
-                            payload,
-                            execution_state,
-                            turn_context,
-                        )?
-                    } else if artifact.has_dynamic_signal_handler(&execution_state, signal_type) {
-                        artifact.execute_dynamic_signal_handler_with_turn(
-                            current_state,
-                            signal_type,
-                            payload,
-                            execution_state,
-                            turn_context,
-                        )?
-                    } else {
-                        artifact.execute_after_signal_with_turn(
-                            current_state,
-                            signal_type,
-                            payload,
-                            execution_state,
-                            turn_context,
-                        )?
-                    };
-                    advanced = true;
-                }
-                WorkflowEvent::WorkflowUpdateAccepted { update_id, update_name, payload } => {
-                    execution = artifact.execute_update_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        update_id,
-                        update_name,
+                    },
+                )?;
+                advanced = true;
+            }
+            WorkflowEvent::SignalReceived { signal_id, signal_type, payload } => {
+                let current_state = replayed.current_state.as_deref().unwrap_or_default();
+                let turn_context = ExecutionTurnContext {
+                    event_id: event.event_id,
+                    occurred_at: event.occurred_at,
+                };
+                let execution_state = execution_state_for_event(&replayed, Some(event));
+                execution = if artifact
+                    .expected_signal_type(current_state)?
+                    .is_some_and(|expected| expected == signal_type)
+                {
+                    artifact.execute_after_signal_with_turn(
+                        current_state,
+                        signal_type,
                         payload,
+                        execution_state,
+                        turn_context,
+                    )?
+                } else if artifact.has_signal_handler(signal_type) {
+                    artifact.execute_signal_handler_with_turn(
+                        current_state,
+                        signal_id,
+                        signal_type,
+                        payload,
+                        execution_state,
+                        turn_context,
+                    )?
+                } else if artifact.has_dynamic_signal_handler(&execution_state, signal_type) {
+                    artifact.execute_dynamic_signal_handler_with_turn(
+                        current_state,
+                        signal_type,
+                        payload,
+                        execution_state,
+                        turn_context,
+                    )?
+                } else {
+                    artifact.execute_after_signal_with_turn(
+                        current_state,
+                        signal_type,
+                        payload,
+                        execution_state,
+                        turn_context,
+                    )?
+                };
+                advanced = true;
+            }
+            WorkflowEvent::WorkflowUpdateAccepted { update_id, update_name, payload } => {
+                execution = artifact.execute_update_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    update_id,
+                    update_name,
+                    payload,
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                advanced = true;
+            }
+            WorkflowEvent::TimerFired { timer_id } => {
+                if !is_internal_control_timer(timer_id) {
+                    match artifact.execute_after_timer_with_turn(
+                        replayed.current_state.as_deref().unwrap_or_default(),
+                        timer_id,
                         execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
                         },
-                    )?;
-                    advanced = true;
-                }
-                WorkflowEvent::TimerFired { timer_id } => {
-                    if !is_internal_control_timer(timer_id) {
-                        execution = artifact.execute_after_timer_with_turn(
-                            replayed.current_state.as_deref().unwrap_or_default(),
-                            timer_id,
-                            execution_state_for_event(&replayed, Some(event)),
-                            ExecutionTurnContext {
-                                event_id: event.event_id,
-                                occurred_at: event.occurred_at,
-                            },
-                        )?;
-                        advanced = true;
+                    ) {
+                        Ok(next_execution) => {
+                            remember_replay_dedupe_key(event, &mut seen_dedupe_keys);
+                            execution = next_execution;
+                            advanced = true;
+                        }
+                        Err(error)
+                            if is_ignorable_duplicate_replay_error(
+                                event,
+                                &error,
+                                &seen_dedupe_keys,
+                            ) => {}
+                        Err(error) => return Err(error.into()),
                     }
                 }
-                WorkflowEvent::ActivityTaskCompleted { activity_id, output, .. } => {
-                    execution = artifact.execute_after_step_completion_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        activity_id,
-                        output,
-                        execution_state_for_event(&replayed, Some(event)),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    advanced = true;
+            }
+            WorkflowEvent::ActivityTaskCompleted { activity_id, output, .. } => {
+                match artifact.execute_after_step_completion_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    activity_id,
+                    output,
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                ) {
+                    Ok(next_execution) => {
+                        remember_replay_dedupe_key(event, &mut seen_dedupe_keys);
+                        execution = next_execution;
+                        advanced = true;
+                    }
+                    Err(error)
+                        if is_ignorable_duplicate_replay_error(
+                            event,
+                            &error,
+                            &seen_dedupe_keys,
+                        ) => {}
+                    Err(error) => return Err(error.into()),
                 }
-                WorkflowEvent::ActivityTaskFailed { activity_id, error, .. } => {
-                    execution = artifact.execute_after_step_failure_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        activity_id,
-                        error,
-                        execution_state_for_event(&replayed, Some(event)),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    advanced = true;
+            }
+            WorkflowEvent::ActivityTaskFailed { activity_id, error, .. } => {
+                match artifact.execute_after_step_failure_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    activity_id,
+                    error,
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                ) {
+                    Ok(next_execution) => {
+                        remember_replay_dedupe_key(event, &mut seen_dedupe_keys);
+                        execution = next_execution;
+                        advanced = true;
+                    }
+                    Err(error)
+                        if is_ignorable_duplicate_replay_error(
+                            event,
+                            &error,
+                            &seen_dedupe_keys,
+                        ) => {}
+                    Err(error) => return Err(error.into()),
                 }
-                WorkflowEvent::ActivityTaskTimedOut { activity_id, .. } => {
-                    execution = artifact.execute_after_step_failure_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        activity_id,
-                        "activity timed out",
-                        execution_state_for_event(&replayed, Some(event)),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    advanced = true;
+            }
+            WorkflowEvent::ActivityTaskTimedOut { activity_id, .. } => {
+                match artifact.execute_after_step_failure_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    activity_id,
+                    "activity timed out",
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                ) {
+                    Ok(next_execution) => {
+                        remember_replay_dedupe_key(event, &mut seen_dedupe_keys);
+                        execution = next_execution;
+                        advanced = true;
+                    }
+                    Err(error)
+                        if is_ignorable_duplicate_replay_error(
+                            event,
+                            &error,
+                            &seen_dedupe_keys,
+                        ) => {}
+                    Err(error) => return Err(error.into()),
                 }
-                WorkflowEvent::ActivityTaskCancelled { activity_id, reason, .. } => {
-                    execution = artifact.execute_after_step_cancellation_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        activity_id,
-                        reason,
-                        execution_state_for_event(&replayed, Some(event)),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    advanced = true;
+            }
+            WorkflowEvent::ActivityTaskCancelled { activity_id, reason, .. } => {
+                match artifact.execute_after_step_cancellation_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    activity_id,
+                    reason,
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                ) {
+                    Ok(next_execution) => {
+                        remember_replay_dedupe_key(event, &mut seen_dedupe_keys);
+                        execution = next_execution;
+                        advanced = true;
+                    }
+                    Err(error)
+                        if is_ignorable_duplicate_replay_error(
+                            event,
+                            &error,
+                            &seen_dedupe_keys,
+                        ) => {}
+                    Err(error) => return Err(error.into()),
                 }
+            }
                 WorkflowEvent::BulkActivityBatchCompleted {
                     batch_id,
                     total_items,
@@ -1513,8 +1583,7 @@ pub fn replay_compiled_history_trace(
                     )?;
                     advanced = true;
                 }
-                _ => {}
-            }
+            _ => {}
         }
         if advanced {
             apply_compiled_execution(&mut replayed, &execution);
@@ -1559,8 +1628,7 @@ pub fn replay_compiled_history_trace_from_snapshot(
             });
             continue;
         }
-        if !should_skip_replay_event(event, &mut seen_dedupe_keys) {
-            match &event.payload {
+        match &event.payload {
                 WorkflowEvent::WorkflowCancellationRequested { reason } => {
                     let execution = artifact.execute_after_workflow_cancellation_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
@@ -1635,7 +1703,7 @@ pub fn replay_compiled_history_trace_from_snapshot(
                 }
                 WorkflowEvent::TimerFired { timer_id } => {
                     if !is_internal_control_timer(timer_id) {
-                        let execution = artifact.execute_after_timer_with_turn(
+                        match artifact.execute_after_timer_with_turn(
                             replayed.current_state.as_deref().unwrap_or_default(),
                             timer_id,
                             execution_state_for_event(&replayed, Some(event)),
@@ -1643,12 +1711,23 @@ pub fn replay_compiled_history_trace_from_snapshot(
                                 event_id: event.event_id,
                                 occurred_at: event.occurred_at,
                             },
-                        )?;
-                        apply_compiled_execution(&mut replayed, &execution);
+                        ) {
+                            Ok(execution) => {
+                                remember_replay_dedupe_key(event, &mut seen_dedupe_keys);
+                                apply_compiled_execution(&mut replayed, &execution);
+                            }
+                            Err(error)
+                                if is_ignorable_duplicate_replay_error(
+                                    event,
+                                    &error,
+                                    &seen_dedupe_keys,
+                                ) => {}
+                            Err(error) => return Err(error.into()),
+                        }
                     }
                 }
                 WorkflowEvent::ActivityTaskCompleted { activity_id, output, .. } => {
-                    let execution = artifact.execute_after_step_completion_with_turn(
+                    match artifact.execute_after_step_completion_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         activity_id,
                         output,
@@ -1657,11 +1736,22 @@ pub fn replay_compiled_history_trace_from_snapshot(
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
                         },
-                    )?;
-                    apply_compiled_execution(&mut replayed, &execution);
+                    ) {
+                        Ok(execution) => {
+                            remember_replay_dedupe_key(event, &mut seen_dedupe_keys);
+                            apply_compiled_execution(&mut replayed, &execution);
+                        }
+                        Err(error)
+                            if is_ignorable_duplicate_replay_error(
+                                event,
+                                &error,
+                                &seen_dedupe_keys,
+                            ) => {}
+                        Err(error) => return Err(error.into()),
+                    }
                 }
                 WorkflowEvent::ActivityTaskFailed { activity_id, error, .. } => {
-                    let execution = artifact.execute_after_step_failure_with_turn(
+                    match artifact.execute_after_step_failure_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         activity_id,
                         error,
@@ -1670,11 +1760,22 @@ pub fn replay_compiled_history_trace_from_snapshot(
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
                         },
-                    )?;
-                    apply_compiled_execution(&mut replayed, &execution);
+                    ) {
+                        Ok(execution) => {
+                            remember_replay_dedupe_key(event, &mut seen_dedupe_keys);
+                            apply_compiled_execution(&mut replayed, &execution);
+                        }
+                        Err(error)
+                            if is_ignorable_duplicate_replay_error(
+                                event,
+                                &error,
+                                &seen_dedupe_keys,
+                            ) => {}
+                        Err(error) => return Err(error.into()),
+                    }
                 }
                 WorkflowEvent::ActivityTaskTimedOut { activity_id, .. } => {
-                    let execution = artifact.execute_after_step_failure_with_turn(
+                    match artifact.execute_after_step_failure_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         activity_id,
                         "activity timed out",
@@ -1683,11 +1784,22 @@ pub fn replay_compiled_history_trace_from_snapshot(
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
                         },
-                    )?;
-                    apply_compiled_execution(&mut replayed, &execution);
+                    ) {
+                        Ok(execution) => {
+                            remember_replay_dedupe_key(event, &mut seen_dedupe_keys);
+                            apply_compiled_execution(&mut replayed, &execution);
+                        }
+                        Err(error)
+                            if is_ignorable_duplicate_replay_error(
+                                event,
+                                &error,
+                                &seen_dedupe_keys,
+                            ) => {}
+                        Err(error) => return Err(error.into()),
+                    }
                 }
                 WorkflowEvent::ActivityTaskCancelled { activity_id, reason, .. } => {
-                    let execution = artifact.execute_after_step_cancellation_with_turn(
+                    match artifact.execute_after_step_cancellation_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
                         activity_id,
                         reason,
@@ -1696,8 +1808,19 @@ pub fn replay_compiled_history_trace_from_snapshot(
                             event_id: event.event_id,
                             occurred_at: event.occurred_at,
                         },
-                    )?;
-                    apply_compiled_execution(&mut replayed, &execution);
+                    ) {
+                        Ok(execution) => {
+                            remember_replay_dedupe_key(event, &mut seen_dedupe_keys);
+                            apply_compiled_execution(&mut replayed, &execution);
+                        }
+                        Err(error)
+                            if is_ignorable_duplicate_replay_error(
+                                event,
+                                &error,
+                                &seen_dedupe_keys,
+                            ) => {}
+                        Err(error) => return Err(error.into()),
+                    }
                 }
                 WorkflowEvent::BulkActivityBatchCompleted {
                     batch_id,
@@ -1818,8 +1941,7 @@ pub fn replay_compiled_history_trace_from_snapshot(
                     )?;
                     apply_compiled_execution(&mut replayed, &execution);
                 }
-                _ => {}
-            }
+            _ => {}
         }
         transitions.push(ReplayTransitionTraceEntry {
             event_id: event.event_id,
@@ -1869,11 +1991,33 @@ fn should_apply_replay_projection_event(event: &EventEnvelope<WorkflowEvent>) ->
     !matches!(event.payload, WorkflowEvent::SignalQueued { .. })
 }
 
-fn should_skip_replay_event(
+fn remember_replay_dedupe_key(
     event: &EventEnvelope<WorkflowEvent>,
     seen_dedupe_keys: &mut HashSet<String>,
+) {
+    if let Some(dedupe_key) = event.dedupe_key.as_ref() {
+        seen_dedupe_keys.insert(dedupe_key.clone());
+    }
+}
+
+fn is_ignorable_duplicate_replay_error(
+    event: &EventEnvelope<WorkflowEvent>,
+    error: &CompiledWorkflowError,
+    seen_dedupe_keys: &HashSet<String>,
 ) -> bool {
-    event.dedupe_key.as_ref().is_some_and(|dedupe_key| !seen_dedupe_keys.insert(dedupe_key.clone()))
+    let Some(dedupe_key) = event.dedupe_key.as_ref() else {
+        return false;
+    };
+    if !seen_dedupe_keys.contains(dedupe_key) {
+        return false;
+    }
+    matches!(
+        error,
+        CompiledWorkflowError::NotWaitingOnTimer(_)
+            | CompiledWorkflowError::UnexpectedTimer { .. }
+            | CompiledWorkflowError::NotWaitingOnStep(_)
+            | CompiledWorkflowError::UnexpectedStep { .. }
+    )
 }
 
 fn is_internal_control_timer(timer_id: &str) -> bool {

@@ -21,6 +21,7 @@ use fabrik_workflow::{
     ArtifactEntrypoint, Assignment, CompiledStateNode, CompiledWorkflow, CompiledWorkflowArtifact,
     ErrorTransition, Expression, RetryPolicy,
 };
+use futures_util::{StreamExt, TryStreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -32,6 +33,9 @@ const DEFAULT_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_STREAM_PROJECTION_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_ADAPTER_READY_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_ADAPTER_FAILOVER_OBSERVATION_TIMEOUT_SECS: u64 = 15;
+const DEFAULT_TRIGGER_SUBMISSION_CONCURRENCY: usize = 128;
+const DEFAULT_TINY_BATCH_START_SIZE: usize = 2_048;
+const DEFAULT_TINY_BATCH_SUBMISSION_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone)]
 struct BenchmarkProfile {
@@ -166,6 +170,7 @@ struct BenchmarkReport {
     failover_injection: Option<FailoverInjectionMetrics>,
     adapter_metrics: Option<AdapterMetrics>,
     control_plane_metrics: Option<ControlPlaneMetrics>,
+    ingress_request_latency_metrics: Option<IngressRequestLatencyMetrics>,
     executor_debug_delta_metrics: Option<ExecutorDebugDeltaMetrics>,
 }
 
@@ -191,6 +196,9 @@ struct BatchRoutingMetrics {
     backend_counts: BTreeMap<String, u64>,
     routing_reason_counts: BTreeMap<String, u64>,
     admission_policy_version_counts: BTreeMap<String, u64>,
+    workflow_execution_path_counts: BTreeMap<String, u64>,
+    workflow_fast_path_rejection_reason_counts: BTreeMap<String, u64>,
+    throughput_execution_path_counts: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +272,16 @@ struct ControlPlaneMetrics {
     manifest_writes: u64,
 }
 
+#[derive(Debug, Serialize, Clone)]
+struct IngressRequestLatencyMetrics {
+    request_count: u64,
+    avg_request_latency_ms: f64,
+    p50_request_latency_ms: f64,
+    p95_request_latency_ms: f64,
+    p99_request_latency_ms: f64,
+    max_request_latency_ms: f64,
+}
+
 #[derive(Debug, Serialize)]
 struct ExecutorDebugDeltaMetrics {
     polls_per_leased_task: f64,
@@ -326,6 +344,18 @@ fn stream_projection_has_converged(
     row.projection_batch_rows as u64 >= expected_batches
         && row.terminal_batch_rows as u64 >= expected_batches
         && stream_projection_accounted_items(row) as u64 >= expected_items
+}
+
+fn stream_projection_uses_inline_microbatch_path(row: &StreamProjectionConvergenceRow) -> bool {
+    row.projection_batch_rows == 0
+        && row.terminal_batch_rows == 0
+        && row.inferred_terminal_batches == 0
+        && row.batch_accounted_items == 0
+        && row.completed_items == 0
+        && row.failed_items == 0
+        && row.cancelled_items == 0
+        && row.terminal_chunk_rows == 0
+        && row.pending_chunks == 0
 }
 
 #[tokio::main]
@@ -434,27 +464,16 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         publish_artifact(&client, &ingest_base, &args.tenant_id, &artifact).await?;
     }
 
-    for workflow_index in 0..args.profile.workflow_count {
-        let instance_id = format!("{instance_prefix}-{workflow_index:04}");
-        let input = benchmark_input(
-            args,
-            args.profile.activities_per_workflow,
-            args.payload_size,
-            args.retry_rate,
-            args.cancel_rate,
-            &instance_id,
-        );
-        trigger_workflow(
-            &client,
-            &ingest_base,
-            &definition_id,
-            &args.tenant_id,
-            &instance_id,
-            &args.task_queue,
-            input,
-        )
-        .await?;
-    }
+    let ingress_request_latency_metrics = submit_benchmark_triggers(
+        &client,
+        &ingest_base,
+        &definition_id,
+        &args.tenant_id,
+        &args.task_queue,
+        &instance_prefix,
+        args,
+    )
+    .await?;
 
     match args.workload_kind {
         BenchmarkWorkloadKind::SignalGate => {
@@ -672,6 +691,7 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         batch_routing_metrics,
         failover_injection,
         control_plane_metrics,
+        ingress_request_latency_metrics: Some(ingress_request_latency_metrics),
         executor_debug_delta_metrics,
         adapter_metrics: None,
     })
@@ -709,27 +729,16 @@ async fn run_topic_adapter_benchmark(
     }
 
     if args.ingress_driver == BenchmarkIngressDriver::TopicAdapterSignal {
-        for workflow_index in 0..args.profile.workflow_count {
-            let instance_id = format!("{instance_prefix}-{workflow_index:04}");
-            let input = benchmark_input(
-                args,
-                args.profile.activities_per_workflow,
-                args.payload_size,
-                args.retry_rate,
-                args.cancel_rate,
-                &instance_id,
-            );
-            trigger_workflow(
-                client,
-                ingest_base,
-                &definition_id,
-                &args.tenant_id,
-                &instance_id,
-                &args.task_queue,
-                input,
-            )
-            .await?;
-        }
+        let _ = submit_benchmark_triggers(
+            client,
+            ingest_base,
+            &definition_id,
+            &args.tenant_id,
+            &args.task_queue,
+            &instance_prefix,
+            args,
+        )
+        .await?;
         wait_for_signal_gate_ready(
             pool,
             &args.tenant_id,
@@ -1032,6 +1041,7 @@ async fn run_topic_adapter_benchmark(
         failover_injection,
         adapter_metrics,
         control_plane_metrics,
+        ingress_request_latency_metrics: None,
         executor_debug_delta_metrics,
     })
 }
@@ -1973,6 +1983,48 @@ fn should_use_compact_benchmark_input(
         )
 }
 
+fn can_use_tiny_batch_api(args: &Args) -> bool {
+    if env::var("BENCHMARK_DISABLE_TINY_BATCH_API")
+        .ok()
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    args.workload_kind == BenchmarkWorkloadKind::Fanout
+        && matches!(args.bulk_reducer.as_str(), "all_settled" | "count")
+        && args.retry_rate == 0.0
+        && args.cancel_rate == 0.0
+        && args.profile.activities_per_workflow <= 32
+        && matches!(
+            args.activity_type.as_str(),
+            BENCHMARK_ECHO_ACTIVITY | BENCHMARK_FAST_COUNT_ACTIVITY
+        )
+        && match args.execution_mode {
+            ExecutionMode::Durable => true,
+            ExecutionMode::Throughput => {
+                args.throughput_backend.as_deref() == Some(STREAM_V2_BACKEND)
+            }
+            ExecutionMode::Unified => false,
+        }
+}
+
+fn trigger_submission_concurrency() -> usize {
+    env::var("BENCHMARK_TRIGGER_SUBMISSION_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_TRIGGER_SUBMISSION_CONCURRENCY)
+}
+
+fn tiny_batch_submission_concurrency() -> usize {
+    env::var("BENCHMARK_TINY_BATCH_SUBMISSION_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_TINY_BATCH_SUBMISSION_CONCURRENCY)
+}
+
 async fn apply_task_queue_throughput_policy(
     pool: &PgPool,
     tenant_id: &str,
@@ -2417,7 +2469,8 @@ async fn trigger_workflow(
     instance_id: &str,
     task_queue: &str,
     input: Value,
-) -> Result<()> {
+ ) -> Result<f64> {
+    let started = Instant::now();
     client
         .post(format!("{ingest_base}/workflows/{definition_id}/trigger"))
         .json(&json!({
@@ -2432,7 +2485,127 @@ async fn trigger_workflow(
         .with_context(|| format!("failed to trigger benchmark workflow {instance_id}"))?
         .error_for_status()
         .with_context(|| format!("benchmark workflow trigger failed for {instance_id}"))?;
-    Ok(())
+    Ok(started.elapsed().as_secs_f64() * 1000.0)
+}
+
+async fn trigger_workflow_batch(
+    client: &Client,
+    ingest_base: &str,
+    definition_id: &str,
+    tenant_id: &str,
+    task_queue: &str,
+    items: Vec<Value>,
+ ) -> Result<f64> {
+    let started = Instant::now();
+    let response = client
+        .post(format!("{ingest_base}/workflows/{definition_id}/trigger-batch"))
+        .json(&json!({
+            "tenant_id": tenant_id,
+            "workflow_task_queue": task_queue,
+            "items": items,
+        }))
+        .send()
+        .await
+        .context("failed to trigger benchmark workflow batch")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!("benchmark workflow batch trigger returned error: {status} {body}");
+    }
+    Ok(started.elapsed().as_secs_f64() * 1000.0)
+}
+
+async fn submit_benchmark_triggers(
+    client: &Client,
+    ingest_base: &str,
+    definition_id: &str,
+    tenant_id: &str,
+    task_queue: &str,
+    instance_prefix: &str,
+    args: &Args,
+) -> Result<IngressRequestLatencyMetrics> {
+    if can_use_tiny_batch_api(args) {
+        let batch_starts = (0..args.profile.workflow_count)
+            .step_by(DEFAULT_TINY_BATCH_START_SIZE)
+            .collect::<Vec<_>>();
+        let latencies = stream::iter(batch_starts)
+            .map(|start| {
+                let client = client.clone();
+                let ingest_base = ingest_base.to_owned();
+                let definition_id = definition_id.to_owned();
+                let tenant_id = tenant_id.to_owned();
+                let task_queue = task_queue.to_owned();
+                let instance_prefix = instance_prefix.to_owned();
+                let args = args.clone();
+                async move {
+                    let end =
+                        (start + DEFAULT_TINY_BATCH_START_SIZE).min(args.profile.workflow_count);
+                    let items = (start..end)
+                        .map(|workflow_index| {
+                            let instance_id = format!("{instance_prefix}-{workflow_index:04}");
+                            json!({
+                                "instance_id": instance_id,
+                                "request_id": instance_id,
+                                "input": benchmark_input(
+                                    &args,
+                                    args.profile.activities_per_workflow,
+                                    args.payload_size,
+                                    args.retry_rate,
+                                    args.cancel_rate,
+                                    &instance_id,
+                                ),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    trigger_workflow_batch(
+                        &client,
+                        &ingest_base,
+                        &definition_id,
+                        &tenant_id,
+                        &task_queue,
+                        items,
+                    )
+                    .await
+                }
+            })
+            .buffer_unordered(tiny_batch_submission_concurrency())
+            .try_collect::<Vec<_>>()
+            .await?;
+        return Ok(ingress_request_latency_metrics(&latencies));
+    }
+    let latencies = stream::iter(0..args.profile.workflow_count)
+        .map(|workflow_index| {
+            let client = client.clone();
+            let ingest_base = ingest_base.to_owned();
+            let definition_id = definition_id.to_owned();
+            let tenant_id = tenant_id.to_owned();
+            let task_queue = task_queue.to_owned();
+            let instance_id = format!("{instance_prefix}-{workflow_index:04}");
+            let input = benchmark_input(
+                args,
+                args.profile.activities_per_workflow,
+                args.payload_size,
+                args.retry_rate,
+                args.cancel_rate,
+                &instance_id,
+            );
+            async move {
+                trigger_workflow(
+                    &client,
+                    &ingest_base,
+                    &definition_id,
+                    &tenant_id,
+                    &instance_id,
+                    &task_queue,
+                    input,
+                )
+                .await
+            }
+        })
+        .buffer_unordered(trigger_submission_concurrency())
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(ingress_request_latency_metrics(&latencies))
 }
 
 async fn signal_workflow(
@@ -2641,6 +2814,14 @@ async fn wait_for_stream_projection_convergence(
         let chunk_accounted_items = row.completed_items + row.failed_items + row.cancelled_items;
         if stream_projection_has_converged(&row, expected_batches, expected_items) {
             return Ok(());
+        }
+        if stream_projection_uses_inline_microbatch_path(&row) {
+            let outcomes = workflow_outcomes(pool, tenant_id, instance_prefix, workload_kind).await?;
+            if outcomes.running == 0
+                && outcomes.completed + outcomes.failed + outcomes.cancelled >= expected_batches
+            {
+                return Ok(());
+            }
         }
 
         if started.elapsed() >= timeout {
@@ -2876,7 +3057,7 @@ async fn batch_routing_metrics(
     )
     .bind(tenant_id)
     .bind(format!("{instance_prefix}%"))
-    .bind(excluded_child_pattern)
+    .bind(excluded_child_pattern.clone())
     .fetch_all(pool)
     .await
     .context("failed to query batch routing metrics")?;
@@ -2887,6 +3068,64 @@ async fn batch_routing_metrics(
         *metrics.backend_counts.entry(backend).or_default() += count;
         *metrics.routing_reason_counts.entry(reason).or_default() += count;
         *metrics.admission_policy_version_counts.entry(version).or_default() += count;
+    }
+    let workflow_path_rows = sqlx::query_as::<_, (String, Option<String>, i64)>(
+        r#"
+        SELECT
+            COALESCE(NULLIF(execution_path, ''), 'unrecorded') AS execution_path,
+            fast_path_rejection_reason,
+            COUNT(*)::bigint AS run_count
+        FROM workflow_runs
+        WHERE tenant_id = $1
+          AND workflow_instance_id LIKE $2
+          AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
+        GROUP BY execution_path, fast_path_rejection_reason
+        ORDER BY run_count DESC, execution_path ASC
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(format!("{instance_prefix}%"))
+    .bind(excluded_child_pattern.clone())
+    .fetch_all(pool)
+    .await
+    .context("failed to query workflow execution path metrics")?;
+    for (execution_path, rejection_reason, count) in workflow_path_rows {
+        let count = count as u64;
+        *metrics
+            .workflow_execution_path_counts
+            .entry(execution_path)
+            .or_default() += count;
+        if let Some(rejection_reason) = rejection_reason {
+            *metrics
+                .workflow_fast_path_rejection_reason_counts
+                .entry(rejection_reason)
+                .or_default() += count;
+        }
+    }
+    let throughput_path_rows = sqlx::query_as::<_, (String, i64)>(
+        r#"
+        SELECT
+            COALESCE(NULLIF(execution_path, ''), 'unrecorded') AS execution_path,
+            COUNT(*)::bigint AS run_count
+        FROM throughput_runs
+        WHERE tenant_id = $1
+          AND workflow_instance_id LIKE $2
+          AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
+        GROUP BY execution_path
+        ORDER BY run_count DESC, execution_path ASC
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(format!("{instance_prefix}%"))
+    .bind(excluded_child_pattern)
+    .fetch_all(pool)
+    .await
+    .context("failed to query throughput execution path metrics")?;
+    for (execution_path, count) in throughput_path_rows {
+        *metrics
+            .throughput_execution_path_counts
+            .entry(execution_path)
+            .or_default() += count as u64;
     }
     Ok(metrics)
 }
@@ -3093,6 +3332,34 @@ fn executor_debug_delta_metrics(
     })
 }
 
+fn ingress_request_latency_metrics(latencies_ms: &[f64]) -> IngressRequestLatencyMetrics {
+    if latencies_ms.is_empty() {
+        return IngressRequestLatencyMetrics {
+            request_count: 0,
+            avg_request_latency_ms: 0.0,
+            p50_request_latency_ms: 0.0,
+            p95_request_latency_ms: 0.0,
+            p99_request_latency_ms: 0.0,
+            max_request_latency_ms: 0.0,
+        };
+    }
+    let mut sorted = latencies_ms.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let percentile = |p: f64| -> f64 {
+        let index = (((sorted.len() - 1) as f64) * p).round() as usize;
+        sorted[index]
+    };
+    let avg = sorted.iter().sum::<f64>() / sorted.len() as f64;
+    IngressRequestLatencyMetrics {
+        request_count: sorted.len() as u64,
+        avg_request_latency_ms: avg,
+        p50_request_latency_ms: percentile(0.50),
+        p95_request_latency_ms: percentile(0.95),
+        p99_request_latency_ms: percentile(0.99),
+        max_request_latency_ms: *sorted.last().unwrap_or(&0.0),
+    }
+}
+
 fn json_numeric_delta(before: &Value, after: &Value) -> Value {
     match (before, after) {
         (Value::Object(before), Value::Object(after)) => {
@@ -3173,10 +3440,30 @@ fn summary_text(report: &BenchmarkReport) -> String {
             metrics.snapshot_writes,
         )
     }).unwrap_or_default();
+    let ingress_request_latency = report.ingress_request_latency_metrics.as_ref().map(|metrics| {
+        format!(
+            "ingress_request_count={}\navg_ingress_request_latency_ms={:.2}\np50_ingress_request_latency_ms={:.2}\np95_ingress_request_latency_ms={:.2}\np99_ingress_request_latency_ms={:.2}\nmax_ingress_request_latency_ms={:.2}\n",
+            metrics.request_count,
+            metrics.avg_request_latency_ms,
+            metrics.p50_request_latency_ms,
+            metrics.p95_request_latency_ms,
+            metrics.p99_request_latency_ms,
+            metrics.max_request_latency_ms,
+        )
+    }).unwrap_or_default();
     let backend_counts = format_counts(&report.batch_routing_metrics.backend_counts);
     let routing_reason_counts = format_counts(&report.batch_routing_metrics.routing_reason_counts);
     let admission_policy_versions =
         format_counts(&report.batch_routing_metrics.admission_policy_version_counts);
+    let workflow_execution_path_counts =
+        format_counts(&report.batch_routing_metrics.workflow_execution_path_counts);
+    let workflow_fast_path_rejection_reason_counts = format_counts(
+        &report
+            .batch_routing_metrics
+            .workflow_fast_path_rejection_reason_counts,
+    );
+    let throughput_execution_path_counts =
+        format_counts(&report.batch_routing_metrics.throughput_execution_path_counts);
     let failover = report.failover_injection.as_ref().map(|metrics| {
         let downtime_ms = metrics
             .downtime_ms
@@ -3233,7 +3520,7 @@ fn summary_text(report: &BenchmarkReport) -> String {
         )
     }).unwrap_or_default();
     format!(
-        "scenario={scenario}\nprofile={profile}\nexecution_mode={execution_mode}\nthroughput_backend={throughput_backend}\nbulk_reducer={bulk_reducer}\nretry_rate={retry_rate}\ncancel_rate={cancel_rate}\nretry_delay_ms={retry_delay_ms}\nchunk_size={chunk_size}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nexecution_duration_ms={execution_duration_ms}\nprojection_convergence_duration_ms={projection_convergence_duration_ms}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nprojection_batch_rows={projection_batch_rows}\nprojection_chunk_rows={projection_chunk_rows}\nmax_aggregation_group_count={max_aggregation_group_count}\ngrouped_batch_rows={grouped_batch_rows}\nadmission_backend_counts={backend_counts}\nadmission_routing_reason_counts={routing_reason_counts}\nadmission_policy_versions={admission_policy_versions}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n{failover}{adapter}{control_plane}{executor_debug_delta}",
+        "scenario={scenario}\nprofile={profile}\nexecution_mode={execution_mode}\nthroughput_backend={throughput_backend}\nbulk_reducer={bulk_reducer}\nretry_rate={retry_rate}\ncancel_rate={cancel_rate}\nretry_delay_ms={retry_delay_ms}\nchunk_size={chunk_size}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nexecution_duration_ms={execution_duration_ms}\nprojection_convergence_duration_ms={projection_convergence_duration_ms}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nprojection_batch_rows={projection_batch_rows}\nprojection_chunk_rows={projection_chunk_rows}\nmax_aggregation_group_count={max_aggregation_group_count}\ngrouped_batch_rows={grouped_batch_rows}\nadmission_backend_counts={backend_counts}\nadmission_routing_reason_counts={routing_reason_counts}\nadmission_policy_versions={admission_policy_versions}\nworkflow_execution_path_counts={workflow_execution_path_counts}\nworkflow_fast_path_rejection_reason_counts={workflow_fast_path_rejection_reason_counts}\nthroughput_execution_path_counts={throughput_execution_path_counts}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n{ingress_request_latency}{failover}{adapter}{control_plane}{executor_debug_delta}",
         scenario = report.scenario,
         profile = report.profile,
         execution_mode = match report.execution_mode {
@@ -3268,12 +3555,16 @@ fn summary_text(report: &BenchmarkReport) -> String {
         backend_counts = backend_counts,
         routing_reason_counts = routing_reason_counts,
         admission_policy_versions = admission_policy_versions,
+        workflow_execution_path_counts = workflow_execution_path_counts,
+        workflow_fast_path_rejection_reason_counts = workflow_fast_path_rejection_reason_counts,
+        throughput_execution_path_counts = throughput_execution_path_counts,
         max_workflow_backlog = report.backlog_metrics.max_workflow_backlog,
         max_activity_backlog = report.backlog_metrics.max_activity_backlog,
         final_workflow_backlog = report.backlog_metrics.final_workflow_backlog,
         final_activity_backlog = report.backlog_metrics.final_activity_backlog,
         avg_schedule = report.activity_metrics.avg_schedule_to_start_latency_ms,
         avg_close = report.activity_metrics.avg_start_to_close_latency_ms,
+        ingress_request_latency = ingress_request_latency,
         failover = failover,
         adapter = adapter,
         control_plane = control_plane,
@@ -3712,6 +4003,7 @@ mod tests {
             }),
             adapter_metrics: None,
             control_plane_metrics: None,
+            ingress_request_latency_metrics: None,
             executor_debug_delta_metrics: None,
         };
 

@@ -3,8 +3,8 @@
   "layer_id": "layer_b_semantic",
   "title": "Layer B: semantic parity fixtures",
   "purpose": "Compiled semantic artifact cases for the supported Temporal TS subset.",
-  "case_count": 9,
-  "passed_count": 9,
+  "case_count": 10,
+  "passed_count": 10,
   "failed_count": 0,
   "results": [
     {
@@ -12,7 +12,7 @@
       "title": "proxy-activities-and-retries",
       "kind": "compiler",
       "status": "passed",
-      "duration_ms": 1194,
+      "duration_ms": 1030,
       "summary": "definition=temporal-compatible-workflow source_files=1",
       "observed": {
         "definition_id": "temporal-compatible-workflow",
@@ -30,7 +30,7 @@
       "title": "continue-as-new",
       "kind": "compiler",
       "status": "passed",
-      "duration_ms": 1168,
+      "duration_ms": 918,
       "summary": "definition=temporal-continue-as-new-workflow source_files=1",
       "observed": {
         "definition_id": "temporal-continue-as-new-workflow",
@@ -48,7 +48,7 @@
       "title": "queries-updates-and-handlers",
       "kind": "compiler",
       "status": "passed",
-      "duration_ms": 1226,
+      "duration_ms": 898,
       "summary": "definition=temporal-query-update-workflow source_files=1",
       "observed": {
         "definition_id": "temporal-query-update-workflow",
@@ -66,7 +66,7 @@
       "title": "signals-and-conditions",
       "kind": "compiler",
       "status": "passed",
-      "duration_ms": 1158,
+      "duration_ms": 943,
       "summary": "definition=temporal-signal-condition-workflow source_files=1",
       "observed": {
         "definition_id": "temporal-signal-condition-workflow",
@@ -84,7 +84,7 @@
       "title": "async-signal-handler",
       "kind": "compiler",
       "status": "passed",
-      "duration_ms": 1118,
+      "duration_ms": 927,
       "summary": "definition=temporal-async-signal-workflow source_files=1",
       "observed": {
         "definition_id": "temporal-async-signal-workflow",
@@ -102,7 +102,7 @@
       "title": "child-workflows",
       "kind": "compiler",
       "status": "passed",
-      "duration_ms": 1094,
+      "duration_ms": 921,
       "summary": "definition=temporal-child-workflow source_files=1",
       "observed": {
         "definition_id": "temporal-child-workflow",
@@ -120,7 +120,7 @@
       "title": "external-workflow-handles",
       "kind": "compiler",
       "status": "passed",
-      "duration_ms": 1090,
+      "duration_ms": 923,
       "summary": "definition=temporal-external-workflow-handle-workflow source_files=1",
       "observed": {
         "definition_id": "temporal-external-workflow-handle-workflow",
@@ -138,7 +138,7 @@
       "title": "cancellation-scopes",
       "kind": "compiler",
       "status": "passed",
-      "duration_ms": 1079,
+      "duration_ms": 909,
       "summary": "definition=temporal-cancellation-scope-workflow source_files=1",
       "observed": {
         "definition_id": "temporal-cancellation-scope-workflow",
@@ -148,7 +148,7 @@
         "source_files": [
           "sdk/typescript-compiler/test-fixtures/temporal-cancellation-scope-workflow.ts"
         ],
-        "state_count": 7
+        "state_count": 8
       }
     },
     {
@@ -156,7 +156,7 @@
       "title": "version-markers",
       "kind": "compiler",
       "status": "passed",
-      "duration_ms": 825,
+      "duration_ms": 685,
       "summary": "definition=version-workflow source_files=1",
       "observed": {
         "definition_id": "version-workflow",
@@ -167,6 +167,24 @@
           "sdk/typescript-compiler/test-fixtures/version-workflow.ts"
         ],
         "state_count": 4
+      }
+    },
+    {
+      "id": "recursive-async-helper-joins",
+      "title": "recursive-async-helper-joins",
+      "kind": "compiler",
+      "status": "passed",
+      "duration_ms": 921,
+      "summary": "definition=temporal-recursive-async-helper-workflow source_files=1",
+      "observed": {
+        "definition_id": "temporal-recursive-async-helper-workflow",
+        "source_file_count": 1
+      },
+      "evidence": {
+        "source_files": [
+          "sdk/typescript-compiler/test-fixtures/temporal-recursive-async-helper-workflow.ts"
+        ],
+        "state_count": 13
       }
     }
   ]

@@ -1,0 +1,19 @@
+{
+  "profiles": {
+    "smoke": [
+      {
+        "name": "fanout-tiny-single-latency",
+        "description": "Low-concurrency tiny single-start latency workload.",
+        "workflowCount": 100,
+        "activitiesPerWorkflow": 1,
+        "payloadSize": 256,
+        "workerCount": 16,
+        "retryRate": 0,
+        "cancelRate": 0,
+        "timeoutSecs": 300,
+        "startConcurrency": 1,
+        "resultConcurrency": 1
+      }
+    ]
+  }
+}

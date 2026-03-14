@@ -48,6 +48,10 @@ The latest compiler, runtime, and packaging passes materially shifted the remain
 - `encryption` now qualifies after static zero-argument `dataConverter` factory helpers moved into the supported packaging adapter slice
 - `query-subscriptions` now qualifies after static workflow-module interceptor bootstraps moved onto the caveated packaging path and helper-side interceptor scaffolding (`setHandler`, `enablePatches`, `Object.defineProperty`) stopped hard-blocking compilation
 - `dsl-interpreter` now qualifies after adding persisted async-helper call frames plus a sequential helper-join lowering for recursive `Promise.all(map(asyncHelper(...)))` patterns; this is explicitly a caveated adapter path, not trust-backed helper-level parallel semantics
+- the first app-style external repo batch produced one strong non-sample candidate:
+  - `worker-versioning-replay-demo` qualifies in `target/external-repo-qualification/app-batch/worker-versioning-replay-demo/migration-report.json`
+  - `worker-versioning-replay-demo` now also has a passing replay/restart/rollback drill in `target/alpha-drills/worker-versioning-replay-demo/worker-versioning-replay-demo-drill-report.json`
+  - `temporal-worker-versioning-typescript` is blocked only by top-level side effects in `src/commit-b/workflows.ts`
 - The remaining explicit unsupported-import census is now dominated by:
   - `WorkflowInterceptors`: `1`
   - `Sinks`: `1`
@@ -57,6 +61,7 @@ This means broad import coverage is no longer the main hard-blocker class. The n
 - external non-Temporal async SDK execution inside workflow code
 - trust-bounded caveat cleanup around the adapter-backed interceptor/sink slice
 - deciding whether the remaining `dsl-interpreter` caveat is acceptable or worth upgrading into full trust-backed helper-parallel semantics
+- scaling the now-proven trust drill from one non-sample repo to a larger real-repo set
 
 ## Priority Order
 

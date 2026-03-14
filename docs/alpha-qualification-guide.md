@@ -80,6 +80,33 @@ Refresh the generated fixture reports with:
 scripts/run-shadow-qualification.sh
 ```
 
+Run a batch of external repos through the same qualification flow with:
+
+```bash
+scripts/run-external-repo-qualification.sh <repo-a> <repo-b> <repo-c>
+```
+
+This writes:
+
+- `target/external-repo-qualification/summary.json`
+- `target/external-repo-qualification/summary.md`
+
+Current app-style repo batch:
+
+- `target/external-repo-qualification/app-batch/worker-versioning-replay-demo/migration-report.json`
+  - current verdict: `qualified_with_caveats`
+  - trust drill: `target/alpha-drills/worker-versioning-replay-demo/worker-versioning-replay-demo-drill-report.json`
+  - current drill status: `passed`
+- `target/external-repo-qualification/app-batch/temporal-worker-versioning-typescript/migration-report.json`
+  - current verdict: `blocked`
+  - current blocker: top-level side effects in `src/commit-b/workflows.ts`
+
+Run the replay/restart/build-routing drill for the first non-sample candidate with:
+
+```bash
+scripts/run-worker-versioning-replay-demo-drill.sh
+```
+
 Run the mixed-build upgrade drill for the payload-path slice with:
 
 ```bash
