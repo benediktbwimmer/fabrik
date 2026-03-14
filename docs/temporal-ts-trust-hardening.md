@@ -18,22 +18,23 @@ Current compatibility snapshot:
   - decide whether sequential helper-join is an accepted caveat or whether helper-parallel equivalence is required
 
 2. Interceptor bridge semantics
-- Current support allows static `interceptors.workflowModules` packaging and helper-side interceptor scaffolding.
-- Runtime interceptor behavior is still caveated.
+- Current support allows static `interceptors.workflowModules` packaging and restart/replay-safe workflow execution when the workflow-visible state stays in the compiled workflow.
+- Helper-side interceptor scaffolding and full Temporal interceptor runtime behavior remain caveated.
 - Next trust task:
-  - add replay/failover fixtures for the supported bridge
+  - keep the supported bridge scoped to static workflow-module presence plus workflow-visible state/query semantics owned by the compiled workflow
   - document exactly which interceptor-visible behaviors are preserved and which are not
 
 3. Sink bridge semantics
 - Current support accepts `proxySinks()` declarations and fire-and-forget sink calls through a caveated bridge.
+- The supported bridge is now replay/restart validated when sink calls are workflow-invisible no-ops.
 - Next trust task:
-  - add semantic fixtures proving workflow-visible behavior is unchanged when sinks are ignored
   - document the non-goals clearly
+  - keep sink trust scoped to workflow-visible semantics, not side-effect delivery guarantees
 
 4. Payload/data-converter adapter semantics
-- Current support is broad enough for the official samples, but trust evidence is still bounded to the adapter slice.
+- Current support is broad enough for the official samples, and the adapter slice now has a restart/replay drill around static factory-based converter packaging plus normalized activity output.
 - Next trust task:
-  - add replay/failover coverage for static factory helpers and static `payloadConverterPath` modules
+  - tighten the remaining converter-query caveat around pre-activity copied object state if that becomes product-relevant
   - keep full transport parity out of scope unless a real repo forces it
 
 ## Real Repo Qualification
@@ -61,6 +62,19 @@ When external repos are scarce, use the internal pressure-repo set for engineeri
   - `target/alpha-drills/temporal-versioning-upgrade-pressure/versioning-pressure-mixed-build-drill-report.json`
   - current drill status: `passed`
   - old/new/rollback replay divergence counts: `0 / 0 / 0`
+- `temporal-interceptor-pressure` now has a passing internal replay/restart drill for the supported interceptor bridge in:
+  - `target/alpha-drills/temporal-interceptor-pressure/interceptor-pressure-drill-report.json`
+  - current drill status: `passed`
+  - replay divergence counts: post-restart `0`, post-complete `0`
+- `temporal-sinks-pressure` now has a passing internal replay/restart drill for the supported sink no-op bridge in:
+  - `target/alpha-drills/temporal-sinks-pressure/sinks-pressure-drill-report.json`
+  - current drill status: `passed`
+  - replay divergence counts: post-restart `0`, post-complete `0`
+- `temporal-converter-trust-pressure` now has a passing internal replay/restart drill for the supported converter adapter slice in:
+  - `target/alpha-drills/temporal-converter-trust-pressure/converter-pressure-drill-report.json`
+  - current drill status: `passed`
+  - replay divergence counts: post-restart `0`, post-complete `0`
+  - current caveat: pre-normalize query state is validated only at the phase level, not full copied input fields
 
 Current app-style batch signal:
 

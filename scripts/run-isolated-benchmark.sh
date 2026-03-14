@@ -1143,7 +1143,9 @@ elif [[ "$EXECUTION_MODE" == "throughput" ]]; then
     "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
     "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \
     "ACTIVITY_WORKER_CONCURRENCY=${ACTIVITY_WORKER_CONCURRENCY:-$WORKER_CONCURRENCY_DEFAULT}" \
+    "ACTIVITY_POLL_MAX_TASKS=${ACTIVITY_POLL_MAX_TASKS:-32}" \
     "ACTIVITY_BULK_POLL_MAX_TASKS=${ACTIVITY_BULK_POLL_MAX_TASKS:-32}" \
+    "ACTIVITY_ENABLE_BULK_LANES=${ACTIVITY_ENABLE_BULK_LANES:-false}" \
     -- \
     target/release/activity-worker-service
 
@@ -1180,16 +1182,19 @@ else
     target/release/throughput-projector
   wait_for_port 127.0.0.1 "$THROUGHPUT_PROJECTOR_PORT" "throughput-projector"
 
-  echo "[isolated-benchmark] starting activity-worker-service (pg-v1/matching)"
+  echo "[isolated-benchmark] starting activity-worker-service (pg-v1/unified)"
   start_service activity-worker-service "$LOG_DIR/activity-worker-service-pg-v1.log" \
     "${COMMON_ENV[@]}" \
     "ACTIVITY_WORKER_SERVICE_PORT=$ACTIVITY_WORKER_SERVICE_PORT" \
-    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
-    "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$MATCHING_PORT" \
+    "UNIFIED_RUNTIME_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
+    "MATCHING_SERVICE_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
+    "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
     "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
     "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \
     "ACTIVITY_WORKER_CONCURRENCY=${ACTIVITY_WORKER_CONCURRENCY:-$WORKER_CONCURRENCY_DEFAULT}" \
+    "ACTIVITY_POLL_MAX_TASKS=${ACTIVITY_POLL_MAX_TASKS:-32}" \
     "ACTIVITY_BULK_POLL_MAX_TASKS=${ACTIVITY_BULK_POLL_MAX_TASKS:-32}" \
+    "ACTIVITY_ENABLE_BULK_LANES=${ACTIVITY_ENABLE_BULK_LANES:-false}" \
     -- \
     target/release/activity-worker-service
 

@@ -3,6 +3,7 @@ use std::{
     env,
     ffi::OsString,
     fs::{self, File},
+    io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
@@ -223,6 +224,7 @@ struct WorkerPackageRecord {
     package_dir: String,
     dist_dir: String,
     manifest_path: String,
+    activity_manifest_path: String,
     bootstrap_path: String,
     resolved_activity_module_path: Option<String>,
     resolved_activity_runtime_helper_path: Option<String>,
@@ -1168,14 +1170,17 @@ fn build_worker_packages(
     let mut packages = Vec::new();
     let package_workers = preferred_packaged_workers(workers);
     for worker in package_workers {
+        let worker_path_key = worker
+            .file
+            .trim_end_matches(".ts")
+            .trim_end_matches(".mts")
+            .trim_end_matches(".cts")
+            .trim_end_matches(".js")
+            .trim_end_matches(".mjs")
+            .trim_end_matches(".cjs");
         let package_name = format!(
             "{}-{}",
-            sanitize_segment(
-                Path::new(&worker.file)
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("worker"),
-            ),
+            sanitize_segment(worker_path_key),
             worker.worker_index
         );
         let package_dir = workers_dir.join(&package_name);
@@ -1184,6 +1189,7 @@ fn build_worker_packages(
         let build_id =
             worker.build_id.clone().unwrap_or_else(|| format!("migrated-{}", package_name));
         let bootstrap_path = package_dir.join("bootstrap.mjs");
+        let activity_manifest_path = package_dir.join("activity-manifest.json");
         let manifest_path = package_dir.join("worker-package.json");
         let log_path = package_dir.join("worker.log");
         let pid_path = package_dir.join("worker.pid");
@@ -1239,6 +1245,16 @@ fn build_worker_packages(
             ),
         )
         .with_context(|| format!("failed to write {}", bootstrap_path.display()))?;
+        let activity_manifest = if resolved_activity_module_path.is_some() {
+            describe_worker_activities(&bootstrap_path, worker.task_queue.as_deref())?
+        } else {
+            json!({
+                "schema_version": 1,
+                "task_queue": worker.task_queue,
+                "activities": [],
+            })
+        };
+        write_json(&activity_manifest_path, &activity_manifest)?;
         write_json(
             &manifest_path,
             &json!({
@@ -1256,6 +1272,7 @@ fn build_worker_packages(
                 "activity_runtime_helper": worker.activity_runtime_helper,
                 "data_converter_mode": worker.data_converter_mode,
                 "payload_converter_module": worker.payload_converter_module,
+                "activity_manifest_path": activity_manifest_path.display().to_string(),
                 "project_root": project_root.display().to_string(),
                 "dist_dir": dist_dir.display().to_string(),
                 "resolved_activity_module_path": resolved_activity_module_path,
@@ -1274,6 +1291,7 @@ fn build_worker_packages(
             package_dir: package_dir.display().to_string(),
             dist_dir: dist_dir.display().to_string(),
             manifest_path: manifest_path.display().to_string(),
+            activity_manifest_path: activity_manifest_path.display().to_string(),
             bootstrap_path: bootstrap_path.display().to_string(),
             resolved_activity_module_path,
             resolved_activity_runtime_helper_path,
@@ -2053,12 +2071,28 @@ fn render_worker_bootstrap(
            }}\n\
            return converterMod.payloadConverter;\n\
          }}\n\
-         async function invoke(request) {{\n\
-           await loadPayloadConverterModule();\n\
+         function normalizeCapabilities(raw) {{\n\
+           if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {{\n\
+             return null;\n\
+           }}\n\
+           const capabilities = {{}};\n\
+           if (typeof raw.payloadless_transport === 'boolean') capabilities.payloadless_transport = raw.payloadless_transport;\n\
+           if (typeof raw.tiny_inline_completion === 'boolean') capabilities.tiny_inline_completion = raw.tiny_inline_completion;\n\
+           if (typeof raw.omit_success_output_short_circuit === 'boolean') capabilities.omit_success_output_short_circuit = raw.omit_success_output_short_circuit;\n\
+           if (typeof raw.payloadlessTransport === 'boolean') capabilities.payloadless_transport = raw.payloadlessTransport;\n\
+           if (typeof raw.tinyInlineCompletion === 'boolean') capabilities.tiny_inline_completion = raw.tinyInlineCompletion;\n\
+           if (typeof raw.omitSuccessOutputShortCircuit === 'boolean') capabilities.omit_success_output_short_circuit = raw.omitSuccessOutputShortCircuit;\n\
+           return Object.keys(capabilities).length > 0 ? capabilities : null;\n\
+         }}\n\
+         async function loadActivityRuntime(loadConverter = true) {{\n\
+           if (loadConverter) {{\n\
+             await loadPayloadConverterModule();\n\
+           }}\n\
            if (!fabrikMigratedWorker.resolvedActivityModulePath) {{\n\
              throw new Error(`worker ${{fabrikMigratedWorker.sourceWorker}} does not export activities for Fabrik dispatch`);\n\
            }}\n\
            let activityContainer;\n\
+           let mod = null;\n\
            if (fabrikMigratedWorker.activityRuntimeHelper) {{\n\
              if (!fabrikMigratedWorker.resolvedActivityRuntimeHelperPath) {{\n\
                throw new Error(`worker ${{fabrikMigratedWorker.sourceWorker}} is missing its activity runtime helper`);\n\
@@ -2067,11 +2101,29 @@ fn render_worker_bootstrap(
              const runtime = await helper.createFabrikWorkerRuntime();\n\
              activityContainer = runtime?.activities;\n\
            }} else {{\n\
-             const mod = await import(pathToFileURL(fabrikMigratedWorker.resolvedActivityModulePath).href);\n\
+             mod = await import(pathToFileURL(fabrikMigratedWorker.resolvedActivityModulePath).href);\n\
              activityContainer = fabrikMigratedWorker.activityFactoryExport\n\
                ? mod[fabrikMigratedWorker.activityFactoryExport](...fabrikMigratedWorker.activityFactoryArgsJs.map((arg) => (0, eval)(arg)))\n\
                : mod;\n\
            }}\n\
+           return {{ activityContainer, mod }};\n\
+         }}\n\
+         function describeActivities(activityContainer, mod) {{\n\
+           const rawCapabilities = activityContainer?.__fabrikActivityCapabilities ?? mod?.fabrikActivityCapabilities ?? {{}};\n\
+           const activities = Object.entries(activityContainer ?? {{}})\n\
+             .filter(([name, value]) => typeof value === 'function' && !name.startsWith('__'))\n\
+             .map(([activity_type]) => {{\n\
+               const capabilities = normalizeCapabilities(rawCapabilities?.[activity_type]);\n\
+               return capabilities ? {{ activity_type, capabilities }} : {{ activity_type }};\n\
+             }});\n\
+           return {{\n\
+             schema_version: 1,\n\
+             task_queue: fabrikMigratedWorker.taskQueue ?? null,\n\
+             activities,\n\
+           }};\n\
+         }}\n\
+         async function invoke(request) {{\n\
+           const {{ activityContainer }} = await loadActivityRuntime(true);\n\
            const fn = activityContainer?.[request.activity_type];\n\
            if (typeof fn !== 'function') {{\n\
              throw new Error(`activity ${{request.activity_type}} is not exported by ${{fabrikMigratedWorker.resolvedActivityModulePath}}`);\n\
@@ -2079,13 +2131,17 @@ fn render_worker_bootstrap(
            const args = Array.isArray(request.input) ? request.input : request.input == null ? [] : [request.input];\n\
            return await fn(...args);\n\
          }}\n\
+         async function describe() {{\n\
+           const {{ activityContainer, mod }} = await loadActivityRuntime(false);\n\
+           return describeActivities(activityContainer, mod);\n\
+         }}\n\
          async function main() {{\n\
            let data = '';\n\
            process.stdin.setEncoding('utf8');\n\
            for await (const chunk of process.stdin) {{ data += chunk; }}\n\
            const request = JSON.parse(data || '{{}}');\n\
            try {{\n\
-             const output = await invoke(request);\n\
+             const output = request.kind === 'describe' ? await describe() : await invoke(request);\n\
              process.stdout.write(JSON.stringify({{ ok: true, output }}));\n\
            }} catch (error) {{\n\
              process.stdout.write(JSON.stringify({{ ok: false, error: String(error?.message ?? error) }}));\n\
@@ -2108,6 +2164,65 @@ fn render_worker_bootstrap(
         resolved_payload_converter_module_path = resolved_payload_converter_module_path,
         bootstrap_pattern = bootstrap_pattern,
     )
+}
+
+fn describe_worker_activities(bootstrap_path: &Path, task_queue: Option<&str>) -> Result<Value> {
+    let mut child = Command::new("node")
+        .arg(bootstrap_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start {}", bootstrap_path.display()))?;
+    {
+        let stdin = child.stdin.as_mut().context("worker bootstrap stdin unavailable")?;
+        stdin.write_all(br#"{"kind":"describe"}"#)?;
+    }
+    let output = child.wait_with_output()?;
+    let response: Value = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "invalid JSON from {}{}",
+            bootstrap_path.display(),
+            if output.status.success() {
+                String::new()
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                if stderr.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (stderr: {stderr})")
+                }
+            },
+        )
+    })?;
+    if !response.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        anyhow::bail!(
+            "{}",
+            response
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("worker bootstrap description failed without an explicit error")
+        );
+    }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        anyhow::bail!(
+            "worker bootstrap description failed for {}: {}",
+            bootstrap_path.display(),
+            if stderr.is_empty() { "unknown error" } else { &stderr }
+        );
+    }
+    let mut manifest = response.get("output").cloned().unwrap_or_else(|| json!({}));
+    if manifest.get("schema_version").is_none() {
+        manifest["schema_version"] = json!(1_u32);
+    }
+    if manifest.get("task_queue").is_none() {
+        manifest["task_queue"] = task_queue.map(str::to_owned).into();
+    }
+    if manifest.get("activities").is_none() {
+        manifest["activities"] = json!([]);
+    }
+    Ok(manifest)
 }
 
 fn render_markdown_report(report: &MigrationReport) -> String {

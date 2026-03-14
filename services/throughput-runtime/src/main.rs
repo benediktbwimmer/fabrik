@@ -1,6 +1,9 @@
 mod local_state;
 
 use std::{
+    fs,
+    io::Write,
+    process::{Command, Stdio},
     collections::{BTreeSet, HashMap, HashSet},
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
@@ -32,17 +35,20 @@ use fabrik_store::{
     WorkflowBulkChunkRecord, WorkflowBulkChunkStatus, WorkflowStore,
 };
 use fabrik_throughput::{
-    ADMISSION_POLICY_VERSION, ActivityExecutionCapabilities, BENCHMARK_ECHO_ACTIVITY,
+    ADMISSION_POLICY_VERSION, ActivityCapabilityRegistry, ActivityExecutionCapabilities,
+    BENCHMARK_ECHO_ACTIVITY, CORE_ACCEPT_ACTIVITY, CORE_ECHO_ACTIVITY, CORE_NOOP_ACTIVITY,
     CollectResultsBatchManifest, CollectResultsChunkSegmentRef, PayloadHandle, PayloadStore,
     PayloadStoreConfig, PayloadStoreKind, StartThroughputRunCommand, ThroughputBackend,
     ThroughputBatchIdentity, ThroughputChangelogEntry, ThroughputChangelogPayload,
     ThroughputChunkReport, ThroughputChunkReportPayload, ThroughputCommand,
-    ThroughputCommandEnvelope, benchmark_echo_item_requires_output, bulk_reducer_class,
+    ThroughputCommandEnvelope, WorkerActivityManifest, benchmark_echo_item_requires_output, bulk_reducer_class,
     bulk_reducer_name, bulk_reducer_settles, bulk_reducer_summary_field_name,
     can_complete_payloadless_bulk_chunk, can_use_payloadless_bulk_transport, decode_cbor,
     effective_aggregation_group_count, encode_cbor, execute_benchmark_echo,
     group_id_for_chunk_index, parse_benchmark_compact_input_meta_from_handle,
+    load_activity_capability_registry_from_env,
     parse_benchmark_compact_total_items_from_handle, planned_reduction_tree_depth,
+    resolve_activity_capabilities,
     stream_v2_fast_lane_enabled, synthesize_benchmark_echo_items, throughput_execution_mode,
     throughput_partition_key, throughput_reducer_execution_path, throughput_reducer_version,
     throughput_routing_reason,
@@ -52,6 +58,7 @@ use fabrik_worker_protocol::activity_worker::{
     PollBulkActivityTaskResponse, ReportBulkActivityTaskResultsRequest,
     activity_worker_api_server::{ActivityWorkerApi, ActivityWorkerApiServer},
 };
+use fabrik_workflow::execute_handler;
 use futures_util::StreamExt;
 use local_state::{
     LeasedChunkSnapshot, LocalThroughputDebugSnapshot, LocalThroughputState, PreparedReportApply,
@@ -73,6 +80,81 @@ const BRIDGE_EVENT_CONCURRENCY: usize = 64;
 const LOCAL_BENCHMARK_FASTLANE_WORKER_ID: &str = "throughput-runtime-local-fastlane";
 const LOCAL_BENCHMARK_FASTLANE_WORKER_BUILD_ID: &str = "throughput-runtime-local-fastlane";
 const LOCAL_BENCHMARK_FASTLANE_BATCH_SIZE: usize = 256;
+
+#[derive(Debug, Clone, Deserialize)]
+struct WorkerPackageFastlaneManifest {
+    task_queue: Option<String>,
+    bootstrap_path: Option<String>,
+    activity_manifest_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LocalActivityExecutorRegistry {
+    by_task_queue: HashMap<String, HashMap<String, String>>,
+}
+
+impl LocalActivityExecutorRegistry {
+    fn lookup(&self, task_queue: &str, activity_type: &str) -> Option<&str> {
+        self.by_task_queue
+            .get(task_queue)
+            .and_then(|activities| activities.get(activity_type))
+            .or_else(|| self.by_task_queue.get("").and_then(|activities| activities.get(activity_type)))
+            .map(String::as_str)
+    }
+
+    fn insert(&mut self, task_queue: Option<&str>, activity_type: &str, bootstrap_path: &str) {
+        self.by_task_queue
+            .entry(task_queue.unwrap_or_default().to_owned())
+            .or_default()
+            .insert(activity_type.to_owned(), bootstrap_path.to_owned());
+    }
+}
+
+fn load_local_activity_executor_registry_from_env(
+    env_var: &str,
+) -> Result<LocalActivityExecutorRegistry> {
+    let workers_dir = std::env::var(env_var).unwrap_or_default();
+    if workers_dir.trim().is_empty() {
+        return Ok(LocalActivityExecutorRegistry::default());
+    }
+    let workers_dir = std::path::PathBuf::from(workers_dir);
+    if !workers_dir.exists() {
+        return Ok(LocalActivityExecutorRegistry::default());
+    }
+    let mut registry = LocalActivityExecutorRegistry::default();
+    for entry in fs::read_dir(&workers_dir)
+        .with_context(|| format!("failed to read worker packages dir {}", workers_dir.display()))?
+    {
+        let entry = entry?;
+        let package_path = entry.path().join("worker-package.json");
+        if !package_path.exists() {
+            continue;
+        }
+        let package: WorkerPackageFastlaneManifest = serde_json::from_slice(
+            &fs::read(&package_path)
+                .with_context(|| format!("failed to read {}", package_path.display()))?,
+        )
+        .with_context(|| format!("failed to parse {}", package_path.display()))?;
+        let Some(bootstrap_path) = package.bootstrap_path.as_deref() else {
+            continue;
+        };
+        let Some(activity_manifest_path) = package.activity_manifest_path.as_deref() else {
+            continue;
+        };
+        let activity_manifest_path = std::path::PathBuf::from(activity_manifest_path);
+        let manifest: WorkerActivityManifest = serde_json::from_slice(
+            &fs::read(&activity_manifest_path)
+                .with_context(|| format!("failed to read {}", activity_manifest_path.display()))?,
+        )
+        .with_context(|| format!("failed to parse {}", activity_manifest_path.display()))?;
+        let task_queue = manifest.task_queue.as_deref().or(package.task_queue.as_deref());
+        for activity in manifest.activities {
+            registry.insert(task_queue, &activity.activity_type, bootstrap_path);
+        }
+    }
+    Ok(registry)
+}
+
 #[derive(Clone)]
 struct AppState {
     store: WorkflowStore,
@@ -84,6 +166,8 @@ struct AppState {
     bulk_notify: Arc<Notify>,
     outbox_notify: Arc<Notify>,
     runtime: ThroughputRuntimeConfig,
+    activity_capability_registry: Arc<ActivityCapabilityRegistry>,
+    activity_executor_registry: Arc<LocalActivityExecutorRegistry>,
     throughput_partitions: i32,
     outbox_publisher_id: String,
     debug: Arc<StdMutex<ThroughputDebugState>>,
@@ -302,6 +386,10 @@ async fn main() -> Result<()> {
     let outbox_notify = Arc::new(Notify::new());
     let debug = Arc::new(StdMutex::new(ThroughputDebugState::default()));
     let payload_store = PayloadStore::from_config(build_payload_store_config(&runtime)).await?;
+    let activity_capability_registry =
+        Arc::new(load_activity_capability_registry_from_env("FABRIK_WORKER_PACKAGES_DIR")?);
+    let activity_executor_registry =
+        Arc::new(load_local_activity_executor_registry_from_env("FABRIK_WORKER_PACKAGES_DIR")?);
     let owner_id = format!("throughput-runtime:{}", Uuid::now_v7());
     let managed_partitions = ownership_config
         .static_partition_ids
@@ -326,6 +414,8 @@ async fn main() -> Result<()> {
         bulk_notify: bulk_notify.clone(),
         outbox_notify: outbox_notify.clone(),
         runtime,
+        activity_capability_registry,
+        activity_executor_registry,
         throughput_partitions: redpanda.throughput_partitions,
         outbox_publisher_id: format!("throughput-runtime:{}", Uuid::now_v7()),
         debug: debug.clone(),
@@ -1670,14 +1760,14 @@ async fn run_local_benchmark_fastlane_once(
         Some(&owned),
         state.throughput_partitions,
         max_chunks,
-        is_local_benchmark_fastlane_chunk,
+        |chunk| is_local_fastlane_chunk(state, chunk),
     )?;
     if leased.is_empty() {
         return Ok(0);
     }
     let mut reports = Vec::with_capacity(leased.len());
     for chunk in leased {
-        reports.push(execute_local_benchmark_chunk(state, chunk).await?);
+        reports.push(execute_local_fastlane_chunk(state, chunk).await?);
     }
     {
         let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
@@ -1695,25 +1785,32 @@ async fn run_local_benchmark_fastlane_once(
     Ok(reports.len())
 }
 
-fn is_local_benchmark_fastlane_chunk(chunk: &LeasedChunkSnapshot) -> bool {
+fn is_local_fastlane_chunk(state: &AppState, chunk: &LeasedChunkSnapshot) -> bool {
     can_complete_payloadless_bulk_chunk(
         &chunk.activity_type,
-        None,
+        chunk.activity_capabilities.as_ref(),
         chunk.omit_success_output,
         chunk.item_count,
         !chunk.items.is_empty(),
         !chunk.input_handle.is_null(),
         chunk.cancellation_requested,
-    ) || chunk.activity_type == BENCHMARK_ECHO_ACTIVITY
+    ) || can_execute_activity_locally(state, &chunk.task_queue, &chunk.activity_type)
 }
 
-async fn execute_local_benchmark_chunk(
+fn can_execute_activity_locally(state: &AppState, task_queue: &str, activity_type: &str) -> bool {
+    matches!(
+        activity_type,
+        BENCHMARK_ECHO_ACTIVITY | CORE_ECHO_ACTIVITY | CORE_NOOP_ACTIVITY | CORE_ACCEPT_ACTIVITY
+    ) || state.activity_executor_registry.lookup(task_queue, activity_type).is_some()
+}
+
+async fn execute_local_fastlane_chunk(
     state: &AppState,
     chunk: LeasedChunkSnapshot,
 ) -> Result<ThroughputChunkReport> {
     if can_complete_payloadless_bulk_chunk(
         &chunk.activity_type,
-        None,
+        chunk.activity_capabilities.as_ref(),
         chunk.omit_success_output,
         chunk.item_count,
         !chunk.items.is_empty(),
@@ -1722,12 +1819,23 @@ async fn execute_local_benchmark_chunk(
     ) {
         return Ok(local_benchmark_completed_report(chunk, Value::Null, None));
     }
-    let items = resolve_local_benchmark_chunk_items(state, &chunk).await?;
-    let omit_success_output =
-        chunk.omit_success_output && !items.iter().any(benchmark_echo_item_requires_output);
+    let items = resolve_local_fastlane_chunk_items(state, &chunk).await?;
+    let omit_success_output = if chunk.activity_type == BENCHMARK_ECHO_ACTIVITY {
+        chunk.omit_success_output && !items.iter().any(benchmark_echo_item_requires_output)
+    } else {
+        chunk.omit_success_output
+    };
     let mut outputs = (!omit_success_output).then(|| Vec::with_capacity(items.len()));
     for item in items {
-        match execute_benchmark_echo(chunk.attempt, &item) {
+        match execute_local_fastlane_activity(
+            state,
+            &chunk.task_queue,
+            &chunk.activity_type,
+            chunk.attempt,
+            &item,
+        )
+        .await
+        {
             Ok(output) => {
                 if let Some(outputs) = outputs.as_mut() {
                     outputs.push(output);
@@ -1744,7 +1852,7 @@ async fn execute_local_benchmark_chunk(
     Ok(local_benchmark_completed_report(chunk, Value::Null, outputs))
 }
 
-async fn resolve_local_benchmark_chunk_items(
+async fn resolve_local_fastlane_chunk_items(
     state: &AppState,
     chunk: &LeasedChunkSnapshot,
 ) -> Result<Vec<Value>> {
@@ -1770,6 +1878,75 @@ async fn resolve_local_benchmark_chunk_items(
     state.payload_store.read_items(&handle).await.with_context(|| {
         format!("failed to read local benchmark chunk input for {}", chunk.chunk_id)
     })
+}
+
+async fn execute_local_fastlane_activity(
+    state: &AppState,
+    task_queue: &str,
+    activity_type: &str,
+    attempt: u32,
+    input: &Value,
+) -> Result<Value> {
+    if activity_type == BENCHMARK_ECHO_ACTIVITY {
+        return execute_benchmark_echo(attempt, input);
+    }
+    match activity_type {
+        CORE_ECHO_ACTIVITY | CORE_NOOP_ACTIVITY | CORE_ACCEPT_ACTIVITY => {
+            return execute_handler(activity_type, input).map_err(anyhow::Error::from);
+        }
+        _ => {}
+    }
+    let Some(bootstrap_path) = state.activity_executor_registry.lookup(task_queue, activity_type) else {
+        anyhow::bail!("activity {activity_type} has no local fastlane executor for task queue {task_queue}");
+    };
+    execute_packaged_node_activity(bootstrap_path, activity_type, input, None)
+}
+
+fn execute_packaged_node_activity(
+    bootstrap_path: &str,
+    activity_type: &str,
+    input: &Value,
+    config: Option<&Value>,
+) -> Result<Value> {
+    let envelope = serde_json::to_vec(&serde_json::json!({
+        "activity_type": activity_type,
+        "input": input,
+        "config": config.cloned().unwrap_or(Value::Null),
+    }))?;
+    let mut child = Command::new("node")
+        .arg(bootstrap_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!("failed to start packaged activity bootstrap {}", bootstrap_path)
+        })?;
+    {
+        let stdin = child.stdin.as_mut().context("packaged activity bootstrap stdin unavailable")?;
+        stdin.write_all(&envelope)?;
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        anyhow::bail!(
+            "packaged activity bootstrap failed for {activity_type}: {}",
+            if stderr.is_empty() { "unknown error" } else { &stderr }
+        );
+    }
+    let response: Value = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!("packaged activity bootstrap produced invalid JSON for {activity_type}")
+    })?;
+    if response.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return Ok(response.get("output").cloned().unwrap_or(Value::Null));
+    }
+    anyhow::bail!(
+        "{}",
+        response
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("packaged activity failed without an explicit error")
+    )
 }
 
 fn local_benchmark_completed_report(
@@ -2528,6 +2705,12 @@ async fn build_stream_projection_records_from_parts(
     let chunk_size_usize =
         usize::try_from(chunk_size.max(1)).context("bulk chunk size exceeds usize")?;
     let total_items = total_items_override.unwrap_or(items.len());
+    let resolved_activity_capabilities = resolve_activity_capabilities(
+        Some(app_state.activity_capability_registry.as_ref()),
+        task_queue,
+        activity_type,
+        activity_capabilities,
+    );
     let chunk_count = if total_items == 0 {
         0
     } else {
@@ -2553,7 +2736,7 @@ async fn build_stream_projection_records_from_parts(
     .await?;
     let payloadless_chunk_transport = can_use_payloadless_bulk_transport(
         activity_type,
-        activity_capabilities,
+        resolved_activity_capabilities.as_ref(),
         reducer,
         max_attempts,
         &items,
@@ -2578,6 +2761,7 @@ async fn build_stream_projection_records_from_parts(
         artifact_hash: artifact_hash.map(str::to_owned),
         batch_id: batch_id.to_owned(),
         activity_type: activity_type.to_owned(),
+        activity_capabilities: resolved_activity_capabilities.clone(),
         task_queue: task_queue.to_owned(),
         state: workflow_state.map(str::to_owned),
         input_handle: serde_json::to_value(&batch_input_handle)
@@ -3653,6 +3837,7 @@ async fn finalize_grouped_stream_batch(
             artifact_hash: existing_batch.artifact_hash.clone(),
             batch_id: existing_batch.identity.batch_id.clone(),
             activity_type: String::new(),
+            activity_capabilities: existing_batch.activity_capabilities.clone(),
             task_queue: existing_batch.task_queue.clone(),
             state: None,
             input_handle: Value::Null,
@@ -3730,6 +3915,7 @@ async fn publish_grouped_batch_terminal_event(
             artifact_hash: projected_apply.batch_artifact_hash.clone(),
             batch_id: report.batch_id.clone(),
             activity_type: String::new(),
+            activity_capabilities: None,
             task_queue: projected_apply.batch_task_queue.clone(),
             state: None,
             input_handle: Value::Null,
@@ -4409,7 +4595,7 @@ fn bulk_chunk_to_proto(
 ) -> BulkActivityTask {
     let payloadless_chunk_transport = can_complete_payloadless_bulk_chunk(
         &record.activity_type,
-        None,
+        record.activity_capabilities.as_ref(),
         record.omit_success_output,
         record.item_count,
         !record.items.is_empty(),
@@ -4439,6 +4625,11 @@ fn bulk_chunk_to_proto(
         chunk_index: record.chunk_index,
         group_id: record.group_id,
         activity_type: record.activity_type.clone(),
+        activity_capabilities_json: if supports_cbor {
+            String::new()
+        } else {
+            serde_json::to_string(&record.activity_capabilities).expect("bulk activity capabilities serialize")
+        },
         task_queue: record.task_queue.clone(),
         attempt: record.attempt,
         items_json: if supports_cbor {
@@ -4470,6 +4661,15 @@ fn bulk_chunk_to_proto(
         {
             encode_cbor(&record.input_handle, "bulk chunk input handle")
                 .expect("bulk chunk input handle encodes as CBOR")
+        } else {
+            Vec::new()
+        },
+        activity_capabilities_cbor: if supports_cbor {
+            encode_cbor(
+                &record.activity_capabilities,
+                "bulk activity capabilities",
+            )
+            .expect("bulk activity capabilities encode")
         } else {
             Vec::new()
         },
@@ -5035,6 +5235,7 @@ mod tests {
                 artifact_hash: Some("artifact-a".to_owned()),
                 chunk_id: "chunk-a".to_owned(),
                 activity_type: "benchmark.echo".to_owned(),
+                activity_capabilities: None,
                 task_queue: "bulk".to_owned(),
                 chunk_index: 0,
                 group_id: 0,
@@ -5328,6 +5529,7 @@ mod tests {
                 Some("artifact-1"),
                 batch_id,
                 "benchmark.echo",
+                None,
                 "bulk",
                 Some("join"),
                 &serde_json::json!({"kind": "inline", "key": "input"}),

@@ -432,6 +432,7 @@ up() {
   echo "[dev-stack] starting docker infra"
   docker compose up -d redpanda postgres minio minio-init >/dev/null
   wait_for_redpanda_ready 90
+  docker exec fabrik-redpanda-1 rpk cluster config set write_caching_default false >/dev/null
   wait_for_container_health fabrik-postgres-1 healthy 90
   wait_for_minio 90
 

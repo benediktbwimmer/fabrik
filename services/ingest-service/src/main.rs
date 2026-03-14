@@ -1,4 +1,8 @@
-use std::{collections::HashMap, env};
+use std::{
+    collections::{HashMap, hash_map::DefaultHasher},
+    env,
+    hash::{Hash, Hasher},
+};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -21,12 +25,13 @@ use fabrik_store::{
     WorkflowRunFilters, WorkflowStore, resolve_topic_adapter_dispatch,
 };
 use fabrik_throughput::{
-    ADMISSION_POLICY_VERSION, BENCHMARK_ECHO_ACTIVITY, BENCHMARK_FAST_COUNT_ACTIVITY,
-    FastPathRejectionReason, PayloadHandle, ThroughputBackend, ThroughputCommand,
+    ADMISSION_POLICY_VERSION, ActivityCapabilityRegistry, FastPathRejectionReason, PayloadHandle,
+    ThroughputBackend, ThroughputCommand,
     ThroughputCommandEnvelope, TinyWorkflowExecutionMode, TinyWorkflowStartBatchCommand,
     TinyWorkflowStartCommand, TinyWorkflowStartItem, WorkflowAdmissionMode,
-    can_inline_durable_tiny_fanout, can_inline_stream_v2_microbatch, execute_benchmark_echo,
-    parse_benchmark_compact_input_spec, parse_benchmark_compact_total_items_from_handle,
+    can_inline_durable_tiny_fanout, can_inline_stream_v2_microbatch,
+    load_activity_capability_registry_from_env, parse_benchmark_compact_input_spec,
+    parse_benchmark_compact_total_items_from_handle, resolve_activity_capabilities,
     tiny_workflow_routing_decision,
 };
 use fabrik_workflow::{
@@ -64,7 +69,59 @@ struct AppState {
     throughput_command_publisher: JsonTopicPublisher<ThroughputCommandEnvelope>,
     store: WorkflowStore,
     runtime_id: String,
+    activity_capability_registry: ActivityCapabilityRegistry,
+    durable_start_analysis_mode: DurableStartAnalysisMode,
     tiny_start_sender: mpsc::Sender<TinyStartQueueItem>,
+}
+
+#[derive(Clone, Copy)]
+enum DurableStartAnalysisMode {
+    Always,
+    Sampled { sample_modulus: u64 },
+    Off,
+}
+
+impl DurableStartAnalysisMode {
+    fn from_env() -> Result<Self> {
+        let mode = env::var("INGEST_DURABLE_FAST_PATH_ANALYSIS")
+            .unwrap_or_else(|_| "sampled".to_owned());
+        match mode.as_str() {
+            "always" => Ok(Self::Always),
+            "off" => Ok(Self::Off),
+            "sampled" => {
+                let sample_modulus = env::var("INGEST_DURABLE_FAST_PATH_ANALYSIS_SAMPLE_MODULUS")
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .filter(|value| *value > 1)
+                    .unwrap_or(64);
+                Ok(Self::Sampled { sample_modulus })
+            }
+            other => anyhow::bail!(
+                "invalid INGEST_DURABLE_FAST_PATH_ANALYSIS value {other}; expected always, sampled, or off"
+            ),
+        }
+    }
+
+    fn should_analyze(
+        self,
+        tenant_id: &str,
+        definition_id: &str,
+        instance_id: &str,
+        run_id: &str,
+    ) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Off => false,
+            Self::Sampled { sample_modulus } => {
+                let mut hasher = DefaultHasher::new();
+                tenant_id.hash(&mut hasher);
+                definition_id.hash(&mut hasher);
+                instance_id.hash(&mut hasher);
+                run_id.hash(&mut hasher);
+                hasher.finish() % sample_modulus == 0
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -126,6 +183,8 @@ struct TriggerWorkflowRequest {
     instance_id: Option<String>,
     #[serde(default)]
     workflow_task_queue: Option<String>,
+    #[serde(default)]
+    admission_mode: Option<String>,
     input: Value,
     #[serde(default)]
     memo: Option<Value>,
@@ -140,6 +199,8 @@ struct TriggerWorkflowBatchRequest {
     tenant_id: String,
     #[serde(default)]
     workflow_task_queue: Option<String>,
+    #[serde(default)]
+    admission_mode: Option<String>,
     items: Vec<TriggerWorkflowBatchItem>,
 }
 
@@ -366,6 +427,9 @@ async fn main() -> Result<()> {
     );
     let store = WorkflowStore::connect(&postgres.url).await?;
     store.init().await?;
+    let activity_capability_registry =
+        load_activity_capability_registry_from_env("FABRIK_WORKER_PACKAGES_DIR")?;
+    let durable_start_analysis_mode = DurableStartAnalysisMode::from_env()?;
     let (tiny_start_sender, tiny_start_receiver) =
         mpsc::channel(TINY_WORKFLOW_SINGLE_START_QUEUE_CAPACITY);
     let state = AppState {
@@ -381,6 +445,8 @@ async fn main() -> Result<()> {
             .ok()
             .filter(|value: &String| !value.is_empty())
             .unwrap_or_else(|| format!("ingest-service-{}", Uuid::now_v7())),
+        activity_capability_registry,
+        durable_start_analysis_mode,
         tiny_start_sender,
     };
     let app = default_router::<AppState>(ServiceInfo::new(
@@ -593,6 +659,7 @@ async fn execute_inline_tiny_workflow_group(
             fast_path_rejection_reason: None,
         };
         match prepare_tiny_workflow_completion(
+            &state.activity_capability_registry,
             &resolved.tenant_id,
             &resolved.workflow_task_queue,
             &resolved.artifact,
@@ -973,6 +1040,7 @@ async fn dispatch_topic_adapter_record(
                 tenant_id: adapter.tenant_id.clone(),
                 instance_id: request.instance_id,
                 workflow_task_queue: request.workflow_task_queue,
+                admission_mode: None,
                 input: request.input,
                 memo: request.memo,
                 search_attributes: request.search_attributes,
@@ -1365,8 +1433,23 @@ async fn handle_trigger_workflow(
     let workflow_task_queue = resolved.workflow_task_queue.clone();
     let trigger_event_id = Uuid::now_v7();
     let accepted_at = Utc::now();
-    let tiny_routing = analyze_tiny_workflow_eligibility(&resolved.artifact, &request.input)?;
-    if let Ok(routing) = tiny_routing {
+    let should_analyze_tiny = !request_forces_durable_start(request.admission_mode.as_deref())
+        && state.durable_start_analysis_mode.should_analyze(
+            &request.tenant_id,
+            &resolved.definition_id,
+            &instance_id,
+            &run_id,
+        );
+    let tiny_routing = if should_analyze_tiny {
+        Some(analyze_tiny_workflow_eligibility(
+            &state.activity_capability_registry,
+            &resolved.artifact,
+            &request.input,
+        )?)
+    } else {
+        None
+    };
+    if let Some(Ok(routing)) = tiny_routing {
         let mode = routing.mode;
         let item = TinyWorkflowStartItem {
             instance_id: instance_id.clone(),
@@ -1432,7 +1515,8 @@ async fn handle_trigger_workflow(
         }
         return Ok(response);
     }
-    let fast_path_rejection_reason = tiny_routing.err().map(|reason| reason.as_str().to_owned());
+    let fast_path_rejection_reason = tiny_routing
+        .and_then(|decision| decision.err().map(|reason| reason.as_str().to_owned()));
     let payload = WorkflowEvent::WorkflowTriggered { input: request.input.clone() };
     let mut envelope = EventEnvelope::new(
         payload.event_type(),
@@ -1467,7 +1551,7 @@ async fn handle_trigger_workflow(
     state.publisher.publish(&envelope, &envelope.partition_key).await.map_err(internal_error)?;
     state
         .store
-        .put_run_start(
+        .put_run_start_with_routing_metadata(
             &envelope.tenant_id,
             &envelope.instance_id,
             &envelope.run_id,
@@ -1481,15 +1565,6 @@ async fn handle_trigger_workflow(
             envelope.occurred_at,
             None,
             None,
-        )
-        .await
-        .map_err(internal_error)?;
-    state
-        .store
-        .update_workflow_run_routing_metadata(
-            &envelope.tenant_id,
-            &envelope.instance_id,
-            &envelope.run_id,
             WorkflowAdmissionMode::DurableWorkflow.as_str(),
             fast_path_rejection_reason.as_deref(),
         )
@@ -1538,9 +1613,18 @@ async fn handle_trigger_workflow_batch(
         request.workflow_task_queue.as_deref(),
     )
     .await?;
+    if request_forces_durable_start(request.admission_mode.as_deref()) {
+        return handle_trigger_workflow_batch_durable(state, request, resolved)
+            .await
+            .map_err(internal_error);
+    }
     let mut items = Vec::with_capacity(request.items.len());
     for item in &request.items {
-        let routing = analyze_tiny_workflow_eligibility(&resolved.artifact, &item.input)?;
+        let routing = analyze_tiny_workflow_eligibility(
+            &state.activity_capability_registry,
+            &resolved.artifact,
+            &item.input,
+        )?;
         let Ok(routing) = routing else {
             let reason = routing.err().expect("routing rejection reason present");
             return Err((
@@ -1555,9 +1639,13 @@ async fn handle_trigger_workflow_batch(
         if items.is_empty() {
             let _ = routing.mode;
         } else if routing.mode
-            != analyze_tiny_workflow_eligibility(&resolved.artifact, &request.items[0].input)?
-                .expect("first batch item remains eligible")
-                .mode
+            != analyze_tiny_workflow_eligibility(
+                &state.activity_capability_registry,
+                &resolved.artifact,
+                &request.items[0].input,
+            )?
+            .expect("first batch item remains eligible")
+            .mode
         {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -1575,14 +1663,18 @@ async fn handle_trigger_workflow_batch(
             search_attributes: item.search_attributes.clone(),
         });
     }
-    let mode = analyze_tiny_workflow_eligibility(&resolved.artifact, &request.items[0].input)?
-        .map_err(|reason| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("trigger batch is not eligible for the fast path: {}", reason.as_str()),
-            )
-        })?
-        .mode;
+    let mode = analyze_tiny_workflow_eligibility(
+        &state.activity_capability_registry,
+        &resolved.artifact,
+        &request.items[0].input,
+    )?
+    .map_err(|reason| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("trigger batch is not eligible for the fast path: {}", reason.as_str()),
+        )
+    })?
+    .mode;
     publish_tiny_workflow_batch(state, &resolved, mode, items.clone())
         .await
         .map_err(internal_error)?;
@@ -1630,6 +1722,85 @@ async fn handle_trigger_workflow_batch(
                 message: None,
             })
             .collect(),
+    })
+}
+
+async fn handle_trigger_workflow_batch_durable(
+    state: &AppState,
+    request: TriggerWorkflowBatchRequest,
+    resolved: ResolvedTriggerTarget,
+) -> Result<TriggerWorkflowBatchResponse> {
+    let mut envelopes = Vec::with_capacity(request.items.len());
+    let mut run_starts = Vec::with_capacity(request.items.len());
+    let mut results = Vec::with_capacity(request.items.len());
+    for item in request.items {
+        let run_id = format!("run-{}", Uuid::now_v7());
+        let accepted_at = Utc::now();
+        let payload = WorkflowEvent::WorkflowTriggered { input: item.input.clone() };
+        let mut envelope = EventEnvelope::new(
+            payload.event_type(),
+            WorkflowIdentity::new(
+                request.tenant_id.clone(),
+                resolved.definition_id.clone(),
+                resolved.definition_version,
+                resolved.artifact_hash.clone(),
+                item.instance_id.clone(),
+                run_id.clone(),
+                "ingest-service",
+            ),
+            payload,
+        );
+        envelope.occurred_at = accepted_at;
+        envelope
+            .metadata
+            .insert("workflow_task_queue".to_owned(), resolved.workflow_task_queue.clone());
+        envelope.metadata.insert(
+            "admission_mode".to_owned(),
+            WorkflowAdmissionMode::DurableWorkflow.as_str().to_owned(),
+        );
+        if let Some(memo) = item.memo.as_ref() {
+            envelope.metadata.insert("memo_json".to_owned(), memo.to_string());
+        }
+        if let Some(search_attributes) = item.search_attributes.as_ref() {
+            envelope
+                .metadata
+                .insert("search_attributes_json".to_owned(), search_attributes.to_string());
+        }
+        run_starts.push(fabrik_store::WorkflowRunStartRecord {
+            tenant_id: request.tenant_id.clone(),
+            instance_id: item.instance_id.clone(),
+            run_id: run_id.clone(),
+            definition_id: resolved.definition_id.clone(),
+            definition_version: Some(resolved.definition_version),
+            artifact_hash: Some(resolved.artifact_hash.clone()),
+            workflow_task_queue: resolved.workflow_task_queue.clone(),
+            memo: item.memo.clone(),
+            search_attributes: item.search_attributes.clone(),
+            trigger_event_id: envelope.event_id,
+            started_at: accepted_at,
+            previous_run_id: None,
+            triggered_by_run_id: None,
+            admission_mode: Some(WorkflowAdmissionMode::DurableWorkflow.as_str().to_owned()),
+            fast_path_rejection_reason: None,
+        });
+        results.push(TriggerWorkflowBatchItemResponse {
+            instance_id: item.instance_id,
+            run_id: Some(run_id),
+            status: "accepted".to_owned(),
+            message: None,
+        });
+        envelopes.push(envelope);
+    }
+    state.publisher.publish_all(&envelopes).await?;
+    state.store.put_run_starts_batch(&run_starts).await?;
+    Ok(TriggerWorkflowBatchResponse {
+        definition_id: resolved.definition_id,
+        definition_version: resolved.definition_version,
+        artifact_hash: resolved.artifact_hash,
+        accepted_count: results.len(),
+        duplicate_count: 0,
+        rejected_count: 0,
+        results,
     })
 }
 
@@ -1693,6 +1864,7 @@ async fn resolve_trigger_target(
 }
 
 fn analyze_tiny_workflow_eligibility(
+    activity_capability_registry: &ActivityCapabilityRegistry,
     artifact: &CompiledWorkflowArtifact,
     input: &Value,
 ) -> Result<
@@ -1704,16 +1876,26 @@ fn analyze_tiny_workflow_eligibility(
     let plan = artifact
         .execute_trigger_with_turn(input, turn_context)
         .map_err(|error| internal_error(error.into()))?;
-    if let Some(decision) = tiny_workflow_throughput_mode(&plan) {
+    if let Some(decision) = tiny_workflow_throughput_mode(activity_capability_registry, &plan) {
         return Ok(decision);
     }
-    if let Some(decision) = tiny_workflow_durable_mode(artifact, &plan) {
+    if let Some(decision) =
+        tiny_workflow_durable_mode(activity_capability_registry, artifact, &plan)
+    {
         return Ok(decision);
     }
     Ok(Err(FastPathRejectionReason::NotTinyWorkflow))
 }
 
+fn request_forces_durable_start(admission_mode: Option<&str>) -> bool {
+    matches!(
+        admission_mode,
+        Some(mode) if mode == WorkflowAdmissionMode::DurableWorkflow.as_str()
+    )
+}
+
 fn tiny_workflow_throughput_mode(
+    activity_capability_registry: &ActivityCapabilityRegistry,
     plan: &CompiledExecutionPlan,
 ) -> Option<std::result::Result<TinyWorkflowRoutingOutcome, FastPathRejectionReason>> {
     let Some(emission) = plan.emissions.iter().find(|emission| {
@@ -1724,6 +1906,7 @@ fn tiny_workflow_throughput_mode(
     let WorkflowEvent::BulkActivityBatchScheduled {
         activity_type,
         activity_capabilities,
+        task_queue,
         items,
         input_handle,
         chunk_size,
@@ -1749,10 +1932,16 @@ fn tiny_workflow_throughput_mode(
     };
     let chunk_count =
         if *chunk_size == 0 { 0 } else { total_items.div_ceil(*chunk_size as usize) as u32 };
+    let resolved_activity_capabilities = resolve_activity_capabilities(
+        Some(activity_capability_registry),
+        task_queue,
+        activity_type,
+        activity_capabilities.as_ref(),
+    );
     Some(
         tiny_workflow_routing_decision(
             activity_type,
-            activity_capabilities.as_ref(),
+            resolved_activity_capabilities.as_ref(),
             reducer.as_deref(),
             Some(throughput_backend.as_str()),
             *max_attempts,
@@ -1768,6 +1957,7 @@ fn tiny_workflow_throughput_mode(
 }
 
 fn tiny_workflow_durable_mode(
+    activity_capability_registry: &ActivityCapabilityRegistry,
     artifact: &CompiledWorkflowArtifact,
     plan: &CompiledExecutionPlan,
 ) -> Option<std::result::Result<TinyWorkflowRoutingOutcome, FastPathRejectionReason>> {
@@ -1791,6 +1981,7 @@ fn tiny_workflow_durable_mode(
         return None;
     };
     let mut items = Vec::with_capacity(plan.emissions.len());
+    let mut scheduled_task_queue = None::<String>;
     for emission in &plan.emissions {
         match &emission.event {
             WorkflowEvent::WorkflowStarted => continue,
@@ -1798,20 +1989,28 @@ fn tiny_workflow_durable_mode(
                 activity_type: scheduled_type,
                 input,
                 attempt,
+                task_queue,
                 ..
             } => {
                 if *attempt != 1 || scheduled_type != &activity_type {
                     return Some(Err(FastPathRejectionReason::RetriesRequired));
                 }
+                scheduled_task_queue.get_or_insert_with(|| task_queue.clone());
                 items.push(input.clone());
             }
             _ => return Some(Err(FastPathRejectionReason::RequiresInteractiveFeatures)),
         }
     }
+    let resolved_activity_capabilities = resolve_activity_capabilities(
+        Some(activity_capability_registry),
+        scheduled_task_queue.as_deref().unwrap_or("default"),
+        &activity_type,
+        activity_capabilities.as_ref(),
+    );
     Some(
         tiny_workflow_routing_decision(
             &activity_type,
-            activity_capabilities.as_ref(),
+            resolved_activity_capabilities.as_ref(),
             reducer.as_deref(),
             None,
             1,
@@ -1878,6 +2077,7 @@ async fn try_execute_tiny_workflow_start_inline(
     };
 
     let Some(completion) = prepare_tiny_workflow_completion(
+        &state.activity_capability_registry,
         &resolved.tenant_id,
         &resolved.workflow_task_queue,
         &resolved.artifact,
@@ -1925,6 +2125,7 @@ async fn submit_tiny_workflow_start_inline(
 }
 
 fn prepare_tiny_workflow_completion(
+    activity_capability_registry: &ActivityCapabilityRegistry,
     tenant_id: &str,
     workflow_task_queue: &str,
     artifact: &CompiledWorkflowArtifact,
@@ -1973,6 +2174,7 @@ fn prepare_tiny_workflow_completion(
     let completed = match mode {
         TinyWorkflowExecutionMode::Throughput => {
             try_inline_stream_v2_microbatch_trigger_completion(
+                activity_capability_registry,
                 artifact,
                 &mut instance,
                 &plan,
@@ -1981,6 +2183,7 @@ fn prepare_tiny_workflow_completion(
             )?
         }
         TinyWorkflowExecutionMode::Durable => try_inline_durable_tiny_workflow_completion(
+            activity_capability_registry,
             artifact,
             &mut instance,
             &plan,
@@ -2067,6 +2270,7 @@ fn tiny_workflow_terminal_payload(instance: &WorkflowInstanceState) -> Value {
 }
 
 fn try_inline_durable_tiny_workflow_completion(
+    activity_capability_registry: &ActivityCapabilityRegistry,
     artifact: &CompiledWorkflowArtifact,
     instance: &mut WorkflowInstanceState,
     plan: &CompiledExecutionPlan,
@@ -2089,22 +2293,36 @@ fn try_inline_durable_tiny_workflow_completion(
         return Ok(false);
     };
     let mut scheduled = Vec::new();
+    let mut scheduled_task_queue = None::<String>;
     for emission in &plan.emissions {
         match &emission.event {
             WorkflowEvent::WorkflowStarted => continue,
-            WorkflowEvent::ActivityTaskScheduled { activity_id, input, attempt, .. } => {
+            WorkflowEvent::ActivityTaskScheduled {
+                activity_id,
+                input,
+                attempt,
+                task_queue,
+                ..
+            } => {
                 if *attempt != 1 {
                     return Ok(false);
                 }
+                scheduled_task_queue.get_or_insert_with(|| task_queue.clone());
                 scheduled.push((activity_id.clone(), input.clone()));
             }
             _ => return Ok(false),
         }
     }
+    let resolved_activity_capabilities = resolve_activity_capabilities(
+        Some(activity_capability_registry),
+        scheduled_task_queue.as_deref().unwrap_or("default"),
+        &activity_type,
+        activity_capabilities.as_ref(),
+    );
     let inputs = scheduled.iter().map(|(_, input)| input.clone()).collect::<Vec<_>>();
     if !can_inline_durable_tiny_fanout(
         &activity_type,
-        activity_capabilities.as_ref(),
+        resolved_activity_capabilities.as_ref(),
         reducer.as_deref(),
         1,
         &inputs,
@@ -2112,11 +2330,8 @@ fn try_inline_durable_tiny_workflow_completion(
         return Ok(false);
     }
     for (activity_id, input) in scheduled {
-        let output = if activity_type == BENCHMARK_FAST_COUNT_ACTIVITY {
-            Value::Null
-        } else {
-            execute_benchmark_echo(1, &input)?
-        };
+        let _ = input;
+        let output = Value::Null;
         let current_state = instance
             .current_state
             .clone()
@@ -2165,6 +2380,7 @@ fn apply_compiled_plan(state: &mut WorkflowInstanceState, plan: &CompiledExecuti
 }
 
 fn try_inline_stream_v2_microbatch_trigger_completion(
+    activity_capability_registry: &ActivityCapabilityRegistry,
     artifact: &CompiledWorkflowArtifact,
     instance: &mut WorkflowInstanceState,
     plan: &CompiledExecutionPlan,
@@ -2180,6 +2396,7 @@ fn try_inline_stream_v2_microbatch_trigger_completion(
         batch_id,
         activity_type,
         activity_capabilities,
+        task_queue,
         items,
         input_handle,
         chunk_size,
@@ -2194,9 +2411,12 @@ fn try_inline_stream_v2_microbatch_trigger_completion(
     if throughput_backend != ThroughputBackend::StreamV2.as_str() {
         return Ok(false);
     }
-    if activity_type != BENCHMARK_ECHO_ACTIVITY && activity_type != BENCHMARK_FAST_COUNT_ACTIVITY {
-        return Ok(false);
-    }
+    let resolved_activity_capabilities = resolve_activity_capabilities(
+        Some(activity_capability_registry),
+        task_queue,
+        activity_type,
+        activity_capabilities.as_ref(),
+    );
     let scheduled_input_handle = serde_json::from_value::<PayloadHandle>(input_handle.clone())
         .context("failed to decode inline microbatch input handle")?;
     let total_items = if items.is_empty() {
@@ -2210,7 +2430,7 @@ fn try_inline_stream_v2_microbatch_trigger_completion(
         if *chunk_size == 0 { 0 } else { total_items.div_ceil(*chunk_size as usize) as u32 };
     if !can_inline_stream_v2_microbatch(
         activity_type,
-        activity_capabilities.as_ref(),
+        resolved_activity_capabilities.as_ref(),
         reducer.as_deref(),
         *max_attempts,
         items,

@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_throughput::{
-    ADMISSION_POLICY_VERSION, ThroughputBackend, ThroughputChunkReport, ThroughputCommandEnvelope,
+    ADMISSION_POLICY_VERSION, ActivityExecutionCapabilities, ThroughputBackend,
+    ThroughputChunkReport, ThroughputCommandEnvelope,
     bulk_reducer_default_summary_value, bulk_reducer_name, bulk_reducer_reduce_errors,
     bulk_reducer_reduce_values, bulk_reducer_requires_error_outputs,
     bulk_reducer_requires_success_outputs, bulk_reducer_settles, throughput_execution_mode,
@@ -112,6 +113,7 @@ pub struct WorkflowActivityRecord {
     pub activity_id: String,
     pub attempt: u32,
     pub activity_type: String,
+    pub activity_capabilities: Option<ActivityExecutionCapabilities>,
     pub task_queue: String,
     pub state: Option<String>,
     pub status: WorkflowActivityStatus,
@@ -192,6 +194,7 @@ pub struct ActivityScheduleUpdate {
     pub activity_id: String,
     pub attempt: u32,
     pub activity_type: String,
+    pub activity_capabilities: Option<ActivityExecutionCapabilities>,
     pub task_queue: String,
     pub state: Option<String>,
     pub input: Value,
@@ -300,6 +303,7 @@ pub struct WorkflowBulkBatchRecord {
     pub artifact_hash: Option<String>,
     pub batch_id: String,
     pub activity_type: String,
+    pub activity_capabilities: Option<ActivityExecutionCapabilities>,
     pub task_queue: String,
     pub state: Option<String>,
     pub input_handle: Value,
@@ -2323,6 +2327,7 @@ impl WorkflowStore {
                 activity_id TEXT NOT NULL,
                 attempt INTEGER NOT NULL,
                 activity_type TEXT NOT NULL,
+                activity_capabilities JSONB,
                 task_queue TEXT NOT NULL,
                 state TEXT,
                 status TEXT NOT NULL,
@@ -2359,6 +2364,7 @@ impl WorkflowStore {
         sqlx::query(
             r#"
             ALTER TABLE workflow_activities
+            ADD COLUMN IF NOT EXISTS activity_capabilities JSONB,
             ADD COLUMN IF NOT EXISTS schedule_to_start_timeout_ms BIGINT,
             ADD COLUMN IF NOT EXISTS schedule_to_close_timeout_ms BIGINT,
             ADD COLUMN IF NOT EXISTS start_to_close_timeout_ms BIGINT,
@@ -2380,6 +2386,7 @@ impl WorkflowStore {
                 artifact_hash TEXT,
                 batch_id TEXT NOT NULL,
                 activity_type TEXT NOT NULL,
+                activity_capabilities JSONB,
                 task_queue TEXT NOT NULL,
                 state TEXT,
                 input_handle JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -2421,6 +2428,7 @@ impl WorkflowStore {
             ALTER TABLE workflow_bulk_batches
             ADD COLUMN IF NOT EXISTS input_handle JSONB NOT NULL DEFAULT '{}'::jsonb,
             ADD COLUMN IF NOT EXISTS result_handle JSONB NOT NULL DEFAULT '{}'::jsonb,
+            ADD COLUMN IF NOT EXISTS activity_capabilities JSONB,
             ADD COLUMN IF NOT EXISTS throughput_backend TEXT NOT NULL DEFAULT 'stream-v2',
             ADD COLUMN IF NOT EXISTS throughput_backend_version TEXT NOT NULL DEFAULT '2.0.0',
             ADD COLUMN IF NOT EXISTS routing_reason TEXT NOT NULL DEFAULT '',
@@ -5482,6 +5490,44 @@ impl WorkflowStore {
         previous_run_id: Option<&str>,
         triggered_by_run_id: Option<&str>,
     ) -> Result<()> {
+        self.put_run_start_with_routing_metadata(
+            tenant_id,
+            instance_id,
+            run_id,
+            definition_id,
+            definition_version,
+            artifact_hash,
+            workflow_task_queue,
+            memo,
+            search_attributes,
+            trigger_event_id,
+            started_at,
+            previous_run_id,
+            triggered_by_run_id,
+            "",
+            None,
+        )
+        .await
+    }
+
+    pub async fn put_run_start_with_routing_metadata(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        definition_id: &str,
+        definition_version: Option<u32>,
+        artifact_hash: Option<&str>,
+        workflow_task_queue: &str,
+        memo: Option<&Value>,
+        search_attributes: Option<&Value>,
+        trigger_event_id: Uuid,
+        started_at: DateTime<Utc>,
+        previous_run_id: Option<&str>,
+        triggered_by_run_id: Option<&str>,
+        admission_mode: &str,
+        fast_path_rejection_reason: Option<&str>,
+    ) -> Result<()> {
         sqlx::query(
             r#"
             INSERT INTO workflow_runs (
@@ -5541,8 +5587,8 @@ impl WorkflowStore {
         .bind(previous_run_id)
         .bind(trigger_event_id)
         .bind(triggered_by_run_id)
-        .bind("")
-        .bind(Option::<&str>::None)
+        .bind(admission_mode)
+        .bind(fast_path_rejection_reason)
         .bind(started_at)
         .execute(&self.pool)
         .await
@@ -11745,6 +11791,7 @@ impl WorkflowStore {
         activity_id: &str,
         attempt: u32,
         activity_type: &str,
+        activity_capabilities: Option<&ActivityExecutionCapabilities>,
         task_queue: &str,
         state: Option<&str>,
         input: &Value,
@@ -11769,6 +11816,7 @@ impl WorkflowStore {
                 activity_id,
                 attempt,
                 activity_type,
+                activity_capabilities,
                 task_queue,
                 state,
                 status,
@@ -11795,9 +11843,9 @@ impl WorkflowStore {
                 updated_at
             )
             VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'scheduled', $12, $13,
-                NULL, NULL, FALSE, NULL, NULL, NULL, NULL, $14, NULL, NULL, NULL, NULL,
-                $15, $16, $17, $18, $19, $20, $21
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'scheduled', $13, $14,
+                NULL, NULL, FALSE, NULL, NULL, NULL, NULL, $15, NULL, NULL, NULL, NULL,
+                $16, $17, $18, $19, $20, $21, $22
             )
             ON CONFLICT (tenant_id, workflow_instance_id, run_id, activity_id, attempt)
             DO UPDATE SET
@@ -11805,6 +11853,7 @@ impl WorkflowStore {
                 workflow_version = EXCLUDED.workflow_version,
                 artifact_hash = EXCLUDED.artifact_hash,
                 activity_type = EXCLUDED.activity_type,
+                activity_capabilities = EXCLUDED.activity_capabilities,
                 task_queue = EXCLUDED.task_queue,
                 state = EXCLUDED.state,
                 status = EXCLUDED.status,
@@ -11840,6 +11889,7 @@ impl WorkflowStore {
         .bind(activity_id)
         .bind(i32::try_from(attempt).context("activity attempt exceeds i32")?)
         .bind(activity_type)
+        .bind(activity_capabilities.cloned().map(Json))
         .bind(task_queue)
         .bind(state)
         .bind(Json(input))
@@ -11879,6 +11929,7 @@ impl WorkflowStore {
                 activity_id,
                 attempt,
                 activity_type,
+                activity_capabilities,
                 task_queue,
                 state,
                 input,
@@ -11906,6 +11957,7 @@ impl WorkflowStore {
                 .push_bind(&update.activity_id)
                 .push_bind(i32::try_from(update.attempt).expect("activity attempt exceeds i32"))
                 .push_bind(&update.activity_type)
+                .push_bind(update.activity_capabilities.as_ref().map(Json))
                 .push_bind(&update.task_queue)
                 .push_bind(update.state.as_deref())
                 .push_bind(Json(&update.input))
@@ -11933,6 +11985,7 @@ impl WorkflowStore {
                 activity_id,
                 attempt,
                 activity_type,
+                activity_capabilities,
                 task_queue,
                 state,
                 status,
@@ -11968,6 +12021,7 @@ impl WorkflowStore {
                 activity_id,
                 attempt,
                 activity_type,
+                activity_capabilities,
                 task_queue,
                 state,
                 'scheduled',
@@ -11999,6 +12053,7 @@ impl WorkflowStore {
                 workflow_version = EXCLUDED.workflow_version,
                 artifact_hash = EXCLUDED.artifact_hash,
                 activity_type = EXCLUDED.activity_type,
+                activity_capabilities = EXCLUDED.activity_capabilities,
                 task_queue = EXCLUDED.task_queue,
                 state = EXCLUDED.state,
                 status = EXCLUDED.status,
@@ -12212,6 +12267,7 @@ impl WorkflowStore {
                     activity.activity_id,
                     activity.attempt,
                     activity.activity_type,
+                    activity.activity_capabilities,
                     activity.task_queue,
                     activity.state,
                     activity.status,
@@ -12504,6 +12560,7 @@ impl WorkflowStore {
                     activity.activity_id,
                     activity.attempt,
                     activity.activity_type,
+                    activity.activity_capabilities,
                     activity.task_queue,
                     activity.state,
                     activity.status,
@@ -12568,6 +12625,7 @@ impl WorkflowStore {
         artifact_hash: Option<&str>,
         batch_id: &str,
         activity_type: &str,
+        activity_capabilities: Option<&ActivityExecutionCapabilities>,
         task_queue: &str,
         state: Option<&str>,
         input_handle: &Value,
@@ -12655,6 +12713,7 @@ impl WorkflowStore {
                 artifact_hash,
                 batch_id,
                 activity_type,
+                activity_capabilities,
                 task_queue,
                 state,
                 input_handle,
@@ -12679,7 +12738,7 @@ impl WorkflowStore {
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                $18, $19, $20, 'scheduled', $21, $22, $23, $24, $25, NULL, $26, $26
+                $18, $19, $20, $21, 'scheduled', $22, $23, $24, $25, $26, NULL, $27, $27
             )
             ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id) DO NOTHING
             "#,
@@ -12692,6 +12751,7 @@ impl WorkflowStore {
         .bind(artifact_hash)
         .bind(batch_id)
         .bind(activity_type)
+        .bind(activity_capabilities.cloned().map(Json))
         .bind(task_queue)
         .bind(state)
         .bind(Json(input_handle))
@@ -12806,6 +12866,7 @@ impl WorkflowStore {
         artifact_hash: Option<&str>,
         batch_id: &str,
         activity_type: &str,
+        activity_capabilities: Option<&ActivityExecutionCapabilities>,
         task_queue: &str,
         state: Option<&str>,
         input_handle: &Value,
@@ -12895,6 +12956,7 @@ impl WorkflowStore {
                 artifact_hash,
                 batch_id,
                 activity_type,
+                activity_capabilities,
                 task_queue,
                 state,
                 input_handle,
@@ -12921,7 +12983,7 @@ impl WorkflowStore {
             )
             VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-                $19, $20, $21, $22, 'scheduled', $23, $24, $25, $26, $27, NULL, $28, $28
+                $19, $20, $21, $22, $23, 'scheduled', $24, $25, $26, $27, $28, NULL, $29, $29
             )
             ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id) DO NOTHING
             "#,
@@ -12934,6 +12996,7 @@ impl WorkflowStore {
         .bind(artifact_hash)
         .bind(batch_id)
         .bind(activity_type)
+        .bind(activity_capabilities.cloned().map(Json))
         .bind(task_queue)
         .bind(state)
         .bind(Json(input_handle))
@@ -16754,6 +16817,7 @@ impl WorkflowStore {
                 activity_id,
                 attempt,
                 activity_type,
+                activity_capabilities,
                 task_queue,
                 state,
                 status,
@@ -16834,6 +16898,7 @@ impl WorkflowStore {
                 activity_id,
                 attempt,
                 activity_type,
+                activity_capabilities,
                 task_queue,
                 state,
                 status,
@@ -16885,6 +16950,7 @@ impl WorkflowStore {
                 activity_id,
                 attempt,
                 activity_type,
+                activity_capabilities,
                 task_queue,
                 state,
                 status,
@@ -16943,6 +17009,7 @@ impl WorkflowStore {
                 activity_id,
                 attempt,
                 activity_type,
+                activity_capabilities,
                 task_queue,
                 state,
                 status,
@@ -17006,6 +17073,7 @@ impl WorkflowStore {
                 activity_id,
                 attempt,
                 activity_type,
+                activity_capabilities,
                 task_queue,
                 state,
                 status,
@@ -17087,6 +17155,24 @@ impl WorkflowStore {
                 })
                 .context("snapshot state missing")?,
         })
+    }
+
+    fn decode_optional_activity_capabilities(
+        row: &sqlx::postgres::PgRow,
+        column: &str,
+    ) -> Result<Option<ActivityExecutionCapabilities>> {
+        match row.try_get::<Option<Json<Value>>, _>(column) {
+            Ok(Some(json)) => {
+                if json.0.is_null() {
+                    Ok(None)
+                } else {
+                    serde_json::from_value(json.0).map(Some).context("invalid activity capabilities")
+                }
+            }
+            Ok(None) => Ok(None),
+            Err(sqlx::Error::ColumnNotFound(_)) => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("failed to decode {column}")),
+        }
     }
 
     fn decode_partition_ownership_row(
@@ -18246,6 +18332,11 @@ impl WorkflowStore {
             activity_type: row
                 .try_get("activity_type")
                 .context("bulk batch activity_type missing")?,
+            activity_capabilities: Self::decode_optional_activity_capabilities(
+                &row,
+                "activity_capabilities",
+            )
+            .context("bulk batch activity_capabilities missing")?,
             task_queue: row.try_get("task_queue").context("bulk batch task_queue missing")?,
             state: row.try_get("state").context("bulk batch state missing")?,
             input_handle: row
@@ -18571,6 +18662,11 @@ impl WorkflowStore {
             activity_type: row
                 .try_get("activity_type")
                 .context("activity activity_type missing")?,
+            activity_capabilities: Self::decode_optional_activity_capabilities(
+                &row,
+                "activity_capabilities",
+            )
+            .context("activity activity_capabilities missing")?,
             task_queue: row.try_get("task_queue").context("activity task_queue missing")?,
             state: row.try_get("state").context("activity state missing")?,
             status: WorkflowActivityStatus::from_db(
@@ -19917,6 +20013,7 @@ mod tests {
                 Some("artifact-1"),
                 "batch-1",
                 "benchmark.echo",
+                None,
                 "default",
                 Some("join"),
                 &json!({ "kind": "inline", "key": "bulk-input:batch-1" }),
@@ -20030,6 +20127,7 @@ mod tests {
                 Some("artifact-1"),
                 "batch-sum",
                 "benchmark.echo",
+                None,
                 "default",
                 Some("join"),
                 &json!({ "kind": "inline", "key": "bulk-input:batch-sum" }),
@@ -20123,6 +20221,7 @@ mod tests {
                 Some("artifact-1"),
                 "batch-errors",
                 "benchmark.echo",
+                None,
                 "default",
                 Some("join"),
                 &json!({ "kind": "inline", "key": "bulk-input:batch-errors" }),
@@ -20218,6 +20317,7 @@ mod tests {
                 Some("artifact-1"),
                 "batch-pg",
                 "benchmark.echo",
+                None,
                 "bulk",
                 Some("join"),
                 &json!({ "kind": "inline", "key": "bulk-input:batch-pg" }),
@@ -20247,6 +20347,7 @@ mod tests {
                 Some("artifact-1"),
                 "batch-stream",
                 "benchmark.echo",
+                None,
                 "bulk",
                 Some("join"),
                 &json!({ "kind": "inline", "key": "bulk-input:batch-stream" }),
@@ -20315,6 +20416,7 @@ mod tests {
                 Some("artifact-1"),
                 "batch-stream-query",
                 "benchmark.echo",
+                None,
                 "bulk",
                 Some("join"),
                 &json!({ "kind": "inline", "key": "bulk-input:batch-stream-query" }),
@@ -20429,6 +20531,7 @@ mod tests {
                 Some("artifact-1"),
                 "batch-stream-patch",
                 "benchmark.echo",
+                None,
                 "bulk",
                 Some("join"),
                 &json!({ "kind": "inline", "key": "bulk-input:batch-stream-patch" }),
@@ -20550,6 +20653,7 @@ mod tests {
                 Some("artifact-1"),
                 "batch-stream-batch-patch",
                 "benchmark.echo",
+                None,
                 "bulk",
                 Some("join"),
                 &json!({ "kind": "inline", "key": "bulk-input:batch-stream-batch-patch" }),
@@ -20686,6 +20790,7 @@ mod tests {
                 Some("artifact-1"),
                 "batch-stream-terminal",
                 "benchmark.echo",
+                None,
                 "bulk",
                 Some("join"),
                 &json!({ "kind": "inline", "key": "bulk-input:batch-stream-terminal" }),
@@ -20779,6 +20884,7 @@ mod tests {
                 Some("artifact-1"),
                 "batch-stream-batch-state-a",
                 "benchmark.echo",
+                None,
                 "bulk",
                 Some("join"),
                 &json!({ "kind": "inline", "key": "bulk-input:batch-stream-batch-state-a" }),
@@ -20810,6 +20916,7 @@ mod tests {
                 Some("artifact-1"),
                 "batch-stream-batch-state-b",
                 "benchmark.echo",
+                None,
                 "bulk",
                 Some("join"),
                 &json!({ "kind": "inline", "key": "bulk-input:batch-stream-batch-state-b" }),
@@ -20914,6 +21021,7 @@ mod tests {
                 Some("artifact-1"),
                 "batch-stream-terminal-chunk",
                 "benchmark.echo",
+                None,
                 "bulk",
                 Some("join"),
                 &json!({ "kind": "inline", "key": "bulk-input:batch-stream-terminal-chunk" }),
@@ -21507,6 +21615,7 @@ mod tests {
                 Some("artifact-1"),
                 "batch-cap-a",
                 "benchmark.echo",
+                None,
                 "bulk",
                 Some("join"),
                 &json!({ "kind": "inline", "key": "bulk-input:batch-cap-a" }),
@@ -21536,6 +21645,7 @@ mod tests {
                 Some("artifact-1"),
                 "batch-cap-b",
                 "benchmark.echo",
+                None,
                 "bulk",
                 Some("join"),
                 &json!({ "kind": "inline", "key": "bulk-input:batch-cap-b" }),
@@ -21607,6 +21717,7 @@ mod tests {
                 Some("artifact-1"),
                 "batch-cancel",
                 "benchmark.echo",
+                None,
                 "bulk",
                 Some("join"),
                 &json!({ "kind": "inline", "key": "bulk-input:batch-cancel" }),

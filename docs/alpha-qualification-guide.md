@@ -122,6 +122,36 @@ Run the replay/restart/build-routing drill for the first non-sample candidate wi
 scripts/run-worker-versioning-replay-demo-drill.sh
 ```
 
+Run the supported interceptor-bridge replay/restart drill with:
+
+```bash
+scripts/run-interceptor-pressure-drill.sh
+```
+
+Its current passing evidence bundle is:
+
+- `target/alpha-drills/temporal-interceptor-pressure/interceptor-pressure-drill-report.json`
+
+Run the supported sink-bridge replay/restart drill with:
+
+```bash
+scripts/run-sinks-pressure-drill.sh
+```
+
+Its current passing evidence bundle is:
+
+- `target/alpha-drills/temporal-sinks-pressure/sinks-pressure-drill-report.json`
+
+Run the supported converter-adapter replay/restart drill with:
+
+```bash
+scripts/run-converter-pressure-drill.sh
+```
+
+Its current passing evidence bundle is:
+
+- `target/alpha-drills/temporal-converter-trust-pressure/converter-pressure-drill-report.json`
+
 Run the mixed-build upgrade drill for the payload-path slice with:
 
 ```bash

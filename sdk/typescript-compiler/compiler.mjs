@@ -992,7 +992,11 @@ function parseActivityCapabilities(expression, label) {
       throw compilerError(`unsupported ${label} option ${property.getText()}`, property);
     }
     const key = property.name.getText().replaceAll(/^["']|["']$/g, "");
-    if (key !== "payloadlessTransport" && key !== "tinyInlineCompletion") {
+    if (
+      key !== "payloadlessTransport"
+      && key !== "tinyInlineCompletion"
+      && key !== "omitSuccessOutputShortCircuit"
+    ) {
       throw compilerError(`unsupported ${label} option ${key}`, property);
     }
     if (property.initializer.kind !== ts.SyntaxKind.TrueKeyword
@@ -1001,8 +1005,11 @@ function parseActivityCapabilities(expression, label) {
     }
     if (key === "payloadlessTransport") {
       capabilities.payloadless_transport = property.initializer.kind === ts.SyntaxKind.TrueKeyword;
-    } else {
+    } else if (key === "tinyInlineCompletion") {
       capabilities.tiny_inline_completion = property.initializer.kind === ts.SyntaxKind.TrueKeyword;
+    } else {
+      capabilities.omit_success_output_short_circuit =
+        property.initializer.kind === ts.SyntaxKind.TrueKeyword;
     }
   }
   return capabilities;

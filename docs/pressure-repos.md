@@ -7,11 +7,15 @@ They exist to exercise the remaining trust and packaging surfaces once the offic
 ## Current Set
 
 - `crates/fabrik-cli/test-fixtures/temporal-interceptor-pressure`
-  - purpose: workflow interceptor bridge semantics with a real worker bootstrap and activity-backed publish path
+  - purpose: static `interceptors.workflowModules` bridge with a real worker bootstrap, workflow-owned query state, and activity-backed publish path
+  - passing drill bundle: `target/alpha-drills/temporal-interceptor-pressure/interceptor-pressure-drill-report.json`
 - `crates/fabrik-cli/test-fixtures/temporal-sinks-pressure`
   - purpose: sink bridge behavior with worker sink injection and workflow-side `proxySinks()`
+  - passing drill bundle: `target/alpha-drills/temporal-sinks-pressure/sinks-pressure-drill-report.json`
 - `crates/fabrik-cli/test-fixtures/temporal-converter-trust-pressure`
   - purpose: static `dataConverter` factory plus static `payloadConverterPath` packaging and replay pressure
+  - passing drill bundle: `target/alpha-drills/temporal-converter-trust-pressure/converter-pressure-drill-report.json`
+  - caveat: pre-normalize query assertions currently validate only workflow phase, not copied input-field reflection
 - `crates/fabrik-cli/test-fixtures/temporal-monorepo-multiworker-pressure`
   - purpose: multi-worker monorepo packaging, workspace resolution, and tsconfig-path handling
 - `crates/fabrik-cli/test-fixtures/temporal-versioning-upgrade-pressure`

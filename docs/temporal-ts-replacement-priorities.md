@@ -56,6 +56,9 @@ The latest compiler, runtime, and packaging passes materially shifted the remain
   - definition doc: `docs/pressure-repos.md`
   - batch summary: `target/pressure-repo-qualification/summary.json`
   - current status: `5/5` qualified with caveats
+  - `temporal-interceptor-pressure` now has a passing replay/restart drill in `target/alpha-drills/temporal-interceptor-pressure/interceptor-pressure-drill-report.json`
+  - `temporal-sinks-pressure` now has a passing replay/restart drill in `target/alpha-drills/temporal-sinks-pressure/sinks-pressure-drill-report.json`
+  - `temporal-converter-trust-pressure` now has a passing replay/restart drill in `target/alpha-drills/temporal-converter-trust-pressure/converter-pressure-drill-report.json`
   - `temporal-versioning-upgrade-pressure` now also has a passing mixed-build/restart/rollback drill in `target/alpha-drills/temporal-versioning-upgrade-pressure/versioning-pressure-mixed-build-drill-report.json`
 - The remaining explicit unsupported-import census is now dominated by:
   - `WorkflowInterceptors`: `1`
@@ -64,7 +67,7 @@ The latest compiler, runtime, and packaging passes materially shifted the remain
 
 This means broad import coverage is no longer the main hard-blocker class. The next replacement bottlenecks are:
 - external non-Temporal async SDK execution inside workflow code
-- trust-bounded caveat cleanup around the adapter-backed interceptor/sink slice
+- trust-bounded caveat cleanup around the adapter-backed converter/interceptor/sink slice
 - deciding whether the remaining `dsl-interpreter` caveat is acceptable or worth upgrading into full trust-backed helper-parallel semantics
 - scaling the now-proven trust drill from one non-sample repo to a larger real-repo set
 

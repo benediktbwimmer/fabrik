@@ -3872,6 +3872,7 @@ dependencies = [
  "fabrik-store",
  "fabrik-throughput",
  "fabrik-worker-protocol",
+ "fabrik-workflow",
  "futures-util",
  "rocksdb",
  "serde",

@@ -435,6 +435,33 @@ fn relative_project_root_uses_relaxed_transpile_fallback_for_worker_packaging() 
 }
 
 #[test]
+fn monorepo_multiworker_packages_do_not_collide_on_shared_worker_filenames() {
+    let output_dir = temp_output_dir("monorepo-multiworker");
+    let (status, report) =
+        run_cli(&fixture("temporal-monorepo-multiworker-pressure"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    let worker_packages = report["worker_packages"].as_array().expect("worker packages");
+    assert_eq!(worker_packages.len(), 2);
+    let package_dirs = worker_packages
+        .iter()
+        .map(|worker| worker["package_dir"].as_str().expect("package dir"))
+        .collect::<Vec<_>>();
+    assert_ne!(package_dirs[0], package_dirs[1]);
+    assert!(
+        package_dirs
+            .iter()
+            .any(|dir| dir.contains("apps-orders-worker-src-worker-1"))
+    );
+    assert!(
+        package_dirs
+            .iter()
+            .any(|dir| dir.contains("apps-reports-worker-src-worker-1"))
+    );
+}
+
+#[test]
 fn dynamic_worker_bootstrap_blocks_migration() {
     let output_dir = temp_output_dir("dynamic-bootstrap");
     let (status, report) =

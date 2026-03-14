@@ -10,8 +10,9 @@ use std::{
 use anyhow::{Context, Result};
 use fabrik_config::{GrpcServiceConfig, ThroughputPayloadStoreConfig, ThroughputPayloadStoreKind};
 use fabrik_throughput::{
-    BENCHMARK_ECHO_ACTIVITY, CORE_ACCEPT_ACTIVITY, CORE_ECHO_ACTIVITY, CORE_NOOP_ACTIVITY,
-    PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
+    ActivityExecutionCapabilities, BENCHMARK_ECHO_ACTIVITY, CORE_ACCEPT_ACTIVITY,
+    CORE_ECHO_ACTIVITY, CORE_NOOP_ACTIVITY, PayloadHandle, PayloadStore, PayloadStoreConfig,
+    PayloadStoreKind,
     activity_can_short_circuit_omitted_success_output, benchmark_echo_item_requires_output,
     can_complete_payloadless_bulk_chunk, decode_cbor, encode_cbor, execute_benchmark_echo,
     parse_benchmark_compact_input_meta_from_handle, synthesize_benchmark_echo_items,
@@ -727,10 +728,15 @@ async fn execute_activity_task(
     worker_id: String,
     worker_build_id: String,
 ) -> Result<ActivityTaskResult> {
+    let activity_capabilities = parse_activity_task_capabilities(&task)?;
     let result = if task.omit_success_output
-        && activity_can_short_circuit_omitted_success_output(&task.activity_type)
+        && activity_can_short_circuit_omitted_success_output(
+            &task.activity_type,
+            activity_capabilities.as_ref(),
+        )
     {
-        execute_activity_task_without_output(&task).map(|()| Value::Null)
+        execute_activity_task_without_output(&task, activity_capabilities.as_ref())
+            .map(|()| Value::Null)
     } else {
         execute_activity(
             client,
@@ -805,7 +811,11 @@ struct BenchmarkEchoTaskInput {
 
 fn execute_activity_task_without_output(
     task: &fabrik_worker_protocol::activity_worker::ActivityTask,
+    activity_capabilities: Option<&ActivityExecutionCapabilities>,
 ) -> Result<()> {
+    if !activity_can_short_circuit_omitted_success_output(&task.activity_type, activity_capabilities) {
+        anyhow::bail!("activity {} cannot short-circuit omitted success output", task.activity_type);
+    }
     if task.activity_type == BENCHMARK_ECHO_ACTIVITY {
         let input = match parse_benchmark_echo_task_input(task) {
             Ok(input) => input,
@@ -829,7 +839,7 @@ fn execute_activity_task_without_output(
     ) {
         return Ok(());
     }
-    anyhow::bail!("activity {} cannot short-circuit omitted success output", task.activity_type)
+    Ok(())
 }
 
 fn parse_benchmark_echo_task_input(
@@ -858,6 +868,40 @@ fn parse_activity_task_config(
         return Ok((!value.is_null()).then_some(value));
     }
     parse_optional_json(&task.config_json)
+}
+
+fn parse_activity_capabilities_json_or_cbor(
+    json: &str,
+    cbor: &[u8],
+    label: &str,
+) -> Result<Option<ActivityExecutionCapabilities>> {
+    if !cbor.is_empty() {
+        return decode_cbor(cbor, label);
+    }
+    if json.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_str(json)?)
+}
+
+fn parse_activity_task_capabilities(
+    task: &fabrik_worker_protocol::activity_worker::ActivityTask,
+) -> Result<Option<ActivityExecutionCapabilities>> {
+    parse_activity_capabilities_json_or_cbor(
+        &task.activity_capabilities_json,
+        &task.activity_capabilities_cbor,
+        "activity task capabilities",
+    )
+}
+
+fn parse_bulk_task_capabilities(
+    task: &fabrik_worker_protocol::activity_worker::BulkActivityTask,
+) -> Result<Option<ActivityExecutionCapabilities>> {
+    parse_activity_capabilities_json_or_cbor(
+        &task.activity_capabilities_json,
+        &task.activity_capabilities_cbor,
+        "bulk activity task capabilities",
+    )
 }
 
 fn encode_activity_completed_result(
@@ -891,9 +935,10 @@ async fn execute_bulk_activity_task(
     worker_build_id: String,
     managed_node: Option<&ManagedNodeActivityConfig>,
 ) -> Result<BulkActivityTaskResult> {
+    let activity_capabilities = parse_bulk_task_capabilities(&task)?;
     if can_complete_payloadless_bulk_chunk(
         &task.activity_type,
-        None,
+        activity_capabilities.as_ref(),
         task.omit_success_output,
         task.item_count,
         !task.items_json.is_empty() || !task.items_cbor.is_empty(),
@@ -1530,7 +1575,7 @@ mod tests {
             ..ActivityTask::default()
         };
 
-        execute_activity_task_without_output(&task).expect("benchmark echo succeeds");
+        execute_activity_task_without_output(&task, None).expect("benchmark echo succeeds");
     }
 
     #[test]
@@ -1542,7 +1587,8 @@ mod tests {
             ..ActivityTask::default()
         };
 
-        let error = execute_activity_task_without_output(&task).expect_err("task should fail");
+        let error =
+            execute_activity_task_without_output(&task, None).expect_err("task should fail");
         assert_eq!(error.to_string(), "benchmark configured failure on attempt 1");
     }
 
@@ -1554,7 +1600,7 @@ mod tests {
             ..ActivityTask::default()
         };
 
-        execute_activity_task_without_output(&task)
+        execute_activity_task_without_output(&task, None)
             .expect("core.accept should short-circuit without materializing output");
     }
 
@@ -1563,7 +1609,8 @@ mod tests {
         let task =
             ActivityTask { activity_type: "http.request".to_owned(), ..ActivityTask::default() };
 
-        let error = execute_activity_task_without_output(&task).expect_err("task should fail");
+        let error =
+            execute_activity_task_without_output(&task, None).expect_err("task should fail");
         assert_eq!(
             error.to_string(),
             "activity http.request cannot short-circuit omitted success output"

@@ -5310,6 +5310,7 @@ mod tests {
                 activity_id: "charge-card".to_owned(),
                 attempt: 2,
                 activity_type: "payments.charge".to_owned(),
+                activity_capabilities: None,
                 task_queue: "payments".to_owned(),
                 state: Some("charge-card".to_owned()),
                 status: WorkflowActivityStatus::Failed,

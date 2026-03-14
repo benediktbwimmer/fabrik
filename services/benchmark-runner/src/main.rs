@@ -2006,6 +2006,17 @@ fn can_use_tiny_batch_api(args: &Args) -> bool {
         }
 }
 
+fn can_use_durable_batch_api(args: &Args) -> bool {
+    env::var("BENCHMARK_USE_DURABLE_BATCH_API")
+        .ok()
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+        && args.execution_mode == ExecutionMode::Durable
+        && args.workload_kind == BenchmarkWorkloadKind::Fanout
+        && args.retry_rate == 0.0
+        && args.cancel_rate == 0.0
+}
+
 fn trigger_submission_concurrency() -> usize {
     env::var("BENCHMARK_TRIGGER_SUBMISSION_CONCURRENCY")
         .ok()
@@ -2472,15 +2483,20 @@ async fn trigger_workflow_batch(
     tenant_id: &str,
     task_queue: &str,
     items: Vec<Value>,
+    admission_mode: Option<&str>,
 ) -> Result<f64> {
     let started = Instant::now();
+    let mut payload = json!({
+        "tenant_id": tenant_id,
+        "workflow_task_queue": task_queue,
+        "items": items,
+    });
+    if let Some(admission_mode) = admission_mode {
+        payload["admission_mode"] = Value::String(admission_mode.to_owned());
+    }
     let response = client
         .post(format!("{ingest_base}/workflows/{definition_id}/trigger-batch"))
-        .json(&json!({
-            "tenant_id": tenant_id,
-            "workflow_task_queue": task_queue,
-            "items": items,
-        }))
+        .json(&payload)
         .send()
         .await
         .context("failed to trigger benchmark workflow batch")?;
@@ -2501,6 +2517,56 @@ async fn submit_benchmark_triggers(
     instance_prefix: &str,
     args: &Args,
 ) -> Result<IngressRequestLatencyMetrics> {
+    if can_use_durable_batch_api(args) {
+        let batch_starts = (0..args.profile.workflow_count)
+            .step_by(DEFAULT_TINY_BATCH_START_SIZE)
+            .collect::<Vec<_>>();
+        let latencies = stream::iter(batch_starts)
+            .map(|start| {
+                let client = client.clone();
+                let ingest_base = ingest_base.to_owned();
+                let definition_id = definition_id.to_owned();
+                let tenant_id = tenant_id.to_owned();
+                let task_queue = task_queue.to_owned();
+                let instance_prefix = instance_prefix.to_owned();
+                let args = args.clone();
+                async move {
+                    let end =
+                        (start + DEFAULT_TINY_BATCH_START_SIZE).min(args.profile.workflow_count);
+                    let items = (start..end)
+                        .map(|workflow_index| {
+                            let instance_id = format!("{instance_prefix}-{workflow_index:04}");
+                            json!({
+                                "instance_id": instance_id,
+                                "request_id": instance_id,
+                                "input": benchmark_input(
+                                    &args,
+                                    args.profile.activities_per_workflow,
+                                    args.payload_size,
+                                    args.retry_rate,
+                                    args.cancel_rate,
+                                    &instance_id,
+                                ),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    trigger_workflow_batch(
+                        &client,
+                        &ingest_base,
+                        &definition_id,
+                        &tenant_id,
+                        &task_queue,
+                        items,
+                        Some("durable_workflow"),
+                    )
+                    .await
+                }
+            })
+            .buffer_unordered(tiny_batch_submission_concurrency())
+            .try_collect::<Vec<_>>()
+            .await?;
+        return Ok(ingress_request_latency_metrics(&latencies));
+    }
     if can_use_tiny_batch_api(args) {
         let batch_starts = (0..args.profile.workflow_count)
             .step_by(DEFAULT_TINY_BATCH_START_SIZE)
@@ -2541,6 +2607,7 @@ async fn submit_benchmark_triggers(
                         &tenant_id,
                         &task_queue,
                         items,
+                        None,
                     )
                     .await
                 }

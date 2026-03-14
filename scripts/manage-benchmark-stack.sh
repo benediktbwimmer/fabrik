@@ -98,6 +98,7 @@ PY
 configure_redpanda_limits() {
   local max_bytes=${1:-8388608}
   docker exec fabrik-redpanda-1 rpk cluster config set kafka_batch_max_bytes "$max_bytes" >/dev/null
+  docker exec fabrik-redpanda-1 rpk cluster config set write_caching_default false >/dev/null
 }
 
 reserve_ports() {
@@ -621,7 +622,7 @@ else
     target/release/throughput-projector
   wait_for_port 127.0.0.1 "$THROUGHPUT_PROJECTOR_PORT" "throughput-projector"
 
-  echo "[benchmark-stack] starting activity-worker-service (pg-v1/matching)"
+  echo "[benchmark-stack] starting activity-worker-service (pg-v1/unified)"
   start_service "$LOG_DIR/activity-worker-service-pg-v1.log" \
     "${COMMON_ENV[@]}" \
     "ACTIVITY_WORKER_SERVICE_PORT=$ACTIVITY_WORKER_SERVICE_PORT" \
@@ -631,7 +632,9 @@ else
     "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
     "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \
     "ACTIVITY_WORKER_CONCURRENCY=${ACTIVITY_WORKER_CONCURRENCY:-8}" \
+    "ACTIVITY_POLL_MAX_TASKS=${ACTIVITY_POLL_MAX_TASKS:-32}" \
     "ACTIVITY_BULK_POLL_MAX_TASKS=${ACTIVITY_BULK_POLL_MAX_TASKS:-32}" \
+    "ACTIVITY_ENABLE_BULK_LANES=${ACTIVITY_ENABLE_BULK_LANES:-false}" \
     -- \
     target/release/activity-worker-service
 

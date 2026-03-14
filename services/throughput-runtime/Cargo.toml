@@ -14,6 +14,7 @@ fabrik-events = { path = "../../crates/fabrik-events" }
 fabrik-service = { path = "../../crates/fabrik-service" }
 fabrik-store = { path = "../../crates/fabrik-store" }
 fabrik-throughput = { path = "../../crates/fabrik-throughput" }
+fabrik-workflow = { path = "../../crates/fabrik-workflow" }
 fabrik-worker-protocol = { path = "../../crates/fabrik-worker-protocol" }
 futures-util.workspace = true
 rocksdb.workspace = true

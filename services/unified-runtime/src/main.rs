@@ -34,16 +34,17 @@ use fabrik_store::{
     WorkflowMailboxRecord, WorkflowStore,
 };
 use fabrik_throughput::{
-    ADMISSION_POLICY_VERSION, ActivityExecutionCapabilities, BENCHMARK_ECHO_ACTIVITY,
-    BENCHMARK_FAST_COUNT_ACTIVITY, PayloadHandle, PayloadStore, PayloadStoreConfig,
-    PayloadStoreKind, StartThroughputRunCommand, ThroughputBackend, ThroughputCommand,
-    ThroughputCommandEnvelope, ThroughputExecutionPath, TinyWorkflowExecutionMode,
-    TinyWorkflowStartItem, bulk_reducer_class, bulk_reducer_is_mergeable,
+    ADMISSION_POLICY_VERSION, ActivityCapabilityRegistry, ActivityExecutionCapabilities,
+    PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
+    StartThroughputRunCommand, ThroughputBackend, ThroughputCommand, ThroughputCommandEnvelope,
+    ThroughputExecutionPath, TinyWorkflowExecutionMode, TinyWorkflowStartItem,
+    bulk_reducer_class, bulk_reducer_is_mergeable,
     bulk_reducer_materializes_results, can_inline_durable_tiny_fanout,
-    can_use_payloadless_bulk_transport, decode_cbor, encode_cbor, execute_benchmark_echo,
+    can_use_payloadless_bulk_transport, decode_cbor, encode_cbor,
+    load_activity_capability_registry_from_env,
     parse_benchmark_compact_input_meta_from_handle,
     parse_benchmark_compact_total_items_from_handle, planned_reduction_tree_depth,
-    stream_v2_fast_lane_enabled, throughput_partition_key,
+    resolve_activity_capabilities, stream_v2_fast_lane_enabled, throughput_partition_key,
 };
 use fabrik_worker_protocol::activity_worker::{
     Ack, ActivityTask, ActivityTaskCancelledResult, ActivityTaskCompletedResult,
@@ -104,6 +105,7 @@ struct AppState {
     persistence: PersistenceConfig,
     admission: BulkAdmissionConfig,
     task_queue_policy_cache: Arc<StdMutex<HashMap<TaskQueuePolicyCacheKey, CachedTaskQueuePolicy>>>,
+    activity_capability_registry: Arc<ActivityCapabilityRegistry>,
     debug: Arc<StdMutex<UnifiedDebugState>>,
     outbox_publisher_id: String,
 }
@@ -374,6 +376,7 @@ struct ActiveActivityMeta {
     attempt: u32,
     task_queue: String,
     activity_type: String,
+    activity_capabilities: Option<ActivityExecutionCapabilities>,
     wait_state: String,
     #[serde(default)]
     omit_success_output: bool,
@@ -389,6 +392,7 @@ struct QueuedActivity {
     run_id: String,
     activity_id: String,
     activity_type: String,
+    activity_capabilities: Option<ActivityExecutionCapabilities>,
     task_queue: String,
     attempt: u32,
     input: Value,
@@ -660,6 +664,8 @@ async fn main() -> Result<()> {
     let local_restored = restore_runtime_state(&persistence, &debug)?;
     let payload_store =
         PayloadStore::from_config(build_payload_store_config(&throughput_runtime)).await?;
+    let activity_capability_registry =
+        Arc::new(load_activity_capability_registry_from_env("FABRIK_WORKER_PACKAGES_DIR")?);
     let shared_restored =
         restore_runtime_state_from_store(&store, &broker, &payload_store, &debug).await?;
     let inner = reconcile_restored_runtime(local_restored, shared_restored, &debug);
@@ -687,6 +693,7 @@ async fn main() -> Result<()> {
         persistence,
         admission,
         task_queue_policy_cache: Arc::new(StdMutex::new(HashMap::new())),
+        activity_capability_registry,
         debug: debug.clone(),
         outbox_publisher_id: format!("unified-runtime:{}", Uuid::now_v7()),
     };
@@ -1576,6 +1583,7 @@ async fn handle_tiny_workflow_batch_command(
     let mut prepared = Vec::with_capacity(items.len());
     for item in items {
         if let Some(completion) = prepare_tiny_workflow_completion(
+            state.activity_capability_registry.as_ref(),
             tenant_id,
             workflow_task_queue,
             &artifact,
@@ -1601,6 +1609,7 @@ async fn handle_tiny_workflow_batch_command(
 }
 
 fn prepare_tiny_workflow_completion(
+    activity_capability_registry: &ActivityCapabilityRegistry,
     tenant_id: &str,
     workflow_task_queue: &str,
     artifact: &CompiledWorkflowArtifact,
@@ -1649,6 +1658,7 @@ fn prepare_tiny_workflow_completion(
     let completed = match mode {
         TinyWorkflowExecutionMode::Throughput => {
             try_inline_stream_v2_microbatch_trigger_completion(
+                activity_capability_registry,
                 artifact,
                 &mut instance,
                 &plan,
@@ -1657,6 +1667,7 @@ fn prepare_tiny_workflow_completion(
             )?
         }
         TinyWorkflowExecutionMode::Durable => try_inline_durable_tiny_workflow_completion(
+            activity_capability_registry,
             artifact,
             &mut instance,
             &plan,
@@ -1743,6 +1754,7 @@ fn tiny_workflow_terminal_payload(instance: &WorkflowInstanceState) -> Value {
 }
 
 fn try_inline_durable_tiny_workflow_completion(
+    activity_capability_registry: &ActivityCapabilityRegistry,
     artifact: &CompiledWorkflowArtifact,
     instance: &mut WorkflowInstanceState,
     plan: &CompiledExecutionPlan,
@@ -1765,22 +1777,37 @@ fn try_inline_durable_tiny_workflow_completion(
         return Ok(false);
     };
     let mut scheduled = Vec::new();
+    let mut scheduled_task_queue = None::<String>;
     for emission in &plan.emissions {
         match &emission.event {
             WorkflowEvent::WorkflowStarted => continue,
-            WorkflowEvent::ActivityTaskScheduled { activity_id, input, attempt, .. } => {
+            WorkflowEvent::ActivityTaskScheduled {
+                activity_id,
+                input,
+                attempt,
+                task_queue,
+                ..
+            } => {
                 if *attempt != 1 {
                     return Ok(false);
                 }
+                scheduled_task_queue
+                    .get_or_insert_with(|| task_queue.clone());
                 scheduled.push((activity_id.clone(), input.clone()));
             }
             _ => return Ok(false),
         }
     }
+    let resolved_activity_capabilities = resolve_activity_capabilities(
+        Some(activity_capability_registry),
+        scheduled_task_queue.as_deref().unwrap_or("default"),
+        &activity_type,
+        activity_capabilities.as_ref(),
+    );
     let inputs = scheduled.iter().map(|(_, input)| input.clone()).collect::<Vec<_>>();
     if !can_inline_durable_tiny_fanout(
         &activity_type,
-        activity_capabilities.as_ref(),
+        resolved_activity_capabilities.as_ref(),
         reducer.as_deref(),
         1,
         &inputs,
@@ -1788,11 +1815,8 @@ fn try_inline_durable_tiny_workflow_completion(
         return Ok(false);
     }
     for (activity_id, input) in scheduled {
-        let output = if activity_type == BENCHMARK_FAST_COUNT_ACTIVITY {
-            Value::Null
-        } else {
-            execute_benchmark_echo(1, &input)?
-        };
+        let _ = input;
+        let output = Value::Null;
         let current_state = instance
             .current_state
             .clone()
@@ -1900,6 +1924,7 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
     };
     apply_compiled_plan(&mut instance, &plan);
     let inline_microbatch_completed = try_inline_stream_v2_microbatch_trigger_completion(
+        state.activity_capability_registry.as_ref(),
         &artifact,
         &mut instance,
         &plan,
@@ -1932,6 +1957,7 @@ async fn handle_trigger_event(state: &AppState, event: EventEnvelope<WorkflowEve
                                 attempt: task.attempt,
                                 task_queue: task.task_queue.clone(),
                                 activity_type: task.activity_type.clone(),
+                                activity_capabilities: task.activity_capabilities.clone(),
                                 wait_state: task.state.clone(),
                                 omit_success_output: task.omit_success_output,
                             },
@@ -2146,6 +2172,7 @@ async fn prepare_inline_trigger_completion(
     apply_compiled_plan(&mut instance, &plan);
     let state_apply_started_at = Instant::now();
     if !try_inline_stream_v2_microbatch_trigger_completion(
+        state.activity_capability_registry.as_ref(),
         &artifact,
         &mut instance,
         &plan,
@@ -2290,6 +2317,7 @@ async fn handle_bulk_batch_terminal_event(
                     attempt: task.attempt,
                     task_queue: task.task_queue.clone(),
                     activity_type: task.activity_type.clone(),
+                    activity_capabilities: task.activity_capabilities.clone(),
                     wait_state: task.state.clone(),
                     omit_success_output: task.omit_success_output,
                 },
@@ -2415,6 +2443,7 @@ async fn handle_timer_fired_event(
                     attempt: task.attempt,
                     task_queue: task.task_queue.clone(),
                     activity_type: task.activity_type.clone(),
+                    activity_capabilities: task.activity_capabilities.clone(),
                     wait_state: task.state.clone(),
                     omit_success_output: task.omit_success_output,
                 },
@@ -2635,6 +2664,7 @@ async fn handle_activity_cancellation_requested_event(
                                 attempt: task.attempt,
                                 task_queue: task.task_queue.clone(),
                                 activity_type: task.activity_type.clone(),
+                                activity_capabilities: task.activity_capabilities.clone(),
                                 wait_state: task.state.clone(),
                                 omit_success_output: task.omit_success_output,
                             },
@@ -3495,6 +3525,7 @@ async fn dispatch_signal_mailbox_item_unified(
                     attempt: task.attempt,
                     task_queue: task.task_queue.clone(),
                     activity_type: task.activity_type.clone(),
+                    activity_capabilities: task.activity_capabilities.clone(),
                     wait_state: task.state.clone(),
                     omit_success_output: task.omit_success_output,
                 },
@@ -4178,6 +4209,7 @@ async fn dispatch_update_mailbox_item_unified(
                     attempt: task.attempt,
                     task_queue: task.task_queue.clone(),
                     activity_type: task.activity_type.clone(),
+                    activity_capabilities: task.activity_capabilities.clone(),
                     wait_state: task.state.clone(),
                     omit_success_output: task.omit_success_output,
                 },
@@ -4375,6 +4407,7 @@ async fn materialize_child_workflows_from_plan(
                                     attempt: task.attempt,
                                     task_queue: task.task_queue.clone(),
                                     activity_type: task.activity_type.clone(),
+                                    activity_capabilities: task.activity_capabilities.clone(),
                                     wait_state: task.state.clone(),
                                     omit_success_output: task.omit_success_output,
                                 },
@@ -4603,6 +4636,7 @@ async fn reflect_terminal_children_to_parents(
                         attempt: task.attempt,
                         task_queue: task.task_queue.clone(),
                         activity_type: task.activity_type.clone(),
+                        activity_capabilities: task.activity_capabilities.clone(),
                         wait_state: task.state.clone(),
                         omit_success_output: task.omit_success_output,
                     },
@@ -4774,6 +4808,7 @@ async fn materialize_continue_as_new_from_plan(
                                     attempt: task.attempt,
                                     task_queue: task.task_queue.clone(),
                                     activity_type: task.activity_type.clone(),
+                                    activity_capabilities: task.activity_capabilities.clone(),
                                     wait_state: task.state.clone(),
                                     omit_success_output: task.omit_success_output,
                                 },
@@ -5089,6 +5124,12 @@ async fn materialize_bulk_batches_from_plan(
         } else {
             items.len()
         };
+        let resolved_activity_capabilities = resolve_activity_capabilities(
+            Some(state.activity_capability_registry.as_ref()),
+            task_queue,
+            activity_type,
+            activity_capabilities.as_ref(),
+        );
 
         let admission_started_at = Instant::now();
         let admission = admit_bulk_batch(
@@ -5143,6 +5184,7 @@ async fn materialize_bulk_batches_from_plan(
                     instance.artifact_hash.as_deref(),
                     batch_id,
                     activity_type,
+                    resolved_activity_capabilities.as_ref(),
                     task_queue,
                     workflow_state.as_deref(),
                     input_handle,
@@ -5176,7 +5218,7 @@ async fn materialize_bulk_batches_from_plan(
         let scheduled_event = WorkflowEvent::BulkActivityBatchScheduled {
             batch_id: batch_id.clone(),
             activity_type: activity_type.clone(),
-            activity_capabilities: activity_capabilities.clone(),
+            activity_capabilities: resolved_activity_capabilities.clone(),
             task_queue: task_queue.clone(),
             items: items.clone(),
             input_handle: input_handle.clone(),
@@ -5194,7 +5236,7 @@ async fn materialize_bulk_batches_from_plan(
         if native_stream_v2 {
             if can_inline_stream_v2_microbatch(
                 activity_type,
-                activity_capabilities.as_ref(),
+                resolved_activity_capabilities.as_ref(),
                 reducer.as_deref(),
                 *max_attempts,
                 items,
@@ -5230,7 +5272,7 @@ async fn materialize_bulk_batches_from_plan(
                     .is_some_and(|meta| meta.payload_size.is_some());
             let native_input_handle = if can_use_payloadless_bulk_transport(
                 activity_type,
-                activity_capabilities.as_ref(),
+                resolved_activity_capabilities.as_ref(),
                 reducer.as_deref(),
                 *max_attempts,
                 items,
@@ -5262,7 +5304,7 @@ async fn materialize_bulk_batches_from_plan(
                 instance,
                 batch_id,
                 activity_type,
-                activity_capabilities.clone(),
+                resolved_activity_capabilities.clone(),
                 task_queue,
                 total_items,
                 result_handle,
@@ -6142,10 +6184,35 @@ impl ActivityWorkerApi for WorkerApi {
                 .await
                 .map_err(internal_status)?;
             if !leased.is_empty() {
-                let tasks = leased
-                    .iter()
-                    .map(|record| bulk_chunk_to_proto(record, request.supports_cbor))
-                    .collect::<Vec<_>>();
+                let mut batch_capabilities: HashMap<String, Option<ActivityExecutionCapabilities>> =
+                    HashMap::new();
+                let mut tasks = Vec::with_capacity(leased.len());
+                for record in &leased {
+                    let capabilities = if let Some(capabilities) = batch_capabilities.get(&record.batch_id)
+                    {
+                        capabilities.clone()
+                    } else {
+                        let capabilities = self
+                            .state
+                            .store
+                            .get_bulk_batch(
+                                &record.tenant_id,
+                                &record.instance_id,
+                                &record.run_id,
+                                &record.batch_id,
+                            )
+                            .await
+                            .map_err(internal_status)?
+                            .and_then(|batch| batch.activity_capabilities);
+                        batch_capabilities.insert(record.batch_id.clone(), capabilities.clone());
+                        capabilities
+                    };
+                    tasks.push(bulk_chunk_to_proto(
+                        record,
+                        capabilities.as_ref(),
+                        request.supports_cbor,
+                    ));
+                }
                 return Ok(Response::new(PollBulkActivityTaskResponse { tasks }));
             }
 
@@ -6609,6 +6676,7 @@ fn prepare_result_application(
                                     attempt: retry_task.task.attempt,
                                     task_queue: retry_task.task.task_queue.clone(),
                                     activity_type: retry_task.task.activity_type.clone(),
+                                    activity_capabilities: retry_task.task.activity_capabilities.clone(),
                                     wait_state: retry_task.task.state.clone(),
                                     omit_success_output: retry_task.task.omit_success_output,
                                 },
@@ -6716,6 +6784,7 @@ fn prepare_result_application(
                                 attempt: task.attempt,
                                 task_queue: task.task_queue.clone(),
                                 activity_type: task.activity_type.clone(),
+                                activity_capabilities: task.activity_capabilities.clone(),
                                 wait_state: task.state.clone(),
                                 omit_success_output: task.omit_success_output,
                             },
@@ -6775,6 +6844,7 @@ fn prepare_result_application(
                                     attempt: task.attempt,
                                     task_queue: task.task_queue.clone(),
                                     activity_type: task.activity_type.clone(),
+                                    activity_capabilities: task.activity_capabilities.clone(),
                                     wait_state: task.state.clone(),
                                     omit_success_output: task.omit_success_output,
                                 },
@@ -7099,7 +7169,11 @@ async fn publish_history_events(
     publisher.publish_all(events).await
 }
 
-fn bulk_chunk_to_proto(record: &WorkflowBulkChunkRecord, supports_cbor: bool) -> BulkActivityTask {
+fn bulk_chunk_to_proto(
+    record: &WorkflowBulkChunkRecord,
+    activity_capabilities: Option<&ActivityExecutionCapabilities>,
+    supports_cbor: bool,
+) -> BulkActivityTask {
     BulkActivityTask {
         tenant_id: record.tenant_id.clone(),
         definition_id: record.definition_id.clone(),
@@ -7112,6 +7186,11 @@ fn bulk_chunk_to_proto(record: &WorkflowBulkChunkRecord, supports_cbor: bool) ->
         chunk_index: record.chunk_index,
         group_id: record.group_id,
         activity_type: record.activity_type.clone(),
+        activity_capabilities_json: if supports_cbor {
+            String::new()
+        } else {
+            serde_json::to_string(&activity_capabilities).expect("bulk activity capabilities serialize")
+        },
         task_queue: record.task_queue.clone(),
         attempt: record.attempt,
         items_json: if supports_cbor {
@@ -7132,6 +7211,12 @@ fn bulk_chunk_to_proto(record: &WorkflowBulkChunkRecord, supports_cbor: bool) ->
         input_handle_cbor: if supports_cbor {
             encode_cbor(&record.input_handle, "bulk chunk input handle")
                 .expect("bulk chunk input handle encodes as CBOR")
+        } else {
+            Vec::new()
+        },
+        activity_capabilities_cbor: if supports_cbor {
+            encode_cbor(&activity_capabilities, "bulk activity capabilities")
+                .expect("bulk activity capabilities encode")
         } else {
             Vec::new()
         },
@@ -7251,6 +7336,7 @@ fn activity_schedule_update(task: &QueuedActivity) -> ActivityScheduleUpdate {
         activity_id: task.activity_id.clone(),
         attempt: task.attempt,
         activity_type: task.activity_type.clone(),
+        activity_capabilities: task.activity_capabilities.clone(),
         task_queue: task.task_queue.clone(),
         state: Some(task.state.clone()),
         input: task.input.clone(),
@@ -7275,6 +7361,7 @@ fn queued_activity_from_record(record: &fabrik_store::WorkflowActivityRecord) ->
         run_id: record.run_id.clone(),
         activity_id: record.activity_id.clone(),
         activity_type: record.activity_type.clone(),
+        activity_capabilities: record.activity_capabilities.clone(),
         task_queue: record.task_queue.clone(),
         attempt: record.attempt,
         input: record.input.clone(),
@@ -7378,6 +7465,18 @@ fn activity_proto(leased: &LeasedActivity, supports_cbor: bool) -> ActivityTask 
         owner_epoch: leased.owner_epoch,
         omit_success_output: leased.task.omit_success_output,
         schedule_to_close_timeout_ms: leased.task.schedule_to_close_timeout_ms.unwrap_or_default(),
+        activity_capabilities_json: if supports_cbor {
+            String::new()
+        } else {
+            serde_json::to_string(&leased.task.activity_capabilities)
+                .expect("activity task capabilities serialize")
+        },
+        activity_capabilities_cbor: if supports_cbor {
+            encode_cbor(&leased.task.activity_capabilities, "activity task capabilities")
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        },
     }
 }
 
@@ -7418,6 +7517,7 @@ fn schedule_activities_from_plan(
         if let WorkflowEvent::ActivityTaskScheduled {
             activity_id,
             activity_type,
+            activity_capabilities,
             task_queue,
             attempt,
             input,
@@ -7445,6 +7545,7 @@ fn schedule_activities_from_plan(
                 run_id: instance.run_id.clone(),
                 activity_id: activity_id.clone(),
                 activity_type: activity_type.clone(),
+                activity_capabilities: activity_capabilities.clone(),
                 task_queue,
                 attempt: *attempt,
                 input: input.clone(),
@@ -7505,6 +7606,7 @@ fn build_retry_task(
             run_id: runtime.instance.run_id.clone(),
             activity_id: activity_id.to_owned(),
             activity_type,
+            activity_capabilities: active.activity_capabilities.clone(),
             task_queue: active.task_queue.clone(),
             attempt: next_attempt,
             input,
@@ -7898,6 +8000,7 @@ async fn restore_runtime_from_instance_row(
                     attempt: activity.attempt,
                     task_queue: activity.task_queue.clone(),
                     activity_type: activity.activity_type.clone(),
+                    activity_capabilities: activity.activity_capabilities.clone(),
                     wait_state: activity.state.clone().unwrap_or_default(),
                     omit_success_output: false,
                 },
@@ -8265,6 +8368,7 @@ fn apply_compiled_plan(state: &mut WorkflowInstanceState, plan: &CompiledExecuti
 }
 
 fn try_inline_stream_v2_microbatch_trigger_completion(
+    activity_capability_registry: &ActivityCapabilityRegistry,
     artifact: &CompiledWorkflowArtifact,
     instance: &mut WorkflowInstanceState,
     plan: &CompiledExecutionPlan,
@@ -8280,6 +8384,7 @@ fn try_inline_stream_v2_microbatch_trigger_completion(
         batch_id,
         activity_type,
         activity_capabilities,
+        task_queue,
         items,
         input_handle,
         chunk_size,
@@ -8294,9 +8399,12 @@ fn try_inline_stream_v2_microbatch_trigger_completion(
     if throughput_backend != ThroughputBackend::StreamV2.as_str() {
         return Ok(false);
     }
-    if activity_type != BENCHMARK_ECHO_ACTIVITY && activity_type != BENCHMARK_FAST_COUNT_ACTIVITY {
-        return Ok(false);
-    }
+    let resolved_activity_capabilities = resolve_activity_capabilities(
+        Some(activity_capability_registry),
+        task_queue,
+        activity_type,
+        activity_capabilities.as_ref(),
+    );
     let scheduled_input_handle = serde_json::from_value::<PayloadHandle>(input_handle.clone())
         .context("failed to decode inline microbatch input handle")?;
     let total_items = if items.is_empty() {
@@ -8310,7 +8418,7 @@ fn try_inline_stream_v2_microbatch_trigger_completion(
         if *chunk_size == 0 { 0 } else { total_items.div_ceil(*chunk_size as usize) as u32 };
     if !can_inline_stream_v2_microbatch(
         activity_type,
-        activity_capabilities.as_ref(),
+        resolved_activity_capabilities.as_ref(),
         reducer.as_deref(),
         *max_attempts,
         items,
@@ -8391,6 +8499,7 @@ mod tests {
             run_id: "run".to_owned(),
             activity_id: activity_id.to_owned(),
             activity_type: "benchmark.echo".to_owned(),
+            activity_capabilities: None,
             task_queue: "default".to_owned(),
             attempt,
             input: Value::Null,
@@ -8617,6 +8726,7 @@ mod tests {
                     attempt: 1,
                     task_queue: "default".to_owned(),
                     activity_type: "benchmark.echo".to_owned(),
+                    activity_capabilities: None,
                     wait_state: "join".to_owned(),
                     omit_success_output: false,
                 },
@@ -9389,6 +9499,7 @@ mod tests {
                 max_active_chunks_per_tenant: 4_096,
                 max_active_chunks_per_task_queue: 2_048,
             },
+            activity_capability_registry: Arc::new(ActivityCapabilityRegistry::default()),
             task_queue_policy_cache: Arc::new(StdMutex::new(HashMap::new())),
             debug: Arc::new(StdMutex::new(UnifiedDebugState::default())),
             outbox_publisher_id: "unified-runtime-test-outbox".to_owned(),
@@ -9817,6 +9928,7 @@ mod tests {
                 attempt: 2,
                 task_queue: "default".to_owned(),
                 activity_type: "benchmark.echo".to_owned(),
+                activity_capabilities: None,
                 wait_state: "join".to_owned(),
                 omit_success_output: false,
             },
@@ -10021,6 +10133,7 @@ mod tests {
                         attempt: queued.attempt,
                         task_queue: queued.task_queue.clone(),
                         activity_type: queued.activity_type.clone(),
+                        activity_capabilities: queued.activity_capabilities.clone(),
                         wait_state: queued.state.clone(),
                         omit_success_output: queued.omit_success_output,
                     },
@@ -10167,6 +10280,7 @@ mod tests {
                         attempt: 1,
                         task_queue: "default".to_owned(),
                         activity_type: "benchmark.echo".to_owned(),
+                        activity_capabilities: None,
                         wait_state: "join".to_owned(),
                         omit_success_output: false,
                     },

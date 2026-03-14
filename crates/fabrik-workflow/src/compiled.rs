@@ -555,14 +555,7 @@ pub struct AsyncHelperFrame {
 }
 
 impl ArtifactExecutionState {
-    pub(crate) fn compact_for_persistence(
-        &mut self,
-        persisted_input: Option<&Value>,
-        keep_input_binding: bool,
-    ) {
-        if keep_input_binding {
-            return;
-        }
+    pub(crate) fn compact_for_persistence(&mut self, persisted_input: Option<&Value>) {
         if self
             .bindings
             .get("input")
@@ -654,6 +647,7 @@ struct DynamicActivityDescriptor {
     task_queue: Option<String>,
     retry: Option<RetryPolicy>,
     config: Option<StepConfig>,
+    activity_capabilities: Option<ActivityExecutionCapabilities>,
     schedule_to_start_timeout_ms: Option<u64>,
     schedule_to_close_timeout_ms: Option<u64>,
     start_to_close_timeout_ms: Option<u64>,
@@ -1567,9 +1561,7 @@ impl CompiledWorkflowArtifact {
         };
 
         let mut fanout = self.fanout_binding(step_state, fanout_ref_var, &execution_state)?;
-        if !fanout_reducer_settles(&fanout) {
-            return Ok(None);
-        }
+        let settles = fanout_reducer_settles(&fanout);
 
         let mut applied = 0usize;
         let mut last_turn_context = None;
@@ -1584,6 +1576,9 @@ impl CompiledWorkflowArtifact {
                 || fanout_index >= fanout_total_count(&fanout)
                 || !fanout_slot_is_pending(&fanout, fanout_index)
             {
+                break;
+            }
+            if !settles && completion != CompletionKind::Succeeded {
                 break;
             }
             fanout_mark_completed(&mut fanout, fanout_index, value, completion);
@@ -2400,7 +2395,7 @@ impl CompiledWorkflowArtifact {
                         event: WorkflowEvent::ActivityTaskScheduled {
                             activity_id: current_state.clone(),
                             activity_type: descriptor.activity_type,
-                            activity_capabilities: None,
+                            activity_capabilities: descriptor.activity_capabilities,
                             task_queue,
                             attempt: 1,
                             input: descriptor.input,
@@ -3899,9 +3894,26 @@ fn parse_descriptor_activity_capabilities(
             });
         }
     };
+    let omit_success_output_short_circuit =
+        match capabilities.get("omit_success_output_short_circuit") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                return Err(CompiledWorkflowError::InvalidDynamicStepDescriptor {
+                    state: state.to_owned(),
+                    details:
+                        "activity_capabilities.omit_success_output_short_circuit must be a boolean"
+                            .to_owned(),
+                });
+            }
+        };
     Ok(Some(
-        ActivityExecutionCapabilities { payloadless_transport, tiny_inline_completion }
-            .normalized(),
+        ActivityExecutionCapabilities {
+            payloadless_transport,
+            tiny_inline_completion,
+            omit_success_output_short_circuit,
+        }
+        .normalized(),
     ))
 }
 
@@ -3954,6 +3966,7 @@ fn parse_dynamic_activity_descriptor(
         task_queue,
         retry: parse_descriptor_retry(&descriptor, state)?,
         config,
+        activity_capabilities: parse_descriptor_activity_capabilities(&descriptor, state)?,
         schedule_to_start_timeout_ms: parse_descriptor_u64(
             &descriptor,
             "schedule_to_start_timeout_ms",
@@ -7707,6 +7720,149 @@ mod tests {
     }
 
     #[test]
+    fn fanout_collect_results_batch_apply_completes_in_one_transition() {
+        let artifact = fanout_artifact_with_reducer(false, Some("collect_results"));
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"items": [{"value": 1}, {"value": 2}, {"value": 3}]}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        let events = vec![
+            terminal_event(
+                &artifact,
+                WorkflowEvent::ActivityTaskCompleted {
+                    activity_id: "dispatch::2".to_owned(),
+                    attempt: 1,
+                    output: json!({"value": 30}),
+                    worker_id: "worker-a".to_owned(),
+                    worker_build_id: "build-a".to_owned(),
+                },
+                1_700_000_000_100,
+            ),
+            terminal_event(
+                &artifact,
+                WorkflowEvent::ActivityTaskCompleted {
+                    activity_id: "dispatch::0".to_owned(),
+                    attempt: 1,
+                    output: json!({"value": 10}),
+                    worker_id: "worker-a".to_owned(),
+                    worker_build_id: "build-a".to_owned(),
+                },
+                1_700_000_000_200,
+            ),
+            terminal_event(
+                &artifact,
+                WorkflowEvent::ActivityTaskCompleted {
+                    activity_id: "dispatch::1".to_owned(),
+                    attempt: 1,
+                    output: json!({"value": 20}),
+                    worker_id: "worker-a".to_owned(),
+                    worker_build_id: "build-a".to_owned(),
+                },
+                1_700_000_000_300,
+            ),
+        ];
+
+        let Some((settled, applied)) = artifact
+            .try_execute_after_step_terminal_batch("join", &events, plan.execution_state)
+            .unwrap()
+        else {
+            panic!("expected fanout batch fast path");
+        };
+
+        assert_eq!(applied, 3);
+        assert_eq!(settled.final_state, "done");
+        assert!(matches!(
+            settled.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output == &json!([
+                {"value": 10},
+                {"value": 20},
+                {"value": 30}
+            ])
+        ));
+    }
+
+    #[test]
+    fn fanout_collect_results_batch_apply_stops_before_failure() {
+        let artifact = fanout_artifact_with_reducer(false, Some("collect_results"));
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({"items": [{"value": 1}, {"value": 2}, {"value": 3}]}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        let events = vec![
+            terminal_event(
+                &artifact,
+                WorkflowEvent::ActivityTaskCompleted {
+                    activity_id: "dispatch::2".to_owned(),
+                    attempt: 1,
+                    output: json!({"value": 30}),
+                    worker_id: "worker-a".to_owned(),
+                    worker_build_id: "build-a".to_owned(),
+                },
+                1_700_000_000_100,
+            ),
+            terminal_event(
+                &artifact,
+                WorkflowEvent::ActivityTaskFailed {
+                    activity_id: "dispatch::1".to_owned(),
+                    attempt: 1,
+                    error: "boom".to_owned(),
+                    worker_id: "worker-a".to_owned(),
+                    worker_build_id: "build-a".to_owned(),
+                },
+                1_700_000_000_200,
+            ),
+        ];
+
+        let Some((waiting, applied)) = artifact
+            .try_execute_after_step_terminal_batch("join", &events, plan.execution_state)
+            .unwrap()
+        else {
+            panic!("expected fanout batch fast path");
+        };
+
+        assert_eq!(applied, 1);
+        assert_eq!(waiting.final_state, "join");
+        assert!(waiting.emissions.is_empty());
+
+        let failed = artifact
+            .execute_after_step_failure_with_turn(
+                "join",
+                "dispatch::1",
+                "boom",
+                waiting.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_300).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(failed.final_state, "fail");
+        assert!(matches!(
+            failed.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowFailed { reason },
+                ..
+            }) if reason == "boom"
+        ));
+    }
+
+    #[test]
     fn fanout_all_settled_intermediate_completion_drops_context_and_failure_map() {
         let artifact = fanout_artifact_with_reducer(false, Some("all_settled"));
         let plan = artifact
@@ -8270,6 +8426,7 @@ mod tests {
                 && activity_capabilities == &Some(ActivityExecutionCapabilities {
                     payloadless_transport: true,
                     tiny_inline_completion: false,
+                    omit_success_output_short_circuit: false,
                 })
                 && task_queue == "bulk"
                 && chunk_size == &32

@@ -48,6 +48,8 @@ message ActivityTask {
   uint64 owner_epoch = 21;
   bool omit_success_output = 25;
   uint64 schedule_to_close_timeout_ms = 26;
+  string activity_capabilities_json = 27;
+  bytes activity_capabilities_cbor = 28;
 }
 
 message PollActivityTaskResponse {
@@ -95,6 +97,8 @@ message BulkActivityTask {
   uint64 owner_epoch = 20;
   bool omit_success_output = 25;
   uint32 item_count = 26;
+  string activity_capabilities_json = 27;
+  bytes activity_capabilities_cbor = 28;
 }
 
 message PollBulkActivityTaskResponse {

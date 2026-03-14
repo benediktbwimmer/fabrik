@@ -23,8 +23,8 @@ use fabrik_store::{
     WorkflowMailboxKind, WorkflowResumeKind, WorkflowStore, WorkflowTaskRecord,
 };
 use fabrik_throughput::{
-    ThroughputBackend, bulk_reducer_class, decode_cbor, encode_cbor, planned_reduction_tree_depth,
-    stream_v2_fast_lane_enabled,
+    ActivityExecutionCapabilities, ThroughputBackend, bulk_reducer_class, decode_cbor,
+    encode_cbor, planned_reduction_tree_depth, stream_v2_fast_lane_enabled,
 };
 use fabrik_worker_protocol::activity_worker::{
     Ack, ActivityTask, ActivityTaskResult, BulkActivityTask, BulkActivityTaskResult,
@@ -396,6 +396,7 @@ async fn process_event(
         WorkflowEvent::ActivityTaskScheduled {
             activity_id,
             activity_type,
+            activity_capabilities,
             task_queue,
             attempt,
             input,
@@ -419,6 +420,7 @@ async fn process_event(
                     activity_id,
                     *attempt,
                     activity_type,
+                    activity_capabilities.as_ref(),
                     task_queue,
                     workflow_state.as_deref(),
                     input,
@@ -443,6 +445,7 @@ async fn process_event(
         WorkflowEvent::BulkActivityBatchScheduled {
             batch_id,
             activity_type,
+            activity_capabilities,
             task_queue,
             items,
             input_handle,
@@ -487,6 +490,7 @@ async fn process_event(
                     Some(&event.artifact_hash),
                     batch_id,
                     activity_type,
+                    activity_capabilities.as_ref(),
                     task_queue,
                     workflow_state.as_deref(),
                     input_handle,
@@ -830,8 +834,19 @@ impl ActivityWorkerApi for ActivityApi {
         );
 
         if let Some(record) = self.state.bulk_prefetch.pop(&worker_key).await {
+            let capabilities = self
+                .state
+                .store
+                .get_bulk_batch(&record.tenant_id, &record.instance_id, &record.run_id, &record.batch_id)
+                .await
+                .map_err(internal_status)?
+                .and_then(|batch| batch.activity_capabilities);
             return Ok(Response::new(PollBulkActivityTaskResponse {
-                tasks: vec![bulk_chunk_to_proto(&record, request.supports_cbor)],
+                tasks: vec![bulk_chunk_to_proto(
+                    &record,
+                    capabilities.as_ref(),
+                    request.supports_cbor,
+                )],
             }));
         }
 
@@ -859,12 +874,46 @@ impl ActivityWorkerApi for ActivityApi {
                         .await;
                 }
                 let mut tasks = Vec::with_capacity(leased.len());
-                tasks.push(bulk_chunk_to_proto(first, request.supports_cbor));
-                tasks.extend(
-                    remaining
-                        .iter()
-                        .map(|record| bulk_chunk_to_proto(record, request.supports_cbor)),
-                );
+                let mut batch_capabilities = HashMap::new();
+                let first_capabilities = self
+                    .state
+                    .store
+                    .get_bulk_batch(&first.tenant_id, &first.instance_id, &first.run_id, &first.batch_id)
+                    .await
+                    .map_err(internal_status)?
+                    .and_then(|batch| batch.activity_capabilities);
+                batch_capabilities.insert(first.batch_id.clone(), first_capabilities.clone());
+                tasks.push(bulk_chunk_to_proto(
+                    first,
+                    first_capabilities.as_ref(),
+                    request.supports_cbor,
+                ));
+                for record in remaining {
+                    let capabilities = if let Some(capabilities) = batch_capabilities.get(&record.batch_id)
+                    {
+                        capabilities.clone()
+                    } else {
+                        let capabilities = self
+                            .state
+                            .store
+                            .get_bulk_batch(
+                                &record.tenant_id,
+                                &record.instance_id,
+                                &record.run_id,
+                                &record.batch_id,
+                            )
+                            .await
+                            .map_err(internal_status)?
+                            .and_then(|batch| batch.activity_capabilities);
+                        batch_capabilities.insert(record.batch_id.clone(), capabilities.clone());
+                        capabilities
+                    };
+                    tasks.push(bulk_chunk_to_proto(
+                        record,
+                        capabilities.as_ref(),
+                        request.supports_cbor,
+                    ));
+                }
                 return Ok(Response::new(PollBulkActivityTaskResponse { tasks }));
             }
 
@@ -2139,10 +2188,17 @@ fn record_to_proto(record: &WorkflowActivityRecord) -> ActivityTask {
         lease_epoch: 0,
         owner_epoch: 0,
         omit_success_output: false,
+        activity_capabilities_json: serde_json::to_string(&record.activity_capabilities)
+            .expect("activity capabilities serialize"),
+        activity_capabilities_cbor: Vec::new(),
     }
 }
 
-fn bulk_chunk_to_proto(record: &WorkflowBulkChunkRecord, supports_cbor: bool) -> BulkActivityTask {
+fn bulk_chunk_to_proto(
+    record: &WorkflowBulkChunkRecord,
+    activity_capabilities: Option<&ActivityExecutionCapabilities>,
+    supports_cbor: bool,
+) -> BulkActivityTask {
     BulkActivityTask {
         tenant_id: record.tenant_id.clone(),
         definition_id: record.definition_id.clone(),
@@ -2155,6 +2211,11 @@ fn bulk_chunk_to_proto(record: &WorkflowBulkChunkRecord, supports_cbor: bool) ->
         chunk_index: record.chunk_index,
         group_id: record.group_id,
         activity_type: record.activity_type.clone(),
+        activity_capabilities_json: if supports_cbor {
+            String::new()
+        } else {
+            serde_json::to_string(&activity_capabilities).expect("bulk activity capabilities serialize")
+        },
         task_queue: record.task_queue.clone(),
         attempt: record.attempt,
         items_json: if supports_cbor {
@@ -2175,6 +2236,12 @@ fn bulk_chunk_to_proto(record: &WorkflowBulkChunkRecord, supports_cbor: bool) ->
         input_handle_cbor: if supports_cbor {
             encode_cbor(&record.input_handle, "bulk chunk input handle")
                 .expect("bulk chunk input handle encodes as CBOR")
+        } else {
+            Vec::new()
+        },
+        activity_capabilities_cbor: if supports_cbor {
+            encode_cbor(&activity_capabilities, "bulk activity capabilities")
+                .expect("bulk activity capabilities encode")
         } else {
             Vec::new()
         },
@@ -2326,6 +2393,7 @@ fn scheduled_activity_record(event: &EventEnvelope<WorkflowEvent>) -> WorkflowAc
     let WorkflowEvent::ActivityTaskScheduled {
         activity_id,
         activity_type,
+        activity_capabilities,
         task_queue,
         attempt,
         input,
@@ -2351,6 +2419,7 @@ fn scheduled_activity_record(event: &EventEnvelope<WorkflowEvent>) -> WorkflowAc
         activity_id: activity_id.clone(),
         attempt: *attempt,
         activity_type: activity_type.clone(),
+        activity_capabilities: activity_capabilities.clone(),
         task_queue: task_queue.clone(),
         state: state.clone(),
         status: WorkflowActivityStatus::Scheduled,
@@ -3571,6 +3640,7 @@ mod tests {
                 Some("artifact-1"),
                 "batch-stream",
                 "benchmark.echo",
+                None,
                 "bulk",
                 Some("join"),
                 &json!({ "kind": "inline", "key": "bulk-input:batch-stream" }),

@@ -126,6 +126,8 @@ pub struct ActivityExecutionCapabilities {
     pub payloadless_transport: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub tiny_inline_completion: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub omit_success_output_short_circuit: bool,
 }
 
 impl ActivityExecutionCapabilities {
@@ -136,11 +138,19 @@ impl ActivityExecutionCapabilities {
         self
     }
 
+    pub fn is_empty(&self) -> bool {
+        !self.payloadless_transport
+            && !self.tiny_inline_completion
+            && !self.omit_success_output_short_circuit
+    }
+
     pub fn merged_with_builtin(activity_type: &str, declared: Option<&Self>) -> Self {
         let mut capabilities = builtin_activity_execution_capabilities(activity_type);
         if let Some(declared) = declared {
             capabilities.payloadless_transport |= declared.payloadless_transport;
             capabilities.tiny_inline_completion |= declared.tiny_inline_completion;
+            capabilities.omit_success_output_short_circuit |=
+                declared.omit_success_output_short_circuit;
         }
         capabilities.normalized()
     }
@@ -153,6 +163,7 @@ pub fn builtin_activity_execution_capabilities(
         BENCHMARK_FAST_COUNT_ACTIVITY => ActivityExecutionCapabilities {
             payloadless_transport: true,
             tiny_inline_completion: true,
+            omit_success_output_short_circuit: false,
         },
         BENCHMARK_ECHO_ACTIVITY
         | CORE_ECHO_ACTIVITY
@@ -160,9 +171,144 @@ pub fn builtin_activity_execution_capabilities(
         | CORE_ACCEPT_ACTIVITY => ActivityExecutionCapabilities {
             payloadless_transport: true,
             tiny_inline_completion: false,
+            omit_success_output_short_circuit: true,
         },
         _ => ActivityExecutionCapabilities::default(),
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerActivityManifestEntry {
+    pub activity_type: String,
+    #[serde(default, skip_serializing_if = "ActivityExecutionCapabilities::is_empty")]
+    pub capabilities: ActivityExecutionCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerActivityManifest {
+    pub schema_version: u32,
+    pub task_queue: Option<String>,
+    #[serde(default)]
+    pub activities: Vec<WorkerActivityManifestEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WorkerPackageManifest {
+    task_queue: Option<String>,
+    activity_manifest_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ActivityCapabilityRegistry {
+    by_task_queue: BTreeMap<String, BTreeMap<String, ActivityExecutionCapabilities>>,
+}
+
+impl ActivityCapabilityRegistry {
+    pub fn is_empty(&self) -> bool { self.by_task_queue.is_empty() }
+
+    pub fn entry_count(&self) -> usize {
+        self.by_task_queue.values().map(BTreeMap::len).sum()
+    }
+
+    pub fn lookup(
+        &self,
+        task_queue: &str,
+        activity_type: &str,
+    ) -> Option<&ActivityExecutionCapabilities> {
+        self.by_task_queue
+            .get(task_queue)
+            .and_then(|activities| activities.get(activity_type))
+            .or_else(|| self.by_task_queue.get("").and_then(|activities| activities.get(activity_type)))
+    }
+
+    pub fn insert(
+        &mut self,
+        task_queue: Option<&str>,
+        activity_type: &str,
+        capabilities: ActivityExecutionCapabilities,
+    ) {
+        if capabilities.is_empty() {
+            return;
+        }
+        self.by_task_queue
+            .entry(task_queue.unwrap_or_default().to_owned())
+            .or_default()
+            .entry(activity_type.to_owned())
+            .and_modify(|existing| {
+                existing.payloadless_transport |= capabilities.payloadless_transport;
+                existing.tiny_inline_completion |= capabilities.tiny_inline_completion;
+                existing.omit_success_output_short_circuit |=
+                    capabilities.omit_success_output_short_circuit;
+                *existing = existing.clone().normalized();
+            })
+            .or_insert_with(|| capabilities.normalized());
+    }
+}
+
+pub fn load_activity_capability_registry_from_worker_packages(
+    workers_dir: &Path,
+) -> Result<ActivityCapabilityRegistry> {
+    let mut registry = ActivityCapabilityRegistry::default();
+    if !workers_dir.exists() {
+        return Ok(registry);
+    }
+    for entry in fs::read_dir(workers_dir)
+        .with_context(|| format!("failed to read worker packages dir {}", workers_dir.display()))?
+    {
+        let entry = entry?;
+        let package_path = entry.path().join("worker-package.json");
+        if !package_path.exists() {
+            continue;
+        }
+        let package: WorkerPackageManifest = serde_json::from_slice(
+            &fs::read(&package_path)
+                .with_context(|| format!("failed to read {}", package_path.display()))?,
+        )
+        .with_context(|| format!("failed to parse {}", package_path.display()))?;
+        let Some(activity_manifest_path) = package.activity_manifest_path.as_deref() else {
+            continue;
+        };
+        let activity_manifest_path = PathBuf::from(activity_manifest_path);
+        let manifest: WorkerActivityManifest = serde_json::from_slice(
+            &fs::read(&activity_manifest_path)
+                .with_context(|| format!("failed to read {}", activity_manifest_path.display()))?,
+        )
+        .with_context(|| format!("failed to parse {}", activity_manifest_path.display()))?;
+        let task_queue =
+            manifest.task_queue.as_deref().or(package.task_queue.as_deref()).filter(|value| !value.is_empty());
+        for activity in manifest.activities {
+            registry.insert(task_queue, &activity.activity_type, activity.capabilities);
+        }
+    }
+    Ok(registry)
+}
+
+pub fn load_activity_capability_registry_from_env(
+    env_var: &str,
+) -> Result<ActivityCapabilityRegistry> {
+    let Some(workers_dir) = std::env::var_os(env_var) else {
+        return Ok(ActivityCapabilityRegistry::default());
+    };
+    load_activity_capability_registry_from_worker_packages(Path::new(&workers_dir))
+}
+
+pub fn resolve_activity_capabilities(
+    registry: Option<&ActivityCapabilityRegistry>,
+    task_queue: &str,
+    activity_type: &str,
+    declared: Option<&ActivityExecutionCapabilities>,
+) -> Option<ActivityExecutionCapabilities> {
+    let mut resolved = registry
+        .and_then(|registry| registry.lookup(task_queue, activity_type))
+        .cloned()
+        .unwrap_or_default();
+    if let Some(declared) = declared {
+        resolved.payloadless_transport |= declared.payloadless_transport;
+        resolved.tiny_inline_completion |= declared.tiny_inline_completion;
+        resolved.omit_success_output_short_circuit |= declared.omit_success_output_short_circuit;
+    }
+    let resolved = resolved.normalized();
+    (!resolved.is_empty()).then_some(resolved)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,11 +409,12 @@ pub fn bulk_reducer_requires_error_outputs(reducer: Option<&str>) -> bool {
     matches!(bulk_reducer_name(reducer), BULK_REDUCER_SAMPLE_ERRORS)
 }
 
-pub fn activity_can_short_circuit_omitted_success_output(activity_type: &str) -> bool {
-    matches!(
-        activity_type,
-        BENCHMARK_ECHO_ACTIVITY | CORE_ECHO_ACTIVITY | CORE_NOOP_ACTIVITY | CORE_ACCEPT_ACTIVITY
-    )
+pub fn activity_can_short_circuit_omitted_success_output(
+    activity_type: &str,
+    declared_capabilities: Option<&ActivityExecutionCapabilities>,
+) -> bool {
+    ActivityExecutionCapabilities::merged_with_builtin(activity_type, declared_capabilities)
+        .omit_success_output_short_circuit
 }
 
 pub fn can_use_payloadless_bulk_transport(
@@ -1901,9 +2048,18 @@ mod tests {
     fn core_activities_are_fast_lane_eligible_when_outputs_can_be_omitted() {
         let items = vec![serde_json::json!({"value": 1}), serde_json::json!({"value": 2})];
 
-        assert!(activity_can_short_circuit_omitted_success_output(CORE_ECHO_ACTIVITY));
-        assert!(activity_can_short_circuit_omitted_success_output(CORE_NOOP_ACTIVITY));
-        assert!(activity_can_short_circuit_omitted_success_output(CORE_ACCEPT_ACTIVITY));
+        assert!(activity_can_short_circuit_omitted_success_output(
+            CORE_ECHO_ACTIVITY,
+            None,
+        ));
+        assert!(activity_can_short_circuit_omitted_success_output(
+            CORE_NOOP_ACTIVITY,
+            None,
+        ));
+        assert!(activity_can_short_circuit_omitted_success_output(
+            CORE_ACCEPT_ACTIVITY,
+            None,
+        ));
         assert!(can_use_payloadless_bulk_transport(
             CORE_ECHO_ACTIVITY,
             None,
@@ -1937,7 +2093,10 @@ mod tests {
 
     #[test]
     fn fast_count_remains_bulk_only_for_single_activity_short_circuiting() {
-        assert!(!activity_can_short_circuit_omitted_success_output(BENCHMARK_FAST_COUNT_ACTIVITY));
+        assert!(!activity_can_short_circuit_omitted_success_output(
+            BENCHMARK_FAST_COUNT_ACTIVITY,
+            None,
+        ));
         assert!(can_complete_payloadless_bulk_chunk(
             BENCHMARK_FAST_COUNT_ACTIVITY,
             None,
@@ -1955,6 +2114,7 @@ mod tests {
         let capabilities = ActivityExecutionCapabilities {
             payloadless_transport: true,
             tiny_inline_completion: false,
+            omit_success_output_short_circuit: false,
         };
 
         assert!(can_use_payloadless_bulk_transport(
