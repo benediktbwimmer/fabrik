@@ -16,7 +16,7 @@ use axum::{
     http::StatusCode,
     routing::get,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use fabrik_broker::{
     BrokerConfig, JsonTopicConfig, JsonTopicPublisher, WorkflowPublisher, build_json_consumer,
     build_json_consumer_from_offsets, build_workflow_consumer, decode_consumed_workflow_event,
@@ -49,8 +49,9 @@ use fabrik_throughput::{
     parse_benchmark_compact_input_meta_from_handle,
     parse_benchmark_compact_total_items_from_handle, planned_reduction_tree_depth,
     resolve_activity_capabilities, stream_v2_fast_lane_enabled, synthesize_benchmark_echo_items,
-    throughput_execution_mode, throughput_partition_key, throughput_reducer_execution_path,
-    throughput_reducer_version, throughput_routing_reason,
+    throughput_bridge_request_id, throughput_execution_mode, throughput_partition_key,
+    throughput_reducer_execution_path, throughput_reducer_version, throughput_routing_reason,
+    throughput_terminal_callback_dedupe_key, throughput_terminal_callback_event_id,
 };
 use fabrik_worker_protocol::activity_worker::{
     Ack, BulkActivityTask, BulkActivityTaskResult, PollBulkActivityTaskRequest,
@@ -726,6 +727,13 @@ async fn handle_throughput_command(
             command.batch_id.as_str(),
             command.throughput_backend.as_str(),
         ),
+        ThroughputCommand::CancelBatch { identity, .. } => (
+            identity.tenant_id.as_str(),
+            identity.instance_id.as_str(),
+            identity.run_id.as_str(),
+            identity.batch_id.as_str(),
+            ThroughputBackend::StreamV2.as_str(),
+        ),
         ThroughputCommand::TinyWorkflowStart(_) | ThroughputCommand::TinyWorkflowStartBatch(_) => {
             return Ok(());
         }
@@ -747,11 +755,50 @@ async fn handle_throughput_command(
             let event = workflow_event_from_throughput_command(&command)?;
             activate_stream_batch(&state, &event).await
         }
+        ThroughputCommand::CancelBatch { identity, reason } => {
+            cancel_stream_batch_via_bridge(&state, identity, reason, command.occurred_at).await
+        }
         ThroughputCommand::TinyWorkflowStart(_) | ThroughputCommand::TinyWorkflowStartBatch(_) => {
             Ok(())
         }
         _ => Ok(()),
     }
+}
+
+async fn cancel_stream_batch_via_bridge(
+    state: &AppState,
+    identity: &ThroughputBatchIdentity,
+    reason: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    let cancelled = state
+        .store
+        .cancel_bulk_batch(
+            &identity.tenant_id,
+            &identity.instance_id,
+            &identity.run_id,
+            &identity.batch_id,
+            reason,
+            None,
+            occurred_at,
+        )
+        .await?;
+    let _ = state
+        .store
+        .mark_throughput_run_terminal(
+            &identity.tenant_id,
+            &identity.instance_id,
+            &identity.run_id,
+            &identity.batch_id,
+            "cancelled",
+            occurred_at,
+        )
+        .await?;
+    if !cancelled.cancelled_chunks.is_empty() {
+        state.bulk_notify.notify_waiters();
+        state.outbox_notify.notify_waiters();
+    }
+    Ok(())
 }
 
 async fn restore_local_state_from_changelog(
@@ -844,6 +891,9 @@ async fn seed_local_state_from_runs(state: &AppState) -> Result<()> {
         .list_nonterminal_throughput_runs_for_backend(ThroughputBackend::StreamV2.as_str(), 10_000)
         .await?;
     for run in runs {
+        if run.command_published_at.is_none() {
+            continue;
+        }
         match &run.command.payload {
             ThroughputCommand::StartThroughputRun(start) => {
                 activate_native_stream_run(state, &run.command, start).await?;
@@ -3666,16 +3716,30 @@ async fn publish_stream_terminal_event(
     };
     let mut envelope = EventEnvelope::new(payload.event_type(), identity, payload);
     let terminal_at = projected.terminal_at.unwrap_or(report.occurred_at);
-    let dedupe_key = stream_batch_terminal_dedupe_key(
+    let dedupe_key = throughput_terminal_callback_dedupe_key(
         &report.tenant_id,
         &report.instance_id,
         &report.run_id,
         &report.batch_id,
         projected.batch_status.as_str(),
     );
-    envelope.event_id = stream_batch_terminal_event_id(&dedupe_key);
+    envelope.event_id = throughput_terminal_callback_event_id(&dedupe_key);
     envelope.occurred_at = terminal_at;
     envelope.dedupe_key = Some(dedupe_key);
+    envelope.metadata.insert(
+        "bridge_request_id".to_owned(),
+        throughput_bridge_request_id(
+            &report.tenant_id,
+            &report.instance_id,
+            &report.run_id,
+            &report.batch_id,
+        ),
+    );
+    envelope.metadata.insert(
+        "bridge_terminal_dedupe_key".to_owned(),
+        envelope.dedupe_key.clone().unwrap_or_default(),
+    );
+    envelope.metadata.insert("bridge_owner_epoch".to_owned(), report.owner_epoch.to_string());
     envelope
         .metadata
         .insert("throughput_backend".to_owned(), ThroughputBackend::StreamV2.as_str().to_owned());
@@ -3756,16 +3820,33 @@ async fn publish_stream_batch_terminal_event(
     };
     let mut envelope = EventEnvelope::new(payload.event_type(), identity, payload);
     let terminal_at = batch.terminal_at.unwrap_or(batch.updated_at);
-    let dedupe_key = stream_batch_terminal_dedupe_key(
+    let dedupe_key = throughput_terminal_callback_dedupe_key(
         &batch.tenant_id,
         &batch.instance_id,
         &batch.run_id,
         &batch.batch_id,
         batch.status.as_str(),
     );
-    envelope.event_id = stream_batch_terminal_event_id(&dedupe_key);
+    envelope.event_id = throughput_terminal_callback_event_id(&dedupe_key);
     envelope.occurred_at = terminal_at;
     envelope.dedupe_key = Some(dedupe_key);
+    envelope.metadata.insert(
+        "bridge_request_id".to_owned(),
+        throughput_bridge_request_id(
+            &batch.tenant_id,
+            &batch.instance_id,
+            &batch.run_id,
+            &batch.batch_id,
+        ),
+    );
+    envelope.metadata.insert(
+        "bridge_terminal_dedupe_key".to_owned(),
+        envelope.dedupe_key.clone().unwrap_or_default(),
+    );
+    envelope.metadata.insert(
+        "bridge_owner_epoch".to_owned(),
+        resolve_terminal_bridge_owner_epoch(state, batch, pending_report).await?.to_string(),
+    );
     envelope
         .metadata
         .insert("throughput_backend".to_owned(), ThroughputBackend::StreamV2.as_str().to_owned());
@@ -3785,18 +3866,24 @@ async fn publish_stream_batch_terminal_event(
     Ok(())
 }
 
-fn stream_batch_terminal_dedupe_key(
-    tenant_id: &str,
-    instance_id: &str,
-    run_id: &str,
-    batch_id: &str,
-    status: &str,
-) -> String {
-    format!("throughput-terminal:{tenant_id}:{instance_id}:{run_id}:{batch_id}:{status}")
-}
-
-fn stream_batch_terminal_event_id(dedupe_key: &str) -> Uuid {
-    Uuid::new_v5(&Uuid::NAMESPACE_URL, format!("throughput-terminal-event:{dedupe_key}").as_bytes())
+async fn resolve_terminal_bridge_owner_epoch(
+    state: &AppState,
+    batch: &WorkflowBulkBatchRecord,
+    pending_report: Option<&ThroughputChunkReport>,
+) -> Result<u64> {
+    if let Some(report) = pending_report {
+        return Ok(report.owner_epoch);
+    }
+    Ok(state
+        .store
+        .get_throughput_projection_batch_max_owner_epoch(
+            &batch.tenant_id,
+            &batch.instance_id,
+            &batch.run_id,
+            &batch.batch_id,
+        )
+        .await?
+        .unwrap_or_default())
 }
 
 async fn finalize_grouped_stream_batch(
@@ -5354,26 +5441,37 @@ mod tests {
 
     #[test]
     fn stream_batch_terminal_identity_is_deterministic_for_report_terminals() {
-        let dedupe_key =
-            stream_batch_terminal_dedupe_key("tenant-a", "wf-a", "run-a", "batch-a", "completed");
+        let dedupe_key = throughput_terminal_callback_dedupe_key(
+            "tenant-a",
+            "wf-a",
+            "run-a",
+            "batch-a",
+            "completed",
+        );
         assert_eq!(dedupe_key, "throughput-terminal:tenant-a:wf-a:run-a:batch-a:completed");
         assert_eq!(
-            stream_batch_terminal_event_id(&dedupe_key),
-            stream_batch_terminal_event_id(&dedupe_key)
+            throughput_terminal_callback_event_id(&dedupe_key),
+            throughput_terminal_callback_event_id(&dedupe_key)
         );
     }
 
     #[test]
     fn stream_batch_terminal_identity_changes_when_projected_terminal_changes() {
-        let completed =
-            stream_batch_terminal_dedupe_key("tenant-a", "wf-a", "run-a", "batch-a", "completed");
-        let failed =
-            stream_batch_terminal_dedupe_key("tenant-a", "wf-a", "run-a", "batch-a", "failed");
+        let completed = throughput_terminal_callback_dedupe_key(
+            "tenant-a",
+            "wf-a",
+            "run-a",
+            "batch-a",
+            "completed",
+        );
+        let failed = throughput_terminal_callback_dedupe_key(
+            "tenant-a", "wf-a", "run-a", "batch-a", "failed",
+        );
 
         assert_ne!(completed, failed);
         assert_ne!(
-            stream_batch_terminal_event_id(&completed),
-            stream_batch_terminal_event_id(&failed)
+            throughput_terminal_callback_event_id(&completed),
+            throughput_terminal_callback_event_id(&failed)
         );
     }
 

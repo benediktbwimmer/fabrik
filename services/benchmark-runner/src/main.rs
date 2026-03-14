@@ -2006,15 +2006,39 @@ fn can_use_tiny_batch_api(args: &Args) -> bool {
         }
 }
 
-fn can_use_durable_batch_api(args: &Args) -> bool {
-    env::var("BENCHMARK_USE_DURABLE_BATCH_API")
-        .ok()
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-        && args.execution_mode == ExecutionMode::Durable
+fn parse_bool_env(name: &str) -> Option<bool> {
+    env::var(name).ok().and_then(|value| {
+        if value == "1" || value.eq_ignore_ascii_case("true") {
+            Some(true)
+        } else if value == "0" || value.eq_ignore_ascii_case("false") {
+            Some(false)
+        } else {
+            None
+        }
+    })
+}
+
+fn can_use_durable_batch_api_with_overrides(
+    args: &Args,
+    use_flag: Option<bool>,
+    disable_flag: Option<bool>,
+) -> bool {
+    if disable_flag == Some(true) {
+        return false;
+    }
+    let eligible = args.execution_mode == ExecutionMode::Durable
         && args.workload_kind == BenchmarkWorkloadKind::Fanout
         && args.retry_rate == 0.0
-        && args.cancel_rate == 0.0
+        && args.cancel_rate == 0.0;
+    use_flag.unwrap_or(eligible) && eligible
+}
+
+fn can_use_durable_batch_api(args: &Args) -> bool {
+    can_use_durable_batch_api_with_overrides(
+        args,
+        parse_bool_env("BENCHMARK_USE_DURABLE_BATCH_API"),
+        parse_bool_env("BENCHMARK_DISABLE_DURABLE_BATCH_API"),
+    )
 }
 
 fn trigger_submission_concurrency() -> usize {
@@ -3696,6 +3720,49 @@ mod tests {
             }
             other => panic!("expected fanout dispatch state, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn durable_batch_api_defaults_on_for_eligible_durable_fanout() {
+        let durable = Args {
+            execution_mode: ExecutionMode::Durable,
+            throughput_backend: None,
+            ..demo_args()
+        };
+
+        assert!(can_use_durable_batch_api_with_overrides(&durable, None, None));
+    }
+
+    #[test]
+    fn durable_batch_api_disable_override_wins() {
+        let durable = Args {
+            execution_mode: ExecutionMode::Durable,
+            throughput_backend: None,
+            ..demo_args()
+        };
+
+        assert!(!can_use_durable_batch_api_with_overrides(
+            &durable,
+            Some(true),
+            Some(true)
+        ));
+    }
+
+    #[test]
+    fn durable_batch_api_stays_off_for_ineligible_workloads() {
+        let mut durable = Args {
+            execution_mode: ExecutionMode::Durable,
+            throughput_backend: None,
+            ..demo_args()
+        };
+        durable.retry_rate = 0.01;
+
+        assert!(!can_use_durable_batch_api_with_overrides(&durable, None, None));
+        assert!(!can_use_durable_batch_api_with_overrides(
+            &durable,
+            Some(true),
+            None
+        ));
     }
 
     #[test]

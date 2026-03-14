@@ -59,6 +59,7 @@ The latest compiler, runtime, and packaging passes materially shifted the remain
   - `temporal-interceptor-pressure` now has a passing replay/restart drill in `target/alpha-drills/temporal-interceptor-pressure/interceptor-pressure-drill-report.json`
   - `temporal-sinks-pressure` now has a passing replay/restart drill in `target/alpha-drills/temporal-sinks-pressure/sinks-pressure-drill-report.json`
   - `temporal-converter-trust-pressure` now has a passing replay/restart drill in `target/alpha-drills/temporal-converter-trust-pressure/converter-pressure-drill-report.json`
+  - `temporal-async-external-pressure` now has a passing replay/restart drill in `target/alpha-drills/temporal-async-external-pressure/async-external-pressure-drill-report.json`
   - `temporal-monorepo-multiworker-pressure` now has a passing replay/restart drill in `target/alpha-drills/temporal-monorepo-multiworker-pressure/monorepo-multiworker-pressure-drill-report.json`
   - `temporal-versioning-upgrade-pressure` now also has a passing mixed-build/restart/rollback drill in `target/alpha-drills/temporal-versioning-upgrade-pressure/versioning-pressure-mixed-build-drill-report.json`
 - The remaining explicit unsupported-import census is now dominated by:
@@ -71,6 +72,8 @@ This means broad import coverage is no longer the main hard-blocker class. The n
 - trust-bounded caveat cleanup around the adapter-backed converter/interceptor/sink slice
 - keeping the accepted sequential helper-join model explicit while avoiding accidental claims of helper-level parallel equivalence
 - scaling the now-proven trust drill from one non-sample repo to a larger real-repo set
+- interceptor and sink bridges are now published as `supported_failover_validated` adapter slices in the derived trust summary, so the remaining work there is scope discipline rather than missing restart/failover evidence
+- async handlers and external workflow handles are now also backed by a passing restart/replay pressure drill, so they no longer rely on replay-only evidence
 
 ## Priority Order
 

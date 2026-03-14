@@ -3,7 +3,7 @@
   "milestone_scope": "temporal_ts_subset_trust",
   "title": "Temporal TS subset trust",
   "goal": "Freeze and validate the Temporal TypeScript subset Fabrik can trust under replay, failover, and upgrade conditions.",
-  "generated_at": "2026-03-14T13:41:56.176Z",
+  "generated_at": "2026-03-14T14:35:26.391Z",
   "status": "passing",
   "trusted_confidence_floor": "supported_failover_validated",
   "upgrade_confidence_floor": "supported_upgrade_validated",
@@ -34,8 +34,8 @@
       "layer_id": "layer_c_trust",
       "title": "Layer C: trust and failure fixtures",
       "purpose": "Restart, failover, replay, upgrade, and routing trust checks for the frozen Temporal TS subset.",
-      "case_count": 18,
-      "passed_count": 18,
+      "case_count": 21,
+      "passed_count": 21,
       "failed_count": 0,
       "report_path": "target/conformance-reports/layer-c-trust.json",
       "public_report_path": "/conformance-reports/layer-c-trust.json",
@@ -45,26 +45,20 @@
   "confidence_bands": [
     {
       "confidence_class": "supported_failover_validated",
-      "count": 10,
+      "count": 12,
       "features": [
         "Activity options and retries",
+        "Async handlers",
         "Cancellation scopes",
         "Child workflows",
         "Conditions and timer waits",
         "Continue-as-new",
+        "External workflow handles",
         "Interceptors and middleware",
         "Proxy activities",
         "Search attributes and memo",
         "Signals, queries, and updates",
         "Sinks"
-      ]
-    },
-    {
-      "confidence_class": "supported_replay_validated",
-      "count": 2,
-      "features": [
-        "Async handlers",
-        "External workflow handles"
       ]
     },
     {
@@ -93,10 +87,12 @@
   ],
   "headline_trusted_features": [
     "Activity options and retries",
+    "Async handlers",
     "Cancellation scopes",
     "Child workflows",
     "Conditions and timer waits",
     "Continue-as-new",
+    "External workflow handles",
     "Interceptors and middleware",
     "Payload and data converter usage",
     "Proxy activities",
@@ -119,6 +115,20 @@
     "operator evidence surfaces can explain the feature and its failure modes"
   ],
   "confidence_deltas": [
+    {
+      "feature": "async_handlers",
+      "label": "Async handlers",
+      "declared_confidence_class": "supported_replay_validated",
+      "derived_confidence_class": "supported_failover_validated",
+      "confidence_status": "evidence_promoted"
+    },
+    {
+      "feature": "external_workflow_handles",
+      "label": "External workflow handles",
+      "declared_confidence_class": "supported_replay_validated",
+      "derived_confidence_class": "supported_failover_validated",
+      "confidence_status": "evidence_promoted"
+    },
     {
       "feature": "interceptors_middleware",
       "label": "Interceptors and middleware",
@@ -215,19 +225,19 @@
       "label": "Async handlers",
       "milestone_status": "supported",
       "support_level": "native",
-      "confidence_class": "supported_replay_validated",
+      "confidence_class": "supported_failover_validated",
       "replay_validation": true,
       "deploy_validation": true,
       "support_fixtures": true,
       "semantic_fixtures": true,
-      "trust_fixtures": false,
+      "trust_fixtures": true,
       "upgrade_fixtures": false,
       "semantic_caveats": [
         "async handlers must stay within the supported control-flow subset"
       ],
       "blocking_severity": "warning",
       "declared_confidence_class": "supported_replay_validated",
-      "confidence_status": "declared_confirmed",
+      "confidence_status": "evidence_promoted",
       "evidence": {
         "support_layer_status": "passing",
         "semantic_layer_status": "passing",
@@ -290,19 +300,19 @@
       "label": "External workflow handles",
       "milestone_status": "supported",
       "support_level": "native",
-      "confidence_class": "supported_replay_validated",
+      "confidence_class": "supported_failover_validated",
       "replay_validation": true,
-      "deploy_validation": false,
+      "deploy_validation": true,
       "support_fixtures": true,
       "semantic_fixtures": true,
-      "trust_fixtures": false,
+      "trust_fixtures": true,
       "upgrade_fixtures": false,
       "semantic_caveats": [
         "external-handle support is limited to the currently compiled subset"
       ],
       "blocking_severity": "warning",
       "declared_confidence_class": "supported_replay_validated",
-      "confidence_status": "declared_confirmed",
+      "confidence_status": "evidence_promoted",
       "evidence": {
         "support_layer_status": "passing",
         "semantic_layer_status": "passing",

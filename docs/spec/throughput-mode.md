@@ -6,6 +6,12 @@ Throughput mode is an explicit workflow primitive for high-cardinality fan-out /
 
 Eager execution is an execution policy inside throughput mode, not a separate workflow model and not a change to the default workflow runtime.
 
+Architecturally, throughput mode now sits across three internal layers:
+
+- `Fabrik Workflows` owns workflow-authoritative batch admission and barrier semantics
+- the bridge owns admission idempotency, fencing, and callback translation
+- the stream-backed execution lane owns nonterminal high-volume execution and projection state
+
 For the product-level streaming narrative and operator workflow around this primitive, see [../streaming-product-guide.md](../streaming-product-guide.md). For benchmark-backed workload-shape guidance, see [../benchmarking/streaming-performance-envelope.md](../benchmarking/streaming-performance-envelope.md).
 
 ## Summary
@@ -47,6 +53,7 @@ const result = await batch.result();
 - `taskQueue`, `chunkSize`, `execution`, `retry`, and `reducer` must be static literal options in the compiled artifact.
 - `chunkSize` defaults to `256` when omitted.
 - backend selection is server-controlled and does not appear in workflow code.
+- throughput mode is intentionally distinct from future stream-job primitives such as `startStreamJob(...)`.
 
 ### Result Shape
 
@@ -93,7 +100,7 @@ Initial reducers are built-in and deterministic:
 - `histogram`
 - `sample_errors`
 
-`all_succeeded`, `all_settled`, `count`, `sum`, `min`, `max`, `avg`, and `histogram` are mergeable reducers used by the optimized `stream-v2` path. `sample_errors` is also supported, but retry-heavy cases are more sensitive to workload shape and benchmark design. `collect_results` remains supported, but stays on the legacy result-materialization path rather than the optimized mergeable reduction path.
+`all_succeeded`, `all_settled`, `count`, `sum`, `min`, `max`, `avg`, and `histogram` are mergeable reducers used by the optimized stream-backed lane. `sample_errors` is also supported, but retry-heavy cases are more sensitive to workload shape and benchmark design. `collect_results` remains supported, but stays on the legacy result-materialization path rather than the optimized mergeable reduction path.
 
 User-defined reducers are out of scope until they can be compiled, version-pinned, and replay-safe.
 
@@ -127,6 +134,25 @@ Hard rule:
 
 - `peek()` is non-durable, non-replayed, and non-authoritative
 - `peek()` must never influence workflow state transitions
+
+## Workflow Truth vs Stream Truth
+
+Workflow-authoritative:
+
+- durable batch admission in workflow history
+- terminal batch outcomes accepted into workflow history
+- explicit workflow-visible cancellation acceptance
+- any future named checkpoint that is explicitly awaited through a dedicated stream-job primitive
+
+Projection-only or stream-owned:
+
+- per-chunk completion counts before the terminal barrier
+- queue or partition lag
+- reducer convergence before the barrier
+- owner-local intermediate state
+- operator progress dashboards and cheap status reads
+
+The bridge is the only legal crossing point between those domains.
 
 ## Semantics
 
@@ -212,33 +238,47 @@ Bad fits:
 - late reports from previously leased chunks are ignored by fencing once cancellation clears active leases
 - exactly one terminal batch cancellation outcome is emitted into workflow history
 
-## Backend
+## Bridge and Execution Lane
 
-Throughput mode uses a single backend implementation behind a stable internal interface. Backend selection remains server-controlled per batch and pinned for the lifetime of that batch, but new bulk work is admitted only to `stream-v2`.
+Throughput mode uses a stable bridge contract above the underlying execution lane. Backend selection remains server-controlled per batch and pinned for the lifetime of that batch.
 
-### Backend Interface
+See [streams-bridge.md](streams-bridge.md) for the authoritative protocol contract.
 
-The backend implements these operations:
+### Bridge Responsibilities
+
+The bridge is responsible for:
+
+- accepting workflow-side batch admission
+- assigning or recovering the execution-lane handle idempotently
+- fencing stale workflow owners and stale stream callbacks
+- translating exactly one terminal lane outcome into the workflow barrier event
+- preserving stable identifiers across retries, replays, and failover
+
+### Stable Interface
+
+The bridge and execution lane preserve these stable operations:
 
 | Operation | Description |
 |---|---|
-| `create_batch` | Persist batch metadata and chunk manifest |
+| `submit_bulk_run` | Idempotently admit batch metadata and runtime payload into the execution lane |
 | `poll_chunks` | Lease scheduled chunks by task queue and build compatibility |
 | `report_chunk_terminal` | Apply chunk completion, failure, or cancellation |
-| `cancel_batch` | Stop leasing new chunks and terminate the batch |
+| `cancel_bulk_run` | Stop leasing new chunks and drive one terminal cancellation outcome |
 | `get_batch_summary` | Read batch metadata and counters |
 | `get_batch_results` | Paginated chunk outputs in chunk order |
+| `accept_terminal_callback` | Translate one fenced terminal lane outcome into the workflow barrier event |
 
-The backend preserves these stable identifiers:
+The bridge and execution lane preserve these stable identifiers:
 
 - `batch_id`, `chunk_id`, `attempt`, `group_id`
+- `bridge_request_id`
 - `lease_epoch`, `owner_epoch`, `report_id`
 - `input_handle`, `result_handle`
 - `throughput_backend`, `throughput_backend_version`
 
-### `stream-v2` — Streaming Backend
+### Current Stream-Backed Implementation
 
-The streaming backend is the active execution path for throughput mode. It removes Postgres from the throughput hot path and is suitable for batches with millions of items or sustained high completion rates.
+The current stream-backed implementation is `stream-v2`. It removes Postgres from the throughput hot path and is suitable for batches with millions of items or sustained high completion rates.
 
 Infrastructure requirements:
 
@@ -250,13 +290,13 @@ Infrastructure requirements:
 
 Behavior:
 
-- authoritative state lives in the throughput shard runtime, not Postgres
+- authoritative nonterminal execution state lives in the throughput shard runtime, not Postgres
 - dedicated `throughput-runtime` owns throughput shards independently of workflow executors
-- `unified-runtime` admits the run and later resumes the workflow, but it does not own nonterminal chunk lifecycle
+- the bridge admits the run and later resumes the workflow, but workflow executors do not own nonterminal chunk lifecycle
 - dedicated `throughput-projector` consumes projection events and updates Postgres asynchronously
 - workers use a dedicated throughput worker RPC served by the throughput owner
 - local owner state persists counters, retry scheduling fields, lease deadlines, and group/barrier state
-- terminal run outcomes are produced by `throughput-runtime` and turned into authoritative workflow events by `unified-runtime`
+- terminal run outcomes are produced by `throughput-runtime` and turned into authoritative workflow events only through the bridge
 - chunk inputs and outputs may be externalized behind payload handles
 - query results are eventually consistent unless routed to the active throughput owner
 
@@ -264,7 +304,7 @@ Log roles:
 
 | Log | Contents | Purpose |
 |---|---|---|
-| Command | `StartThroughputRun`, `CancelThroughputRun`, `TimeoutThroughputRun` | Admission and control intent from `unified-runtime` |
+| Command | `StartThroughputRun`, `CancelThroughputRun`, `TimeoutThroughputRun` | Admission and control intent from workflow-side bridge logic |
 | Report | `ChunkCompleted`, `ChunkFailed`, `ChunkCancelled` | Raw worker observations |
 | Owner changelog | `RunStarted`, `ChunkLeased`, `ChunkRequeued`, `ChunkApplied`, `GroupTerminal`, `RunTerminal` | Checkpoint and audit for the throughput owner |
 
@@ -278,6 +318,12 @@ Tradeoffs:
 - requires additional infrastructure
 - batch/chunk visibility is eventually consistent by default
 - operationally more complex
+
+## Future Boundary
+
+Throughput mode remains the bounded bulk primitive inside workflow semantics.
+
+If `Fabrik` later exposes dedicated stream-job workflow primitives, they should be specified separately and should not change the `ctx.bulkActivity()` contract or the barrier-only workflow semantics defined here.
 
 Admission control:
 

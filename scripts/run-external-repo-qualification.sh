@@ -57,9 +57,9 @@ for repo in "${REPOS[@]}"; do
   mkdir -p "$output_dir"
   set +e
   if [[ "$DEPLOY" == "on" ]]; then
-    cargo run -q -p fabrik-cli -- migrate temporal "$repo" --output-dir "$output_dir" --deploy
+    cargo run -q -p fabrik-cli --bin fabrik -- migrate temporal "$repo" --output-dir "$output_dir" --deploy
   else
-    cargo run -q -p fabrik-cli -- migrate temporal "$repo" --output-dir "$output_dir"
+    cargo run -q -p fabrik-cli --bin fabrik -- migrate temporal "$repo" --output-dir "$output_dir"
   fi
   status=$?
   set -e

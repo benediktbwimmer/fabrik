@@ -17,6 +17,8 @@ STATE_DIR="$STATE_ROOT/state"
 CHECKPOINT_DIR="$STATE_ROOT/checkpoints"
 ENV_FILE="$STATE_ROOT/environment.sh"
 LOCK_DIR="$STATE_ROOT/lock"
+LOCK_PID_FILE="$LOCK_DIR/pid"
+LOCK_COMMAND_FILE="$LOCK_DIR/command"
 
 PROFILE="${DEV_STACK_PROFILE:-debug}"
 if [[ "$PROFILE" == "release" ]]; then
@@ -100,16 +102,43 @@ require_bin() {
 acquire_lock() {
   local waited=0
   while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    local owner_pid=""
+    if [[ -f "$LOCK_PID_FILE" ]]; then
+      owner_pid="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
+    fi
+    if [[ -n "$owner_pid" ]] && ! kill -0 "$owner_pid" >/dev/null 2>&1; then
+      echo "[dev-stack] removing stale lock from pid $owner_pid" >&2
+      rm -f "$LOCK_PID_FILE" "$LOCK_COMMAND_FILE"
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      continue
+    fi
+    if [[ -z "$owner_pid" ]]; then
+      echo "[dev-stack] removing stale lock with no owner pid" >&2
+      rm -f "$LOCK_COMMAND_FILE"
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      continue
+    fi
     if (( waited == 0 )); then
-      echo "[dev-stack] waiting for existing dev-stack command to finish" >&2
+      local owner_command=""
+      if [[ -f "$LOCK_COMMAND_FILE" ]]; then
+        owner_command="$(cat "$LOCK_COMMAND_FILE" 2>/dev/null || true)"
+      fi
+      if [[ -n "$owner_command" ]]; then
+        echo "[dev-stack] waiting for existing dev-stack command to finish (pid $owner_pid: $owner_command)" >&2
+      else
+        echo "[dev-stack] waiting for existing dev-stack command to finish (pid $owner_pid)" >&2
+      fi
     fi
     waited=1
     sleep 1
   done
+  printf '%s\n' "$$" > "$LOCK_PID_FILE"
+  printf '%s\n' "$COMMAND" > "$LOCK_COMMAND_FILE"
   trap release_lock EXIT
 }
 
 release_lock() {
+  rm -f "$LOCK_PID_FILE" "$LOCK_COMMAND_FILE"
   rmdir "$LOCK_DIR" 2>/dev/null || true
 }
 
@@ -139,6 +168,26 @@ while time.time() < deadline:
 
 print(f"timed out waiting for {label} on {host}:{port}", file=sys.stderr)
 sys.exit(1)
+PY
+}
+
+probe_port() {
+  local host=$1
+  local port=$2
+  python3 - "$host" "$port" <<'PY'
+import socket
+import sys
+
+host, port = sys.argv[1], int(sys.argv[2])
+sock = socket.socket()
+sock.settimeout(0.2)
+try:
+    sock.connect((host, port))
+except OSError:
+    sys.exit(1)
+finally:
+    sock.close()
+sys.exit(0)
 PY
 }
 
@@ -365,6 +414,15 @@ start_service() {
   local log_file=$2
   local wait_port=${3:-}
   shift 3
+  if service_running "$name"; then
+    if [[ -n "$wait_port" ]] && ! probe_port 127.0.0.1 "$wait_port"; then
+      echo "[dev-stack] $name pid is live but port $wait_port is down; restarting"
+      stop_service "$name"
+    else
+      echo "[dev-stack] $name already running"
+      return 0
+    fi
+  fi
   if service_running "$name"; then
     echo "[dev-stack] $name already running"
     return 0

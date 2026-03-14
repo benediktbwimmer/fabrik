@@ -3713,6 +3713,8 @@ mod tests {
             throughput_command_publisher,
             store,
             runtime_id: runtime_id.to_owned(),
+            activity_capability_registry: ActivityCapabilityRegistry::default(),
+            durable_start_analysis_mode: DurableStartAnalysisMode::Off,
             tiny_start_sender,
         })
     }

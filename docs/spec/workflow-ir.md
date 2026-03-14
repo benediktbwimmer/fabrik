@@ -41,8 +41,8 @@ Phase-1 node types must cover:
 - `WaitTimer`
 - `ScheduleActivity`
 - `AwaitActivity`
-- `StartBulkActivity` — throughput mode batch creation with execution-policy metadata
-- `WaitForBulkActivity` — throughput mode batch barrier
+- `StartBulkActivity` — throughput mode batch admission with bridge-managed execution metadata
+- `WaitForBulkActivity` — throughput mode batch barrier satisfied only by a bridge-delivered terminal outcome
 - `StartChildWorkflow`
 - `AwaitChildWorkflow`
 - `InvokePredicate`
@@ -89,6 +89,7 @@ For throughput mode, bulk-call metadata must be representable in the artifact an
 
 - execution policy
 - reducer identity
+- bridge request identity
 - handle and barrier metadata needed to await the terminal batch outcome
 
 ## Determinism Rule
@@ -105,3 +106,17 @@ Non-deterministic values may enter workflow execution only through:
 ## Design Constraint
 
 The IR must not be defined so narrowly that it prevents feature parity with Temporal workflow semantics.
+
+## Planned Extension Boundary
+
+Dedicated stream-job workflow semantics are intentionally outside the current phase-1 IR.
+
+If `startStreamJob`-style primitives are added later, they should land as distinct node types such as:
+
+- `StartStreamJob`
+- `WaitForStreamCheckpoint`
+- `QueryStreamJob`
+- `CancelStreamJob`
+- `AwaitStreamJobTerminal`
+
+They must not be smuggled into the bulk-activity nodes in a way that weakens the current throughput-mode contract.

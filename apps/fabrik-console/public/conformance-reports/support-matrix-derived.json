@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "milestone_scope": "temporal_ts_subset_trust",
-  "generated_at": "2026-03-14T13:41:56.175Z",
+  "generated_at": "2026-03-14T14:35:26.390Z",
   "reports": [
     {
       "layer_id": "layer_a_support",
@@ -18,7 +18,7 @@
     {
       "layer_id": "layer_c_trust",
       "status": "passing",
-      "case_count": 18,
+      "case_count": 21,
       "failed_count": 0
     }
   ],
@@ -103,19 +103,19 @@
       "label": "Async handlers",
       "milestone_status": "supported",
       "support_level": "native",
-      "confidence_class": "supported_replay_validated",
+      "confidence_class": "supported_failover_validated",
       "replay_validation": true,
       "deploy_validation": true,
       "support_fixtures": true,
       "semantic_fixtures": true,
-      "trust_fixtures": false,
+      "trust_fixtures": true,
       "upgrade_fixtures": false,
       "semantic_caveats": [
         "async handlers must stay within the supported control-flow subset"
       ],
       "blocking_severity": "warning",
       "declared_confidence_class": "supported_replay_validated",
-      "confidence_status": "declared_confirmed",
+      "confidence_status": "evidence_promoted",
       "evidence": {
         "support_layer_status": "passing",
         "semantic_layer_status": "passing",
@@ -178,19 +178,19 @@
       "label": "External workflow handles",
       "milestone_status": "supported",
       "support_level": "native",
-      "confidence_class": "supported_replay_validated",
+      "confidence_class": "supported_failover_validated",
       "replay_validation": true,
-      "deploy_validation": false,
+      "deploy_validation": true,
       "support_fixtures": true,
       "semantic_fixtures": true,
-      "trust_fixtures": false,
+      "trust_fixtures": true,
       "upgrade_fixtures": false,
       "semantic_caveats": [
         "external-handle support is limited to the currently compiled subset"
       ],
       "blocking_severity": "warning",
       "declared_confidence_class": "supported_replay_validated",
-      "confidence_status": "declared_confirmed",
+      "confidence_status": "evidence_promoted",
       "evidence": {
         "support_layer_status": "passing",
         "semantic_layer_status": "passing",
@@ -448,6 +448,20 @@
     }
   ],
   "confidence_deltas": [
+    {
+      "feature": "async_handlers",
+      "label": "Async handlers",
+      "declared_confidence_class": "supported_replay_validated",
+      "derived_confidence_class": "supported_failover_validated",
+      "confidence_status": "evidence_promoted"
+    },
+    {
+      "feature": "external_workflow_handles",
+      "label": "External workflow handles",
+      "declared_confidence_class": "supported_replay_validated",
+      "derived_confidence_class": "supported_failover_validated",
+      "confidence_status": "evidence_promoted"
+    },
     {
       "feature": "interceptors_middleware",
       "label": "Interceptors and middleware",

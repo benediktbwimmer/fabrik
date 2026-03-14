@@ -44,6 +44,43 @@ pub const TINY_WORKFLOW_MAX_ITEMS: usize = 32;
 const REDUCTION_GROUP_LEVEL_SHIFT: u32 = 24;
 const REDUCTION_GROUP_SLOT_MASK: u32 = (1 << REDUCTION_GROUP_LEVEL_SHIFT) - 1;
 
+pub fn throughput_bridge_request_id(
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    batch_id: &str,
+) -> String {
+    format!("throughput-bridge:{tenant_id}:{instance_id}:{run_id}:{batch_id}")
+}
+
+pub fn throughput_start_dedupe_key(source_event_id: Uuid, batch_id: &str) -> String {
+    format!("throughput-start:{source_event_id}:{batch_id}")
+}
+
+pub fn throughput_start_command_id(source_event_id: Uuid, batch_id: &str) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("unified-throughput-start:{source_event_id}:{batch_id}").as_bytes(),
+    )
+}
+
+pub fn throughput_terminal_callback_dedupe_key(
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    batch_id: &str,
+    status: &str,
+) -> String {
+    format!("throughput-terminal:{tenant_id}:{instance_id}:{run_id}:{batch_id}:{status}")
+}
+
+pub fn throughput_terminal_callback_event_id(dedupe_key: &str) -> Uuid {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!("throughput-terminal-event:{dedupe_key}").as_bytes(),
+    )
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowAdmissionMode {
@@ -1151,6 +1188,8 @@ pub struct TinyWorkflowStartBatchCommand {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StartThroughputRunCommand {
     pub dedupe_key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub bridge_request_id: String,
     pub tenant_id: String,
     pub definition_id: String,
     pub definition_version: Option<u32>,
@@ -1176,6 +1215,21 @@ pub struct StartThroughputRunCommand {
     pub admission_policy_version: String,
     pub input_handle: PayloadHandle,
     pub result_handle: PayloadHandle,
+}
+
+impl StartThroughputRunCommand {
+    pub fn resolved_bridge_request_id(&self) -> String {
+        if self.bridge_request_id.is_empty() {
+            throughput_bridge_request_id(
+                &self.tenant_id,
+                &self.instance_id,
+                &self.run_id,
+                &self.batch_id,
+            )
+        } else {
+            self.bridge_request_id.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1213,6 +1267,12 @@ impl CreateBatchCommand {
     pub fn to_start_throughput_run(&self) -> StartThroughputRunCommand {
         StartThroughputRunCommand {
             dedupe_key: self.dedupe_key.clone(),
+            bridge_request_id: throughput_bridge_request_id(
+                &self.tenant_id,
+                &self.instance_id,
+                &self.run_id,
+                &self.batch_id,
+            ),
             tenant_id: self.tenant_id.clone(),
             definition_id: self.definition_id.clone(),
             definition_version: Some(self.definition_version),
@@ -1948,6 +2008,12 @@ mod tests {
             partition_key: "batch-a:0".to_owned(),
             payload: ThroughputCommand::StartThroughputRun(StartThroughputRunCommand {
                 dedupe_key: "throughput-start:test".to_owned(),
+                bridge_request_id: throughput_bridge_request_id(
+                    "tenant-a",
+                    "instance-a",
+                    "run-a",
+                    "batch-a",
+                ),
                 tenant_id: "tenant-a".to_owned(),
                 definition_id: "demo".to_owned(),
                 definition_version: Some(7),
@@ -2021,7 +2087,37 @@ mod tests {
         assert_eq!(native.definition_version, Some(3));
         assert_eq!(native.artifact_hash.as_deref(), Some("artifact-a"));
         assert_eq!(native.total_items, 10);
+        assert_eq!(
+            native.bridge_request_id,
+            throughput_bridge_request_id("tenant-a", "instance-a", "run-a", "batch-a")
+        );
         assert_eq!(native.input_handle, legacy.input_handle);
+    }
+
+    #[test]
+    fn bridge_request_and_terminal_dedupe_helpers_are_stable() {
+        let bridge_request_id =
+            throughput_bridge_request_id("tenant-a", "instance-a", "run-a", "batch-a");
+        assert_eq!(
+            bridge_request_id,
+            "throughput-bridge:tenant-a:instance-a:run-a:batch-a"
+        );
+
+        let callback_dedupe = throughput_terminal_callback_dedupe_key(
+            "tenant-a",
+            "instance-a",
+            "run-a",
+            "batch-a",
+            "completed",
+        );
+        assert_eq!(
+            callback_dedupe,
+            "throughput-terminal:tenant-a:instance-a:run-a:batch-a:completed"
+        );
+        assert_eq!(
+            throughput_terminal_callback_event_id(&callback_dedupe),
+            throughput_terminal_callback_event_id(&callback_dedupe)
+        );
     }
 
     #[test]

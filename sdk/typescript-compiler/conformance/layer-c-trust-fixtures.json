@@ -237,6 +237,16 @@
       "expect": {
         "output_matches": ["\\[sinks-pressure-drill\\] completed", "sinks-pressure-drill-report\\.md"]
       }
+    },
+    {
+      "id": "async-external-pressure-drill",
+      "title": "Async handlers and external workflow handles survive deploy, restart, and replay",
+      "kind": "command",
+      "command": "bash",
+      "args": ["scripts/run-async-external-pressure-drill.sh"],
+      "expect": {
+        "output_matches": ["\\[async-external-pressure-drill\\] completed", "async-external-pressure-drill-report\\.md"]
+      }
     }
   ]
 }

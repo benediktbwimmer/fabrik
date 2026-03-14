@@ -35,6 +35,14 @@ The runtime model is intentionally not identical to Temporal's internals:
 - durable history is authoritative
 - snapshots and caches are optimization only
 
+For throughput-heavy bulk work, the internal architecture is split into three layers:
+
+- `Fabrik Workflows` owns workflow-authoritative history, replay, and workflow-visible barriers
+- the bridge owns throughput admission, idempotency, fencing, and callback translation
+- a stream-backed execution lane owns nonterminal high-volume execution state and progress
+
+This split is architectural first. The current external product story remains workflow-centric.
+
 ## Optimization Target
 
 `fabrik` is optimized for:
@@ -55,9 +63,15 @@ The following are explicit non-goals:
 - using snapshots or projections as a second source of truth
 - sacrificing replay correctness for benchmark-only wins
 - making the broker or connector layer the primary product abstraction
+- leaking backend selection into workflow code for throughput mode
+- conflating workflow-authoritative state with stream-side projections or lag views
 
 ## Consequence
 
 All lower-level docs, services, SDKs, and benchmarks should be evaluated against one question first:
 
 Does this move `fabrik` closer to a faster, more scalable Temporal-compatible durable execution platform?
+
+For throughput-specific changes, the follow-up question is:
+
+Does this preserve a clean `Workflows -> Bridge -> Streams` split without weakening workflow-authoritative semantics?

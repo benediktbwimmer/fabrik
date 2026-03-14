@@ -136,16 +136,17 @@ Exit criteria:
 - task queue throughput scales horizontally
 - failover preserves correctness under load
 
-## Phase 6.5: Throughput Mode
+## Phase 6.5: Throughput Mode and Bridge Extraction
 
-Goal: enable high-cardinality bulk workloads with chunk-level durability.
+Goal: enable high-cardinality bulk workloads with chunk-level durability while making the `Workflows -> Bridge -> Streams` split explicit.
 
 Deliverables:
 
 - `ctx.bulkActivity()` workflow primitive
 - `start_bulk_activity` and `wait_for_bulk_activity` IR nodes
 - batch-level workflow history events
-- `stream-v2` streaming backend with dedicated throughput-runtime service
+- bridge protocol for throughput admission, fencing, idempotency, and callback translation
+- stream-backed execution lane with dedicated throughput-runtime service
 - chunk-level retry and coarse cancellation
 - batch/chunk visibility query endpoints
 - dedicated bulk worker gRPC protocol
@@ -154,8 +155,29 @@ Deliverables:
 Exit criteria:
 
 - throughput mode outperforms durable mode by at least 5x on fan-out benchmarks
-- `stream-v2` handles batches with millions of items
+- the stream-backed lane handles batches with millions of items
 - mixed durable and bulk steps work correctly in one workflow
+- workflow code does not select or name the throughput backend
+
+## Phase 6.75: Stream Subsystem Productization
+
+Goal: turn the internal stream-backed lane into a clean standalone subsystem without destabilizing the workflow product story.
+
+Deliverables:
+
+- formal `Fabrik Workflows -> Bridge -> Streams` ownership split across docs and services
+- authoritative bridge protocol for callbacks, closed-run handling, cancellation races, and checkpoint semantics
+- current `stream-v2` lane treated as the first implementation of the internal stream subsystem
+- operator surfaces that clearly distinguish workflow-authoritative outcomes from projected stream progress
+- reserved SDK and IR design for future stream-job primitives without shipping them prematurely
+
+Exit criteria:
+
+- throughput internals can evolve independently of the workflow runtime
+- docs no longer describe `stream-v2` as a workflow-internal product surface
+- stream semantics can expand later without changing the `ctx.bulkActivity()` contract
+
+Implementation sequencing for this phase is captured in [streams-transition-plan.md](streams-transition-plan.md).
 
 ## Phase 7: Hosted Platform Hardening
 
@@ -182,11 +204,12 @@ Exit criteria:
 - SDK ergonomics
 - operator experience
 - documentation
-- throughput mode backend evolution (v2.1 groups, v2.2 manifests, v2.3 warm failover)
+- throughput lane evolution (v2.1 groups, v2.2 manifests, v2.3 warm failover)
 
 ## Recommended Immediate Next Steps
 
 1. Define workflow task and activity task queue semantics.
 2. Define the arbitrary activity worker protocol.
 3. Expand the workflow IR to cover child workflows, updates, joins, and version markers.
-4. Design worker versioning and visibility before the first broad SDK rollout.
+4. Freeze the bridge protocol before broadening stream-backed semantics.
+5. Execute the first bridge slice from [streams-transition-plan.md](streams-transition-plan.md).

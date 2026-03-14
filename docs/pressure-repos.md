@@ -6,6 +6,9 @@ They exist to exercise the remaining trust and packaging surfaces once the offic
 
 ## Current Set
 
+- `crates/fabrik-cli/test-fixtures/temporal-async-external-pressure`
+  - purpose: external workflow handle signal/cancel plus async signal-handler state across restart and replay
+  - passing drill bundle: `target/alpha-drills/temporal-async-external-pressure/async-external-pressure-drill-report.json`
 - `crates/fabrik-cli/test-fixtures/temporal-interceptor-pressure`
   - purpose: static `interceptors.workflowModules` bridge with a real worker bootstrap, workflow-owned query state, and activity-backed publish path
   - passing drill bundle: `target/alpha-drills/temporal-interceptor-pressure/interceptor-pressure-drill-report.json`

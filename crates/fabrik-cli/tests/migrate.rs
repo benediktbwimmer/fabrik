@@ -453,6 +453,26 @@ fn monorepo_multiworker_packages_do_not_collide_on_shared_worker_filenames() {
 }
 
 #[test]
+fn async_external_pressure_fixture_qualifies_and_packages_both_workflows() {
+    let output_dir = temp_output_dir("async-external-pressure");
+    let (status, report) =
+        run_cli(&fixture("temporal-async-external-pressure"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    let compiled_workflows = report["compiled_workflows"].as_array().expect("compiled workflows");
+    assert_eq!(compiled_workflows.len(), 2);
+    let definition_ids = compiled_workflows
+        .iter()
+        .map(|workflow| workflow["definition_id"].as_str().expect("definition id"))
+        .collect::<Vec<_>>();
+    assert!(definition_ids.iter().any(|id| id.contains("asyncsignaltargetworkflow")));
+    assert!(definition_ids.iter().any(|id| id.contains("externalcontrollerworkflow")));
+    assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
+    assert_eq!(report["worker_packages"][0]["task_queue"], "async-external-pressure");
+}
+
+#[test]
 fn dynamic_worker_bootstrap_blocks_migration() {
     let output_dir = temp_output_dir("dynamic-bootstrap");
     let (status, report) =

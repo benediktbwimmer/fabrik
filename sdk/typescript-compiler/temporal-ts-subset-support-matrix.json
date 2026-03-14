@@ -69,7 +69,7 @@
       "deploy_validation": true,
       "support_fixtures": true,
       "semantic_fixtures": true,
-      "trust_fixtures": false,
+      "trust_fixtures": true,
       "upgrade_fixtures": false,
       "semantic_caveats": ["async handlers must stay within the supported control-flow subset"],
       "blocking_severity": "warning"
@@ -111,10 +111,10 @@
       "support_level": "native",
       "confidence_class": "supported_replay_validated",
       "replay_validation": true,
-      "deploy_validation": false,
+      "deploy_validation": true,
       "support_fixtures": true,
       "semantic_fixtures": true,
-      "trust_fixtures": false,
+      "trust_fixtures": true,
       "upgrade_fixtures": false,
       "semantic_caveats": ["external-handle support is limited to the currently compiled subset"],
       "blocking_severity": "warning"

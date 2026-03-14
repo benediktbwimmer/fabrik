@@ -17,6 +17,7 @@ Current compatibility snapshot:
 
 2. Interceptor bridge semantics
 - Current support allows static `interceptors.workflowModules` packaging and restart/replay-safe workflow execution when the workflow-visible state stays in the compiled workflow.
+- This slice is now published as `supported_failover_validated` in the derived trust summary.
 - Helper-side interceptor scaffolding and full Temporal interceptor runtime behavior remain caveated.
 - Next trust task:
   - keep the supported bridge scoped to static workflow-module presence plus workflow-visible state/query semantics owned by the compiled workflow
@@ -24,7 +25,8 @@ Current compatibility snapshot:
 
 3. Sink bridge semantics
 - Current support accepts `proxySinks()` declarations and fire-and-forget sink calls through a caveated bridge.
-- The supported bridge is now replay/restart validated when sink calls are workflow-invisible no-ops.
+- This slice is now published as `supported_failover_validated` in the derived trust summary.
+- The supported bridge is replay/restart validated when sink calls are workflow-invisible no-ops.
 - Next trust task:
   - document the non-goals clearly
   - keep sink trust scoped to workflow-visible semantics, not side-effect delivery guarantees
@@ -33,6 +35,12 @@ Current compatibility snapshot:
 - Current support is broad enough for the official samples, and the adapter slice now has a restart/replay drill around static factory-based converter packaging, pre-normalize query state, restart preservation, and normalized activity output.
 - Remaining non-goal:
   - keep full transport parity out of scope unless a real repo forces it
+
+5. Async handlers and external workflow handles
+- Current support is now trust-backed for the accepted subset: async signal/update handlers within the supported control-flow slice, plus external workflow handle signal/cancel against concrete workflow/run ids.
+- This slice is now published as `supported_failover_validated` in the derived trust summary.
+- Remaining non-goal:
+  - do not claim broader external-handle parity outside the currently compiled subset
 
 ## Real Repo Qualification
 
@@ -72,6 +80,10 @@ When external repos are scarce, use the internal pressure-repo set for engineeri
   - current drill status: `passed`
   - replay divergence counts: post-restart `0`, post-complete `0`
   - pre-normalize query state now preserves copied `id/tags` fields before and after restart
+- `temporal-async-external-pressure` now has a passing internal replay/restart drill for async handler state and external workflow handle control in:
+  - `target/alpha-drills/temporal-async-external-pressure/async-external-pressure-drill-report.json`
+  - current drill status: `passed`
+  - replay divergence counts: target/controller post-restart `0 / 0`, post-complete `0 / 0`
 - `temporal-monorepo-multiworker-pressure` now has a passing internal replay/restart drill for the multi-worker monorepo packaging and restore path in:
   - `target/alpha-drills/temporal-monorepo-multiworker-pressure/monorepo-multiworker-pressure-drill-report.json`
   - current drill status: `passed`

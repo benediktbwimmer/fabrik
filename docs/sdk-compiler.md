@@ -65,6 +65,8 @@ Required workflow primitives include:
 - `ctx.complete(output?)`
 - `ctx.fail(reason)`
 
+Future stream-native primitives such as `ctx.startStreamJob(...)` are intentionally not part of the current workflow replacement claim. They should ship only after the bridge contract and stream semantics are explicit enough to justify a distinct workflow primitive.
+
 ## Temporal Compatibility Progress
 
 The long-term goal is source compatibility with Temporal workflow code, starting with the TypeScript SDK surface.
@@ -183,12 +185,14 @@ Likely artifact sections:
 
 For throughput mode, the compiler additionally lowers `ctx.bulkActivity()` into:
 
-- `start_bulk_activity` — creates batch and chunk manifest
-- `wait_for_bulk_activity` — blocks until batch terminal event
+- `start_bulk_activity` — records a workflow-side bulk admission that is later resolved through the bridge
+- `wait_for_bulk_activity` — blocks until the bridge delivers one terminal batch outcome
 
 Bulk activity options (`taskQueue`, `chunkSize`, `execution`, `reducer`, `retry`) must be static literals in the compiled artifact. The `items` expression is evaluated at runtime.
 
-Backend selection is server-controlled and pinned per batch. Workflow code does not select the backend, and new bulk work is admitted only to `stream-v2`.
+Backend selection is server-controlled and pinned per batch. Workflow code does not select or name the backend. The current high-throughput execution lane is the internal stream subsystem implemented by `stream-v2`.
+
+If dedicated stream-job primitives are added later, they should lower into separate IR nodes rather than overloading `start_bulk_activity` with long-lived stream semantics.
 
 The compiler must reject workflow code that breaks determinism, while activity code remains unconstrained.
 

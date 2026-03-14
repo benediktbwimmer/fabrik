@@ -15,6 +15,7 @@
 - shard-local workflow ownership and sticky execution
 - log-first durable history
 - task-queue dispatch designed for very high concurrent activity volume
+- a stream-backed throughput lane behind a strict bridge for very wide bulk work
 - visibility and replay built into the architecture from the start
 
 ## Product Thesis
@@ -53,6 +54,8 @@ The core product position is:
 - Workflow task dispatch and sticky queue support
 - Activity task queues with worker polling, heartbeats, cancellation, and retries
 - Sharded workflow executors that run compiled workflow artifacts
+- A bridge layer for throughput admission, idempotency, fencing, and callback translation
+- A stream-backed execution lane for high-cardinality throughput workloads
 - Timer and timeout infrastructure for workflows and activities
 - Visibility and indexing services for search attributes, metadata, and operational queries
 - Worker versioning and compatible routing for safe rollout
@@ -77,13 +80,22 @@ The target platform must support:
 
 ## Repository Status
 
-This repository is still in an early implementation phase. The default runtime path is now centered on `unified-runtime`, with compiled workflow execution, durable activity-task history, and external activity workers polling that unified runtime surface.
+This repository is still in an early implementation phase. The default runtime path is centered on `unified-runtime` for workflow truth, with compiled workflow execution, durable activity-task history, and external activity workers polling that unified runtime surface.
+
+Throughput mode is being clarified around a stricter internal split:
+
+- `Fabrik Workflows` owns workflow-authoritative history and replay
+- a bridge layer owns admission, idempotency, fencing, and callback translation
+- a stream-backed execution lane owns nonterminal high-volume throughput execution
+
+The current implementation of that stream-backed lane is `stream-v2`, but backend details are being pushed down below the workflow API and product narrative.
 
 The documentation under `docs/` now reflects the new target architecture:
 
 - compiled workflows for low-latency workflow execution
 - arbitrary activities in workers for full Temporal-equivalent capability
 - task queues, visibility, updates, child workflows, and worker versioning as first-class features
+- a bridge-mediated throughput lane that preserves workflow-authoritative semantics while letting stream execution evolve independently
 
 ## Getting Started
 
@@ -105,7 +117,7 @@ Show local stack status:
 make status
 ```
 
-Run the first eager/count smoke flow against `stream-v2`:
+Run the first eager/count smoke flow against the current stream-backed throughput lane (`stream-v2` today):
 
 ```bash
 make smoke-eager-count
@@ -188,6 +200,7 @@ Migration policy and generated output contract:
 - redesign the runtime around workflow and activity task queues
 - add worker versioning and visibility as core platform features
 - preserve the compiled-workflow advantage without weakening the activity model
+- formalize the workflow-to-stream bridge contract for throughput mode
 
 ## Documents
 
@@ -200,7 +213,10 @@ Migration policy and generated output contract:
 - [Architecture Decision Record 0002](/Users/bene/code/fabrik/docs/adr/0002-code-authored-compiled-workflows.md)
 - [Architecture Decision Record 0003](/Users/bene/code/fabrik/docs/adr/0003-execution-invariants.md)
 - [Architecture Decision Record 0004](/Users/bene/code/fabrik/docs/adr/0004-temporal-parity-pivot.md)
+- [Architecture Decision Record 0006](/Users/bene/code/fabrik/docs/adr/0006-workflows-bridge-streams-split.md)
 - [SDK + Compiler Direction](/Users/bene/code/fabrik/docs/sdk-compiler.md)
+- [Streams Bridge Protocol](/Users/bene/code/fabrik/docs/spec/streams-bridge.md)
+- [Streams Transition Plan](/Users/bene/code/fabrik/docs/streams-transition-plan.md)
 - [Temporal TypeScript Equivalence Contract](/Users/bene/code/fabrik/docs/temporal-typescript-equivalence-contract.md)
 - [Temporal TS Replacement Priorities](/Users/bene/code/fabrik/docs/temporal-ts-replacement-priorities.md)
 - [Durability and Replay Contract](/Users/bene/code/fabrik/docs/durability-and-replay-contract.md)

@@ -148,6 +148,55 @@ json_post() {
     -o "$dest"
 }
 
+relaunch_managed_workers() {
+  local workspace_dir=$1
+  local runtime_endpoint=${FABRIK_UNIFIED_RUNTIME_ENDPOINT:-http://127.0.0.1:50054}
+  python3 - "$workspace_dir" "$TENANT_ID" "$runtime_endpoint" <<'PY'
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+workspace_dir = pathlib.Path(sys.argv[1])
+tenant_id = sys.argv[2]
+runtime_endpoint = sys.argv[3]
+
+for package_path in sorted(workspace_dir.glob("workers/*/worker-package.json")):
+    package = json.loads(package_path.read_text(encoding="utf-8"))
+    pid_path = pathlib.Path(package["pid_path"])
+    log_path = pathlib.Path(package["log_path"])
+    bootstrap_path = package["bootstrap_path"]
+    task_queue = package["task_queue"]
+    build_id = package["build_id"]
+    env = os.environ.copy()
+    env.update({
+        "ACTIVITY_WORKER_SERVICE_PORT": "0",
+        "UNIFIED_RUNTIME_ENDPOINT": runtime_endpoint,
+        "ACTIVITY_TASK_QUEUE": task_queue,
+        "ACTIVITY_WORKER_TENANT_ID": tenant_id,
+        "ACTIVITY_WORKER_BUILD_ID": build_id,
+        "ACTIVITY_ENABLE_BULK_LANES": "false",
+        "ACTIVITY_WORKER_CONCURRENCY": "1",
+        "ACTIVITY_RESULT_FLUSHER_CONCURRENCY": "1",
+        "ACTIVITY_NODE_BOOTSTRAP": bootstrap_path,
+        "ACTIVITY_NODE_EXECUTABLE": "node",
+    })
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "ab", buffering=0) as log_handle:
+        proc = subprocess.Popen(
+            ["/Users/bene/code/fabrik/target/debug/activity-worker-service"],
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+            close_fds=True,
+        )
+    pid_path.write_text(f"{proc.pid}\n", encoding="utf-8")
+PY
+}
+
 poll_json_path() {
   local path=$1
   local python_expr=$2
@@ -433,7 +482,7 @@ wait_for_http "$API_URL/health" "api gateway"
 echo "[mixed-build-drill] running v1 migration and deployment"
 mkdir -p "$OUTPUT_DIR_ABS/migration-v1"
 FABRIK_WORKFLOW_BUILD_ID="$BUILD_V1" \
-  cargo run -p fabrik-cli -- migrate temporal "$REPO_V1" \
+  cargo run -p fabrik-cli --bin fabrik -- migrate temporal "$REPO_V1" \
   --deploy \
   --output-dir "$OUTPUT_DIR_ABS/migration-v1" \
   --api-url "$API_URL" \
@@ -483,7 +532,7 @@ json_get "/tenants/${TENANT_ID}/workflows/${OLD_INSTANCE_ID}/routing" "$OUTPUT_D
 echo "[mixed-build-drill] running v2 migration and deployment"
 mkdir -p "$OUTPUT_DIR_ABS/migration-v2"
 FABRIK_WORKFLOW_BUILD_ID="$BUILD_V2" \
-  cargo run -p fabrik-cli -- migrate temporal "$REPO_V2" \
+  cargo run -p fabrik-cli --bin fabrik -- migrate temporal "$REPO_V2" \
   --deploy \
   --output-dir "$OUTPUT_DIR_ABS/migration-v2" \
   --api-url "$API_URL" \
@@ -536,6 +585,9 @@ if [[ "$SKIP_RESTART" != "1" ]]; then
   echo "[mixed-build-drill] restarting dev stack"
   scripts/dev-stack.sh down
   DEV_STACK_BUILD=0 scripts/dev-stack.sh up
+  echo "[mixed-build-drill] relaunching managed migrated workers"
+  relaunch_managed_workers "$OUTPUT_DIR_ABS/migration-v1"
+  relaunch_managed_workers "$OUTPUT_DIR_ABS/migration-v2"
 fi
 
 wait_for_http "$API_URL/health" "api gateway after restart"

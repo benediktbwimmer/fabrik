@@ -11,6 +11,7 @@ The product keeps Temporal's workflow and activity semantics, but the runtime is
 - shard-local workflow ownership with sticky execution
 - durable history as the source of truth
 - worker fleets that run arbitrary user activity code
+- a bridge-mediated stream-backed lane for throughput-heavy bulk execution
 
 ## High-Level Topology
 
@@ -38,25 +39,31 @@ The product keeps Temporal's workflow and activity semantics, but the runtime is
                 | Workflow         |
                 | Executors        |
                 | compiled turns   |
-                +---+-----------+--+
+                +---+-----------+---+
+                    |           |   |
+                    |           |   v
+                    |           | +-------------+
+                    |           | | Timer /     |
+                    |           | | timeout svc |
+                    |           | +-------------+
                     |           |
                     |           v
                     |    +------+------+
-                    |    | Timer /     |
-                    |    | timeout svc |
-                    |    +-------------+
-                    |
-                    v
-             +------+--------+
-             | Matching /    |
-             | Task Queues   |
-             +---+--------+--+
-                 |        |
-                 |        v
-                 |   +----+------------------+
-                 |   | Activity Workers      |
-                 |   | arbitrary user code   |
-                 |   +-----------------------+
+                    |    | Throughput  |
+                    |    | Bridge      |
+                    |    +------+------+
+                    |           |
+                    v           v
+             +------+--------+  +----------------------+
+             | Matching /    |  | Stream Execution     |
+             | Task Queues   |  | Runtime + Checkpoint |
+             +---+--------+--+  +----+------------+----+
+                 |        |          |            |
+                 |        v          |            v
+                 |   +----+------------------+  +------------------+
+                 |   | Activity Workers      |  | Stream Workers   |
+                 |   | arbitrary user code   |  | bulk / stream    |
+                 |   +-----------------------+  +------------------+
                  |
                  v
            +-----+---------------------------+
@@ -162,7 +169,35 @@ The timer subsystem handles:
 
 No correctness-critical timeout may live only in worker memory.
 
-### 7. Visibility Layer
+### 7. Throughput Bridge
+
+Throughput mode crosses from workflow semantics into high-volume execution through a dedicated bridge.
+
+Responsibilities:
+
+- accept bulk-work admission from workflow executors
+- preserve idempotency for repeated admissions and retries
+- fence stale workflow owners and stale stream callbacks
+- translate stream-side terminal outcomes into workflow-authoritative events
+- define the only legal crossing point between workflow truth and stream truth
+
+The bridge is a protocol boundary, not a convenience helper. The workflow API remains backend-agnostic above it.
+
+### 8. Stream Execution Subsystem
+
+The stream-backed execution subsystem owns high-volume nonterminal throughput execution.
+
+Responsibilities:
+
+- own batch and stream execution state outside workflow history
+- schedule and apply chunk or partition work at high volume
+- checkpoint owner state and recover on failover
+- expose strong owner-routed reads and cheaper eventual projections
+- emit fenced terminal outcomes or named checkpoints back through the bridge
+
+The current implementation of this subsystem is the `stream-v2` lane built from `throughput-runtime`, `throughput-projector`, Redpanda or Kafka, RocksDB, and object storage. The architecture should treat that as an implementation detail of the internal stream subsystem rather than as workflow-facing product surface.
+
+### 9. Visibility Layer
 
 Visibility is a primary product surface, not an afterthought.
 
@@ -176,7 +211,7 @@ Responsibilities:
 
 The visibility model may be eventually consistent, but the product must also provide direct strong-query paths where workflow semantics require them.
 
-### 8. Worker Versioning
+### 10. Worker Versioning
 
 Temporal parity requires safe code rollout.
 
@@ -241,11 +276,16 @@ For high-cardinality fan-out beyond what durable per-activity execution supports
 
 Throughput mode may run with an eager execution policy. In eager mode, chunk work may execute ahead of workflow observation, but it does not directly mutate workflow state. The workflow still observes only deterministic batch barrier outcomes.
 
-Throughput mode uses the `stream-v2` backend. It removes Postgres from the throughput hot path and uses a dedicated `throughput-runtime` service with RocksDB for shard-local state, Redpanda for command/report/changelog logs, and S3 for durable checkpoints. The workflow-visible contract stays batch-level and deterministic even though the throughput engine owns the nonterminal chunk lifecycle.
+Architecturally, throughput mode is now split into:
 
-Backend selection remains server-controlled, but the active product architecture now admits only `stream-v2` for new bulk work.
+- workflow-owned batch admission and barrier semantics
+- bridge-owned idempotency, fencing, and callback translation
+- stream-owned nonterminal execution, checkpoints, and progress
+
+Backend selection remains server-controlled and must not leak into workflow code. The current stream-backed implementation is `stream-v2`, but that is below the workflow contract.
 
 See [throughput-mode.md](spec/throughput-mode.md) for the full specification.
+See [streams-bridge.md](spec/streams-bridge.md) for the bridge protocol boundary.
 See [streaming-product-guide.md](streaming-product-guide.md) for the product-level operator story and [benchmarking/streaming-performance-envelope.md](benchmarking/streaming-performance-envelope.md) for the current benchmark-backed workload guidance.
 
 ### Sticky Execution
@@ -279,16 +319,16 @@ It is trying to replace Temporal by preserving the workflow model users want whi
 
 That means compiled workflows plus arbitrary activities, not compiled workflows instead of arbitrary activities.
 
-### 9. Throughput Runtime (`stream-v2`)
+### 11. Throughput Runtime (`stream-v2` Implementation)
 
-When throughput mode is configured with the `stream-v2` backend, `throughput-runtime` is the execution owner for active throughput runs. `unified-runtime` remains the workflow barrier owner, but only for admission and terminal resume.
+`throughput-runtime` is the current implementation of the internal stream execution subsystem for active throughput runs. `unified-runtime` remains the workflow barrier owner, but only through the bridge for admission and terminal resume.
 
 The intended `stream-v2` split is:
 
-- `unified-runtime` validates a bulk step, persists minimal throughput admission plus workflow resume metadata, and emits `StartThroughputRun`
+- workflow-side bridge logic validates a bulk step, persists minimal throughput admission plus workflow resume metadata, and emits `StartThroughputRun`
 - `throughput-runtime` owns chunk planning, worker leasing, retries, reducer state, cancellation, checkpointing, and terminalization
-- `throughput-runtime` returns exactly one terminal run outcome to `unified-runtime`
-- `unified-runtime` appends the authoritative workflow barrier event and resumes the workflow turn
+- `throughput-runtime` returns exactly one terminal run outcome through the bridge
+- workflow-side bridge logic appends the authoritative workflow barrier event and resumes the workflow turn
 
 The throughput runtime therefore:
 
@@ -298,7 +338,7 @@ The throughput runtime therefore:
 - enforces fencing via `(chunk_id, attempt, lease_epoch, owner_epoch)` tuples
 - materializes visibility asynchronously instead of depending on SQL rows for execution
 
-The current workflow-to-throughput bridge and per-chunk projection tables are transitional compatibility machinery, not the long-term architecture. The target model is a stream-native throughput engine rather than a workflow-event bridge.
+Per-chunk projection tables are transitional compatibility machinery, not the long-term architecture. The long-term architecture keeps the bridge as the protocol boundary while allowing the underlying stream implementation to evolve independently.
 
 ## Future Directions
 

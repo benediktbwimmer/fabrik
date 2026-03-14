@@ -138,6 +138,7 @@ struct WorkflowBulkBatchesResponse {
     page: PageInfo,
     batch_count: usize,
     batches: Vec<WorkflowBulkBatchRecord>,
+    bridge_statuses: Vec<WorkflowBulkBridgeStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -151,6 +152,7 @@ struct WorkflowBulkBatchResponse {
     watch_cursor: String,
     runtime_control: Option<WorkflowBulkBatchRuntimeControlRecord>,
     batch: WorkflowBulkBatchRecord,
+    bridge_status: Option<WorkflowBulkBridgeStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -166,6 +168,7 @@ struct WorkflowBulkChunksResponse {
     page: PageInfo,
     chunk_count: usize,
     chunks: Vec<WorkflowBulkChunkRecord>,
+    bridge_status: Option<WorkflowBulkBridgeStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -181,6 +184,24 @@ struct WorkflowBulkResultsResponse {
     page: PageInfo,
     chunk_count: usize,
     chunks: Vec<WorkflowBulkChunkRecord>,
+    bridge_status: Option<WorkflowBulkBridgeStatus>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowBulkBridgeStatus {
+    batch_id: String,
+    bridge_request_id: String,
+    submission_status: Option<String>,
+    stream_status: String,
+    stream_terminal_at: Option<DateTime<Utc>>,
+    cancellation_requested_at: Option<DateTime<Utc>>,
+    cancellation_reason: Option<String>,
+    cancel_command_published_at: Option<DateTime<Utc>>,
+    cancelled_at: Option<DateTime<Utc>>,
+    workflow_status: Option<String>,
+    workflow_terminal_event_id: Option<Uuid>,
+    workflow_owner_epoch: Option<u64>,
+    workflow_accepted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1291,11 +1312,7 @@ async fn execute_strong_query(
         };
 
     let result = artifact
-        .evaluate_query(
-            &query_name,
-            &request.args,
-            execution_state_for_event(&query_state, None),
-        )
+        .evaluate_query(&query_name, &request.args, execution_state_for_event(&query_state, None))
         .map_err(|error| {
             (StatusCode::BAD_REQUEST, Json(ErrorResponse { message: error.to_string() }))
         })?;
@@ -3534,10 +3551,61 @@ fn projection_lag_ms_from_times(
 
 fn authoritative_bulk_source(throughput_backend: &str) -> &'static str {
     if throughput_backend == ThroughputBackend::StreamV2.as_str() {
-        "stream-v2-owner-state"
+        "bridge-owner-routed"
     } else {
-        "projection"
+        "workflow-store"
     }
+}
+
+fn projected_bulk_source(throughput_backend: &str) -> &'static str {
+    if throughput_backend == ThroughputBackend::StreamV2.as_str() {
+        "stream-projection"
+    } else {
+        "workflow-store"
+    }
+}
+
+async fn load_bulk_bridge_status(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    batch_id: &str,
+    throughput_backend: &str,
+) -> Result<Option<WorkflowBulkBridgeStatus>> {
+    if throughput_backend != ThroughputBackend::StreamV2.as_str() {
+        return Ok(None);
+    }
+    let bridge_progress = state
+        .store
+        .get_throughput_bridge_progress_for_batch(tenant_id, instance_id, run_id, batch_id)
+        .await?;
+    let Some(run) =
+        state.store.get_throughput_run(tenant_id, instance_id, run_id, batch_id).await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(WorkflowBulkBridgeStatus {
+        batch_id: run.batch_id,
+        bridge_request_id: run.bridge_request_id,
+        submission_status: bridge_progress.as_ref().map(|progress| progress.submission_status.clone()),
+        stream_status: run.status,
+        stream_terminal_at: run.terminal_at,
+        cancellation_requested_at: bridge_progress
+            .as_ref()
+            .and_then(|progress| progress.cancellation_requested_at),
+        cancellation_reason: bridge_progress
+            .as_ref()
+            .and_then(|progress| progress.cancellation_reason.clone()),
+        cancel_command_published_at: bridge_progress
+            .as_ref()
+            .and_then(|progress| progress.cancel_command_published_at),
+        cancelled_at: bridge_progress.as_ref().and_then(|progress| progress.cancelled_at),
+        workflow_status: run.bridge_terminal_status,
+        workflow_terminal_event_id: run.bridge_terminal_event_id,
+        workflow_owner_epoch: run.bridge_terminal_owner_epoch,
+        workflow_accepted_at: run.bridge_terminal_accepted_at,
+    }))
 }
 
 fn parse_read_consistency(raw: Option<&str>) -> Result<ReadConsistency> {
@@ -3729,8 +3797,34 @@ async fn load_workflow_bulk_batches(
             (total, batches)
         }
     };
-    let authoritative_source =
-        if consistency == ReadConsistency::Strong { "stream-v2-owner-state" } else { "projection" };
+    let authoritative_source = if consistency == ReadConsistency::Strong {
+        batches
+            .iter()
+            .find(|batch| batch.throughput_backend == ThroughputBackend::StreamV2.as_str())
+            .map(|batch| authoritative_bulk_source(&batch.throughput_backend))
+            .unwrap_or("workflow-store")
+    } else {
+        batches
+            .iter()
+            .find(|batch| batch.throughput_backend == ThroughputBackend::StreamV2.as_str())
+            .map(|batch| projected_bulk_source(&batch.throughput_backend))
+            .unwrap_or("workflow-store")
+    };
+    let mut bridge_statuses = Vec::new();
+    for batch in &batches {
+        if let Some(bridge_status) = load_bulk_bridge_status(
+            state,
+            tenant_id,
+            instance_id,
+            run_id,
+            &batch.batch_id,
+            &batch.throughput_backend,
+        )
+        .await?
+        {
+            bridge_statuses.push(bridge_status);
+        }
+    }
     Ok(WorkflowBulkBatchesResponse {
         tenant_id: tenant_id.to_owned(),
         instance_id: instance_id.to_owned(),
@@ -3751,6 +3845,7 @@ async fn load_workflow_bulk_batches(
         page: build_page_info(&page, total, batches.len()),
         batch_count: total,
         batches,
+        bridge_statuses,
     })
 }
 
@@ -3786,18 +3881,32 @@ async fn load_workflow_bulk_batch(
         .store
         .get_bulk_batch_runtime_control(tenant_id, instance_id, run_id, batch_id)
         .await?;
+    let bridge_status = load_bulk_bridge_status(
+        state,
+        tenant_id,
+        instance_id,
+        run_id,
+        batch_id,
+        &batch.throughput_backend,
+    )
+    .await?;
     Ok(WorkflowBulkBatchResponse {
         tenant_id: tenant_id.to_owned(),
         instance_id: instance_id.to_owned(),
         run_id: run_id.to_owned(),
         consistency: consistency.as_str(),
-        authoritative_source: authoritative_bulk_source(&batch.throughput_backend),
+        authoritative_source: if consistency == ReadConsistency::Strong {
+            authoritative_bulk_source(&batch.throughput_backend)
+        } else {
+            projected_bulk_source(&batch.throughput_backend)
+        },
         projection_lag_ms: (consistency == ReadConsistency::Eventual)
             .then(|| projection_lag_ms_from_times([Some(batch.updated_at)]))
             .flatten(),
         watch_cursor: batch.updated_at.to_rfc3339(),
         runtime_control,
         batch,
+        bridge_status,
     })
 }
 
@@ -3902,13 +4011,26 @@ async fn load_workflow_bulk_chunks(
     for chunk in chunks {
         resolved_chunks.push(resolve_chunk_payloads(state, chunk, true, false).await?);
     }
+    let bridge_status = load_bulk_bridge_status(
+        state,
+        tenant_id,
+        instance_id,
+        run_id,
+        batch_id,
+        &batch.throughput_backend,
+    )
+    .await?;
     Ok(WorkflowBulkChunksResponse {
         tenant_id: tenant_id.to_owned(),
         instance_id: instance_id.to_owned(),
         run_id: run_id.to_owned(),
         batch_id: batch_id.to_owned(),
         consistency: consistency.as_str(),
-        authoritative_source: authoritative_bulk_source(&batch.throughput_backend),
+        authoritative_source: if consistency == ReadConsistency::Strong {
+            authoritative_bulk_source(&batch.throughput_backend)
+        } else {
+            projected_bulk_source(&batch.throughput_backend)
+        },
         projection_lag_ms: (consistency == ReadConsistency::Eventual)
             .then(|| {
                 projection_lag_ms_from_times(
@@ -3925,6 +4047,7 @@ async fn load_workflow_bulk_chunks(
         page: build_page_info(&page, total, resolved_chunks.len()),
         chunk_count: total,
         chunks: resolved_chunks,
+        bridge_status,
     })
 }
 
@@ -4025,13 +4148,26 @@ async fn load_workflow_bulk_results(
     };
     let chunks =
         resolved_chunks.into_iter().filter(|chunk| chunk.output.is_some()).collect::<Vec<_>>();
+    let bridge_status = load_bulk_bridge_status(
+        state,
+        tenant_id,
+        instance_id,
+        run_id,
+        batch_id,
+        &batch.throughput_backend,
+    )
+    .await?;
     Ok(WorkflowBulkResultsResponse {
         tenant_id: tenant_id.to_owned(),
         instance_id: instance_id.to_owned(),
         run_id: run_id.to_owned(),
         batch_id: batch_id.to_owned(),
         consistency: consistency.as_str(),
-        authoritative_source: authoritative_bulk_source(&batch.throughput_backend),
+        authoritative_source: if consistency == ReadConsistency::Strong {
+            authoritative_bulk_source(&batch.throughput_backend)
+        } else {
+            projected_bulk_source(&batch.throughput_backend)
+        },
         projection_lag_ms: (consistency == ReadConsistency::Eventual)
             .then(|| {
                 projection_lag_ms_from_times(chunks.iter().map(|chunk| Some(chunk.updated_at)))
@@ -4046,6 +4182,7 @@ async fn load_workflow_bulk_results(
         page: build_page_info(&page, total, chunks.len()),
         chunk_count: total,
         chunks,
+        bridge_status,
     })
 }
 
@@ -5076,6 +5213,142 @@ mod tests {
         assert_eq!(response.result, json!({"ok": true}));
         assert_eq!(response.consistency, "strong");
         assert_eq!(response.source, "hot_owner");
+    }
+
+    #[test]
+    fn bulk_sources_distinguish_bridge_reads_from_projections() {
+        assert_eq!(
+            authoritative_bulk_source(ThroughputBackend::StreamV2.as_str()),
+            "bridge-owner-routed"
+        );
+        assert_eq!(
+            projected_bulk_source(ThroughputBackend::StreamV2.as_str()),
+            "stream-projection"
+        );
+        assert_eq!(authoritative_bulk_source("legacy"), "workflow-store");
+        assert_eq!(projected_bulk_source("legacy"), "workflow-store");
+    }
+
+    #[tokio::test]
+    async fn load_bulk_bridge_status_returns_stream_and_workflow_terminal_state() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state = test_state(store.clone()).await?;
+        let now = Utc::now();
+        let command = fabrik_throughput::ThroughputCommandEnvelope {
+            command_id: Uuid::now_v7(),
+            occurred_at: now,
+            dedupe_key: "throughput-start:test-query-bridge".to_owned(),
+            partition_key: "batch-a:0".to_owned(),
+            payload: fabrik_throughput::ThroughputCommand::StartThroughputRun(
+                fabrik_throughput::StartThroughputRunCommand {
+                    dedupe_key: "throughput-start:test-query-bridge".to_owned(),
+                    bridge_request_id: fabrik_throughput::throughput_bridge_request_id(
+                        "tenant-a",
+                        "instance-a",
+                        "run-a",
+                        "batch-a",
+                    ),
+                    tenant_id: "tenant-a".to_owned(),
+                    definition_id: "demo".to_owned(),
+                    definition_version: Some(1),
+                    artifact_hash: Some("artifact-a".to_owned()),
+                    instance_id: "instance-a".to_owned(),
+                    run_id: "run-a".to_owned(),
+                    batch_id: "batch-a".to_owned(),
+                    activity_type: "benchmark.echo".to_owned(),
+                    activity_capabilities: None,
+                    task_queue: "bulk".to_owned(),
+                    state: Some("join".to_owned()),
+                    chunk_size: 2,
+                    max_attempts: 1,
+                    retry_delay_ms: 0,
+                    total_items: 2,
+                    aggregation_group_count: 1,
+                    execution_policy: Some("parallel".to_owned()),
+                    reducer: Some("count".to_owned()),
+                    throughput_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
+                    throughput_backend_version: ThroughputBackend::StreamV2
+                        .default_version()
+                        .to_owned(),
+                    routing_reason: "stream_v2_selected".to_owned(),
+                    admission_policy_version: fabrik_throughput::ADMISSION_POLICY_VERSION
+                        .to_owned(),
+                    input_handle: fabrik_throughput::PayloadHandle::Inline {
+                        key: "bulk-input:batch-a".to_owned(),
+                    },
+                    result_handle: fabrik_throughput::PayloadHandle::Inline {
+                        key: "bulk-result:batch-a".to_owned(),
+                    },
+                },
+            ),
+        };
+        store
+            .upsert_throughput_run(&fabrik_store::ThroughputRunRecord {
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "instance-a".to_owned(),
+                run_id: "run-a".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                batch_id: "batch-a".to_owned(),
+                bridge_request_id: fabrik_throughput::throughput_bridge_request_id(
+                    "tenant-a",
+                    "instance-a",
+                    "run-a",
+                    "batch-a",
+                ),
+                throughput_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
+                execution_path: "native_stream_v2".to_owned(),
+                status: "completed".to_owned(),
+                command_dedupe_key: command.dedupe_key.clone(),
+                command,
+                command_published_at: Some(now),
+                started_at: Some(now),
+                terminal_at: Some(now),
+                bridge_terminal_status: Some("completed".to_owned()),
+                bridge_terminal_event_id: Some(Uuid::now_v7()),
+                bridge_terminal_owner_epoch: Some(9),
+                bridge_terminal_accepted_at: Some(now + chrono::Duration::seconds(1)),
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+
+        let status = load_bulk_bridge_status(
+            &state,
+            "tenant-a",
+            "instance-a",
+            "run-a",
+            "batch-a",
+            ThroughputBackend::StreamV2.as_str(),
+        )
+        .await?
+        .context("bridge status should exist")?;
+        assert_eq!(status.batch_id, "batch-a");
+        assert_eq!(status.bridge_request_id, "throughput-bridge:tenant-a:instance-a:run-a:batch-a");
+        assert_eq!(status.stream_status, "completed");
+        assert!(status.stream_terminal_at.is_some());
+        assert_eq!(status.workflow_status.as_deref(), Some("completed"));
+        assert_eq!(status.workflow_owner_epoch, Some(9));
+        assert!(status.workflow_terminal_event_id.is_some());
+        assert!(status.workflow_accepted_at.is_some());
+
+        assert!(
+            load_bulk_bridge_status(
+                &state,
+                "tenant-a",
+                "instance-a",
+                "run-a",
+                "batch-a",
+                "legacy",
+            )
+            .await?
+            .is_none()
+        );
+        Ok(())
     }
 
     fn graph_test_artifact() -> CompiledWorkflowArtifact {

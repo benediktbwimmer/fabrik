@@ -36,13 +36,14 @@ use fabrik_store::{
 use fabrik_throughput::{
     ADMISSION_POLICY_VERSION, ActivityCapabilityRegistry, ActivityExecutionCapabilities,
     PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind, StartThroughputRunCommand,
-    ThroughputBackend, ThroughputCommand, ThroughputCommandEnvelope, ThroughputExecutionPath,
-    TinyWorkflowExecutionMode, TinyWorkflowStartItem, bulk_reducer_class,
+    ThroughputBackend, ThroughputBatchIdentity, ThroughputCommand, ThroughputCommandEnvelope,
+    ThroughputExecutionPath, TinyWorkflowExecutionMode, TinyWorkflowStartItem, bulk_reducer_class,
     bulk_reducer_is_mergeable, bulk_reducer_materializes_results, can_inline_durable_tiny_fanout,
     can_use_payloadless_bulk_transport, decode_cbor, encode_cbor,
     load_activity_capability_registry_from_env, parse_benchmark_compact_input_meta_from_handle,
     parse_benchmark_compact_total_items_from_handle, planned_reduction_tree_depth,
-    resolve_activity_capabilities, stream_v2_fast_lane_enabled, throughput_partition_key,
+    resolve_activity_capabilities, stream_v2_fast_lane_enabled, throughput_bridge_request_id,
+    throughput_partition_key, throughput_start_command_id, throughput_start_dedupe_key,
 };
 use fabrik_worker_protocol::activity_worker::{
     Ack, ActivityTask, ActivityTaskCancelledResult, ActivityTaskCompletedResult,
@@ -222,6 +223,10 @@ struct UnifiedDebugState {
     ignored_lease_epoch_reports: u64,
     ignored_owner_epoch_reports: u64,
     ignored_worker_mismatch_reports: u64,
+    applied_bulk_terminal_callbacks: u64,
+    ignored_stale_owner_epoch_bulk_terminal_callbacks: u64,
+    ignored_missing_bulk_terminal_callbacks: u64,
+    ignored_closed_bulk_terminal_callbacks: u64,
     poll_requests: u64,
     poll_responses: u64,
     leased_tasks: u64,
@@ -449,6 +454,16 @@ enum PreparedDbAction {
     Terminal(ActivityTerminalUpdate),
     UpsertInstance(WorkflowInstanceState),
     UpsertPersistedInstance(WorkflowInstanceState),
+    RecordBridgeTerminalAcceptance {
+        tenant_id: String,
+        instance_id: String,
+        run_id: String,
+        batch_id: String,
+        terminal_status: String,
+        terminal_event_id: Uuid,
+        owner_epoch: Option<u64>,
+        accepted_at: DateTime<Utc>,
+    },
     CloseRun(RunKey, DateTime<Utc>),
     PutRunStart {
         tenant_id: String,
@@ -2465,157 +2480,311 @@ async fn handle_bulk_batch_terminal_event(
     state: &AppState,
     event: EventEnvelope<WorkflowEvent>,
 ) -> Result<()> {
+    match accept_bulk_batch_terminal_via_bridge(state, event).await? {
+        BulkTerminalBridgeAcceptance::Applied => {
+            let mut debug = state.debug.lock().expect("unified debug lock poisoned");
+            debug.applied_bulk_terminal_callbacks =
+                debug.applied_bulk_terminal_callbacks.saturating_add(1);
+            state.notify.notify_waiters();
+            state.persist_notify.notify_one();
+        }
+        BulkTerminalBridgeAcceptance::IgnoredMissingRun => {
+            let mut debug = state.debug.lock().expect("unified debug lock poisoned");
+            debug.ignored_missing_bulk_terminal_callbacks =
+                debug.ignored_missing_bulk_terminal_callbacks.saturating_add(1);
+        }
+        BulkTerminalBridgeAcceptance::IgnoredStaleOwnerEpoch => {
+            let mut debug = state.debug.lock().expect("unified debug lock poisoned");
+            debug.ignored_stale_owner_epoch_bulk_terminal_callbacks =
+                debug.ignored_stale_owner_epoch_bulk_terminal_callbacks.saturating_add(1);
+        }
+        BulkTerminalBridgeAcceptance::IgnoredClosedRun => {
+            let mut debug = state.debug.lock().expect("unified debug lock poisoned");
+            debug.ignored_closed_bulk_terminal_callbacks =
+                debug.ignored_closed_bulk_terminal_callbacks.saturating_add(1);
+        }
+    }
+    Ok(())
+}
+
+enum BulkTerminalBridgeAcceptance {
+    Applied,
+    IgnoredMissingRun,
+    IgnoredStaleOwnerEpoch,
+    IgnoredClosedRun,
+}
+
+fn bulk_terminal_batch_id(event: &WorkflowEvent) -> Option<&str> {
+    match event {
+        WorkflowEvent::BulkActivityBatchCompleted { batch_id, .. }
+        | WorkflowEvent::BulkActivityBatchFailed { batch_id, .. }
+        | WorkflowEvent::BulkActivityBatchCancelled { batch_id, .. } => Some(batch_id.as_str()),
+        _ => None,
+    }
+}
+
+fn bulk_terminal_status(event: &WorkflowEvent) -> Option<&'static str> {
+    match event {
+        WorkflowEvent::BulkActivityBatchCompleted { .. } => Some("completed"),
+        WorkflowEvent::BulkActivityBatchFailed { .. } => Some("failed"),
+        WorkflowEvent::BulkActivityBatchCancelled { .. } => Some("cancelled"),
+        _ => None,
+    }
+}
+
+fn bulk_terminal_owner_epoch(event: &EventEnvelope<WorkflowEvent>) -> Option<u64> {
+    event.metadata.get("bridge_owner_epoch").and_then(|value| value.parse::<u64>().ok())
+}
+
+async fn bulk_terminal_owner_epoch_is_stale(
+    state: &AppState,
+    event: &EventEnvelope<WorkflowEvent>,
+) -> Result<bool> {
+    let Some(callback_owner_epoch) = bulk_terminal_owner_epoch(event) else {
+        return Ok(false);
+    };
+    let Some(batch_id) = bulk_terminal_batch_id(&event.payload) else {
+        return Ok(false);
+    };
+    let Some(current_owner_epoch) = state
+        .store
+        .get_throughput_projection_batch_max_owner_epoch(
+            &event.tenant_id,
+            &event.instance_id,
+            &event.run_id,
+            batch_id,
+        )
+        .await?
+    else {
+        return Ok(false);
+    };
+    Ok(callback_owner_epoch < current_owner_epoch)
+}
+
+async fn classify_cold_bulk_terminal_via_bridge(
+    state: &AppState,
+    event: &EventEnvelope<WorkflowEvent>,
+) -> Result<BulkTerminalBridgeAcceptance> {
+    let Some(batch_id) = bulk_terminal_batch_id(&event.payload) else {
+        return Ok(BulkTerminalBridgeAcceptance::IgnoredMissingRun);
+    };
+
+    if let Some(run) = state
+        .store
+        .get_throughput_run(&event.tenant_id, &event.instance_id, &event.run_id, batch_id)
+        .await?
+    {
+        let expected_bridge_request_id = throughput_bridge_request_id(
+            &event.tenant_id,
+            &event.instance_id,
+            &event.run_id,
+            batch_id,
+        );
+        if !run.bridge_request_id.is_empty() && run.bridge_request_id != expected_bridge_request_id
+        {
+            return Ok(BulkTerminalBridgeAcceptance::IgnoredMissingRun);
+        }
+        if run.bridge_terminal_accepted_at.is_some() {
+            return Ok(BulkTerminalBridgeAcceptance::IgnoredClosedRun);
+        }
+    }
+
+    let stored = state.store.get_instance(&event.tenant_id, &event.instance_id).await?;
+    Ok(
+        if stored.is_some_and(|instance| {
+            instance.run_id == event.run_id && instance.status.is_terminal()
+        }) {
+            BulkTerminalBridgeAcceptance::IgnoredClosedRun
+        } else {
+            BulkTerminalBridgeAcceptance::IgnoredMissingRun
+        },
+    )
+}
+
+async fn accept_bulk_batch_terminal_via_bridge(
+    state: &AppState,
+    event: EventEnvelope<WorkflowEvent>,
+) -> Result<BulkTerminalBridgeAcceptance> {
+    if bulk_terminal_owner_epoch_is_stale(state, &event).await? {
+        return Ok(BulkTerminalBridgeAcceptance::IgnoredStaleOwnerEpoch);
+    }
+
     let run_key = RunKey {
         tenant_id: event.tenant_id.clone(),
         instance_id: event.instance_id.clone(),
         run_id: event.run_id.clone(),
     };
 
-    let mut general = Vec::new();
-    let mut schedules = Vec::new();
-    let (final_instance, post_plan) = {
+    let hot_result = {
         let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
-        let Some(runtime) = inner.instances.get_mut(&run_key) else {
-            return Ok(());
-        };
-        if runtime.instance.status.is_terminal() {
-            return Ok(());
-        }
+        match inner.instances.get_mut(&run_key) {
+            None => None,
+            Some(runtime) if runtime.instance.status.is_terminal() => {
+                Some(Err(BulkTerminalBridgeAcceptance::IgnoredClosedRun))
+            }
+            Some(runtime) => {
+                let mut general = Vec::new();
+                let mut schedules = Vec::new();
+                let current_state = runtime
+                    .instance
+                    .current_state
+                    .clone()
+                    .unwrap_or_else(|| runtime.artifact.workflow.initial_state.clone());
+                let execution_state = execution_state_for_event(&runtime.instance, Some(&event));
+                let turn_context = ExecutionTurnContext {
+                    event_id: event.event_id,
+                    occurred_at: event.occurred_at,
+                };
+                let plan = match &event.payload {
+                    WorkflowEvent::BulkActivityBatchCompleted {
+                        batch_id,
+                        total_items,
+                        succeeded_items,
+                        failed_items,
+                        cancelled_items,
+                        chunk_count,
+                        reducer_output,
+                    } => runtime.artifact.execute_after_bulk_completion_with_turn(
+                        &current_state,
+                        batch_id,
+                        &bulk_terminal_payload(
+                            batch_id,
+                            "completed",
+                            None,
+                            *total_items,
+                            *succeeded_items,
+                            *failed_items,
+                            *cancelled_items,
+                            *chunk_count,
+                            reducer_output.as_ref(),
+                        ),
+                        execution_state,
+                        turn_context,
+                    )?,
+                    WorkflowEvent::BulkActivityBatchFailed {
+                        batch_id,
+                        total_items,
+                        succeeded_items,
+                        failed_items,
+                        cancelled_items,
+                        chunk_count,
+                        message,
+                        reducer_output,
+                    } => runtime.artifact.execute_after_bulk_failure_with_turn(
+                        &current_state,
+                        batch_id,
+                        &bulk_terminal_payload(
+                            batch_id,
+                            "failed",
+                            Some(message.as_str()),
+                            *total_items,
+                            *succeeded_items,
+                            *failed_items,
+                            *cancelled_items,
+                            *chunk_count,
+                            reducer_output.as_ref(),
+                        ),
+                        execution_state,
+                        turn_context,
+                    )?,
+                    WorkflowEvent::BulkActivityBatchCancelled {
+                        batch_id,
+                        total_items,
+                        succeeded_items,
+                        failed_items,
+                        cancelled_items,
+                        chunk_count,
+                        message,
+                        reducer_output,
+                    } => runtime.artifact.execute_after_bulk_failure_with_turn(
+                        &current_state,
+                        batch_id,
+                        &bulk_terminal_payload(
+                            batch_id,
+                            "cancelled",
+                            Some(message.as_str()),
+                            *total_items,
+                            *succeeded_items,
+                            *failed_items,
+                            *cancelled_items,
+                            *chunk_count,
+                            reducer_output.as_ref(),
+                        ),
+                        execution_state,
+                        turn_context,
+                    )?,
+                    _ => return Ok(BulkTerminalBridgeAcceptance::IgnoredMissingRun),
+                };
 
-        let current_state = runtime
-            .instance
-            .current_state
-            .clone()
-            .unwrap_or_else(|| runtime.artifact.workflow.initial_state.clone());
-        let execution_state = execution_state_for_event(&runtime.instance, Some(&event));
-        let turn_context =
-            ExecutionTurnContext { event_id: event.event_id, occurred_at: event.occurred_at };
-        let plan = match &event.payload {
-            WorkflowEvent::BulkActivityBatchCompleted {
-                batch_id,
-                total_items,
-                succeeded_items,
-                failed_items,
-                cancelled_items,
-                chunk_count,
-                reducer_output,
-            } => runtime.artifact.execute_after_bulk_completion_with_turn(
-                &current_state,
-                batch_id,
-                &bulk_terminal_payload(
-                    batch_id,
-                    "completed",
-                    None,
-                    *total_items,
-                    *succeeded_items,
-                    *failed_items,
-                    *cancelled_items,
-                    *chunk_count,
-                    reducer_output.as_ref(),
-                ),
-                execution_state,
-                turn_context,
-            )?,
-            WorkflowEvent::BulkActivityBatchFailed {
-                batch_id,
-                total_items,
-                succeeded_items,
-                failed_items,
-                cancelled_items,
-                chunk_count,
-                message,
-                reducer_output,
-            } => runtime.artifact.execute_after_bulk_failure_with_turn(
-                &current_state,
-                batch_id,
-                &bulk_terminal_payload(
-                    batch_id,
-                    "failed",
-                    Some(message.as_str()),
-                    *total_items,
-                    *succeeded_items,
-                    *failed_items,
-                    *cancelled_items,
-                    *chunk_count,
-                    reducer_output.as_ref(),
-                ),
-                execution_state,
-                turn_context,
-            )?,
-            WorkflowEvent::BulkActivityBatchCancelled {
-                batch_id,
-                total_items,
-                succeeded_items,
-                failed_items,
-                cancelled_items,
-                chunk_count,
-                message,
-                reducer_output,
-            } => runtime.artifact.execute_after_bulk_failure_with_turn(
-                &current_state,
-                batch_id,
-                &bulk_terminal_payload(
-                    batch_id,
-                    "cancelled",
-                    Some(message.as_str()),
-                    *total_items,
-                    *succeeded_items,
-                    *failed_items,
-                    *cancelled_items,
-                    *chunk_count,
-                    reducer_output.as_ref(),
-                ),
-                execution_state,
-                turn_context,
-            )?,
-            _ => return Ok(()),
-        };
+                runtime.instance.apply_event(&event);
+                apply_compiled_plan(&mut runtime.instance, &plan);
+                let scheduled_tasks = schedule_activities_from_plan(
+                    &runtime.artifact,
+                    &runtime.instance,
+                    &plan,
+                    event.occurred_at,
+                )?;
+                for task in &scheduled_tasks {
+                    schedules.push(PreparedDbAction::Schedule(task.clone()));
+                    runtime.active_activities.insert(
+                        task.activity_id.clone(),
+                        ActiveActivityMeta {
+                            attempt: task.attempt,
+                            task_queue: task.task_queue.clone(),
+                            activity_type: task.activity_type.clone(),
+                            activity_capabilities: task.activity_capabilities.clone(),
+                            wait_state: task.state.clone(),
+                            omit_success_output: task.omit_success_output,
+                        },
+                    );
+                }
+                let ready_tasks = scheduled_tasks;
+                let final_instance = runtime.instance.clone();
+                general.push(PreparedDbAction::UpsertInstance(runtime.instance.clone()));
+                if let (Some(batch_id), Some(terminal_status)) =
+                    (bulk_terminal_batch_id(&event.payload), bulk_terminal_status(&event.payload))
+                {
+                    general.push(PreparedDbAction::RecordBridgeTerminalAcceptance {
+                        tenant_id: event.tenant_id.clone(),
+                        instance_id: event.instance_id.clone(),
+                        run_id: event.run_id.clone(),
+                        batch_id: batch_id.to_owned(),
+                        terminal_status: terminal_status.to_owned(),
+                        terminal_event_id: event.event_id,
+                        owner_epoch: bulk_terminal_owner_epoch(&event),
+                        accepted_at: event.occurred_at,
+                    });
+                }
+                let post_plan = PostPlanEffect {
+                    run_key: run_key.clone(),
+                    artifact: runtime.artifact.clone(),
+                    instance: runtime.instance.clone(),
+                    plan,
+                    source_event_id: event.event_id,
+                    occurred_at: event.occurred_at,
+                };
+                mark_runtime_dirty(&mut inner, "bulk_terminal", true);
+                for task in &ready_tasks {
+                    inner
+                        .ready
+                        .entry(QueueKey {
+                            tenant_id: task.tenant_id.clone(),
+                            task_queue: task.task_queue.clone(),
+                        })
+                        .or_default()
+                        .push_back(task.clone());
+                }
+                Some(Ok((general, schedules, final_instance, post_plan)))
+            }
+        }
+    };
 
-        runtime.instance.apply_event(&event);
-        apply_compiled_plan(&mut runtime.instance, &plan);
-        let scheduled_tasks = schedule_activities_from_plan(
-            &runtime.artifact,
-            &runtime.instance,
-            &plan,
-            event.occurred_at,
-        )?;
-        for task in &scheduled_tasks {
-            schedules.push(PreparedDbAction::Schedule(task.clone()));
-            runtime.active_activities.insert(
-                task.activity_id.clone(),
-                ActiveActivityMeta {
-                    attempt: task.attempt,
-                    task_queue: task.task_queue.clone(),
-                    activity_type: task.activity_type.clone(),
-                    activity_capabilities: task.activity_capabilities.clone(),
-                    wait_state: task.state.clone(),
-                    omit_success_output: task.omit_success_output,
-                },
-            );
-        }
-        let ready_tasks = scheduled_tasks;
-        let final_instance = runtime.instance.clone();
-        general.push(PreparedDbAction::UpsertInstance(runtime.instance.clone()));
-        let post_plan = PostPlanEffect {
-            run_key: run_key.clone(),
-            artifact: runtime.artifact.clone(),
-            instance: runtime.instance.clone(),
-            plan,
-            source_event_id: event.event_id,
-            occurred_at: event.occurred_at,
-        };
-        mark_runtime_dirty(&mut inner, "bulk_terminal", true);
-        for task in &ready_tasks {
-            inner
-                .ready
-                .entry(QueueKey {
-                    tenant_id: task.tenant_id.clone(),
-                    task_queue: task.task_queue.clone(),
-                })
-                .or_default()
-                .push_back(task.clone());
-        }
-        (final_instance, post_plan)
+    let Some(hot_result) = hot_result else {
+        return classify_cold_bulk_terminal_via_bridge(state, &event).await;
+    };
+    let (general, schedules, final_instance, post_plan) = match hot_result {
+        Ok(applied) => applied,
+        Err(outcome) => return Ok(outcome),
     };
 
     apply_db_actions(state, general, schedules).await?;
@@ -2629,9 +2798,7 @@ async fn handle_bulk_batch_terminal_event(
         )
         .await?;
     }
-    state.notify.notify_waiters();
-    state.persist_notify.notify_one();
-    Ok(())
+    Ok(BulkTerminalBridgeAcceptance::Applied)
 }
 
 async fn handle_timer_fired_event(
@@ -3878,7 +4045,6 @@ async fn dispatch_cancel_mailbox_item_unified(
             .current_state
             .clone()
             .unwrap_or_else(|| runtime.artifact.workflow.initial_state.clone());
-        runtime.instance.apply_event(&item.source_event);
         if runtime.artifact.is_non_cancellable_state(&current_state) {
             if let Some(execution) = runtime.instance.artifact_execution.as_mut() {
                 execution.pending_workflow_cancellation = Some(reason.clone());
@@ -3905,6 +4071,15 @@ async fn dispatch_cancel_mailbox_item_unified(
     }
 
     propagate_cancellation_to_open_children_unified(state, &item.source_event, &reason).await?;
+    request_stream_batch_cancellations_for_run(
+        state,
+        &item.tenant_id,
+        &item.instance_id,
+        &item.run_id,
+        &reason,
+        item.source_event.occurred_at,
+    )
+    .await?;
 
     let unwindable_activities = {
         let mut inner = state.inner.lock().expect("unified runtime lock poisoned");
@@ -4033,6 +4208,48 @@ async fn dispatch_cancel_mailbox_item_unified(
             terminal_instance,
         )),
     })
+}
+
+async fn request_stream_batch_cancellations_for_run(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    reason: &str,
+    requested_at: DateTime<Utc>,
+) -> Result<()> {
+    let batches = state
+        .store
+        .list_bulk_batches_for_run_page_query_view(tenant_id, instance_id, run_id, 10_000, 0)
+        .await?;
+    for batch in batches {
+        if batch.throughput_backend != ThroughputBackend::StreamV2.as_str()
+            || batch.status.is_terminal()
+        {
+            continue;
+        }
+        let Some(progress) = state
+            .store
+            .get_throughput_bridge_progress_for_batch(
+                tenant_id,
+                instance_id,
+                run_id,
+                &batch.batch_id,
+            )
+            .await?
+        else {
+            continue;
+        };
+        let _ = state
+            .store
+            .request_throughput_bridge_cancellation(
+                progress.workflow_event_id,
+                requested_at,
+                reason,
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 async fn maybe_enact_pending_workflow_cancellation_unified(
@@ -5569,7 +5786,7 @@ async fn materialize_bulk_batches_from_plan(
                     batch_id,
                 )
             };
-            let command = start_throughput_run_command(
+            submit_native_stream_run_via_bridge(
                 state,
                 instance,
                 batch_id,
@@ -5593,43 +5810,6 @@ async fn materialize_bulk_batches_from_plan(
                 occurred_at,
             )
             .await?;
-            state
-                .store
-                .upsert_throughput_run(&ThroughputRunRecord {
-                    tenant_id: instance.tenant_id.clone(),
-                    instance_id: instance.instance_id.clone(),
-                    run_id: instance.run_id.clone(),
-                    definition_id: instance.definition_id.clone(),
-                    definition_version: instance.definition_version,
-                    artifact_hash: instance.artifact_hash.clone(),
-                    batch_id: batch_id.clone(),
-                    throughput_backend: selected_backend.to_owned(),
-                    execution_path: ThroughputExecutionPath::NativeStreamV2.as_str().to_owned(),
-                    status: "scheduled".to_owned(),
-                    command_dedupe_key: command.dedupe_key.clone(),
-                    command: command.clone(),
-                    command_published_at: None,
-                    started_at: None,
-                    terminal_at: None,
-                    created_at: occurred_at,
-                    updated_at: occurred_at,
-                })
-                .await?;
-            let command_publisher = state
-                .throughput_command_publisher
-                .as_ref()
-                .context("stream-v2 bulk admission requires throughput command publisher")?;
-            command_publisher.publish(&command, &command.partition_key).await?;
-            let _ = state
-                .store
-                .mark_throughput_run_command_published(
-                    &instance.tenant_id,
-                    &instance.instance_id,
-                    &instance.run_id,
-                    batch_id,
-                    Utc::now(),
-                )
-                .await?;
         } else if let Some(publisher) = state.publisher.as_ref() {
             let envelope = emitted_bulk_batch_event(
                 instance,
@@ -6107,15 +6287,27 @@ async fn repair_unpublished_stream_v2_runs(state: &AppState) -> Result<usize> {
     let Some(command_publisher) = state.throughput_command_publisher.as_ref() else {
         return Ok(0);
     };
-    let runs = state
+    let submissions = state
         .store
-        .list_unpublished_scheduled_throughput_runs_for_backend(
+        .list_pending_throughput_bridge_submissions_for_backend(
             ThroughputBackend::StreamV2.as_str(),
             10_000,
         )
         .await?;
     let mut repaired = 0_usize;
-    for run in runs {
+    for submission in submissions {
+        let Some(run) = state
+            .store
+            .get_throughput_run(
+                &submission.tenant_id,
+                &submission.instance_id,
+                &submission.run_id,
+                &submission.batch_id,
+            )
+            .await?
+        else {
+            continue;
+        };
         let ThroughputCommand::StartThroughputRun(_) = &run.command.payload else {
             continue;
         };
@@ -6138,6 +6330,98 @@ async fn repair_unpublished_stream_v2_runs(state: &AppState) -> Result<usize> {
                 published_at,
             )
             .await?;
+        state
+            .store
+            .mark_throughput_bridge_command_published(submission.workflow_event_id, published_at)
+            .await?;
+        repaired = repaired.saturating_add(1);
+    }
+    Ok(repaired)
+}
+
+async fn repair_unpublished_stream_v2_cancellations(state: &AppState) -> Result<usize> {
+    let Some(command_publisher) = state.throughput_command_publisher.as_ref() else {
+        return Ok(0);
+    };
+    let cancellations = state
+        .store
+        .list_pending_throughput_bridge_cancellations_for_backend(
+            ThroughputBackend::StreamV2.as_str(),
+            10_000,
+        )
+        .await?;
+    let mut repaired = 0_usize;
+    for cancellation in cancellations {
+        let reason = cancellation
+            .cancellation_reason
+            .clone()
+            .unwrap_or_else(|| "workflow cancelled".to_owned());
+        let command = ThroughputCommandEnvelope {
+            command_id: Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                format!(
+                    "throughput-cancel:{}:{}",
+                    cancellation.workflow_event_id, cancellation.batch_id
+                )
+                .as_bytes(),
+            ),
+            occurred_at: cancellation.cancellation_requested_at.unwrap_or(cancellation.updated_at),
+            dedupe_key: format!("throughput-cancel:{}", cancellation.workflow_event_id),
+            partition_key: throughput_partition_key(&cancellation.batch_id, 0),
+            payload: ThroughputCommand::CancelBatch {
+                identity: ThroughputBatchIdentity {
+                    tenant_id: cancellation.tenant_id.clone(),
+                    instance_id: cancellation.instance_id.clone(),
+                    run_id: cancellation.run_id.clone(),
+                    batch_id: cancellation.batch_id.clone(),
+                },
+                reason,
+            },
+        };
+        command_publisher.publish(&command, &command.partition_key).await.with_context(|| {
+            format!(
+                "failed to publish native throughput cancel command for batch {}",
+                cancellation.batch_id
+            )
+        })?;
+        state
+            .store
+            .mark_throughput_bridge_cancel_command_published(
+                cancellation.workflow_event_id,
+                Utc::now(),
+            )
+            .await?;
+        repaired = repaired.saturating_add(1);
+    }
+    Ok(repaired)
+}
+
+async fn repair_pending_stream_v2_terminal_acceptance(state: &AppState) -> Result<usize> {
+    let Some(publisher) = state.publisher.as_ref() else {
+        return Ok(0);
+    };
+    let runs = state
+        .store
+        .list_pending_bridge_terminal_acceptance_for_backend(
+            ThroughputBackend::StreamV2.as_str(),
+            10_000,
+        )
+        .await?;
+    let mut repaired = 0_usize;
+    for run in runs {
+        let Some(terminal) = state
+            .store
+            .get_throughput_terminal(&run.tenant_id, &run.instance_id, &run.run_id, &run.batch_id)
+            .await?
+        else {
+            continue;
+        };
+        publisher
+            .publish(&terminal.terminal_event, &terminal.terminal_event.partition_key)
+            .await
+            .with_context(|| {
+            format!("failed to republish bridge terminal for batch {}", run.batch_id)
+        })?;
         repaired = repaired.saturating_add(1);
     }
     Ok(repaired)
@@ -6152,6 +6436,24 @@ async fn run_throughput_run_repair_loop(state: AppState) {
             Ok(_) => {}
             Err(error) => {
                 error!(error = %error, "failed to repair unpublished native stream-v2 admissions");
+            }
+        }
+        match repair_unpublished_stream_v2_cancellations(&state).await {
+            Ok(repaired) if repaired > 0 => {
+                info!(repaired, "repaired unpublished native stream-v2 cancellations");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(error = %error, "failed to repair unpublished native stream-v2 cancellations");
+            }
+        }
+        match repair_pending_stream_v2_terminal_acceptance(&state).await {
+            Ok(repaired) if repaired > 0 => {
+                info!(repaired, "repaired pending native stream-v2 terminal acceptance");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                error!(error = %error, "failed to repair pending native stream-v2 terminal acceptance");
             }
         }
         tokio::time::sleep(Duration::from_millis(1_000)).await;
@@ -7196,6 +7498,7 @@ async fn apply_db_actions(
             PreparedDbAction::UpsertPersistedInstance(instance) => {
                 persisted_instance_updates.push(instance)
             }
+            PreparedDbAction::RecordBridgeTerminalAcceptance { .. } => other_general.push(action),
             PreparedDbAction::CloseRun(run_key, closed_at) => {
                 close_run_updates.push((run_key, closed_at));
             }
@@ -7247,6 +7550,30 @@ async fn apply_db_actions(
             PreparedDbAction::UpsertInstance(_) => unreachable!("instance upserts are batched"),
             PreparedDbAction::UpsertPersistedInstance(_) => {
                 unreachable!("persisted instance upserts are batched")
+            }
+            PreparedDbAction::RecordBridgeTerminalAcceptance {
+                tenant_id,
+                instance_id,
+                run_id,
+                batch_id,
+                terminal_status,
+                terminal_event_id,
+                owner_epoch,
+                accepted_at,
+            } => {
+                state
+                    .store
+                    .record_throughput_bridge_terminal_acceptance(
+                        &tenant_id,
+                        &instance_id,
+                        &run_id,
+                        &batch_id,
+                        &terminal_status,
+                        terminal_event_id,
+                        owner_epoch,
+                        accepted_at,
+                    )
+                    .await?;
             }
             PreparedDbAction::CloseRun(_, _) => unreachable!("run closes are batched"),
             PreparedDbAction::PutRunStart {
@@ -8517,17 +8844,20 @@ async fn start_throughput_run_command(
 ) -> Result<ThroughputCommandEnvelope> {
     let result_handle: PayloadHandle = serde_json::from_value(result_handle.clone())
         .context("failed to deserialize bulk result handle for throughput command")?;
-    let dedupe_key = format!("throughput-start:{source_event_id}:{batch_id}");
+    let dedupe_key = throughput_start_dedupe_key(source_event_id, batch_id);
     Ok(ThroughputCommandEnvelope {
-        command_id: Uuid::new_v5(
-            &Uuid::NAMESPACE_URL,
-            format!("unified-throughput-start:{source_event_id}:{batch_id}").as_bytes(),
-        ),
+        command_id: throughput_start_command_id(source_event_id, batch_id),
         occurred_at,
         dedupe_key: dedupe_key.clone(),
         partition_key: throughput_partition_key(batch_id, 0),
         payload: ThroughputCommand::StartThroughputRun(StartThroughputRunCommand {
             dedupe_key,
+            bridge_request_id: throughput_bridge_request_id(
+                &instance.tenant_id,
+                &instance.instance_id,
+                &instance.run_id,
+                batch_id,
+            ),
             tenant_id: instance.tenant_id.clone(),
             definition_id: instance.definition_id.clone(),
             definition_version: instance.definition_version,
@@ -8554,6 +8884,128 @@ async fn start_throughput_run_command(
             result_handle,
         }),
     })
+}
+
+async fn submit_native_stream_run_via_bridge(
+    state: &AppState,
+    instance: &WorkflowInstanceState,
+    batch_id: &str,
+    activity_type: &str,
+    activity_capabilities: Option<ActivityExecutionCapabilities>,
+    task_queue: &str,
+    total_items: usize,
+    result_handle: &Value,
+    workflow_state: Option<String>,
+    chunk_size: u32,
+    max_attempts: u32,
+    retry_delay_ms: u64,
+    aggregation_group_count: u32,
+    execution_policy: Option<String>,
+    reducer: Option<String>,
+    throughput_backend: &str,
+    throughput_backend_version: &str,
+    admission: &BulkAdmissionDecision,
+    input_handle: PayloadHandle,
+    source_event_id: Uuid,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    let command = start_throughput_run_command(
+        state,
+        instance,
+        batch_id,
+        activity_type,
+        activity_capabilities,
+        task_queue,
+        total_items,
+        result_handle,
+        workflow_state,
+        chunk_size,
+        max_attempts,
+        retry_delay_ms,
+        aggregation_group_count,
+        execution_policy,
+        reducer,
+        throughput_backend,
+        throughput_backend_version,
+        admission,
+        input_handle,
+        source_event_id,
+        occurred_at,
+    )
+    .await?;
+    let bridge_progress = state
+        .store
+        .upsert_throughput_bridge_submission(
+            source_event_id,
+            &instance.tenant_id,
+            &instance.instance_id,
+            &instance.run_id,
+            batch_id,
+            throughput_backend,
+            &throughput_bridge_request_id(
+                &instance.tenant_id,
+                &instance.instance_id,
+                &instance.run_id,
+                batch_id,
+            ),
+            &command.dedupe_key,
+            Some(command.command_id),
+            Some(&command.partition_key),
+            occurred_at,
+        )
+        .await?;
+    state
+        .store
+        .upsert_throughput_run(&ThroughputRunRecord {
+            tenant_id: instance.tenant_id.clone(),
+            instance_id: instance.instance_id.clone(),
+            run_id: instance.run_id.clone(),
+            definition_id: instance.definition_id.clone(),
+            definition_version: instance.definition_version,
+            artifact_hash: instance.artifact_hash.clone(),
+            batch_id: batch_id.to_owned(),
+            bridge_request_id: throughput_bridge_request_id(
+                &instance.tenant_id,
+                &instance.instance_id,
+                &instance.run_id,
+                batch_id,
+            ),
+            throughput_backend: throughput_backend.to_owned(),
+            execution_path: ThroughputExecutionPath::NativeStreamV2.as_str().to_owned(),
+            status: "scheduled".to_owned(),
+            command_dedupe_key: command.dedupe_key.clone(),
+            command: command.clone(),
+            command_published_at: None,
+            started_at: None,
+            terminal_at: None,
+            bridge_terminal_status: None,
+            bridge_terminal_event_id: None,
+            bridge_terminal_owner_epoch: None,
+            bridge_terminal_accepted_at: None,
+            created_at: occurred_at,
+            updated_at: occurred_at,
+        })
+        .await?;
+    if bridge_progress.command_published_at.is_some() || bridge_progress.cancelled_at.is_some() {
+        return Ok(());
+    }
+    let command_publisher = state
+        .throughput_command_publisher
+        .as_ref()
+        .context("stream-v2 bulk admission requires throughput command publisher")?;
+    command_publisher.publish(&command, &command.partition_key).await?;
+    let _ = state
+        .store
+        .mark_throughput_run_command_published(
+            &instance.tenant_id,
+            &instance.instance_id,
+            &instance.run_id,
+            batch_id,
+            Utc::now(),
+        )
+        .await?;
+    state.store.mark_throughput_bridge_command_published(source_event_id, Utc::now()).await?;
+    Ok(())
 }
 
 fn unified_failure_allows_retry(attempt: u32, retry: &RetryPolicy, error: &str) -> bool {
@@ -8762,7 +9214,7 @@ mod tests {
     use chrono::Duration as ChronoDuration;
     use fabrik_broker::WorkflowPublisher;
     use fabrik_events::WorkflowIdentity;
-    use fabrik_store::{WorkflowMailboxStatus, WorkflowUpdateStatus};
+    use fabrik_store::{ThroughputTerminalRecord, WorkflowMailboxStatus, WorkflowUpdateStatus};
     use fabrik_workflow::{
         ArtifactEntrypoint, CompiledStateNode, CompiledUpdateHandler, CompiledWorkflow,
         ErrorTransition, Expression, ParentClosePolicy,
@@ -10469,6 +10921,7 @@ mod tests {
         let inner = app_state.inner.lock().expect("unified runtime lock poisoned");
         let runtime = inner.instances.get(&run_key).context("runtime should exist")?;
         assert_eq!(runtime.instance.status, WorkflowStatus::Cancelled);
+        assert_eq!(runtime.instance.event_count, 1);
         assert!(runtime.active_activities.is_empty());
         assert!(inner.ready.values().all(VecDeque::is_empty));
         assert_eq!(delayed_retry_count(&inner.delayed_retries), 0);
@@ -10479,6 +10932,7 @@ mod tests {
             .await?
             .context("stored instance should exist")?;
         assert_eq!(stored.status, WorkflowStatus::Cancelled);
+        assert_eq!(stored.event_count, 1);
 
         fs::remove_dir_all(state_dir).ok();
         Ok(())
@@ -10966,10 +11420,136 @@ mod tests {
         let ThroughputCommand::StartThroughputRun(start) = &command.payload else {
             panic!("expected native start throughput command");
         };
+        assert_eq!(
+            start.bridge_request_id,
+            throughput_bridge_request_id(
+                "tenant",
+                "instance-native-start",
+                "run-native-start",
+                "batch-a",
+            )
+        );
         let PayloadHandle::Inline { key } = &start.input_handle else {
             panic!("expected db-backed native input handle reference");
         };
         assert!(key.starts_with("throughput-run-input:"));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_start_command_keeps_same_bridge_request_identity() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-duplicate-bridge-request-{}", Uuid::now_v7()));
+        let mut app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        app_state.throughput_runtime.native_stream_v2_engine_enabled = true;
+
+        let instance = WorkflowInstanceState {
+            tenant_id: "tenant".to_owned(),
+            instance_id: "instance-dup-start".to_owned(),
+            run_id: "run-dup-start".to_owned(),
+            definition_id: "demo".to_owned(),
+            definition_version: Some(1),
+            artifact_hash: Some("artifact-a".to_owned()),
+            workflow_task_queue: "default".to_owned(),
+            sticky_workflow_build_id: None,
+            sticky_workflow_poller_id: None,
+            current_state: Some("join".to_owned()),
+            context: None,
+            artifact_execution: None,
+            status: WorkflowStatus::Running,
+            input: None,
+            persisted_input_handle: None,
+            memo: None,
+            search_attributes: None,
+            output: None,
+            event_count: 1,
+            last_event_id: Uuid::now_v7(),
+            last_event_type: "WorkflowTriggered".to_owned(),
+            updated_at: Utc::now(),
+        };
+        let source_event_id = Uuid::now_v7();
+        let occurred_at = Utc::now();
+        let admission = BulkAdmissionDecision {
+            selected_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
+            selected_backend_version: ThroughputBackend::StreamV2.default_version().to_owned(),
+            routing_reason: "stream_v2_selected".to_owned(),
+            admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
+        };
+        let command_one = start_throughput_run_command(
+            &app_state,
+            &instance,
+            "batch-a",
+            "benchmark.echo",
+            None,
+            "bulk",
+            2,
+            &serde_json::to_value(PayloadHandle::inline_batch_result("batch-a"))?,
+            Some("join".to_owned()),
+            16,
+            3,
+            1000,
+            2,
+            Some("parallel".to_owned()),
+            Some("count".to_owned()),
+            ThroughputBackend::StreamV2.as_str(),
+            ThroughputBackend::StreamV2.default_version(),
+            &admission,
+            native_stream_v2_run_input_handle(
+                "tenant",
+                "instance-dup-start",
+                "run-dup-start",
+                "batch-a",
+            ),
+            source_event_id,
+            occurred_at,
+        )
+        .await?;
+        let command_two = start_throughput_run_command(
+            &app_state,
+            &instance,
+            "batch-a",
+            "benchmark.echo",
+            None,
+            "bulk",
+            2,
+            &serde_json::to_value(PayloadHandle::inline_batch_result("batch-a"))?,
+            Some("join".to_owned()),
+            16,
+            3,
+            1000,
+            2,
+            Some("parallel".to_owned()),
+            Some("count".to_owned()),
+            ThroughputBackend::StreamV2.as_str(),
+            ThroughputBackend::StreamV2.default_version(),
+            &admission,
+            native_stream_v2_run_input_handle(
+                "tenant",
+                "instance-dup-start",
+                "run-dup-start",
+                "batch-a",
+            ),
+            source_event_id,
+            occurred_at,
+        )
+        .await?;
+
+        let ThroughputCommand::StartThroughputRun(start_one) = &command_one.payload else {
+            panic!("expected start command");
+        };
+        let ThroughputCommand::StartThroughputRun(start_two) = &command_two.payload else {
+            panic!("expected start command");
+        };
+        assert_eq!(start_one.bridge_request_id, start_two.bridge_request_id);
+        assert_eq!(command_one.command_id, command_two.command_id);
+        assert_eq!(command_one.dedupe_key, command_two.dedupe_key);
 
         fs::remove_dir_all(state_dir).ok();
         Ok(())
@@ -11091,6 +11671,568 @@ mod tests {
         assert_eq!(output.get("batchId"), Some(&Value::String(batch.batch_id.clone())));
         assert_eq!(output.get("terminalStatus"), Some(&Value::String("completed".to_owned())));
         assert_eq!(output.get("succeededItems"), Some(&json!(batch.total_items)));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_bulk_terminal_callback_is_ignored_after_completion() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = throughput_artifact("default");
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-throughput-stale-callback-{}", Uuid::now_v7()));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-throughput-stale",
+            "run-throughput-stale",
+            "unified-runtime-test",
+        );
+        let items = (0..33).map(|index| json!({"value": format!("x-{index}")})).collect::<Vec<_>>();
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({ "items": items }) },
+            Utc::now(),
+        );
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let batch = store
+            .list_bulk_batches_for_run_page(
+                "tenant",
+                "instance-throughput-stale",
+                "run-throughput-stale",
+                10,
+                0,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("batch should exist")?;
+
+        let completed = test_event(
+            &identity,
+            WorkflowEvent::BulkActivityBatchCompleted {
+                batch_id: batch.batch_id.clone(),
+                total_items: batch.total_items,
+                succeeded_items: batch.total_items,
+                failed_items: 0,
+                cancelled_items: 0,
+                chunk_count: batch.chunk_count,
+                reducer_output: None,
+            },
+            Utc::now(),
+        );
+        handle_bulk_batch_terminal_event(&app_state, completed).await?;
+
+        let stale = test_event(
+            &identity,
+            WorkflowEvent::BulkActivityBatchFailed {
+                batch_id: batch.batch_id.clone(),
+                total_items: batch.total_items,
+                succeeded_items: 0,
+                failed_items: batch.total_items,
+                cancelled_items: 0,
+                chunk_count: batch.chunk_count,
+                message: "stale failure".to_owned(),
+                reducer_output: None,
+            },
+            Utc::now(),
+        );
+        handle_bulk_batch_terminal_event(&app_state, stale).await?;
+
+        let stored = store
+            .get_instance("tenant", "instance-throughput-stale")
+            .await?
+            .context("stored throughput instance should exist")?;
+        assert_eq!(stored.status, WorkflowStatus::Completed);
+        let debug = app_state.debug.lock().expect("unified debug lock poisoned").clone();
+        assert_eq!(debug.ignored_closed_bulk_terminal_callbacks, 1);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn closed_workflow_bulk_terminal_callback_is_ignored_when_run_is_not_hot() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = throughput_artifact("default");
+        let now = Utc::now();
+        let instance = WorkflowInstanceState {
+            tenant_id: "tenant".to_owned(),
+            instance_id: "instance-throughput-closed".to_owned(),
+            run_id: "run-throughput-closed".to_owned(),
+            definition_id: artifact.definition_id.clone(),
+            definition_version: Some(artifact.definition_version),
+            artifact_hash: Some(artifact.artifact_hash.clone()),
+            workflow_task_queue: "default".to_owned(),
+            sticky_workflow_build_id: None,
+            sticky_workflow_poller_id: None,
+            current_state: Some("join".to_owned()),
+            context: None,
+            artifact_execution: None,
+            status: WorkflowStatus::Completed,
+            input: Some(json!({"items": []})),
+            persisted_input_handle: None,
+            memo: None,
+            search_attributes: None,
+            output: Some(json!({"ok": true})),
+            event_count: 2,
+            last_event_id: Uuid::now_v7(),
+            last_event_type: "BulkActivityBatchCompleted".to_owned(),
+            updated_at: now,
+        };
+        store.upsert_instance(&instance).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-throughput-closed-callback-{}", Uuid::now_v7()));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-throughput-closed",
+            "run-throughput-closed",
+            "unified-runtime-test",
+        );
+        let completed = test_event(
+            &identity,
+            WorkflowEvent::BulkActivityBatchCompleted {
+                batch_id: "batch-a".to_owned(),
+                total_items: 0,
+                succeeded_items: 0,
+                failed_items: 0,
+                cancelled_items: 0,
+                chunk_count: 0,
+                reducer_output: None,
+            },
+            now + ChronoDuration::seconds(1),
+        );
+        handle_bulk_batch_terminal_event(&app_state, completed).await?;
+
+        let debug = app_state.debug.lock().expect("unified debug lock poisoned").clone();
+        assert_eq!(debug.ignored_closed_bulk_terminal_callbacks, 1);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persisted_throughput_terminal_marks_cold_callback_as_closed() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-throughput-persisted-terminal-{}", Uuid::now_v7()));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        let identity = WorkflowIdentity::new(
+            "tenant".to_owned(),
+            "demo".to_owned(),
+            1,
+            "artifact-a".to_owned(),
+            "instance-throughput-terminal".to_owned(),
+            "run-throughput-terminal".to_owned(),
+            "unified-runtime-test",
+        );
+        let terminal_event = test_event(
+            &identity,
+            WorkflowEvent::BulkActivityBatchCompleted {
+                batch_id: "batch-a".to_owned(),
+                total_items: 2,
+                succeeded_items: 2,
+                failed_items: 0,
+                cancelled_items: 0,
+                chunk_count: 1,
+                reducer_output: Some(json!(2)),
+            },
+            now,
+        );
+        let command = ThroughputCommandEnvelope {
+            command_id: Uuid::now_v7(),
+            occurred_at: now,
+            dedupe_key: "throughput-start:test-persisted-terminal".to_owned(),
+            partition_key: "batch-a:0".to_owned(),
+            payload: ThroughputCommand::StartThroughputRun(StartThroughputRunCommand {
+                dedupe_key: "throughput-start:test-persisted-terminal".to_owned(),
+                bridge_request_id: throughput_bridge_request_id(
+                    "tenant",
+                    "instance-throughput-terminal",
+                    "run-throughput-terminal",
+                    "batch-a",
+                ),
+                tenant_id: "tenant".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                instance_id: "instance-throughput-terminal".to_owned(),
+                run_id: "run-throughput-terminal".to_owned(),
+                batch_id: "batch-a".to_owned(),
+                activity_type: "benchmark.echo".to_owned(),
+                activity_capabilities: None,
+                task_queue: "bulk".to_owned(),
+                state: Some("join".to_owned()),
+                chunk_size: 2,
+                max_attempts: 1,
+                retry_delay_ms: 0,
+                total_items: 2,
+                aggregation_group_count: 1,
+                execution_policy: Some("parallel".to_owned()),
+                reducer: Some("count".to_owned()),
+                throughput_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
+                throughput_backend_version: ThroughputBackend::StreamV2
+                    .default_version()
+                    .to_owned(),
+                routing_reason: "stream_v2_selected".to_owned(),
+                admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
+                input_handle: PayloadHandle::Inline { key: "bulk-input:batch-a".to_owned() },
+                result_handle: PayloadHandle::Inline { key: "bulk-result:batch-a".to_owned() },
+            }),
+        };
+        store
+            .upsert_throughput_run(&ThroughputRunRecord {
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-throughput-terminal".to_owned(),
+                run_id: "run-throughput-terminal".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                batch_id: "batch-a".to_owned(),
+                bridge_request_id: throughput_bridge_request_id(
+                    "tenant",
+                    "instance-throughput-terminal",
+                    "run-throughput-terminal",
+                    "batch-a",
+                ),
+                throughput_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
+                execution_path: ThroughputExecutionPath::NativeStreamV2.as_str().to_owned(),
+                status: "running".to_owned(),
+                command_dedupe_key: command.dedupe_key.clone(),
+                command: command.clone(),
+                command_published_at: Some(now),
+                started_at: Some(now),
+                terminal_at: None,
+                bridge_terminal_status: None,
+                bridge_terminal_event_id: None,
+                bridge_terminal_owner_epoch: None,
+                bridge_terminal_accepted_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        assert!(
+            store
+                .commit_throughput_terminal_handoff(&ThroughputTerminalRecord {
+                    tenant_id: "tenant".to_owned(),
+                    instance_id: "instance-throughput-terminal".to_owned(),
+                    run_id: "run-throughput-terminal".to_owned(),
+                    batch_id: "batch-a".to_owned(),
+                    status: "completed".to_owned(),
+                    terminal_at: now,
+                    terminal_event_id: terminal_event.event_id,
+                    terminal_event: terminal_event.clone(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await?
+        );
+        assert!(
+            store
+                .record_throughput_bridge_terminal_acceptance(
+                    "tenant",
+                    "instance-throughput-terminal",
+                    "run-throughput-terminal",
+                    "batch-a",
+                    "completed",
+                    terminal_event.event_id,
+                    None,
+                    now,
+                )
+                .await?
+        );
+
+        handle_bulk_batch_terminal_event(&app_state, terminal_event).await?;
+
+        let debug = app_state.debug.lock().expect("unified debug lock poisoned").clone();
+        assert_eq!(debug.ignored_closed_bulk_terminal_callbacks, 1);
+        assert_eq!(debug.ignored_missing_bulk_terminal_callbacks, 0);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn persisted_throughput_terminal_without_acceptance_is_not_closed() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-throughput-terminal-no-acceptance-{}", Uuid::now_v7()));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        let identity = WorkflowIdentity::new(
+            "tenant".to_owned(),
+            "demo".to_owned(),
+            1,
+            "artifact-a".to_owned(),
+            "instance-throughput-terminal-no-acceptance".to_owned(),
+            "run-throughput-terminal-no-acceptance".to_owned(),
+            "unified-runtime-test",
+        );
+        let terminal_event = test_event(
+            &identity,
+            WorkflowEvent::BulkActivityBatchCompleted {
+                batch_id: "batch-a".to_owned(),
+                total_items: 2,
+                succeeded_items: 2,
+                failed_items: 0,
+                cancelled_items: 0,
+                chunk_count: 1,
+                reducer_output: Some(json!(2)),
+            },
+            now,
+        );
+        let command = ThroughputCommandEnvelope {
+            command_id: Uuid::now_v7(),
+            occurred_at: now,
+            dedupe_key: "throughput-start:test-terminal-no-acceptance".to_owned(),
+            partition_key: "batch-a:0".to_owned(),
+            payload: ThroughputCommand::StartThroughputRun(StartThroughputRunCommand {
+                dedupe_key: "throughput-start:test-terminal-no-acceptance".to_owned(),
+                bridge_request_id: throughput_bridge_request_id(
+                    "tenant",
+                    "instance-throughput-terminal-no-acceptance",
+                    "run-throughput-terminal-no-acceptance",
+                    "batch-a",
+                ),
+                tenant_id: "tenant".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                instance_id: "instance-throughput-terminal-no-acceptance".to_owned(),
+                run_id: "run-throughput-terminal-no-acceptance".to_owned(),
+                batch_id: "batch-a".to_owned(),
+                activity_type: "benchmark.echo".to_owned(),
+                activity_capabilities: None,
+                task_queue: "bulk".to_owned(),
+                state: Some("join".to_owned()),
+                chunk_size: 2,
+                max_attempts: 1,
+                retry_delay_ms: 0,
+                total_items: 2,
+                aggregation_group_count: 1,
+                execution_policy: Some("parallel".to_owned()),
+                reducer: Some("count".to_owned()),
+                throughput_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
+                throughput_backend_version: ThroughputBackend::StreamV2
+                    .default_version()
+                    .to_owned(),
+                routing_reason: "stream_v2_selected".to_owned(),
+                admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
+                input_handle: PayloadHandle::Inline { key: "bulk-input:batch-a".to_owned() },
+                result_handle: PayloadHandle::Inline { key: "bulk-result:batch-a".to_owned() },
+            }),
+        };
+        store
+            .upsert_throughput_run(&ThroughputRunRecord {
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-throughput-terminal-no-acceptance".to_owned(),
+                run_id: "run-throughput-terminal-no-acceptance".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                batch_id: "batch-a".to_owned(),
+                bridge_request_id: throughput_bridge_request_id(
+                    "tenant",
+                    "instance-throughput-terminal-no-acceptance",
+                    "run-throughput-terminal-no-acceptance",
+                    "batch-a",
+                ),
+                throughput_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
+                execution_path: ThroughputExecutionPath::NativeStreamV2.as_str().to_owned(),
+                status: "running".to_owned(),
+                command_dedupe_key: command.dedupe_key.clone(),
+                command: command.clone(),
+                command_published_at: Some(now),
+                started_at: Some(now),
+                terminal_at: None,
+                bridge_terminal_status: None,
+                bridge_terminal_event_id: None,
+                bridge_terminal_owner_epoch: None,
+                bridge_terminal_accepted_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        assert!(
+            store
+                .commit_throughput_terminal_handoff(&ThroughputTerminalRecord {
+                    tenant_id: "tenant".to_owned(),
+                    instance_id: "instance-throughput-terminal-no-acceptance".to_owned(),
+                    run_id: "run-throughput-terminal-no-acceptance".to_owned(),
+                    batch_id: "batch-a".to_owned(),
+                    status: "completed".to_owned(),
+                    terminal_at: now,
+                    terminal_event_id: terminal_event.event_id,
+                    terminal_event: terminal_event.clone(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await?
+        );
+
+        handle_bulk_batch_terminal_event(&app_state, terminal_event).await?;
+
+        let debug = app_state.debug.lock().expect("unified debug lock poisoned").clone();
+        assert_eq!(debug.ignored_missing_bulk_terminal_callbacks, 1);
+        assert_eq!(debug.ignored_closed_bulk_terminal_callbacks, 0);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_owner_epoch_bulk_terminal_callback_is_ignored() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-throughput-stale-owner-{}", Uuid::now_v7()));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        store
+            .persist_bulk_batch_with_metadata(
+                "tenant",
+                "instance-stale-owner",
+                "run-stale-owner",
+                "demo",
+                Some(1),
+                Some("artifact-a"),
+                "batch-a",
+                "benchmark.echo",
+                None,
+                "bulk",
+                Some("join"),
+                &json!({ "kind": "inline", "key": "bulk-input:batch-a" }),
+                &json!({ "kind": "inline", "key": "bulk-result:batch-a" }),
+                &[json!({ "value": 1 }), json!({ "value": 2 })],
+                1,
+                1,
+                0,
+                None,
+                None,
+                "legacy",
+                1,
+                false,
+                1,
+                ThroughputBackend::StreamV2.as_str(),
+                ThroughputBackend::StreamV2.default_version(),
+                "stream_v2_selected",
+                ADMISSION_POLICY_VERSION,
+                now,
+            )
+            .await?;
+        let batch = store
+            .get_bulk_batch("tenant", "instance-stale-owner", "run-stale-owner", "batch-a")
+            .await?
+            .context("persisted batch should exist")?;
+        let chunks = store
+            .list_bulk_chunks_for_batch_page(
+                "tenant",
+                "instance-stale-owner",
+                "run-stale-owner",
+                "batch-a",
+                i64::MAX,
+                0,
+            )
+            .await?;
+        store.upsert_throughput_projection_batch(&batch).await?;
+        store.upsert_throughput_projection_chunks(&chunks).await?;
+        store
+            .update_throughput_projection_chunk_states(&[
+                fabrik_store::ThroughputProjectionChunkStateUpdate {
+                    tenant_id: "tenant".to_owned(),
+                    instance_id: "instance-stale-owner".to_owned(),
+                    run_id: "run-stale-owner".to_owned(),
+                    batch_id: "batch-a".to_owned(),
+                    chunk_id: chunks[0].chunk_id.clone(),
+                    chunk_index: chunks[0].chunk_index,
+                    group_id: chunks[0].group_id,
+                    item_count: chunks[0].item_count,
+                    status: "started".to_owned(),
+                    attempt: 1,
+                    lease_epoch: 1,
+                    owner_epoch: 2,
+                    input_handle: Some(chunks[0].input_handle.clone()),
+                    result_handle: Some(chunks[0].result_handle.clone()),
+                    output: None,
+                    error: None,
+                    cancellation_requested: false,
+                    cancellation_reason: None,
+                    cancellation_metadata: None,
+                    worker_id: Some("worker-a".to_owned()),
+                    worker_build_id: Some("build-a".to_owned()),
+                    lease_token: Some(Uuid::now_v7()),
+                    last_report_id: Some("report-1".to_owned()),
+                    available_at: now,
+                    started_at: Some(now),
+                    lease_expires_at: Some(now + ChronoDuration::seconds(30)),
+                    completed_at: None,
+                    updated_at: now + ChronoDuration::seconds(1),
+                },
+            ])
+            .await?;
+
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            "demo",
+            1,
+            "artifact-a",
+            "instance-stale-owner",
+            "run-stale-owner",
+            "unified-runtime-test",
+        );
+        let mut stale = test_event(
+            &identity,
+            WorkflowEvent::BulkActivityBatchCompleted {
+                batch_id: "batch-a".to_owned(),
+                total_items: 2,
+                succeeded_items: 2,
+                failed_items: 0,
+                cancelled_items: 0,
+                chunk_count: 2,
+                reducer_output: Some(json!(2)),
+            },
+            now + ChronoDuration::seconds(2),
+        );
+        stale.metadata.insert("bridge_owner_epoch".to_owned(), "1".to_owned());
+
+        handle_bulk_batch_terminal_event(&app_state, stale).await?;
+
+        let debug = app_state.debug.lock().expect("unified debug lock poisoned").clone();
+        assert_eq!(debug.ignored_stale_owner_epoch_bulk_terminal_callbacks, 1);
+        assert_eq!(debug.ignored_missing_bulk_terminal_callbacks, 0);
+        assert_eq!(debug.ignored_closed_bulk_terminal_callbacks, 0);
 
         fs::remove_dir_all(state_dir).ok();
         Ok(())
