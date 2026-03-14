@@ -394,10 +394,12 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
 
     let ingest_base =
         env::var("INGEST_SERVICE_URL").unwrap_or_else(|_| "http://127.0.0.1:3001".to_owned());
-    let throughput_runtime_debug_base =
-        env::var("THROUGHPUT_DEBUG_URL").unwrap_or_else(|_| "http://127.0.0.1:3006".to_owned());
-    let throughput_projector_base =
-        env::var("THROUGHPUT_PROJECTOR_URL").unwrap_or_else(|_| "http://127.0.0.1:3007".to_owned());
+    let throughput_runtime_debug_base = env::var("STREAMS_DEBUG_URL")
+        .or_else(|_| env::var("THROUGHPUT_DEBUG_URL"))
+        .unwrap_or_else(|_| "http://127.0.0.1:3006".to_owned());
+    let throughput_projector_base = env::var("STREAMS_PROJECTOR_URL")
+        .or_else(|_| env::var("THROUGHPUT_PROJECTOR_URL"))
+        .unwrap_or_else(|_| "http://127.0.0.1:3007".to_owned());
     let unified_runtime_debug_base = env::var("UNIFIED_RUNTIME_DEBUG_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:3008".to_owned());
 
@@ -429,7 +431,7 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         Some(
             fetch_optional_debug(
                 &client,
-                &format!("{throughput_runtime_debug_base}/debug/throughput"),
+                &format!("{throughput_runtime_debug_base}/debug/streams-runtime"),
             )
             .await,
         )
@@ -442,7 +444,7 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         Some(
             fetch_optional_debug(
                 &client,
-                &format!("{throughput_projector_base}/debug/throughput-projector"),
+                &format!("{throughput_projector_base}/debug/streams-projector"),
             )
             .await,
         )
@@ -594,7 +596,7 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         Some(
             fetch_optional_debug(
                 &client,
-                &format!("{throughput_runtime_debug_base}/debug/throughput"),
+                &format!("{throughput_runtime_debug_base}/debug/streams-runtime"),
             )
             .await,
         )
@@ -611,7 +613,7 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         Some(
             fetch_optional_debug(
                 &client,
-                &format!("{throughput_projector_base}/debug/throughput-projector"),
+                &format!("{throughput_projector_base}/debug/streams-projector"),
             )
             .await,
         )
@@ -794,7 +796,7 @@ async fn run_topic_adapter_benchmark(
         Some(
             fetch_optional_debug(
                 client,
-                &format!("{throughput_runtime_debug_base}/debug/throughput"),
+                &format!("{throughput_runtime_debug_base}/debug/streams-runtime"),
             )
             .await,
         )
@@ -807,7 +809,7 @@ async fn run_topic_adapter_benchmark(
         Some(
             fetch_optional_debug(
                 client,
-                &format!("{throughput_projector_base}/debug/throughput-projector"),
+                &format!("{throughput_projector_base}/debug/streams-projector"),
             )
             .await,
         )
@@ -941,7 +943,7 @@ async fn run_topic_adapter_benchmark(
         Some(
             fetch_optional_debug(
                 client,
-                &format!("{throughput_runtime_debug_base}/debug/throughput"),
+                &format!("{throughput_runtime_debug_base}/debug/streams-runtime"),
             )
             .await,
         )
@@ -958,7 +960,7 @@ async fn run_topic_adapter_benchmark(
         Some(
             fetch_optional_debug(
                 client,
-                &format!("{throughput_projector_base}/debug/throughput-projector"),
+                &format!("{throughput_projector_base}/debug/streams-projector"),
             )
             .await,
         )
@@ -3741,11 +3743,7 @@ mod tests {
             ..demo_args()
         };
 
-        assert!(!can_use_durable_batch_api_with_overrides(
-            &durable,
-            Some(true),
-            Some(true)
-        ));
+        assert!(!can_use_durable_batch_api_with_overrides(&durable, Some(true), Some(true)));
     }
 
     #[test]
@@ -3758,11 +3756,7 @@ mod tests {
         durable.retry_rate = 0.01;
 
         assert!(!can_use_durable_batch_api_with_overrides(&durable, None, None));
-        assert!(!can_use_durable_batch_api_with_overrides(
-            &durable,
-            Some(true),
-            None
-        ));
+        assert!(!can_use_durable_batch_api_with_overrides(&durable, Some(true), None));
     }
 
     #[test]

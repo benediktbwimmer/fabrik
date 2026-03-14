@@ -9,7 +9,7 @@ dependencies = [
  "anyhow",
  "fabrik-config",
  "fabrik-service",
- "fabrik-throughput",
+ "fabrik-streams",
  "fabrik-worker-protocol",
  "fabrik-workflow",
  "reqwest",
@@ -740,7 +740,7 @@ dependencies = [
  "fabrik-broker",
  "fabrik-config",
  "fabrik-store",
- "fabrik-throughput",
+ "fabrik-streams",
  "fabrik-workflow",
  "futures-util",
  "reqwest",
@@ -1239,7 +1239,7 @@ name = "fabrik-events"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "fabrik-throughput",
+ "fabrik-streams",
  "serde",
  "serde_json",
  "uuid",
@@ -1264,7 +1264,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "fabrik-events",
- "fabrik-throughput",
+ "fabrik-streams",
  "fabrik-workflow",
  "serde",
  "serde_json",
@@ -1274,7 +1274,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "fabrik-throughput"
+name = "fabrik-streams"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1304,7 +1304,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "fabrik-events",
- "fabrik-throughput",
+ "fabrik-streams",
  "serde",
  "serde_json",
  "sha2",
@@ -2018,7 +2018,7 @@ dependencies = [
  "fabrik-events",
  "fabrik-service",
  "fabrik-store",
- "fabrik-throughput",
+ "fabrik-streams",
  "fabrik-workflow",
  "futures-util",
  "serde",
@@ -2741,7 +2741,7 @@ dependencies = [
  "fabrik-events",
  "fabrik-service",
  "fabrik-store",
- "fabrik-throughput",
+ "fabrik-streams",
  "fabrik-workflow",
  "reqwest",
  "serde",
@@ -3706,6 +3706,50 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "streams-projector"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.8.8",
+ "chrono",
+ "fabrik-broker",
+ "fabrik-config",
+ "fabrik-service",
+ "fabrik-store",
+ "fabrik-streams",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "streams-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.8.8",
+ "chrono",
+ "fabrik-broker",
+ "fabrik-config",
+ "fabrik-events",
+ "fabrik-service",
+ "fabrik-store",
+ "fabrik-streams",
+ "fabrik-worker-protocol",
+ "fabrik-workflow",
+ "futures-util",
+ "rocksdb",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "stringprep"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3813,50 +3857,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "throughput-projector"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum 0.8.8",
- "chrono",
- "fabrik-broker",
- "fabrik-config",
- "fabrik-service",
- "fabrik-store",
- "fabrik-throughput",
- "futures-util",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "throughput-runtime"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum 0.8.8",
- "chrono",
- "fabrik-broker",
- "fabrik-config",
- "fabrik-events",
- "fabrik-service",
- "fabrik-store",
- "fabrik-throughput",
- "fabrik-worker-protocol",
- "fabrik-workflow",
- "futures-util",
- "rocksdb",
- "serde",
- "serde_json",
- "tokio",
- "tonic",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -4229,7 +4229,7 @@ dependencies = [
  "fabrik-events",
  "fabrik-service",
  "fabrik-store",
- "fabrik-throughput",
+ "fabrik-streams",
  "fabrik-worker-protocol",
  "fabrik-workflow",
  "futures-util",

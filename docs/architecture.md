@@ -195,7 +195,7 @@ Responsibilities:
 - expose strong owner-routed reads and cheaper eventual projections
 - emit fenced terminal outcomes or named checkpoints back through the bridge
 
-The current implementation of this subsystem is the `stream-v2` lane built from `throughput-runtime`, `throughput-projector`, Redpanda or Kafka, RocksDB, and object storage. The architecture should treat that as an implementation detail of the internal stream subsystem rather than as workflow-facing product surface.
+The current implementation of this subsystem is the `stream-v2` lane built from the `streams-runtime` and `streams-projector` services, Redpanda or Kafka, RocksDB, and object storage. The architecture should treat that as an implementation detail of the internal stream subsystem rather than as workflow-facing product surface.
 
 ### 9. Visibility Layer
 
@@ -321,13 +321,13 @@ That means compiled workflows plus arbitrary activities, not compiled workflows 
 
 ### 11. Throughput Runtime (`stream-v2` Implementation)
 
-`throughput-runtime` is the current implementation of the internal stream execution subsystem for active throughput runs. `unified-runtime` remains the workflow barrier owner, but only through the bridge for admission and terminal resume.
+`streams-runtime` is the current implementation of the internal stream execution subsystem for active throughput runs. `unified-runtime` remains the workflow barrier owner, but only through the bridge for admission and terminal resume.
 
 The intended `stream-v2` split is:
 
 - workflow-side bridge logic validates a bulk step, persists minimal throughput admission plus workflow resume metadata, and emits `StartThroughputRun`
-- `throughput-runtime` owns chunk planning, worker leasing, retries, reducer state, cancellation, checkpointing, and terminalization
-- `throughput-runtime` returns exactly one terminal run outcome through the bridge
+- `streams-runtime` owns chunk planning, worker leasing, retries, reducer state, cancellation, checkpointing, and terminalization
+- `streams-runtime` returns exactly one terminal run outcome through the bridge
 - workflow-side bridge logic appends the authoritative workflow barrier event and resumes the workflow turn
 
 The throughput runtime therefore:

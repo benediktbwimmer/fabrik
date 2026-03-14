@@ -1,8 +1,12 @@
 [package]
-name = "throughput-projector"
+name = "streams-projector"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+
+[[bin]]
+name = "throughput-projector"
+path = "src/bin/throughput-projector.rs"
 
 [dependencies]
 anyhow.workspace = true
@@ -12,7 +16,7 @@ fabrik-broker = { path = "../../crates/fabrik-broker" }
 fabrik-config = { path = "../../crates/fabrik-config" }
 fabrik-service = { path = "../../crates/fabrik-service" }
 fabrik-store = { path = "../../crates/fabrik-store" }
-fabrik-throughput = { path = "../../crates/fabrik-throughput" }
+fabrik-throughput = { package = "fabrik-streams", path = "../../crates/fabrik-throughput" }
 futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true

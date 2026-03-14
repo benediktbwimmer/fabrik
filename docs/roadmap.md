@@ -146,7 +146,7 @@ Deliverables:
 - `start_bulk_activity` and `wait_for_bulk_activity` IR nodes
 - batch-level workflow history events
 - bridge protocol for throughput admission, fencing, idempotency, and callback translation
-- stream-backed execution lane with dedicated throughput-runtime service
+- stream-backed execution lane with dedicated streams-runtime service
 - chunk-level retry and coarse cancellation
 - batch/chunk visibility query endpoints
 - dedicated bulk worker gRPC protocol

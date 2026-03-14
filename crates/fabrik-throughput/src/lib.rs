@@ -4,6 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod bridge;
+
 use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::{
@@ -15,6 +17,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use uuid::Uuid;
+
+pub use bridge::*;
 
 pub const STREAM_V2_BACKEND: &str = "stream-v2";
 pub const CORE_ECHO_ACTIVITY: &str = "core.echo";
@@ -75,10 +79,7 @@ pub fn throughput_terminal_callback_dedupe_key(
 }
 
 pub fn throughput_terminal_callback_event_id(dedupe_key: &str) -> Uuid {
-    Uuid::new_v5(
-        &Uuid::NAMESPACE_URL,
-        format!("throughput-terminal-event:{dedupe_key}").as_bytes(),
-    )
+    Uuid::new_v5(&Uuid::NAMESPACE_URL, format!("throughput-terminal-event:{dedupe_key}").as_bytes())
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -2098,10 +2099,7 @@ mod tests {
     fn bridge_request_and_terminal_dedupe_helpers_are_stable() {
         let bridge_request_id =
             throughput_bridge_request_id("tenant-a", "instance-a", "run-a", "batch-a");
-        assert_eq!(
-            bridge_request_id,
-            "throughput-bridge:tenant-a:instance-a:run-a:batch-a"
-        );
+        assert_eq!(bridge_request_id, "throughput-bridge:tenant-a:instance-a:run-a:batch-a");
 
         let callback_dedupe = throughput_terminal_callback_dedupe_key(
             "tenant-a",

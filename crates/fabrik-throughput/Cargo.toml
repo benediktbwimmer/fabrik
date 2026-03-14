@@ -1,5 +1,5 @@
 [package]
-name = "fabrik-throughput"
+name = "fabrik-streams"
 edition.workspace = true
 license.workspace = true
 version.workspace = true

@@ -23,8 +23,8 @@ If we reverse that order, we risk moving today's coupling into a new package or 
 Today the system already has most of the execution pieces:
 
 - workflow-side admission in `unified-runtime`
-- a dedicated `throughput-runtime`
-- asynchronous projection in `throughput-projector`
+- a dedicated `streams-runtime`
+- asynchronous projection in `streams-projector`
 - throughput-specific worker polling and reporting
 - query and visibility paths that expose batch and chunk state
 

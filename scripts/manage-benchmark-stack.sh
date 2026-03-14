@@ -248,8 +248,8 @@ stop_existing_local_services() {
   fi
   local patterns=(
     'target/release/ingest-service'
-    'target/release/throughput-runtime'
-    'target/release/throughput-projector'
+    'target/release/streams-runtime'
+    'target/release/streams-projector'
     'target/release/timer-service'
     'target/release/unified-runtime'
     'target/release/activity-worker-service'
@@ -383,9 +383,9 @@ while IFS= read -r port; do
   PORTS+=("$port")
 done < <(reserve_ports)
 INGEST_PORT="${INGEST_SERVICE_PORT:-${PORTS[0]}}"
-THROUGHPUT_RUNTIME_PORT="${THROUGHPUT_RUNTIME_PORT:-${PORTS[3]}}"
-THROUGHPUT_DEBUG_PORT="${THROUGHPUT_DEBUG_PORT:-${PORTS[4]}}"
-THROUGHPUT_PROJECTOR_PORT="${THROUGHPUT_PROJECTOR_PORT:-${PORTS[5]}}"
+STREAMS_RUNTIME_PORT="${STREAMS_RUNTIME_PORT:-${THROUGHPUT_RUNTIME_PORT:-${PORTS[3]}}}"
+STREAMS_DEBUG_PORT="${STREAMS_DEBUG_PORT:-${THROUGHPUT_DEBUG_PORT:-${PORTS[4]}}}"
+STREAMS_PROJECTOR_PORT="${STREAMS_PROJECTOR_PORT:-${THROUGHPUT_PROJECTOR_PORT:-${PORTS[5]}}}"
 ACTIVITY_WORKER_SERVICE_PORT="${ACTIVITY_WORKER_SERVICE_PORT:-${PORTS[6]}}"
 STREAM_ACTIVITY_WORKER_SERVICE_PORT="${STREAM_ACTIVITY_WORKER_SERVICE_PORT:-${PORTS[7]}}"
 TIMER_SERVICE_PORT="${TIMER_SERVICE_PORT:-${PORTS[8]}}"
@@ -506,8 +506,8 @@ if [[ "$BUILD_RELEASE" == "1" ]]; then
     -p benchmark-runner \
     -p ingest-service \
     -p unified-runtime \
-    -p throughput-runtime \
-    -p throughput-projector \
+    -p streams-runtime \
+    -p streams-projector \
     -p timer-service \
     -p activity-worker-service >/dev/null
 fi
@@ -590,23 +590,26 @@ if [[ "$EXECUTION_MODE" == "unified" ]]; then
     -- \
     target/release/activity-worker-service
 else
-  echo "[benchmark-stack] starting throughput-runtime"
-  start_service "$LOG_DIR/throughput-runtime.log" \
+  echo "[benchmark-stack] starting streams-runtime"
+  start_service "$LOG_DIR/streams-runtime.log" \
     "${COMMON_ENV[@]}" \
-    "THROUGHPUT_RUNTIME_PORT=$THROUGHPUT_RUNTIME_PORT" \
-    "THROUGHPUT_DEBUG_PORT=$THROUGHPUT_DEBUG_PORT" \
+    "STREAMS_RUNTIME_PORT=$STREAMS_RUNTIME_PORT" \
+    "STREAMS_DEBUG_PORT=$STREAMS_DEBUG_PORT" \
+    "THROUGHPUT_RUNTIME_PORT=$STREAMS_RUNTIME_PORT" \
+    "THROUGHPUT_DEBUG_PORT=$STREAMS_DEBUG_PORT" \
     -- \
-    target/release/throughput-runtime
-  wait_for_port 127.0.0.1 "$THROUGHPUT_RUNTIME_PORT" "throughput-runtime"
-  wait_for_port 127.0.0.1 "$THROUGHPUT_DEBUG_PORT" "throughput-runtime-debug"
+    target/release/streams-runtime
+  wait_for_port 127.0.0.1 "$STREAMS_RUNTIME_PORT" "streams-runtime"
+  wait_for_port 127.0.0.1 "$STREAMS_DEBUG_PORT" "streams-runtime-debug"
 
-  echo "[benchmark-stack] starting throughput-projector"
-  start_service "$LOG_DIR/throughput-projector.log" \
+  echo "[benchmark-stack] starting streams-projector"
+  start_service "$LOG_DIR/streams-projector.log" \
     "${COMMON_ENV[@]}" \
-    "THROUGHPUT_PROJECTOR_PORT=$THROUGHPUT_PROJECTOR_PORT" \
+    "STREAMS_PROJECTOR_PORT=$STREAMS_PROJECTOR_PORT" \
+    "THROUGHPUT_PROJECTOR_PORT=$STREAMS_PROJECTOR_PORT" \
     -- \
-    target/release/throughput-projector
-  wait_for_port 127.0.0.1 "$THROUGHPUT_PROJECTOR_PORT" "throughput-projector"
+    target/release/streams-projector
+  wait_for_port 127.0.0.1 "$STREAMS_PROJECTOR_PORT" "streams-projector"
 
   echo "[benchmark-stack] starting activity-worker-service (pg-v1/unified)"
   start_service "$LOG_DIR/activity-worker-service-pg-v1.log" \
@@ -628,7 +631,7 @@ else
     "${COMMON_ENV[@]}" \
     "ACTIVITY_WORKER_SERVICE_PORT=$STREAM_ACTIVITY_WORKER_SERVICE_PORT" \
     "UNIFIED_RUNTIME_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
-    "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$THROUGHPUT_RUNTIME_PORT" \
+    "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$STREAMS_RUNTIME_PORT" \
     "ACTIVITY_WORKER_TENANT_ID=$TENANT_ID" \
     "ACTIVITY_TASK_QUEUE=$TASK_QUEUE" \
     "ACTIVITY_WORKER_CONCURRENCY=${STREAM_ACTIVITY_WORKER_CONCURRENCY:-8}" \
@@ -651,8 +654,10 @@ THROUGHPUT_REPORTS_TOPIC=$THROUGHPUT_REPORTS_TOPIC
 THROUGHPUT_CHANGELOG_TOPIC=$THROUGHPUT_CHANGELOG_TOPIC
 THROUGHPUT_PROJECTIONS_TOPIC=$THROUGHPUT_PROJECTIONS_TOPIC
 INGEST_SERVICE_URL=http://127.0.0.1:$INGEST_PORT
-THROUGHPUT_DEBUG_URL=http://127.0.0.1:$THROUGHPUT_DEBUG_PORT
-THROUGHPUT_PROJECTOR_URL=http://127.0.0.1:$THROUGHPUT_PROJECTOR_PORT
+STREAMS_DEBUG_URL=http://127.0.0.1:$STREAMS_DEBUG_PORT
+THROUGHPUT_DEBUG_URL=http://127.0.0.1:$STREAMS_DEBUG_PORT
+STREAMS_PROJECTOR_URL=http://127.0.0.1:$STREAMS_PROJECTOR_PORT
+THROUGHPUT_PROJECTOR_URL=http://127.0.0.1:$STREAMS_PROJECTOR_PORT
 TIMER_SERVICE_URL=http://127.0.0.1:$TIMER_SERVICE_PORT
 UNIFIED_RUNTIME_DEBUG_URL=http://127.0.0.1:$UNIFIED_DEBUG_PORT
 KEEP_BENCHMARK_DATABASE=${KEEP_BENCHMARK_DATABASE:-0}

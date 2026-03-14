@@ -22,16 +22,16 @@ impl GrpcServiceConfig {
         default_name: &str,
         default_port: u16,
     ) -> Result<Self, ConfigError> {
-        let port_key = format!("{env_prefix}_PORT");
-        let port = match env::var(&port_key) {
-            Ok(raw) => raw
-                .parse::<u16>()
-                .map_err(|_| ConfigError::InvalidPort { key: port_key.clone(), value: raw })?,
-            Err(env::VarError::NotPresent) => default_port,
-            Err(err) => {
-                return Err(ConfigError::UnreadableEnv { key: port_key, source: err });
-            }
-        };
+        Self::from_env_aliases(&[env_prefix], default_name, default_port)
+    }
+
+    pub fn from_env_aliases(
+        env_prefixes: &[&str],
+        default_name: &str,
+        default_port: u16,
+    ) -> Result<Self, ConfigError> {
+        let port =
+            read_u16_with_default_aliases(&env_prefixes_to_port_keys(env_prefixes), default_port)?;
 
         let log_filter = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned());
 
@@ -45,16 +45,16 @@ impl HttpServiceConfig {
         default_name: &str,
         default_port: u16,
     ) -> Result<Self, ConfigError> {
-        let port_key = format!("{env_prefix}_PORT");
-        let port = match env::var(&port_key) {
-            Ok(raw) => raw
-                .parse::<u16>()
-                .map_err(|_| ConfigError::InvalidPort { key: port_key.clone(), value: raw })?,
-            Err(env::VarError::NotPresent) => default_port,
-            Err(err) => {
-                return Err(ConfigError::UnreadableEnv { key: port_key, source: err });
-            }
-        };
+        Self::from_env_aliases(&[env_prefix], default_name, default_port)
+    }
+
+    pub fn from_env_aliases(
+        env_prefixes: &[&str],
+        default_name: &str,
+        default_port: u16,
+    ) -> Result<Self, ConfigError> {
+        let port =
+            read_u16_with_default_aliases(&env_prefixes_to_port_keys(env_prefixes), default_port)?;
 
         let log_filter = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_owned());
 
@@ -78,28 +78,34 @@ impl RedpandaConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         Ok(Self {
             brokers: read_string_with_default("REDPANDA_BROKERS", "localhost:29092")?,
-            workflow_events_topic: read_string_with_default(
-                "WORKFLOW_EVENTS_TOPIC",
+            workflow_events_topic: read_string_with_default_aliases(
+                &["WORKFLOW_EVENTS_TOPIC"],
                 "workflow-events",
             )?,
-            workflow_events_partitions: read_i32_with_default("WORKFLOW_EVENTS_PARTITIONS", 4)?,
-            throughput_commands_topic: read_string_with_default(
-                "THROUGHPUT_COMMANDS_TOPIC",
+            workflow_events_partitions: read_i32_with_default_aliases(
+                &["WORKFLOW_EVENTS_PARTITIONS"],
+                4,
+            )?,
+            throughput_commands_topic: read_string_with_default_aliases(
+                &["STREAMS_COMMANDS_TOPIC", "THROUGHPUT_COMMANDS_TOPIC"],
                 "throughput-commands",
             )?,
-            throughput_reports_topic: read_string_with_default(
-                "THROUGHPUT_REPORTS_TOPIC",
+            throughput_reports_topic: read_string_with_default_aliases(
+                &["STREAMS_REPORTS_TOPIC", "THROUGHPUT_REPORTS_TOPIC"],
                 "throughput-reports",
             )?,
-            throughput_changelog_topic: read_string_with_default(
-                "THROUGHPUT_CHANGELOG_TOPIC",
+            throughput_changelog_topic: read_string_with_default_aliases(
+                &["STREAMS_CHANGELOG_TOPIC", "THROUGHPUT_CHANGELOG_TOPIC"],
                 "throughput-changelog",
             )?,
-            throughput_projections_topic: read_string_with_default(
-                "THROUGHPUT_PROJECTIONS_TOPIC",
+            throughput_projections_topic: read_string_with_default_aliases(
+                &["STREAMS_PROJECTIONS_TOPIC", "THROUGHPUT_PROJECTIONS_TOPIC"],
                 "throughput-projections",
             )?,
-            throughput_partitions: read_i32_with_default("THROUGHPUT_PARTITIONS", 4)?,
+            throughput_partitions: read_i32_with_default_aliases(
+                &["STREAMS_PARTITIONS", "THROUGHPUT_PARTITIONS"],
+                4,
+            )?,
         })
     }
 }
@@ -208,98 +214,144 @@ pub struct ThroughputOwnershipConfig {
     pub partition_id_offset: i32,
 }
 
+pub type StreamsRuntimeConfig = ThroughputRuntimeConfig;
+pub type StreamsPayloadStoreConfig = ThroughputPayloadStoreConfig;
+pub type StreamsOwnershipConfig = ThroughputOwnershipConfig;
+
 impl ThroughputRuntimeConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let owner_first_apply = read_bool_with_default("THROUGHPUT_OWNER_FIRST_APPLY", true)?;
+        let owner_first_apply = read_bool_with_default_aliases(
+            &["STREAMS_OWNER_FIRST_APPLY", "THROUGHPUT_OWNER_FIRST_APPLY"],
+            true,
+        )?;
         Ok(Self {
-            native_stream_v2_engine_enabled: read_bool_with_default(
-                "THROUGHPUT_NATIVE_STREAM_V2_ENGINE",
+            native_stream_v2_engine_enabled: read_bool_with_default_aliases(
+                &["STREAMS_NATIVE_STREAM_V2_ENGINE", "THROUGHPUT_NATIVE_STREAM_V2_ENGINE"],
                 false,
             )?,
-            lease_ttl_seconds: read_u64_with_default("THROUGHPUT_LEASE_TTL_SECONDS", 30)?,
-            sweep_interval_ms: read_u64_with_default("THROUGHPUT_SWEEP_INTERVAL_MS", 500)?,
-            poll_max_tasks: read_usize_with_default("THROUGHPUT_POLL_MAX_TASKS", 32)?,
-            report_apply_batch_size: read_usize_with_default(
-                "THROUGHPUT_REPORT_APPLY_BATCH_SIZE",
+            lease_ttl_seconds: read_u64_with_default_aliases(
+                &["STREAMS_LEASE_TTL_SECONDS", "THROUGHPUT_LEASE_TTL_SECONDS"],
+                30,
+            )?,
+            sweep_interval_ms: read_u64_with_default_aliases(
+                &["STREAMS_SWEEP_INTERVAL_MS", "THROUGHPUT_SWEEP_INTERVAL_MS"],
+                500,
+            )?,
+            poll_max_tasks: read_usize_with_default_aliases(
+                &["STREAMS_POLL_MAX_TASKS", "THROUGHPUT_POLL_MAX_TASKS"],
+                32,
+            )?,
+            report_apply_batch_size: read_usize_with_default_aliases(
+                &["STREAMS_REPORT_APPLY_BATCH_SIZE", "THROUGHPUT_REPORT_APPLY_BATCH_SIZE"],
                 64,
             )?,
-            changelog_publish_batch_size: read_usize_with_default(
-                "THROUGHPUT_CHANGELOG_PUBLISH_BATCH_SIZE",
+            changelog_publish_batch_size: read_usize_with_default_aliases(
+                &[
+                    "STREAMS_CHANGELOG_PUBLISH_BATCH_SIZE",
+                    "THROUGHPUT_CHANGELOG_PUBLISH_BATCH_SIZE",
+                ],
                 128,
             )?,
-            projection_publish_batch_size: read_usize_with_default(
-                "THROUGHPUT_PROJECTION_PUBLISH_BATCH_SIZE",
+            projection_publish_batch_size: read_usize_with_default_aliases(
+                &[
+                    "STREAMS_PROJECTION_PUBLISH_BATCH_SIZE",
+                    "THROUGHPUT_PROJECTION_PUBLISH_BATCH_SIZE",
+                ],
                 128,
             )?,
-            publish_transient_projection_updates: read_bool_with_default(
-                "THROUGHPUT_PUBLISH_TRANSIENT_PROJECTION_UPDATES",
+            publish_transient_projection_updates: read_bool_with_default_aliases(
+                &[
+                    "STREAMS_PUBLISH_TRANSIENT_PROJECTION_UPDATES",
+                    "THROUGHPUT_PUBLISH_TRANSIENT_PROJECTION_UPDATES",
+                ],
                 false,
             )?,
             owner_first_apply,
-            publish_projection_events: read_bool_with_default(
-                "THROUGHPUT_PUBLISH_PROJECTION_EVENTS",
+            publish_projection_events: read_bool_with_default_aliases(
+                &["STREAMS_PUBLISH_PROJECTION_EVENTS", "THROUGHPUT_PUBLISH_PROJECTION_EVENTS"],
                 !owner_first_apply,
             )?,
-            max_active_chunks_per_batch: read_usize_with_default(
-                "THROUGHPUT_MAX_ACTIVE_CHUNKS_PER_BATCH",
+            max_active_chunks_per_batch: read_usize_with_default_aliases(
+                &["STREAMS_MAX_ACTIVE_CHUNKS_PER_BATCH", "THROUGHPUT_MAX_ACTIVE_CHUNKS_PER_BATCH"],
                 256,
             )?,
-            max_active_chunks_per_tenant: read_usize_with_default(
-                "THROUGHPUT_MAX_ACTIVE_CHUNKS_PER_TENANT",
+            max_active_chunks_per_tenant: read_usize_with_default_aliases(
+                &[
+                    "STREAMS_MAX_ACTIVE_CHUNKS_PER_TENANT",
+                    "THROUGHPUT_MAX_ACTIVE_CHUNKS_PER_TENANT",
+                ],
                 4_096,
             )?,
-            max_active_chunks_per_task_queue: read_usize_with_default(
-                "THROUGHPUT_MAX_ACTIVE_CHUNKS_PER_TASK_QUEUE",
+            max_active_chunks_per_task_queue: read_usize_with_default_aliases(
+                &[
+                    "STREAMS_MAX_ACTIVE_CHUNKS_PER_TASK_QUEUE",
+                    "THROUGHPUT_MAX_ACTIVE_CHUNKS_PER_TASK_QUEUE",
+                ],
                 2_048,
             )?,
-            local_state_dir: read_string_with_default(
-                "THROUGHPUT_LOCAL_STATE_DIR",
+            local_state_dir: read_string_with_default_aliases(
+                &["STREAMS_LOCAL_STATE_DIR", "THROUGHPUT_LOCAL_STATE_DIR"],
                 "/tmp/fabrik-throughput/state",
             )?,
-            checkpoint_dir: read_string_with_default(
-                "THROUGHPUT_CHECKPOINT_DIR",
+            checkpoint_dir: read_string_with_default_aliases(
+                &["STREAMS_CHECKPOINT_DIR", "THROUGHPUT_CHECKPOINT_DIR"],
                 "/tmp/fabrik-throughput/checkpoints",
             )?,
-            checkpoint_interval_seconds: read_u64_with_default(
-                "THROUGHPUT_CHECKPOINT_INTERVAL_SECONDS",
+            checkpoint_interval_seconds: read_u64_with_default_aliases(
+                &["STREAMS_CHECKPOINT_INTERVAL_SECONDS", "THROUGHPUT_CHECKPOINT_INTERVAL_SECONDS"],
                 30,
             )?,
-            checkpoint_retention: read_usize_with_default("THROUGHPUT_CHECKPOINT_RETENTION", 5)?,
-            checkpoint_key_prefix: read_string_with_default(
-                "THROUGHPUT_CHECKPOINT_KEY_PREFIX",
+            checkpoint_retention: read_usize_with_default_aliases(
+                &["STREAMS_CHECKPOINT_RETENTION", "THROUGHPUT_CHECKPOINT_RETENTION"],
+                5,
+            )?,
+            checkpoint_key_prefix: read_string_with_default_aliases(
+                &["STREAMS_CHECKPOINT_KEY_PREFIX", "THROUGHPUT_CHECKPOINT_KEY_PREFIX"],
                 "checkpoints",
             )?,
-            terminal_state_retention_seconds: read_u64_with_default(
-                "THROUGHPUT_TERMINAL_STATE_RETENTION_SECONDS",
+            terminal_state_retention_seconds: read_u64_with_default_aliases(
+                &[
+                    "STREAMS_TERMINAL_STATE_RETENTION_SECONDS",
+                    "THROUGHPUT_TERMINAL_STATE_RETENTION_SECONDS",
+                ],
                 3600,
             )?,
-            terminal_gc_interval_seconds: read_u64_with_default(
-                "THROUGHPUT_TERMINAL_GC_INTERVAL_SECONDS",
+            terminal_gc_interval_seconds: read_u64_with_default_aliases(
+                &[
+                    "STREAMS_TERMINAL_GC_INTERVAL_SECONDS",
+                    "THROUGHPUT_TERMINAL_GC_INTERVAL_SECONDS",
+                ],
                 60,
             )?,
-            restore_idle_timeout_ms: read_u64_with_default(
-                "THROUGHPUT_RESTORE_IDLE_TIMEOUT_MS",
+            restore_idle_timeout_ms: read_u64_with_default_aliases(
+                &["STREAMS_RESTORE_IDLE_TIMEOUT_MS", "THROUGHPUT_RESTORE_IDLE_TIMEOUT_MS"],
                 1_000,
             )?,
             payload_store: ThroughputPayloadStoreConfig::from_env()?,
-            inline_chunk_input_threshold_bytes: read_usize_with_default(
-                "THROUGHPUT_INLINE_CHUNK_INPUT_THRESHOLD_BYTES",
+            inline_chunk_input_threshold_bytes: read_usize_with_default_aliases(
+                &[
+                    "STREAMS_INLINE_CHUNK_INPUT_THRESHOLD_BYTES",
+                    "THROUGHPUT_INLINE_CHUNK_INPUT_THRESHOLD_BYTES",
+                ],
                 32 * 1024,
             )?,
-            inline_chunk_output_threshold_bytes: read_usize_with_default(
-                "THROUGHPUT_INLINE_CHUNK_OUTPUT_THRESHOLD_BYTES",
+            inline_chunk_output_threshold_bytes: read_usize_with_default_aliases(
+                &[
+                    "STREAMS_INLINE_CHUNK_OUTPUT_THRESHOLD_BYTES",
+                    "THROUGHPUT_INLINE_CHUNK_OUTPUT_THRESHOLD_BYTES",
+                ],
                 32 * 1024,
             )?,
-            grouping_chunk_threshold: read_usize_with_default(
-                "THROUGHPUT_GROUPING_CHUNK_THRESHOLD",
+            grouping_chunk_threshold: read_usize_with_default_aliases(
+                &["STREAMS_GROUPING_CHUNK_THRESHOLD", "THROUGHPUT_GROUPING_CHUNK_THRESHOLD"],
                 128,
             )?,
-            target_chunks_per_group: read_usize_with_default(
-                "THROUGHPUT_TARGET_CHUNKS_PER_GROUP",
+            target_chunks_per_group: read_usize_with_default_aliases(
+                &["STREAMS_TARGET_CHUNKS_PER_GROUP", "THROUGHPUT_TARGET_CHUNKS_PER_GROUP"],
                 64,
             )?,
-            max_aggregation_groups: read_usize_with_default(
-                "THROUGHPUT_MAX_AGGREGATION_GROUPS",
+            max_aggregation_groups: read_usize_with_default_aliases(
+                &["STREAMS_MAX_AGGREGATION_GROUPS", "THROUGHPUT_MAX_AGGREGATION_GROUPS"],
                 32,
             )?,
         })
@@ -308,50 +360,79 @@ impl ThroughputRuntimeConfig {
 
 impl ThroughputOwnershipConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let static_partition_ids = match env::var("THROUGHPUT_OWNERSHIP_PARTITIONS") {
-            Ok(raw) => Some(parse_partition_ids(&raw)?),
-            Err(env::VarError::NotPresent) => match env::var("THROUGHPUT_OWNERSHIP_PARTITION_ID") {
-                Ok(raw) => Some(vec![raw.parse::<i32>().map_err(|_| ConfigError::InvalidI32 {
-                    key: "THROUGHPUT_OWNERSHIP_PARTITION_ID".to_owned(),
-                    value: raw,
-                })?]),
-                Err(env::VarError::NotPresent) => None,
-                Err(source) => {
-                    return Err(ConfigError::UnreadableEnv {
-                        key: "THROUGHPUT_OWNERSHIP_PARTITION_ID".to_owned(),
-                        source,
-                    });
+        let static_partition_ids = match env_var_first(&[
+            "STREAMS_OWNERSHIP_PARTITIONS",
+            "THROUGHPUT_OWNERSHIP_PARTITIONS",
+        ])? {
+            Ok((_, raw)) => Some(parse_partition_ids(&raw)?),
+            Err(env::VarError::NotPresent) => {
+                match env_var_first(&[
+                    "STREAMS_OWNERSHIP_PARTITION_ID",
+                    "THROUGHPUT_OWNERSHIP_PARTITION_ID",
+                ])? {
+                    Ok((key, raw)) => Some(vec![
+                        raw.parse::<i32>()
+                            .map_err(|_| ConfigError::InvalidI32 { key, value: raw })?,
+                    ]),
+                    Err(env::VarError::NotPresent) => None,
+                    Err(source) => {
+                        return Err(ConfigError::UnreadableEnv {
+                            key: "STREAMS_OWNERSHIP_PARTITION_ID".to_owned(),
+                            source,
+                        });
+                    }
                 }
-            },
+            }
             Err(source) => {
                 return Err(ConfigError::UnreadableEnv {
-                    key: "THROUGHPUT_OWNERSHIP_PARTITIONS".to_owned(),
+                    key: "STREAMS_OWNERSHIP_PARTITIONS".to_owned(),
                     source,
                 });
             }
         };
         Ok(Self {
             static_partition_ids,
-            runtime_capacity: read_usize_with_default("THROUGHPUT_RUNTIME_CAPACITY", 4)?,
-            member_heartbeat_ttl_seconds: read_u64_with_default(
-                "THROUGHPUT_OWNERSHIP_MEMBER_HEARTBEAT_TTL_SECONDS",
+            runtime_capacity: read_usize_with_default_aliases(
+                &["STREAMS_RUNTIME_CAPACITY", "THROUGHPUT_RUNTIME_CAPACITY"],
+                4,
+            )?,
+            member_heartbeat_ttl_seconds: read_u64_with_default_aliases(
+                &[
+                    "STREAMS_OWNERSHIP_MEMBER_HEARTBEAT_TTL_SECONDS",
+                    "THROUGHPUT_OWNERSHIP_MEMBER_HEARTBEAT_TTL_SECONDS",
+                ],
                 15,
             )?,
-            assignment_poll_interval_seconds: read_u64_with_default(
-                "THROUGHPUT_OWNERSHIP_ASSIGNMENT_POLL_INTERVAL_SECONDS",
+            assignment_poll_interval_seconds: read_u64_with_default_aliases(
+                &[
+                    "STREAMS_OWNERSHIP_ASSIGNMENT_POLL_INTERVAL_SECONDS",
+                    "THROUGHPUT_OWNERSHIP_ASSIGNMENT_POLL_INTERVAL_SECONDS",
+                ],
                 2,
             )?,
-            rebalance_interval_seconds: read_u64_with_default(
-                "THROUGHPUT_OWNERSHIP_REBALANCE_INTERVAL_SECONDS",
+            rebalance_interval_seconds: read_u64_with_default_aliases(
+                &[
+                    "STREAMS_OWNERSHIP_REBALANCE_INTERVAL_SECONDS",
+                    "THROUGHPUT_OWNERSHIP_REBALANCE_INTERVAL_SECONDS",
+                ],
                 5,
             )?,
-            lease_ttl_seconds: read_u64_with_default("THROUGHPUT_OWNERSHIP_LEASE_TTL_SECONDS", 15)?,
-            renew_interval_seconds: read_u64_with_default(
-                "THROUGHPUT_OWNERSHIP_RENEW_INTERVAL_SECONDS",
+            lease_ttl_seconds: read_u64_with_default_aliases(
+                &["STREAMS_OWNERSHIP_LEASE_TTL_SECONDS", "THROUGHPUT_OWNERSHIP_LEASE_TTL_SECONDS"],
+                15,
+            )?,
+            renew_interval_seconds: read_u64_with_default_aliases(
+                &[
+                    "STREAMS_OWNERSHIP_RENEW_INTERVAL_SECONDS",
+                    "THROUGHPUT_OWNERSHIP_RENEW_INTERVAL_SECONDS",
+                ],
                 5,
             )?,
-            partition_id_offset: read_i32_with_default(
-                "THROUGHPUT_OWNERSHIP_PARTITION_ID_OFFSET",
+            partition_id_offset: read_i32_with_default_aliases(
+                &[
+                    "STREAMS_OWNERSHIP_PARTITION_ID_OFFSET",
+                    "THROUGHPUT_OWNERSHIP_PARTITION_ID_OFFSET",
+                ],
                 2_000_000,
             )?,
         })
@@ -414,25 +495,40 @@ impl QueryRuntimeConfig {
 impl ThroughputPayloadStoreConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         Ok(Self {
-            kind: read_payload_store_kind_with_default(
-                "THROUGHPUT_PAYLOAD_STORE",
+            kind: read_payload_store_kind_with_default_aliases(
+                &["STREAMS_PAYLOAD_STORE", "THROUGHPUT_PAYLOAD_STORE"],
                 ThroughputPayloadStoreKind::LocalFilesystem,
             )?,
-            local_dir: read_string_with_default(
-                "THROUGHPUT_PAYLOAD_STORE_DIR",
+            local_dir: read_string_with_default_aliases(
+                &["STREAMS_PAYLOAD_STORE_DIR", "THROUGHPUT_PAYLOAD_STORE_DIR"],
                 "/tmp/fabrik-throughput/payloads",
             )?,
-            s3_bucket: read_optional_string("THROUGHPUT_PAYLOAD_S3_BUCKET")?,
-            s3_region: read_string_with_default("THROUGHPUT_PAYLOAD_S3_REGION", "us-east-1")?,
-            s3_endpoint: read_optional_string("THROUGHPUT_PAYLOAD_S3_ENDPOINT")?,
-            s3_access_key_id: read_optional_string("THROUGHPUT_PAYLOAD_S3_ACCESS_KEY_ID")?,
-            s3_secret_access_key: read_optional_string("THROUGHPUT_PAYLOAD_S3_SECRET_ACCESS_KEY")?,
-            s3_force_path_style: read_bool_with_default(
-                "THROUGHPUT_PAYLOAD_S3_FORCE_PATH_STYLE",
+            s3_bucket: read_optional_string_aliases(&[
+                "STREAMS_PAYLOAD_S3_BUCKET",
+                "THROUGHPUT_PAYLOAD_S3_BUCKET",
+            ])?,
+            s3_region: read_string_with_default_aliases(
+                &["STREAMS_PAYLOAD_S3_REGION", "THROUGHPUT_PAYLOAD_S3_REGION"],
+                "us-east-1",
+            )?,
+            s3_endpoint: read_optional_string_aliases(&[
+                "STREAMS_PAYLOAD_S3_ENDPOINT",
+                "THROUGHPUT_PAYLOAD_S3_ENDPOINT",
+            ])?,
+            s3_access_key_id: read_optional_string_aliases(&[
+                "STREAMS_PAYLOAD_S3_ACCESS_KEY_ID",
+                "THROUGHPUT_PAYLOAD_S3_ACCESS_KEY_ID",
+            ])?,
+            s3_secret_access_key: read_optional_string_aliases(&[
+                "STREAMS_PAYLOAD_S3_SECRET_ACCESS_KEY",
+                "THROUGHPUT_PAYLOAD_S3_SECRET_ACCESS_KEY",
+            ])?,
+            s3_force_path_style: read_bool_with_default_aliases(
+                &["STREAMS_PAYLOAD_S3_FORCE_PATH_STYLE", "THROUGHPUT_PAYLOAD_S3_FORCE_PATH_STYLE"],
                 false,
             )?,
-            s3_key_prefix: read_string_with_default(
-                "THROUGHPUT_PAYLOAD_S3_KEY_PREFIX",
+            s3_key_prefix: read_string_with_default_aliases(
+                &["STREAMS_PAYLOAD_S3_KEY_PREFIX", "THROUGHPUT_PAYLOAD_S3_KEY_PREFIX"],
                 "throughput",
             )?,
         })
@@ -482,13 +578,14 @@ impl ExecutorRuntimeConfig {
                 "EXECUTOR_MAX_TRANSITIONS_PER_TURN",
                 10_000,
             )?,
-            throughput_default_backend: read_throughput_backend_with_default(
-                "EXECUTOR_THROUGHPUT_DEFAULT_BACKEND",
+            throughput_default_backend: read_throughput_backend_with_default_aliases(
+                &["EXECUTOR_STREAMS_DEFAULT_BACKEND", "EXECUTOR_THROUGHPUT_DEFAULT_BACKEND"],
                 "stream-v2",
             )?,
-            throughput_task_queue_backends: read_task_queue_backend_overrides(
+            throughput_task_queue_backends: read_task_queue_backend_overrides_aliases(&[
+                "EXECUTOR_STREAMS_TASK_QUEUE_BACKENDS",
                 "EXECUTOR_THROUGHPUT_TASK_QUEUE_BACKENDS",
-            )?,
+            ])?,
         })
     }
 }
@@ -573,41 +670,87 @@ fn parse_partition_ids(raw: &str) -> Result<Vec<i32>, ConfigError> {
     Ok(partitions)
 }
 
+fn env_prefixes_to_port_keys(env_prefixes: &[&str]) -> Vec<String> {
+    env_prefixes.iter().map(|prefix| format!("{prefix}_PORT")).collect()
+}
+
+fn env_var_first(keys: &[&str]) -> Result<Result<(String, String), env::VarError>, ConfigError> {
+    for key in keys {
+        match env::var(key) {
+            Ok(value) => return Ok(Ok(((*key).to_owned(), value))),
+            Err(env::VarError::NotPresent) => continue,
+            Err(source) => {
+                return Err(ConfigError::UnreadableEnv { key: (*key).to_owned(), source });
+            }
+        }
+    }
+    Ok(Err(env::VarError::NotPresent))
+}
+
 fn read_string_with_default(key: &str, default: &str) -> Result<String, ConfigError> {
-    match env::var(key) {
-        Ok(value) => Ok(value),
+    read_string_with_default_aliases(&[key], default)
+}
+
+fn read_string_with_default_aliases(keys: &[&str], default: &str) -> Result<String, ConfigError> {
+    match env_var_first(keys)? {
+        Ok((_, value)) => Ok(value),
         Err(env::VarError::NotPresent) => Ok(default.to_owned()),
-        Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
+        Err(source) => Err(ConfigError::UnreadableEnv { key: keys[0].to_owned(), source }),
     }
 }
 
+fn read_u16_with_default_aliases(keys: &[String], default: u16) -> Result<u16, ConfigError> {
+    for key in keys {
+        match env::var(key) {
+            Ok(raw) => {
+                return raw
+                    .parse::<u16>()
+                    .map_err(|_| ConfigError::InvalidPort { key: key.clone(), value: raw });
+            }
+            Err(env::VarError::NotPresent) => continue,
+            Err(source) => {
+                return Err(ConfigError::UnreadableEnv { key: key.clone(), source });
+            }
+        }
+    }
+    Ok(default)
+}
+
 fn read_usize_with_default(key: &str, default: usize) -> Result<usize, ConfigError> {
-    match env::var(key) {
-        Ok(raw) => raw
-            .parse::<usize>()
-            .map_err(|_| ConfigError::InvalidUsize { key: key.to_owned(), value: raw }),
+    read_usize_with_default_aliases(&[key], default)
+}
+
+fn read_usize_with_default_aliases(keys: &[&str], default: usize) -> Result<usize, ConfigError> {
+    match env_var_first(keys)? {
+        Ok((key, raw)) => {
+            raw.parse::<usize>().map_err(|_| ConfigError::InvalidUsize { key, value: raw })
+        }
         Err(env::VarError::NotPresent) => Ok(default),
-        Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
+        Err(source) => Err(ConfigError::UnreadableEnv { key: keys[0].to_owned(), source }),
     }
 }
 
 fn read_u64_with_default(key: &str, default: u64) -> Result<u64, ConfigError> {
-    match env::var(key) {
-        Ok(raw) => raw
-            .parse::<u64>()
-            .map_err(|_| ConfigError::InvalidU64 { key: key.to_owned(), value: raw }),
+    read_u64_with_default_aliases(&[key], default)
+}
+
+fn read_u64_with_default_aliases(keys: &[&str], default: u64) -> Result<u64, ConfigError> {
+    match env_var_first(keys)? {
+        Ok((key, raw)) => {
+            raw.parse::<u64>().map_err(|_| ConfigError::InvalidU64 { key, value: raw })
+        }
         Err(env::VarError::NotPresent) => Ok(default),
-        Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
+        Err(source) => Err(ConfigError::UnreadableEnv { key: keys[0].to_owned(), source }),
     }
 }
 
-fn read_i32_with_default(key: &str, default: i32) -> Result<i32, ConfigError> {
-    match env::var(key) {
-        Ok(raw) => raw
-            .parse::<i32>()
-            .map_err(|_| ConfigError::InvalidI32 { key: key.to_owned(), value: raw }),
+fn read_i32_with_default_aliases(keys: &[&str], default: i32) -> Result<i32, ConfigError> {
+    match env_var_first(keys)? {
+        Ok((key, raw)) => {
+            raw.parse::<i32>().map_err(|_| ConfigError::InvalidI32 { key, value: raw })
+        }
         Err(env::VarError::NotPresent) => Ok(default),
-        Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
+        Err(source) => Err(ConfigError::UnreadableEnv { key: keys[0].to_owned(), source }),
     }
 }
 
@@ -622,31 +765,33 @@ fn read_i64_with_default(key: &str, default: i64) -> Result<i64, ConfigError> {
 }
 
 fn read_optional_u64(key: &str) -> Result<Option<u64>, ConfigError> {
-    match env::var(key) {
-        Ok(raw) if raw.trim().is_empty() => Ok(None),
-        Ok(raw) => raw
-            .parse::<u64>()
-            .map(Some)
-            .map_err(|_| ConfigError::InvalidU64 { key: key.to_owned(), value: raw }),
+    match env_var_first(&[key])? {
+        Ok((_key, raw)) if raw.trim().is_empty() => Ok(None),
+        Ok((key, raw)) => {
+            raw.parse::<u64>().map(Some).map_err(|_| ConfigError::InvalidU64 { key, value: raw })
+        }
         Err(env::VarError::NotPresent) => Ok(None),
         Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
     }
 }
 
-fn read_optional_string(key: &str) -> Result<Option<String>, ConfigError> {
-    match env::var(key) {
-        Ok(raw) if raw.trim().is_empty() => Ok(None),
-        Ok(raw) => Ok(Some(raw)),
+fn read_optional_string_aliases(keys: &[&str]) -> Result<Option<String>, ConfigError> {
+    match env_var_first(keys)? {
+        Ok((_, raw)) if raw.trim().is_empty() => Ok(None),
+        Ok((_, raw)) => Ok(Some(raw)),
         Err(env::VarError::NotPresent) => Ok(None),
-        Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
+        Err(source) => Err(ConfigError::UnreadableEnv { key: keys[0].to_owned(), source }),
     }
 }
 
-fn read_throughput_backend_with_default(key: &str, default: &str) -> Result<String, ConfigError> {
-    match env::var(key) {
-        Ok(raw) => validate_throughput_backend(key, raw),
+fn read_throughput_backend_with_default_aliases(
+    keys: &[&str],
+    default: &str,
+) -> Result<String, ConfigError> {
+    match env_var_first(keys)? {
+        Ok((key, raw)) => validate_throughput_backend(&key, raw),
         Err(env::VarError::NotPresent) => Ok(default.to_owned()),
-        Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
+        Err(source) => Err(ConfigError::UnreadableEnv { key: keys[0].to_owned(), source }),
     }
 }
 
@@ -657,8 +802,10 @@ fn validate_throughput_backend(key: &str, raw: String) -> Result<String, ConfigE
     }
 }
 
-fn read_task_queue_backend_overrides(key: &str) -> Result<BTreeMap<String, String>, ConfigError> {
-    let Some(raw) = read_optional_string(key)? else {
+fn read_task_queue_backend_overrides_aliases(
+    keys: &[&str],
+) -> Result<BTreeMap<String, String>, ConfigError> {
+    let Some(raw) = read_optional_string_aliases(keys)? else {
         return Ok(BTreeMap::new());
     };
 
@@ -670,49 +817,49 @@ fn read_task_queue_backend_overrides(key: &str) -> Result<BTreeMap<String, Strin
         }
         let Some((task_queue, backend)) = trimmed.split_once('=') else {
             return Err(ConfigError::InvalidTaskQueueBackendMapping {
-                key: key.to_owned(),
+                key: keys[0].to_owned(),
                 value: trimmed.to_owned(),
             });
         };
         let task_queue = task_queue.trim();
         if task_queue.is_empty() {
             return Err(ConfigError::InvalidTaskQueueBackendMapping {
-                key: key.to_owned(),
+                key: keys[0].to_owned(),
                 value: trimmed.to_owned(),
             });
         }
         overrides.insert(
             task_queue.to_owned(),
-            validate_throughput_backend(key, backend.trim().to_owned())?,
+            validate_throughput_backend(keys[0], backend.trim().to_owned())?,
         );
     }
     Ok(overrides)
 }
 
-fn read_bool_with_default(key: &str, default: bool) -> Result<bool, ConfigError> {
-    match env::var(key) {
-        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+fn read_bool_with_default_aliases(keys: &[&str], default: bool) -> Result<bool, ConfigError> {
+    match env_var_first(keys)? {
+        Ok((key, raw)) => match raw.trim().to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => Ok(true),
             "0" | "false" | "no" | "off" => Ok(false),
-            _ => Err(ConfigError::InvalidBool { key: key.to_owned(), value: raw }),
+            _ => Err(ConfigError::InvalidBool { key, value: raw }),
         },
         Err(env::VarError::NotPresent) => Ok(default),
-        Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
+        Err(source) => Err(ConfigError::UnreadableEnv { key: keys[0].to_owned(), source }),
     }
 }
 
-fn read_payload_store_kind_with_default(
-    key: &str,
+fn read_payload_store_kind_with_default_aliases(
+    keys: &[&str],
     default: ThroughputPayloadStoreKind,
 ) -> Result<ThroughputPayloadStoreKind, ConfigError> {
-    match env::var(key) {
-        Ok(raw) => match raw.trim() {
+    match env_var_first(keys)? {
+        Ok((key, raw)) => match raw.trim() {
             "localfs" => Ok(ThroughputPayloadStoreKind::LocalFilesystem),
             "s3" => Ok(ThroughputPayloadStoreKind::S3),
-            _ => Err(ConfigError::InvalidPayloadStoreKind { key: key.to_owned(), value: raw }),
+            _ => Err(ConfigError::InvalidPayloadStoreKind { key, value: raw }),
         },
         Err(env::VarError::NotPresent) => Ok(default),
-        Err(source) => Err(ConfigError::UnreadableEnv { key: key.to_owned(), source }),
+        Err(source) => Err(ConfigError::UnreadableEnv { key: keys[0].to_owned(), source }),
     }
 }
 
@@ -744,7 +891,7 @@ pub enum ConfigError {
 
 #[cfg(test)]
 mod tests {
-    use super::{HttpServiceConfig, ThroughputOwnershipConfig};
+    use super::{HttpServiceConfig, ThroughputOwnershipConfig, ThroughputRuntimeConfig};
 
     #[test]
     fn falls_back_to_default_port() {
@@ -757,8 +904,44 @@ mod tests {
     fn throughput_ownership_uses_non_overlapping_default_offset() {
         unsafe {
             std::env::remove_var("THROUGHPUT_OWNERSHIP_PARTITION_ID_OFFSET");
+            std::env::remove_var("STREAMS_OWNERSHIP_PARTITION_ID_OFFSET");
         }
         let config = ThroughputOwnershipConfig::from_env().unwrap();
         assert_eq!(config.partition_id_offset, 2_000_000);
+    }
+
+    #[test]
+    fn service_config_accepts_streams_prefix_alias() {
+        unsafe {
+            std::env::set_var("STREAMS_PROJECTOR_PORT", "4310");
+            std::env::remove_var("THROUGHPUT_PROJECTOR_PORT");
+        }
+        let config = HttpServiceConfig::from_env_aliases(
+            &["STREAMS_PROJECTOR", "THROUGHPUT_PROJECTOR"],
+            "streams-projector",
+            3007,
+        )
+        .unwrap();
+        assert_eq!(config.port, 4310);
+        assert_eq!(config.name, "streams-projector");
+        unsafe {
+            std::env::remove_var("STREAMS_PROJECTOR_PORT");
+        }
+    }
+
+    #[test]
+    fn throughput_runtime_config_accepts_streams_aliases() {
+        unsafe {
+            std::env::set_var("STREAMS_LEASE_TTL_SECONDS", "41");
+            std::env::set_var("STREAMS_PAYLOAD_STORE", "localfs");
+            std::env::remove_var("THROUGHPUT_LEASE_TTL_SECONDS");
+            std::env::remove_var("THROUGHPUT_PAYLOAD_STORE");
+        }
+        let config = ThroughputRuntimeConfig::from_env().unwrap();
+        assert_eq!(config.lease_ttl_seconds, 41);
+        unsafe {
+            std::env::remove_var("STREAMS_LEASE_TTL_SECONDS");
+            std::env::remove_var("STREAMS_PAYLOAD_STORE");
+        }
     }
 }

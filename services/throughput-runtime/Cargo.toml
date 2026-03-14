@@ -1,8 +1,12 @@
 [package]
-name = "throughput-runtime"
+name = "streams-runtime"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+
+[[bin]]
+name = "throughput-runtime"
+path = "src/bin/throughput-runtime.rs"
 
 [dependencies]
 anyhow.workspace = true
@@ -13,7 +17,7 @@ fabrik-config = { path = "../../crates/fabrik-config" }
 fabrik-events = { path = "../../crates/fabrik-events" }
 fabrik-service = { path = "../../crates/fabrik-service" }
 fabrik-store = { path = "../../crates/fabrik-store" }
-fabrik-throughput = { path = "../../crates/fabrik-throughput" }
+fabrik-throughput = { package = "fabrik-streams", path = "../../crates/fabrik-throughput" }
 fabrik-workflow = { path = "../../crates/fabrik-workflow" }
 fabrik-worker-protocol = { path = "../../crates/fabrik-worker-protocol" }
 futures-util.workspace = true

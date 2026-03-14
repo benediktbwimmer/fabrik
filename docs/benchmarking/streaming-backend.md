@@ -30,7 +30,7 @@ By default it runs the `streaming` suite with the `target` profile. You can pass
 
 ## Prerequisites
 
-- local stack running, including MinIO, `throughput-runtime`, and `throughput-projector`
+- local stack running, including MinIO, `streams-runtime`, and `streams-projector`
 - at least one worker polling the benchmark task queue
 - `THROUGHPUT_PAYLOAD_STORE=s3` for the MinIO-backed throughput path
 

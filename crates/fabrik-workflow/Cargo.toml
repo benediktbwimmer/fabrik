@@ -8,7 +8,7 @@ version.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 fabrik-events = { path = "../fabrik-events" }
-fabrik-throughput = { path = "../fabrik-throughput" }
+fabrik-throughput = { package = "fabrik-streams", path = "../fabrik-throughput" }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

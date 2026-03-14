@@ -13,7 +13,7 @@ fabrik-config = { path = "../../crates/fabrik-config" }
 fabrik-events = { path = "../../crates/fabrik-events" }
 fabrik-service = { path = "../../crates/fabrik-service" }
 fabrik-store = { path = "../../crates/fabrik-store" }
-fabrik-throughput = { path = "../../crates/fabrik-throughput" }
+fabrik-throughput = { package = "fabrik-streams", path = "../../crates/fabrik-throughput" }
 fabrik-worker-protocol = { path = "../../crates/fabrik-worker-protocol" }
 fabrik-workflow = { path = "../../crates/fabrik-workflow" }
 futures-util.workspace = true

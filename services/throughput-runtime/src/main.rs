@@ -1,3 +1,4 @@
+mod bridge;
 mod local_state;
 
 use std::{
@@ -16,11 +17,11 @@ use axum::{
     http::StatusCode,
     routing::get,
 };
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use fabrik_broker::{
     BrokerConfig, JsonTopicConfig, JsonTopicPublisher, WorkflowPublisher, build_json_consumer,
-    build_json_consumer_from_offsets, build_workflow_consumer, decode_consumed_workflow_event,
-    decode_json_record, partition_for_key,
+    build_json_consumer_from_offsets, build_workflow_consumer, decode_json_record,
+    partition_for_key,
 };
 use fabrik_config::{
     GrpcServiceConfig, HttpServiceConfig, PostgresConfig, RedpandaConfig,
@@ -68,7 +69,6 @@ use local_state::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Notify;
-use tokio::task::JoinSet;
 use tonic::{Request, Response, Status, transport::Server};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -77,8 +77,20 @@ const BULK_EVENT_OUTBOX_BATCH_SIZE: usize = 128;
 const BULK_EVENT_OUTBOX_LEASE_SECONDS: i64 = 30;
 const BULK_EVENT_OUTBOX_RETRY_MS: i64 = 250;
 const BRIDGE_EVENT_CONCURRENCY: usize = 64;
-const LOCAL_BENCHMARK_FASTLANE_WORKER_ID: &str = "throughput-runtime-local-fastlane";
-const LOCAL_BENCHMARK_FASTLANE_WORKER_BUILD_ID: &str = "throughput-runtime-local-fastlane";
+pub(crate) const STREAMS_RUNTIME_SERVICE_NAME: &str = "streams-runtime";
+pub(crate) const STREAMS_RUNTIME_DEBUG_SERVICE_NAME: &str = "streams-runtime-debug";
+pub(crate) const STREAMS_RUNTIME_DEBUG_ROUTE: &str = "/debug/streams-runtime";
+pub(crate) const STREAMS_RUNTIME_DEBUG_BATCH_ROUTE: &str =
+    "/debug/streams-runtime/batches/{tenant_id}/{instance_id}/{run_id}/{batch_id}";
+pub(crate) const STREAMS_RUNTIME_DEBUG_CHUNKS_ROUTE: &str =
+    "/debug/streams-runtime/batches/{tenant_id}/{instance_id}/{run_id}/{batch_id}/chunks";
+const LEGACY_THROUGHPUT_DEBUG_ROUTE: &str = "/debug/throughput";
+const LEGACY_THROUGHPUT_DEBUG_BATCH_ROUTE: &str =
+    "/debug/throughput/batches/{tenant_id}/{instance_id}/{run_id}/{batch_id}";
+const LEGACY_THROUGHPUT_DEBUG_CHUNKS_ROUTE: &str =
+    "/debug/throughput/batches/{tenant_id}/{instance_id}/{run_id}/{batch_id}/chunks";
+const LOCAL_BENCHMARK_FASTLANE_WORKER_ID: &str = "streams-runtime-local-fastlane";
+const LOCAL_BENCHMARK_FASTLANE_WORKER_BUILD_ID: &str = "streams-runtime-local-fastlane";
 const LOCAL_BENCHMARK_FASTLANE_BATCH_SIZE: usize = 256;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -328,9 +340,16 @@ struct ThroughputOwnershipDebugSnapshot {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = GrpcServiceConfig::from_env("THROUGHPUT_RUNTIME", "throughput-runtime", 50053)?;
-    let debug_config =
-        HttpServiceConfig::from_env("THROUGHPUT_DEBUG", "throughput-runtime-debug", 3006)?;
+    let config = GrpcServiceConfig::from_env_aliases(
+        &["STREAMS_RUNTIME", "THROUGHPUT_RUNTIME"],
+        STREAMS_RUNTIME_SERVICE_NAME,
+        50053,
+    )?;
+    let debug_config = HttpServiceConfig::from_env_aliases(
+        &["STREAMS_DEBUG", "THROUGHPUT_DEBUG"],
+        STREAMS_RUNTIME_DEBUG_SERVICE_NAME,
+        3006,
+    )?;
     let postgres = PostgresConfig::from_env()?;
     let redpanda = RedpandaConfig::from_env()?;
     let runtime = ThroughputRuntimeConfig::from_env()?;
@@ -429,12 +448,12 @@ async fn main() -> Result<()> {
     }
     let restored_from_checkpoint = restore_state_from_checkpoint(&state).await?;
     if restored_from_checkpoint {
-        info!("throughput-runtime restored local state from latest checkpoint");
+        info!("streams-runtime restored local state from latest checkpoint");
     } else {
         seed_local_state_from_store(&state).await?;
     }
     if state.runtime.owner_first_apply {
-        info!("throughput-runtime skipping changelog restore in owner-first mode");
+        info!("streams-runtime skipping changelog restore in owner-first mode");
     } else {
         restore_local_state_from_changelog(&state, &changelog_config, true).await?;
     }
@@ -466,8 +485,8 @@ async fn main() -> Result<()> {
         &workflow_broker.all_partition_ids(),
     )
     .await?;
-    tokio::spawn(run_command_loop(state.clone(), command_consumer));
-    tokio::spawn(run_bridge_loop(state.clone(), consumer));
+    tokio::spawn(bridge::run_command_loop(state.clone(), command_consumer));
+    tokio::spawn(bridge::run_bridge_loop(state.clone(), consumer));
     if !state.runtime.owner_first_apply {
         tokio::spawn(run_changelog_consumer_loop(state.clone(), changelog_config.clone()));
     }
@@ -487,44 +506,26 @@ async fn main() -> Result<()> {
     tokio::spawn(run_outbox_publisher(state.clone()));
     tokio::spawn(run_bulk_requeue_sweep(state.clone()));
     tokio::spawn(run_local_benchmark_fastlane_loop(state.clone()));
-    let debug_state = debug.clone();
-    let debug_state_app = state.clone();
     let debug_app = default_router::<AppState>(ServiceInfo::new(
         debug_config.name,
-        "throughput-debug",
+        STREAMS_RUNTIME_DEBUG_SERVICE_NAME,
         env!("CARGO_PKG_VERSION"),
     ))
-    .route(
-        "/debug/throughput",
-        get(move || {
-            let debug_state = debug_state.clone();
-            let state = debug_state_app.clone();
-            async move {
-                let runtime = debug_state.lock().expect("throughput debug lock poisoned").clone();
-                let local_state =
-                    state.local_state.debug_snapshot().expect("throughput local state snapshot");
-                let ownership = throughput_ownership_debug_snapshot(&state);
-                Json(ThroughputDebugResponse { runtime, local_state, ownership })
-            }
-        }),
-    )
-    .route(
-        "/debug/throughput/batches/{tenant_id}/{instance_id}/{run_id}/{batch_id}",
-        get(get_strong_batch_snapshot),
-    )
-    .route(
-        "/debug/throughput/batches/{tenant_id}/{instance_id}/{run_id}/{batch_id}/chunks",
-        get(get_strong_chunk_snapshots),
-    )
+    .route(STREAMS_RUNTIME_DEBUG_ROUTE, get(get_debug_snapshot))
+    .route(LEGACY_THROUGHPUT_DEBUG_ROUTE, get(get_debug_snapshot))
+    .route(STREAMS_RUNTIME_DEBUG_BATCH_ROUTE, get(get_strong_batch_snapshot))
+    .route(LEGACY_THROUGHPUT_DEBUG_BATCH_ROUTE, get(get_strong_batch_snapshot))
+    .route(STREAMS_RUNTIME_DEBUG_CHUNKS_ROUTE, get(get_strong_chunk_snapshots))
+    .route(LEGACY_THROUGHPUT_DEBUG_CHUNKS_ROUTE, get(get_strong_chunk_snapshots))
     .with_state(state.clone());
     tokio::spawn(async move {
         if let Err(error) = serve(debug_app, debug_config.port).await {
-            error!(error = %error, "throughput-runtime debug server exited");
+            error!(error = %error, "streams-runtime debug server exited");
         }
     });
 
     let addr = format!("0.0.0.0:{}", config.port).parse()?;
-    info!(%addr, "throughput-runtime listening");
+    info!(%addr, "streams-runtime listening");
     Server::builder()
         .add_service(ActivityWorkerApiServer::new(WorkerApi { state }))
         .serve(addr)
@@ -541,6 +542,15 @@ async fn get_strong_batch_snapshot(
         .map_err(internal_http_error)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("bulk batch {batch_id} not found")))?;
     Ok(Json(StrongBatchResponse { batch }))
+}
+
+async fn get_debug_snapshot(
+    AxumState(state): AxumState<AppState>,
+) -> Json<ThroughputDebugResponse> {
+    let runtime = state.debug.lock().expect("throughput debug lock poisoned").clone();
+    let local_state = state.local_state.debug_snapshot().expect("throughput local state snapshot");
+    let ownership = throughput_ownership_debug_snapshot(&state);
+    Json(ThroughputDebugResponse { runtime, local_state, ownership })
 }
 
 async fn get_strong_chunk_snapshots(
@@ -562,243 +572,6 @@ async fn get_strong_chunk_snapshots(
     .await
     .map_err(internal_http_error)?;
     Ok(Json(StrongChunksResponse { chunks }))
-}
-
-async fn run_bridge_loop(state: AppState, mut consumer: fabrik_broker::WorkflowConsumerStream) {
-    let mut in_flight = JoinSet::new();
-    while let Some(message) = consumer.next().await {
-        let record = match message {
-            Ok(record) => record,
-            Err(error) => {
-                error!(error = %error, "throughput-runtime consumer error");
-                continue;
-            }
-        };
-        let event = match decode_consumed_workflow_event(&record) {
-            Ok(event) => event,
-            Err(error) => {
-                warn!(error = %error, "throughput-runtime skipping invalid workflow event");
-                continue;
-            }
-        };
-        while in_flight.len() >= BRIDGE_EVENT_CONCURRENCY {
-            if let Some(result) = in_flight.join_next().await {
-                if let Err(error) = result {
-                    error!(error = %error, "throughput-runtime bridge worker task failed");
-                }
-            }
-        }
-        let state = state.clone();
-        let debug_state = state.clone();
-        in_flight.spawn(async move {
-            if let Err(error) = handle_bridge_event(state, event).await {
-                let mut debug = debug_state.debug.lock().expect("throughput debug lock poisoned");
-                debug.bridge_failures = debug.bridge_failures.saturating_add(1);
-                drop(debug);
-                error!(error = %error, "throughput-runtime failed to handle workflow bridge event");
-            }
-        });
-    }
-
-    while let Some(result) = in_flight.join_next().await {
-        if let Err(error) = result {
-            error!(error = %error, "throughput-runtime bridge worker task failed");
-        }
-    }
-}
-
-async fn handle_bridge_event(state: AppState, event: EventEnvelope<WorkflowEvent>) -> Result<()> {
-    if let WorkflowEvent::WorkflowCancellationRequested { reason } = &event.payload {
-        cancel_stream_batches_for_run(&state, &event, reason).await?;
-        return Ok(());
-    }
-
-    let WorkflowEvent::BulkActivityBatchScheduled {
-        batch_id,
-        task_queue: _,
-        activity_type: _,
-        items: _,
-        input_handle: _,
-        result_handle: _,
-        chunk_size: _,
-        max_attempts: _,
-        retry_delay_ms: _,
-        aggregation_group_count: _,
-        execution_policy: _,
-        reducer: _,
-        throughput_backend,
-        throughput_backend_version: _,
-        state: _,
-        ..
-    } = &event.payload
-    else {
-        return Ok(());
-    };
-    if throughput_backend != ThroughputBackend::StreamV2.as_str() {
-        return Ok(());
-    }
-    if state
-        .store
-        .get_throughput_run(&event.tenant_id, &event.instance_id, &event.run_id, batch_id)
-        .await?
-        .is_some_and(|run| run.command_published_at.is_some())
-    {
-        let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
-        debug.duplicate_bridge_events = debug.duplicate_bridge_events.saturating_add(1);
-        return Ok(());
-    }
-
-    let dedupe_key = format!("throughput-create:{}", event.event_id);
-    let published_at = state
-        .store
-        .ensure_throughput_bridge_progress(
-            event.event_id,
-            &event.tenant_id,
-            &event.instance_id,
-            &event.run_id,
-            batch_id,
-            throughput_backend,
-            &dedupe_key,
-            event.occurred_at,
-        )
-        .await
-        .with_context(|| format!("failed to record throughput bridge progress for {batch_id}"))?;
-    if published_at.is_some() {
-        let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
-        debug.duplicate_bridge_events = debug.duplicate_bridge_events.saturating_add(1);
-        return Ok(());
-    }
-
-    activate_stream_batch(&state, &event).await?;
-
-    state
-        .store
-        .mark_throughput_bridge_command_published(event.event_id, Utc::now())
-        .await
-        .with_context(|| {
-            format!("failed to mark throughput create command published for {batch_id}")
-        })?;
-    let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
-    debug.bridged_batches = debug.bridged_batches.saturating_add(1);
-    debug.last_bridge_at = Some(Utc::now());
-    drop(debug);
-    state.bulk_notify.notify_waiters();
-    Ok(())
-}
-
-async fn run_command_loop(state: AppState, mut consumer: fabrik_broker::JsonConsumerStream) {
-    while let Some(message) = consumer.next().await {
-        let record = match message {
-            Ok(record) => record,
-            Err(error) => {
-                error!(error = %error, "throughput-runtime command consumer error");
-                continue;
-            }
-        };
-        let command = match decode_json_record::<ThroughputCommandEnvelope>(&record.record) {
-            Ok(command) => command,
-            Err(error) => {
-                warn!(error = %error, "throughput-runtime skipping invalid command");
-                continue;
-            }
-        };
-        if let Err(error) = handle_throughput_command(state.clone(), command).await {
-            error!(error = %error, "throughput-runtime failed to handle throughput command");
-        }
-    }
-}
-
-async fn handle_throughput_command(
-    state: AppState,
-    command: ThroughputCommandEnvelope,
-) -> Result<()> {
-    let (tenant_id, instance_id, run_id, batch_id, throughput_backend) = match &command.payload {
-        ThroughputCommand::StartThroughputRun(command) => (
-            command.tenant_id.as_str(),
-            command.instance_id.as_str(),
-            command.run_id.as_str(),
-            command.batch_id.as_str(),
-            command.throughput_backend.as_str(),
-        ),
-        ThroughputCommand::CreateBatch(command) => (
-            command.tenant_id.as_str(),
-            command.instance_id.as_str(),
-            command.run_id.as_str(),
-            command.batch_id.as_str(),
-            command.throughput_backend.as_str(),
-        ),
-        ThroughputCommand::CancelBatch { identity, .. } => (
-            identity.tenant_id.as_str(),
-            identity.instance_id.as_str(),
-            identity.run_id.as_str(),
-            identity.batch_id.as_str(),
-            ThroughputBackend::StreamV2.as_str(),
-        ),
-        ThroughputCommand::TinyWorkflowStart(_) | ThroughputCommand::TinyWorkflowStartBatch(_) => {
-            return Ok(());
-        }
-        _ => return Ok(()),
-    };
-    if throughput_backend != ThroughputBackend::StreamV2.as_str() {
-        return Ok(());
-    }
-    if state.store.get_throughput_run(tenant_id, instance_id, run_id, batch_id).await?.is_some_and(
-        |run| matches!(run.status.as_str(), "running" | "completed" | "failed" | "cancelled"),
-    ) {
-        return Ok(());
-    }
-    match &command.payload {
-        ThroughputCommand::StartThroughputRun(start) => {
-            activate_native_stream_run(&state, &command, start).await
-        }
-        ThroughputCommand::CreateBatch(_) => {
-            let event = workflow_event_from_throughput_command(&command)?;
-            activate_stream_batch(&state, &event).await
-        }
-        ThroughputCommand::CancelBatch { identity, reason } => {
-            cancel_stream_batch_via_bridge(&state, identity, reason, command.occurred_at).await
-        }
-        ThroughputCommand::TinyWorkflowStart(_) | ThroughputCommand::TinyWorkflowStartBatch(_) => {
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-async fn cancel_stream_batch_via_bridge(
-    state: &AppState,
-    identity: &ThroughputBatchIdentity,
-    reason: &str,
-    occurred_at: DateTime<Utc>,
-) -> Result<()> {
-    let cancelled = state
-        .store
-        .cancel_bulk_batch(
-            &identity.tenant_id,
-            &identity.instance_id,
-            &identity.run_id,
-            &identity.batch_id,
-            reason,
-            None,
-            occurred_at,
-        )
-        .await?;
-    let _ = state
-        .store
-        .mark_throughput_run_terminal(
-            &identity.tenant_id,
-            &identity.instance_id,
-            &identity.run_id,
-            &identity.batch_id,
-            "cancelled",
-            occurred_at,
-        )
-        .await?;
-    if !cancelled.cancelled_chunks.is_empty() {
-        state.bulk_notify.notify_waiters();
-        state.outbox_notify.notify_waiters();
-    }
-    Ok(())
 }
 
 async fn restore_local_state_from_changelog(
@@ -1668,7 +1441,7 @@ async fn run_outbox_publisher(state: AppState) {
         {
             Ok(rows) => rows,
             Err(error) => {
-                error!(error = %error, "throughput-runtime failed to lease workflow outbox");
+                error!(error = %error, "streams-runtime failed to lease workflow outbox");
                 tokio::time::sleep(Duration::from_millis(BULK_EVENT_OUTBOX_RETRY_MS as u64)).await;
                 continue;
             }
@@ -1727,7 +1500,7 @@ async fn run_bulk_requeue_sweep(state: AppState) {
         ) {
             Ok(chunks) => chunks,
             Err(error) => {
-                error!(error = %error, "throughput-runtime failed to list expired chunks from local state");
+                error!(error = %error, "streams-runtime failed to list expired chunks from local state");
                 continue;
             }
         };
@@ -1785,7 +1558,7 @@ async fn run_local_benchmark_fastlane_loop(state: AppState) {
             }
             Ok(_) => tokio::task::yield_now().await,
             Err(error) => {
-                error!(error = %error, "throughput-runtime local benchmark fastlane failed");
+                error!(error = %error, "streams-runtime local benchmark fastlane failed");
                 let _ = tokio::time::timeout(idle_wait, state.bulk_notify.notified()).await;
             }
         }
@@ -2132,7 +1905,7 @@ impl ActivityWorkerApi for WorkerApi {
         _request: Request<fabrik_worker_protocol::activity_worker::PollActivityTaskRequest>,
     ) -> Result<Response<fabrik_worker_protocol::activity_worker::PollActivityTaskResponse>, Status>
     {
-        Err(Status::unimplemented("throughput-runtime only serves bulk tasks"))
+        Err(Status::unimplemented("streams-runtime only serves bulk tasks"))
     }
 
     async fn poll_activity_tasks(
@@ -2140,7 +1913,7 @@ impl ActivityWorkerApi for WorkerApi {
         _request: Request<fabrik_worker_protocol::activity_worker::PollActivityTasksRequest>,
     ) -> Result<Response<fabrik_worker_protocol::activity_worker::PollActivityTasksResponse>, Status>
     {
-        Err(Status::unimplemented("throughput-runtime only serves bulk tasks"))
+        Err(Status::unimplemented("streams-runtime only serves bulk tasks"))
     }
 
     async fn poll_bulk_activity_task(
@@ -2428,14 +2201,14 @@ impl ActivityWorkerApi for WorkerApi {
         &self,
         _request: Request<fabrik_worker_protocol::activity_worker::CompleteActivityTaskRequest>,
     ) -> Result<Response<Ack>, Status> {
-        Err(Status::unimplemented("throughput-runtime only serves bulk tasks"))
+        Err(Status::unimplemented("streams-runtime only serves bulk tasks"))
     }
 
     async fn fail_activity_task(
         &self,
         _request: Request<fabrik_worker_protocol::activity_worker::FailActivityTaskRequest>,
     ) -> Result<Response<Ack>, Status> {
-        Err(Status::unimplemented("throughput-runtime only serves bulk tasks"))
+        Err(Status::unimplemented("streams-runtime only serves bulk tasks"))
     }
 
     async fn record_activity_heartbeat(
@@ -2445,7 +2218,7 @@ impl ActivityWorkerApi for WorkerApi {
         Response<fabrik_worker_protocol::activity_worker::RecordActivityHeartbeatResponse>,
         Status,
     > {
-        Err(Status::unimplemented("throughput-runtime only serves bulk tasks"))
+        Err(Status::unimplemented("streams-runtime only serves bulk tasks"))
     }
 
     async fn report_activity_task_cancelled(
@@ -2454,7 +2227,7 @@ impl ActivityWorkerApi for WorkerApi {
             fabrik_worker_protocol::activity_worker::ReportActivityTaskCancelledRequest,
         >,
     ) -> Result<Response<Ack>, Status> {
-        Err(Status::unimplemented("throughput-runtime only serves bulk tasks"))
+        Err(Status::unimplemented("streams-runtime only serves bulk tasks"))
     }
 
     async fn report_activity_task_results(
@@ -2463,7 +2236,7 @@ impl ActivityWorkerApi for WorkerApi {
             fabrik_worker_protocol::activity_worker::ReportActivityTaskResultsRequest,
         >,
     ) -> Result<Response<Ack>, Status> {
-        Err(Status::unimplemented("throughput-runtime only serves bulk tasks"))
+        Err(Status::unimplemented("streams-runtime only serves bulk tasks"))
     }
 
     async fn report_bulk_activity_task_results(

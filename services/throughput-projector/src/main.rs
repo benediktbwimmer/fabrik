@@ -18,6 +18,10 @@ use tracing::error;
 
 const PROJECTION_APPLY_BATCH_SIZE: usize = 128;
 const PROJECTION_APPLY_BATCH_WAIT_MS: u64 = 2;
+const STREAMS_PROJECTOR_SERVICE_NAME: &str = "streams-projector";
+const STREAMS_PROJECTOR_DEBUG_ROUTE: &str = "/debug/streams-projector";
+const LEGACY_THROUGHPUT_PROJECTOR_DEBUG_ROUTE: &str = "/debug/throughput-projector";
+const LEGACY_THROUGHPUT_PROJECTOR_ID: &str = "throughput-projector";
 
 #[derive(Clone)]
 struct AppState {
@@ -45,7 +49,11 @@ struct BufferedProjectionRecord {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = HttpServiceConfig::from_env("THROUGHPUT_PROJECTOR", "throughput-projector", 3007)?;
+    let config = HttpServiceConfig::from_env_aliases(
+        &["STREAMS_PROJECTOR", "THROUGHPUT_PROJECTOR"],
+        STREAMS_PROJECTOR_SERVICE_NAME,
+        3007,
+    )?;
     let postgres = PostgresConfig::from_env()?;
     let redpanda = RedpandaConfig::from_env()?;
     let query = QueryRuntimeConfig::from_env()?;
@@ -54,7 +62,7 @@ async fn main() -> Result<()> {
     let store = WorkflowStore::connect(&postgres.url).await?;
     store.init().await?;
     let payload_store = PayloadStore::from_config(build_payload_store_config(&query)).await?;
-    let projector_id = "throughput-projector".to_owned();
+    let projector_id = LEGACY_THROUGHPUT_PROJECTOR_ID.to_owned();
     let debug = Arc::new(Mutex::new(ProjectorDebugState::default()));
     let state = AppState {
         store: store.clone(),
@@ -74,10 +82,11 @@ async fn main() -> Result<()> {
 
     let app = default_router::<AppState>(ServiceInfo::new(
         config.name,
-        "throughput-projector",
+        STREAMS_PROJECTOR_SERVICE_NAME,
         env!("CARGO_PKG_VERSION"),
     ))
-    .route("/debug/throughput-projector", get(get_debug))
+    .route(STREAMS_PROJECTOR_DEBUG_ROUTE, get(get_debug))
+    .route(LEGACY_THROUGHPUT_PROJECTOR_DEBUG_ROUTE, get(get_debug))
     .with_state(state);
     serve(app, config.port).await
 }
@@ -85,7 +94,7 @@ async fn main() -> Result<()> {
 async fn get_debug(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Json<ProjectorDebugState> {
-    Json(state.debug.lock().expect("throughput projector debug lock poisoned").clone())
+    Json(state.debug.lock().expect("streams projector debug lock poisoned").clone())
 }
 
 async fn run_projection_consumer(state: AppState, config: JsonTopicConfig) {
@@ -94,7 +103,7 @@ async fn run_projection_consumer(state: AppState, config: JsonTopicConfig) {
             match state.store.load_throughput_projection_offsets(&state.projector_id).await {
                 Ok(offsets) => offsets,
                 Err(error) => {
-                    error!(error = %error, "failed to load throughput projection offsets");
+                    error!(error = %error, "failed to load streams projection offsets");
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     continue;
                 }
@@ -110,7 +119,7 @@ async fn run_projection_consumer(state: AppState, config: JsonTopicConfig) {
         {
             Ok(consumer) => consumer,
             Err(error) => {
-                error!(error = %error, "failed to build throughput projection consumer");
+                error!(error = %error, "failed to build streams projection consumer");
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
@@ -140,19 +149,19 @@ async fn run_projection_consumer(state: AppState, config: JsonTopicConfig) {
             if let Err(error) = apply_projection_batch(&state, &batch).await {
                 {
                     let mut debug =
-                        state.debug.lock().expect("throughput projector debug lock poisoned");
+                        state.debug.lock().expect("streams projector debug lock poisoned");
                     debug.apply_failures = debug.apply_failures.saturating_add(1);
                     debug.last_failure = Some(error.to_string());
                 }
-                error!(error = %error, "failed to apply throughput projection event");
+                error!(error = %error, "failed to apply streams projection event");
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 break;
             }
             if let Err(error) = commit_projection_batch_offsets(&state, &batch).await {
-                error!(error = %error, "failed to commit throughput projection offset");
+                error!(error = %error, "failed to commit streams projection offset");
                 break;
             }
-            let mut debug = state.debug.lock().expect("throughput projector debug lock poisoned");
+            let mut debug = state.debug.lock().expect("streams projector debug lock poisoned");
             debug.applied_events = debug.applied_events.saturating_add(batch.len() as u64);
             debug.last_applied_at = Some(Utc::now());
         }
@@ -165,14 +174,14 @@ fn decode_projection_record(
     let record = match message {
         Ok(record) => record,
         Err(error) => {
-            error!(error = %error, "failed to read throughput projection message");
+            error!(error = %error, "failed to read streams projection message");
             return None;
         }
     };
     let event: ThroughputProjectionEvent = match decode_json_record(&record.record) {
         Ok(event) => event,
         Err(error) => {
-            error!(error = %error, "failed to decode throughput projection event");
+            error!(error = %error, "failed to decode streams projection event");
             return None;
         }
     };
@@ -296,7 +305,7 @@ async fn sync_batch_result_manifest(
             PayloadHandle::Inline { .. } => return Ok(()),
         };
         state.payload_store.write_value(&key, &manifest).await?;
-        let mut debug = state.debug.lock().expect("throughput projector debug lock poisoned");
+        let mut debug = state.debug.lock().expect("streams projector debug lock poisoned");
         debug.manifest_writes = debug.manifest_writes.saturating_add(1);
     }
     Ok(())

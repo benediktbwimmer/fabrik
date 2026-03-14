@@ -3,7 +3,8 @@ use chrono::{DateTime, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_throughput::{
     ADMISSION_POLICY_VERSION, ActivityExecutionCapabilities, ThroughputBackend,
-    ThroughputChunkReport, ThroughputCommandEnvelope, bulk_reducer_default_summary_value,
+    ThroughputBridgeSubmissionStatus, ThroughputBridgeTerminalStatus, ThroughputChunkReport,
+    ThroughputCommandEnvelope, ThroughputRunStatus, bulk_reducer_default_summary_value,
     bulk_reducer_name, bulk_reducer_reduce_errors, bulk_reducer_reduce_values,
     bulk_reducer_requires_error_outputs, bulk_reducer_requires_success_outputs,
     bulk_reducer_settles, throughput_execution_mode, throughput_reducer_execution_path,
@@ -366,6 +367,16 @@ pub struct ThroughputRunRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+impl ThroughputRunRecord {
+    pub fn parsed_status(&self) -> Option<ThroughputRunStatus> {
+        ThroughputRunStatus::parse(&self.status)
+    }
+
+    pub fn parsed_workflow_terminal_status(&self) -> Option<ThroughputBridgeTerminalStatus> {
+        self.bridge_terminal_status.as_deref().and_then(ThroughputBridgeTerminalStatus::parse)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ThroughputRunInputRecord {
     pub tenant_id: String,
@@ -411,6 +422,43 @@ pub struct ThroughputBridgeProgressRecord {
     pub cancelled_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl ThroughputBridgeProgressRecord {
+    pub fn parsed_submission_status(&self) -> Option<ThroughputBridgeSubmissionStatus> {
+        ThroughputBridgeSubmissionStatus::parse(&self.submission_status)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThroughputBridgeBatchStateRecord {
+    pub batch_id: String,
+    pub bridge_request_id: String,
+    pub submission_status: Option<String>,
+    pub stream_status: String,
+    pub stream_terminal_at: Option<DateTime<Utc>>,
+    pub cancellation_requested_at: Option<DateTime<Utc>>,
+    pub cancellation_reason: Option<String>,
+    pub cancel_command_published_at: Option<DateTime<Utc>>,
+    pub cancelled_at: Option<DateTime<Utc>>,
+    pub workflow_status: Option<String>,
+    pub workflow_terminal_event_id: Option<Uuid>,
+    pub workflow_owner_epoch: Option<u64>,
+    pub workflow_accepted_at: Option<DateTime<Utc>>,
+}
+
+impl ThroughputBridgeBatchStateRecord {
+    pub fn parsed_submission_status(&self) -> Option<ThroughputBridgeSubmissionStatus> {
+        self.submission_status.as_deref().and_then(ThroughputBridgeSubmissionStatus::parse)
+    }
+
+    pub fn parsed_stream_status(&self) -> Option<ThroughputRunStatus> {
+        ThroughputRunStatus::parse(&self.stream_status)
+    }
+
+    pub fn parsed_workflow_status(&self) -> Option<ThroughputBridgeTerminalStatus> {
+        self.workflow_status.as_deref().and_then(ThroughputBridgeTerminalStatus::parse)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -14385,6 +14433,7 @@ impl WorkflowStore {
         command_partition_key: Option<&str>,
         created_at: DateTime<Utc>,
     ) -> Result<ThroughputBridgeProgressRecord> {
+        let admitted = ThroughputBridgeSubmissionStatus::Admitted.as_str();
         let row = sqlx::query(
             r#"
             INSERT INTO throughput_bridge_progress (
@@ -14407,7 +14456,7 @@ impl WorkflowStore {
                 cancel_command_published_at,
                 cancelled_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, 'admitted', $8, $9, $10, $11, $11, NULL, NULL, NULL, NULL, NULL)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, NULL, NULL, NULL, NULL, NULL)
             ON CONFLICT (workflow_event_id) DO UPDATE
             SET tenant_id = EXCLUDED.tenant_id,
                 workflow_instance_id = EXCLUDED.workflow_instance_id,
@@ -14431,6 +14480,7 @@ impl WorkflowStore {
         .bind(batch_id)
         .bind(throughput_backend)
         .bind(bridge_request_id)
+        .bind(admitted)
         .bind(dedupe_key)
         .bind(command_id)
         .bind(command_partition_key)
@@ -14475,13 +14525,16 @@ impl WorkflowStore {
         workflow_event_id: Uuid,
         published_at: DateTime<Utc>,
     ) -> Result<()> {
+        let published = ThroughputBridgeSubmissionStatus::Published.as_str();
+        let cancellation_requested =
+            ThroughputBridgeSubmissionStatus::CancellationRequested.as_str();
         sqlx::query(
             r#"
             UPDATE throughput_bridge_progress
             SET command_published_at = COALESCE(command_published_at, $2),
                 submission_status = CASE
-                    WHEN cancelled_at IS NULL AND cancellation_requested_at IS NULL THEN 'published'
-                    WHEN cancelled_at IS NULL THEN 'cancellation_requested'
+                    WHEN cancelled_at IS NULL AND cancellation_requested_at IS NULL THEN $3
+                    WHEN cancelled_at IS NULL THEN $4
                     ELSE submission_status
                 END,
                 updated_at = $2
@@ -14490,6 +14543,8 @@ impl WorkflowStore {
         )
         .bind(workflow_event_id)
         .bind(published_at)
+        .bind(published)
+        .bind(cancellation_requested)
         .execute(&self.pool)
         .await
         .context("failed to mark throughput bridge command published")?;
@@ -14501,13 +14556,15 @@ impl WorkflowStore {
         workflow_event_id: Uuid,
         published_at: DateTime<Utc>,
     ) -> Result<()> {
+        let cancellation_requested =
+            ThroughputBridgeSubmissionStatus::CancellationRequested.as_str();
         sqlx::query(
             r#"
             UPDATE throughput_bridge_progress
             SET cancel_command_published_at = COALESCE(cancel_command_published_at, $2),
                 submission_status = CASE
                     WHEN cancelled_at IS NULL AND cancellation_requested_at IS NOT NULL
-                        THEN 'cancellation_requested'
+                        THEN $3
                     ELSE submission_status
                 END,
                 updated_at = $2
@@ -14516,6 +14573,7 @@ impl WorkflowStore {
         )
         .bind(workflow_event_id)
         .bind(published_at)
+        .bind(cancellation_requested)
         .execute(&self.pool)
         .await
         .context("failed to mark throughput bridge cancel command published")?;
@@ -14528,6 +14586,10 @@ impl WorkflowStore {
         requested_at: DateTime<Utc>,
         reason: &str,
     ) -> Result<Option<ThroughputBridgeProgressRecord>> {
+        let cancelled_before_publish =
+            ThroughputBridgeSubmissionStatus::CancelledBeforePublish.as_str();
+        let cancellation_requested =
+            ThroughputBridgeSubmissionStatus::CancellationRequested.as_str();
         let row = sqlx::query(
             r#"
             UPDATE throughput_bridge_progress
@@ -14538,8 +14600,8 @@ impl WorkflowStore {
                     ELSE cancelled_at
                 END,
                 submission_status = CASE
-                    WHEN command_published_at IS NULL THEN 'cancelled_before_publish'
-                    ELSE 'cancellation_requested'
+                    WHEN command_published_at IS NULL THEN $4
+                    ELSE $5
                 END,
                 updated_at = $2
             WHERE workflow_event_id = $1
@@ -14549,6 +14611,8 @@ impl WorkflowStore {
         .bind(workflow_event_id)
         .bind(requested_at)
         .bind(reason)
+        .bind(cancelled_before_publish)
+        .bind(cancellation_requested)
         .fetch_optional(&self.pool)
         .await
         .context("failed to request throughput bridge cancellation")?;
@@ -14602,24 +14666,63 @@ impl WorkflowStore {
         row.map(Self::decode_throughput_bridge_progress_row).transpose()
     }
 
+    pub async fn load_throughput_bridge_batch_state(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+    ) -> Result<Option<ThroughputBridgeBatchStateRecord>> {
+        let Some(run) = self.get_throughput_run(tenant_id, instance_id, run_id, batch_id).await?
+        else {
+            return Ok(None);
+        };
+        let progress = self
+            .get_throughput_bridge_progress_for_batch(tenant_id, instance_id, run_id, batch_id)
+            .await?;
+        Ok(Some(ThroughputBridgeBatchStateRecord {
+            batch_id: run.batch_id,
+            bridge_request_id: run.bridge_request_id,
+            submission_status: progress.as_ref().map(|record| record.submission_status.clone()),
+            stream_status: run.status,
+            stream_terminal_at: run.terminal_at,
+            cancellation_requested_at: progress
+                .as_ref()
+                .and_then(|record| record.cancellation_requested_at),
+            cancellation_reason: progress
+                .as_ref()
+                .and_then(|record| record.cancellation_reason.clone()),
+            cancel_command_published_at: progress
+                .as_ref()
+                .and_then(|record| record.cancel_command_published_at),
+            cancelled_at: progress.as_ref().and_then(|record| record.cancelled_at),
+            workflow_status: run.bridge_terminal_status,
+            workflow_terminal_event_id: run.bridge_terminal_event_id,
+            workflow_owner_epoch: run.bridge_terminal_owner_epoch,
+            workflow_accepted_at: run.bridge_terminal_accepted_at,
+        }))
+    }
+
     pub async fn list_pending_throughput_bridge_submissions_for_backend(
         &self,
         throughput_backend: &str,
         limit: usize,
     ) -> Result<Vec<ThroughputBridgeProgressRecord>> {
+        let admitted = ThroughputBridgeSubmissionStatus::Admitted.as_str();
         let rows = sqlx::query(
             r#"
             SELECT *
             FROM throughput_bridge_progress
             WHERE throughput_backend = $1
-              AND submission_status = 'admitted'
+              AND submission_status = $2
               AND command_published_at IS NULL
               AND cancelled_at IS NULL
             ORDER BY created_at ASC, batch_id ASC
-            LIMIT $2
+            LIMIT $3
             "#,
         )
         .bind(throughput_backend)
+        .bind(admitted)
         .bind(i64::try_from(limit.max(1)).context("bridge submission limit exceeds i64")?)
         .fetch_all(&self.pool)
         .await
@@ -14632,20 +14735,23 @@ impl WorkflowStore {
         throughput_backend: &str,
         limit: usize,
     ) -> Result<Vec<ThroughputBridgeProgressRecord>> {
+        let cancellation_requested =
+            ThroughputBridgeSubmissionStatus::CancellationRequested.as_str();
         let rows = sqlx::query(
             r#"
             SELECT *
             FROM throughput_bridge_progress
             WHERE throughput_backend = $1
-              AND submission_status = 'cancellation_requested'
+              AND submission_status = $2
               AND cancellation_requested_at IS NOT NULL
               AND cancel_command_published_at IS NULL
               AND cancelled_at IS NULL
             ORDER BY cancellation_requested_at ASC NULLS FIRST, batch_id ASC
-            LIMIT $2
+            LIMIT $3
             "#,
         )
         .bind(throughput_backend)
+        .bind(cancellation_requested)
         .bind(i64::try_from(limit.max(1)).context("bridge cancellation limit exceeds i64")?)
         .fetch_all(&self.pool)
         .await
@@ -14898,17 +15004,21 @@ impl WorkflowStore {
         throughput_backend: &str,
         limit: usize,
     ) -> Result<Vec<ThroughputRunRecord>> {
+        let scheduled = ThroughputRunStatus::Scheduled.as_str();
+        let running = ThroughputRunStatus::Running.as_str();
         let rows = sqlx::query(
             r#"
             SELECT *
             FROM throughput_runs
             WHERE throughput_backend = $1
-              AND status IN ('scheduled', 'running')
+              AND status IN ($2, $3)
             ORDER BY created_at ASC, batch_id ASC
-            LIMIT $2
+            LIMIT $4
             "#,
         )
         .bind(throughput_backend)
+        .bind(scheduled)
+        .bind(running)
         .bind(i64::try_from(limit.max(1)).context("throughput run bootstrap limit exceeds i64")?)
         .fetch_all(&self.pool)
         .await
@@ -14945,18 +15055,20 @@ impl WorkflowStore {
         throughput_backend: &str,
         limit: usize,
     ) -> Result<Vec<ThroughputRunRecord>> {
+        let scheduled = ThroughputRunStatus::Scheduled.as_str();
         let rows = sqlx::query(
             r#"
             SELECT *
             FROM throughput_runs
             WHERE throughput_backend = $1
-              AND status = 'scheduled'
+              AND status = $2
               AND command_published_at IS NULL
             ORDER BY created_at ASC, batch_id ASC
-            LIMIT $2
+            LIMIT $3
             "#,
         )
         .bind(throughput_backend)
+        .bind(scheduled)
         .bind(i64::try_from(limit.max(1)).context("throughput run bootstrap limit exceeds i64")?)
         .fetch_all(&self.pool)
         .await
@@ -15002,11 +15114,12 @@ impl WorkflowStore {
         batch_id: &str,
         started_at: DateTime<Utc>,
     ) -> Result<bool> {
+        let running = ThroughputRunStatus::Running.as_str();
         let updated = sqlx::query(
             r#"
             UPDATE throughput_runs
             SET status = CASE
-                    WHEN terminal_at IS NULL THEN 'running'
+                    WHEN terminal_at IS NULL THEN $6
                     ELSE status
                 END,
                 started_at = COALESCE(started_at, $5),
@@ -15022,6 +15135,7 @@ impl WorkflowStore {
         .bind(run_id)
         .bind(batch_id)
         .bind(started_at)
+        .bind(running)
         .execute(&self.pool)
         .await
         .context("failed to mark throughput run started")?;
@@ -15034,9 +15148,12 @@ impl WorkflowStore {
         instance_id: &str,
         run_id: &str,
         batch_id: &str,
-        status: &str,
+        status: ThroughputRunStatus,
         terminal_at: DateTime<Utc>,
     ) -> Result<bool> {
+        if !status.is_terminal() {
+            anyhow::bail!("throughput terminal status must be terminal, got {}", status.as_str());
+        }
         let updated = sqlx::query(
             r#"
             UPDATE throughput_runs
@@ -15056,11 +15173,55 @@ impl WorkflowStore {
         .bind(instance_id)
         .bind(run_id)
         .bind(batch_id)
-        .bind(status)
+        .bind(status.as_str())
         .bind(terminal_at)
         .execute(&self.pool)
         .await
         .context("failed to mark throughput run terminal")?;
+        Ok(updated.rows_affected() > 0)
+    }
+
+    pub async fn mark_throughput_bridge_cancelled(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+        cancelled_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let cancelled = ThroughputBridgeSubmissionStatus::Cancelled.as_str();
+        let updated = sqlx::query(
+            r#"
+            WITH latest AS (
+                SELECT workflow_event_id
+                FROM throughput_bridge_progress
+                WHERE tenant_id = $1
+                  AND workflow_instance_id = $2
+                  AND run_id = $3
+                  AND batch_id = $4
+                ORDER BY created_at DESC
+                LIMIT 1
+            )
+            UPDATE throughput_bridge_progress
+            SET cancelled_at = COALESCE(cancelled_at, $5),
+                submission_status = CASE
+                    WHEN cancel_command_published_at IS NOT NULL OR cancellation_requested_at IS NOT NULL
+                        THEN $6
+                    ELSE submission_status
+                END,
+                updated_at = $5
+            WHERE workflow_event_id IN (SELECT workflow_event_id FROM latest)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .bind(cancelled_at)
+        .bind(cancelled)
+        .execute(&self.pool)
+        .await
+        .context("failed to mark throughput bridge cancelled")?;
         Ok(updated.rows_affected() > 0)
     }
 
@@ -15075,6 +15236,9 @@ impl WorkflowStore {
         owner_epoch: Option<u64>,
         accepted_at: DateTime<Utc>,
     ) -> Result<bool> {
+        if ThroughputBridgeTerminalStatus::parse(terminal_status).is_none() {
+            anyhow::bail!("unsupported throughput bridge terminal status {terminal_status}");
+        }
         let mut tx = self
             .pool
             .begin()
@@ -21974,11 +22138,25 @@ mod tests {
                 created_at + chrono::Duration::seconds(3),
             )
             .await?;
+        store
+            .mark_throughput_bridge_cancelled(
+                "tenant-a",
+                "wf-bridge",
+                "run-bridge",
+                "batch-after",
+                created_at + chrono::Duration::seconds(4),
+            )
+            .await?;
         let reloaded_after = store
             .get_throughput_bridge_progress(after.workflow_event_id)
             .await?
             .context("reloaded bridge progress should exist")?;
         assert!(reloaded_after.cancel_command_published_at.is_some());
+        assert_eq!(
+            reloaded_after.submission_status,
+            ThroughputBridgeSubmissionStatus::Cancelled.as_str()
+        );
+        assert!(reloaded_after.cancelled_at.is_some());
 
         Ok(())
     }
@@ -22106,7 +22284,7 @@ mod tests {
                     "instance-a",
                     "run-a",
                     "batch-a",
-                    "completed",
+                    ThroughputRunStatus::Completed,
                     now + chrono::Duration::seconds(3),
                 )
                 .await?

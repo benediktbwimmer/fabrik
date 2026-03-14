@@ -3576,35 +3576,39 @@ async fn load_bulk_bridge_status(
     if throughput_backend != ThroughputBackend::StreamV2.as_str() {
         return Ok(None);
     }
-    let bridge_progress = state
+    let Some(bridge_state) = state
         .store
-        .get_throughput_bridge_progress_for_batch(tenant_id, instance_id, run_id, batch_id)
-        .await?;
-    let Some(run) =
-        state.store.get_throughput_run(tenant_id, instance_id, run_id, batch_id).await?
+        .load_throughput_bridge_batch_state(tenant_id, instance_id, run_id, batch_id)
+        .await?
     else {
         return Ok(None);
     };
+    let submission_status = bridge_state
+        .parsed_submission_status()
+        .map(|status| status.as_str().to_owned())
+        .or(bridge_state.submission_status.clone());
+    let stream_status = bridge_state
+        .parsed_stream_status()
+        .map(|status| status.as_str().to_owned())
+        .unwrap_or_else(|| bridge_state.stream_status.clone());
+    let workflow_status = bridge_state
+        .parsed_workflow_status()
+        .map(|status| status.as_str().to_owned())
+        .or(bridge_state.workflow_status.clone());
     Ok(Some(WorkflowBulkBridgeStatus {
-        batch_id: run.batch_id,
-        bridge_request_id: run.bridge_request_id,
-        submission_status: bridge_progress.as_ref().map(|progress| progress.submission_status.clone()),
-        stream_status: run.status,
-        stream_terminal_at: run.terminal_at,
-        cancellation_requested_at: bridge_progress
-            .as_ref()
-            .and_then(|progress| progress.cancellation_requested_at),
-        cancellation_reason: bridge_progress
-            .as_ref()
-            .and_then(|progress| progress.cancellation_reason.clone()),
-        cancel_command_published_at: bridge_progress
-            .as_ref()
-            .and_then(|progress| progress.cancel_command_published_at),
-        cancelled_at: bridge_progress.as_ref().and_then(|progress| progress.cancelled_at),
-        workflow_status: run.bridge_terminal_status,
-        workflow_terminal_event_id: run.bridge_terminal_event_id,
-        workflow_owner_epoch: run.bridge_terminal_owner_epoch,
-        workflow_accepted_at: run.bridge_terminal_accepted_at,
+        batch_id: bridge_state.batch_id,
+        bridge_request_id: bridge_state.bridge_request_id,
+        submission_status,
+        stream_status,
+        stream_terminal_at: bridge_state.stream_terminal_at,
+        cancellation_requested_at: bridge_state.cancellation_requested_at,
+        cancellation_reason: bridge_state.cancellation_reason,
+        cancel_command_published_at: bridge_state.cancel_command_published_at,
+        cancelled_at: bridge_state.cancelled_at,
+        workflow_status,
+        workflow_terminal_event_id: bridge_state.workflow_terminal_event_id,
+        workflow_owner_epoch: bridge_state.workflow_owner_epoch,
+        workflow_accepted_at: bridge_state.workflow_accepted_at,
     }))
 }
 
@@ -4290,7 +4294,7 @@ async fn fetch_strong_stream_batch(
     let response = state
         .client
         .get(format!(
-            "{endpoint}/debug/throughput/batches/{tenant_id}/{instance_id}/{run_id}/{batch_id}"
+            "{endpoint}/debug/streams-runtime/batches/{tenant_id}/{instance_id}/{run_id}/{batch_id}"
         ))
         .send()
         .await
@@ -4334,7 +4338,7 @@ async fn fetch_strong_stream_chunks(
     let response = state
         .client
         .get(format!(
-            "{endpoint}/debug/throughput/batches/{tenant_id}/{instance_id}/{run_id}/{batch_id}/chunks"
+            "{endpoint}/debug/streams-runtime/batches/{tenant_id}/{instance_id}/{run_id}/{batch_id}/chunks"
         ))
         .query(&[("limit", limit), ("offset", offset)])
         .send()

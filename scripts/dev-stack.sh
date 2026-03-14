@@ -38,11 +38,11 @@ API_GATEWAY_PORT="${API_GATEWAY_PORT:-3000}"
 INGEST_PORT="${INGEST_SERVICE_PORT:-3001}"
 TIMER_PORT="${TIMER_SERVICE_PORT:-3003}"
 QUERY_PORT="${QUERY_SERVICE_PORT:-3005}"
-THROUGHPUT_DEBUG_PORT="${THROUGHPUT_DEBUG_PORT:-3006}"
-THROUGHPUT_PROJECTOR_PORT="${THROUGHPUT_PROJECTOR_PORT:-3007}"
+STREAMS_DEBUG_PORT="${STREAMS_DEBUG_PORT:-${THROUGHPUT_DEBUG_PORT:-3006}}"
+STREAMS_PROJECTOR_PORT="${STREAMS_PROJECTOR_PORT:-${THROUGHPUT_PROJECTOR_PORT:-3007}}"
 UNIFIED_DEBUG_PORT="${UNIFIED_DEBUG_PORT:-3008}"
 ACTIVITY_WORKER_PORT="${ACTIVITY_WORKER_SERVICE_PORT:-50052}"
-THROUGHPUT_RUNTIME_PORT="${THROUGHPUT_RUNTIME_PORT:-50053}"
+STREAMS_RUNTIME_PORT="${STREAMS_RUNTIME_PORT:-${THROUGHPUT_RUNTIME_PORT:-50053}}"
 UNIFIED_RUNTIME_PORT="${UNIFIED_RUNTIME_PORT:-50054}"
 STREAM_ACTIVITY_WORKER_PORT="${STREAM_ACTIVITY_WORKER_SERVICE_PORT:-50055}"
 
@@ -83,8 +83,8 @@ SERVICES=(
   "ingest-service"
   "query-service"
   "api-gateway"
-  "throughput-runtime"
-  "throughput-projector"
+  "streams-runtime"
+  "streams-projector"
   "timer-service"
   "activity-worker-service"
   "activity-worker-service-stream-v2"
@@ -254,11 +254,11 @@ service_ports_for() {
     api-gateway)
       printf '%s\n' "$API_GATEWAY_PORT"
       ;;
-    throughput-runtime)
-      printf '%s\n%s\n' "$THROUGHPUT_RUNTIME_PORT" "$THROUGHPUT_DEBUG_PORT"
+    streams-runtime)
+      printf '%s\n%s\n' "$STREAMS_RUNTIME_PORT" "$STREAMS_DEBUG_PORT"
       ;;
-    throughput-projector)
-      printf '%s\n' "$THROUGHPUT_PROJECTOR_PORT"
+    streams-projector)
+      printf '%s\n' "$STREAMS_PROJECTOR_PORT"
       ;;
     timer-service)
       printf '%s\n' "$TIMER_PORT"
@@ -487,9 +487,12 @@ export INGEST_SERVICE_URL=http://127.0.0.1:${INGEST_PORT}
 export QUERY_SERVICE_URL=http://127.0.0.1:${QUERY_PORT}
 export UNIFIED_RUNTIME_ENDPOINT=http://127.0.0.1:${UNIFIED_RUNTIME_PORT}
 export UNIFIED_RUNTIME_DEBUG_URL=http://127.0.0.1:${UNIFIED_DEBUG_PORT}
-export THROUGHPUT_RUNTIME_ENDPOINT=http://127.0.0.1:${THROUGHPUT_RUNTIME_PORT}
-export THROUGHPUT_DEBUG_URL=http://127.0.0.1:${THROUGHPUT_DEBUG_PORT}
-export THROUGHPUT_PROJECTOR_URL=http://127.0.0.1:${THROUGHPUT_PROJECTOR_PORT}
+export STREAMS_RUNTIME_ENDPOINT=http://127.0.0.1:${STREAMS_RUNTIME_PORT}
+export STREAMS_DEBUG_URL=http://127.0.0.1:${STREAMS_DEBUG_PORT}
+export STREAMS_PROJECTOR_URL=http://127.0.0.1:${STREAMS_PROJECTOR_PORT}
+export THROUGHPUT_RUNTIME_ENDPOINT=http://127.0.0.1:${STREAMS_RUNTIME_PORT}
+export THROUGHPUT_DEBUG_URL=http://127.0.0.1:${STREAMS_DEBUG_PORT}
+export THROUGHPUT_PROJECTOR_URL=http://127.0.0.1:${STREAMS_PROJECTOR_PORT}
 export POSTGRES_URL=${POSTGRES_URL}
 export REDPANDA_BROKERS=localhost:${REDPANDA_HOST_PORT}
 export DEV_STACK_TENANT_ID=${DEV_STACK_TENANT_ID}
@@ -505,8 +508,8 @@ build_services() {
     -p ingest-service \
     -p unified-runtime \
     -p query-service \
-    -p throughput-runtime \
-    -p throughput-projector \
+    -p streams-runtime \
+    -p streams-projector \
     -p timer-service \
     -p activity-worker-service
 }
@@ -579,28 +582,31 @@ up() {
     -- \
     "$BIN_DIR/api-gateway"
 
-  echo "[dev-stack] starting throughput-runtime"
+  echo "[dev-stack] starting streams-runtime"
   retry_service_start \
-    throughput-runtime \
-    "$LOG_DIR/throughput-runtime.log" \
-    "$THROUGHPUT_RUNTIME_PORT" \
-    "$THROUGHPUT_DEBUG_PORT" \
+    streams-runtime \
+    "$LOG_DIR/streams-runtime.log" \
+    "$STREAMS_RUNTIME_PORT" \
+    "$STREAMS_DEBUG_PORT" \
     "${COMMON_ENV[@]}" \
-    "THROUGHPUT_RUNTIME_PORT=$THROUGHPUT_RUNTIME_PORT" \
-    "THROUGHPUT_DEBUG_PORT=$THROUGHPUT_DEBUG_PORT" \
+    "STREAMS_RUNTIME_PORT=$STREAMS_RUNTIME_PORT" \
+    "STREAMS_DEBUG_PORT=$STREAMS_DEBUG_PORT" \
+    "THROUGHPUT_RUNTIME_PORT=$STREAMS_RUNTIME_PORT" \
+    "THROUGHPUT_DEBUG_PORT=$STREAMS_DEBUG_PORT" \
     -- \
-    "$BIN_DIR/throughput-runtime"
+    "$BIN_DIR/streams-runtime"
 
-  echo "[dev-stack] starting throughput-projector"
+  echo "[dev-stack] starting streams-projector"
   retry_service_start \
-    throughput-projector \
-    "$LOG_DIR/throughput-projector.log" \
-    "$THROUGHPUT_PROJECTOR_PORT" \
+    streams-projector \
+    "$LOG_DIR/streams-projector.log" \
+    "$STREAMS_PROJECTOR_PORT" \
     "" \
     "${COMMON_ENV[@]}" \
-    "THROUGHPUT_PROJECTOR_PORT=$THROUGHPUT_PROJECTOR_PORT" \
+    "STREAMS_PROJECTOR_PORT=$STREAMS_PROJECTOR_PORT" \
+    "THROUGHPUT_PROJECTOR_PORT=$STREAMS_PROJECTOR_PORT" \
     -- \
-    "$BIN_DIR/throughput-projector"
+    "$BIN_DIR/streams-projector"
 
   echo "[dev-stack] starting timer-service"
   retry_service_start \
@@ -637,7 +643,7 @@ up() {
     "${COMMON_ENV[@]}" \
     "ACTIVITY_WORKER_SERVICE_PORT=$STREAM_ACTIVITY_WORKER_PORT" \
     "UNIFIED_RUNTIME_ENDPOINT=http://127.0.0.1:$UNIFIED_RUNTIME_PORT" \
-    "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$THROUGHPUT_RUNTIME_PORT" \
+    "BULK_ACTIVITY_ENDPOINT=http://127.0.0.1:$STREAMS_RUNTIME_PORT" \
     "ACTIVITY_WORKER_TENANT_ID=$DEV_STACK_TENANT_ID" \
     "ACTIVITY_TASK_QUEUE=$DEV_STACK_TASK_QUEUE" \
     -- \

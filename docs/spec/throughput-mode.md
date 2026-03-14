@@ -291,12 +291,12 @@ Infrastructure requirements:
 Behavior:
 
 - authoritative nonterminal execution state lives in the throughput shard runtime, not Postgres
-- dedicated `throughput-runtime` owns throughput shards independently of workflow executors
+- dedicated `streams-runtime` owns throughput shards independently of workflow executors
 - the bridge admits the run and later resumes the workflow, but workflow executors do not own nonterminal chunk lifecycle
-- dedicated `throughput-projector` consumes projection events and updates Postgres asynchronously
+- dedicated `streams-projector` consumes projection events and updates Postgres asynchronously
 - workers use a dedicated throughput worker RPC served by the throughput owner
 - local owner state persists counters, retry scheduling fields, lease deadlines, and group/barrier state
-- terminal run outcomes are produced by `throughput-runtime` and turned into authoritative workflow events only through the bridge
+- terminal run outcomes are produced by `streams-runtime` and turned into authoritative workflow events only through the bridge
 - chunk inputs and outputs may be externalized behind payload handles
 - query results are eventually consistent unless routed to the active throughput owner
 
@@ -327,7 +327,7 @@ If `Fabrik` later exposes dedicated stream-job workflow primitives, they should 
 
 Admission control:
 
-- `throughput-runtime` enforces active chunk caps per batch, per tenant, and per task queue
+- `streams-runtime` enforces active chunk caps per batch, per tenant, and per task queue
 - when a cap is hit, the runtime stops leasing new chunks until capacity is available
 - throttle reasons are surfaced through the runtime debug endpoint
 

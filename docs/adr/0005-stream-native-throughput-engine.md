@@ -17,7 +17,7 @@ The current `stream-v2` path still preserves too much workflow-shaped control-pl
 - `unified-runtime` persists full or near-full workflow instance state at trigger time
 - workflow history emits `BulkActivityBatchScheduled` and the async `workflow_event_outbox` republishes it
 - `throughput_bridge_progress` tracks whether the bridge published the stream command
-- `throughput-runtime` rebuilds batch state from the bridged event
+- `streams-runtime` rebuilds batch state from the bridged event
 - `throughput_projection_batches` and `throughput_projection_chunks` are updated continuously for visibility
 
 This means throughput work does not become truly stream-native until after the workflow runtime has already paid multiple JSON, SQL, and broker costs. Benchmarks have shown only modest gains over durable mode, which indicates the system is still bottlenecked by the workflow-era control plane rather than the chunk execution path.
@@ -47,9 +47,9 @@ For `ctx.bulkActivity()` batches admitted to `stream-v2`, `unified-runtime` will
 
 At that point it appends the corresponding authoritative workflow event and resumes the compiled workflow turn.
 
-### 2. `throughput-runtime` becomes the sole owner of throughput execution
+### 2. `streams-runtime` becomes the sole owner of throughput execution
 
-`throughput-runtime` will own the full nonterminal lifecycle of a throughput run:
+`streams-runtime` will own the full nonterminal lifecycle of a throughput run:
 
 - input expansion and chunk planning
 - partition-local scheduling and admission control
@@ -84,7 +84,7 @@ Checkpoints alone are not sufficient to preserve accepted worker progress. `stre
 
 The chosen model is a write-ahead report log:
 
-- before a worker result is acknowledged, `throughput-runtime` durably appends a report record
+- before a worker result is acknowledged, `streams-runtime` durably appends a report record
 - restore rebuilds from the latest checkpoint plus the durable report tail after that checkpoint
 - checkpoints compact prior report-log progress but do not replace the need for a durable tail
 
@@ -143,7 +143,7 @@ The terminalization rule is:
 - nonterminal run state may transition to terminal exactly once
 - terminal commit is fenced by `run_id` and the active `owner_epoch`
 - `throughput_terminals` enforces one durable terminal record per run
-- the handoff from `throughput-runtime` to `unified-runtime` uses a durable terminal outbox or equivalent atomic terminal command
+- the handoff from `streams-runtime` to `unified-runtime` uses a durable terminal outbox or equivalent atomic terminal command
 - `unified-runtime` deduplicates terminal handoff by `run_id` plus terminal sequencing metadata
 
 The workflow-visible barrier event is appended only from that durable terminal handoff, never from transient in-memory state.
@@ -154,15 +154,15 @@ The intended `stream-v2` lifecycle is:
 
 1. `unified-runtime` admits a `stream-v2` bulk step and writes a `throughput_runs` row plus minimal workflow resume state.
 2. `unified-runtime` emits `StartThroughputRun`.
-3. `throughput-runtime` expands the payload into chunk groups, schedules work, and checkpoints active state.
-4. workers poll partition-owned chunk leases and report terminal chunk results directly to `throughput-runtime`.
-5. `throughput-runtime` reduces results, retries failed chunks when needed, and computes the terminal run outcome.
-6. `throughput-runtime` emits exactly one terminal command back to `unified-runtime`.
+3. `streams-runtime` expands the payload into chunk groups, schedules work, and checkpoints active state.
+4. workers poll partition-owned chunk leases and report terminal chunk results directly to `streams-runtime`.
+5. `streams-runtime` reduces results, retries failed chunks when needed, and computes the terminal run outcome.
+6. `streams-runtime` emits exactly one terminal command back to `unified-runtime`.
 7. `unified-runtime` appends the authoritative workflow barrier event and resumes the workflow.
 
 ## Correctness Invariants
 
-1. `throughput-runtime` is authoritative for all nonterminal progress of a `stream-v2` run.
+1. `streams-runtime` is authoritative for all nonterminal progress of a `stream-v2` run.
 2. `unified-runtime` is authoritative only for workflow-visible barrier semantics.
 3. A worker result is authoritative only after it is durably captured in the report log.
 4. A throughput run has exactly one durable terminal outcome.
@@ -172,7 +172,7 @@ The intended `stream-v2` lifecycle is:
 
 ## Ownership And Fencing
 
-Because `throughput-runtime` is the sole nonterminal owner, epoch fencing is part of the core execution model.
+Because `streams-runtime` is the sole nonterminal owner, epoch fencing is part of the core execution model.
 
 The ownership model is:
 
@@ -223,7 +223,7 @@ These may remain temporarily as compatibility projections or migration scaffoldi
 - the throughput hot path finally matches the intended execution model
 - `stream-v2` can scale with partition-local state and checkpoints instead of SQL row churn
 - workflow runtime latency stops being coupled to chunk scheduling and reduction
-- the service boundary becomes cleaner: workflow barrier semantics stay in `unified-runtime`, throughput execution stays in `throughput-runtime`
+- the service boundary becomes cleaner: workflow barrier semantics stay in `unified-runtime`, throughput execution stays in `streams-runtime`
 
 ### Negative
 
@@ -254,15 +254,15 @@ This phase exists to keep storage, RPC, and failover semantics from drifting whi
 - teach `unified-runtime` to write throughput admission records
 - publish `StartThroughputRun` directly from admission, while keeping the legacy bridge available behind a compatibility flag
 
-### Phase 2: Make `throughput-runtime` restore from checkpoints, not bridged workflow state
+### Phase 2: Make `streams-runtime` restore from checkpoints, not bridged workflow state
 
 - build run state directly from `throughput_runs`, checkpoints, and the durable report tail
-- move chunk planning and reducer initialization fully into `throughput-runtime`
+- move chunk planning and reducer initialization fully into `streams-runtime`
 - stop requiring `throughput_projection_*` rows for restore
 
 ### Phase 3: Move worker polling and reporting to run-native state
 
-- switch the worker RPC surface to run/chunk leases owned by `throughput-runtime`
+- switch the worker RPC surface to run/chunk leases owned by `streams-runtime`
 - stop depending on workflow-shaped batch/chunk SQL records for execution
 
 ### Phase 4: Return only terminal outcomes to the workflow runtime

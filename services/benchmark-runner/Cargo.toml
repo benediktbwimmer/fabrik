@@ -18,5 +18,5 @@ uuid.workspace = true
 fabrik-config = { path = "../../crates/fabrik-config" }
 fabrik-broker = { path = "../../crates/fabrik-broker" }
 fabrik-store = { path = "../../crates/fabrik-store" }
-fabrik-throughput = { path = "../../crates/fabrik-throughput" }
+fabrik-throughput = { package = "fabrik-streams", path = "../../crates/fabrik-throughput" }
 fabrik-workflow = { path = "../../crates/fabrik-workflow" }

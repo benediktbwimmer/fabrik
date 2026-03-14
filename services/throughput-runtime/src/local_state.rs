@@ -21,9 +21,9 @@ use fabrik_throughput::{
     ThroughputChangelogPayload, ThroughputChunkReport, ThroughputChunkReportPayload,
     bulk_reducer_default_summary_value, bulk_reducer_reduce_errors, bulk_reducer_reduce_values,
     bulk_reducer_requires_error_outputs, bulk_reducer_requires_success_outputs,
-    bulk_reducer_settles, bulk_reducer_summary_field_name, reduction_tree_child_group_ids,
-    reduction_tree_level_counts, reduction_tree_node_id, reduction_tree_node_level,
-    reduction_tree_parent_group_id,
+    bulk_reducer_settles, bulk_reducer_summary_field_name, decode_cbor, encode_cbor,
+    reduction_tree_child_group_ids, reduction_tree_level_counts, reduction_tree_node_id,
+    reduction_tree_node_level, reduction_tree_parent_group_id,
 };
 use rocksdb::{DB, IteratorMode, Options, WriteBatch};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -40,13 +40,22 @@ const READY_INDEX_PREFIX: &str = "idx:ready:";
 const STARTED_INDEX_PREFIX: &str = "idx:started:";
 const LEASE_EXPIRY_INDEX_PREFIX: &str = "idx:lease-expiry:";
 const LATEST_CHECKPOINT_FILE: &str = "latest.json";
+const ROCKSDB_ENCODING_PREFIX: &[u8] = b"fs2\0";
 
 fn encode_rocksdb_value<T: Serialize>(value: &T, subject: &str) -> Result<Vec<u8>> {
-    serde_json::to_vec(value).with_context(|| format!("failed to serialize {subject}"))
+    let encoded = encode_cbor(value, subject)?;
+    let mut bytes = Vec::with_capacity(ROCKSDB_ENCODING_PREFIX.len() + encoded.len());
+    bytes.extend_from_slice(ROCKSDB_ENCODING_PREFIX);
+    bytes.extend_from_slice(&encoded);
+    Ok(bytes)
 }
 
 fn decode_rocksdb_value<T: DeserializeOwned>(bytes: &[u8], subject: &str) -> Result<T> {
-    serde_json::from_slice(bytes).with_context(|| format!("failed to deserialize {subject}"))
+    if let Some(cbor_bytes) = bytes.strip_prefix(ROCKSDB_ENCODING_PREFIX) {
+        return decode_cbor(cbor_bytes, subject);
+    }
+    serde_json::from_slice(bytes)
+        .with_context(|| format!("failed to deserialize legacy JSON {subject}"))
 }
 
 #[derive(Clone)]
@@ -212,7 +221,7 @@ fn encode_rocksdb_chunk_state(state: &LocalChunkState) -> Result<Vec<u8>> {
 }
 
 fn decode_rocksdb_chunk_state(bytes: &[u8]) -> Result<LocalChunkState> {
-    serde_json::from_slice(bytes).context("failed to deserialize throughput chunk state")
+    decode_rocksdb_value(bytes, "throughput chunk state")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4026,7 +4035,7 @@ mod tests {
     }
 
     #[test]
-    fn local_state_writes_json_rocksdb_values() -> Result<()> {
+    fn local_state_writes_cbor_rocksdb_values_with_format_prefix() -> Result<()> {
         let db_path = temp_path("throughput-state-json-db");
         let checkpoint_dir = temp_path("throughput-state-json-checkpoints");
         let state = LocalThroughputState::open(&db_path, &checkpoint_dir, 3)?;
@@ -4053,51 +4062,63 @@ mod tests {
 
         let batch_bytes =
             state.db.get(batch_key(&identity()))?.expect("batch state should be written");
-        let decoded_batch: LocalBatchState = serde_json::from_slice(&batch_bytes)?;
+        assert!(batch_bytes.starts_with(ROCKSDB_ENCODING_PREFIX));
+        let decoded_batch: LocalBatchState =
+            decode_rocksdb_value(&batch_bytes, "throughput batch state")?;
         assert_eq!(decoded_batch.status, WorkflowBulkBatchStatus::Running.as_str());
 
         let scheduled_bytes = state
             .db
             .get(chunk_key(&identity(), "chunk-a"))?
             .expect("scheduled chunk state should be written");
-        let decoded_scheduled: LocalChunkState = serde_json::from_slice(&scheduled_bytes)?;
+        assert!(scheduled_bytes.starts_with(ROCKSDB_ENCODING_PREFIX));
+        let decoded_scheduled: LocalChunkState =
+            decode_rocksdb_value(&scheduled_bytes, "throughput chunk state")?;
         assert_eq!(decoded_scheduled.status, WorkflowBulkChunkStatus::Scheduled.as_str());
 
         let started_bytes = state
             .db
             .get(chunk_key(&identity(), "chunk-b"))?
             .expect("started chunk state should be written");
-        let decoded_started: LocalChunkState = serde_json::from_slice(&started_bytes)?;
+        assert!(started_bytes.starts_with(ROCKSDB_ENCODING_PREFIX));
+        let decoded_started: LocalChunkState =
+            decode_rocksdb_value(&started_bytes, "throughput chunk state")?;
         assert_eq!(decoded_started.status, WorkflowBulkChunkStatus::Started.as_str());
 
         let chunk_index_bytes = state
             .db
             .get(batch_chunk_index_key(&identity(), "chunk-a"))?
             .expect("batch chunk index should be written");
-        let decoded_chunk_index: BatchChunkIndexEntry = serde_json::from_slice(&chunk_index_bytes)?;
+        assert!(chunk_index_bytes.starts_with(ROCKSDB_ENCODING_PREFIX));
+        let decoded_chunk_index: BatchChunkIndexEntry =
+            decode_rocksdb_value(&chunk_index_bytes, "batch chunk index entry")?;
         assert_eq!(decoded_chunk_index.chunk_id, "chunk-a");
 
         let ready_index_bytes = state
             .db
             .get(ready_index_key(&scheduled_state))?
             .expect("ready index should be written");
-        let decoded_ready_index: ReadyChunkIndexEntry = serde_json::from_slice(&ready_index_bytes)?;
+        assert!(ready_index_bytes.starts_with(ROCKSDB_ENCODING_PREFIX));
+        let decoded_ready_index: ReadyChunkIndexEntry =
+            decode_rocksdb_value(&ready_index_bytes, "ready chunk index entry")?;
         assert_eq!(decoded_ready_index.chunk_id, "chunk-a");
 
         let started_index_bytes = state
             .db
             .get(started_index_key(&started_state))?
             .expect("started index should be written");
+        assert!(started_index_bytes.starts_with(ROCKSDB_ENCODING_PREFIX));
         let decoded_started_index: StartedChunkIndexEntry =
-            serde_json::from_slice(&started_index_bytes)?;
+            decode_rocksdb_value(&started_index_bytes, "started chunk index entry")?;
         assert_eq!(decoded_started_index.chunk_id, "chunk-b");
 
         let lease_expiry_bytes = state
             .db
             .get(lease_expiry_index_key(&started_state))?
             .expect("lease expiry index should be written");
+        assert!(lease_expiry_bytes.starts_with(ROCKSDB_ENCODING_PREFIX));
         let decoded_lease_expiry: StartedChunkIndexEntry =
-            serde_json::from_slice(&lease_expiry_bytes)?;
+            decode_rocksdb_value(&lease_expiry_bytes, "lease expiry index entry")?;
         assert_eq!(decoded_lease_expiry.chunk_id, "chunk-b");
 
         let mut write_batch = WriteBatch::default();
@@ -4120,14 +4141,18 @@ mod tests {
 
         let group_bytes =
             state.db.get(group_key(&identity(), 0))?.expect("group state should be written");
-        let decoded_group: LocalGroupState = serde_json::from_slice(&group_bytes)?;
+        assert!(group_bytes.starts_with(ROCKSDB_ENCODING_PREFIX));
+        let decoded_group: LocalGroupState =
+            decode_rocksdb_value(&group_bytes, "throughput group state")?;
         assert_eq!(decoded_group.group_id, 0);
 
         let group_index_bytes = state
             .db
             .get(batch_group_index_key(&identity(), 0))?
             .expect("group index should be written");
-        let decoded_group_index: BatchGroupIndexEntry = serde_json::from_slice(&group_index_bytes)?;
+        assert!(group_index_bytes.starts_with(ROCKSDB_ENCODING_PREFIX));
+        let decoded_group_index: BatchGroupIndexEntry =
+            decode_rocksdb_value(&group_index_bytes, "batch group index entry")?;
         assert_eq!(decoded_group_index.group_id, 0);
 
         let _ = fs::remove_dir_all(&db_path);
