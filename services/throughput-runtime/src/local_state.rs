@@ -683,11 +683,7 @@ impl LocalThroughputState {
                 worker_id: chunk.worker_id.clone(),
                 lease_token: chunk.lease_token.map(|value| value.to_string()),
                 report_id: chunk.last_report_id.clone(),
-                result_handle: if strip_collect_results_output {
-                    Value::Null
-                } else {
-                    chunk.result_handle.clone()
-                },
+                result_handle: chunk.result_handle.clone(),
                 output: if strip_collect_results_output { None } else { chunk.output.clone() },
                 error: chunk.error.clone(),
                 input_handle: chunk.input_handle.clone(),
@@ -749,11 +745,7 @@ impl LocalThroughputState {
             worker_id: chunk.worker_id.clone(),
             lease_token: chunk.lease_token.map(|value| value.to_string()),
             report_id: chunk.last_report_id.clone(),
-            result_handle: if strip_collect_results_output {
-                Value::Null
-            } else {
-                chunk.result_handle.clone()
-            },
+            result_handle: chunk.result_handle.clone(),
             output: if strip_collect_results_output { None } else { chunk.output.clone() },
             error: chunk.error.clone(),
             input_handle: chunk.input_handle.clone(),
@@ -2684,11 +2676,7 @@ impl LocalThroughputState {
                     worker_id: None,
                     lease_token: None,
                     report_id: Some(report_id.clone()),
-                    result_handle: if strip_collect_results_output {
-                        Value::Null
-                    } else {
-                        result_handle.clone().unwrap_or(Value::Null)
-                    },
+                    result_handle: result_handle.clone().unwrap_or(Value::Null),
                     output: if strip_collect_results_output { None } else { output.clone() },
                     error: error.clone(),
                     input_handle: existing_chunk

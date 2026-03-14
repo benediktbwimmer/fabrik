@@ -222,27 +222,36 @@ fn mixed_build_payload_converter_path_upgrade_fixture_is_qualified_for_alpha() {
 }
 
 #[test]
-fn custom_payload_converter_usage_blocks_migration() {
+fn static_data_converter_factory_usage_is_qualified_for_alpha() {
+    let output_dir = temp_output_dir("data-converter-factory");
+    let (status, report) = run_cli(
+        &fixture("temporal-data-converter-factory-qualified"),
+        &output_dir,
+        &[],
+    );
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["validation"]["payload_data_converter_validation"]["status"], "passed");
+    assert_eq!(
+        report["worker_packages"][0]["data_converter_mode"],
+        "static_data_converter_factory"
+    );
+}
+
+#[test]
+fn static_payload_converter_module_usage_is_qualified_for_alpha() {
     let output_dir = temp_output_dir("payload");
     let (status, report) = run_cli(&fixture("temporal-payload-blocked"), &output_dir, &[]);
-    assert_eq!(status.code(), Some(2));
-    assert_eq!(report["status"], "incompatible_blocked");
-    assert_eq!(report["alpha_qualification"]["verdict"], "blocked");
-    assert_eq!(report["validation"]["payload_data_converter_validation"]["status"], "blocked");
-    assert!(
-        report["findings"]
-            .as_array()
-            .expect("findings")
-            .iter()
-            .any(|finding| finding["feature"] == "payload_data_converter_usage")
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["validation"]["payload_data_converter_validation"]["status"], "passed");
+    assert_eq!(
+        report["worker_packages"][0]["data_converter_mode"],
+        "path_static_payload_converter"
     );
-    assert!(
-        report["alpha_qualification"]["blocker_categories"]
-            .as_array()
-            .expect("blocker categories")
-            .iter()
-            .any(|group| group["category"] == "unsupported_api")
-    );
+    assert!(report["worker_packages"][0]["resolved_payload_converter_module_path"].is_string());
 }
 
 #[test]

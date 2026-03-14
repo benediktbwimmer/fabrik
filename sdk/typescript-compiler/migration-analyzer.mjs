@@ -22,7 +22,10 @@ const WORKFLOW_SUPPORTED_IMPORTS = new Set([
   "ParentClosePolicy",
   "patched",
   "proxyActivities",
+  "proxyLocalActivities",
+  "proxySinks",
   "SearchAttributes",
+  "Sinks",
   "deprecatePatch",
   "setWorkflowOptions",
   "setHandler",
@@ -34,13 +37,9 @@ const WORKFLOW_SUPPORTED_IMPORTS = new Set([
 ]);
 
 const BLOCKED_PAYLOAD_IMPORTS = new Set([
-  "CompositePayloadConverter",
   "DefaultFailureConverter",
-  "DefaultPayloadConverterWithProtobufs",
   "LoadedDataConverter",
-  "PayloadCodec",
   "PayloadConverter",
-  "PayloadConverterWithEncoding",
 ]);
 
 const SUPPORTED_DATA_CONVERTER_IMPORTS = new Set([
@@ -60,7 +59,6 @@ const WORKER_BLOCKING_PROPERTIES = new Map([
   ["payloadConverterPath", "custom payload converters are not supported by the migration pipeline"],
   ["codecServer", "codec servers are not supported by the migration pipeline"],
   ["interceptors", "worker interceptors are not migration-ready yet"],
-  ["sinks", "custom worker sinks are not migration-ready yet"],
   ["workflowInterceptorModules", "workflow interceptors are not migration-ready yet"],
 ]);
 
@@ -914,7 +912,12 @@ function createSourceBindings(parentBindings, sourceFile, projectRoot, program) 
         continue;
       }
       const staticValue = evaluateStaticValue(initializer, moduleBindings, checker);
-      if (staticValue !== undefined) {
+      if (
+        staticValue !== undefined ||
+        ts.isFunctionDeclaration(initializer) ||
+        ts.isFunctionExpression(initializer) ||
+        ts.isArrowFunction(initializer)
+      ) {
         bindings.set(element.name.text, initializer);
       }
     }
@@ -988,6 +991,25 @@ function analyzeSupportedDataConverter(node, bindings, temporalImports, checker 
   if (importedName != null && SUPPORTED_DATA_CONVERTER_IMPORTS.has(importedName)) {
     return { supported: true, mode: "default_temporal" };
   }
+  const awaitedCall = ts.isAwaitExpression(resolved) ? resolved.expression : resolved;
+  if (
+    ts.isCallExpression(awaitedCall) &&
+    awaitedCall.arguments.length === 0 &&
+    ts.isIdentifier(awaitedCall.expression)
+  ) {
+    const factory = resolveIdentifierInitializer(awaitedCall.expression, bindings, checker, new Set());
+    if (
+      factory &&
+      (
+        ts.isFunctionDeclaration(factory) ||
+        ts.isFunctionExpression(factory) ||
+        ts.isArrowFunction(factory)
+      ) &&
+      factory.parameters.length === 0
+    ) {
+      return { supported: true, mode: "static_data_converter_factory" };
+    }
+  }
   if (!ts.isObjectLiteralExpression(resolved)) {
     return { supported: false, mode: null };
   }
@@ -1023,6 +1045,15 @@ function analyzeSupportedDataConverter(node, bindings, temporalImports, checker 
 }
 
 function findExportedBindingExpression(sourceFile, exportName, bindings) {
+  for (const statement of sourceFile.statements) {
+    if (
+      ts.isFunctionDeclaration(statement) &&
+      statement.name?.text === exportName &&
+      statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)
+    ) {
+      return statement;
+    }
+  }
   for (const statement of sourceFile.statements) {
     if (!ts.isVariableStatement(statement)) {
       continue;
@@ -1070,13 +1101,21 @@ function analyzePayloadConverterModule(program, projectRoot, sourceFile, specifi
   const exportedPayloadConverter =
     findExportedBindingExpression(moduleSourceFile, "payloadConverter", moduleBindings);
   if (exportedPayloadConverter == null) {
-    return { supported: false, mode: null, resolvedModulePath };
+    const checker = program.getTypeChecker();
+    const moduleSymbol = checker.getSymbolAtLocation(moduleSourceFile);
+    const hasNamedExport =
+      moduleSymbol != null &&
+      checker.getExportsOfModule(moduleSymbol).some((candidate) => candidate.getName() === "payloadConverter");
+    if (!hasNamedExport) {
+      return { supported: false, mode: null, resolvedModulePath };
+    }
+    return { supported: true, mode: "path_static_payload_converter", resolvedModulePath };
   }
   const checker = program.getTypeChecker();
-  if (!isSupportedPayloadConverterExpression(exportedPayloadConverter, moduleBindings, temporalImports, checker)) {
-    return { supported: false, mode: null, resolvedModulePath };
+  if (isSupportedPayloadConverterExpression(exportedPayloadConverter, moduleBindings, temporalImports, checker)) {
+    return { supported: true, mode: "path_default_temporal", resolvedModulePath };
   }
-  return { supported: true, mode: "path_default_temporal", resolvedModulePath };
+  return { supported: true, mode: "path_static_payload_converter", resolvedModulePath };
 }
 
 function analyzeWorkerDataConverter(program, projectRoot, sourceFile, node, bindings, temporalImports) {
@@ -1235,7 +1274,9 @@ async function main() {
     for (const [localName, importedName] of workflowImports) {
       temporalImports.push(`@temporalio/workflow:${importedName} as ${localName}`);
       if (WORKFLOW_SUPPORTED_IMPORTS.has(importedName)) {
-        if (importedName === "proxyActivities") fileUses.add("proxy_activities");
+        if (importedName === "proxyActivities" || importedName === "proxyLocalActivities") {
+          fileUses.add("proxy_activities");
+        }
         if (["defineSignal", "defineQuery", "defineUpdate"].includes(importedName)) {
           fileUses.add("signals_queries_updates");
         }
@@ -1305,7 +1346,7 @@ async function main() {
           : scopeBindings;
       if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
         const importedWorkflowName = workflowImports.get(node.expression.text);
-        if (importedWorkflowName === "proxyActivities") {
+        if (importedWorkflowName === "proxyActivities" || importedWorkflowName === "proxyLocalActivities") {
           fileUses.add("proxy_activities");
           fileUses.add("activity_options_and_retries");
         } else if (["defineSignal", "defineQuery", "defineUpdate"].includes(importedWorkflowName)) {
@@ -1412,8 +1453,8 @@ async function main() {
                   "blocked_data_converter_usage",
                   "payload_data_converter_usage",
                   dataConverterProperty,
-                  "Worker dataConverter must stay within Fabrik's default-compatible adapter subset",
-                  "use defaultDataConverter or a static object literal with defaultPayloadConverter and an empty payloadCodecs list",
+                  "Worker dataConverter must stay within Fabrik's supported static adapter subset",
+                  "use defaultDataConverter, a static object literal with defaultPayloadConverter and an empty payloadCodecs list, or a static payloadConverterPath module",
                   "dataConverter",
                 ),
               );
@@ -1530,11 +1571,12 @@ async function main() {
             );
           }
         }
-        if (
-          propertyName === "payloadCodec" ||
-          propertyName === "payloadConverterPath" ||
-          propertyName === "codecServer"
-        ) {
+        if (propertyName === "payloadConverterPath") {
+          fileUses.add("payload_data_converter_usage");
+          ts.forEachChild(node, (child) => visit(child, currentBindings));
+          return;
+        }
+        if (propertyName === "payloadCodec" || propertyName === "codecServer") {
           if (supportedPayloadConverterPathNodes.has(node)) {
             ts.forEachChild(node, (child) => visit(child, currentBindings));
             return;

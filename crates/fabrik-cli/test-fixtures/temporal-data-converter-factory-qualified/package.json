@@ -1,0 +1,8 @@
+{
+  "name": "temporal-data-converter-factory-qualified",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@temporalio/worker": "^1.11.0"
+  }
+}

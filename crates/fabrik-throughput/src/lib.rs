@@ -534,6 +534,20 @@ impl PayloadHandle {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CollectResultsChunkSegmentRef {
+    pub chunk_id: String,
+    pub chunk_index: u32,
+    pub item_count: u32,
+    pub result_handle: PayloadHandle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CollectResultsBatchManifest {
+    pub kind: String,
+    pub chunks: Vec<CollectResultsChunkSegmentRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ThroughputBatchIdentity {
     pub tenant_id: String,
     pub instance_id: String,

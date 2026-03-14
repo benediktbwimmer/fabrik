@@ -269,6 +269,7 @@ function collectTemporalWorkflowApi(sourceFile) {
     activityFailure: new Set(),
     proxyActivities: new Set(),
     proxyLocalActivities: new Set(),
+    proxySinks: new Set(),
     sleep: new Set(),
     continueAsNew: new Set(),
     condition: new Set(),
@@ -315,6 +316,7 @@ function collectTemporalWorkflowApi(sourceFile) {
       if (importedName === "ActivityFailure") api.activityFailure.add(localName);
       if (importedName === "proxyActivities") api.proxyActivities.add(localName);
       if (importedName === "proxyLocalActivities") api.proxyLocalActivities.add(localName);
+      if (importedName === "proxySinks") api.proxySinks.add(localName);
       if (importedName === "sleep") api.sleep.add(localName);
       if (importedName === "continueAsNew") api.continueAsNew.add(localName);
       if (importedName === "condition") api.condition.add(localName);
@@ -561,6 +563,8 @@ function isTemporalProxyDeclaration(declaration, temporalApi) {
       "proxyLocalActivities",
       temporalApi,
     )
+    &&
+    !temporalImportedCallMatches(initializer, temporalApi.proxySinks, "proxySinks", temporalApi)
   ) {
     return false;
   }
@@ -1722,6 +1726,255 @@ function ensureAwaitedReturnExpression(expression) {
     : ts.setTextRange(ts.factory.createAwaitExpression(expression), expression);
 }
 
+function cloneAsyncHelperBindingName(name, renames) {
+  if (ts.isIdentifier(name)) {
+    return ts.factory.createIdentifier(renames.get(name.text) ?? name.text);
+  }
+  throw compilerError(`async helper bindings must be plain identifiers`, name);
+}
+
+function cloneAsyncHelperExpression(node, renames) {
+  if (ts.isIdentifier(node)) {
+    return ts.factory.createIdentifier(renames.get(node.text) ?? node.text);
+  }
+  if (
+    ts.isStringLiteral(node) ||
+    ts.isNoSubstitutionTemplateLiteral(node) ||
+    ts.isNumericLiteral(node)
+  ) {
+    return node;
+  }
+  if (
+    node.kind === ts.SyntaxKind.TrueKeyword ||
+    node.kind === ts.SyntaxKind.FalseKeyword ||
+    node.kind === ts.SyntaxKind.NullKeyword ||
+    node.kind === ts.SyntaxKind.ThisKeyword ||
+    node.kind === ts.SyntaxKind.SuperKeyword
+  ) {
+    return node;
+  }
+  if (ts.isAwaitExpression(node)) {
+    return ts.factory.createAwaitExpression(cloneAsyncHelperExpression(node.expression, renames));
+  }
+  if (ts.isCallExpression(node)) {
+    return ts.factory.createCallExpression(
+      cloneAsyncHelperExpression(node.expression, renames),
+      node.typeArguments,
+      node.arguments.map((arg) => cloneAsyncHelperExpression(arg, renames)),
+    );
+  }
+  if (ts.isSpreadElement(node)) {
+    return ts.factory.createSpreadElement(cloneAsyncHelperExpression(node.expression, renames));
+  }
+  if (ts.isPropertyAccessExpression(node)) {
+    return ts.factory.createPropertyAccessExpression(
+      cloneAsyncHelperExpression(node.expression, renames),
+      node.name,
+    );
+  }
+  if (ts.isElementAccessExpression(node)) {
+    return ts.factory.createElementAccessExpression(
+      cloneAsyncHelperExpression(node.expression, renames),
+      cloneAsyncHelperExpression(node.argumentExpression, renames),
+    );
+  }
+  if (ts.isBinaryExpression(node)) {
+    return ts.factory.createBinaryExpression(
+      cloneAsyncHelperExpression(node.left, renames),
+      node.operatorToken.kind,
+      cloneAsyncHelperExpression(node.right, renames),
+    );
+  }
+  if (ts.isPrefixUnaryExpression(node)) {
+    return ts.factory.createPrefixUnaryExpression(
+      node.operator,
+      cloneAsyncHelperExpression(node.operand, renames),
+    );
+  }
+  if (ts.isPostfixUnaryExpression(node)) {
+    return ts.factory.createPostfixUnaryExpression(
+      cloneAsyncHelperExpression(node.operand, renames),
+      node.operator,
+    );
+  }
+  if (ts.isParenthesizedExpression(node)) {
+    return ts.factory.createParenthesizedExpression(
+      cloneAsyncHelperExpression(node.expression, renames),
+    );
+  }
+  if (ts.isArrayLiteralExpression(node)) {
+    return ts.factory.createArrayLiteralExpression(
+      node.elements.map((element) => cloneAsyncHelperExpression(element, renames)),
+      node.multiLine,
+    );
+  }
+  if (ts.isPropertyAssignment(node)) {
+    return ts.factory.createPropertyAssignment(
+      node.name,
+      cloneAsyncHelperExpression(node.initializer, renames),
+    );
+  }
+  if (ts.isShorthandPropertyAssignment(node)) {
+    return ts.factory.createPropertyAssignment(
+      node.name,
+      ts.factory.createIdentifier(renames.get(node.name.text) ?? node.name.text),
+    );
+  }
+  if (ts.isObjectLiteralExpression(node)) {
+    return ts.factory.createObjectLiteralExpression(
+      node.properties.map((property) => cloneAsyncHelperExpression(property, renames)),
+      node.multiLine,
+    );
+  }
+  if (ts.isArrowFunction(node)) {
+    return ts.factory.createArrowFunction(
+      node.modifiers,
+      node.typeParameters,
+      node.parameters.map((parameter) =>
+        ts.factory.createParameterDeclaration(
+          parameter.modifiers,
+          parameter.dotDotDotToken,
+          cloneAsyncHelperBindingName(parameter.name, renames),
+          parameter.questionToken,
+          parameter.type,
+          parameter.initializer ? cloneAsyncHelperExpression(parameter.initializer, renames) : undefined,
+        )
+      ),
+      node.type,
+      node.equalsGreaterThanToken,
+      ts.isBlock(node.body)
+        ? cloneAsyncHelperBlock(node.body, renames)
+        : cloneAsyncHelperExpression(node.body, renames),
+    );
+  }
+  if (ts.isTemplateExpression(node)) {
+    return ts.factory.createTemplateExpression(
+      node.head,
+      node.templateSpans.map((span) =>
+        ts.factory.createTemplateSpan(
+          cloneAsyncHelperExpression(span.expression, renames),
+          span.literal,
+        )
+      ),
+    );
+  }
+  if (ts.isAsExpression(node)) {
+    return ts.factory.createAsExpression(
+      cloneAsyncHelperExpression(node.expression, renames),
+      node.type,
+    );
+  }
+  if (ts.isNonNullExpression(node)) {
+    return ts.factory.createNonNullExpression(cloneAsyncHelperExpression(node.expression, renames));
+  }
+  throw compilerError(`unsupported async helper expression: ${node.getText()}`, node);
+}
+
+function cloneAsyncHelperStatement(statement, renames) {
+  if (ts.isExpressionStatement(statement)) {
+    return ts.factory.createExpressionStatement(
+      cloneAsyncHelperExpression(statement.expression, renames),
+    );
+  }
+  if (ts.isReturnStatement(statement)) {
+    return ts.factory.createReturnStatement(
+      statement.expression
+        ? ensureAwaitedReturnExpression(cloneAsyncHelperExpression(statement.expression, renames))
+        : undefined,
+    );
+  }
+  if (ts.isVariableStatement(statement)) {
+    return ts.factory.createVariableStatement(
+      statement.modifiers,
+      ts.factory.createVariableDeclarationList(
+        statement.declarationList.declarations.map((declaration) =>
+          ts.factory.createVariableDeclaration(
+            cloneAsyncHelperBindingName(declaration.name, renames),
+            declaration.exclamationToken,
+            declaration.type,
+            declaration.initializer
+              ? cloneAsyncHelperExpression(declaration.initializer, renames)
+              : undefined,
+          )
+        ),
+        statement.declarationList.flags,
+      ),
+    );
+  }
+  if (ts.isIfStatement(statement)) {
+    return ts.factory.createIfStatement(
+      cloneAsyncHelperExpression(statement.expression, renames),
+      cloneAsyncHelperStatement(statement.thenStatement, renames),
+      statement.elseStatement
+        ? cloneAsyncHelperStatement(statement.elseStatement, renames)
+        : undefined,
+    );
+  }
+  if (ts.isForOfStatement(statement)) {
+    const initializer = ts.isVariableDeclarationList(statement.initializer)
+      ? ts.factory.createVariableDeclarationList(
+          statement.initializer.declarations.map((declaration) =>
+            ts.factory.createVariableDeclaration(
+              cloneAsyncHelperBindingName(declaration.name, renames),
+              declaration.exclamationToken,
+              declaration.type,
+              declaration.initializer
+                ? cloneAsyncHelperExpression(declaration.initializer, renames)
+                : undefined,
+            )
+          ),
+          statement.initializer.flags,
+        )
+      : cloneAsyncHelperExpression(statement.initializer, renames);
+    return ts.factory.createForOfStatement(
+      statement.awaitModifier,
+      initializer,
+      cloneAsyncHelperExpression(statement.expression, renames),
+      cloneAsyncHelperStatement(statement.statement, renames),
+    );
+  }
+  if (ts.isBlock(statement)) {
+    return cloneAsyncHelperBlock(statement, renames);
+  }
+  throw compilerError(`unsupported async helper statement: ${statement.getText()}`, statement);
+}
+
+function cloneAsyncHelperBlock(block, renames) {
+  return ts.factory.createBlock(
+    block.statements.map((statement) => cloneAsyncHelperStatement(statement, renames)),
+    true,
+  );
+}
+
+function rewriteAsyncHelperSourceText(sourceText, renames) {
+  if (renames.size === 0) {
+    return sourceText;
+  }
+  const scanner = ts.createScanner(ts.ScriptTarget.Latest, true, ts.LanguageVariant.Standard, sourceText);
+  let output = "";
+  let lastPos = 0;
+  let previousToken = ts.SyntaxKind.Unknown;
+  for (let token = scanner.scan(); token !== ts.SyntaxKind.EndOfFileToken; token = scanner.scan()) {
+    const tokenPos = scanner.getTokenPos();
+    const textPos = scanner.getTextPos();
+    output += sourceText.slice(lastPos, tokenPos);
+    let text = sourceText.slice(tokenPos, textPos);
+    if (
+      token === ts.SyntaxKind.Identifier &&
+      renames.has(text) &&
+      previousToken !== ts.SyntaxKind.DotToken &&
+      previousToken !== ts.SyntaxKind.QuestionDotToken
+    ) {
+      text = renames.get(text);
+    }
+    output += text;
+    lastPos = textPos;
+    previousToken = token;
+  }
+  output += sourceText.slice(lastPos);
+  return output;
+}
+
 function extractWrappedAwaitExpression(expression) {
   if (ts.isAwaitExpression(expression)) {
     return {
@@ -1769,42 +2022,25 @@ function extractWrappedAwaitExpression(expression) {
 }
 
 function prepareAsyncHelperStatements(declaration, renames) {
-  const sourceStatements =
+  const helperBodySource =
     declaration.body && ts.isBlock(declaration.body)
-      ? declaration.body.statements
-      : [
-          ts.setTextRange(
-            ts.factory.createReturnStatement(
-              ensureAwaitedReturnExpression(declaration.body),
-            ),
-            declaration.body ?? declaration,
-          ),
-        ];
-  const transformer = (context) => {
-    const visit = (node) => {
-      if (ts.isReturnStatement(node) && node.expression) {
-        return ts.visitEachChild(
-          ts.setTextRange(
-            ts.factory.createReturnStatement(ensureAwaitedReturnExpression(node.expression)),
-            node,
-          ),
-          visit,
-          context,
-        );
-      }
-      if (ts.isIdentifier(node) && renames.has(node.text) && shouldRenameIdentifierNode(node)) {
-        return ts.setTextRange(ts.factory.createIdentifier(renames.get(node.text)), node);
-      }
-      return ts.visitEachChild(node, visit, context);
-    };
-    return (root) => ts.visitNode(root, visit);
-  };
-  const result = ts.transform(sourceStatements, [transformer]);
-  try {
-    return result.transformed;
-  } finally {
-    result.dispose();
+      ? declaration.body.statements.map((statement) => statement.getText()).join("\n")
+      : `return await (${declaration.body ? declaration.body.getText() : "undefined"});`;
+  const rewritten = rewriteAsyncHelperSourceText(helperBodySource, renames);
+  const wrapper = ts.createSourceFile(
+    "__async_helper.ts",
+    `async function __helper__() {\n${rewritten}\n}`,
+    ts.ScriptTarget.Latest,
+    true,
+    ts.ScriptKind.TS,
+  );
+  const fn = wrapper.statements.find(
+    (statement) => ts.isFunctionDeclaration(statement) && statement.name?.text === "__helper__",
+  );
+  if (!fn?.body) {
+    throw compilerError(`failed to reparse async helper body`, declaration);
   }
+  return [...fn.body.statements];
 }
 
 function compileAssignmentAction(statement, left, operatorKind, right) {
@@ -2947,6 +3183,9 @@ class WorkflowLowerer {
     this.temporalActivityBindings = sourceFile
       ? this.discoverTemporalActivityBindings(sourceFile)
       : { direct: new Map(), objects: new Set() };
+    this.temporalSinkBindings = sourceFile
+      ? this.discoverTemporalSinkBindings(sourceFile)
+      : { direct: new Set(), objects: new Set() };
     this.promiseLikeTimerClasses = sourceFile ? this.discoverPromiseLikeTimerClasses(sourceFile) : new Map();
     this.callbackHelpers = sourceFile ? this.discoverCallbackHelpers(sourceFile) : new Map();
     this.asyncLocalHelpers = sourceFile ? this.discoverAsyncLocalHelpers(sourceFile) : new Map();
@@ -3062,6 +3301,47 @@ class WorkflowLowerer {
               options,
             });
           }
+        }
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
+    return bindings;
+  }
+
+  discoverTemporalSinkBindings(sourceFile) {
+    const bindings = {
+      direct: new Set(),
+      objects: new Set(),
+    };
+    const visit = (node) => {
+      if (!ts.isVariableStatement(node)) {
+        ts.forEachChild(node, visit);
+        return;
+      }
+      for (const declaration of node.declarationList.declarations) {
+        const initializer = declaration.initializer
+          ? unwrapStaticReferenceExpression(declaration.initializer)
+          : null;
+        if (
+          !initializer ||
+          !ts.isCallExpression(initializer) ||
+          !temporalImportedCallMatches(initializer, this.temporalApi.proxySinks, "proxySinks", this.temporalApi)
+        ) {
+          continue;
+        }
+        if (ts.isIdentifier(declaration.name)) {
+          bindings.objects.add(declaration.name.text);
+          continue;
+        }
+        if (!ts.isObjectBindingPattern(declaration.name)) {
+          throw compilerError(`proxySinks declarations must bind identifiers`, declaration.name);
+        }
+        for (const element of declaration.name.elements) {
+          if (element.propertyName || !ts.isIdentifier(element.name) || element.initializer) {
+            throw compilerError(`proxySinks bindings must use plain identifiers`, element);
+          }
+          bindings.direct.add(element.name.text);
         }
       }
       ts.forEachChild(node, visit);
@@ -4450,6 +4730,19 @@ class WorkflowLowerer {
         return nextState;
       }
       if (ts.isCallExpression(statement.expression) && ts.isPropertyAccessExpression(statement.expression.expression)) {
+        const receiver = statement.expression.expression.expression;
+        if (
+          (ts.isIdentifier(receiver) && this.temporalSinkBindings.direct.has(receiver.text)) ||
+          (
+            ts.isPropertyAccessExpression(receiver) &&
+            ts.isIdentifier(receiver.expression) &&
+            this.temporalSinkBindings.objects.has(receiver.expression.text)
+          )
+        ) {
+          return nextState;
+        }
+      }
+      if (ts.isCallExpression(statement.expression) && ts.isPropertyAccessExpression(statement.expression.expression)) {
         const property = statement.expression.expression.name.text;
         let scopeVar = null;
         if (property === "cancel") {
@@ -5711,6 +6004,16 @@ class WorkflowLowerer {
         awaitExpression,
       );
     }
+    const mappedAsyncHelperPromiseAll = this.resolveMappedAsyncHelperPromiseAll(call);
+    if (mappedAsyncHelperPromiseAll) {
+      return this.lowerMappedAsyncHelperPromiseAll(
+        mappedAsyncHelperPromiseAll,
+        targetVar,
+        nextState,
+        errorTarget,
+        awaitExpression,
+      );
+    }
     if (
       ts.isPropertyAccessExpression(call.expression) &&
       call.expression.name.text === "result" &&
@@ -6138,6 +6441,53 @@ class WorkflowLowerer {
     };
   }
 
+  resolveMappedAsyncHelperPromiseAll(call) {
+    if (
+      !ts.isPropertyAccessExpression(call.expression) ||
+      !ts.isIdentifier(call.expression.expression) ||
+      call.expression.expression.text !== "Promise" ||
+      call.expression.name.text !== "all" ||
+      call.arguments.length !== 1
+    ) {
+      return null;
+    }
+    const mapCall = call.arguments[0];
+    if (
+      !ts.isCallExpression(mapCall) ||
+      !ts.isPropertyAccessExpression(mapCall.expression) ||
+      mapCall.expression.name.text !== "map" ||
+      mapCall.arguments.length !== 1
+    ) {
+      return null;
+    }
+    const mapper = mapCall.arguments[0];
+    if (!ts.isArrowFunction(mapper) && !ts.isFunctionExpression(mapper)) {
+      return null;
+    }
+    if (mapper.parameters.length !== 1 || !ts.isIdentifier(mapper.parameters[0].name)) {
+      return null;
+    }
+    const mappedExpression = functionBodyExpression(mapper.body);
+    if (!mappedExpression) {
+      return null;
+    }
+    const helperCall =
+      ts.isAwaitExpression(mappedExpression) ? mappedExpression.expression : mappedExpression;
+    if (!ts.isCallExpression(helperCall)) {
+      return null;
+    }
+    const helperDeclaration = this.resolveAsyncLocalHelperCall(helperCall);
+    if (!helperDeclaration) {
+      return null;
+    }
+    return {
+      itemsExpr: compileExpression(mapCall.expression.expression),
+      mapperVar: mapper.parameters[0].name.text,
+      helperDeclaration,
+      helperCall,
+    };
+  }
+
   lowerLocalChildPromiseAll(arrayVar, targetVar, nextState, errorTarget, node) {
     const indexVar = this.nextId("child_join_index", node);
     const handleVar = this.nextId("child_join_handle", node);
@@ -6297,6 +6647,87 @@ class WorkflowLowerer {
         { target: indexVar, expr: { kind: "literal", value: 0 } },
         { target: handleArrayVar, expr: { kind: "literal", value: [] } },
       ],
+      next: choiceState,
+    }, node);
+  }
+
+  lowerMappedAsyncHelperPromiseAll(mappedAsyncHelperPromiseAll, targetVar, nextState, errorTarget, node) {
+    const indexVar = this.nextId("helper_map_index", node);
+    const helperResultVar = this.nextId("helper_map_result", node);
+    const choiceState = this.nextId("helper_map_choice", node);
+    const incrementState = this.addState("assign", {
+      type: "assign",
+      actions: [{
+        target: indexVar,
+        expr: {
+          kind: "binary",
+          op: "add",
+          left: { kind: "identifier", name: indexVar },
+          right: { kind: "literal", value: 1 },
+        },
+      }],
+      next: choiceState,
+    }, node);
+    const afterHelperState = targetVar
+      ? this.addState("assign", {
+          type: "assign",
+          actions: [{
+            target: targetVar,
+            expr: {
+              kind: "call",
+              callee: "__builtin_array_append",
+              args: [
+                { kind: "identifier", name: targetVar },
+                { kind: "identifier", name: helperResultVar },
+              ],
+            },
+          }],
+          next: incrementState,
+        }, node)
+      : incrementState;
+    const helperState = this.lowerAsyncLocalHelperCall(
+      mappedAsyncHelperPromiseAll.helperDeclaration,
+      mappedAsyncHelperPromiseAll.helperCall,
+      targetVar ? helperResultVar : null,
+      afterHelperState,
+      errorTarget,
+      node,
+    );
+    const assignMapperState = this.addState("assign", {
+      type: "assign",
+      actions: [{
+        target: mappedAsyncHelperPromiseAll.mapperVar,
+        expr: {
+          kind: "index",
+          object: mappedAsyncHelperPromiseAll.itemsExpr,
+          index: { kind: "identifier", name: indexVar },
+        },
+      }],
+      next: helperState,
+    }, node);
+    this.states[choiceState] = {
+      type: "choice",
+      condition: {
+        kind: "binary",
+        op: "less_than",
+        left: { kind: "identifier", name: indexVar },
+        right: {
+          kind: "member",
+          object: mappedAsyncHelperPromiseAll.itemsExpr,
+          property: "length",
+        },
+      },
+      then_next: assignMapperState,
+      else_next: nextState,
+    };
+    this.sourceMap[choiceState] = sourceLocation(node);
+    const initActions = [{ target: indexVar, expr: { kind: "literal", value: 0 } }];
+    if (targetVar) {
+      initActions.push({ target: targetVar, expr: { kind: "literal", value: [] } });
+    }
+    return this.addState("assign", {
+      type: "assign",
+      actions: initActions,
       next: choiceState,
     }, node);
   }

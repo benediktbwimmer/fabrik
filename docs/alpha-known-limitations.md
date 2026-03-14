@@ -6,7 +6,7 @@ This document lists the highest-signal limitations for the current design-partne
 
 - Search attributes and memo are only supported in the alpha slice for static start-time values, the narrow compiled `upsertSearchAttributes(...)` subset, and exact-match visibility filters.
 - Static-evaluable start-time memo/search-attribute shapes are supported, but broader dynamic runtime-shaped visibility writes are still blocked.
-- Payload/data converter support is limited to static default-compatible `dataConverter` declarations and static default-compatible `payloadConverterPath` modules; custom payload codecs, broader path-based converters, and codec servers are still blocked.
+- Payload/data converter support is limited to static default-compatible `dataConverter` declarations and static `payloadConverterPath` modules that export a named `payloadConverter`; custom payload codecs, codec-bearing `dataConverter` objects, and codec servers are still blocked.
 - Interceptors and middleware are still blocked.
 - Dynamic `Worker.create(...)` bootstraps are still blocked.
 - Unsupported Temporal workflow APIs remain blocked until they are explicitly implemented and trusted.

@@ -1546,6 +1546,7 @@ fn benchmark_artifact(
                     condition: Expression::Identifier { name: "signal_ready".to_owned() },
                     next: "dispatch".to_owned(),
                     timeout_ref: None,
+                    timer_expr: None,
                     timeout_next: None,
                 },
             );
@@ -1610,6 +1611,7 @@ fn benchmark_artifact(
                     condition: Expression::Identifier { name: "update_ready".to_owned() },
                     next: "dispatch".to_owned(),
                     timeout_ref: None,
+                    timer_expr: None,
                     timeout_next: None,
                 },
             );

@@ -34,13 +34,13 @@ The alpha claim is:
 - workflow-side `upsertSearchAttributes(...)` within the supported compiler subset
 - exact-match visibility filtering over the supported `memo` and `searchAttributes` slice
 - static default-compatible `dataConverter` declarations on `Worker.create({ ... })`
-- static default-compatible `payloadConverterPath` modules on `Worker.create({ ... })`
+- static `payloadConverterPath` modules on `Worker.create({ ... })` that export a named `payloadConverter`
 - mixed-build deploy, restart, replay, and rollback evidence for the supported payload/data-converter adapter slice
 - workflow task queue preservation through replay, snapshot restore, and owner handoff for the supported alpha slice
 
 ## Blocked in Alpha
 
-- custom payload/data converter customization beyond the default-compatible adapter subset
+- codec-bearing `dataConverter` objects, codec servers, and broader payload/data converter customization beyond the static `payloadConverterPath` slice
 - worker or workflow interceptors
 - dynamic worker bootstrap shapes
 - arbitrary workflow inspection APIs outside the supported subset

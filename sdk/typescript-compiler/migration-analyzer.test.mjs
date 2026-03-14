@@ -91,6 +91,10 @@ test("migration analyzer supports default-compatible payload converters and bloc
     root,
     "crates/fabrik-cli/test-fixtures/temporal-payload-path-qualified-v2",
   );
+  const dataConverterFactoryQualifiedFixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-data-converter-factory-qualified",
+  );
   const payloadFixture = path.join(root, "crates/fabrik-cli/test-fixtures/temporal-payload-blocked");
   const payloadQualified = await analyze(payloadQualifiedFixture);
   const bootstrapQualified = await analyze(bootstrapQualifiedFixture);
@@ -108,6 +112,7 @@ test("migration analyzer supports default-compatible payload converters and bloc
   const searchAttributesQualified = await analyze(searchAttributesQualifiedFixture);
   const patchingQualified = await analyze(patchingQualifiedFixture);
   const payloadPathQualifiedV2 = await analyze(payloadPathQualifiedV2Fixture);
+  const dataConverterFactoryQualified = await analyze(dataConverterFactoryQualifiedFixture);
   const visibilityFixture = path.join(
     root,
     "crates/fabrik-cli/test-fixtures/temporal-visibility-blocked",
@@ -171,7 +176,17 @@ test("migration analyzer supports default-compatible payload converters and bloc
   assert.equal(patchingQualified.workers[0].task_queue, "patching-qualified");
   assert.equal(payloadPathQualifiedV2.summary.hard_block_count, 0);
   assert.equal(payloadPathQualifiedV2.workers[0].data_converter_mode, "path_default_temporal");
-  assert.ok(payload.findings.some((finding) => finding.feature === "payload_data_converter_usage"));
+  assert.equal(dataConverterFactoryQualified.summary.hard_block_count, 0);
+  assert.equal(
+    dataConverterFactoryQualified.workers[0].data_converter_mode,
+    "static_data_converter_factory",
+  );
+  assert.equal(payload.summary.hard_block_count, 0);
+  assert.equal(payload.workers[0].data_converter_mode, "path_static_payload_converter");
+  assert.equal(
+    payload.workers[0].payload_converter_module,
+    "./src/custom-payload-converter.ts",
+  );
   assert.ok(!visibility.findings.some((finding) => finding.feature === "visibility_search_usage"));
   assert.equal(visibility.summary.hard_block_count, 0);
   assert.ok(visibility.files.some((file) => file.uses.includes("search_attributes_memo")));

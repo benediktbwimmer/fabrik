@@ -326,6 +326,15 @@ textarea {
   gap: 12px;
 }
 
+.field-label {
+  font-weight: 700;
+}
+
+.field-help {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .row {
   display: flex;
   align-items: center;
@@ -367,6 +376,27 @@ textarea {
   border-radius: 16px;
   background: rgba(10, 22, 29, 0.72);
   box-shadow: none;
+}
+
+.editor-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.editor-section {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: rgba(8, 18, 24, 0.45);
+}
+
+.code-input {
+  min-height: 140px;
+  font-family: var(--font-mono);
+  font-size: 12px;
 }
 
 .detail-stack {
@@ -591,6 +621,7 @@ details summary {
   .split,
   .graph-workbench-body,
   .grid.two,
+  .editor-grid,
   .filters-grid,
   .timeline-item {
     grid-template-columns: 1fr;

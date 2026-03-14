@@ -11,20 +11,20 @@ Current source snapshot:
 ## Current State
 
 - Samples analyzed: `48`
-- Qualified with caveats: `39`
-- Blocked: `9`
+- Qualified with caveats: `44`
+- Blocked: `4`
 - Status counts:
-  - `compatible_ready_not_deployed`: `39`
-  - `incompatible_blocked`: `9`
+  - `compatible_ready_not_deployed`: `44`
+  - `incompatible_blocked`: `4`
 
 ## What Moved
 
 The latest compiler, runtime, and packaging passes materially shifted the remaining replacement frontier:
 
-- `unsupported_api` blocker occurrences dropped from `51` to `16`
+- `unsupported_api` blocker occurrences dropped from `51` to `8`
 - `unsupported_temporal_api` hard blocks dropped from `34` to `4`
 - `unsupported_packaging_bootstrap` blocker occurrences dropped from `72` to `1`
-- qualified official samples rose from `4` to `39`
+- qualified official samples rose from `4` to `43`
 - `log`, `workflowInfo`, `uuid4`, `ApplicationFailure`, `ActivityFailure`, `ParentClosePolicy`, `ActivityCancellationType`, `patched`, `deprecatePatch`, `setWorkflowOptions`, `SearchAttributes`, and `upsertSearchAttributes` are no longer explicit hard-block imports in the official sample frontier
 - workflow-only workers no longer falsely block packaging, which moved `continue-as-new`, `nexus-hello`, and several other sample repos into the qualified set
 - `batch-sliding-window`, `child-workflows`, `cron-workflows`, `patching-api`, `saga`, `search-attributes`, and `worker-versioning` now compile cleanly in the refreshed official census
@@ -41,6 +41,10 @@ The latest compiler, runtime, and packaging passes materially shifted the remain
 - `activities-dependency-injection` now qualifies after packaging learned how to materialize safe imported activity-factory calls with static bootstrap arguments
 - `activities-examples` now qualifies after test-only worker bootstrap failures stopped blocking repos that already have a production worker entrypoint
 - `worker-specific-task-queues` now qualifies after worker-local runtime helpers learned how to reconstruct dynamic activity-factory setup and multi-worker packaging stopped colliding on duplicate file stems
+- `mutex` now qualifies after dynamic signal registration and dynamic condition timeout lowering covered its lock-release workflow shape
+- `eager-workflow-start` now qualifies after `proxyLocalActivities` moved onto the same supported proxy-activity path as `proxyActivities`
+- `ejson` and `protobufs` now qualify after static `payloadConverterPath` modules broadened from the default-compatible-only slice to a packageable static path-based adapter slice
+- `sinks` now qualifies after `proxySinks()` declarations and fire-and-forget sink calls moved onto a caveated no-op migration bridge and worker `sinks` configuration stopped hard-blocking packaging
 - The remaining explicit unsupported-import census is now dominated by:
   - `WorkflowInterceptors`: `1`
   - `Sinks`: `1`
@@ -55,21 +59,22 @@ This means broad import coverage is no longer the main hard-blocker class. The n
 ## Priority Order
 
 1. Unsupported Temporal workflow/runtime APIs
-- Hard-block findings: `3`
-- Affected samples: `7`
-- Blocker-category occurrences: `16`
-- The explicit import backlog is now narrow. The bigger problem inside this category is generic compile-subset failure on otherwise-recognized APIs.
-- Remaining explicit import frontier:
+- Hard-block findings: `4`
+- Affected samples: `4`
+- Blocker-category occurrences: `8`
+- The explicit import backlog is now narrow. The bigger problem inside this category is no longer generic syntax; it is the dedicated interceptor/sink surface and one remaining recursive orchestration compiler gap.
+- Remaining frontier:
   - interceptor shapes: `WorkflowInterceptors`
-  - sinks APIs: `Sinks`, `proxySinks`
-- Recommendation: focus this category on `query-subscriptions`, `sinks`, `protobufs`, and the remaining client-side replacement gaps instead of generic workflow syntax.
+  - recursive orchestration compile gap in `dsl-interpreter`
+  - broader external-library async orchestration in `ai-sdk`
+- Recommendation: focus this category on `dsl-interpreter`, `query-subscriptions`, and `ai-sdk` rather than generic workflow syntax.
 
 2. Broader payload/data-converter parity
-- Hard-block findings: `8`
-- Affected samples: `3`
-- Main samples: `ejson`, `encryption`, `protobufs`
-- Current alpha support only covers the default-compatible subset and static default-compatible `payloadConverterPath`.
-- Recommendation: scope one exact next slice from these samples, not generic converter parity.
+- Hard-block findings: `2`
+- Affected samples: `1`
+- Main sample: `encryption`
+- Current alpha support covers the default-compatible subset plus static `payloadConverterPath` modules that can be packaged into worker bootstrap artifacts. Codec-bearing async `dataConverter` objects are still blocked.
+- Recommendation: scope the next payload slice specifically around static `payloadCodecs` / codec-loader support if `encryption` is worth the added trust surface.
 
 3. Remaining worker bootstrap edge cases
 - Hard-block findings: `1`
@@ -104,11 +109,10 @@ This means broad import coverage is no longer the main hard-blocker class. The n
 
 1. Burn down the next blocked sample cluster, not generic syntax lists.
 - Best first targets:
+  - `dsl-interpreter`
   - `query-subscriptions`
-  - `sinks`
-  - `ejson`
   - `encryption`
-- Success criterion: reduce the remaining blocked sample count below `10` without widening trust debt.
+- Success criterion: reduce the remaining blocked sample count below `4` without widening trust debt.
 
 2. Re-run the blocker census after every parity slice.
 - Use `/Users/bene/code/fabrik/scripts/run-temporal-ts-blocker-census.sh`

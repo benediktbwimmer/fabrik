@@ -385,6 +385,22 @@ pub struct ThroughputReportLogEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThroughputResultSegmentRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub batch_id: String,
+    pub chunk_id: String,
+    pub chunk_index: u32,
+    pub item_count: u32,
+    pub result_handle: Value,
+    pub encoded_bytes: Option<u64>,
+    pub checksum: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkflowBulkBatchRuntimeControlRecord {
     pub tenant_id: String,
     pub instance_id: String,
@@ -1086,6 +1102,12 @@ pub struct TopicAdapterDispatchPreview {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TopicAdapterDispatchFailure {
+    pub error: TopicAdapterMappingError,
+    pub diagnostics: Vec<TopicAdapterMappingDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TopicAdapterMappingError {
     pub field: String,
     pub detail: String,
@@ -1126,67 +1148,207 @@ enum TemplateResolve {
     Omitted,
 }
 
+pub fn validate_topic_adapter_config(
+    action: TopicAdapterAction,
+    definition_id: Option<&str>,
+    signal_type: Option<&str>,
+    workflow_task_queue: Option<&str>,
+    workflow_instance_id_json_pointer: Option<&str>,
+    payload_json_pointer: Option<&str>,
+    payload_template_json: Option<&Value>,
+    memo_json_pointer: Option<&str>,
+    memo_template_json: Option<&Value>,
+    search_attributes_json_pointer: Option<&str>,
+    search_attributes_template_json: Option<&Value>,
+    request_id_json_pointer: Option<&str>,
+    dedupe_key_json_pointer: Option<&str>,
+) -> std::result::Result<(), TopicAdapterMappingError> {
+    validate_json_pointer(workflow_instance_id_json_pointer, "workflow_instance_id_json_pointer")?;
+    validate_json_pointer(payload_json_pointer, "payload_json_pointer")?;
+    validate_json_pointer(memo_json_pointer, "memo_json_pointer")?;
+    validate_json_pointer(search_attributes_json_pointer, "search_attributes_json_pointer")?;
+    validate_json_pointer(request_id_json_pointer, "request_id_json_pointer")?;
+    validate_json_pointer(dedupe_key_json_pointer, "dedupe_key_json_pointer")?;
+
+    validate_template(payload_template_json, "payload_template_json")?;
+    validate_template(memo_template_json, "memo_template_json")?;
+    validate_template(
+        search_attributes_template_json,
+        "search_attributes_template_json",
+    )?;
+
+    validate_exclusive_mapping(
+        "payload",
+        payload_json_pointer,
+        payload_template_json,
+        "payload_json_pointer",
+        "payload_template_json",
+    )?;
+    validate_exclusive_mapping(
+        "memo",
+        memo_json_pointer,
+        memo_template_json,
+        "memo_json_pointer",
+        "memo_template_json",
+    )?;
+    validate_exclusive_mapping(
+        "search_attributes",
+        search_attributes_json_pointer,
+        search_attributes_template_json,
+        "search_attributes_json_pointer",
+        "search_attributes_template_json",
+    )?;
+
+    match action {
+        TopicAdapterAction::StartWorkflow => {
+            if definition_id.is_none_or(str::is_empty) {
+                return Err(TopicAdapterMappingError {
+                    field: "definition_id".to_owned(),
+                    detail: "start_workflow adapters require definition_id".to_owned(),
+                });
+            }
+            if signal_type.is_some() {
+                return Err(TopicAdapterMappingError {
+                    field: "signal_type".to_owned(),
+                    detail: "start_workflow adapters cannot configure signal_type".to_owned(),
+                });
+            }
+            if dedupe_key_json_pointer.is_some() {
+                return Err(TopicAdapterMappingError {
+                    field: "dedupe_key_json_pointer".to_owned(),
+                    detail: "start_workflow adapters cannot configure dedupe_key_json_pointer"
+                        .to_owned(),
+                });
+            }
+        }
+        TopicAdapterAction::SignalWorkflow => {
+            if signal_type.is_none_or(str::is_empty) {
+                return Err(TopicAdapterMappingError {
+                    field: "signal_type".to_owned(),
+                    detail: "signal_workflow adapters require signal_type".to_owned(),
+                });
+            }
+            if definition_id.is_some() {
+                return Err(TopicAdapterMappingError {
+                    field: "definition_id".to_owned(),
+                    detail: "signal_workflow adapters cannot configure definition_id".to_owned(),
+                });
+            }
+            if workflow_task_queue.is_some() {
+                return Err(TopicAdapterMappingError {
+                    field: "workflow_task_queue".to_owned(),
+                    detail: "signal_workflow adapters cannot configure workflow_task_queue"
+                        .to_owned(),
+                });
+            }
+            if workflow_instance_id_json_pointer.is_none() {
+                return Err(TopicAdapterMappingError {
+                    field: "workflow_instance_id_json_pointer".to_owned(),
+                    detail:
+                        "signal_workflow adapters require workflow_instance_id_json_pointer"
+                            .to_owned(),
+                });
+            }
+            if memo_json_pointer.is_some() || memo_template_json.is_some() {
+                return Err(TopicAdapterMappingError {
+                    field: "memo".to_owned(),
+                    detail: "signal_workflow adapters cannot configure memo mapping".to_owned(),
+                });
+            }
+            if search_attributes_json_pointer.is_some() || search_attributes_template_json.is_some()
+            {
+                return Err(TopicAdapterMappingError {
+                    field: "search_attributes".to_owned(),
+                    detail:
+                        "signal_workflow adapters cannot configure search_attributes mapping"
+                            .to_owned(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn resolve_topic_adapter_dispatch(
     adapter: &TopicAdapterRecord,
     payload: &Value,
     partition_id: i32,
     log_offset: i64,
 ) -> std::result::Result<TopicAdapterDispatchPreview, TopicAdapterMappingError> {
+    resolve_topic_adapter_dispatch_detailed(adapter, payload, partition_id, log_offset)
+        .map_err(|failure| failure.error)
+}
+
+pub fn resolve_topic_adapter_dispatch_detailed(
+    adapter: &TopicAdapterRecord,
+    payload: &Value,
+    partition_id: i32,
+    log_offset: i64,
+) -> std::result::Result<TopicAdapterDispatchPreview, TopicAdapterDispatchFailure> {
     let default_request_id = format!(
         "adapter:{}:{}:{partition_id}:{log_offset}",
         adapter.adapter_id, adapter.topic_name
     );
     let mut diagnostics = Vec::new();
-    match adapter.action {
-        TopicAdapterAction::StartWorkflow => {
-            let definition_id = adapter.definition_id.clone().ok_or_else(|| TopicAdapterMappingError {
-                field: "definition_id".to_owned(),
-                detail: format!("topic adapter {} missing definition_id", adapter.adapter_id),
-            })?;
-            let instance_id = resolve_optional_string(
-                payload,
-                adapter.workflow_instance_id_json_pointer.as_deref(),
-                "workflow_instance_id",
-                &mut diagnostics,
-            )?;
-            let input = resolve_required_value(
-                payload,
-                adapter.payload_json_pointer.as_deref(),
-                adapter.payload_template_json.as_ref(),
-                "input",
-                &mut diagnostics,
-                true,
-            )?;
-            let memo = resolve_optional_value(
-                payload,
-                adapter.memo_json_pointer.as_deref(),
-                adapter.memo_template_json.as_ref(),
-                "memo",
-                &mut diagnostics,
-            )?;
-            let search_attributes = resolve_optional_value(
-                payload,
-                adapter.search_attributes_json_pointer.as_deref(),
-                adapter.search_attributes_template_json.as_ref(),
-                "search_attributes",
-                &mut diagnostics,
-            )?;
-            let request_id = resolve_optional_string(
-                payload,
-                adapter.request_id_json_pointer.as_deref(),
-                "request_id",
-                &mut diagnostics,
-            )?
-            .unwrap_or_else(|| {
-                diagnostics.push(TopicAdapterMappingDiagnostic {
-                    field: "request_id".to_owned(),
-                    mode: "derived".to_owned(),
-                    detail: "derived from topic partition and offset".to_owned(),
+    let dispatch =
+        (|| -> std::result::Result<TopicAdapterResolvedDispatch, TopicAdapterMappingError> {
+            match adapter.action {
+            TopicAdapterAction::StartWorkflow => {
+                let definition_id =
+                    adapter.definition_id.clone().ok_or_else(|| TopicAdapterMappingError {
+                        field: "definition_id".to_owned(),
+                        detail: format!(
+                            "topic adapter {} missing definition_id",
+                            adapter.adapter_id
+                        ),
+                    })?;
+                let instance_id = resolve_optional_string(
+                    payload,
+                    adapter.workflow_instance_id_json_pointer.as_deref(),
+                    "workflow_instance_id",
+                    &mut diagnostics,
+                )?;
+                let input = resolve_required_value(
+                    payload,
+                    adapter.payload_json_pointer.as_deref(),
+                    adapter.payload_template_json.as_ref(),
+                    "input",
+                    "payload_template_json",
+                    &mut diagnostics,
+                    true,
+                )?;
+                let memo = resolve_optional_value(
+                    payload,
+                    adapter.memo_json_pointer.as_deref(),
+                    adapter.memo_template_json.as_ref(),
+                    "memo",
+                    "memo_template_json",
+                    &mut diagnostics,
+                )?;
+                let search_attributes = resolve_optional_value(
+                    payload,
+                    adapter.search_attributes_json_pointer.as_deref(),
+                    adapter.search_attributes_template_json.as_ref(),
+                    "search_attributes",
+                    "search_attributes_template_json",
+                    &mut diagnostics,
+                )?;
+                let request_id = resolve_optional_string(
+                    payload,
+                    adapter.request_id_json_pointer.as_deref(),
+                    "request_id",
+                    &mut diagnostics,
+                )?
+                .unwrap_or_else(|| {
+                    diagnostics.push(TopicAdapterMappingDiagnostic {
+                        field: "request_id".to_owned(),
+                        mode: "derived".to_owned(),
+                        detail: "derived from topic partition and offset".to_owned(),
+                    });
+                    default_request_id.clone()
                 });
-                default_request_id.clone()
-            });
-            Ok(TopicAdapterDispatchPreview {
-                dispatch: TopicAdapterResolvedDispatch::StartWorkflow(
+                Ok(TopicAdapterResolvedDispatch::StartWorkflow(
                     TopicAdapterResolvedStartRequest {
                         definition_id,
                         instance_id,
@@ -1196,59 +1358,61 @@ pub fn resolve_topic_adapter_dispatch(
                         search_attributes,
                         request_id,
                     },
-                ),
-                diagnostics,
-            })
-        }
-        TopicAdapterAction::SignalWorkflow => {
-            let signal_type = adapter.signal_type.clone().ok_or_else(|| TopicAdapterMappingError {
-                field: "signal_type".to_owned(),
-                detail: format!("topic adapter {} missing signal_type", adapter.adapter_id),
-            })?;
-            let instance_id = resolve_required_string(
-                payload,
-                adapter.workflow_instance_id_json_pointer.as_deref(),
-                "workflow_instance_id",
-                &mut diagnostics,
-            )?;
-            let request_id = resolve_optional_string(
-                payload,
-                adapter.request_id_json_pointer.as_deref(),
-                "request_id",
-                &mut diagnostics,
-            )?
-            .unwrap_or_else(|| {
-                diagnostics.push(TopicAdapterMappingDiagnostic {
-                    field: "request_id".to_owned(),
-                    mode: "derived".to_owned(),
-                    detail: "derived from topic partition and offset".to_owned(),
+                ))
+            }
+            TopicAdapterAction::SignalWorkflow => {
+                let signal_type =
+                    adapter.signal_type.clone().ok_or_else(|| TopicAdapterMappingError {
+                        field: "signal_type".to_owned(),
+                        detail: format!(
+                            "topic adapter {} missing signal_type",
+                            adapter.adapter_id
+                        ),
+                    })?;
+                let instance_id = resolve_required_string(
+                    payload,
+                    adapter.workflow_instance_id_json_pointer.as_deref(),
+                    "workflow_instance_id",
+                    &mut diagnostics,
+                )?;
+                let request_id = resolve_optional_string(
+                    payload,
+                    adapter.request_id_json_pointer.as_deref(),
+                    "request_id",
+                    &mut diagnostics,
+                )?
+                .unwrap_or_else(|| {
+                    diagnostics.push(TopicAdapterMappingDiagnostic {
+                        field: "request_id".to_owned(),
+                        mode: "derived".to_owned(),
+                        detail: "derived from topic partition and offset".to_owned(),
+                    });
+                    default_request_id.clone()
                 });
-                default_request_id.clone()
-            });
-            let dedupe_key = resolve_optional_string(
-                payload,
-                adapter.dedupe_key_json_pointer.as_deref(),
-                "dedupe_key",
-                &mut diagnostics,
-            )?
-            .or_else(|| {
-                diagnostics.push(TopicAdapterMappingDiagnostic {
-                    field: "dedupe_key".to_owned(),
-                    mode: "derived".to_owned(),
-                    detail: "defaulted to request_id".to_owned(),
+                let dedupe_key = resolve_optional_string(
+                    payload,
+                    adapter.dedupe_key_json_pointer.as_deref(),
+                    "dedupe_key",
+                    &mut diagnostics,
+                )?
+                .or_else(|| {
+                    diagnostics.push(TopicAdapterMappingDiagnostic {
+                        field: "dedupe_key".to_owned(),
+                        mode: "derived".to_owned(),
+                        detail: "defaulted to request_id".to_owned(),
+                    });
+                    Some(request_id.clone())
                 });
-                Some(request_id.clone())
-            });
-            let signal_payload = resolve_required_value(
-                payload,
-                adapter.payload_json_pointer.as_deref(),
-                adapter.payload_template_json.as_ref(),
-                "payload",
-                &mut diagnostics,
-                true,
-            )?;
-            Ok(TopicAdapterDispatchPreview {
-                dispatch: TopicAdapterResolvedDispatch::SignalWorkflow(
+                let signal_payload = resolve_required_value(
+                    payload,
+                    adapter.payload_json_pointer.as_deref(),
+                    adapter.payload_template_json.as_ref(),
+                    "payload",
+                    "payload_template_json",
+                    &mut diagnostics,
+                    true,
+                )?;
+                Ok(TopicAdapterResolvedDispatch::SignalWorkflow(
                     TopicAdapterResolvedSignalRequest {
                         signal_type,
                         instance_id,
@@ -1256,10 +1420,16 @@ pub fn resolve_topic_adapter_dispatch(
                         dedupe_key,
                         request_id,
                     },
-                ),
-                diagnostics,
-            })
+                ))
+            }
         }
+        })();
+    match dispatch {
+        Ok(dispatch) => Ok(TopicAdapterDispatchPreview {
+            dispatch,
+            diagnostics,
+        }),
+        Err(error) => Err(TopicAdapterDispatchFailure { error, diagnostics }),
     }
 }
 
@@ -1268,6 +1438,7 @@ fn resolve_required_value(
     pointer: Option<&str>,
     template: Option<&Value>,
     field: &str,
+    template_field: &str,
     diagnostics: &mut Vec<TopicAdapterMappingDiagnostic>,
     default_to_whole_payload: bool,
 ) -> std::result::Result<Value, TopicAdapterMappingError> {
@@ -1275,9 +1446,9 @@ fn resolve_required_value(
         diagnostics.push(TopicAdapterMappingDiagnostic {
             field: field.to_owned(),
             mode: "template".to_owned(),
-            detail: format!("resolved via {}_template_json", field),
+            detail: format!("resolved via {template_field}"),
         });
-        return match resolve_template_value(template, payload, field, &format!("{field}_template_json"))? {
+        return match resolve_template_value(template, payload, field, template_field)? {
             TemplateResolve::Present(value) => Ok(value),
             TemplateResolve::Omitted => Err(TopicAdapterMappingError {
                 field: field.to_owned(),
@@ -1315,15 +1486,16 @@ fn resolve_optional_value(
     pointer: Option<&str>,
     template: Option<&Value>,
     field: &str,
+    template_field: &str,
     diagnostics: &mut Vec<TopicAdapterMappingDiagnostic>,
 ) -> std::result::Result<Option<Value>, TopicAdapterMappingError> {
     if let Some(template) = template {
         diagnostics.push(TopicAdapterMappingDiagnostic {
             field: field.to_owned(),
             mode: "template".to_owned(),
-            detail: format!("resolved via {}_template_json", field),
+            detail: format!("resolved via {template_field}"),
         });
-        return match resolve_template_value(template, payload, field, &format!("{field}_template_json"))? {
+        return match resolve_template_value(template, payload, field, template_field)? {
             TemplateResolve::Present(value) => Ok(Some(value)),
             TemplateResolve::Omitted => Ok(None),
         };
@@ -1389,14 +1561,15 @@ fn resolve_template_value(
     template: &Value,
     payload: &Value,
     field: &str,
-    template_name: &str,
+    template_path: &str,
 ) -> std::result::Result<TemplateResolve, TopicAdapterMappingError> {
     match template {
-        Value::Object(map) if map.contains_key("$from") => resolve_template_from(map, payload, field, template_name),
+        Value::Object(map) if map.contains_key("$from") => resolve_template_from(map, payload, template_path),
         Value::Object(map) => {
             let mut output = Map::new();
             for (key, value) in map {
-                match resolve_template_value(value, payload, field, template_name)? {
+                let child_path = format!("{template_path}.{key}");
+                match resolve_template_value(value, payload, field, &child_path)? {
                     TemplateResolve::Present(resolved) => {
                         output.insert(key.clone(), resolved);
                     }
@@ -1407,8 +1580,9 @@ fn resolve_template_value(
         }
         Value::Array(items) => {
             let mut output = Vec::with_capacity(items.len());
-            for value in items {
-                match resolve_template_value(value, payload, field, template_name)? {
+            for (index, value) in items.iter().enumerate() {
+                let child_path = format!("{template_path}[{index}]");
+                match resolve_template_value(value, payload, field, &child_path)? {
                     TemplateResolve::Present(resolved) => output.push(resolved),
                     TemplateResolve::Omitted => output.push(Value::Null),
                 }
@@ -1422,15 +1596,14 @@ fn resolve_template_value(
 fn resolve_template_from(
     map: &Map<String, Value>,
     payload: &Value,
-    field: &str,
-    template_name: &str,
+    template_path: &str,
 ) -> std::result::Result<TemplateResolve, TopicAdapterMappingError> {
     let pointer = map
         .get("$from")
         .and_then(Value::as_str)
         .ok_or_else(|| TopicAdapterMappingError {
-            field: field.to_owned(),
-            detail: format!("{template_name} $from must be a string json pointer"),
+            field: template_path.to_owned(),
+            detail: format!("{template_path}.$from must be a string json pointer"),
         })?;
     let optional = map.get("$optional").and_then(Value::as_bool).unwrap_or(false);
     let invalid_keys = map
@@ -1440,9 +1613,9 @@ fn resolve_template_from(
         .collect::<Vec<_>>();
     if !invalid_keys.is_empty() {
         return Err(TopicAdapterMappingError {
-            field: field.to_owned(),
+            field: template_path.to_owned(),
             detail: format!(
-                "{template_name} $from directives only support $from and $optional; found {}",
+                "{template_path} $from directives only support $from and $optional; found {}",
                 invalid_keys.join(", ")
             ),
         });
@@ -1451,11 +1624,102 @@ fn resolve_template_from(
         Some(value) => Ok(TemplateResolve::Present(value)),
         None if optional => Ok(TemplateResolve::Omitted),
         None => Err(TopicAdapterMappingError {
+            field: template_path.to_owned(),
+            detail: format!("{template_path} missing source value at json pointer {pointer}"),
+        }),
+    }
+}
+
+fn validate_exclusive_mapping(
+    field: &str,
+    pointer: Option<&str>,
+    template: Option<&Value>,
+    pointer_field: &str,
+    template_field: &str,
+) -> std::result::Result<(), TopicAdapterMappingError> {
+    if pointer.is_some() && template.is_some() {
+        return Err(TopicAdapterMappingError {
             field: field.to_owned(),
             detail: format!(
-                "{template_name} missing source value at json pointer {pointer}"
+                "configure either {pointer_field} or {template_field}, not both"
             ),
-        }),
+        });
+    }
+    Ok(())
+}
+
+fn validate_json_pointer(
+    pointer: Option<&str>,
+    field: &str,
+) -> std::result::Result<(), TopicAdapterMappingError> {
+    let Some(pointer) = pointer else {
+        return Ok(());
+    };
+    if pointer.is_empty() || pointer.starts_with('/') {
+        return Ok(());
+    }
+    Err(TopicAdapterMappingError {
+        field: field.to_owned(),
+        detail: format!("{field} must be an RFC 6901 json pointer"),
+    })
+}
+
+fn validate_template(
+    template: Option<&Value>,
+    template_path: &str,
+) -> std::result::Result<(), TopicAdapterMappingError> {
+    let Some(template) = template else {
+        return Ok(());
+    };
+    match template {
+        Value::Object(map) if map.contains_key("$from") => {
+            let pointer = map
+                .get("$from")
+                .and_then(Value::as_str)
+                .ok_or_else(|| TopicAdapterMappingError {
+                    field: template_path.to_owned(),
+                    detail: format!("{template_path}.$from must be a string json pointer"),
+                })?;
+            validate_json_pointer(Some(pointer), &format!("{template_path}.$from"))?;
+            if let Some(optional) = map.get("$optional") {
+                if !optional.is_boolean() {
+                    return Err(TopicAdapterMappingError {
+                        field: format!("{template_path}.$optional"),
+                        detail: format!("{template_path}.$optional must be a boolean"),
+                    });
+                }
+            }
+            let invalid_keys = map
+                .keys()
+                .filter(|key| key.as_str() != "$from" && key.as_str() != "$optional")
+                .cloned()
+                .collect::<Vec<_>>();
+            if !invalid_keys.is_empty() {
+                return Err(TopicAdapterMappingError {
+                    field: template_path.to_owned(),
+                    detail: format!(
+                        "{template_path} $from directives only support $from and $optional; found {}",
+                        invalid_keys.join(", ")
+                    ),
+                });
+            }
+            Ok(())
+        }
+        Value::Object(map) => {
+            for (key, value) in map {
+                let child_path = format!("{template_path}.{key}");
+                validate_template(Some(value), &child_path)?;
+            }
+            Ok(())
+        }
+        Value::Array(items) => {
+            for (index, value) in items.iter().enumerate() {
+                let child_path = format!("{template_path}[{index}]");
+                validate_template(Some(value), &child_path)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -2295,6 +2559,45 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize throughput_report_log captured index")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS throughput_result_segments (
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                batch_id TEXT NOT NULL,
+                chunk_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                item_count INTEGER NOT NULL,
+                result_handle JSONB NOT NULL,
+                encoded_bytes BIGINT,
+                checksum TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, workflow_instance_id, run_id, batch_id, chunk_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize throughput_result_segments table")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS throughput_result_segments_batch_idx
+            ON throughput_result_segments (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                batch_id,
+                chunk_index
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize throughput_result_segments batch index")?;
 
         sqlx::query(
             r#"
@@ -13316,6 +13619,138 @@ impl WorkflowStore {
             .collect()
     }
 
+    pub async fn upsert_throughput_result_segments(
+        &self,
+        segments: &[ThroughputResultSegmentRecord],
+    ) -> Result<()> {
+        if segments.is_empty() {
+            return Ok(());
+        }
+        let mut builder = QueryBuilder::<Postgres>::new(
+            r#"
+            INSERT INTO throughput_result_segments (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                batch_id,
+                chunk_id,
+                chunk_index,
+                item_count,
+                result_handle,
+                encoded_bytes,
+                checksum,
+                created_at,
+                updated_at
+            )
+            "#,
+        );
+        builder.push_values(segments, |mut row, segment| {
+            row.push_bind(&segment.tenant_id)
+                .push_bind(&segment.instance_id)
+                .push_bind(&segment.run_id)
+                .push_bind(&segment.batch_id)
+                .push_bind(&segment.chunk_id)
+                .push_bind(i32::try_from(segment.chunk_index).unwrap_or(i32::MAX))
+                .push_bind(i32::try_from(segment.item_count).unwrap_or(i32::MAX))
+                .push_bind(Json(&segment.result_handle))
+                .push_bind(segment.encoded_bytes.and_then(|value| i64::try_from(value).ok()))
+                .push_bind(segment.checksum.as_deref())
+                .push_bind(segment.created_at)
+                .push_bind(segment.updated_at);
+        });
+        builder.push(
+            r#"
+            ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id, chunk_id)
+            DO UPDATE SET
+                chunk_index = EXCLUDED.chunk_index,
+                item_count = EXCLUDED.item_count,
+                result_handle = EXCLUDED.result_handle,
+                encoded_bytes = EXCLUDED.encoded_bytes,
+                checksum = EXCLUDED.checksum,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        );
+        builder
+            .build()
+            .execute(&self.pool)
+            .await
+            .context("failed to upsert throughput result segments")?;
+        Ok(())
+    }
+
+    pub async fn list_throughput_result_segments_for_batch(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+    ) -> Result<Vec<ThroughputResultSegmentRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM throughput_result_segments
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND batch_id = $4
+            ORDER BY chunk_index ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list throughput result segments for batch")?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ThroughputResultSegmentRecord {
+                    tenant_id: row
+                        .try_get("tenant_id")
+                        .context("throughput result segment tenant_id missing")?,
+                    instance_id: row
+                        .try_get("workflow_instance_id")
+                        .context("throughput result segment workflow_instance_id missing")?,
+                    run_id: row
+                        .try_get("run_id")
+                        .context("throughput result segment run_id missing")?,
+                    batch_id: row
+                        .try_get("batch_id")
+                        .context("throughput result segment batch_id missing")?,
+                    chunk_id: row
+                        .try_get("chunk_id")
+                        .context("throughput result segment chunk_id missing")?,
+                    chunk_index: row
+                        .try_get::<i32, _>("chunk_index")
+                        .context("throughput result segment chunk_index missing")?
+                        as u32,
+                    item_count: row
+                        .try_get::<i32, _>("item_count")
+                        .context("throughput result segment item_count missing")?
+                        as u32,
+                    result_handle: row
+                        .try_get::<Json<Value>, _>("result_handle")
+                        .map(|value| value.0)
+                        .context("throughput result segment result_handle missing")?,
+                    encoded_bytes: row
+                        .try_get::<Option<i64>, _>("encoded_bytes")
+                        .context("throughput result segment encoded_bytes missing")?
+                        .map(|value| value as u64),
+                    checksum: row
+                        .try_get("checksum")
+                        .context("throughput result segment checksum missing")?,
+                    created_at: row
+                        .try_get("created_at")
+                        .context("throughput result segment created_at missing")?,
+                    updated_at: row
+                        .try_get("updated_at")
+                        .context("throughput result segment updated_at missing")?,
+                })
+            })
+            .collect()
+    }
+
     pub async fn delete_throughput_report_log_through(
         &self,
         captured_through: DateTime<Utc>,
@@ -19577,6 +20012,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn throughput_result_segments_round_trip_in_chunk_order() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+        let segments = vec![
+            ThroughputResultSegmentRecord {
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "instance-a".to_owned(),
+                run_id: "run-a".to_owned(),
+                batch_id: "batch-a".to_owned(),
+                chunk_id: "batch-a::1".to_owned(),
+                chunk_index: 1,
+                item_count: 2,
+                result_handle: json!({
+                    "kind": "payload_handle",
+                    "bucket": "segments",
+                    "key": "batch-a/1"
+                }),
+                encoded_bytes: Some(128),
+                checksum: Some("checksum-1".to_owned()),
+                created_at: now,
+                updated_at: now,
+            },
+            ThroughputResultSegmentRecord {
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "instance-a".to_owned(),
+                run_id: "run-a".to_owned(),
+                batch_id: "batch-a".to_owned(),
+                chunk_id: "batch-a::0".to_owned(),
+                chunk_index: 0,
+                item_count: 2,
+                result_handle: json!({
+                    "kind": "payload_handle",
+                    "bucket": "segments",
+                    "key": "batch-a/0"
+                }),
+                encoded_bytes: Some(96),
+                checksum: Some("checksum-0".to_owned()),
+                created_at: now,
+                updated_at: now,
+            },
+        ];
+
+        store.upsert_throughput_result_segments(&segments).await?;
+        store.upsert_throughput_result_segments(&segments).await?;
+
+        let stored = store
+            .list_throughput_result_segments_for_batch("tenant-a", "instance-a", "run-a", "batch-a")
+            .await?;
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].chunk_id, "batch-a::0");
+        assert_eq!(stored[0].chunk_index, 0);
+        assert_eq!(stored[0].item_count, 2);
+        assert_eq!(stored[0].result_handle["key"], "batch-a/0");
+        assert_eq!(stored[1].chunk_id, "batch-a::1");
+        assert_eq!(stored[1].chunk_index, 1);
+        assert_eq!(stored[1].item_count, 2);
+        assert_eq!(stored[1].result_handle["key"], "batch-a/1");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn throughput_terminal_handoff_round_trips_and_is_idempotent() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
@@ -20102,6 +20602,103 @@ mod tests {
             .iter()
             .any(|entry| entry.field == "request_id" && entry.mode == "pointer"));
         Ok(())
+    }
+
+    #[test]
+    fn validate_topic_adapter_config_rejects_conflicting_or_invalid_templates() {
+        let conflict = validate_topic_adapter_config(
+            TopicAdapterAction::StartWorkflow,
+            Some("order-workflow"),
+            None,
+            Some("orders"),
+            None,
+            Some("/payload"),
+            Some(&json!({"amount": {"$from": "/payload/amount"}})),
+            None,
+            None,
+            None,
+            None,
+            Some("/request_id"),
+            None,
+        )
+        .expect_err("conflicting payload mapping should fail");
+        assert_eq!(conflict.field, "payload");
+
+        let invalid_template = validate_topic_adapter_config(
+            TopicAdapterAction::StartWorkflow,
+            Some("order-workflow"),
+            None,
+            Some("orders"),
+            None,
+            None,
+            Some(&json!({"amount": {"$from": "payload/amount"}})),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("invalid template pointer should fail");
+        assert_eq!(invalid_template.field, "payload_template_json.amount.$from");
+        assert!(invalid_template
+            .detail
+            .contains("must be an RFC 6901 json pointer"));
+    }
+
+    #[test]
+    fn resolve_topic_adapter_dispatch_failure_preserves_partial_diagnostics() {
+        let adapter = TopicAdapterRecord {
+            tenant_id: "tenant-a".to_owned(),
+            adapter_id: "orders".to_owned(),
+            adapter_kind: TopicAdapterKind::Redpanda,
+            brokers: "127.0.0.1:9092".to_owned(),
+            topic_name: "orders.events".to_owned(),
+            topic_partitions: 1,
+            action: TopicAdapterAction::StartWorkflow,
+            definition_id: Some("order-workflow".to_owned()),
+            signal_type: None,
+            workflow_task_queue: Some("orders".to_owned()),
+            workflow_instance_id_json_pointer: None,
+            payload_json_pointer: None,
+            payload_template_json: Some(json!({
+                "order_id": {"$from": "/payload/id"}
+            })),
+            memo_json_pointer: None,
+            memo_template_json: None,
+            search_attributes_json_pointer: None,
+            search_attributes_template_json: None,
+            request_id_json_pointer: Some("/request_id".to_owned()),
+            dedupe_key_json_pointer: None,
+            dead_letter_policy: TopicAdapterDeadLetterPolicy::Store,
+            is_paused: false,
+            processed_count: 0,
+            failed_count: 0,
+            ownership_handoff_count: 0,
+            last_processed_at: None,
+            last_handoff_at: None,
+            last_takeover_latency_ms: None,
+            last_error: None,
+            last_error_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let failure = resolve_topic_adapter_dispatch_detailed(
+            &adapter,
+            &json!({
+                "request_id": "req-42"
+            }),
+            0,
+            12,
+        )
+        .expect_err("missing template source should fail");
+
+        assert_eq!(failure.error.field, "payload_template_json.order_id");
+        assert!(failure
+            .diagnostics
+            .iter()
+            .any(|entry| entry.field == "input" && entry.mode == "template"));
     }
 
     #[tokio::test]

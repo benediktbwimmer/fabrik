@@ -1012,6 +1012,29 @@ test("compiler lowers mapped executeChild Promise.all joins", async () => {
   assert.match(serialized, /"property":"length"/);
 });
 
+test("compiler lowers Promise.all over mapped async local helpers", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-async-helper-promise-all-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalAsyncHelperPromiseAllWorkflow",
+    "--definition-id",
+    "temporal-async-helper-promise-all-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"property":"length"/);
+  assert.match(serialized, /__helper_item/);
+  assert.match(serialized, /"type":"wait_for_timer"/);
+});
+
 test("compiler lowers Temporal Promise.all proxy activity maps into fan-out plus barrier", async () => {
   const fixture = path.join(
     root,

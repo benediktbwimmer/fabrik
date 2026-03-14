@@ -221,7 +221,7 @@
       "semantic_fixtures": false,
       "trust_fixtures": true,
       "upgrade_fixtures": true,
-      "semantic_caveats": ["alpha support is limited to static default-compatible dataConverter declarations and static default-compatible payloadConverterPath modules; custom payloadCodecs, broader converter modules, failureConverterPath, and codec servers remain blocked"],
+      "semantic_caveats": ["alpha support covers static default-compatible dataConverter declarations and static payloadConverterPath modules that export payloadConverter; payloadCodecs, codec-bearing dataConverter objects, failureConverterPath, and codec servers remain blocked"],
       "blocking_severity": "warning"
     },
     {

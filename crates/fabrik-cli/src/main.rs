@@ -626,7 +626,7 @@ async fn try_main() -> Result<i32> {
         payload_data_converter_validation: GateResult {
             status: if payload_blocks { "blocked".to_owned() } else { "passed".to_owned() },
             message: if payload_blocks {
-                "payload/data converter usage exceeded the default-compatible adapter subset"
+                "payload/data converter usage exceeded the supported static adapter subset"
                     .to_owned()
             } else {
                 "no unsupported payload/data converter blockers detected".to_owned()
@@ -2050,7 +2050,7 @@ fn render_worker_bootstrap(
         "import {{ pathToFileURL }} from 'node:url';\n\
          export const fabrikMigratedWorker = {{\n  sourceWorker: {source_worker},\n  taskQueue: {task_queue},\n  buildId: {build_id},\n  workflowsPath: {workflows_path},\n  activitiesReference: {activities_reference},\n  activityModule: {activity_module},\n  activityFactoryExport: {activity_factory_export},\n  activityFactoryArgsJs: {activity_factory_args_js},\n  activityRuntimeHelper: {activity_runtime_helper},\n  resolvedActivityModulePath: {resolved_activity_module_path},\n  resolvedActivityRuntimeHelperPath: {resolved_activity_runtime_helper_path},\n  dataConverterMode: {data_converter_mode},\n  resolvedPayloadConverterModulePath: {resolved_payload_converter_module_path},\n  bootstrapPattern: {bootstrap_pattern}\n}};\n\
          async function loadPayloadConverterModule() {{\n\
-           if (fabrikMigratedWorker.dataConverterMode !== 'path_default_temporal') {{\n\
+           if (typeof fabrikMigratedWorker.dataConverterMode !== 'string' || !fabrikMigratedWorker.dataConverterMode.startsWith('path_')) {{\n\
              return null;\n\
            }}\n\
            if (!fabrikMigratedWorker.resolvedPayloadConverterModulePath) {{\n\

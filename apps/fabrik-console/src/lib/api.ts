@@ -538,6 +538,28 @@ export type TopicAdapterPreviewResponse = {
   } | null;
 };
 
+export type TopicAdapterUpsertRequest = {
+  adapter_kind: string;
+  brokers: string;
+  topic_name: string;
+  topic_partitions: number;
+  action: string;
+  definition_id?: string | null;
+  signal_type?: string | null;
+  workflow_task_queue?: string | null;
+  workflow_instance_id_json_pointer?: string | null;
+  payload_json_pointer?: string | null;
+  payload_template_json?: unknown | null;
+  memo_json_pointer?: string | null;
+  memo_template_json?: unknown | null;
+  search_attributes_json_pointer?: string | null;
+  search_attributes_template_json?: unknown | null;
+  request_id_json_pointer?: string | null;
+  dedupe_key_json_pointer?: string | null;
+  dead_letter_policy?: string;
+  is_paused?: boolean;
+};
+
 export type WatchEvent<T = unknown> = {
   event_type: string;
   occurred_at: string;
@@ -958,31 +980,7 @@ export const api = {
   listTopicAdapters: (tenantId: string) => request<TopicAdapter[]>(`/admin/tenants/${tenantId}/topic-adapters`),
   getTopicAdapter: (tenantId: string, adapterId: string) =>
     request<TopicAdapterDetailResponse>(`/admin/tenants/${tenantId}/topic-adapters/${adapterId}`),
-  setTopicAdapter: (
-    tenantId: string,
-    adapterId: string,
-    payload: {
-      adapter_kind: string;
-      brokers: string;
-      topic_name: string;
-      topic_partitions: number;
-      action: string;
-      definition_id?: string | null;
-      signal_type?: string | null;
-      workflow_task_queue?: string | null;
-      workflow_instance_id_json_pointer?: string | null;
-      payload_json_pointer?: string | null;
-      payload_template_json?: unknown | null;
-      memo_json_pointer?: string | null;
-      memo_template_json?: unknown | null;
-      search_attributes_json_pointer?: string | null;
-      search_attributes_template_json?: unknown | null;
-      request_id_json_pointer?: string | null;
-      dedupe_key_json_pointer?: string | null;
-      dead_letter_policy?: string;
-      is_paused?: boolean;
-    }
-  ) =>
+  setTopicAdapter: (tenantId: string, adapterId: string, payload: TopicAdapterUpsertRequest) =>
     request<TopicAdapter>(`/admin/tenants/${tenantId}/topic-adapters/${adapterId}`, {
       method: "PUT",
       body: JSON.stringify(payload)
@@ -1007,6 +1005,20 @@ export const api = {
     payload: { payload: unknown; partition_id?: number; log_offset?: number }
   ) =>
     request<TopicAdapterPreviewResponse>(`/admin/tenants/${tenantId}/topic-adapters/${adapterId}/preview`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  previewTopicAdapterDraft: (
+    tenantId: string,
+    payload: {
+      adapter_id?: string;
+      adapter: TopicAdapterUpsertRequest;
+      payload: unknown;
+      partition_id?: number;
+      log_offset?: number;
+    }
+  ) =>
+    request<TopicAdapterPreviewResponse>(`/admin/tenants/${tenantId}/topic-adapters/preview-draft`, {
       method: "POST",
       body: JSON.stringify(payload)
     }),

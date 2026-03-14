@@ -22,8 +22,8 @@ use fabrik_store::{
     WorkflowStateSnapshot, WorkflowStore, WorkflowUpdateRecord, WorkflowUpdateStatus,
 };
 use fabrik_throughput::{
-    PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind, ThroughputBackend,
-    throughput_partition_key,
+    CollectResultsBatchManifest, PayloadHandle, PayloadStore, PayloadStoreConfig,
+    PayloadStoreKind, ThroughputBackend, throughput_partition_key,
 };
 use fabrik_workflow::{
     CompiledStateNode, CompiledWorkflowArtifact, ReplayDivergence, ReplayDivergenceKind,
@@ -2652,6 +2652,7 @@ fn source_anchor(location: &SourceLocation) -> WorkflowGraphSourceAnchor {
 fn compiled_state_kind(state: &CompiledStateNode) -> &'static str {
     match state {
         CompiledStateNode::Assign { .. } => "assign",
+        CompiledStateNode::RegisterDynamicSignalHandler { .. } => "register_dynamic_signal_handler",
         CompiledStateNode::Choice { .. } => "choice",
         CompiledStateNode::Step { .. } => "step",
         CompiledStateNode::DynamicStep { .. } => "dynamic_step",
@@ -2678,7 +2679,9 @@ fn compiled_state_kind(state: &CompiledStateNode) -> &'static str {
 
 fn semantic_module_kind(_graph: &str, state: &CompiledStateNode) -> &'static str {
     match state {
-        CompiledStateNode::Assign { .. } | CompiledStateNode::Choice { .. } => "assign_decision",
+        CompiledStateNode::Assign { .. }
+        | CompiledStateNode::RegisterDynamicSignalHandler { .. }
+        | CompiledStateNode::Choice { .. } => "assign_decision",
         CompiledStateNode::Step { .. }
         | CompiledStateNode::DynamicStep { .. }
         | CompiledStateNode::StartStepHandle { .. } => "activity_step",
@@ -2719,6 +2722,9 @@ fn module_collapsed_by_default(state: &CompiledStateNode) -> bool {
 fn compiled_state_subtitle(state: &CompiledStateNode) -> Option<String> {
     match state {
         CompiledStateNode::Assign { actions, .. } => Some(format!("{} assignments", actions.len())),
+        CompiledStateNode::RegisterDynamicSignalHandler { .. } => {
+            Some("register dynamic signal handler".to_owned())
+        }
         CompiledStateNode::Choice { .. } => Some("branch".to_owned()),
         CompiledStateNode::Step { handler, task_queue, .. } => Some(
             task_queue
@@ -2772,7 +2778,10 @@ fn compiled_state_subtitle(state: &CompiledStateNode) -> Option<String> {
 
 fn state_transition_targets(state: &CompiledStateNode) -> Vec<(String, String)> {
     match state {
-        CompiledStateNode::Assign { next, .. } => vec![("next".to_owned(), next.clone())],
+        CompiledStateNode::Assign { next, .. }
+        | CompiledStateNode::RegisterDynamicSignalHandler { next, .. } => {
+            vec![("next".to_owned(), next.clone())]
+        }
         CompiledStateNode::Choice { then_next, else_next, .. } => {
             vec![("then".to_owned(), then_next.clone()), ("else".to_owned(), else_next.clone())]
         }
@@ -4035,6 +4044,29 @@ async fn resolve_collect_results_page_from_batch_payload(
         .read_value(&handle)
         .await
         .context("failed to read collect_results batch result payload")?;
+    if let Ok(manifest) = serde_json::from_value::<CollectResultsBatchManifest>(value.clone()) {
+        let handles = manifest
+            .chunks
+            .into_iter()
+            .map(|chunk| (chunk.chunk_id, chunk.result_handle))
+            .collect::<BTreeMap<_, _>>();
+        let mut resolved = Vec::with_capacity(chunks.len());
+        for mut chunk in chunks {
+            if let Some(handle) = handles.get(&chunk.chunk_id) {
+                let value = state
+                    .payload_store
+                    .read_value(handle)
+                    .await
+                    .context("failed to read collect_results segment payload")?;
+                chunk.output = Some(match value {
+                    Value::Array(items) => items,
+                    _ => Vec::new(),
+                });
+            }
+            resolved.push(chunk);
+        }
+        return Ok(resolved);
+    }
     let items = match value {
         Value::Array(items) => items,
         _ => Vec::new(),

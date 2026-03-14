@@ -22,8 +22,8 @@ use fabrik_config::{
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
     BulkBatchRoutingCount, TaskQueueKind, TopicAdapterAction, TopicAdapterDeadLetterPolicy,
-    TopicAdapterKind, TopicAdapterUpsert, WorkflowRunFilters, WorkflowStore,
-    resolve_topic_adapter_dispatch,
+    TopicAdapterKind, TopicAdapterRecord, TopicAdapterUpsert, WorkflowRunFilters, WorkflowStore,
+    resolve_topic_adapter_dispatch_detailed, validate_topic_adapter_config,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -158,6 +158,18 @@ struct TopicAdapterDeadLetterQuery {
 
 #[derive(Debug, Deserialize)]
 struct TopicAdapterPreviewRequest {
+    payload: Value,
+    #[serde(default)]
+    partition_id: i32,
+    #[serde(default)]
+    log_offset: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TopicAdapterDraftPreviewRequest {
+    #[serde(default)]
+    adapter_id: Option<String>,
+    adapter: TopicAdapterRequest,
     payload: Value,
     #[serde(default)]
     partition_id: i32,
@@ -430,6 +442,10 @@ fn build_app(state: AppState, service_name: String) -> Router {
     )
     .route("/admin/tenants/{tenant_id}/task-queues", get(list_task_queues))
     .route("/admin/tenants/{tenant_id}/topic-adapters", get(list_topic_adapters))
+    .route(
+        "/admin/tenants/{tenant_id}/topic-adapters/preview-draft",
+        post(preview_topic_adapter_draft),
+    )
     .route(
         "/admin/tenants/{tenant_id}/topic-adapters/{adapter_id}",
         get(get_topic_adapter).put(upsert_topic_adapter),
@@ -1672,7 +1688,58 @@ async fn preview_topic_adapter(
                 format!("topic adapter {adapter_id} not found for tenant {tenant_id}"),
             )
         })?;
-    let response = match resolve_topic_adapter_dispatch(
+    let response = match resolve_topic_adapter_dispatch_detailed(
+        &adapter, &request.payload, request.partition_id, request.log_offset,
+    ) {
+        Ok(preview) => json!({
+            "ok": true,
+            "dispatch": preview.dispatch,
+            "diagnostics": preview.diagnostics,
+            "error": Value::Null,
+        }),
+        Err(failure) => json!({
+            "ok": false,
+            "dispatch": Value::Null,
+            "diagnostics": failure.diagnostics,
+            "error": failure.error,
+        }),
+    };
+    Ok(Json(response))
+}
+
+async fn preview_topic_adapter_draft(
+    Path(tenant_id): Path<String>,
+    Json(request): Json<TopicAdapterDraftPreviewRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if let Err(error) = validate_topic_adapter_config(
+        request.adapter.action.clone(),
+        request.adapter.definition_id.as_deref(),
+        request.adapter.signal_type.as_deref(),
+        request.adapter.workflow_task_queue.as_deref(),
+        request.adapter.workflow_instance_id_json_pointer.as_deref(),
+        request.adapter.payload_json_pointer.as_deref(),
+        request.adapter.payload_template_json.as_ref(),
+        request.adapter.memo_json_pointer.as_deref(),
+        request.adapter.memo_template_json.as_ref(),
+        request.adapter.search_attributes_json_pointer.as_deref(),
+        request.adapter.search_attributes_template_json.as_ref(),
+        request.adapter.request_id_json_pointer.as_deref(),
+        request.adapter.dedupe_key_json_pointer.as_deref(),
+    ) {
+        return Ok(Json(json!({
+            "ok": false,
+            "dispatch": Value::Null,
+            "diagnostics": [],
+            "error": error,
+        })));
+    }
+    let adapter_id = request
+        .adapter_id
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("draft");
+    let adapter = topic_adapter_request_to_record(&tenant_id, adapter_id, request.adapter);
+    let response = match resolve_topic_adapter_dispatch_detailed(
         &adapter,
         &request.payload,
         request.partition_id,
@@ -1684,11 +1751,11 @@ async fn preview_topic_adapter(
             "diagnostics": preview.diagnostics,
             "error": Value::Null,
         }),
-        Err(error) => json!({
+        Err(failure) => json!({
             "ok": false,
             "dispatch": Value::Null,
-            "diagnostics": [],
-            "error": error,
+            "diagnostics": failure.diagnostics,
+            "error": failure.error,
         }),
     };
     Ok(Json(response))
@@ -1948,31 +2015,64 @@ fn validate_topic_adapter_request(
             "topic_partitions must be greater than zero".to_owned(),
         ));
     }
-    match request.action {
-        TopicAdapterAction::StartWorkflow => {
-            if request.definition_id.as_deref().is_none_or(str::is_empty) {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "start_workflow adapters require definition_id".to_owned(),
-                ));
-            }
-        }
-        TopicAdapterAction::SignalWorkflow => {
-            if request.signal_type.as_deref().is_none_or(str::is_empty) {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "signal_workflow adapters require signal_type".to_owned(),
-                ));
-            }
-            if request.workflow_instance_id_json_pointer.as_deref().is_none_or(str::is_empty) {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "signal_workflow adapters require workflow_instance_id_json_pointer".to_owned(),
-                ));
-            }
-        }
-    }
+    validate_topic_adapter_config(
+        request.action.clone(),
+        request.definition_id.as_deref(),
+        request.signal_type.as_deref(),
+        request.workflow_task_queue.as_deref(),
+        request.workflow_instance_id_json_pointer.as_deref(),
+        request.payload_json_pointer.as_deref(),
+        request.payload_template_json.as_ref(),
+        request.memo_json_pointer.as_deref(),
+        request.memo_template_json.as_ref(),
+        request.search_attributes_json_pointer.as_deref(),
+        request.search_attributes_template_json.as_ref(),
+        request.request_id_json_pointer.as_deref(),
+        request.dedupe_key_json_pointer.as_deref(),
+    )
+    .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     Ok(())
+}
+
+fn topic_adapter_request_to_record(
+    tenant_id: &str,
+    adapter_id: &str,
+    request: TopicAdapterRequest,
+) -> TopicAdapterRecord {
+    let now = Utc::now();
+    TopicAdapterRecord {
+        tenant_id: tenant_id.to_owned(),
+        adapter_id: adapter_id.to_owned(),
+        adapter_kind: request.adapter_kind,
+        brokers: request.brokers,
+        topic_name: request.topic_name,
+        topic_partitions: request.topic_partitions,
+        action: request.action,
+        definition_id: request.definition_id,
+        signal_type: request.signal_type,
+        workflow_task_queue: request.workflow_task_queue,
+        workflow_instance_id_json_pointer: request.workflow_instance_id_json_pointer,
+        payload_json_pointer: request.payload_json_pointer,
+        payload_template_json: request.payload_template_json,
+        memo_json_pointer: request.memo_json_pointer,
+        memo_template_json: request.memo_template_json,
+        search_attributes_json_pointer: request.search_attributes_json_pointer,
+        search_attributes_template_json: request.search_attributes_template_json,
+        request_id_json_pointer: request.request_id_json_pointer,
+        dedupe_key_json_pointer: request.dedupe_key_json_pointer,
+        dead_letter_policy: request.dead_letter_policy,
+        is_paused: request.is_paused,
+        processed_count: 0,
+        failed_count: 0,
+        ownership_handoff_count: 0,
+        last_processed_at: None,
+        last_handoff_at: None,
+        last_takeover_latency_ms: None,
+        last_error: None,
+        last_error_at: None,
+        created_at: now,
+        updated_at: now,
+    }
 }
 
 fn queue_kind_label(queue_kind: &TaskQueueKind) -> &'static str {
@@ -2564,12 +2664,30 @@ mod tests {
                 Request::put("/admin/tenants/tenant-a/topic-adapters/orders")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"adapter_kind":"redpanda","brokers":"127.0.0.1:9092","topic_name":"orders.events","topic_partitions":3,"action":"start_workflow","definition_id":"order-workflow","workflow_task_queue":"orders","payload_json_pointer":"/payload","payload_template_json":{"order":{"$from":"/payload"},"request":{"$from":"/request_id"}},"request_id_json_pointer":"/request_id"}"#,
+                        r#"{"adapter_kind":"redpanda","brokers":"127.0.0.1:9092","topic_name":"orders.events","topic_partitions":3,"action":"start_workflow","definition_id":"order-workflow","workflow_task_queue":"orders","payload_template_json":{"order":{"$from":"/payload"},"request":{"$from":"/request_id"}},"request_id_json_pointer":"/request_id"}"#,
                     ))
                     .expect("topic adapter upsert request"),
             )
             .await?;
         assert_eq!(upsert_response.status(), StatusCode::OK);
+
+        let draft_preview_response = app
+            .clone()
+            .oneshot(
+                Request::post("/admin/tenants/tenant-a/topic-adapters/preview-draft")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"adapter_id":"draft-orders","adapter":{"adapter_kind":"redpanda","brokers":"127.0.0.1:9092","topic_name":"orders.preview","topic_partitions":1,"action":"start_workflow","definition_id":"order-workflow","workflow_task_queue":"orders","payload_template_json":{"order":{"$from":"/payload"},"request":{"$from":"/request_id"}},"request_id_json_pointer":"/request_id"},"payload":{"payload":{"amount":99},"request_id":"draft-99"},"partition_id":0,"log_offset":4}"#,
+                    ))
+                    .expect("topic adapter draft preview request"),
+            )
+            .await?;
+        assert_eq!(draft_preview_response.status(), StatusCode::OK);
+        let draft_preview_body = to_bytes(draft_preview_response.into_body(), usize::MAX).await?;
+        let draft_preview_json: Value = serde_json::from_slice(&draft_preview_body)?;
+        assert_eq!(draft_preview_json["ok"], true);
+        assert_eq!(draft_preview_json["dispatch"]["action"], "start_workflow");
+        assert_eq!(draft_preview_json["dispatch"]["input"]["order"]["amount"], 99);
 
         store.record_topic_adapter_success("tenant-a", "orders", 0, 11, Utc::now()).await?;
         store
@@ -2637,6 +2755,49 @@ mod tests {
         assert!(preview_json["diagnostics"].as_array().is_some_and(|diagnostics| diagnostics
             .iter()
             .any(|entry| entry["field"] == "input" && entry["mode"] == "template")));
+
+        let failing_preview_response = app
+            .clone()
+            .oneshot(
+                Request::post("/admin/tenants/tenant-a/topic-adapters/orders/preview")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"payload":{"request_id":"req-43"},"partition_id":0,"log_offset":8}"#,
+                    ))
+                    .expect("topic adapter failing preview request"),
+            )
+            .await?;
+        assert_eq!(failing_preview_response.status(), StatusCode::OK);
+        let failing_preview_body =
+            to_bytes(failing_preview_response.into_body(), usize::MAX).await?;
+        let failing_preview_json: Value = serde_json::from_slice(&failing_preview_body)?;
+        assert_eq!(failing_preview_json["ok"], false);
+        assert_eq!(
+            failing_preview_json["error"]["field"],
+            "payload_template_json.order"
+        );
+        assert!(failing_preview_json["diagnostics"]
+            .as_array()
+            .is_some_and(|diagnostics| diagnostics
+                .iter()
+                .any(|entry| entry["field"] == "input" && entry["mode"] == "template")));
+
+        let invalid_upsert_response = app
+            .clone()
+            .oneshot(
+                Request::put("/admin/tenants/tenant-a/topic-adapters/orders-invalid")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"adapter_kind":"redpanda","brokers":"127.0.0.1:9092","topic_name":"orders.invalid","topic_partitions":1,"action":"signal_workflow","definition_id":"order-workflow","signal_type":"approved","workflow_instance_id_json_pointer":"/instance_id","payload_template_json":{"payload":{"$from":"payload"}}}"#,
+                    ))
+                    .expect("invalid topic adapter upsert request"),
+            )
+            .await?;
+        assert_eq!(invalid_upsert_response.status(), StatusCode::BAD_REQUEST);
+        let invalid_upsert_body =
+            to_bytes(invalid_upsert_response.into_body(), usize::MAX).await?;
+        let invalid_upsert_text = String::from_utf8(invalid_upsert_body.to_vec())?;
+        assert!(invalid_upsert_text.contains("mapping"));
 
         let pause_response = app
             .clone()
