@@ -3248,6 +3248,7 @@ class WorkflowLowerer {
     this.childPromiseArrayVars = new Set();
     this.externalHandleVars = new Map();
     this.bulkHandleVars = new Set();
+    this.streamJobHandleVars = new Set();
     this.timerHandleVars = new Set();
     this.stepHandleVars = new Set();
     this.inlineAsyncResultVars = new Set();
@@ -3991,6 +3992,7 @@ class WorkflowLowerer {
           const method = awaitedCall.expression.name.text;
           if (method === "startChild") this.childHandleVars.add(current.name.text);
           if (method === "bulkActivity") this.bulkHandleVars.add(current.name.text);
+          if (method === "startStreamJob") this.streamJobHandleVars.add(current.name.text);
         }
         if (
           temporalImportedCallMatches(awaitedCall, this.temporalApi.startChild, "startChild", this.temporalApi)
@@ -6332,7 +6334,71 @@ class WorkflowLowerer {
           on_error: errorTarget ?? undefined,
         }, awaitExpression);
       }
+      if (this.streamJobHandleVars.has(handleName)) {
+        return this.addState("wait_stream_terminal", {
+          type: "await_stream_job_terminal",
+          stream_job_ref_var: handleName,
+          next: nextState,
+          output_var: targetVar ?? undefined,
+          on_error: errorTarget ?? undefined,
+        }, awaitExpression);
+      }
       throw compilerError(`unknown handle ${handleName}.result()`, awaitExpression);
+    }
+    if (
+      ts.isPropertyAccessExpression(call.expression) &&
+      ts.isIdentifier(call.expression.expression) &&
+      this.streamJobHandleVars.has(call.expression.expression.text)
+    ) {
+      const handleName = call.expression.expression.text;
+      const method = call.expression.name.text;
+      const continueState = targetVar
+        ? this.addState("assign", {
+            type: "assign",
+            actions: [{ target: targetVar, expr: { kind: "literal", value: null } }],
+            next: nextState,
+          }, awaitExpression)
+        : nextState;
+      if (method === "untilCheckpoint") {
+        if (call.arguments.length !== 1) {
+          throw compilerError(`streamJobHandle.untilCheckpoint requires exactly one checkpoint name`, call);
+        }
+        return this.addState("wait_stream_checkpoint", {
+          type: "wait_for_stream_checkpoint",
+          stream_job_ref_var: handleName,
+          checkpoint_name: literalString(call.arguments[0], "streamJobHandle.untilCheckpoint checkpoint name"),
+          next: nextState,
+          output_var: targetVar ?? undefined,
+          on_error: errorTarget ?? undefined,
+        }, awaitExpression);
+      }
+      if (method === "query") {
+        if (call.arguments.length < 1 || call.arguments.length > 3) {
+          throw compilerError(`streamJobHandle.query requires a name, optional args, and optional options`, call);
+        }
+        const options = call.arguments[2] ? compileStreamJobQueryOptions(call.arguments[2]) : {};
+        return this.addState("query_stream_job", {
+          type: "query_stream_job",
+          stream_job_ref_var: handleName,
+          query_name: literalString(call.arguments[0], "streamJobHandle.query name"),
+          args: call.arguments[1] ? compileExpression(call.arguments[1]) : undefined,
+          consistency: options.consistency,
+          next: nextState,
+          output_var: targetVar ?? undefined,
+          on_error: errorTarget ?? undefined,
+        }, awaitExpression);
+      }
+      if (method === "cancel") {
+        if (call.arguments.length > 1) {
+          throw compilerError(`streamJobHandle.cancel accepts at most one optional reason`, call);
+        }
+        return this.addState("cancel_stream_job", {
+          type: "cancel_stream_job",
+          stream_job_ref_var: handleName,
+          reason: call.arguments[0] ? compileExpression(call.arguments[0]) : undefined,
+          next: continueState,
+        }, awaitExpression);
+      }
     }
     if (
       ts.isPropertyAccessExpression(call.expression) &&
@@ -6679,6 +6745,22 @@ class WorkflowLowerer {
         reducer: options.reducer,
         chunk_size: options.chunk_size,
         retry: options.retry,
+      }, awaitExpression);
+    }
+    if (method === "startStreamJob") {
+      if (!targetVar) {
+        throw compilerError(`await ctx.startStreamJob(...) must be assigned to a handle variable`, awaitExpression);
+      }
+      const jobNameExpr = call.arguments[0];
+      const options = call.arguments[1] ? compileStreamJobOptions(call.arguments[1]) : {};
+      this.streamJobHandleVars.add(targetVar);
+      return this.addState("start_stream_job", {
+        type: "start_stream_job",
+        job_name: literalString(jobNameExpr, "ctx.startStreamJob job name"),
+        input: options.input ?? { kind: "literal", value: null },
+        config: options.config,
+        next: nextState,
+        handle_var: targetVar,
       }, awaitExpression);
     }
     if (method === "sideEffect") {
@@ -7305,6 +7387,55 @@ function compileBulkOptions(expression) {
       continue;
     }
     throw compilerError(`unsupported bulkActivity option ${key}`, property);
+  }
+  return options;
+}
+
+function compileStreamJobOptions(expression) {
+  if (!ts.isObjectLiteralExpression(expression)) {
+    throw compilerError(`ctx.startStreamJob options must be a static object`, expression);
+  }
+  const options = {};
+  for (const property of expression.properties) {
+    if (!ts.isPropertyAssignment(property)) {
+      throw compilerError(`unsupported startStreamJob option ${property.getText()}`, property);
+    }
+    const key = property.name.getText().replaceAll(/^["']|["']$/g, "");
+    if (key === "input") {
+      options.input = compileExpression(property.initializer);
+      continue;
+    }
+    if (key === "config") {
+      options.config = compileExpression(property.initializer);
+      continue;
+    }
+    throw compilerError(`unsupported startStreamJob option ${key}`, property);
+  }
+  return options;
+}
+
+function compileStreamJobQueryOptions(expression) {
+  if (!ts.isObjectLiteralExpression(expression)) {
+    throw compilerError(`streamJobHandle.query options must be a static object`, expression);
+  }
+  const options = {};
+  for (const property of expression.properties) {
+    if (!ts.isPropertyAssignment(property)) {
+      throw compilerError(`unsupported stream job query option ${property.getText()}`, property);
+    }
+    const key = property.name.getText().replaceAll(/^["']|["']$/g, "");
+    if (key === "consistency") {
+      const consistency = literalString(property.initializer, "streamJobHandle.query consistency");
+      if (consistency !== "strong" && consistency !== "eventual") {
+        throw compilerError(
+          `streamJobHandle.query consistency must be "strong" or "eventual"`,
+          property.initializer,
+        );
+      }
+      options.consistency = consistency;
+      continue;
+    }
+    throw compilerError(`unsupported stream job query option ${key}`, property);
   }
   return options;
 }

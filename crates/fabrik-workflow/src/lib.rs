@@ -16,7 +16,7 @@ pub use compiled::{
     CompiledExecutionPlan, CompiledQueryHandler, CompiledSignalHandler, CompiledStateNode,
     CompiledUpdateHandler, CompiledWorkflow, CompiledWorkflowArtifact, CompiledWorkflowError,
     ErrorTransition, ExecutionTurnContext, Expression, HelperFunction, ParentClosePolicy,
-    SourceLocation,
+    SourceLocation, StreamJobExecutionState, evaluate_expression,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -908,9 +908,35 @@ impl WorkflowInstanceState {
             | WorkflowEvent::ActivityTaskHeartbeatRecorded { .. }
             | WorkflowEvent::ActivityTaskCancellationRequested { .. }
             | WorkflowEvent::BulkActivityBatchScheduled { .. }
+            | WorkflowEvent::StreamJobScheduled { .. }
+            | WorkflowEvent::StreamJobCancellationRequested { .. }
+            | WorkflowEvent::StreamJobQueryRequested { .. }
             | WorkflowEvent::TimerScheduled { .. }
             | WorkflowEvent::TimerFired { .. } => {
                 self.status = WorkflowStatus::Running;
+            }
+            WorkflowEvent::StreamJobCheckpointReached { output, .. } => {
+                self.status = WorkflowStatus::Running;
+                if let Some(output) = output {
+                    self.context = Some(output.clone());
+                }
+            }
+            WorkflowEvent::StreamJobQueryCompleted { output, .. } => {
+                self.status = WorkflowStatus::Running;
+                self.context = Some(output.clone());
+            }
+            WorkflowEvent::StreamJobQueryFailed { error, .. } => {
+                self.status = WorkflowStatus::Running;
+                self.context = Some(Value::String(error.clone()));
+            }
+            WorkflowEvent::StreamJobCompleted { output, .. } => {
+                self.status = WorkflowStatus::Running;
+                self.context = Some(output.clone());
+            }
+            WorkflowEvent::StreamJobFailed { error, .. }
+            | WorkflowEvent::StreamJobCancelled { reason: error, .. } => {
+                self.status = WorkflowStatus::Running;
+                self.context = Some(Value::String(error.clone()));
             }
             WorkflowEvent::ActivityTaskCompleted { output, .. } => {
                 self.status = WorkflowStatus::Running;

@@ -48,6 +48,14 @@ pub const TINY_WORKFLOW_MAX_ITEMS: usize = 32;
 const REDUCTION_GROUP_LEVEL_SHIFT: u32 = 24;
 const REDUCTION_GROUP_SLOT_MASK: u32 = (1 << REDUCTION_GROUP_LEVEL_SHIFT) - 1;
 
+fn default_throughput_bridge_protocol_version() -> String {
+    THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned()
+}
+
+fn default_throughput_bridge_operation_kind() -> String {
+    ThroughputBridgeOperationKind::BulkRun.as_str().to_owned()
+}
+
 pub fn throughput_bridge_request_id(
     tenant_id: &str,
     instance_id: &str,
@@ -1191,6 +1199,10 @@ pub struct StartThroughputRunCommand {
     pub dedupe_key: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub bridge_request_id: String,
+    #[serde(default = "default_throughput_bridge_protocol_version")]
+    pub bridge_protocol_version: String,
+    #[serde(default = "default_throughput_bridge_operation_kind")]
+    pub bridge_operation_kind: String,
     pub tenant_id: String,
     pub definition_id: String,
     pub definition_version: Option<u32>,
@@ -1230,6 +1242,19 @@ impl StartThroughputRunCommand {
         } else {
             self.bridge_request_id.clone()
         }
+    }
+
+    pub fn resolved_bridge_protocol_version(&self) -> &str {
+        if self.bridge_protocol_version.trim().is_empty() {
+            THROUGHPUT_BRIDGE_PROTOCOL_VERSION
+        } else {
+            self.bridge_protocol_version.as_str()
+        }
+    }
+
+    pub fn resolved_bridge_operation_kind(&self) -> ThroughputBridgeOperationKind {
+        ThroughputBridgeOperationKind::parse(&self.bridge_operation_kind)
+            .unwrap_or(ThroughputBridgeOperationKind::BulkRun)
     }
 }
 
@@ -1274,6 +1299,8 @@ impl CreateBatchCommand {
                 &self.run_id,
                 &self.batch_id,
             ),
+            bridge_protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            bridge_operation_kind: ThroughputBridgeOperationKind::BulkRun.as_str().to_owned(),
             tenant_id: self.tenant_id.clone(),
             definition_id: self.definition_id.clone(),
             definition_version: Some(self.definition_version),
@@ -2015,6 +2042,8 @@ mod tests {
                     "run-a",
                     "batch-a",
                 ),
+                bridge_protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                bridge_operation_kind: ThroughputBridgeOperationKind::BulkRun.as_str().to_owned(),
                 tenant_id: "tenant-a".to_owned(),
                 definition_id: "demo".to_owned(),
                 definition_version: Some(7),
@@ -2092,6 +2121,8 @@ mod tests {
             native.bridge_request_id,
             throughput_bridge_request_id("tenant-a", "instance-a", "run-a", "batch-a")
         );
+        assert_eq!(native.bridge_protocol_version, THROUGHPUT_BRIDGE_PROTOCOL_VERSION);
+        assert_eq!(native.bridge_operation_kind, ThroughputBridgeOperationKind::BulkRun.as_str());
         assert_eq!(native.input_handle, legacy.input_handle);
     }
 

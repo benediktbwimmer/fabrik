@@ -10,6 +10,8 @@ The bridge is currently required for throughput mode driven by `ctx.bulkActivity
 
 Future stream-job workflow primitives may reuse the same bridge, but they are outside the current shipping workflow contract unless stated explicitly elsewhere.
 
+The target stream-job contract is defined separately in [stream-jobs.md](/Users/bene/code/fabrik/docs/spec/stream-jobs.md).
+
 ## Core Rule
 
 The bridge is the only legal crossing point between workflow truth and stream truth.
@@ -132,6 +134,46 @@ Eventual reads:
 - are suitable for UI and cheap status inspection
 - are never workflow-authoritative
 
+## Debug Surfaces
+
+The query service exposes bridge inspection routes for stream jobs:
+
+- `/debug/streams-bridge/jobs/{tenant_id}/{instance_id}/{run_id}`
+- `/debug/streams-bridge/jobs/{tenant_id}/{instance_id}/{run_id}/repairs`
+- `/debug/streams-bridge/jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}`
+
+The list route supports server-side filtering:
+
+- `status`
+- `next_repair`
+- `latest_query_status`
+- `latest_query_name`
+- `latest_query_consistency`
+
+The dedicated repairs route applies the same filters and sorts, but only returns handles with pending bridge repair debt.
+
+The list route also supports sorting:
+
+- `sort=created_at_asc`
+- `sort=created_at_desc`
+- `sort=latest_query_activity_desc`
+- `sort=latest_query_activity_asc`
+
+The detail route returns:
+
+- bridge handle metadata
+- awaited checkpoint records
+- stream-job query records
+
+The list route returns per-handle summary fields for the latest observed query so operators can scan for stuck or noisy jobs without opening each handle individually.
+
+The stream-job bridge responses now also expose repair visibility directly:
+
+- handle summaries include `pending_repairs`, `pending_repair_count`, and `next_repair`
+- checkpoint rows include `next_repair`
+- query rows include `next_repair`
+- handle metadata includes `workflow_accepted_at` so terminal handoff and workflow acceptance are distinguishable
+
 ## Checkpoint Boundary
 
 The current throughput-mode contract does not expose stream checkpoints directly to workflow code.
@@ -156,3 +198,5 @@ The bridge is not:
 ## Consequence
 
 Throughput mode can evolve onto richer stream infrastructure without changing the current workflow-facing contract, as long as the bridge semantics remain stable.
+
+If stream-native workflow primitives are added later, they should reuse this protocol machinery while following the distinct semantic contract in [stream-jobs.md](/Users/bene/code/fabrik/docs/spec/stream-jobs.md).

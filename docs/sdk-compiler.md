@@ -67,6 +67,8 @@ Required workflow primitives include:
 
 Future stream-native primitives such as `ctx.startStreamJob(...)` are intentionally not part of the current workflow replacement claim. They should ship only after the bridge contract and stream semantics are explicit enough to justify a distinct workflow primitive.
 
+The target semantic contract for those primitives is defined in [spec/stream-jobs.md](spec/stream-jobs.md).
+
 ## Temporal Compatibility Progress
 
 The long-term goal is source compatibility with Temporal workflow code, starting with the TypeScript SDK surface.

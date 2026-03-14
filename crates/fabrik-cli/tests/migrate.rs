@@ -455,8 +455,7 @@ fn monorepo_multiworker_packages_do_not_collide_on_shared_worker_filenames() {
 #[test]
 fn async_external_pressure_fixture_qualifies_and_packages_both_workflows() {
     let output_dir = temp_output_dir("async-external-pressure");
-    let (status, report) =
-        run_cli(&fixture("temporal-async-external-pressure"), &output_dir, &[]);
+    let (status, report) = run_cli(&fixture("temporal-async-external-pressure"), &output_dir, &[]);
     assert!(status.success(), "report: {report:?}");
     assert_eq!(report["status"], "compatible_ready_not_deployed");
     assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");

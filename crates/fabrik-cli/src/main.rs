@@ -23,7 +23,13 @@ const MIGRATION_REPORT_SCHEMA_VERSION: u32 = 1;
 const REPO_ROOT: &str = "/Users/bene/code/fabrik";
 
 #[derive(Debug, Clone)]
-struct CliArgs {
+enum CliArgs {
+    MigrateTemporal(MigrateCliArgs),
+    InspectStreamJobRepairs(InspectStreamJobRepairsArgs),
+}
+
+#[derive(Debug, Clone)]
+struct MigrateCliArgs {
     project_root: PathBuf,
     deploy: bool,
     analyze_only: bool,
@@ -31,6 +37,22 @@ struct CliArgs {
     validation_run_limit: usize,
     api_url: Option<String>,
     tenant_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct InspectStreamJobRepairsArgs {
+    api_url: String,
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    status: Option<String>,
+    next_repair: Option<String>,
+    latest_query_status: Option<String>,
+    latest_query_name: Option<String>,
+    latest_query_consistency: Option<String>,
+    sort: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -355,6 +377,14 @@ async fn main() {
 
 async fn try_main() -> Result<i32> {
     let args = parse_args(env::args().skip(1).collect())?;
+    match args {
+        CliArgs::MigrateTemporal(args) => try_main_migrate_temporal(args).await,
+        CliArgs::InspectStreamJobRepairs(args) => inspect_stream_job_repairs(args).await,
+    }
+}
+
+async fn try_main_migrate_temporal(args: MigrateCliArgs) -> Result<i32> {
+    let client = Client::new();
     let output_dir =
         args.output_dir.clone().unwrap_or_else(|| args.project_root.join(".fabrik-migration"));
     fs::create_dir_all(&output_dir)
@@ -430,8 +460,6 @@ async fn try_main() -> Result<i32> {
 
     let mut workflow_records = Vec::new();
     let mut compiled_artifacts = Vec::new();
-    let client = Client::new();
-
     if hard_blocks == 0 && !args.analyze_only {
         for workflow in &analyzer.workflows {
             let definition_version = determine_definition_version(
@@ -739,8 +767,76 @@ async fn try_main() -> Result<i32> {
     })
 }
 
+async fn inspect_stream_job_repairs(args: InspectStreamJobRepairsArgs) -> Result<i32> {
+    let client = Client::new();
+    let mut url = reqwest::Url::parse(&format!(
+        "{}/debug/streams-bridge/jobs/{}/{}/{}/repairs",
+        args.api_url.trim_end_matches('/'),
+        args.tenant_id,
+        args.instance_id,
+        args.run_id
+    ))
+    .context("invalid query-service api url")?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        if let Some(status) = args.status.as_deref() {
+            pairs.append_pair("status", status);
+        }
+        if let Some(next_repair) = args.next_repair.as_deref() {
+            pairs.append_pair("next_repair", next_repair);
+        }
+        if let Some(latest_query_status) = args.latest_query_status.as_deref() {
+            pairs.append_pair("latest_query_status", latest_query_status);
+        }
+        if let Some(latest_query_name) = args.latest_query_name.as_deref() {
+            pairs.append_pair("latest_query_name", latest_query_name);
+        }
+        if let Some(latest_query_consistency) = args.latest_query_consistency.as_deref() {
+            pairs.append_pair("latest_query_consistency", latest_query_consistency);
+        }
+        if let Some(sort) = args.sort.as_deref() {
+            pairs.append_pair("sort", sort);
+        }
+        if let Some(limit) = args.limit {
+            pairs.append_pair("limit", &limit.to_string());
+        }
+        if let Some(offset) = args.offset {
+            pairs.append_pair("offset", &offset.to_string());
+        }
+    }
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .context("failed to fetch stream-job repairs from query-service")?;
+    let status = response.status();
+    let body = response.text().await.context("failed to read query-service response body")?;
+    if !status.is_success() {
+        bail!("stream-job repairs request failed ({status}): {body}");
+    }
+    let json: Value =
+        serde_json::from_str(&body).context("failed to decode stream-job repairs response")?;
+    println!("{}", serde_json::to_string_pretty(&json)?);
+    Ok(0)
+}
+
 fn parse_args(args: Vec<String>) -> Result<CliArgs> {
-    if args.len() < 4 || args[0] != "migrate" || args[1] != "temporal" {
+    match args.as_slice() {
+        [cmd, target, ..] if cmd == "migrate" && target == "temporal" => {
+            parse_migrate_temporal_args(args)
+        }
+        [cmd, target, ..] if cmd == "inspect" && target == "stream-job-repairs" => {
+            parse_inspect_stream_job_repairs_args(args)
+        }
+        _ => bail!(
+            "usage:\n  fabrik migrate temporal <local_repo_path> [--deploy] [--analyze-only] [--output-dir <dir>] [--validation-run-limit <n>] [--api-url <url>] [--tenant <tenant_id>]\n  fabrik inspect stream-job-repairs <instance_id> <run_id> [--api-url <url>] [--tenant <tenant_id>] [--status <status>] [--next-repair <repair>] [--latest-query-status <status>] [--latest-query-name <name>] [--latest-query-consistency <mode>] [--sort <sort>] [--limit <n>] [--offset <n>]"
+        ),
+    }
+}
+
+fn parse_migrate_temporal_args(args: Vec<String>) -> Result<CliArgs> {
+    if args.len() < 3 {
         bail!(
             "usage: fabrik migrate temporal <local_repo_path> [--deploy] [--analyze-only] [--output-dir <dir>] [--validation-run-limit <n>] [--api-url <url>] [--tenant <tenant_id>]"
         );
@@ -791,7 +887,7 @@ fn parse_args(args: Vec<String>) -> Result<CliArgs> {
         }
     }
 
-    Ok(CliArgs {
+    Ok(CliArgs::MigrateTemporal(MigrateCliArgs {
         project_root: fs::canonicalize(&project_root)
             .with_context(|| format!("failed to resolve {}", project_root.display()))?,
         deploy,
@@ -800,7 +896,114 @@ fn parse_args(args: Vec<String>) -> Result<CliArgs> {
         validation_run_limit,
         api_url,
         tenant_id,
-    })
+    }))
+}
+
+fn parse_inspect_stream_job_repairs_args(args: Vec<String>) -> Result<CliArgs> {
+    if args.len() < 4 {
+        bail!(
+            "usage: fabrik inspect stream-job-repairs <instance_id> <run_id> [--api-url <url>] [--tenant <tenant_id>] [--status <status>] [--next-repair <repair>] [--latest-query-status <status>] [--latest-query-name <name>] [--latest-query-consistency <mode>] [--sort <sort>] [--limit <n>] [--offset <n>]"
+        );
+    }
+
+    let instance_id = args[2].clone();
+    let run_id = args[3].clone();
+    let mut api_url = env::var("FABRIK_API_URL").ok();
+    let mut tenant_id = env::var("FABRIK_TENANT_ID").ok();
+    let mut status = None;
+    let mut next_repair = None;
+    let mut latest_query_status = None;
+    let mut latest_query_name = None;
+    let mut latest_query_consistency = None;
+    let mut sort = None;
+    let mut limit = None;
+    let mut offset = None;
+
+    let mut index = 4;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--api-url" => {
+                api_url = Some(args.get(index + 1).context("--api-url requires a value")?.clone());
+                index += 2;
+            }
+            "--tenant" => {
+                tenant_id = Some(args.get(index + 1).context("--tenant requires a value")?.clone());
+                index += 2;
+            }
+            "--status" => {
+                status = Some(args.get(index + 1).context("--status requires a value")?.clone());
+                index += 2;
+            }
+            "--next-repair" => {
+                next_repair =
+                    Some(args.get(index + 1).context("--next-repair requires a value")?.clone());
+                index += 2;
+            }
+            "--latest-query-status" => {
+                latest_query_status = Some(
+                    args.get(index + 1).context("--latest-query-status requires a value")?.clone(),
+                );
+                index += 2;
+            }
+            "--latest-query-name" => {
+                latest_query_name = Some(
+                    args.get(index + 1).context("--latest-query-name requires a value")?.clone(),
+                );
+                index += 2;
+            }
+            "--latest-query-consistency" => {
+                latest_query_consistency = Some(
+                    args.get(index + 1)
+                        .context("--latest-query-consistency requires a value")?
+                        .clone(),
+                );
+                index += 2;
+            }
+            "--sort" => {
+                sort = Some(args.get(index + 1).context("--sort requires a value")?.clone());
+                index += 2;
+            }
+            "--limit" => {
+                limit = Some(
+                    args.get(index + 1)
+                        .context("--limit requires a value")?
+                        .parse::<usize>()
+                        .context("--limit must be an integer")?,
+                );
+                index += 2;
+            }
+            "--offset" => {
+                offset = Some(
+                    args.get(index + 1)
+                        .context("--offset requires a value")?
+                        .parse::<usize>()
+                        .context("--offset must be an integer")?,
+                );
+                index += 2;
+            }
+            flag => bail!("unknown flag {flag}"),
+        }
+    }
+
+    let api_url = api_url
+        .context("--api-url is required for inspect stream-job-repairs (or FABRIK_API_URL)")?;
+    let tenant_id = tenant_id
+        .context("--tenant is required for inspect stream-job-repairs (or FABRIK_TENANT_ID)")?;
+
+    Ok(CliArgs::InspectStreamJobRepairs(InspectStreamJobRepairsArgs {
+        api_url,
+        tenant_id,
+        instance_id,
+        run_id,
+        status,
+        next_repair,
+        latest_query_status,
+        latest_query_name,
+        latest_query_consistency,
+        sort,
+        limit,
+        offset,
+    }))
 }
 
 fn run_analyzer(project_root: &Path) -> Result<AnalyzerOutput> {
@@ -2474,8 +2677,39 @@ mod tests {
             "/Users/bene/code/fabrik".to_owned(),
             "--analyze-only".to_owned(),
         ])?;
+        let CliArgs::MigrateTemporal(args) = args else {
+            panic!("expected migrate temporal args");
+        };
         assert!(args.analyze_only);
         assert!(!args.deploy);
+        Ok(())
+    }
+
+    #[test]
+    fn parse_stream_job_repairs_inspect_args() -> Result<()> {
+        let args = parse_args(vec![
+            "inspect".to_owned(),
+            "stream-job-repairs".to_owned(),
+            "instance-a".to_owned(),
+            "run-a".to_owned(),
+            "--api-url".to_owned(),
+            "http://127.0.0.1:8080".to_owned(),
+            "--tenant".to_owned(),
+            "tenant-a".to_owned(),
+            "--next-repair".to_owned(),
+            "accept_stream_terminal".to_owned(),
+            "--limit".to_owned(),
+            "25".to_owned(),
+        ])?;
+        let CliArgs::InspectStreamJobRepairs(args) = args else {
+            panic!("expected inspect stream-job-repairs args");
+        };
+        assert_eq!(args.instance_id, "instance-a");
+        assert_eq!(args.run_id, "run-a");
+        assert_eq!(args.api_url, "http://127.0.0.1:8080");
+        assert_eq!(args.tenant_id, "tenant-a");
+        assert_eq!(args.next_repair.as_deref(), Some("accept_stream_terminal"));
+        assert_eq!(args.limit, Some(25));
         Ok(())
     }
 

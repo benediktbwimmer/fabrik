@@ -1,3 +1,4 @@
+mod aggregation;
 mod bridge;
 mod local_state;
 
@@ -6,10 +7,14 @@ use std::{
     fs,
     io::Write,
     process::{Command, Stdio},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
+use aggregation::AggregationCoordinator;
 use anyhow::{Context, Result};
 use axum::{
     Json,
@@ -17,7 +22,7 @@ use axum::{
     http::StatusCode,
     routing::get,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use fabrik_broker::{
     BrokerConfig, JsonTopicConfig, JsonTopicPublisher, WorkflowPublisher, build_json_consumer,
     build_json_consumer_from_offsets, build_workflow_consumer, decode_json_record,
@@ -39,11 +44,12 @@ use fabrik_throughput::{
     ADMISSION_POLICY_VERSION, ActivityCapabilityRegistry, ActivityExecutionCapabilities,
     BENCHMARK_ECHO_ACTIVITY, CORE_ACCEPT_ACTIVITY, CORE_ECHO_ACTIVITY, CORE_NOOP_ACTIVITY,
     CollectResultsBatchManifest, CollectResultsChunkSegmentRef, PayloadHandle, PayloadStore,
-    PayloadStoreConfig, PayloadStoreKind, StartThroughputRunCommand, ThroughputBackend,
-    ThroughputBatchIdentity, ThroughputChangelogEntry, ThroughputChangelogPayload,
+    PayloadStoreConfig, PayloadStoreKind, StartThroughputRunCommand,
+    THROUGHPUT_BRIDGE_PROTOCOL_VERSION, ThroughputBackend, ThroughputBatchIdentity,
+    ThroughputBridgeOperationKind, ThroughputChangelogEntry, ThroughputChangelogPayload,
     ThroughputChunkReport, ThroughputChunkReportPayload, ThroughputCommand,
     ThroughputCommandEnvelope, WorkerActivityManifest, benchmark_echo_item_requires_output,
-    bulk_reducer_class, bulk_reducer_name, bulk_reducer_settles, bulk_reducer_summary_field_name,
+    bulk_reducer_class, bulk_reducer_name, bulk_reducer_settles,
     can_complete_payloadless_bulk_chunk, can_use_payloadless_bulk_transport, decode_cbor,
     effective_aggregation_group_count, encode_cbor, execute_benchmark_echo,
     group_id_for_chunk_index, load_activity_capability_registry_from_env,
@@ -62,13 +68,14 @@ use fabrik_worker_protocol::activity_worker::{
 use fabrik_workflow::execute_handler;
 use futures_util::StreamExt;
 use local_state::{
-    LeasedChunkSnapshot, LocalThroughputDebugSnapshot, LocalThroughputState, PreparedReportApply,
+    LeasedChunkSnapshot, LocalThroughputCoordinatorPaths, LocalThroughputDebugSnapshot,
+    LocalThroughputShardPaths, LocalThroughputState, PreparedValidatedReport,
     ProjectedBatchGroupSummary, ProjectedBatchTerminal, ProjectedGroupTerminal,
     ProjectedTerminalApply, ReportValidation,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc, oneshot};
 use tonic::{Request, Response, Status, transport::Server};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -84,6 +91,7 @@ pub(crate) const STREAMS_RUNTIME_DEBUG_BATCH_ROUTE: &str =
     "/debug/streams-runtime/batches/{tenant_id}/{instance_id}/{run_id}/{batch_id}";
 pub(crate) const STREAMS_RUNTIME_DEBUG_CHUNKS_ROUTE: &str =
     "/debug/streams-runtime/batches/{tenant_id}/{instance_id}/{run_id}/{batch_id}/chunks";
+pub(crate) const STREAMS_RUNTIME_DEBUG_STREAM_JOB_VIEW_ROUTE: &str = "/debug/streams-runtime/stream-jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}/views/{view_name}/keys/{logical_key}";
 const LEGACY_THROUGHPUT_DEBUG_ROUTE: &str = "/debug/throughput";
 const LEGACY_THROUGHPUT_DEBUG_BATCH_ROUTE: &str =
     "/debug/throughput/batches/{tenant_id}/{instance_id}/{run_id}/{batch_id}";
@@ -173,6 +181,8 @@ fn load_local_activity_executor_registry_from_env(
 struct AppState {
     store: WorkflowStore,
     local_state: LocalThroughputState,
+    aggregation: AggregationCoordinator,
+    shard_workers: Arc<OnceLock<ShardWorkerPool>>,
     workflow_publisher: WorkflowPublisher,
     changelog_publisher: JsonTopicPublisher<ThroughputChangelogEntry>,
     projection_publisher: JsonTopicPublisher<ThroughputProjectionEvent>,
@@ -191,6 +201,372 @@ struct AppState {
 #[derive(Clone)]
 struct WorkerApi {
     state: AppState,
+    shard_workers: ShardWorkerPool,
+}
+
+struct ShardWorker {
+    state: AppState,
+    scheduling_state: LocalThroughputState,
+    scheduling_partition_id: Option<i32>,
+    shard_partitions: HashSet<i32>,
+}
+
+#[derive(Clone)]
+struct ShardWorkerHandle {
+    command_tx: mpsc::Sender<ShardWorkerCommand>,
+}
+
+#[derive(Clone)]
+struct ShardWorkerPool {
+    handles: Vec<ShardWorkerHandle>,
+    handles_by_partition: Arc<HashMap<i32, ShardWorkerHandle>>,
+    coordinator_storage: LocalThroughputCoordinatorPaths,
+    local_state_by_partition: Arc<HashMap<i32, LocalThroughputState>>,
+    storage_by_partition: Arc<HashMap<i32, LocalThroughputShardPaths>>,
+    next_poll_index: Arc<AtomicUsize>,
+}
+
+enum ShardWorkerCommand {
+    PollBulkActivityTasks {
+        request: PollBulkActivityTaskRequest,
+        respond_to: oneshot::Sender<Result<PollBulkActivityTaskResponse, Status>>,
+    },
+    ApplyReportBatch {
+        report_batch: Vec<ThroughputChunkReport>,
+        capture_report_log: bool,
+        respond_to: oneshot::Sender<Result<()>>,
+    },
+    RunLocalBenchmarkFastlaneOnce {
+        batch_limit: Option<usize>,
+        lease_ttl: chrono::Duration,
+        max_chunks: usize,
+        respond_to: oneshot::Sender<Result<usize>>,
+    },
+    RunExpiredChunkSweepOnce {
+        now: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+        respond_to: oneshot::Sender<Result<usize>>,
+    },
+}
+
+impl ShardWorker {
+    fn new(
+        state: AppState,
+        scheduling_state: LocalThroughputState,
+        shard_partitions: HashSet<i32>,
+    ) -> Self {
+        let scheduling_partition_id = if shard_partitions.len() == 1 {
+            shard_partitions.iter().copied().next()
+        } else {
+            None
+        };
+        Self { state, scheduling_state, scheduling_partition_id, shard_partitions }
+    }
+
+    fn owned_partitions(&self) -> HashSet<i32> {
+        owned_throughput_partitions(&self.state)
+            .into_iter()
+            .filter(|partition_id| self.shard_partitions.contains(partition_id))
+            .collect()
+    }
+
+    fn mirror_scheduling_changelog_records(
+        &self,
+        entries: &[ThroughputChangelogEntry],
+    ) -> Result<()> {
+        if self.scheduling_partition_id.is_none() || entries.is_empty() {
+            return Ok(());
+        }
+        self.scheduling_state.mirror_changelog_records(entries)
+    }
+}
+
+impl ShardWorkerHandle {
+    fn new(
+        state: AppState,
+        scheduling_state: LocalThroughputState,
+        shard_partitions: HashSet<i32>,
+    ) -> Self {
+        let mailbox_capacity =
+            state.runtime.report_apply_batch_size.max(state.runtime.poll_max_tasks).max(32);
+        let (command_tx, command_rx) = mpsc::channel(mailbox_capacity);
+        tokio::spawn(run_shard_worker_loop(
+            ShardWorker::new(state, scheduling_state, shard_partitions),
+            command_rx,
+        ));
+        Self { command_tx }
+    }
+
+    async fn poll_bulk_activity_tasks(
+        &self,
+        request: PollBulkActivityTaskRequest,
+    ) -> Result<PollBulkActivityTaskResponse, Status> {
+        let (respond_to, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ShardWorkerCommand::PollBulkActivityTasks { request, respond_to })
+            .await
+            .map_err(|_| Status::unavailable("shard worker stopped"))?;
+        response_rx.await.map_err(|_| Status::unavailable("shard worker stopped"))?
+    }
+
+    async fn apply_report_batch(
+        &self,
+        report_batch: Vec<ThroughputChunkReport>,
+        capture_report_log: bool,
+    ) -> Result<()> {
+        let (respond_to, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ShardWorkerCommand::ApplyReportBatch {
+                report_batch,
+                capture_report_log,
+                respond_to,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("shard worker stopped"))?;
+        response_rx.await.map_err(|_| anyhow::anyhow!("shard worker stopped"))?
+    }
+
+    async fn run_local_benchmark_fastlane_once(
+        &self,
+        batch_limit: Option<usize>,
+        lease_ttl: chrono::Duration,
+        max_chunks: usize,
+    ) -> Result<usize> {
+        let (respond_to, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ShardWorkerCommand::RunLocalBenchmarkFastlaneOnce {
+                batch_limit,
+                lease_ttl,
+                max_chunks,
+                respond_to,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("shard worker stopped"))?;
+        response_rx.await.map_err(|_| anyhow::anyhow!("shard worker stopped"))?
+    }
+
+    async fn run_expired_chunk_sweep_once(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<usize> {
+        let (respond_to, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(ShardWorkerCommand::RunExpiredChunkSweepOnce { now, limit, respond_to })
+            .await
+            .map_err(|_| anyhow::anyhow!("shard worker stopped"))?;
+        response_rx.await.map_err(|_| anyhow::anyhow!("shard worker stopped"))?
+    }
+}
+
+impl ShardWorkerPool {
+    fn new(state: AppState, managed_partitions: &[i32]) -> Self {
+        let mut handles = Vec::with_capacity(managed_partitions.len().max(1));
+        let mut handles_by_partition = HashMap::with_capacity(managed_partitions.len().max(1));
+        let mut local_state_by_partition = HashMap::with_capacity(managed_partitions.len().max(1));
+        let mut storage_by_partition = HashMap::with_capacity(managed_partitions.len().max(1));
+        let coordinator_storage = LocalThroughputState::coordinator_paths(
+            &state.runtime.local_state_dir,
+            &state.runtime.checkpoint_dir,
+        );
+        for partition_id in managed_partitions.iter().copied() {
+            let partition_state = LocalThroughputState::open_partition_shard(
+                &state.runtime.local_state_dir,
+                &state.runtime.checkpoint_dir,
+                partition_id,
+                state.runtime.checkpoint_retention,
+            )
+            .unwrap_or_else(|error| {
+                panic!("failed to open shard-local throughput state for partition {partition_id}: {error}")
+            });
+            let storage = LocalThroughputState::partition_shard_paths(
+                &state.runtime.local_state_dir,
+                &state.runtime.checkpoint_dir,
+                partition_id,
+            );
+            let handle = ShardWorkerHandle::new(
+                state.clone(),
+                partition_state.clone(),
+                HashSet::from([partition_id]),
+            );
+            local_state_by_partition.insert(partition_id, partition_state);
+            storage_by_partition.insert(partition_id, storage);
+            handles_by_partition.insert(partition_id, handle.clone());
+            handles.push(handle);
+        }
+        if handles.is_empty() {
+            let partition_state = LocalThroughputState::open_partition_shard(
+                &state.runtime.local_state_dir,
+                &state.runtime.checkpoint_dir,
+                0,
+                state.runtime.checkpoint_retention,
+            )
+            .unwrap_or_else(|error| {
+                panic!("failed to open fallback shard-local throughput state: {error}")
+            });
+            handles.push(ShardWorkerHandle::new(state, partition_state, HashSet::new()));
+        }
+        Self {
+            handles,
+            handles_by_partition: Arc::new(handles_by_partition),
+            coordinator_storage,
+            local_state_by_partition: Arc::new(local_state_by_partition),
+            storage_by_partition: Arc::new(storage_by_partition),
+            next_poll_index: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    async fn poll_bulk_activity_tasks(
+        &self,
+        request: PollBulkActivityTaskRequest,
+    ) -> Result<PollBulkActivityTaskResponse, Status> {
+        if self.handles.is_empty() {
+            return Ok(PollBulkActivityTaskResponse { tasks: Vec::new() });
+        }
+        let shard_count = self.handles.len();
+        let start = self.next_poll_index.fetch_add(1, Ordering::Relaxed) % shard_count;
+        let poll_started_at = tokio::time::Instant::now();
+        let poll_timeout = Duration::from_millis(request.poll_timeout_ms.max(1));
+        for offset in 0..shard_count {
+            let elapsed = poll_started_at.elapsed();
+            if elapsed >= poll_timeout {
+                break;
+            }
+            let remaining = poll_timeout.saturating_sub(elapsed);
+            let shards_left = shard_count.saturating_sub(offset);
+            let slice_ms = if shards_left <= 1 {
+                remaining.as_millis()
+            } else {
+                (remaining.as_millis() / u128::try_from(shards_left).unwrap_or(1)).max(1)
+            };
+            let mut shard_request = request.clone();
+            shard_request.poll_timeout_ms = u64::try_from(slice_ms).unwrap_or(u64::MAX);
+            let handle = &self.handles[(start + offset) % shard_count];
+            let response = handle.poll_bulk_activity_tasks(shard_request).await?;
+            if !response.tasks.is_empty() {
+                return Ok(response);
+            }
+        }
+        Ok(PollBulkActivityTaskResponse { tasks: Vec::new() })
+    }
+
+    async fn apply_report_batch(
+        &self,
+        report_batch: Vec<ThroughputChunkReport>,
+        capture_report_log: bool,
+        throughput_partitions: i32,
+    ) -> Result<()> {
+        let mut batches_by_partition = HashMap::<i32, Vec<ThroughputChunkReport>>::new();
+        for report in report_batch {
+            let partition_id = throughput_partition_for_batch(
+                &report.batch_id,
+                report.group_id,
+                throughput_partitions,
+            );
+            batches_by_partition.entry(partition_id).or_default().push(report);
+        }
+        let mut partition_ids = batches_by_partition.keys().copied().collect::<Vec<_>>();
+        partition_ids.sort_unstable();
+        for partition_id in partition_ids {
+            let Some(handle) = self.handles_by_partition.get(&partition_id) else {
+                anyhow::bail!("no shard worker configured for throughput partition {partition_id}");
+            };
+            if let Some(batch) = batches_by_partition.remove(&partition_id) {
+                handle.apply_report_batch(batch, capture_report_log).await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn handles(&self) -> &[ShardWorkerHandle] {
+        &self.handles
+    }
+
+    fn coordinator_storage(&self) -> &LocalThroughputCoordinatorPaths {
+        &self.coordinator_storage
+    }
+
+    fn local_state_for_partition(&self, partition_id: i32) -> Option<&LocalThroughputState> {
+        self.local_state_by_partition.get(&partition_id)
+    }
+
+    fn storage_paths(&self) -> impl Iterator<Item = &LocalThroughputShardPaths> {
+        self.storage_by_partition.values()
+    }
+
+    fn sync_batch_chunks(
+        &self,
+        batch: &WorkflowBulkBatchRecord,
+        chunks: &[WorkflowBulkChunkRecord],
+        throughput_partitions: i32,
+    ) -> Result<()> {
+        let mut chunks_by_partition = HashMap::<i32, Vec<WorkflowBulkChunkRecord>>::new();
+        for chunk in chunks {
+            let partition_id = throughput_partition_for_batch(
+                &chunk.batch_id,
+                chunk.group_id,
+                throughput_partitions,
+            );
+            chunks_by_partition.entry(partition_id).or_default().push(chunk.clone());
+        }
+        for (partition_id, partition_chunks) in chunks_by_partition {
+            let Some(local_state) = self.local_state_for_partition(partition_id) else {
+                anyhow::bail!("missing shard-local state for throughput partition {partition_id}");
+            };
+            local_state.upsert_batch_with_chunks(batch, &partition_chunks)?;
+        }
+        Ok(())
+    }
+
+    async fn run_expired_chunk_sweep_once(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        limit_per_shard: usize,
+    ) -> Result<usize> {
+        let mut requeued = 0usize;
+        for handle in &self.handles {
+            requeued = requeued
+                .saturating_add(handle.run_expired_chunk_sweep_once(now, limit_per_shard).await?);
+        }
+        Ok(requeued)
+    }
+}
+
+async fn run_shard_worker_loop(
+    shard_worker: ShardWorker,
+    mut command_rx: mpsc::Receiver<ShardWorkerCommand>,
+) {
+    while let Some(command) = command_rx.recv().await {
+        match command {
+            ShardWorkerCommand::PollBulkActivityTasks { request, respond_to } => {
+                let _ = respond_to.send(shard_worker.poll_bulk_activity_tasks(request).await);
+            }
+            ShardWorkerCommand::ApplyReportBatch {
+                report_batch,
+                capture_report_log,
+                respond_to,
+            } => {
+                let _ = respond_to
+                    .send(shard_worker.apply_report_batch(&report_batch, capture_report_log).await);
+            }
+            ShardWorkerCommand::RunLocalBenchmarkFastlaneOnce {
+                batch_limit,
+                lease_ttl,
+                max_chunks,
+                respond_to,
+            } => {
+                let _ = respond_to.send(
+                    shard_worker
+                        .run_local_benchmark_fastlane_once(batch_limit, lease_ttl, max_chunks)
+                        .await,
+                );
+            }
+            ShardWorkerCommand::RunExpiredChunkSweepOnce { now, limit, respond_to } => {
+                let _ =
+                    respond_to.send(shard_worker.run_expired_chunk_sweep_once(now, limit).await);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -259,6 +635,17 @@ struct StrongChunksResponse {
     chunks: Vec<WorkflowBulkChunkRecord>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StrongStreamJobViewResponse {
+    handle_id: String,
+    job_id: String,
+    view_name: String,
+    logical_key: String,
+    output: Value,
+    checkpoint_sequence: i64,
+    updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone)]
 struct ChunkTerminalArtifacts {
     result_handle: Option<Value>,
@@ -276,6 +663,27 @@ struct StreamProjectionRecord {
 struct StreamChangelogRecord {
     key: String,
     entry: ThroughputChangelogEntry,
+}
+
+#[derive(Debug, Clone)]
+struct AcceptedReportApply {
+    report: ThroughputChunkReport,
+    identity: ThroughputBatchIdentity,
+    projected: ProjectedTerminalApply,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PreparedReportBatchApply {
+    accepted_reports: Vec<AcceptedReportApply>,
+    result_segments: Vec<ThroughputResultSegmentRecord>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PreparedLeaseBatch {
+    leased_tasks: Vec<BulkActivityTask>,
+    projection_records: Vec<StreamProjectionRecord>,
+    changelog_records: Vec<StreamChangelogRecord>,
+    skipped_projection_events: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,7 +771,7 @@ async fn main() -> Result<()> {
 
     let store = WorkflowStore::connect(&postgres.url).await?;
     store.init().await?;
-    let local_state = LocalThroughputState::open(
+    let local_state = LocalThroughputState::open_coordinator(
         &runtime.local_state_dir,
         &runtime.checkpoint_dir,
         runtime.checkpoint_retention,
@@ -406,6 +814,7 @@ async fn main() -> Result<()> {
     let bulk_notify = Arc::new(Notify::new());
     let outbox_notify = Arc::new(Notify::new());
     let debug = Arc::new(StdMutex::new(ThroughputDebugState::default()));
+    let shard_workers = Arc::new(OnceLock::new());
     let payload_store = PayloadStore::from_config(build_payload_store_config(&runtime)).await?;
     let activity_capability_registry =
         Arc::new(load_activity_capability_registry_from_env("FABRIK_WORKER_PACKAGES_DIR")?);
@@ -427,7 +836,9 @@ async fn main() -> Result<()> {
     }));
     let state = AppState {
         store,
+        aggregation: AggregationCoordinator::new(local_state.clone()),
         local_state,
+        shard_workers: shard_workers.clone(),
         workflow_publisher,
         changelog_publisher,
         projection_publisher,
@@ -457,6 +868,23 @@ async fn main() -> Result<()> {
     } else {
         restore_local_state_from_changelog(&state, &changelog_config, true).await?;
     }
+    let shard_workers = ShardWorkerPool::new(state.clone(), &managed_partitions);
+    let _ = state.shard_workers.set(shard_workers.clone());
+    let coordinator_storage = shard_workers.coordinator_storage();
+    info!(
+        db_path = %coordinator_storage.db_path.display(),
+        checkpoint_dir = %coordinator_storage.checkpoint_dir.display(),
+        "streams-runtime coordinator RocksDB layout"
+    );
+    for shard_storage in shard_workers.storage_paths() {
+        info!(
+            throughput_partition_id = shard_storage.throughput_partition_id,
+            db_path = %shard_storage.db_path.display(),
+            checkpoint_dir = %shard_storage.checkpoint_dir.display(),
+            "streams-runtime planned shard-local RocksDB layout"
+        );
+    }
+    seed_partition_shard_local_states_from_coordinator(&state, &shard_workers)?;
     let ownership_replay_timeout =
         Duration::from_secs(u64::from(ownership_config.lease_ttl_seconds.max(1)).saturating_mul(2));
     let debug_base_url = format!("http://127.0.0.1:{}", debug_config.port);
@@ -470,7 +898,7 @@ async fn main() -> Result<()> {
             ownership_config.clone(),
         );
         wait_for_owned_partitions(&state, &managed_partitions, ownership_replay_timeout).await?;
-        replay_report_log_tail(&state).await?;
+        replay_report_log_tail(&state, &shard_workers).await?;
     }
 
     let command_consumer = build_json_consumer(
@@ -505,7 +933,13 @@ async fn main() -> Result<()> {
     }
     tokio::spawn(run_outbox_publisher(state.clone()));
     tokio::spawn(run_bulk_requeue_sweep(state.clone()));
-    tokio::spawn(run_local_benchmark_fastlane_loop(state.clone()));
+    for shard_worker in shard_workers.handles().iter().cloned() {
+        tokio::spawn(run_local_benchmark_fastlane_loop(
+            shard_worker,
+            state.runtime.clone(),
+            state.bulk_notify.clone(),
+        ));
+    }
     let debug_app = default_router::<AppState>(ServiceInfo::new(
         debug_config.name,
         STREAMS_RUNTIME_DEBUG_SERVICE_NAME,
@@ -517,6 +951,7 @@ async fn main() -> Result<()> {
     .route(LEGACY_THROUGHPUT_DEBUG_BATCH_ROUTE, get(get_strong_batch_snapshot))
     .route(STREAMS_RUNTIME_DEBUG_CHUNKS_ROUTE, get(get_strong_chunk_snapshots))
     .route(LEGACY_THROUGHPUT_DEBUG_CHUNKS_ROUTE, get(get_strong_chunk_snapshots))
+    .route(STREAMS_RUNTIME_DEBUG_STREAM_JOB_VIEW_ROUTE, get(get_strong_stream_job_view))
     .with_state(state.clone());
     tokio::spawn(async move {
         if let Err(error) = serve(debug_app, debug_config.port).await {
@@ -527,7 +962,10 @@ async fn main() -> Result<()> {
     let addr = format!("0.0.0.0:{}", config.port).parse()?;
     info!(%addr, "streams-runtime listening");
     Server::builder()
-        .add_service(ActivityWorkerApiServer::new(WorkerApi { state }))
+        .add_service(ActivityWorkerApiServer::new(WorkerApi {
+            state: state.clone(),
+            shard_workers,
+        }))
         .serve(addr)
         .await?;
     Ok(())
@@ -542,6 +980,44 @@ async fn get_strong_batch_snapshot(
         .map_err(internal_http_error)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("bulk batch {batch_id} not found")))?;
     Ok(Json(StrongBatchResponse { batch }))
+}
+
+async fn get_strong_stream_job_view(
+    Path((tenant_id, instance_id, run_id, job_id, view_name, logical_key)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+    AxumState(state): AxumState<AppState>,
+) -> Result<Json<StrongStreamJobViewResponse>, (StatusCode, String)> {
+    let handle = state
+        .store
+        .get_stream_job_bridge_handle(&tenant_id, &instance_id, &run_id, &job_id)
+        .await
+        .map_err(internal_http_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("stream job {job_id} not found")))?;
+    let view = state
+        .local_state
+        .load_stream_job_view_state(&handle.handle_id, &view_name, &logical_key)
+        .map_err(internal_http_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("stream job view {view_name} key {logical_key} not found"),
+            )
+        })?;
+    Ok(Json(StrongStreamJobViewResponse {
+        handle_id: view.handle_id,
+        job_id: view.job_id,
+        view_name: view.view_name,
+        logical_key: view.logical_key,
+        output: view.output,
+        checkpoint_sequence: view.checkpoint_sequence,
+        updated_at: view.updated_at,
+    }))
 }
 
 async fn get_debug_snapshot(
@@ -950,6 +1426,46 @@ async fn restore_state_from_checkpoint(state: &AppState) -> Result<bool> {
     state.local_state.restore_from_latest_checkpoint_if_empty()
 }
 
+fn seed_partition_shard_local_states_from_coordinator(
+    state: &AppState,
+    shard_workers: &ShardWorkerPool,
+) -> Result<()> {
+    for shard_storage in shard_workers.storage_paths() {
+        let checkpoint = state.local_state.snapshot_partition_checkpoint_value(
+            shard_storage.throughput_partition_id,
+            state.throughput_partitions,
+        )?;
+        let shard_state = shard_workers
+            .local_state_for_partition(shard_storage.throughput_partition_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "missing shard-local state for throughput partition {}",
+                    shard_storage.throughput_partition_id
+                )
+            })?;
+        let restored = shard_state.restore_from_checkpoint_value_if_empty(checkpoint)?;
+        info!(
+            throughput_partition_id = shard_storage.throughput_partition_id,
+            restored,
+            db_path = %shard_storage.db_path.display(),
+            checkpoint_dir = %shard_storage.checkpoint_dir.display(),
+            "streams-runtime hydrated shard-local RocksDB from coordinator checkpoint"
+        );
+    }
+    Ok(())
+}
+
+fn sync_batch_chunks_to_partition_shards(
+    state: &AppState,
+    batch: &WorkflowBulkBatchRecord,
+    chunks: &[WorkflowBulkChunkRecord],
+) -> Result<()> {
+    let Some(shard_workers) = state.shard_workers.get() else {
+        return Ok(());
+    };
+    shard_workers.sync_batch_chunks(batch, chunks, state.throughput_partitions)
+}
+
 async fn load_latest_checkpoint_value(state: &AppState) -> Result<Option<serde_json::Value>> {
     let latest_key = checkpoint_latest_pointer_key(&state.runtime.checkpoint_key_prefix);
     let latest_handle = PayloadHandle::Manifest {
@@ -1000,7 +1516,7 @@ async fn write_remote_checkpoint(state: &AppState) -> Result<()> {
     Ok(())
 }
 
-async fn replay_report_log_tail(state: &AppState) -> Result<()> {
+async fn replay_report_log_tail(state: &AppState, shard_workers: &ShardWorkerPool) -> Result<()> {
     let mut captured_after = state.local_state.debug_snapshot()?.last_checkpoint_at;
     let page_size = state.runtime.report_apply_batch_size.max(1).saturating_mul(32);
     loop {
@@ -1011,7 +1527,7 @@ async fn replay_report_log_tail(state: &AppState) -> Result<()> {
         }
         for report_batch in entries.chunks(state.runtime.report_apply_batch_size.max(1)) {
             let reports = report_batch.iter().map(|entry| entry.report.clone()).collect::<Vec<_>>();
-            apply_throughput_report_batch(state, &reports, false).await?;
+            shard_workers.apply_report_batch(reports, false, state.throughput_partitions).await?;
         }
         captured_after = entries.last().map(|entry| entry.captured_at);
         if entries.len() < page_size {
@@ -1114,38 +1630,9 @@ fn throughput_partition_for_batch(batch_id: &str, group_id: u32, partition_count
     partition_for_key(&throughput_partition_key(batch_id, group_id), partition_count)
 }
 
-fn local_terminal_projection_batch_update(
-    local_state: &LocalThroughputState,
-    batch: &local_state::LocalBatchSnapshot,
-) -> Result<Option<ThroughputProjectionBatchStateUpdate>> {
-    if !matches!(batch.status.as_str(), "completed" | "failed" | "cancelled") {
-        return Ok(None);
-    }
-    let terminal_at = batch.terminal_at.unwrap_or(batch.updated_at);
-    let reducer_output = if batch.status == WorkflowBulkBatchStatus::Completed.as_str() {
-        local_state.reduce_batch_success_outputs_after_report(&batch.identity, None)?
-    } else {
-        None
-    };
-    Ok(Some(ThroughputProjectionBatchStateUpdate {
-        tenant_id: batch.identity.tenant_id.clone(),
-        instance_id: batch.identity.instance_id.clone(),
-        run_id: batch.identity.run_id.clone(),
-        batch_id: batch.identity.batch_id.clone(),
-        status: batch.status.clone(),
-        succeeded_items: batch.succeeded_items,
-        failed_items: batch.failed_items,
-        cancelled_items: batch.cancelled_items,
-        error: batch.error.clone(),
-        reducer_output: reducer_output.or_else(|| batch.reducer_output.clone()),
-        terminal_at: Some(terminal_at),
-        updated_at: batch.updated_at.max(terminal_at),
-    }))
-}
-
 async fn repair_stale_terminal_projection_batches_in_store(
     store: &WorkflowStore,
-    local_state: &LocalThroughputState,
+    aggregation: &AggregationCoordinator,
     owned_partitions: &HashSet<i32>,
     throughput_partitions: i32,
 ) -> Result<usize> {
@@ -1168,11 +1655,10 @@ async fn repair_stale_terminal_projection_batches_in_store(
             run_id: batch.run_id.clone(),
             batch_id: batch.batch_id.clone(),
         };
-        let Some(local_batch) = local_state.batch_snapshot(&identity)? else {
+        let Some(local_batch) = aggregation.batch_snapshot(&identity)? else {
             continue;
         };
-        let Some(update) = local_terminal_projection_batch_update(local_state, &local_batch)?
-        else {
+        let Some(update) = aggregation.local_terminal_projection_batch_update(&local_batch)? else {
             continue;
         };
         updates.push(update);
@@ -1190,7 +1676,7 @@ async fn repair_stale_terminal_projection_batches(
 ) -> Result<usize> {
     let repaired = repair_stale_terminal_projection_batches_in_store(
         &state.store,
-        &state.local_state,
+        &state.aggregation,
         owned_partitions,
         state.throughput_partitions,
     )
@@ -1321,7 +1807,7 @@ async fn load_owner_batch_record(
         run_id: run_id.to_owned(),
         batch_id: batch_id.to_owned(),
     };
-    if let Some(snapshot) = state.local_state.batch_snapshot(&identity)? {
+    if let Some(snapshot) = state.aggregation.batch_snapshot(&identity)? {
         batch.status = parse_bulk_batch_status(&snapshot.status)?;
         batch.succeeded_items = snapshot.succeeded_items;
         batch.failed_items = snapshot.failed_items;
@@ -1331,7 +1817,7 @@ async fn load_owner_batch_record(
         batch.terminal_at = snapshot.terminal_at;
     }
     batch.reducer_output =
-        state.local_state.reduce_batch_success_outputs_after_report(&identity, None)?;
+        state.aggregation.reducer_output_after_report(&identity, batch.reducer.as_deref(), None)?;
     Ok(Some(batch))
 }
 
@@ -1488,6 +1974,14 @@ async fn run_bulk_requeue_sweep(state: AppState) {
     let interval = Duration::from_millis(state.runtime.sweep_interval_ms.max(1));
     loop {
         tokio::time::sleep(interval).await;
+        if let Some(shard_workers) = state.shard_workers.get() {
+            match shard_workers.run_expired_chunk_sweep_once(Utc::now(), 10_000).await {
+                Ok(_) => continue,
+                Err(error) => {
+                    error!(error = %error, "streams-runtime shard-local expired chunk sweep failed");
+                }
+            }
+        }
         let owned = owned_throughput_partitions(&state);
         if owned.is_empty() {
             continue;
@@ -1541,72 +2035,706 @@ async fn run_bulk_requeue_sweep(state: AppState) {
     }
 }
 
-async fn run_local_benchmark_fastlane_loop(state: AppState) {
+async fn run_local_benchmark_fastlane_loop(
+    shard_worker: ShardWorkerHandle,
+    runtime: ThroughputRuntimeConfig,
+    bulk_notify: Arc<Notify>,
+) {
     let idle_wait = Duration::from_millis(50);
-    let batch_limit = (state.runtime.max_active_chunks_per_batch > 0)
-        .then_some(state.runtime.max_active_chunks_per_batch);
-    let lease_ttl = chrono::Duration::seconds(state.runtime.lease_ttl_seconds as i64);
-    let max_chunks = state
-        .runtime
+    let batch_limit =
+        (runtime.max_active_chunks_per_batch > 0).then_some(runtime.max_active_chunks_per_batch);
+    let lease_ttl = chrono::Duration::seconds(runtime.lease_ttl_seconds as i64);
+    let max_chunks = runtime
         .report_apply_batch_size
-        .max(state.runtime.poll_max_tasks)
+        .max(runtime.poll_max_tasks)
         .max(LOCAL_BENCHMARK_FASTLANE_BATCH_SIZE);
     loop {
-        match run_local_benchmark_fastlane_once(&state, batch_limit, lease_ttl, max_chunks).await {
+        match shard_worker
+            .run_local_benchmark_fastlane_once(batch_limit, lease_ttl, max_chunks)
+            .await
+        {
             Ok(0) => {
-                let _ = tokio::time::timeout(idle_wait, state.bulk_notify.notified()).await;
+                let _ = tokio::time::timeout(idle_wait, bulk_notify.notified()).await;
             }
             Ok(_) => tokio::task::yield_now().await,
             Err(error) => {
                 error!(error = %error, "streams-runtime local benchmark fastlane failed");
-                let _ = tokio::time::timeout(idle_wait, state.bulk_notify.notified()).await;
+                let _ = tokio::time::timeout(idle_wait, bulk_notify.notified()).await;
             }
         }
     }
 }
 
-async fn run_local_benchmark_fastlane_once(
-    state: &AppState,
-    batch_limit: Option<usize>,
-    lease_ttl: chrono::Duration,
-    max_chunks: usize,
-) -> Result<usize> {
-    let owned = owned_throughput_partitions(state);
-    if owned.is_empty() {
-        return Ok(0);
+impl ShardWorker {
+    async fn run_expired_chunk_sweep_once(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+    ) -> Result<usize> {
+        let owned = self.owned_partitions();
+        if owned.is_empty() {
+            return Ok(0);
+        }
+        let expired = self.scheduling_state.expired_started_chunks(
+            now,
+            limit,
+            Some(&owned),
+            self.state.throughput_partitions,
+        )?;
+        let mut requeued = 0usize;
+        for chunk in expired {
+            let projected = match self.scheduling_state.project_requeue(
+                &chunk.identity,
+                &chunk.chunk_id,
+                now,
+            )? {
+                Some(projected) => projected,
+                None => continue,
+            };
+            let entry = changelog_entry(
+                throughput_partition_key(&chunk.identity.batch_id, projected.group_id),
+                ThroughputChangelogPayload::ChunkRequeued {
+                    identity: chunk.identity.clone(),
+                    chunk_id: projected.chunk_id.clone(),
+                    chunk_index: projected.chunk_index,
+                    attempt: projected.attempt,
+                    group_id: projected.group_id,
+                    item_count: projected.item_count,
+                    max_attempts: projected.max_attempts,
+                    retry_delay_ms: projected.retry_delay_ms,
+                    lease_epoch: projected.lease_epoch,
+                    owner_epoch: projected.owner_epoch,
+                    available_at: projected.available_at,
+                },
+            );
+            self.state.local_state.mirror_changelog_entry(&entry)?;
+            self.mirror_scheduling_changelog_records(std::slice::from_ref(&entry))?;
+            if !self.state.runtime.owner_first_apply {
+                publish_changelog_records(
+                    &self.state,
+                    vec![StreamChangelogRecord { key: entry.partition_key.clone(), entry }],
+                )
+                .await;
+            }
+            self.state.bulk_notify.notify_waiters();
+            requeued = requeued.saturating_add(1);
+        }
+        Ok(requeued)
     }
-    let leased = state.local_state.lease_ready_chunks_matching(
-        LOCAL_BENCHMARK_FASTLANE_WORKER_ID,
-        Utc::now(),
-        lease_ttl,
-        batch_limit,
-        &HashSet::new(),
-        Some(&owned),
-        state.throughput_partitions,
-        max_chunks,
-        |chunk| is_local_fastlane_chunk(state, chunk),
-    )?;
-    if leased.is_empty() {
-        return Ok(0);
+
+    async fn run_local_benchmark_fastlane_once(
+        &self,
+        batch_limit: Option<usize>,
+        lease_ttl: chrono::Duration,
+        max_chunks: usize,
+    ) -> Result<usize> {
+        let owned = self.owned_partitions();
+        if owned.is_empty() {
+            return Ok(0);
+        }
+        let leased = self.scheduling_state.lease_ready_chunks_matching(
+            LOCAL_BENCHMARK_FASTLANE_WORKER_ID,
+            Utc::now(),
+            lease_ttl,
+            batch_limit,
+            &HashSet::new(),
+            Some(&owned),
+            self.state.throughput_partitions,
+            max_chunks,
+            |chunk| is_local_fastlane_chunk(&self.state, chunk),
+        )?;
+        if leased.is_empty() {
+            return Ok(0);
+        }
+        let mut reports = Vec::with_capacity(leased.len());
+        for chunk in leased {
+            reports.push(execute_local_fastlane_chunk(&self.state, chunk).await?);
+        }
+        {
+            let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
+            debug.local_fastlane_batches_applied =
+                debug.local_fastlane_batches_applied.saturating_add(1);
+            debug.local_fastlane_chunks_completed =
+                debug.local_fastlane_chunks_completed.saturating_add(reports.len() as u64);
+            debug.report_batches_applied = debug.report_batches_applied.saturating_add(1);
+            debug.report_batch_items_total =
+                debug.report_batch_items_total.saturating_add(reports.len() as u64);
+            debug.reports_received = debug.reports_received.saturating_add(reports.len() as u64);
+            debug.last_report_at = Some(Utc::now());
+        }
+        self.apply_report_batch(&reports, true).await?;
+        Ok(reports.len())
     }
-    let mut reports = Vec::with_capacity(leased.len());
-    for chunk in leased {
-        reports.push(execute_local_fastlane_chunk(state, chunk).await?);
+
+    async fn poll_bulk_activity_tasks(
+        &self,
+        request: PollBulkActivityTaskRequest,
+    ) -> Result<PollBulkActivityTaskResponse, Status> {
+        let max_tasks = usize::try_from(request.max_tasks.max(1))
+            .unwrap_or(1)
+            .min(self.state.runtime.poll_max_tasks.max(1));
+        {
+            let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
+            debug.poll_requests = debug.poll_requests.saturating_add(1);
+            debug.poll_responses = debug.poll_responses.saturating_add(1);
+        }
+        let batch_limit = (self.state.runtime.max_active_chunks_per_batch > 0)
+            .then_some(self.state.runtime.max_active_chunks_per_batch);
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_millis(request.poll_timeout_ms.max(1));
+        loop {
+            let owned = self.owned_partitions();
+            if owned.is_empty() {
+                if !self.wait_for_bulk_work(deadline).await {
+                    return Ok(Self::empty_poll_bulk_activity_task_response());
+                }
+                continue;
+            }
+            let queue_control = self
+                .state
+                .store
+                .get_task_queue_runtime_control(
+                    &request.tenant_id,
+                    TaskQueueKind::Activity,
+                    &request.task_queue,
+                )
+                .await
+                .map_err(internal_status)?;
+            if let Some(control) = queue_control.as_ref() {
+                if control.is_paused {
+                    record_throttle(&self.state, "queue_paused");
+                    if !self.wait_for_bulk_work(deadline).await {
+                        return Ok(Self::empty_poll_bulk_activity_task_response());
+                    }
+                    continue;
+                }
+                if control.is_draining {
+                    record_throttle(&self.state, "queue_draining");
+                    if !self.wait_for_bulk_work(deadline).await {
+                        return Ok(Self::empty_poll_bulk_activity_task_response());
+                    }
+                    continue;
+                }
+            }
+            let paused_batch_ids = self
+                .state
+                .store
+                .list_paused_bulk_batch_ids_for_task_queue(&request.tenant_id, &request.task_queue)
+                .await
+                .map_err(internal_status)?
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let tenant_active = self
+                .scheduling_state
+                .count_started_chunks(
+                    Some(&request.tenant_id),
+                    None,
+                    None,
+                    Some(&owned),
+                    self.state.throughput_partitions,
+                )
+                .map_err(internal_status)?;
+            if self.state.runtime.max_active_chunks_per_tenant > 0
+                && tenant_active
+                    >= u64::try_from(self.state.runtime.max_active_chunks_per_tenant)
+                        .map_err(|_| Status::internal("tenant chunk cap exceeds u64"))?
+            {
+                record_throttle(&self.state, "tenant_cap");
+                if !self.wait_for_bulk_work(deadline).await {
+                    return Ok(Self::empty_poll_bulk_activity_task_response());
+                }
+                continue;
+            }
+            let queue_active = self
+                .scheduling_state
+                .count_started_chunks(
+                    Some(&request.tenant_id),
+                    Some(&request.task_queue),
+                    None,
+                    Some(&owned),
+                    self.state.throughput_partitions,
+                )
+                .map_err(internal_status)?;
+            if self.state.runtime.max_active_chunks_per_task_queue > 0
+                && queue_active
+                    >= u64::try_from(self.state.runtime.max_active_chunks_per_task_queue)
+                        .map_err(|_| Status::internal("task queue chunk cap exceeds u64"))?
+            {
+                record_throttle(&self.state, "task_queue_cap");
+                if !self.wait_for_bulk_work(deadline).await {
+                    return Ok(Self::empty_poll_bulk_activity_task_response());
+                }
+                continue;
+            }
+            if let Some(prepared) = self
+                .prepare_leased_task_batch(
+                    &request,
+                    &owned,
+                    &paused_batch_ids,
+                    batch_limit,
+                    max_tasks,
+                )
+                .await?
+            {
+                return Ok(self.publish_leased_task_batch(prepared).await);
+            }
+            {
+                let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
+                debug.empty_polls = debug.empty_polls.saturating_add(1);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let lease_selection_debug = self
+                    .scheduling_state
+                    .debug_lease_selection(
+                        &request.tenant_id,
+                        &request.task_queue,
+                        Utc::now(),
+                        batch_limit,
+                        &paused_batch_ids,
+                        Some(&owned),
+                        self.state.throughput_partitions,
+                    )
+                    .map_err(internal_status)?;
+                if batch_limit.is_some() && lease_selection_debug.batch_cap_blocked > 0 {
+                    record_throttle(&self.state, "batch_cap");
+                    let mut debug =
+                        self.state.debug.lock().expect("throughput debug lock poisoned");
+                    debug.lease_misses_with_ready_chunks =
+                        debug.lease_misses_with_ready_chunks.saturating_add(1);
+                    debug.last_lease_miss_with_ready_chunks_at = Some(Utc::now());
+                    debug.last_lease_selection_debug =
+                        serde_json::to_value(lease_selection_debug).ok();
+                } else if lease_selection_debug.batch_paused > 0 {
+                    record_throttle(&self.state, "batch_paused");
+                    let mut debug =
+                        self.state.debug.lock().expect("throughput debug lock poisoned");
+                    debug.last_lease_selection_debug =
+                        serde_json::to_value(lease_selection_debug).ok();
+                } else {
+                    let mut debug =
+                        self.state.debug.lock().expect("throughput debug lock poisoned");
+                    debug.last_lease_selection_debug =
+                        serde_json::to_value(lease_selection_debug).ok();
+                }
+                return Ok(Self::empty_poll_bulk_activity_task_response());
+            }
+            if !self.wait_for_bulk_work(deadline).await {
+                return Ok(Self::empty_poll_bulk_activity_task_response());
+            }
+        }
     }
-    {
-        let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
-        debug.local_fastlane_batches_applied =
-            debug.local_fastlane_batches_applied.saturating_add(1);
-        debug.local_fastlane_chunks_completed =
-            debug.local_fastlane_chunks_completed.saturating_add(reports.len() as u64);
-        debug.report_batches_applied = debug.report_batches_applied.saturating_add(1);
-        debug.report_batch_items_total =
-            debug.report_batch_items_total.saturating_add(reports.len() as u64);
-        debug.reports_received = debug.reports_received.saturating_add(reports.len() as u64);
-        debug.last_report_at = Some(Utc::now());
+
+    async fn prepare_leased_task_batch(
+        &self,
+        request: &PollBulkActivityTaskRequest,
+        owned: &HashSet<i32>,
+        paused_batch_ids: &HashSet<String>,
+        batch_limit: Option<usize>,
+        max_tasks: usize,
+    ) -> Result<Option<PreparedLeaseBatch>, Status> {
+        let now = Utc::now();
+        let leased_local = self
+            .scheduling_state
+            .lease_ready_chunks(
+                &request.tenant_id,
+                &request.task_queue,
+                &request.worker_id,
+                now,
+                chrono::Duration::seconds(self.state.runtime.lease_ttl_seconds as i64),
+                batch_limit,
+                paused_batch_ids,
+                Some(owned),
+                self.state.throughput_partitions,
+                max_tasks,
+            )
+            .map_err(internal_status)?;
+        if leased_local.is_empty() {
+            return Ok(None);
+        }
+
+        let mut prepared = PreparedLeaseBatch {
+            leased_tasks: Vec::with_capacity(leased_local.len()),
+            projection_records: Vec::with_capacity(max_tasks * 2),
+            changelog_records: Vec::with_capacity(max_tasks),
+            skipped_projection_events: 0,
+        };
+        for leased_local in leased_local {
+            let leased =
+                leased_snapshot_to_projection_chunk(&leased_local, &request.worker_build_id)
+                    .map_err(internal_status)?;
+            let identity = batch_identity(&leased);
+            if let Some(batch) = self
+                .scheduling_state
+                .project_batch_running(&identity, leased.updated_at)
+                .map_err(internal_status)?
+            {
+                if self.state.runtime.publish_transient_projection_updates {
+                    prepared.projection_records.push(running_batch_projection_record(&batch));
+                } else {
+                    prepared.skipped_projection_events =
+                        prepared.skipped_projection_events.saturating_add(1);
+                }
+            }
+            if self.state.runtime.publish_transient_projection_updates {
+                prepared.projection_records.push(leased_chunk_projection_record(&leased));
+            } else {
+                prepared.skipped_projection_events =
+                    prepared.skipped_projection_events.saturating_add(1);
+            }
+            if !self.state.runtime.owner_first_apply {
+                prepared.changelog_records.push(changelog_record(
+                    throughput_partition_key(&leased.batch_id, leased.group_id),
+                    ThroughputChangelogPayload::ChunkLeased {
+                        identity,
+                        chunk_id: leased.chunk_id.clone(),
+                        chunk_index: leased.chunk_index,
+                        attempt: leased.attempt,
+                        group_id: leased.group_id,
+                        item_count: leased.item_count,
+                        max_attempts: leased.max_attempts,
+                        retry_delay_ms: leased.retry_delay_ms,
+                        lease_epoch: leased.lease_epoch,
+                        owner_epoch: leased.owner_epoch,
+                        worker_id: request.worker_id.clone(),
+                        lease_token: leased
+                            .lease_token
+                            .map(|value| value.to_string())
+                            .unwrap_or_default(),
+                        lease_expires_at: leased.lease_expires_at.unwrap_or_else(Utc::now),
+                    },
+                ));
+            }
+            prepared.leased_tasks.push(bulk_chunk_to_proto(
+                &leased_local,
+                request.supports_cbor,
+                self.state.runtime.inline_chunk_input_threshold_bytes,
+            ));
+        }
+        Ok(Some(prepared))
     }
-    apply_throughput_report_batch(state, &reports, true).await?;
-    Ok(reports.len())
+
+    async fn publish_leased_task_batch(
+        &self,
+        prepared: PreparedLeaseBatch,
+    ) -> PollBulkActivityTaskResponse {
+        let PreparedLeaseBatch {
+            leased_tasks,
+            projection_records,
+            changelog_records,
+            skipped_projection_events,
+        } = prepared;
+
+        if let Err(error) = publish_projection_records(&self.state, projection_records).await {
+            error!(error = %error, "failed to sync leased stream-v2 projection state");
+        }
+        let scheduling_entries =
+            changelog_records.iter().map(|record| record.entry.clone()).collect::<Vec<_>>();
+        if let Err(error) = self.state.local_state.mirror_changelog_records(&scheduling_entries) {
+            self.state.local_state.record_changelog_apply_failure();
+            error!(error = %error, "failed to mirror leased stream-v2 coordinator state");
+        }
+        if let Err(error) = self.mirror_scheduling_changelog_records(&scheduling_entries) {
+            error!(error = %error, "failed to mirror leased stream-v2 scheduling state");
+        }
+        if !self.state.runtime.owner_first_apply {
+            publish_changelog_records(&self.state, changelog_records).await;
+        }
+        {
+            let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
+            debug.projection_events_skipped =
+                debug.projection_events_skipped.saturating_add(skipped_projection_events);
+            debug.leased_tasks = debug.leased_tasks.saturating_add(leased_tasks.len() as u64);
+        }
+        PollBulkActivityTaskResponse { tasks: leased_tasks }
+    }
+
+    async fn wait_for_bulk_work(&self, deadline: tokio::time::Instant) -> bool {
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::timeout(remaining, self.state.bulk_notify.notified()).await.is_ok()
+    }
+
+    fn empty_poll_bulk_activity_task_response() -> PollBulkActivityTaskResponse {
+        PollBulkActivityTaskResponse { tasks: Vec::new() }
+    }
+
+    async fn apply_report_batch(
+        &self,
+        report_batch: &[ThroughputChunkReport],
+        capture_report_log: bool,
+    ) -> Result<()> {
+        let prepared = self.prepare_report_batch(report_batch).await?;
+        if !prepared.result_segments.is_empty() {
+            self.state.store.upsert_throughput_result_segments(&prepared.result_segments).await?;
+        }
+        if capture_report_log && self.state.runtime.owner_first_apply {
+            let captured = prepared
+                .accepted_reports
+                .iter()
+                .map(|accepted| accepted.report.clone())
+                .collect::<Vec<_>>();
+            self.state.store.append_throughput_report_log_entries(&captured, Utc::now()).await?;
+        }
+        self.publish_applied_report_batch(prepared.accepted_reports).await
+    }
+
+    async fn prepare_report_batch(
+        &self,
+        report_batch: &[ThroughputChunkReport],
+    ) -> Result<PreparedReportBatchApply> {
+        let mut prepared = PreparedReportBatchApply {
+            accepted_reports: Vec::with_capacity(report_batch.len()),
+            result_segments: Vec::new(),
+        };
+        for report in report_batch {
+            let throughput_partition_id = throughput_partition_for_batch(
+                &report.batch_id,
+                report.group_id,
+                self.state.throughput_partitions,
+            );
+            if !owns_throughput_partition(&self.state, throughput_partition_id) {
+                anyhow::bail!(
+                    "throughput partition {} is not owned by this runtime",
+                    throughput_partition_id
+                );
+            }
+            let identity = ThroughputBatchIdentity {
+                tenant_id: report.tenant_id.clone(),
+                instance_id: report.instance_id.clone(),
+                run_id: report.run_id.clone(),
+                batch_id: report.batch_id.clone(),
+            };
+            let validated_chunk = match self.scheduling_state.prepare_report_validation(report)? {
+                PreparedValidatedReport::MissingBatch => {
+                    anyhow::bail!("bulk batch {} is not owned by this runtime", report.batch_id);
+                }
+                PreparedValidatedReport::Rejected(validation) => {
+                    let mut debug =
+                        self.state.debug.lock().expect("throughput debug lock poisoned");
+                    debug.reports_rejected = debug.reports_rejected.saturating_add(1);
+                    debug.last_report_rejection_reason =
+                        Some(report_validation_label(validation).to_owned());
+                    continue;
+                }
+                PreparedValidatedReport::Accepted(validated_chunk) => validated_chunk,
+            };
+            let Some(projected_chunk) = self
+                .scheduling_state
+                .project_chunk_apply_after_validation(report, &validated_chunk)?
+            else {
+                let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
+                debug.apply_divergences = debug.apply_divergences.saturating_add(1);
+                debug.last_apply_divergence = Some(format!(
+                    "accepted report {} for batch {} chunk {} missing shard-local chunk projection state",
+                    report.report_id, report.batch_id, report.chunk_id
+                ));
+                anyhow::bail!(
+                    "accepted throughput report {} for batch {} chunk {} missing shard-local state",
+                    report.report_id,
+                    report.batch_id,
+                    report.chunk_id
+                );
+            };
+            let Some(projected_rollup) = self
+                .state
+                .aggregation
+                .project_batch_rollup_after_chunk_apply(&identity, report, &projected_chunk)?
+            else {
+                let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
+                debug.apply_divergences = debug.apply_divergences.saturating_add(1);
+                debug.last_apply_divergence = Some(format!(
+                    "accepted report {} for batch {} chunk {} missing coordinator rollup state",
+                    report.report_id, report.batch_id, report.chunk_id
+                ));
+                anyhow::bail!(
+                    "accepted throughput report {} for batch {} chunk {} missing coordinator rollup state",
+                    report.report_id,
+                    report.batch_id,
+                    report.chunk_id
+                );
+            };
+            let projected = ProjectedTerminalApply::from_parts(projected_chunk, projected_rollup);
+            let (report, segment) = materialize_collect_results_segment(
+                &self.state,
+                report,
+                projected.batch_reducer.as_deref(),
+                projected.chunk_item_count,
+            )
+            .await?;
+            if let Some(segment) = segment {
+                prepared.result_segments.push(segment);
+            }
+            prepared.accepted_reports.push(AcceptedReportApply { report, identity, projected });
+        }
+        Ok(prepared)
+    }
+
+    async fn publish_applied_report_batch(
+        &self,
+        accepted_reports: Vec<AcceptedReportApply>,
+    ) -> Result<()> {
+        let mut terminal_handoff_candidates = BTreeSet::new();
+        let mut projection_records = Vec::with_capacity(accepted_reports.len() * 2);
+        let mut skipped_projection_events = 0_u64;
+
+        for accepted in accepted_reports {
+            let report = &accepted.report;
+            let identity = &accepted.identity;
+            let projected = &accepted.projected;
+            let terminal_artifacts = materialize_chunk_terminal_artifacts(
+                &self.state,
+                report,
+                projected.batch_reducer.as_deref(),
+            )
+            .await?;
+            let batch_reducer_output = reduce_stream_batch_output(
+                &self.state,
+                identity,
+                projected.batch_reducer.as_deref(),
+                Some(report),
+            )?;
+            let chunk_output = completed_chunk_output(report);
+            projection_records.extend(projected_apply_projection_records(
+                report,
+                projected,
+                &terminal_artifacts,
+                chunk_output.clone(),
+                batch_reducer_output.clone(),
+            ));
+            let mut changelog_records = vec![changelog_record(
+                throughput_partition_key(&report.batch_id, report.group_id),
+                ThroughputChangelogPayload::ChunkApplied {
+                    identity: identity.clone(),
+                    chunk_id: projected.chunk_id.clone(),
+                    chunk_index: report.chunk_index,
+                    attempt: projected.chunk_attempt,
+                    group_id: report.group_id,
+                    item_count: projected.chunk_item_count,
+                    max_attempts: projected.chunk_max_attempts,
+                    retry_delay_ms: projected.chunk_retry_delay_ms,
+                    lease_epoch: report.lease_epoch,
+                    owner_epoch: report.owner_epoch,
+                    report_id: report.report_id.clone(),
+                    status: projected.chunk_status.clone(),
+                    available_at: projected.chunk_available_at,
+                    result_handle: terminal_artifacts.result_handle.clone(),
+                    output: chunk_output,
+                    error: projected.chunk_error.clone(),
+                    cancellation_reason: terminal_artifacts.cancellation_reason.clone(),
+                    cancellation_metadata: terminal_artifacts.cancellation_metadata.clone(),
+                },
+            )];
+            if let Some(group_terminal) = projected.group_terminal.as_ref() {
+                record_group_terminal_published(&self.state, group_terminal);
+                changelog_records.push(group_terminal_changelog_record(identity, group_terminal));
+                for parent_group in &projected.parent_group_terminals {
+                    record_group_terminal_published(&self.state, parent_group);
+                    changelog_records.push(group_terminal_changelog_record(identity, parent_group));
+                }
+                if let Some(batch_terminal) = projected.grouped_batch_terminal.as_ref() {
+                    projection_records.push(grouped_batch_terminal_projection_record(
+                        identity,
+                        batch_terminal,
+                        batch_reducer_output.clone(),
+                    ));
+                    changelog_records
+                        .push(grouped_batch_terminal_changelog_record(identity, batch_terminal));
+                } else if let Some(summary) = projected.grouped_batch_summary.as_ref() {
+                    if self.state.runtime.publish_transient_projection_updates {
+                        projection_records.push(grouped_batch_summary_projection_record(
+                            identity,
+                            summary,
+                            batch_reducer_output.clone(),
+                        ));
+                    } else {
+                        skipped_projection_events = skipped_projection_events.saturating_add(1);
+                    }
+                }
+            }
+            if projected.batch_terminal && !self.state.runtime.owner_first_apply {
+                changelog_records.push(changelog_record(
+                    throughput_partition_key(&report.batch_id, report.group_id),
+                    ThroughputChangelogPayload::BatchTerminal {
+                        identity: identity.clone(),
+                        status: projected.batch_status.clone(),
+                        report_id: report.report_id.clone(),
+                        succeeded_items: projected.batch_succeeded_items,
+                        failed_items: projected.batch_failed_items,
+                        cancelled_items: projected.batch_cancelled_items,
+                        error: projected.batch_error.clone(),
+                        terminal_at: projected.terminal_at.unwrap_or(report.occurred_at),
+                    },
+                ));
+            }
+            if self.state.runtime.owner_first_apply {
+                let staged_entries =
+                    changelog_records.iter().map(|record| record.entry.clone()).collect::<Vec<_>>();
+                self.state.local_state.mirror_changelog_records(&staged_entries)?;
+            }
+            let scheduling_entries =
+                changelog_records.iter().map(|record| record.entry.clone()).collect::<Vec<_>>();
+            if let Err(error) = self.mirror_scheduling_changelog_records(&scheduling_entries) {
+                error!(error = %error, "failed to mirror applied stream-v2 scheduling state");
+            }
+            if !self.state.runtime.owner_first_apply {
+                publish_changelog_records(&self.state, changelog_records).await;
+            }
+            if let Some(batch_terminal) = projected.grouped_batch_terminal.as_ref() {
+                publish_grouped_batch_terminal_event(
+                    &self.state,
+                    report,
+                    projected,
+                    batch_terminal,
+                )
+                .await?;
+                let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
+                debug.terminal_events_published = debug.terminal_events_published.saturating_add(1);
+                debug.last_terminal_event_at = Some(Utc::now());
+            }
+            if projected.batch_terminal {
+                publish_stream_terminal_event(&self.state, report, projected).await?;
+                let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
+                debug.terminal_events_published = debug.terminal_events_published.saturating_add(1);
+                debug.last_terminal_event_at = Some(Utc::now());
+            }
+            if projected.chunk_status == WorkflowBulkChunkStatus::Scheduled.as_str()
+                || projected.batch_terminal_deferred
+            {
+                self.state.bulk_notify.notify_waiters();
+            }
+            terminal_handoff_candidates.insert((
+                identity.tenant_id.clone(),
+                identity.instance_id.clone(),
+                identity.run_id.clone(),
+                identity.batch_id.clone(),
+            ));
+        }
+
+        publish_projection_records(&self.state, projection_records).await?;
+        for (tenant_id, instance_id, run_id, batch_id) in terminal_handoff_candidates {
+            if publish_projection_batch_terminal_handoff(
+                &self.state,
+                &tenant_id,
+                &instance_id,
+                &run_id,
+                &batch_id,
+            )
+            .await?
+            {
+                let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
+                debug.terminal_events_published = debug.terminal_events_published.saturating_add(1);
+                debug.last_terminal_event_at = Some(Utc::now());
+            }
+        }
+        if skipped_projection_events > 0 {
+            let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
+            debug.projection_events_skipped =
+                debug.projection_events_skipped.saturating_add(skipped_projection_events);
+        }
+        Ok(())
+    }
 }
 
 fn is_local_fastlane_chunk(state: &AppState, chunk: &LeasedChunkSnapshot) -> bool {
@@ -1856,7 +2984,7 @@ async fn run_group_barrier_reconciler(state: AppState) {
         let owned = owned_throughput_partitions(&state);
         if !owned.is_empty() {
             let candidates = match state
-                .local_state
+                .aggregation
                 .group_barrier_batches(Some(&owned), state.throughput_partitions)
             {
                 Ok(candidates) => candidates,
@@ -1867,7 +2995,7 @@ async fn run_group_barrier_reconciler(state: AppState) {
             };
             for identity in candidates {
                 let Some(projected_terminal) = (match state
-                    .local_state
+                    .aggregation
                     .project_batch_terminal_from_groups(&identity, Utc::now())
                 {
                     Ok(projected) => projected,
@@ -1920,281 +3048,7 @@ impl ActivityWorkerApi for WorkerApi {
         &self,
         request: Request<PollBulkActivityTaskRequest>,
     ) -> Result<Response<PollBulkActivityTaskResponse>, Status> {
-        let request = request.into_inner();
-        let max_tasks = usize::try_from(request.max_tasks.max(1))
-            .unwrap_or(1)
-            .min(self.state.runtime.poll_max_tasks.max(1));
-        {
-            let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
-            debug.poll_requests = debug.poll_requests.saturating_add(1);
-            debug.poll_responses = debug.poll_responses.saturating_add(1);
-        }
-        let batch_limit = (self.state.runtime.max_active_chunks_per_batch > 0)
-            .then_some(self.state.runtime.max_active_chunks_per_batch);
-        let deadline =
-            tokio::time::Instant::now() + Duration::from_millis(request.poll_timeout_ms.max(1));
-        loop {
-            let owned = owned_throughput_partitions(&self.state);
-            if owned.is_empty() {
-                if tokio::time::Instant::now() >= deadline {
-                    return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
-                }
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if tokio::time::timeout(remaining, self.state.bulk_notify.notified()).await.is_err()
-                {
-                    return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
-                }
-                continue;
-            }
-            let queue_control = self
-                .state
-                .store
-                .get_task_queue_runtime_control(
-                    &request.tenant_id,
-                    TaskQueueKind::Activity,
-                    &request.task_queue,
-                )
-                .await
-                .map_err(internal_status)?;
-            if let Some(control) = queue_control.as_ref() {
-                if control.is_paused {
-                    record_throttle(&self.state, "queue_paused");
-                    if tokio::time::Instant::now() >= deadline {
-                        return Ok(Response::new(PollBulkActivityTaskResponse {
-                            tasks: Vec::new(),
-                        }));
-                    }
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if tokio::time::timeout(remaining, self.state.bulk_notify.notified())
-                        .await
-                        .is_err()
-                    {
-                        return Ok(Response::new(PollBulkActivityTaskResponse {
-                            tasks: Vec::new(),
-                        }));
-                    }
-                    continue;
-                }
-                if control.is_draining {
-                    record_throttle(&self.state, "queue_draining");
-                    if tokio::time::Instant::now() >= deadline {
-                        return Ok(Response::new(PollBulkActivityTaskResponse {
-                            tasks: Vec::new(),
-                        }));
-                    }
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if tokio::time::timeout(remaining, self.state.bulk_notify.notified())
-                        .await
-                        .is_err()
-                    {
-                        return Ok(Response::new(PollBulkActivityTaskResponse {
-                            tasks: Vec::new(),
-                        }));
-                    }
-                    continue;
-                }
-            }
-            let paused_batch_ids = self
-                .state
-                .store
-                .list_paused_bulk_batch_ids_for_task_queue(&request.tenant_id, &request.task_queue)
-                .await
-                .map_err(internal_status)?
-                .into_iter()
-                .collect::<HashSet<_>>();
-            let tenant_active = self
-                .state
-                .local_state
-                .count_started_chunks(
-                    Some(&request.tenant_id),
-                    None,
-                    None,
-                    Some(&owned),
-                    self.state.throughput_partitions,
-                )
-                .map_err(internal_status)?;
-            if self.state.runtime.max_active_chunks_per_tenant > 0
-                && tenant_active
-                    >= u64::try_from(self.state.runtime.max_active_chunks_per_tenant)
-                        .map_err(|_| Status::internal("tenant chunk cap exceeds u64"))?
-            {
-                record_throttle(&self.state, "tenant_cap");
-                if tokio::time::Instant::now() >= deadline {
-                    return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
-                }
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if tokio::time::timeout(remaining, self.state.bulk_notify.notified()).await.is_err()
-                {
-                    return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
-                }
-                continue;
-            }
-            let queue_active = self
-                .state
-                .local_state
-                .count_started_chunks(
-                    Some(&request.tenant_id),
-                    Some(&request.task_queue),
-                    None,
-                    Some(&owned),
-                    self.state.throughput_partitions,
-                )
-                .map_err(internal_status)?;
-            if self.state.runtime.max_active_chunks_per_task_queue > 0
-                && queue_active
-                    >= u64::try_from(self.state.runtime.max_active_chunks_per_task_queue)
-                        .map_err(|_| Status::internal("task queue chunk cap exceeds u64"))?
-            {
-                record_throttle(&self.state, "task_queue_cap");
-                if tokio::time::Instant::now() >= deadline {
-                    return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
-                }
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if tokio::time::timeout(remaining, self.state.bulk_notify.notified()).await.is_err()
-                {
-                    return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
-                }
-                continue;
-            }
-            let now = Utc::now();
-            let leased_local = self
-                .state
-                .local_state
-                .lease_ready_chunks(
-                    &request.tenant_id,
-                    &request.task_queue,
-                    &request.worker_id,
-                    now,
-                    chrono::Duration::seconds(self.state.runtime.lease_ttl_seconds as i64),
-                    batch_limit,
-                    &paused_batch_ids,
-                    Some(&owned),
-                    self.state.throughput_partitions,
-                    max_tasks,
-                )
-                .map_err(internal_status)?;
-            if !leased_local.is_empty() {
-                let mut leased_tasks = Vec::with_capacity(leased_local.len());
-                let mut projection_records = Vec::with_capacity(max_tasks * 2);
-                let mut changelog_records = Vec::with_capacity(max_tasks);
-                let mut skipped_projection_events = 0_u64;
-                for leased_local in leased_local {
-                    let leased = leased_snapshot_to_projection_chunk(
-                        &leased_local,
-                        &request.worker_build_id,
-                    )
-                    .map_err(internal_status)?;
-                    let identity = batch_identity(&leased);
-                    if let Some(batch) = self
-                        .state
-                        .local_state
-                        .mark_batch_running(&identity, leased.updated_at)
-                        .map_err(internal_status)?
-                    {
-                        if self.state.runtime.publish_transient_projection_updates {
-                            projection_records.push(running_batch_projection_record(&batch));
-                        } else {
-                            skipped_projection_events = skipped_projection_events.saturating_add(1);
-                        }
-                    }
-                    if self.state.runtime.publish_transient_projection_updates {
-                        projection_records.push(leased_chunk_projection_record(&leased));
-                    } else {
-                        skipped_projection_events = skipped_projection_events.saturating_add(1);
-                    }
-                    if !self.state.runtime.owner_first_apply {
-                        changelog_records.push(changelog_record(
-                            throughput_partition_key(&leased.batch_id, leased.group_id),
-                            ThroughputChangelogPayload::ChunkLeased {
-                                identity,
-                                chunk_id: leased.chunk_id.clone(),
-                                chunk_index: leased.chunk_index,
-                                attempt: leased.attempt,
-                                group_id: leased.group_id,
-                                item_count: leased.item_count,
-                                max_attempts: leased.max_attempts,
-                                retry_delay_ms: leased.retry_delay_ms,
-                                lease_epoch: leased.lease_epoch,
-                                owner_epoch: leased.owner_epoch,
-                                worker_id: request.worker_id.clone(),
-                                lease_token: leased
-                                    .lease_token
-                                    .map(|value| value.to_string())
-                                    .unwrap_or_default(),
-                                lease_expires_at: leased.lease_expires_at.unwrap_or_else(Utc::now),
-                            },
-                        ));
-                    }
-                    leased_tasks.push(bulk_chunk_to_proto(
-                        &leased_local,
-                        request.supports_cbor,
-                        self.state.runtime.inline_chunk_input_threshold_bytes,
-                    ));
-                }
-                let lease_projection_result =
-                    publish_projection_records(&self.state, projection_records).await;
-                if let Err(error) = lease_projection_result {
-                    error!(error = %error, "failed to sync leased stream-v2 projection state");
-                }
-                if !self.state.runtime.owner_first_apply {
-                    publish_changelog_records(&self.state, changelog_records).await;
-                }
-                {
-                    let mut debug =
-                        self.state.debug.lock().expect("throughput debug lock poisoned");
-                    debug.projection_events_skipped =
-                        debug.projection_events_skipped.saturating_add(skipped_projection_events);
-                    debug.leased_tasks =
-                        debug.leased_tasks.saturating_add(leased_tasks.len() as u64);
-                }
-                return Ok(Response::new(PollBulkActivityTaskResponse { tasks: leased_tasks }));
-            }
-            {
-                let mut debug = self.state.debug.lock().expect("throughput debug lock poisoned");
-                debug.empty_polls = debug.empty_polls.saturating_add(1);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                let lease_selection_debug = self
-                    .state
-                    .local_state
-                    .debug_lease_selection(
-                        &request.tenant_id,
-                        &request.task_queue,
-                        Utc::now(),
-                        batch_limit,
-                        &paused_batch_ids,
-                        Some(&owned),
-                        self.state.throughput_partitions,
-                    )
-                    .map_err(internal_status)?;
-                if batch_limit.is_some() && lease_selection_debug.batch_cap_blocked > 0 {
-                    record_throttle(&self.state, "batch_cap");
-                    let mut debug =
-                        self.state.debug.lock().expect("throughput debug lock poisoned");
-                    debug.lease_misses_with_ready_chunks =
-                        debug.lease_misses_with_ready_chunks.saturating_add(1);
-                    debug.last_lease_miss_with_ready_chunks_at = Some(Utc::now());
-                    debug.last_lease_selection_debug =
-                        serde_json::to_value(lease_selection_debug).ok();
-                } else if lease_selection_debug.batch_paused > 0 {
-                    record_throttle(&self.state, "batch_paused");
-                    let mut debug =
-                        self.state.debug.lock().expect("throughput debug lock poisoned");
-                    debug.last_lease_selection_debug =
-                        serde_json::to_value(lease_selection_debug).ok();
-                } else {
-                    let mut debug =
-                        self.state.debug.lock().expect("throughput debug lock poisoned");
-                    debug.last_lease_selection_debug =
-                        serde_json::to_value(lease_selection_debug).ok();
-                }
-                return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
-            }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if tokio::time::timeout(remaining, self.state.bulk_notify.notified()).await.is_err() {
-                return Ok(Response::new(PollBulkActivityTaskResponse { tasks: Vec::new() }));
-            }
-        }
+        Ok(Response::new(self.shard_workers.poll_bulk_activity_tasks(request.into_inner()).await?))
     }
 
     async fn complete_activity_task(
@@ -2261,243 +3115,13 @@ impl ActivityWorkerApi for WorkerApi {
                 debug.report_batch_items_total =
                     debug.report_batch_items_total.saturating_add(report_batch.len() as u64);
             }
-            apply_throughput_report_batch(&self.state, report_batch, true)
+            self.shard_workers
+                .apply_report_batch(report_batch.to_vec(), true, self.state.throughput_partitions)
                 .await
                 .map_err(internal_status)?;
         }
         Ok(Response::new(Ack {}))
     }
-}
-
-async fn apply_throughput_report_batch(
-    state: &AppState,
-    report_batch: &[ThroughputChunkReport],
-    capture_report_log: bool,
-) -> Result<()> {
-    struct AcceptedReportApply {
-        report: ThroughputChunkReport,
-        identity: ThroughputBatchIdentity,
-        projected: ProjectedTerminalApply,
-    }
-
-    let mut accepted_reports = Vec::with_capacity(report_batch.len());
-    let mut terminal_handoff_candidates = BTreeSet::new();
-    let mut result_segments = Vec::new();
-    let mut skipped_projection_events = 0_u64;
-    for report in report_batch {
-        let throughput_partition_id = throughput_partition_for_batch(
-            &report.batch_id,
-            report.group_id,
-            state.throughput_partitions,
-        );
-        if !owns_throughput_partition(state, throughput_partition_id) {
-            anyhow::bail!(
-                "throughput partition {} is not owned by this runtime",
-                throughput_partition_id
-            );
-        }
-        let identity = ThroughputBatchIdentity {
-            tenant_id: report.tenant_id.clone(),
-            instance_id: report.instance_id.clone(),
-            run_id: report.run_id.clone(),
-            batch_id: report.batch_id.clone(),
-        };
-        let projected = match state.local_state.prepare_report_apply(report)? {
-            PreparedReportApply::MissingBatch => {
-                anyhow::bail!("bulk batch {} is not owned by this runtime", report.batch_id);
-            }
-            PreparedReportApply::Rejected(validation) => {
-                let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
-                debug.reports_rejected = debug.reports_rejected.saturating_add(1);
-                debug.last_report_rejection_reason =
-                    Some(report_validation_label(validation).to_owned());
-                continue;
-            }
-            PreparedReportApply::Accepted(projected) => projected,
-        };
-        let (report, segment) = materialize_collect_results_segment(
-            state,
-            report,
-            projected.batch_reducer.as_deref(),
-            projected.chunk_item_count,
-        )
-        .await?;
-        if let Some(segment) = segment {
-            result_segments.push(segment);
-        }
-        accepted_reports.push(AcceptedReportApply { report, identity, projected });
-    }
-    if !result_segments.is_empty() {
-        state.store.upsert_throughput_result_segments(&result_segments).await?;
-    }
-    if capture_report_log && state.runtime.owner_first_apply {
-        let captured =
-            accepted_reports.iter().map(|accepted| accepted.report.clone()).collect::<Vec<_>>();
-        state.store.append_throughput_report_log_entries(&captured, Utc::now()).await?;
-    }
-    let mut projection_records = Vec::with_capacity(report_batch.len() * 2);
-    for accepted in accepted_reports {
-        let report = &accepted.report;
-        let identity = &accepted.identity;
-        let projected = &accepted.projected;
-        let terminal_artifacts =
-            materialize_chunk_terminal_artifacts(state, report, projected.batch_reducer.as_deref())
-                .await?;
-        let batch_reducer_output = reduce_stream_batch_output(
-            state,
-            identity,
-            projected.batch_reducer.as_deref(),
-            Some(report),
-        )?;
-        let chunk_output = completed_chunk_output(report);
-        projection_records.extend(projected_apply_projection_records(
-            report,
-            &projected,
-            &terminal_artifacts,
-            chunk_output.clone(),
-            batch_reducer_output.clone(),
-        ));
-        let mut changelog_records = vec![changelog_record(
-            throughput_partition_key(&report.batch_id, report.group_id),
-            ThroughputChangelogPayload::ChunkApplied {
-                identity: identity.clone(),
-                chunk_id: projected.chunk_id.clone(),
-                chunk_index: report.chunk_index,
-                attempt: projected.chunk_attempt,
-                group_id: report.group_id,
-                item_count: projected.chunk_item_count,
-                max_attempts: projected.chunk_max_attempts,
-                retry_delay_ms: projected.chunk_retry_delay_ms,
-                lease_epoch: report.lease_epoch,
-                owner_epoch: report.owner_epoch,
-                report_id: report.report_id.clone(),
-                status: projected.chunk_status.clone(),
-                available_at: projected.chunk_available_at,
-                result_handle: terminal_artifacts.result_handle.clone(),
-                output: chunk_output,
-                error: projected.chunk_error.clone(),
-                cancellation_reason: terminal_artifacts.cancellation_reason.clone(),
-                cancellation_metadata: terminal_artifacts.cancellation_metadata.clone(),
-            },
-        )];
-        if let Some(group_terminal) = projected.group_terminal.as_ref() {
-            record_group_terminal_published(state, group_terminal);
-            changelog_records.push(group_terminal_changelog_record(&identity, group_terminal));
-            for parent_group in &projected.parent_group_terminals {
-                record_group_terminal_published(state, parent_group);
-                changelog_records.push(group_terminal_changelog_record(&identity, parent_group));
-            }
-            if let Some(batch_terminal) = projected.grouped_batch_terminal.as_ref() {
-                projection_records.push(grouped_batch_terminal_projection_record(
-                    &identity,
-                    batch_terminal,
-                    batch_reducer_output.clone(),
-                ));
-                changelog_records
-                    .push(grouped_batch_terminal_changelog_record(identity, batch_terminal));
-            } else if let Some(summary) = projected.grouped_batch_summary.as_ref() {
-                if state.runtime.publish_transient_projection_updates {
-                    projection_records.push(grouped_batch_summary_projection_record(
-                        identity,
-                        summary,
-                        batch_reducer_output.clone(),
-                    ));
-                } else {
-                    skipped_projection_events = skipped_projection_events.saturating_add(1);
-                }
-            }
-        }
-        if projected.batch_terminal && !state.runtime.owner_first_apply {
-            changelog_records.push(changelog_record(
-                throughput_partition_key(&report.batch_id, report.group_id),
-                ThroughputChangelogPayload::BatchTerminal {
-                    identity: identity.clone(),
-                    status: projected.batch_status.clone(),
-                    report_id: report.report_id.clone(),
-                    succeeded_items: projected.batch_succeeded_items,
-                    failed_items: projected.batch_failed_items,
-                    cancelled_items: projected.batch_cancelled_items,
-                    error: projected.batch_error.clone(),
-                    terminal_at: projected.terminal_at.unwrap_or(report.occurred_at),
-                },
-            ));
-        }
-        if state.runtime.owner_first_apply {
-            let staged_entries =
-                changelog_records.iter().map(|record| record.entry.clone()).collect::<Vec<_>>();
-            state.local_state.mirror_changelog_records(&staged_entries)?;
-        }
-        if !state.runtime.owner_first_apply {
-            publish_changelog_records(state, changelog_records).await;
-        }
-        if let Some(batch_terminal) = projected.grouped_batch_terminal.as_ref() {
-            publish_grouped_batch_terminal_event(state, report, &projected, batch_terminal).await?;
-            let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
-            debug.terminal_events_published = debug.terminal_events_published.saturating_add(1);
-            debug.last_terminal_event_at = Some(Utc::now());
-        }
-        if projected.batch_terminal {
-            publish_stream_terminal_event(state, report, &projected).await?;
-            let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
-            debug.terminal_events_published = debug.terminal_events_published.saturating_add(1);
-            debug.last_terminal_event_at = Some(Utc::now());
-        }
-        if projected.chunk_status == WorkflowBulkChunkStatus::Scheduled.as_str()
-            || projected.batch_terminal_deferred
-        {
-            state.bulk_notify.notify_waiters();
-        }
-        terminal_handoff_candidates.insert((
-            identity.tenant_id.clone(),
-            identity.instance_id.clone(),
-            identity.run_id.clone(),
-            identity.batch_id.clone(),
-        ));
-    }
-    publish_projection_records(state, projection_records).await?;
-    for (tenant_id, instance_id, run_id, batch_id) in terminal_handoff_candidates {
-        if publish_projection_batch_terminal_handoff(
-            state,
-            &tenant_id,
-            &instance_id,
-            &run_id,
-            &batch_id,
-        )
-        .await?
-        {
-            let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
-            debug.terminal_events_published = debug.terminal_events_published.saturating_add(1);
-            debug.last_terminal_event_at = Some(Utc::now());
-        }
-    }
-    if skipped_projection_events > 0 {
-        let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
-        debug.projection_events_skipped =
-            debug.projection_events_skipped.saturating_add(skipped_projection_events);
-    }
-    Ok(())
-}
-
-async fn ensure_bulk_batch_backend(
-    store: &WorkflowStore,
-    tenant_id: &str,
-    instance_id: &str,
-    run_id: &str,
-    batch_id: &str,
-    expected_backend: &str,
-) -> Result<(), Status> {
-    let batch = store
-        .get_bulk_batch_query_view(tenant_id, instance_id, run_id, batch_id)
-        .await
-        .map_err(internal_status)?
-        .ok_or_else(|| Status::not_found(format!("bulk batch {batch_id} not found")))?;
-    if batch.throughput_backend != expected_backend {
-        return Err(Status::failed_precondition(format!(
-            "bulk batch {batch_id} is owned by backend {}",
-            batch.throughput_backend
-        )));
-    }
-    Ok(())
 }
 
 async fn build_stream_projection_records_from_parts(
@@ -2961,6 +3585,13 @@ async fn activate_stream_batch(
     if let Err(error) = state.local_state.upsert_batch_with_chunks(&batch, &chunks) {
         error!(error = %error, batch_id = %batch_id, "failed to seed local stream-v2 batch state");
     }
+    if let Err(error) = sync_batch_chunks_to_partition_shards(state, &batch, &chunks) {
+        error!(
+            error = %error,
+            batch_id = %batch_id,
+            "failed to seed shard-local stream-v2 batch state"
+        );
+    }
     if !state.runtime.owner_first_apply {
         publish_changelog_records(
             state,
@@ -3012,7 +3643,7 @@ async fn activate_native_stream_run(
         run_id: command.run_id.clone(),
         batch_id: command.batch_id.clone(),
     };
-    if state.local_state.batch_snapshot(&identity)?.is_some() {
+    if state.aggregation.batch_snapshot(&identity)?.is_some() {
         let _ = state
             .store
             .mark_throughput_run_started(
@@ -3034,6 +3665,13 @@ async fn activate_native_stream_run(
             })?;
     if let Err(error) = state.local_state.upsert_batch_with_chunks(&batch, &chunks) {
         error!(error = %error, batch_id = %command.batch_id, "failed to seed native stream-v2 batch state");
+    }
+    if let Err(error) = sync_batch_chunks_to_partition_shards(state, &batch, &chunks) {
+        error!(
+            error = %error,
+            batch_id = %command.batch_id,
+            "failed to seed native shard-local stream-v2 batch state"
+        );
     }
     let projection_state = state.clone();
     let projection_batch = batch.clone();
@@ -3409,13 +4047,7 @@ fn reduce_stream_batch_output(
     reducer: Option<&str>,
     pending_report: Option<&ThroughputChunkReport>,
 ) -> Result<Option<Value>> {
-    if collect_results_uses_batch_result_handle_only(reducer) {
-        return Ok(None);
-    }
-    if bulk_reducer_summary_field_name(reducer).is_none() {
-        return Ok(None);
-    }
-    state.local_state.reduce_batch_success_outputs_after_report(identity, pending_report)
+    state.aggregation.reducer_output_after_report(identity, reducer, pending_report)
 }
 
 async fn publish_stream_terminal_event(
@@ -3511,6 +4143,14 @@ async fn publish_stream_terminal_event(
     envelope.metadata.insert(
         "bridge_terminal_dedupe_key".to_owned(),
         envelope.dedupe_key.clone().unwrap_or_default(),
+    );
+    envelope.metadata.insert(
+        "bridge_protocol_version".to_owned(),
+        THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+    );
+    envelope.metadata.insert(
+        "bridge_operation_kind".to_owned(),
+        ThroughputBridgeOperationKind::BulkRun.as_str().to_owned(),
     );
     envelope.metadata.insert("bridge_owner_epoch".to_owned(), report.owner_epoch.to_string());
     envelope
@@ -3617,6 +4257,14 @@ async fn publish_stream_batch_terminal_event(
         envelope.dedupe_key.clone().unwrap_or_default(),
     );
     envelope.metadata.insert(
+        "bridge_protocol_version".to_owned(),
+        THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+    );
+    envelope.metadata.insert(
+        "bridge_operation_kind".to_owned(),
+        ThroughputBridgeOperationKind::BulkRun.as_str().to_owned(),
+    );
+    envelope.metadata.insert(
         "bridge_owner_epoch".to_owned(),
         resolve_terminal_bridge_owner_epoch(state, batch, pending_report).await?.to_string(),
     );
@@ -3664,7 +4312,7 @@ async fn finalize_grouped_stream_batch(
     identity: &ThroughputBatchIdentity,
     projected: &ProjectedBatchTerminal,
 ) -> Result<()> {
-    let Some(existing_batch) = state.local_state.batch_snapshot(identity)? else {
+    let Some(existing_batch) = state.aggregation.batch_snapshot(identity)? else {
         anyhow::bail!(
             "grouped throughput batch {} missing from local owner state",
             identity.batch_id
@@ -4564,7 +5212,7 @@ fn bulk_reducer_materializes_results(reducer: Option<&str>) -> bool {
     matches!(reducer.unwrap_or("collect_results"), "collect_results" | "collect_settled_results")
 }
 
-fn collect_results_uses_batch_result_handle_only(reducer: Option<&str>) -> bool {
+pub(crate) fn collect_results_uses_batch_result_handle_only(reducer: Option<&str>) -> bool {
     reducer == Some("collect_results")
 }
 
@@ -5464,8 +6112,9 @@ mod tests {
         assert_eq!(before.terminal_at, None);
 
         let owned = HashSet::from([throughput_partition_for_batch(batch_id, 0, 8)]);
+        let aggregation = AggregationCoordinator::new(local_state.clone());
         let repaired =
-            repair_stale_terminal_projection_batches_in_store(&store, &local_state, &owned, 8)
+            repair_stale_terminal_projection_batches_in_store(&store, &aggregation, &owned, 8)
                 .await?;
         assert_eq!(repaired, 1);
 
@@ -5728,7 +6377,7 @@ async fn cancel_stream_batches_for_run(
                 throughput_partition_key(&chunk.batch_id, chunk.group_id),
             )
             .await;
-            if let Ok(Some(group_terminal)) = state.local_state.project_group_terminal(
+            if let Ok(Some(group_terminal)) = state.aggregation.project_group_terminal(
                 &batch_identity(&chunk),
                 chunk.group_id,
                 occurred_at,

@@ -54,6 +54,7 @@ const result = await batch.result();
 - `chunkSize` defaults to `256` when omitted.
 - backend selection is server-controlled and does not appear in workflow code.
 - throughput mode is intentionally distinct from future stream-job primitives such as `startStreamJob(...)`.
+- future stream-job semantics are defined separately in [stream-jobs.md](stream-jobs.md).
 
 ### Result Shape
 

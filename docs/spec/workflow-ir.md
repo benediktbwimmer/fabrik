@@ -120,3 +120,5 @@ If `startStreamJob`-style primitives are added later, they should land as distin
 - `AwaitStreamJobTerminal`
 
 They must not be smuggled into the bulk-activity nodes in a way that weakens the current throughput-mode contract.
+
+See [stream-jobs.md](/Users/bene/code/fabrik/docs/spec/stream-jobs.md) for the target semantic contract behind those nodes.

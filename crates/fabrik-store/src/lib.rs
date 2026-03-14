@@ -2,13 +2,15 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_throughput::{
-    ADMISSION_POLICY_VERSION, ActivityExecutionCapabilities, ThroughputBackend,
-    ThroughputBridgeSubmissionStatus, ThroughputBridgeTerminalStatus, ThroughputChunkReport,
-    ThroughputCommandEnvelope, ThroughputRunStatus, bulk_reducer_default_summary_value,
-    bulk_reducer_name, bulk_reducer_reduce_errors, bulk_reducer_reduce_values,
-    bulk_reducer_requires_error_outputs, bulk_reducer_requires_success_outputs,
-    bulk_reducer_settles, throughput_execution_mode, throughput_reducer_execution_path,
-    throughput_reducer_version, throughput_routing_reason,
+    ADMISSION_POLICY_VERSION, ActivityExecutionCapabilities, StreamJobBridgeHandleStatus,
+    StreamJobCheckpointStatus, StreamJobQueryConsistency, StreamJobQueryStatus, StreamJobStatus,
+    THROUGHPUT_BRIDGE_PROTOCOL_VERSION, ThroughputBackend, ThroughputBridgeOperationKind,
+    ThroughputBridgeRepairKind, ThroughputBridgeState, ThroughputBridgeSubmissionStatus,
+    ThroughputBridgeTerminalStatus, ThroughputChunkReport, ThroughputCommandEnvelope,
+    ThroughputRunStatus, bulk_reducer_default_summary_value, bulk_reducer_name,
+    bulk_reducer_reduce_errors, bulk_reducer_reduce_values, bulk_reducer_requires_error_outputs,
+    bulk_reducer_requires_success_outputs, bulk_reducer_settles, throughput_execution_mode,
+    throughput_reducer_execution_path, throughput_reducer_version, throughput_routing_reason,
 };
 use fabrik_workflow::{CompiledWorkflowArtifact, WorkflowDefinition, WorkflowInstanceState};
 use serde::{Deserialize, Serialize};
@@ -350,6 +352,8 @@ pub struct ThroughputRunRecord {
     pub definition_version: Option<u32>,
     pub artifact_hash: Option<String>,
     pub batch_id: String,
+    pub bridge_protocol_version: String,
+    pub bridge_operation_kind: String,
     pub bridge_request_id: String,
     pub throughput_backend: String,
     pub execution_path: String,
@@ -368,6 +372,10 @@ pub struct ThroughputRunRecord {
 }
 
 impl ThroughputRunRecord {
+    pub fn parsed_bridge_operation_kind(&self) -> Option<ThroughputBridgeOperationKind> {
+        ThroughputBridgeOperationKind::parse(&self.bridge_operation_kind)
+    }
+
     pub fn parsed_status(&self) -> Option<ThroughputRunStatus> {
         ThroughputRunStatus::parse(&self.status)
     }
@@ -405,6 +413,8 @@ pub struct ThroughputTerminalRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ThroughputBridgeProgressRecord {
     pub workflow_event_id: Uuid,
+    pub protocol_version: String,
+    pub operation_kind: String,
     pub tenant_id: String,
     pub instance_id: String,
     pub run_id: String,
@@ -425,6 +435,10 @@ pub struct ThroughputBridgeProgressRecord {
 }
 
 impl ThroughputBridgeProgressRecord {
+    pub fn parsed_operation_kind(&self) -> Option<ThroughputBridgeOperationKind> {
+        ThroughputBridgeOperationKind::parse(&self.operation_kind)
+    }
+
     pub fn parsed_submission_status(&self) -> Option<ThroughputBridgeSubmissionStatus> {
         ThroughputBridgeSubmissionStatus::parse(&self.submission_status)
     }
@@ -432,9 +446,14 @@ impl ThroughputBridgeProgressRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ThroughputBridgeBatchStateRecord {
+    pub workflow_event_id: Option<Uuid>,
     pub batch_id: String,
+    pub protocol_version: String,
+    pub operation_kind: String,
     pub bridge_request_id: String,
     pub submission_status: Option<String>,
+    pub command_id: Option<Uuid>,
+    pub command_partition_key: Option<String>,
     pub stream_status: String,
     pub stream_terminal_at: Option<DateTime<Utc>>,
     pub cancellation_requested_at: Option<DateTime<Utc>>,
@@ -448,6 +467,10 @@ pub struct ThroughputBridgeBatchStateRecord {
 }
 
 impl ThroughputBridgeBatchStateRecord {
+    pub fn parsed_operation_kind(&self) -> Option<ThroughputBridgeOperationKind> {
+        ThroughputBridgeOperationKind::parse(&self.operation_kind)
+    }
+
     pub fn parsed_submission_status(&self) -> Option<ThroughputBridgeSubmissionStatus> {
         self.submission_status.as_deref().and_then(ThroughputBridgeSubmissionStatus::parse)
     }
@@ -459,6 +482,373 @@ impl ThroughputBridgeBatchStateRecord {
     pub fn parsed_workflow_status(&self) -> Option<ThroughputBridgeTerminalStatus> {
         self.workflow_status.as_deref().and_then(ThroughputBridgeTerminalStatus::parse)
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ThroughputBridgeLedgerRecord {
+    pub workflow_event_id: Option<Uuid>,
+    pub protocol_version: String,
+    pub operation_kind: String,
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub batch_id: String,
+    pub throughput_backend: String,
+    pub bridge_request_id: String,
+    pub submission_status: Option<String>,
+    pub command_id: Option<Uuid>,
+    pub command_partition_key: Option<String>,
+    pub command_published_at: Option<DateTime<Utc>>,
+    pub cancellation_requested_at: Option<DateTime<Utc>>,
+    pub cancellation_reason: Option<String>,
+    pub cancel_command_published_at: Option<DateTime<Utc>>,
+    pub cancelled_at: Option<DateTime<Utc>>,
+    pub stream_status: Option<String>,
+    pub stream_terminal_at: Option<DateTime<Utc>>,
+    pub workflow_status: Option<String>,
+    pub workflow_terminal_event_id: Option<Uuid>,
+    pub workflow_owner_epoch: Option<u64>,
+    pub workflow_accepted_at: Option<DateTime<Utc>>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+impl ThroughputBridgeLedgerRecord {
+    pub fn parsed_operation_kind(&self) -> Option<ThroughputBridgeOperationKind> {
+        ThroughputBridgeOperationKind::parse(&self.operation_kind)
+    }
+
+    pub fn parsed_submission_status(&self) -> Option<ThroughputBridgeSubmissionStatus> {
+        self.submission_status.as_deref().and_then(ThroughputBridgeSubmissionStatus::parse)
+    }
+
+    pub fn parsed_stream_status(&self) -> Option<ThroughputRunStatus> {
+        self.stream_status.as_deref().and_then(ThroughputRunStatus::parse)
+    }
+
+    pub fn parsed_workflow_status(&self) -> Option<ThroughputBridgeTerminalStatus> {
+        self.workflow_status.as_deref().and_then(ThroughputBridgeTerminalStatus::parse)
+    }
+
+    pub fn bridge_state(&self) -> ThroughputBridgeState {
+        ThroughputBridgeState {
+            protocol_version: if self.protocol_version.trim().is_empty() {
+                THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned()
+            } else {
+                self.protocol_version.clone()
+            },
+            operation_kind: self
+                .parsed_operation_kind()
+                .unwrap_or(ThroughputBridgeOperationKind::BulkRun),
+            workflow_event_id: self.workflow_event_id,
+            bridge_request_id: self.bridge_request_id.clone(),
+            submission_status: self.parsed_submission_status(),
+            command_id: self.command_id,
+            command_partition_key: self.command_partition_key.clone(),
+            command_published_at: self.command_published_at,
+            cancellation_requested_at: self.cancellation_requested_at,
+            cancellation_reason: self.cancellation_reason.clone(),
+            cancel_command_published_at: self.cancel_command_published_at,
+            cancelled_at: self.cancelled_at,
+            stream_status: self.parsed_stream_status(),
+            stream_terminal_at: self.stream_terminal_at,
+            workflow_status: self.parsed_workflow_status(),
+            workflow_terminal_event_id: self.workflow_terminal_event_id,
+            workflow_owner_epoch: self.workflow_owner_epoch,
+            workflow_accepted_at: self.workflow_accepted_at,
+        }
+    }
+
+    pub fn next_repair(&self) -> Option<ThroughputBridgeRepairKind> {
+        self.bridge_state().next_repair()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamJobBridgeHandleRecord {
+    pub workflow_event_id: Uuid,
+    pub protocol_version: String,
+    pub operation_kind: String,
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub job_id: String,
+    pub handle_id: String,
+    pub bridge_request_id: String,
+    pub definition_id: String,
+    pub definition_version: Option<u32>,
+    pub artifact_hash: Option<String>,
+    pub job_name: String,
+    pub input_ref: String,
+    pub config_ref: Option<String>,
+    pub checkpoint_policy: Option<Value>,
+    pub view_definitions: Option<Value>,
+    pub status: String,
+    pub workflow_owner_epoch: Option<u64>,
+    pub stream_owner_epoch: Option<u64>,
+    pub cancellation_requested_at: Option<DateTime<Utc>>,
+    pub cancellation_reason: Option<String>,
+    pub terminal_event_id: Option<Uuid>,
+    pub terminal_at: Option<DateTime<Utc>>,
+    pub workflow_accepted_at: Option<DateTime<Utc>>,
+    pub terminal_output: Option<Value>,
+    pub terminal_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl StreamJobBridgeHandleRecord {
+    pub fn parsed_operation_kind(&self) -> Option<ThroughputBridgeOperationKind> {
+        ThroughputBridgeOperationKind::parse(&self.operation_kind)
+    }
+
+    pub fn parsed_status(&self) -> Option<StreamJobBridgeHandleStatus> {
+        StreamJobBridgeHandleStatus::parse(&self.status)
+    }
+
+    pub fn next_repair(&self) -> Option<ThroughputBridgeRepairKind> {
+        if self.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal)
+            && self.terminal_at.is_some()
+            && self.workflow_accepted_at.is_none()
+        {
+            Some(ThroughputBridgeRepairKind::AcceptStreamTerminal)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamJobCheckpointRecord {
+    pub workflow_event_id: Uuid,
+    pub protocol_version: String,
+    pub operation_kind: String,
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub job_id: String,
+    pub handle_id: String,
+    pub bridge_request_id: String,
+    pub await_request_id: String,
+    pub checkpoint_name: String,
+    pub checkpoint_sequence: Option<i64>,
+    pub status: String,
+    pub workflow_owner_epoch: Option<u64>,
+    pub stream_owner_epoch: Option<u64>,
+    pub reached_at: Option<DateTime<Utc>>,
+    pub output: Option<Value>,
+    pub accepted_at: Option<DateTime<Utc>>,
+    pub cancelled_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl StreamJobCheckpointRecord {
+    pub fn parsed_operation_kind(&self) -> Option<ThroughputBridgeOperationKind> {
+        ThroughputBridgeOperationKind::parse(&self.operation_kind)
+    }
+
+    pub fn parsed_status(&self) -> Option<StreamJobCheckpointStatus> {
+        StreamJobCheckpointStatus::parse(&self.status)
+    }
+
+    pub fn next_repair(&self) -> Option<ThroughputBridgeRepairKind> {
+        match self.parsed_status() {
+            Some(StreamJobCheckpointStatus::Reached) if self.accepted_at.is_none() => {
+                Some(ThroughputBridgeRepairKind::AcceptStreamCheckpoint)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamJobQueryRecord {
+    pub workflow_event_id: Uuid,
+    pub protocol_version: String,
+    pub operation_kind: String,
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub job_id: String,
+    pub handle_id: String,
+    pub bridge_request_id: String,
+    pub query_id: String,
+    pub query_name: String,
+    pub query_args: Option<Value>,
+    pub consistency: String,
+    pub status: String,
+    pub workflow_owner_epoch: Option<u64>,
+    pub stream_owner_epoch: Option<u64>,
+    pub output: Option<Value>,
+    pub error: Option<String>,
+    pub requested_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub accepted_at: Option<DateTime<Utc>>,
+    pub cancelled_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl StreamJobQueryRecord {
+    pub fn parsed_operation_kind(&self) -> Option<ThroughputBridgeOperationKind> {
+        ThroughputBridgeOperationKind::parse(&self.operation_kind)
+    }
+
+    pub fn parsed_status(&self) -> Option<StreamJobQueryStatus> {
+        StreamJobQueryStatus::parse(&self.status)
+    }
+
+    pub fn parsed_consistency(&self) -> Option<StreamJobQueryConsistency> {
+        StreamJobQueryConsistency::parse(&self.consistency)
+    }
+
+    pub fn next_repair(&self) -> Option<ThroughputBridgeRepairKind> {
+        match self.parsed_status() {
+            Some(StreamJobQueryStatus::Completed | StreamJobQueryStatus::Failed)
+                if self.accepted_at.is_none() =>
+            {
+                Some(ThroughputBridgeRepairKind::AcceptStreamQuery)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamJobRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub job_id: String,
+    pub handle_id: String,
+    pub protocol_version: String,
+    pub operation_kind: String,
+    pub workflow_event_id: Uuid,
+    pub bridge_request_id: String,
+    pub definition_id: String,
+    pub definition_version: Option<u32>,
+    pub artifact_hash: Option<String>,
+    pub job_name: String,
+    pub input_ref: String,
+    pub config_ref: Option<String>,
+    pub checkpoint_policy: Option<Value>,
+    pub view_definitions: Option<Value>,
+    pub status: String,
+    pub workflow_owner_epoch: Option<u64>,
+    pub stream_owner_epoch: Option<u64>,
+    pub starting_at: Option<DateTime<Utc>>,
+    pub running_at: Option<DateTime<Utc>>,
+    pub draining_at: Option<DateTime<Utc>>,
+    pub latest_checkpoint_name: Option<String>,
+    pub latest_checkpoint_sequence: Option<i64>,
+    pub latest_checkpoint_at: Option<DateTime<Utc>>,
+    pub latest_checkpoint_output: Option<Value>,
+    pub cancellation_requested_at: Option<DateTime<Utc>>,
+    pub cancellation_reason: Option<String>,
+    pub workflow_accepted_at: Option<DateTime<Utc>>,
+    pub terminal_event_id: Option<Uuid>,
+    pub terminal_at: Option<DateTime<Utc>>,
+    pub terminal_output: Option<Value>,
+    pub terminal_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl StreamJobRecord {
+    pub fn parsed_operation_kind(&self) -> Option<ThroughputBridgeOperationKind> {
+        ThroughputBridgeOperationKind::parse(&self.operation_kind)
+    }
+
+    pub fn parsed_status(&self) -> Option<StreamJobStatus> {
+        StreamJobStatus::parse(&self.status)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamJobBridgeLedgerRecord {
+    pub workflow_event_id: Uuid,
+    pub protocol_version: String,
+    pub operation_kind: String,
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub job_id: String,
+    pub handle_id: String,
+    pub bridge_request_id: String,
+    pub definition_id: String,
+    pub definition_version: Option<u32>,
+    pub artifact_hash: Option<String>,
+    pub job_name: String,
+    pub input_ref: String,
+    pub config_ref: Option<String>,
+    pub status: String,
+    pub workflow_owner_epoch: Option<u64>,
+    pub stream_owner_epoch: Option<u64>,
+    pub cancellation_requested_at: Option<DateTime<Utc>>,
+    pub cancellation_reason: Option<String>,
+    pub terminal_event_id: Option<Uuid>,
+    pub terminal_at: Option<DateTime<Utc>>,
+    pub workflow_accepted_at: Option<DateTime<Utc>>,
+    pub checkpoint_count: u64,
+    pub query_count: u64,
+    pub pending_checkpoint_repairs: u64,
+    pub pending_query_repairs: u64,
+    pub latest_query_id: Option<String>,
+    pub latest_query_name: Option<String>,
+    pub latest_query_status: Option<String>,
+    pub latest_query_consistency: Option<String>,
+    pub latest_query_requested_at: Option<DateTime<Utc>>,
+    pub latest_query_completed_at: Option<DateTime<Utc>>,
+    pub latest_query_accepted_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl StreamJobBridgeLedgerRecord {
+    pub fn parsed_operation_kind(&self) -> Option<ThroughputBridgeOperationKind> {
+        ThroughputBridgeOperationKind::parse(&self.operation_kind)
+    }
+
+    pub fn parsed_status(&self) -> Option<StreamJobBridgeHandleStatus> {
+        StreamJobBridgeHandleStatus::parse(&self.status)
+    }
+
+    pub fn parsed_latest_query_status(&self) -> Option<StreamJobQueryStatus> {
+        self.latest_query_status.as_deref().and_then(StreamJobQueryStatus::parse)
+    }
+
+    pub fn parsed_latest_query_consistency(&self) -> Option<StreamJobQueryConsistency> {
+        self.latest_query_consistency.as_deref().and_then(StreamJobQueryConsistency::parse)
+    }
+
+    pub fn pending_repairs(&self) -> Vec<ThroughputBridgeRepairKind> {
+        let mut repairs = Vec::new();
+        if self.pending_checkpoint_repairs > 0 {
+            repairs.push(ThroughputBridgeRepairKind::AcceptStreamCheckpoint);
+        }
+        if self.pending_query_repairs > 0 {
+            repairs.push(ThroughputBridgeRepairKind::AcceptStreamQuery);
+        }
+        if self.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal)
+            && self.terminal_at.is_some()
+            && self.workflow_accepted_at.is_none()
+        {
+            repairs.push(ThroughputBridgeRepairKind::AcceptStreamTerminal);
+        }
+        repairs
+    }
+
+    pub fn next_repair(&self) -> Option<ThroughputBridgeRepairKind> {
+        self.pending_repairs().into_iter().next()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamJobBridgePruneSummary {
+    pub pruned_handles: u64,
+    pub pruned_checkpoints: u64,
+    pub pruned_queries: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2641,6 +3031,8 @@ impl WorkflowStore {
             r#"
             CREATE TABLE IF NOT EXISTS throughput_bridge_progress (
                 workflow_event_id UUID PRIMARY KEY,
+                protocol_version TEXT NOT NULL DEFAULT '1',
+                operation_kind TEXT NOT NULL DEFAULT 'bulk_run',
                 tenant_id TEXT NOT NULL,
                 workflow_instance_id TEXT NOT NULL,
                 run_id TEXT NOT NULL,
@@ -2665,6 +3057,18 @@ impl WorkflowStore {
         .await
         .context("failed to initialize throughput_bridge_progress table")?;
 
+        sqlx::query(
+            "ALTER TABLE throughput_bridge_progress ADD COLUMN IF NOT EXISTS protocol_version TEXT NOT NULL DEFAULT '1'",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add throughput_bridge_progress.protocol_version")?;
+        sqlx::query(
+            "ALTER TABLE throughput_bridge_progress ADD COLUMN IF NOT EXISTS operation_kind TEXT NOT NULL DEFAULT 'bulk_run'",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add throughput_bridge_progress.operation_kind")?;
         sqlx::query(
             "ALTER TABLE throughput_bridge_progress ADD COLUMN IF NOT EXISTS command_published_at TIMESTAMPTZ",
         )
@@ -2742,6 +3146,8 @@ impl WorkflowStore {
                 workflow_version INTEGER,
                 artifact_hash TEXT,
                 batch_id TEXT NOT NULL,
+                bridge_protocol_version TEXT NOT NULL DEFAULT '1',
+                bridge_operation_kind TEXT NOT NULL DEFAULT 'bulk_run',
                 bridge_request_id TEXT NOT NULL DEFAULT '',
                 throughput_backend TEXT NOT NULL,
                 admission_mode TEXT NOT NULL DEFAULT '',
@@ -2774,6 +3180,18 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize throughput_runs backend status index")?;
+        sqlx::query(
+            "ALTER TABLE throughput_runs ADD COLUMN IF NOT EXISTS bridge_protocol_version TEXT NOT NULL DEFAULT '1'",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add throughput_runs.bridge_protocol_version")?;
+        sqlx::query(
+            "ALTER TABLE throughput_runs ADD COLUMN IF NOT EXISTS bridge_operation_kind TEXT NOT NULL DEFAULT 'bulk_run'",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add throughput_runs.bridge_operation_kind")?;
         sqlx::query(
             "ALTER TABLE throughput_runs ADD COLUMN IF NOT EXISTS execution_path TEXT NOT NULL DEFAULT ''",
         )
@@ -2859,6 +3277,231 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize throughput_terminals terminal index")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS stream_jobs (
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                handle_id TEXT NOT NULL,
+                protocol_version TEXT NOT NULL,
+                operation_kind TEXT NOT NULL,
+                workflow_event_id UUID NOT NULL,
+                bridge_request_id TEXT NOT NULL,
+                workflow_id TEXT NOT NULL,
+                workflow_version INTEGER,
+                artifact_hash TEXT,
+                job_name TEXT NOT NULL,
+                input_ref TEXT NOT NULL,
+                config_ref TEXT,
+                checkpoint_policy JSONB,
+                view_definitions JSONB,
+                status TEXT NOT NULL,
+                workflow_owner_epoch BIGINT,
+                stream_owner_epoch BIGINT,
+                starting_at TIMESTAMPTZ,
+                running_at TIMESTAMPTZ,
+                draining_at TIMESTAMPTZ,
+                latest_checkpoint_name TEXT,
+                latest_checkpoint_sequence BIGINT,
+                latest_checkpoint_at TIMESTAMPTZ,
+                latest_checkpoint_output JSONB,
+                cancellation_requested_at TIMESTAMPTZ,
+                cancellation_reason TEXT,
+                workflow_accepted_at TIMESTAMPTZ,
+                terminal_event_id UUID,
+                terminal_at TIMESTAMPTZ,
+                terminal_output JSONB,
+                terminal_error TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, workflow_instance_id, run_id, job_id),
+                UNIQUE (tenant_id, workflow_instance_id, run_id, handle_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize stream_jobs table")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS stream_jobs_run_created_idx
+            ON stream_jobs (tenant_id, workflow_instance_id, run_id, created_at, job_id)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize stream_jobs run index")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS stream_jobs_run_status_idx
+            ON stream_jobs (tenant_id, workflow_instance_id, run_id, status, updated_at, job_id)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize stream_jobs status index")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS stream_job_bridge_handles (
+                workflow_event_id UUID NOT NULL PRIMARY KEY,
+                protocol_version TEXT NOT NULL,
+                operation_kind TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                handle_id TEXT NOT NULL,
+                bridge_request_id TEXT NOT NULL,
+                workflow_id TEXT NOT NULL,
+                workflow_version INTEGER,
+                artifact_hash TEXT,
+                job_name TEXT NOT NULL,
+                input_ref TEXT NOT NULL,
+                config_ref TEXT,
+                checkpoint_policy JSONB,
+                view_definitions JSONB,
+                status TEXT NOT NULL,
+                workflow_owner_epoch BIGINT,
+                stream_owner_epoch BIGINT,
+                cancellation_requested_at TIMESTAMPTZ,
+                cancellation_reason TEXT,
+                terminal_event_id UUID,
+                terminal_at TIMESTAMPTZ,
+                workflow_accepted_at TIMESTAMPTZ,
+                terminal_output JSONB,
+                terminal_error TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                UNIQUE (tenant_id, workflow_instance_id, run_id, job_id),
+                UNIQUE (tenant_id, workflow_instance_id, run_id, handle_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize stream_job_bridge_handles table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS stream_job_bridge_checkpoints (
+                workflow_event_id UUID NOT NULL PRIMARY KEY,
+                protocol_version TEXT NOT NULL,
+                operation_kind TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                handle_id TEXT NOT NULL,
+                bridge_request_id TEXT NOT NULL,
+                await_request_id TEXT NOT NULL UNIQUE,
+                checkpoint_name TEXT NOT NULL,
+                checkpoint_sequence BIGINT,
+                status TEXT NOT NULL,
+                workflow_owner_epoch BIGINT,
+                stream_owner_epoch BIGINT,
+                reached_at TIMESTAMPTZ,
+                output JSONB,
+                accepted_at TIMESTAMPTZ,
+                cancelled_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                UNIQUE (tenant_id, workflow_instance_id, run_id, handle_id, checkpoint_name, await_request_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize stream_job_bridge_checkpoints table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS stream_job_bridge_queries (
+                workflow_event_id UUID NOT NULL PRIMARY KEY,
+                protocol_version TEXT NOT NULL,
+                operation_kind TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                handle_id TEXT NOT NULL,
+                bridge_request_id TEXT NOT NULL,
+                query_id TEXT NOT NULL UNIQUE,
+                query_name TEXT NOT NULL,
+                query_args JSONB,
+                consistency TEXT NOT NULL,
+                status TEXT NOT NULL,
+                workflow_owner_epoch BIGINT,
+                stream_owner_epoch BIGINT,
+                output JSONB,
+                error TEXT,
+                requested_at TIMESTAMPTZ NOT NULL,
+                completed_at TIMESTAMPTZ,
+                accepted_at TIMESTAMPTZ,
+                cancelled_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                UNIQUE (tenant_id, workflow_instance_id, run_id, handle_id, query_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize stream_job_bridge_queries table")?;
+
+        sqlx::query(
+            "ALTER TABLE stream_job_bridge_handles ADD COLUMN IF NOT EXISTS workflow_accepted_at TIMESTAMPTZ",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add stream_job_bridge_handles.workflow_accepted_at")?;
+        sqlx::query(
+            "ALTER TABLE stream_job_bridge_handles ADD COLUMN IF NOT EXISTS terminal_output JSONB",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add stream_job_bridge_handles.terminal_output")?;
+        sqlx::query(
+            "ALTER TABLE stream_job_bridge_handles ADD COLUMN IF NOT EXISTS terminal_error TEXT",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add stream_job_bridge_handles.terminal_error")?;
+        sqlx::query(
+            "ALTER TABLE stream_job_bridge_handles ADD COLUMN IF NOT EXISTS checkpoint_policy JSONB",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add stream_job_bridge_handles.checkpoint_policy")?;
+        sqlx::query(
+            "ALTER TABLE stream_job_bridge_handles ADD COLUMN IF NOT EXISTS view_definitions JSONB",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add stream_job_bridge_handles.view_definitions")?;
+        sqlx::query(
+            "ALTER TABLE stream_job_bridge_checkpoints ADD COLUMN IF NOT EXISTS output JSONB",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add stream_job_bridge_checkpoints.output")?;
+        sqlx::query(
+            "ALTER TABLE stream_jobs ADD COLUMN IF NOT EXISTS checkpoint_policy JSONB",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add stream_jobs.checkpoint_policy")?;
+        sqlx::query(
+            "ALTER TABLE stream_jobs ADD COLUMN IF NOT EXISTS view_definitions JSONB",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add stream_jobs.view_definitions")?;
 
         sqlx::query(
             r#"
@@ -14422,6 +15065,8 @@ impl WorkflowStore {
     pub async fn upsert_throughput_bridge_submission(
         &self,
         workflow_event_id: Uuid,
+        protocol_version: &str,
+        operation_kind: ThroughputBridgeOperationKind,
         tenant_id: &str,
         instance_id: &str,
         run_id: &str,
@@ -14438,6 +15083,8 @@ impl WorkflowStore {
             r#"
             INSERT INTO throughput_bridge_progress (
                 workflow_event_id,
+                protocol_version,
+                operation_kind,
                 tenant_id,
                 workflow_instance_id,
                 run_id,
@@ -14456,9 +15103,11 @@ impl WorkflowStore {
                 cancel_command_published_at,
                 cancelled_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, NULL, NULL, NULL, NULL, NULL)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14, NULL, NULL, NULL, NULL, NULL)
             ON CONFLICT (workflow_event_id) DO UPDATE
-            SET tenant_id = EXCLUDED.tenant_id,
+            SET protocol_version = EXCLUDED.protocol_version,
+                operation_kind = EXCLUDED.operation_kind,
+                tenant_id = EXCLUDED.tenant_id,
                 workflow_instance_id = EXCLUDED.workflow_instance_id,
                 run_id = EXCLUDED.run_id,
                 batch_id = EXCLUDED.batch_id,
@@ -14474,6 +15123,8 @@ impl WorkflowStore {
             "#,
         )
         .bind(workflow_event_id)
+        .bind(protocol_version)
+        .bind(operation_kind.as_str())
         .bind(tenant_id)
         .bind(instance_id)
         .bind(run_id)
@@ -14505,6 +15156,8 @@ impl WorkflowStore {
         Ok(self
             .upsert_throughput_bridge_submission(
                 workflow_event_id,
+                THROUGHPUT_BRIDGE_PROTOCOL_VERSION,
+                ThroughputBridgeOperationKind::BulkRun,
                 tenant_id,
                 instance_id,
                 run_id,
@@ -14525,26 +15178,36 @@ impl WorkflowStore {
         workflow_event_id: Uuid,
         published_at: DateTime<Utc>,
     ) -> Result<()> {
-        let published = ThroughputBridgeSubmissionStatus::Published.as_str();
-        let cancellation_requested =
-            ThroughputBridgeSubmissionStatus::CancellationRequested.as_str();
+        let Some(current) = self.get_throughput_bridge_progress(workflow_event_id).await? else {
+            return Ok(());
+        };
+        let current_status = current.parsed_submission_status().ok_or_else(|| {
+            anyhow::anyhow!("invalid throughput bridge submission status for {workflow_event_id}")
+        })?;
+        let next = if current.cancellation_requested_at.is_some() {
+            ThroughputBridgeSubmissionStatus::CancellationRequested
+        } else {
+            ThroughputBridgeSubmissionStatus::Published
+        };
+        if !current_status.can_transition_to(next) {
+            anyhow::bail!(
+                "invalid throughput bridge submission transition {} -> {} for {workflow_event_id}",
+                current_status.as_str(),
+                next.as_str()
+            );
+        }
         sqlx::query(
             r#"
             UPDATE throughput_bridge_progress
             SET command_published_at = COALESCE(command_published_at, $2),
-                submission_status = CASE
-                    WHEN cancelled_at IS NULL AND cancellation_requested_at IS NULL THEN $3
-                    WHEN cancelled_at IS NULL THEN $4
-                    ELSE submission_status
-                END,
+                submission_status = $3,
                 updated_at = $2
             WHERE workflow_event_id = $1
             "#,
         )
         .bind(workflow_event_id)
         .bind(published_at)
-        .bind(published)
-        .bind(cancellation_requested)
+        .bind(next.as_str())
         .execute(&self.pool)
         .await
         .context("failed to mark throughput bridge command published")?;
@@ -14556,24 +15219,32 @@ impl WorkflowStore {
         workflow_event_id: Uuid,
         published_at: DateTime<Utc>,
     ) -> Result<()> {
-        let cancellation_requested =
-            ThroughputBridgeSubmissionStatus::CancellationRequested.as_str();
+        let Some(current) = self.get_throughput_bridge_progress(workflow_event_id).await? else {
+            return Ok(());
+        };
+        let current_status = current.parsed_submission_status().ok_or_else(|| {
+            anyhow::anyhow!("invalid throughput bridge submission status for {workflow_event_id}")
+        })?;
+        let next = ThroughputBridgeSubmissionStatus::CancellationRequested;
+        if !current_status.can_transition_to(next) {
+            anyhow::bail!(
+                "invalid throughput bridge submission transition {} -> {} for {workflow_event_id}",
+                current_status.as_str(),
+                next.as_str()
+            );
+        }
         sqlx::query(
             r#"
             UPDATE throughput_bridge_progress
             SET cancel_command_published_at = COALESCE(cancel_command_published_at, $2),
-                submission_status = CASE
-                    WHEN cancelled_at IS NULL AND cancellation_requested_at IS NOT NULL
-                        THEN $3
-                    ELSE submission_status
-                END,
+                submission_status = $3,
                 updated_at = $2
             WHERE workflow_event_id = $1
             "#,
         )
         .bind(workflow_event_id)
         .bind(published_at)
-        .bind(cancellation_requested)
+        .bind(next.as_str())
         .execute(&self.pool)
         .await
         .context("failed to mark throughput bridge cancel command published")?;
@@ -14586,10 +15257,24 @@ impl WorkflowStore {
         requested_at: DateTime<Utc>,
         reason: &str,
     ) -> Result<Option<ThroughputBridgeProgressRecord>> {
-        let cancelled_before_publish =
-            ThroughputBridgeSubmissionStatus::CancelledBeforePublish.as_str();
-        let cancellation_requested =
-            ThroughputBridgeSubmissionStatus::CancellationRequested.as_str();
+        let Some(current) = self.get_throughput_bridge_progress(workflow_event_id).await? else {
+            return Ok(None);
+        };
+        let current_status = current.parsed_submission_status().ok_or_else(|| {
+            anyhow::anyhow!("invalid throughput bridge submission status for {workflow_event_id}")
+        })?;
+        let next = if current.command_published_at.is_none() {
+            ThroughputBridgeSubmissionStatus::CancelledBeforePublish
+        } else {
+            ThroughputBridgeSubmissionStatus::CancellationRequested
+        };
+        if !current_status.can_transition_to(next) {
+            anyhow::bail!(
+                "invalid throughput bridge submission transition {} -> {} for {workflow_event_id}",
+                current_status.as_str(),
+                next.as_str()
+            );
+        }
         let row = sqlx::query(
             r#"
             UPDATE throughput_bridge_progress
@@ -14599,10 +15284,7 @@ impl WorkflowStore {
                     WHEN command_published_at IS NULL THEN COALESCE(cancelled_at, $2)
                     ELSE cancelled_at
                 END,
-                submission_status = CASE
-                    WHEN command_published_at IS NULL THEN $4
-                    ELSE $5
-                END,
+                submission_status = $4,
                 updated_at = $2
             WHERE workflow_event_id = $1
             RETURNING *
@@ -14611,8 +15293,7 @@ impl WorkflowStore {
         .bind(workflow_event_id)
         .bind(requested_at)
         .bind(reason)
-        .bind(cancelled_before_publish)
-        .bind(cancellation_requested)
+        .bind(next.as_str())
         .fetch_optional(&self.pool)
         .await
         .context("failed to request throughput bridge cancellation")?;
@@ -14673,34 +15354,91 @@ impl WorkflowStore {
         run_id: &str,
         batch_id: &str,
     ) -> Result<Option<ThroughputBridgeBatchStateRecord>> {
-        let Some(run) = self.get_throughput_run(tenant_id, instance_id, run_id, batch_id).await?
+        let Some(ledger) = self
+            .load_throughput_bridge_ledger_for_batch(tenant_id, instance_id, run_id, batch_id)
+            .await?
         else {
             return Ok(None);
         };
-        let progress = self
-            .get_throughput_bridge_progress_for_batch(tenant_id, instance_id, run_id, batch_id)
-            .await?;
         Ok(Some(ThroughputBridgeBatchStateRecord {
-            batch_id: run.batch_id,
-            bridge_request_id: run.bridge_request_id,
-            submission_status: progress.as_ref().map(|record| record.submission_status.clone()),
-            stream_status: run.status,
-            stream_terminal_at: run.terminal_at,
-            cancellation_requested_at: progress
-                .as_ref()
-                .and_then(|record| record.cancellation_requested_at),
-            cancellation_reason: progress
-                .as_ref()
-                .and_then(|record| record.cancellation_reason.clone()),
-            cancel_command_published_at: progress
-                .as_ref()
-                .and_then(|record| record.cancel_command_published_at),
-            cancelled_at: progress.as_ref().and_then(|record| record.cancelled_at),
-            workflow_status: run.bridge_terminal_status,
-            workflow_terminal_event_id: run.bridge_terminal_event_id,
-            workflow_owner_epoch: run.bridge_terminal_owner_epoch,
-            workflow_accepted_at: run.bridge_terminal_accepted_at,
+            workflow_event_id: ledger.workflow_event_id,
+            batch_id: ledger.batch_id,
+            protocol_version: ledger.protocol_version,
+            operation_kind: ledger.operation_kind,
+            bridge_request_id: ledger.bridge_request_id,
+            submission_status: ledger.submission_status,
+            command_id: ledger.command_id,
+            command_partition_key: ledger.command_partition_key,
+            stream_status: ledger.stream_status.unwrap_or_else(|| "missing".to_owned()),
+            stream_terminal_at: ledger.stream_terminal_at,
+            cancellation_requested_at: ledger.cancellation_requested_at,
+            cancellation_reason: ledger.cancellation_reason,
+            cancel_command_published_at: ledger.cancel_command_published_at,
+            cancelled_at: ledger.cancelled_at,
+            workflow_status: ledger.workflow_status,
+            workflow_terminal_event_id: ledger.workflow_terminal_event_id,
+            workflow_owner_epoch: ledger.workflow_owner_epoch,
+            workflow_accepted_at: ledger.workflow_accepted_at,
         }))
+    }
+
+    pub async fn load_throughput_bridge_ledger_for_batch(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+    ) -> Result<Option<ThroughputBridgeLedgerRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                p.workflow_event_id,
+                COALESCE(p.protocol_version, r.bridge_protocol_version, '1') AS protocol_version,
+                COALESCE(p.operation_kind, r.bridge_operation_kind, 'bulk_run') AS operation_kind,
+                COALESCE(p.tenant_id, r.tenant_id) AS tenant_id,
+                COALESCE(p.workflow_instance_id, r.workflow_instance_id) AS workflow_instance_id,
+                COALESCE(p.run_id, r.run_id) AS run_id,
+                COALESCE(p.batch_id, r.batch_id) AS batch_id,
+                COALESCE(p.throughput_backend, r.throughput_backend) AS throughput_backend,
+                COALESCE(NULLIF(p.bridge_request_id, ''), NULLIF(r.bridge_request_id, ''), '') AS bridge_request_id,
+                p.submission_status,
+                p.command_id,
+                p.command_partition_key,
+                p.command_published_at,
+                p.cancellation_requested_at,
+                p.cancellation_reason,
+                p.cancel_command_published_at,
+                p.cancelled_at,
+                r.status AS stream_status,
+                r.terminal_at AS stream_terminal_at,
+                r.bridge_terminal_status AS workflow_status,
+                r.bridge_terminal_event_id AS workflow_terminal_event_id,
+                r.bridge_terminal_owner_epoch AS workflow_owner_epoch,
+                r.bridge_terminal_accepted_at AS workflow_accepted_at,
+                COALESCE(p.created_at, r.created_at) AS created_at,
+                GREATEST(COALESCE(p.updated_at, p.created_at), COALESCE(r.updated_at, r.created_at)) AS updated_at
+            FROM throughput_runs r
+            LEFT JOIN throughput_bridge_progress p
+              ON p.tenant_id = r.tenant_id
+             AND p.workflow_instance_id = r.workflow_instance_id
+             AND p.run_id = r.run_id
+             AND p.batch_id = r.batch_id
+            WHERE r.tenant_id = $1
+              AND r.workflow_instance_id = $2
+              AND r.run_id = $3
+              AND r.batch_id = $4
+            ORDER BY p.created_at DESC NULLS LAST
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load throughput bridge ledger for batch")?;
+        row.map(Self::decode_throughput_bridge_ledger_row).transpose()
     }
 
     pub async fn list_pending_throughput_bridge_submissions_for_backend(
@@ -14759,6 +15497,995 @@ impl WorkflowStore {
         rows.into_iter().map(Self::decode_throughput_bridge_progress_row).collect()
     }
 
+    pub async fn list_pending_throughput_bridge_repairs_for_backend(
+        &self,
+        throughput_backend: &str,
+        limit: usize,
+    ) -> Result<Vec<ThroughputBridgeLedgerRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                p.workflow_event_id,
+                COALESCE(p.protocol_version, r.bridge_protocol_version, '1') AS protocol_version,
+                COALESCE(p.operation_kind, r.bridge_operation_kind, 'bulk_run') AS operation_kind,
+                COALESCE(p.tenant_id, r.tenant_id) AS tenant_id,
+                COALESCE(p.workflow_instance_id, r.workflow_instance_id) AS workflow_instance_id,
+                COALESCE(p.run_id, r.run_id) AS run_id,
+                COALESCE(p.batch_id, r.batch_id) AS batch_id,
+                COALESCE(p.throughput_backend, r.throughput_backend) AS throughput_backend,
+                COALESCE(NULLIF(p.bridge_request_id, ''), NULLIF(r.bridge_request_id, ''), '') AS bridge_request_id,
+                p.submission_status,
+                p.command_id,
+                p.command_partition_key,
+                p.command_published_at,
+                p.cancellation_requested_at,
+                p.cancellation_reason,
+                p.cancel_command_published_at,
+                p.cancelled_at,
+                r.status AS stream_status,
+                r.terminal_at AS stream_terminal_at,
+                r.bridge_terminal_status AS workflow_status,
+                r.bridge_terminal_event_id AS workflow_terminal_event_id,
+                r.bridge_terminal_owner_epoch AS workflow_owner_epoch,
+                r.bridge_terminal_accepted_at AS workflow_accepted_at,
+                COALESCE(p.created_at, r.created_at) AS created_at,
+                GREATEST(COALESCE(p.updated_at, p.created_at), COALESCE(r.updated_at, r.created_at)) AS updated_at
+            FROM throughput_runs r
+            LEFT JOIN throughput_bridge_progress p
+              ON p.tenant_id = r.tenant_id
+             AND p.workflow_instance_id = r.workflow_instance_id
+             AND p.run_id = r.run_id
+             AND p.batch_id = r.batch_id
+            WHERE r.throughput_backend = $1
+            ORDER BY COALESCE(r.terminal_at, p.cancellation_requested_at, p.created_at, r.created_at) ASC,
+                     r.batch_id ASC
+            LIMIT $2
+            "#,
+        )
+        .bind(throughput_backend)
+        .bind(i64::try_from(limit.max(1)).context("bridge repair limit exceeds i64")?)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list pending throughput bridge repairs")?;
+        let mut ledgers = Vec::new();
+        for row in rows {
+            let ledger = Self::decode_throughput_bridge_ledger_row(row)?;
+            if ledger.next_repair().is_some() {
+                ledgers.push(ledger);
+            }
+        }
+        Ok(ledgers)
+    }
+
+    pub async fn upsert_stream_job(&self, job: &StreamJobRecord) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO stream_jobs (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                job_id,
+                handle_id,
+                protocol_version,
+                operation_kind,
+                workflow_event_id,
+                bridge_request_id,
+                workflow_id,
+                workflow_version,
+                artifact_hash,
+                job_name,
+                input_ref,
+                config_ref,
+                checkpoint_policy,
+                view_definitions,
+                status,
+                workflow_owner_epoch,
+                stream_owner_epoch,
+                starting_at,
+                running_at,
+                draining_at,
+                latest_checkpoint_name,
+                latest_checkpoint_sequence,
+                latest_checkpoint_at,
+                latest_checkpoint_output,
+                cancellation_requested_at,
+                cancellation_reason,
+                workflow_accepted_at,
+                terminal_event_id,
+                terminal_at,
+                terminal_output,
+                terminal_error,
+                created_at,
+                updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32,
+                $33, $34, $35, $36
+            )
+            ON CONFLICT (tenant_id, workflow_instance_id, run_id, job_id) DO UPDATE SET
+                handle_id = EXCLUDED.handle_id,
+                protocol_version = EXCLUDED.protocol_version,
+                operation_kind = EXCLUDED.operation_kind,
+                workflow_event_id = EXCLUDED.workflow_event_id,
+                bridge_request_id = EXCLUDED.bridge_request_id,
+                workflow_id = EXCLUDED.workflow_id,
+                workflow_version = EXCLUDED.workflow_version,
+                artifact_hash = EXCLUDED.artifact_hash,
+                job_name = EXCLUDED.job_name,
+                input_ref = EXCLUDED.input_ref,
+                config_ref = EXCLUDED.config_ref,
+                checkpoint_policy = EXCLUDED.checkpoint_policy,
+                view_definitions = EXCLUDED.view_definitions,
+                status = EXCLUDED.status,
+                workflow_owner_epoch = EXCLUDED.workflow_owner_epoch,
+                stream_owner_epoch = EXCLUDED.stream_owner_epoch,
+                starting_at = EXCLUDED.starting_at,
+                running_at = EXCLUDED.running_at,
+                draining_at = EXCLUDED.draining_at,
+                latest_checkpoint_name = EXCLUDED.latest_checkpoint_name,
+                latest_checkpoint_sequence = EXCLUDED.latest_checkpoint_sequence,
+                latest_checkpoint_at = EXCLUDED.latest_checkpoint_at,
+                latest_checkpoint_output = EXCLUDED.latest_checkpoint_output,
+                cancellation_requested_at = EXCLUDED.cancellation_requested_at,
+                cancellation_reason = EXCLUDED.cancellation_reason,
+                workflow_accepted_at = EXCLUDED.workflow_accepted_at,
+                terminal_event_id = EXCLUDED.terminal_event_id,
+                terminal_at = EXCLUDED.terminal_at,
+                terminal_output = EXCLUDED.terminal_output,
+                terminal_error = EXCLUDED.terminal_error,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(&job.tenant_id)
+        .bind(&job.instance_id)
+        .bind(&job.run_id)
+        .bind(&job.job_id)
+        .bind(&job.handle_id)
+        .bind(&job.protocol_version)
+        .bind(&job.operation_kind)
+        .bind(job.workflow_event_id)
+        .bind(&job.bridge_request_id)
+        .bind(&job.definition_id)
+        .bind(job.definition_version.map(|value| value as i32))
+        .bind(&job.artifact_hash)
+        .bind(&job.job_name)
+        .bind(&job.input_ref)
+        .bind(&job.config_ref)
+        .bind(job.checkpoint_policy.as_ref().map(Json))
+        .bind(job.view_definitions.as_ref().map(Json))
+        .bind(&job.status)
+        .bind(job.workflow_owner_epoch.map(|value| value as i64))
+        .bind(job.stream_owner_epoch.map(|value| value as i64))
+        .bind(job.starting_at)
+        .bind(job.running_at)
+        .bind(job.draining_at)
+        .bind(&job.latest_checkpoint_name)
+        .bind(job.latest_checkpoint_sequence)
+        .bind(job.latest_checkpoint_at)
+        .bind(job.latest_checkpoint_output.as_ref().map(Json))
+        .bind(job.cancellation_requested_at)
+        .bind(&job.cancellation_reason)
+        .bind(job.workflow_accepted_at)
+        .bind(job.terminal_event_id)
+        .bind(job.terminal_at)
+        .bind(job.terminal_output.as_ref().map(Json))
+        .bind(&job.terminal_error)
+        .bind(job.created_at)
+        .bind(job.updated_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert stream job")?;
+        Ok(())
+    }
+
+    pub async fn get_stream_job(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        job_id: &str,
+    ) -> Result<Option<StreamJobRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_jobs
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND job_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load stream job")?;
+        row.map(Self::decode_stream_job_row).transpose()
+    }
+
+    pub async fn list_stream_jobs_for_run_page(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StreamJobRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_jobs
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+            ORDER BY created_at ASC, job_id ASC
+            LIMIT $4
+            OFFSET $5
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list stream jobs")?;
+        rows.into_iter().map(Self::decode_stream_job_row).collect()
+    }
+
+    pub async fn upsert_stream_job_bridge_handle(
+        &self,
+        handle: &StreamJobBridgeHandleRecord,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO stream_job_bridge_handles (
+                workflow_event_id,
+                protocol_version,
+                operation_kind,
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                job_id,
+                handle_id,
+                bridge_request_id,
+                workflow_id,
+                workflow_version,
+                artifact_hash,
+                job_name,
+                input_ref,
+                config_ref,
+                checkpoint_policy,
+                view_definitions,
+                status,
+                workflow_owner_epoch,
+                stream_owner_epoch,
+                cancellation_requested_at,
+                cancellation_reason,
+                terminal_event_id,
+                terminal_at,
+                workflow_accepted_at,
+                terminal_output,
+                terminal_error,
+                created_at,
+                updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29
+            )
+            ON CONFLICT (workflow_event_id) DO UPDATE SET
+                protocol_version = EXCLUDED.protocol_version,
+                operation_kind = EXCLUDED.operation_kind,
+                tenant_id = EXCLUDED.tenant_id,
+                workflow_instance_id = EXCLUDED.workflow_instance_id,
+                run_id = EXCLUDED.run_id,
+                job_id = EXCLUDED.job_id,
+                handle_id = EXCLUDED.handle_id,
+                bridge_request_id = EXCLUDED.bridge_request_id,
+                workflow_id = EXCLUDED.workflow_id,
+                workflow_version = EXCLUDED.workflow_version,
+                artifact_hash = EXCLUDED.artifact_hash,
+                job_name = EXCLUDED.job_name,
+                input_ref = EXCLUDED.input_ref,
+                config_ref = EXCLUDED.config_ref,
+                checkpoint_policy = EXCLUDED.checkpoint_policy,
+                view_definitions = EXCLUDED.view_definitions,
+                status = EXCLUDED.status,
+                workflow_owner_epoch = EXCLUDED.workflow_owner_epoch,
+                stream_owner_epoch = EXCLUDED.stream_owner_epoch,
+                cancellation_requested_at = EXCLUDED.cancellation_requested_at,
+                cancellation_reason = EXCLUDED.cancellation_reason,
+                terminal_event_id = EXCLUDED.terminal_event_id,
+                terminal_at = EXCLUDED.terminal_at,
+                workflow_accepted_at = EXCLUDED.workflow_accepted_at,
+                terminal_output = EXCLUDED.terminal_output,
+                terminal_error = EXCLUDED.terminal_error,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(handle.workflow_event_id)
+        .bind(&handle.protocol_version)
+        .bind(&handle.operation_kind)
+        .bind(&handle.tenant_id)
+        .bind(&handle.instance_id)
+        .bind(&handle.run_id)
+        .bind(&handle.job_id)
+        .bind(&handle.handle_id)
+        .bind(&handle.bridge_request_id)
+        .bind(&handle.definition_id)
+        .bind(handle.definition_version.map(|value| value as i32))
+        .bind(&handle.artifact_hash)
+        .bind(&handle.job_name)
+        .bind(&handle.input_ref)
+        .bind(&handle.config_ref)
+        .bind(handle.checkpoint_policy.as_ref().map(Json))
+        .bind(handle.view_definitions.as_ref().map(Json))
+        .bind(&handle.status)
+        .bind(handle.workflow_owner_epoch.map(|value| value as i64))
+        .bind(handle.stream_owner_epoch.map(|value| value as i64))
+        .bind(handle.cancellation_requested_at)
+        .bind(&handle.cancellation_reason)
+        .bind(handle.terminal_event_id)
+        .bind(handle.terminal_at)
+        .bind(handle.workflow_accepted_at)
+        .bind(handle.terminal_output.as_ref().map(Json))
+        .bind(&handle.terminal_error)
+        .bind(handle.created_at)
+        .bind(handle.updated_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert stream job bridge handle")?;
+        Ok(())
+    }
+
+    pub async fn get_stream_job_bridge_handle(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        job_id: &str,
+    ) -> Result<Option<StreamJobBridgeHandleRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_job_bridge_handles
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND job_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load stream job bridge handle")?;
+        row.map(Self::decode_stream_job_bridge_handle_row).transpose()
+    }
+
+    pub async fn get_stream_job_bridge_handle_by_handle_id(
+        &self,
+        handle_id: &str,
+    ) -> Result<Option<StreamJobBridgeHandleRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_job_bridge_handles
+            WHERE handle_id = $1
+            "#,
+        )
+        .bind(handle_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load stream job bridge handle by handle id")?;
+        row.map(Self::decode_stream_job_bridge_handle_row).transpose()
+    }
+
+    pub async fn list_stream_job_bridge_handles_for_run_page(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StreamJobBridgeHandleRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_job_bridge_handles
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+            ORDER BY created_at ASC, job_id ASC
+            LIMIT $4
+            OFFSET $5
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list stream job bridge handles")?;
+        rows.into_iter().map(Self::decode_stream_job_bridge_handle_row).collect()
+    }
+
+    pub async fn upsert_stream_job_bridge_checkpoint(
+        &self,
+        checkpoint: &StreamJobCheckpointRecord,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO stream_job_bridge_checkpoints (
+                workflow_event_id,
+                protocol_version,
+                operation_kind,
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                job_id,
+                handle_id,
+                bridge_request_id,
+                await_request_id,
+                checkpoint_name,
+                checkpoint_sequence,
+                status,
+                workflow_owner_epoch,
+                stream_owner_epoch,
+                reached_at,
+                output,
+                accepted_at,
+                cancelled_at,
+                created_at,
+                updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                $18, $19, $20, $21
+            )
+            ON CONFLICT (workflow_event_id) DO UPDATE SET
+                protocol_version = EXCLUDED.protocol_version,
+                operation_kind = EXCLUDED.operation_kind,
+                tenant_id = EXCLUDED.tenant_id,
+                workflow_instance_id = EXCLUDED.workflow_instance_id,
+                run_id = EXCLUDED.run_id,
+                job_id = EXCLUDED.job_id,
+                handle_id = EXCLUDED.handle_id,
+                bridge_request_id = EXCLUDED.bridge_request_id,
+                await_request_id = EXCLUDED.await_request_id,
+                checkpoint_name = EXCLUDED.checkpoint_name,
+                checkpoint_sequence = EXCLUDED.checkpoint_sequence,
+                status = EXCLUDED.status,
+                workflow_owner_epoch = EXCLUDED.workflow_owner_epoch,
+                stream_owner_epoch = EXCLUDED.stream_owner_epoch,
+                reached_at = EXCLUDED.reached_at,
+                output = EXCLUDED.output,
+                accepted_at = EXCLUDED.accepted_at,
+                cancelled_at = EXCLUDED.cancelled_at,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(checkpoint.workflow_event_id)
+        .bind(&checkpoint.protocol_version)
+        .bind(&checkpoint.operation_kind)
+        .bind(&checkpoint.tenant_id)
+        .bind(&checkpoint.instance_id)
+        .bind(&checkpoint.run_id)
+        .bind(&checkpoint.job_id)
+        .bind(&checkpoint.handle_id)
+        .bind(&checkpoint.bridge_request_id)
+        .bind(&checkpoint.await_request_id)
+        .bind(&checkpoint.checkpoint_name)
+        .bind(checkpoint.checkpoint_sequence)
+        .bind(&checkpoint.status)
+        .bind(checkpoint.workflow_owner_epoch.map(|value| value as i64))
+        .bind(checkpoint.stream_owner_epoch.map(|value| value as i64))
+        .bind(checkpoint.reached_at)
+        .bind(checkpoint.output.as_ref().map(Json))
+        .bind(checkpoint.accepted_at)
+        .bind(checkpoint.cancelled_at)
+        .bind(checkpoint.created_at)
+        .bind(checkpoint.updated_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert stream job bridge checkpoint")?;
+        Ok(())
+    }
+
+    pub async fn get_stream_job_bridge_checkpoint(
+        &self,
+        await_request_id: &str,
+    ) -> Result<Option<StreamJobCheckpointRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_job_bridge_checkpoints
+            WHERE await_request_id = $1
+            "#,
+        )
+        .bind(await_request_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load stream job bridge checkpoint")?;
+        row.map(Self::decode_stream_job_bridge_checkpoint_row).transpose()
+    }
+
+    pub async fn list_stream_job_bridge_checkpoints_for_handle_page(
+        &self,
+        handle_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StreamJobCheckpointRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_job_bridge_checkpoints
+            WHERE handle_id = $1
+            ORDER BY created_at ASC, checkpoint_name ASC, await_request_id ASC
+            LIMIT $2
+            OFFSET $3
+            "#,
+        )
+        .bind(handle_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list stream job bridge checkpoints")?;
+        rows.into_iter().map(Self::decode_stream_job_bridge_checkpoint_row).collect()
+    }
+
+    pub async fn upsert_stream_job_bridge_query(
+        &self,
+        query_record: &StreamJobQueryRecord,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO stream_job_bridge_queries (
+                workflow_event_id,
+                protocol_version,
+                operation_kind,
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                job_id,
+                handle_id,
+                bridge_request_id,
+                query_id,
+                query_name,
+                query_args,
+                consistency,
+                status,
+                workflow_owner_epoch,
+                stream_owner_epoch,
+                output,
+                error,
+                requested_at,
+                completed_at,
+                accepted_at,
+                cancelled_at,
+                created_at,
+                updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                $18, $19, $20, $21, $22, $23, $24
+            )
+            ON CONFLICT (workflow_event_id) DO UPDATE SET
+                protocol_version = EXCLUDED.protocol_version,
+                operation_kind = EXCLUDED.operation_kind,
+                tenant_id = EXCLUDED.tenant_id,
+                workflow_instance_id = EXCLUDED.workflow_instance_id,
+                run_id = EXCLUDED.run_id,
+                job_id = EXCLUDED.job_id,
+                handle_id = EXCLUDED.handle_id,
+                bridge_request_id = EXCLUDED.bridge_request_id,
+                query_id = EXCLUDED.query_id,
+                query_name = EXCLUDED.query_name,
+                query_args = EXCLUDED.query_args,
+                consistency = EXCLUDED.consistency,
+                status = EXCLUDED.status,
+                workflow_owner_epoch = EXCLUDED.workflow_owner_epoch,
+                stream_owner_epoch = EXCLUDED.stream_owner_epoch,
+                output = EXCLUDED.output,
+                error = EXCLUDED.error,
+                requested_at = EXCLUDED.requested_at,
+                completed_at = EXCLUDED.completed_at,
+                accepted_at = EXCLUDED.accepted_at,
+                cancelled_at = EXCLUDED.cancelled_at,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(query_record.workflow_event_id)
+        .bind(&query_record.protocol_version)
+        .bind(&query_record.operation_kind)
+        .bind(&query_record.tenant_id)
+        .bind(&query_record.instance_id)
+        .bind(&query_record.run_id)
+        .bind(&query_record.job_id)
+        .bind(&query_record.handle_id)
+        .bind(&query_record.bridge_request_id)
+        .bind(&query_record.query_id)
+        .bind(&query_record.query_name)
+        .bind(query_record.query_args.as_ref().map(Json))
+        .bind(&query_record.consistency)
+        .bind(&query_record.status)
+        .bind(query_record.workflow_owner_epoch.map(|value| value as i64))
+        .bind(query_record.stream_owner_epoch.map(|value| value as i64))
+        .bind(query_record.output.as_ref().map(Json))
+        .bind(&query_record.error)
+        .bind(query_record.requested_at)
+        .bind(query_record.completed_at)
+        .bind(query_record.accepted_at)
+        .bind(query_record.cancelled_at)
+        .bind(query_record.created_at)
+        .bind(query_record.updated_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert stream job bridge query")?;
+        Ok(())
+    }
+
+    pub async fn get_stream_job_bridge_query(
+        &self,
+        query_id: &str,
+    ) -> Result<Option<StreamJobQueryRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_job_bridge_queries
+            WHERE query_id = $1
+            "#,
+        )
+        .bind(query_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load stream job bridge query")?;
+        row.map(Self::decode_stream_job_bridge_query_row).transpose()
+    }
+
+    pub async fn list_stream_job_bridge_queries_for_handle_page(
+        &self,
+        handle_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StreamJobQueryRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_job_bridge_queries
+            WHERE handle_id = $1
+            ORDER BY created_at ASC, query_name ASC, query_id ASC
+            LIMIT $2
+            OFFSET $3
+            "#,
+        )
+        .bind(handle_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list stream job bridge queries")?;
+        rows.into_iter().map(Self::decode_stream_job_bridge_query_row).collect()
+    }
+
+    pub async fn load_stream_job_bridge_ledger_for_handle(
+        &self,
+        handle_id: &str,
+    ) -> Result<Option<StreamJobBridgeLedgerRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                h.workflow_event_id,
+                COALESCE(NULLIF(h.protocol_version, ''), '1') AS protocol_version,
+                COALESCE(NULLIF(h.operation_kind, ''), 'stream_job') AS operation_kind,
+                h.tenant_id,
+                h.workflow_instance_id,
+                h.run_id,
+                h.job_id,
+                h.handle_id,
+                h.bridge_request_id,
+                h.workflow_id,
+                h.workflow_version,
+                h.artifact_hash,
+                h.job_name,
+                h.input_ref,
+                h.config_ref,
+                h.status,
+                h.workflow_owner_epoch,
+                h.stream_owner_epoch,
+                h.cancellation_requested_at,
+                h.cancellation_reason,
+                h.terminal_event_id,
+                h.terminal_at,
+                h.workflow_accepted_at,
+                COALESCE(checkpoints.checkpoint_count, 0) AS checkpoint_count,
+                COALESCE(checkpoints.pending_checkpoint_repairs, 0) AS pending_checkpoint_repairs,
+                COALESCE(queries.query_count, 0) AS query_count,
+                COALESCE(queries.pending_query_repairs, 0) AS pending_query_repairs,
+                latest_query.query_id AS latest_query_id,
+                latest_query.query_name AS latest_query_name,
+                latest_query.status AS latest_query_status,
+                latest_query.consistency AS latest_query_consistency,
+                latest_query.requested_at AS latest_query_requested_at,
+                latest_query.completed_at AS latest_query_completed_at,
+                latest_query.accepted_at AS latest_query_accepted_at,
+                h.created_at,
+                h.updated_at
+            FROM stream_job_bridge_handles h
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) AS checkpoint_count,
+                    COUNT(*) FILTER (
+                        WHERE status = 'reached'
+                          AND accepted_at IS NULL
+                          AND cancelled_at IS NULL
+                    ) AS pending_checkpoint_repairs
+                FROM stream_job_bridge_checkpoints c
+                WHERE c.handle_id = h.handle_id
+            ) checkpoints ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) AS query_count,
+                    COUNT(*) FILTER (
+                        WHERE status IN ('completed', 'failed')
+                          AND accepted_at IS NULL
+                          AND cancelled_at IS NULL
+                    ) AS pending_query_repairs
+                FROM stream_job_bridge_queries q
+                WHERE q.handle_id = h.handle_id
+            ) queries ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    q.query_id,
+                    q.query_name,
+                    q.status,
+                    q.consistency,
+                    q.requested_at,
+                    q.completed_at,
+                    q.accepted_at
+                FROM stream_job_bridge_queries q
+                WHERE q.handle_id = h.handle_id
+                ORDER BY COALESCE(q.accepted_at, q.completed_at, q.requested_at) DESC,
+                         q.query_id DESC
+                LIMIT 1
+            ) latest_query ON TRUE
+            WHERE h.handle_id = $1
+            "#,
+        )
+        .bind(handle_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load stream job bridge ledger for handle")?;
+        row.map(Self::decode_stream_job_bridge_ledger_row).transpose()
+    }
+
+    pub async fn list_stream_job_bridge_ledgers_for_run_page(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StreamJobBridgeLedgerRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                h.workflow_event_id,
+                COALESCE(NULLIF(h.protocol_version, ''), '1') AS protocol_version,
+                COALESCE(NULLIF(h.operation_kind, ''), 'stream_job') AS operation_kind,
+                h.tenant_id,
+                h.workflow_instance_id,
+                h.run_id,
+                h.job_id,
+                h.handle_id,
+                h.bridge_request_id,
+                h.workflow_id,
+                h.workflow_version,
+                h.artifact_hash,
+                h.job_name,
+                h.input_ref,
+                h.config_ref,
+                h.status,
+                h.workflow_owner_epoch,
+                h.stream_owner_epoch,
+                h.cancellation_requested_at,
+                h.cancellation_reason,
+                h.terminal_event_id,
+                h.terminal_at,
+                h.workflow_accepted_at,
+                COALESCE(checkpoints.checkpoint_count, 0) AS checkpoint_count,
+                COALESCE(checkpoints.pending_checkpoint_repairs, 0) AS pending_checkpoint_repairs,
+                COALESCE(queries.query_count, 0) AS query_count,
+                COALESCE(queries.pending_query_repairs, 0) AS pending_query_repairs,
+                latest_query.query_id AS latest_query_id,
+                latest_query.query_name AS latest_query_name,
+                latest_query.status AS latest_query_status,
+                latest_query.consistency AS latest_query_consistency,
+                latest_query.requested_at AS latest_query_requested_at,
+                latest_query.completed_at AS latest_query_completed_at,
+                latest_query.accepted_at AS latest_query_accepted_at,
+                h.created_at,
+                h.updated_at
+            FROM stream_job_bridge_handles h
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) AS checkpoint_count,
+                    COUNT(*) FILTER (
+                        WHERE status = 'reached'
+                          AND accepted_at IS NULL
+                          AND cancelled_at IS NULL
+                    ) AS pending_checkpoint_repairs
+                FROM stream_job_bridge_checkpoints c
+                WHERE c.handle_id = h.handle_id
+            ) checkpoints ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) AS query_count,
+                    COUNT(*) FILTER (
+                        WHERE status IN ('completed', 'failed')
+                          AND accepted_at IS NULL
+                          AND cancelled_at IS NULL
+                    ) AS pending_query_repairs
+                FROM stream_job_bridge_queries q
+                WHERE q.handle_id = h.handle_id
+            ) queries ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    q.query_id,
+                    q.query_name,
+                    q.status,
+                    q.consistency,
+                    q.requested_at,
+                    q.completed_at,
+                    q.accepted_at
+                FROM stream_job_bridge_queries q
+                WHERE q.handle_id = h.handle_id
+                ORDER BY COALESCE(q.accepted_at, q.completed_at, q.requested_at) DESC,
+                         q.query_id DESC
+                LIMIT 1
+            ) latest_query ON TRUE
+            WHERE h.tenant_id = $1
+              AND h.workflow_instance_id = $2
+              AND h.run_id = $3
+            ORDER BY h.created_at ASC, h.job_id ASC
+            LIMIT $4
+            OFFSET $5
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list stream job bridge ledgers")?;
+        rows.into_iter().map(Self::decode_stream_job_bridge_ledger_row).collect()
+    }
+
+    pub async fn prune_stream_job_bridge_retention(
+        &self,
+        accepted_before: DateTime<Utc>,
+    ) -> Result<StreamJobBridgePruneSummary> {
+        let pruned_queries = sqlx::query(
+            r#"
+            DELETE FROM stream_job_bridge_queries
+            WHERE handle_id IN (
+                SELECT handle_id
+                FROM stream_job_bridge_handles
+                WHERE workflow_accepted_at IS NOT NULL
+                  AND workflow_accepted_at < $1
+            )
+            "#,
+        )
+        .bind(accepted_before)
+        .execute(&self.pool)
+        .await
+        .context("failed to prune stream job bridge queries by retention policy")?
+        .rows_affected();
+        let pruned_checkpoints = sqlx::query(
+            r#"
+            DELETE FROM stream_job_bridge_checkpoints
+            WHERE handle_id IN (
+                SELECT handle_id
+                FROM stream_job_bridge_handles
+                WHERE workflow_accepted_at IS NOT NULL
+                  AND workflow_accepted_at < $1
+            )
+            "#,
+        )
+        .bind(accepted_before)
+        .execute(&self.pool)
+        .await
+        .context("failed to prune stream job bridge checkpoints by retention policy")?
+        .rows_affected();
+        let pruned_handles = sqlx::query(
+            r#"
+            DELETE FROM stream_job_bridge_handles
+            WHERE workflow_accepted_at IS NOT NULL
+              AND workflow_accepted_at < $1
+            "#,
+        )
+        .bind(accepted_before)
+        .execute(&self.pool)
+        .await
+        .context("failed to prune stream job bridge handles by retention policy")?
+        .rows_affected();
+        Ok(StreamJobBridgePruneSummary { pruned_handles, pruned_checkpoints, pruned_queries })
+    }
+
+    pub async fn list_pending_stream_job_query_repairs(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<StreamJobQueryRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_job_bridge_queries
+            WHERE status IN ('completed', 'failed')
+              AND accepted_at IS NULL
+              AND cancelled_at IS NULL
+            ORDER BY completed_at ASC NULLS LAST, created_at ASC, query_id ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list pending stream job query repairs")?;
+        rows.into_iter().map(Self::decode_stream_job_bridge_query_row).collect()
+    }
+
+    pub async fn list_pending_stream_job_checkpoint_repairs(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<StreamJobCheckpointRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_job_bridge_checkpoints
+            WHERE status = 'reached'
+              AND accepted_at IS NULL
+              AND cancelled_at IS NULL
+            ORDER BY reached_at ASC NULLS LAST, created_at ASC, await_request_id ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list pending stream job checkpoint repairs")?;
+        rows.into_iter().map(Self::decode_stream_job_bridge_checkpoint_row).collect()
+    }
+
+    pub async fn list_pending_stream_job_terminal_repairs(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<StreamJobBridgeHandleRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_job_bridge_handles
+            WHERE status IN ('completed', 'failed', 'cancelled')
+              AND terminal_at IS NOT NULL
+              AND workflow_accepted_at IS NULL
+            ORDER BY terminal_at ASC, created_at ASC, handle_id ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list pending stream job terminal repairs")?;
+        rows.into_iter().map(Self::decode_stream_job_bridge_handle_row).collect()
+    }
+
     pub async fn upsert_throughput_run(&self, run: &ThroughputRunRecord) -> Result<()> {
         sqlx::query(
             r#"
@@ -14770,6 +16497,8 @@ impl WorkflowStore {
                 workflow_version,
                 artifact_hash,
                 batch_id,
+                bridge_protocol_version,
+                bridge_operation_kind,
                 bridge_request_id,
                 throughput_backend,
                 execution_path,
@@ -14787,13 +16516,15 @@ impl WorkflowStore {
                 updated_at
             )
             VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24
             )
             ON CONFLICT (tenant_id, workflow_instance_id, run_id, batch_id)
             DO UPDATE SET
                 workflow_id = EXCLUDED.workflow_id,
                 workflow_version = EXCLUDED.workflow_version,
                 artifact_hash = EXCLUDED.artifact_hash,
+                bridge_protocol_version = EXCLUDED.bridge_protocol_version,
+                bridge_operation_kind = EXCLUDED.bridge_operation_kind,
                 bridge_request_id = EXCLUDED.bridge_request_id,
                 throughput_backend = EXCLUDED.throughput_backend,
                 execution_path = EXCLUDED.execution_path,
@@ -14829,6 +16560,8 @@ impl WorkflowStore {
         .bind(run.definition_version.map(|value| value as i32))
         .bind(&run.artifact_hash)
         .bind(&run.batch_id)
+        .bind(&run.bridge_protocol_version)
+        .bind(&run.bridge_operation_kind)
         .bind(&run.bridge_request_id)
         .bind(&run.throughput_backend)
         .bind(&run.execution_path)
@@ -15189,6 +16922,21 @@ impl WorkflowStore {
         batch_id: &str,
         cancelled_at: DateTime<Utc>,
     ) -> Result<bool> {
+        if let Some(current) = self
+            .get_throughput_bridge_progress_for_batch(tenant_id, instance_id, run_id, batch_id)
+            .await?
+        {
+            if let Some(current_status) = current.parsed_submission_status() {
+                let next = ThroughputBridgeSubmissionStatus::Cancelled;
+                if !current_status.can_transition_to(next) {
+                    anyhow::bail!(
+                        "invalid throughput bridge submission transition {} -> {} for batch {batch_id}",
+                        current_status.as_str(),
+                        next.as_str()
+                    );
+                }
+            }
+        }
         let cancelled = ThroughputBridgeSubmissionStatus::Cancelled.as_str();
         let updated = sqlx::query(
             r#"
@@ -19231,6 +20979,12 @@ impl WorkflowStore {
                 .try_get("artifact_hash")
                 .context("throughput run artifact_hash missing")?,
             batch_id: row.try_get("batch_id").context("throughput run batch_id missing")?,
+            bridge_protocol_version: row
+                .try_get("bridge_protocol_version")
+                .context("throughput run bridge_protocol_version missing")?,
+            bridge_operation_kind: row
+                .try_get("bridge_operation_kind")
+                .context("throughput run bridge_operation_kind missing")?,
             bridge_request_id: row
                 .try_get("bridge_request_id")
                 .context("throughput run bridge_request_id missing")?,
@@ -19339,6 +21093,12 @@ impl WorkflowStore {
             workflow_event_id: row
                 .try_get("workflow_event_id")
                 .context("throughput bridge workflow_event_id missing")?,
+            protocol_version: row
+                .try_get("protocol_version")
+                .context("throughput bridge protocol_version missing")?,
+            operation_kind: row
+                .try_get("operation_kind")
+                .context("throughput bridge operation_kind missing")?,
             tenant_id: row.try_get("tenant_id").context("throughput bridge tenant_id missing")?,
             instance_id: row
                 .try_get("workflow_instance_id")
@@ -19384,6 +21144,562 @@ impl WorkflowStore {
             updated_at: row
                 .try_get("updated_at")
                 .context("throughput bridge updated_at missing")?,
+        })
+    }
+
+    fn decode_throughput_bridge_ledger_row(
+        row: sqlx::postgres::PgRow,
+    ) -> Result<ThroughputBridgeLedgerRecord> {
+        Ok(ThroughputBridgeLedgerRecord {
+            workflow_event_id: row
+                .try_get("workflow_event_id")
+                .context("throughput bridge ledger workflow_event_id missing")?,
+            protocol_version: row
+                .try_get("protocol_version")
+                .context("throughput bridge ledger protocol_version missing")?,
+            operation_kind: row
+                .try_get("operation_kind")
+                .context("throughput bridge ledger operation_kind missing")?,
+            tenant_id: row
+                .try_get("tenant_id")
+                .context("throughput bridge ledger tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("throughput bridge ledger workflow_instance_id missing")?,
+            run_id: row.try_get("run_id").context("throughput bridge ledger run_id missing")?,
+            batch_id: row
+                .try_get("batch_id")
+                .context("throughput bridge ledger batch_id missing")?,
+            throughput_backend: row
+                .try_get("throughput_backend")
+                .context("throughput bridge ledger throughput_backend missing")?,
+            bridge_request_id: row
+                .try_get("bridge_request_id")
+                .context("throughput bridge ledger bridge_request_id missing")?,
+            submission_status: row
+                .try_get("submission_status")
+                .context("throughput bridge ledger submission_status missing")?,
+            command_id: row
+                .try_get("command_id")
+                .context("throughput bridge ledger command_id missing")?,
+            command_partition_key: row
+                .try_get("command_partition_key")
+                .context("throughput bridge ledger command_partition_key missing")?,
+            command_published_at: row
+                .try_get("command_published_at")
+                .context("throughput bridge ledger command_published_at missing")?,
+            cancellation_requested_at: row
+                .try_get("cancellation_requested_at")
+                .context("throughput bridge ledger cancellation_requested_at missing")?,
+            cancellation_reason: row
+                .try_get("cancellation_reason")
+                .context("throughput bridge ledger cancellation_reason missing")?,
+            cancel_command_published_at: row
+                .try_get("cancel_command_published_at")
+                .context("throughput bridge ledger cancel_command_published_at missing")?,
+            cancelled_at: row
+                .try_get("cancelled_at")
+                .context("throughput bridge ledger cancelled_at missing")?,
+            stream_status: row
+                .try_get("stream_status")
+                .context("throughput bridge ledger stream_status missing")?,
+            stream_terminal_at: row
+                .try_get("stream_terminal_at")
+                .context("throughput bridge ledger stream_terminal_at missing")?,
+            workflow_status: row
+                .try_get("workflow_status")
+                .context("throughput bridge ledger workflow_status missing")?,
+            workflow_terminal_event_id: row
+                .try_get("workflow_terminal_event_id")
+                .context("throughput bridge ledger workflow_terminal_event_id missing")?,
+            workflow_owner_epoch: row
+                .try_get::<Option<i64>, _>("workflow_owner_epoch")
+                .context("throughput bridge ledger workflow_owner_epoch missing")?
+                .map(|value| {
+                    u64::try_from(value)
+                        .context("throughput bridge ledger workflow_owner_epoch cannot be negative")
+                })
+                .transpose()?,
+            workflow_accepted_at: row
+                .try_get("workflow_accepted_at")
+                .context("throughput bridge ledger workflow_accepted_at missing")?,
+            created_at: row
+                .try_get("created_at")
+                .context("throughput bridge ledger created_at missing")?,
+            updated_at: row
+                .try_get("updated_at")
+                .context("throughput bridge ledger updated_at missing")?,
+        })
+    }
+
+    fn decode_stream_job_bridge_handle_row(
+        row: sqlx::postgres::PgRow,
+    ) -> Result<StreamJobBridgeHandleRecord> {
+        Ok(StreamJobBridgeHandleRecord {
+            workflow_event_id: row
+                .try_get("workflow_event_id")
+                .context("stream job handle workflow_event_id missing")?,
+            protocol_version: row
+                .try_get("protocol_version")
+                .context("stream job handle protocol_version missing")?,
+            operation_kind: row
+                .try_get("operation_kind")
+                .context("stream job handle operation_kind missing")?,
+            tenant_id: row.try_get("tenant_id").context("stream job handle tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("stream job handle workflow_instance_id missing")?,
+            run_id: row.try_get("run_id").context("stream job handle run_id missing")?,
+            job_id: row.try_get("job_id").context("stream job handle job_id missing")?,
+            handle_id: row.try_get("handle_id").context("stream job handle handle_id missing")?,
+            bridge_request_id: row
+                .try_get("bridge_request_id")
+                .context("stream job handle bridge_request_id missing")?,
+            definition_id: row
+                .try_get("workflow_id")
+                .context("stream job handle workflow_id missing")?,
+            definition_version: row
+                .try_get::<Option<i32>, _>("workflow_version")
+                .context("stream job handle workflow_version missing")?
+                .map(|value| value as u32),
+            artifact_hash: row
+                .try_get("artifact_hash")
+                .context("stream job handle artifact_hash missing")?,
+            job_name: row.try_get("job_name").context("stream job handle job_name missing")?,
+            input_ref: row.try_get("input_ref").context("stream job handle input_ref missing")?,
+            config_ref: row
+                .try_get("config_ref")
+                .context("stream job handle config_ref missing")?,
+            checkpoint_policy: row
+                .try_get::<Option<Json<Value>>, _>("checkpoint_policy")
+                .context("stream job handle checkpoint_policy missing")?
+                .map(|value| value.0),
+            view_definitions: row
+                .try_get::<Option<Json<Value>>, _>("view_definitions")
+                .context("stream job handle view_definitions missing")?
+                .map(|value| value.0),
+            status: row.try_get("status").context("stream job handle status missing")?,
+            workflow_owner_epoch: row
+                .try_get::<Option<i64>, _>("workflow_owner_epoch")
+                .context("stream job handle workflow_owner_epoch missing")?
+                .map(|value| {
+                    u64::try_from(value)
+                        .context("stream job handle workflow_owner_epoch cannot be negative")
+                })
+                .transpose()?,
+            stream_owner_epoch: row
+                .try_get::<Option<i64>, _>("stream_owner_epoch")
+                .context("stream job handle stream_owner_epoch missing")?
+                .map(|value| {
+                    u64::try_from(value)
+                        .context("stream job handle stream_owner_epoch cannot be negative")
+                })
+                .transpose()?,
+            cancellation_requested_at: row
+                .try_get("cancellation_requested_at")
+                .context("stream job handle cancellation_requested_at missing")?,
+            cancellation_reason: row
+                .try_get("cancellation_reason")
+                .context("stream job handle cancellation_reason missing")?,
+            terminal_event_id: row
+                .try_get("terminal_event_id")
+                .context("stream job handle terminal_event_id missing")?,
+            terminal_at: row
+                .try_get("terminal_at")
+                .context("stream job handle terminal_at missing")?,
+            workflow_accepted_at: row
+                .try_get("workflow_accepted_at")
+                .context("stream job handle workflow_accepted_at missing")?,
+            terminal_output: row
+                .try_get::<Option<Json<Value>>, _>("terminal_output")
+                .context("stream job handle terminal_output missing")?
+                .map(|value| value.0),
+            terminal_error: row
+                .try_get("terminal_error")
+                .context("stream job handle terminal_error missing")?,
+            created_at: row
+                .try_get("created_at")
+                .context("stream job handle created_at missing")?,
+            updated_at: row
+                .try_get("updated_at")
+                .context("stream job handle updated_at missing")?,
+        })
+    }
+
+    fn decode_stream_job_bridge_ledger_row(
+        row: sqlx::postgres::PgRow,
+    ) -> Result<StreamJobBridgeLedgerRecord> {
+        Ok(StreamJobBridgeLedgerRecord {
+            workflow_event_id: row
+                .try_get("workflow_event_id")
+                .context("stream job bridge ledger workflow_event_id missing")?,
+            protocol_version: row
+                .try_get("protocol_version")
+                .context("stream job bridge ledger protocol_version missing")?,
+            operation_kind: row
+                .try_get("operation_kind")
+                .context("stream job bridge ledger operation_kind missing")?,
+            tenant_id: row
+                .try_get("tenant_id")
+                .context("stream job bridge ledger tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("stream job bridge ledger workflow_instance_id missing")?,
+            run_id: row.try_get("run_id").context("stream job bridge ledger run_id missing")?,
+            job_id: row.try_get("job_id").context("stream job bridge ledger job_id missing")?,
+            handle_id: row
+                .try_get("handle_id")
+                .context("stream job bridge ledger handle_id missing")?,
+            bridge_request_id: row
+                .try_get("bridge_request_id")
+                .context("stream job bridge ledger bridge_request_id missing")?,
+            definition_id: row
+                .try_get("workflow_id")
+                .context("stream job bridge ledger workflow_id missing")?,
+            definition_version: row
+                .try_get::<Option<i32>, _>("workflow_version")
+                .context("stream job bridge ledger workflow_version missing")?
+                .map(|value| {
+                    u32::try_from(value)
+                        .context("stream job bridge ledger workflow_version cannot be negative")
+                })
+                .transpose()?,
+            artifact_hash: row
+                .try_get("artifact_hash")
+                .context("stream job bridge ledger artifact_hash missing")?,
+            job_name: row
+                .try_get("job_name")
+                .context("stream job bridge ledger job_name missing")?,
+            input_ref: row
+                .try_get("input_ref")
+                .context("stream job bridge ledger input_ref missing")?,
+            config_ref: row
+                .try_get("config_ref")
+                .context("stream job bridge ledger config_ref missing")?,
+            status: row.try_get("status").context("stream job bridge ledger status missing")?,
+            workflow_owner_epoch: row
+                .try_get::<Option<i64>, _>("workflow_owner_epoch")
+                .context("stream job bridge ledger workflow_owner_epoch missing")?
+                .map(|value| {
+                    u64::try_from(value)
+                        .context("stream job bridge ledger workflow_owner_epoch cannot be negative")
+                })
+                .transpose()?,
+            stream_owner_epoch: row
+                .try_get::<Option<i64>, _>("stream_owner_epoch")
+                .context("stream job bridge ledger stream_owner_epoch missing")?
+                .map(|value| {
+                    u64::try_from(value)
+                        .context("stream job bridge ledger stream_owner_epoch cannot be negative")
+                })
+                .transpose()?,
+            cancellation_requested_at: row
+                .try_get("cancellation_requested_at")
+                .context("stream job bridge ledger cancellation_requested_at missing")?,
+            cancellation_reason: row
+                .try_get("cancellation_reason")
+                .context("stream job bridge ledger cancellation_reason missing")?,
+            terminal_event_id: row
+                .try_get("terminal_event_id")
+                .context("stream job bridge ledger terminal_event_id missing")?,
+            terminal_at: row
+                .try_get("terminal_at")
+                .context("stream job bridge ledger terminal_at missing")?,
+            workflow_accepted_at: row
+                .try_get("workflow_accepted_at")
+                .context("stream job bridge ledger workflow_accepted_at missing")?,
+            checkpoint_count: row
+                .try_get::<i64, _>("checkpoint_count")
+                .context("stream job bridge ledger checkpoint_count missing")?
+                .try_into()
+                .context("stream job bridge ledger checkpoint_count cannot be negative")?,
+            query_count: row
+                .try_get::<i64, _>("query_count")
+                .context("stream job bridge ledger query_count missing")?
+                .try_into()
+                .context("stream job bridge ledger query_count cannot be negative")?,
+            pending_checkpoint_repairs: row
+                .try_get::<i64, _>("pending_checkpoint_repairs")
+                .context("stream job bridge ledger pending_checkpoint_repairs missing")?
+                .try_into()
+                .context(
+                    "stream job bridge ledger pending_checkpoint_repairs cannot be negative",
+                )?,
+            pending_query_repairs: row
+                .try_get::<i64, _>("pending_query_repairs")
+                .context("stream job bridge ledger pending_query_repairs missing")?
+                .try_into()
+                .context("stream job bridge ledger pending_query_repairs cannot be negative")?,
+            latest_query_id: row
+                .try_get("latest_query_id")
+                .context("stream job bridge ledger latest_query_id missing")?,
+            latest_query_name: row
+                .try_get("latest_query_name")
+                .context("stream job bridge ledger latest_query_name missing")?,
+            latest_query_status: row
+                .try_get("latest_query_status")
+                .context("stream job bridge ledger latest_query_status missing")?,
+            latest_query_consistency: row
+                .try_get("latest_query_consistency")
+                .context("stream job bridge ledger latest_query_consistency missing")?,
+            latest_query_requested_at: row
+                .try_get("latest_query_requested_at")
+                .context("stream job bridge ledger latest_query_requested_at missing")?,
+            latest_query_completed_at: row
+                .try_get("latest_query_completed_at")
+                .context("stream job bridge ledger latest_query_completed_at missing")?,
+            latest_query_accepted_at: row
+                .try_get("latest_query_accepted_at")
+                .context("stream job bridge ledger latest_query_accepted_at missing")?,
+            created_at: row
+                .try_get("created_at")
+                .context("stream job bridge ledger created_at missing")?,
+            updated_at: row
+                .try_get("updated_at")
+                .context("stream job bridge ledger updated_at missing")?,
+        })
+    }
+
+    fn decode_stream_job_row(row: sqlx::postgres::PgRow) -> Result<StreamJobRecord> {
+        Ok(StreamJobRecord {
+            tenant_id: row.try_get("tenant_id").context("stream job tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("stream job workflow_instance_id missing")?,
+            run_id: row.try_get("run_id").context("stream job run_id missing")?,
+            job_id: row.try_get("job_id").context("stream job job_id missing")?,
+            handle_id: row.try_get("handle_id").context("stream job handle_id missing")?,
+            protocol_version: row
+                .try_get("protocol_version")
+                .context("stream job protocol_version missing")?,
+            operation_kind: row
+                .try_get("operation_kind")
+                .context("stream job operation_kind missing")?,
+            workflow_event_id: row
+                .try_get("workflow_event_id")
+                .context("stream job workflow_event_id missing")?,
+            bridge_request_id: row
+                .try_get("bridge_request_id")
+                .context("stream job bridge_request_id missing")?,
+            definition_id: row.try_get("workflow_id").context("stream job workflow_id missing")?,
+            definition_version: row
+                .try_get::<Option<i32>, _>("workflow_version")
+                .context("stream job workflow_version missing")?
+                .map(|value| value as u32),
+            artifact_hash: row
+                .try_get("artifact_hash")
+                .context("stream job artifact_hash missing")?,
+            job_name: row.try_get("job_name").context("stream job job_name missing")?,
+            input_ref: row.try_get("input_ref").context("stream job input_ref missing")?,
+            config_ref: row.try_get("config_ref").context("stream job config_ref missing")?,
+            checkpoint_policy: row
+                .try_get::<Option<Json<Value>>, _>("checkpoint_policy")
+                .context("stream job checkpoint_policy missing")?
+                .map(|value| value.0),
+            view_definitions: row
+                .try_get::<Option<Json<Value>>, _>("view_definitions")
+                .context("stream job view_definitions missing")?
+                .map(|value| value.0),
+            status: row.try_get("status").context("stream job status missing")?,
+            workflow_owner_epoch: row
+                .try_get::<Option<i64>, _>("workflow_owner_epoch")
+                .context("stream job workflow_owner_epoch missing")?
+                .map(|value| {
+                    u64::try_from(value)
+                        .context("stream job workflow_owner_epoch cannot be negative")
+                })
+                .transpose()?,
+            stream_owner_epoch: row
+                .try_get::<Option<i64>, _>("stream_owner_epoch")
+                .context("stream job stream_owner_epoch missing")?
+                .map(|value| {
+                    u64::try_from(value).context("stream job stream_owner_epoch cannot be negative")
+                })
+                .transpose()?,
+            starting_at: row.try_get("starting_at").context("stream job starting_at missing")?,
+            running_at: row.try_get("running_at").context("stream job running_at missing")?,
+            draining_at: row.try_get("draining_at").context("stream job draining_at missing")?,
+            latest_checkpoint_name: row
+                .try_get("latest_checkpoint_name")
+                .context("stream job latest_checkpoint_name missing")?,
+            latest_checkpoint_sequence: row
+                .try_get("latest_checkpoint_sequence")
+                .context("stream job latest_checkpoint_sequence missing")?,
+            latest_checkpoint_at: row
+                .try_get("latest_checkpoint_at")
+                .context("stream job latest_checkpoint_at missing")?,
+            latest_checkpoint_output: row
+                .try_get::<Option<Json<Value>>, _>("latest_checkpoint_output")
+                .context("stream job latest_checkpoint_output missing")?
+                .map(|value| value.0),
+            cancellation_requested_at: row
+                .try_get("cancellation_requested_at")
+                .context("stream job cancellation_requested_at missing")?,
+            cancellation_reason: row
+                .try_get("cancellation_reason")
+                .context("stream job cancellation_reason missing")?,
+            workflow_accepted_at: row
+                .try_get("workflow_accepted_at")
+                .context("stream job workflow_accepted_at missing")?,
+            terminal_event_id: row
+                .try_get("terminal_event_id")
+                .context("stream job terminal_event_id missing")?,
+            terminal_at: row.try_get("terminal_at").context("stream job terminal_at missing")?,
+            terminal_output: row
+                .try_get::<Option<Json<Value>>, _>("terminal_output")
+                .context("stream job terminal_output missing")?
+                .map(|value| value.0),
+            terminal_error: row
+                .try_get("terminal_error")
+                .context("stream job terminal_error missing")?,
+            created_at: row.try_get("created_at").context("stream job created_at missing")?,
+            updated_at: row.try_get("updated_at").context("stream job updated_at missing")?,
+        })
+    }
+
+    fn decode_stream_job_bridge_checkpoint_row(
+        row: sqlx::postgres::PgRow,
+    ) -> Result<StreamJobCheckpointRecord> {
+        Ok(StreamJobCheckpointRecord {
+            workflow_event_id: row
+                .try_get("workflow_event_id")
+                .context("stream job checkpoint workflow_event_id missing")?,
+            protocol_version: row
+                .try_get("protocol_version")
+                .context("stream job checkpoint protocol_version missing")?,
+            operation_kind: row
+                .try_get("operation_kind")
+                .context("stream job checkpoint operation_kind missing")?,
+            tenant_id: row
+                .try_get("tenant_id")
+                .context("stream job checkpoint tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("stream job checkpoint workflow_instance_id missing")?,
+            run_id: row.try_get("run_id").context("stream job checkpoint run_id missing")?,
+            job_id: row.try_get("job_id").context("stream job checkpoint job_id missing")?,
+            handle_id: row
+                .try_get("handle_id")
+                .context("stream job checkpoint handle_id missing")?,
+            bridge_request_id: row
+                .try_get("bridge_request_id")
+                .context("stream job checkpoint bridge_request_id missing")?,
+            await_request_id: row
+                .try_get("await_request_id")
+                .context("stream job checkpoint await_request_id missing")?,
+            checkpoint_name: row
+                .try_get("checkpoint_name")
+                .context("stream job checkpoint checkpoint_name missing")?,
+            checkpoint_sequence: row
+                .try_get("checkpoint_sequence")
+                .context("stream job checkpoint checkpoint_sequence missing")?,
+            status: row.try_get("status").context("stream job checkpoint status missing")?,
+            workflow_owner_epoch: row
+                .try_get::<Option<i64>, _>("workflow_owner_epoch")
+                .context("stream job checkpoint workflow_owner_epoch missing")?
+                .map(|value| {
+                    u64::try_from(value)
+                        .context("stream job checkpoint workflow_owner_epoch cannot be negative")
+                })
+                .transpose()?,
+            stream_owner_epoch: row
+                .try_get::<Option<i64>, _>("stream_owner_epoch")
+                .context("stream job checkpoint stream_owner_epoch missing")?
+                .map(|value| {
+                    u64::try_from(value)
+                        .context("stream job checkpoint stream_owner_epoch cannot be negative")
+                })
+                .transpose()?,
+            reached_at: row
+                .try_get("reached_at")
+                .context("stream job checkpoint reached_at missing")?,
+            output: row
+                .try_get::<Option<Json<Value>>, _>("output")
+                .context("stream job checkpoint output missing")?
+                .map(|value| value.0),
+            accepted_at: row
+                .try_get("accepted_at")
+                .context("stream job checkpoint accepted_at missing")?,
+            cancelled_at: row
+                .try_get("cancelled_at")
+                .context("stream job checkpoint cancelled_at missing")?,
+            created_at: row
+                .try_get("created_at")
+                .context("stream job checkpoint created_at missing")?,
+            updated_at: row
+                .try_get("updated_at")
+                .context("stream job checkpoint updated_at missing")?,
+        })
+    }
+
+    fn decode_stream_job_bridge_query_row(
+        row: sqlx::postgres::PgRow,
+    ) -> Result<StreamJobQueryRecord> {
+        Ok(StreamJobQueryRecord {
+            workflow_event_id: row
+                .try_get("workflow_event_id")
+                .context("stream job query workflow_event_id missing")?,
+            protocol_version: row
+                .try_get("protocol_version")
+                .context("stream job query protocol_version missing")?,
+            operation_kind: row
+                .try_get("operation_kind")
+                .context("stream job query operation_kind missing")?,
+            tenant_id: row.try_get("tenant_id").context("stream job query tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("stream job query workflow_instance_id missing")?,
+            run_id: row.try_get("run_id").context("stream job query run_id missing")?,
+            job_id: row.try_get("job_id").context("stream job query job_id missing")?,
+            handle_id: row.try_get("handle_id").context("stream job query handle_id missing")?,
+            bridge_request_id: row
+                .try_get("bridge_request_id")
+                .context("stream job query bridge_request_id missing")?,
+            query_id: row.try_get("query_id").context("stream job query query_id missing")?,
+            query_name: row.try_get("query_name").context("stream job query query_name missing")?,
+            query_args: row
+                .try_get::<Option<Json<Value>>, _>("query_args")
+                .context("stream job query query_args missing")?
+                .map(|value| value.0),
+            consistency: row
+                .try_get("consistency")
+                .context("stream job query consistency missing")?,
+            status: row.try_get("status").context("stream job query status missing")?,
+            workflow_owner_epoch: row
+                .try_get::<Option<i64>, _>("workflow_owner_epoch")
+                .context("stream job query workflow_owner_epoch missing")?
+                .map(|value| {
+                    u64::try_from(value)
+                        .context("stream job query workflow_owner_epoch cannot be negative")
+                })
+                .transpose()?,
+            stream_owner_epoch: row
+                .try_get::<Option<i64>, _>("stream_owner_epoch")
+                .context("stream job query stream_owner_epoch missing")?
+                .map(|value| {
+                    u64::try_from(value)
+                        .context("stream job query stream_owner_epoch cannot be negative")
+                })
+                .transpose()?,
+            output: row
+                .try_get::<Option<Json<Value>>, _>("output")
+                .context("stream job query output missing")?
+                .map(|value| value.0),
+            error: row.try_get("error").context("stream job query error missing")?,
+            requested_at: row
+                .try_get("requested_at")
+                .context("stream job query requested_at missing")?,
+            completed_at: row
+                .try_get("completed_at")
+                .context("stream job query completed_at missing")?,
+            accepted_at: row
+                .try_get("accepted_at")
+                .context("stream job query accepted_at missing")?,
+            cancelled_at: row
+                .try_get("cancelled_at")
+                .context("stream job query cancelled_at missing")?,
+            created_at: row.try_get("created_at").context("stream job query created_at missing")?,
+            updated_at: row.try_get("updated_at").context("stream job query updated_at missing")?,
         })
     }
 
@@ -22075,6 +24391,8 @@ mod tests {
         let before = store
             .upsert_throughput_bridge_submission(
                 before_publish,
+                THROUGHPUT_BRIDGE_PROTOCOL_VERSION,
+                ThroughputBridgeOperationKind::BulkRun,
                 "tenant-a",
                 "wf-bridge",
                 "run-bridge",
@@ -22103,6 +24421,8 @@ mod tests {
         let after = store
             .upsert_throughput_bridge_submission(
                 after_publish,
+                THROUGHPUT_BRIDGE_PROTOCOL_VERSION,
+                ThroughputBridgeOperationKind::BulkRun,
                 "tenant-a",
                 "wf-bridge",
                 "run-bridge",
@@ -22162,6 +24482,566 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn throughput_bridge_ledger_reports_protocol_metadata_and_repairs() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+        let workflow_event_id = Uuid::now_v7();
+        let command = ThroughputCommandEnvelope {
+            command_id: Uuid::now_v7(),
+            occurred_at: now,
+            dedupe_key: "throughput-start:test-ledger".to_owned(),
+            partition_key: "batch-ledger:0".to_owned(),
+            payload: fabrik_throughput::ThroughputCommand::StartThroughputRun(
+                fabrik_throughput::StartThroughputRunCommand {
+                    dedupe_key: "throughput-start:test-ledger".to_owned(),
+                    bridge_request_id: "throughput-bridge:tenant-a:instance-a:run-a:batch-ledger"
+                        .to_owned(),
+                    bridge_protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                    bridge_operation_kind: ThroughputBridgeOperationKind::BulkRun
+                        .as_str()
+                        .to_owned(),
+                    tenant_id: "tenant-a".to_owned(),
+                    definition_id: "demo".to_owned(),
+                    definition_version: Some(1),
+                    artifact_hash: Some("artifact-a".to_owned()),
+                    instance_id: "instance-a".to_owned(),
+                    run_id: "run-a".to_owned(),
+                    batch_id: "batch-ledger".to_owned(),
+                    activity_type: "benchmark.echo".to_owned(),
+                    activity_capabilities: None,
+                    task_queue: "bulk".to_owned(),
+                    state: Some("join".to_owned()),
+                    chunk_size: 8,
+                    max_attempts: 1,
+                    retry_delay_ms: 0,
+                    total_items: 8,
+                    aggregation_group_count: 1,
+                    execution_policy: Some("parallel".to_owned()),
+                    reducer: Some("count".to_owned()),
+                    throughput_backend: "stream-v2".to_owned(),
+                    throughput_backend_version: "2.0.0".to_owned(),
+                    routing_reason: "stream_v2_selected".to_owned(),
+                    admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
+                    input_handle: fabrik_throughput::PayloadHandle::Inline {
+                        key: "bulk-input:batch-ledger".to_owned(),
+                    },
+                    result_handle: fabrik_throughput::PayloadHandle::Inline {
+                        key: "bulk-result:batch-ledger".to_owned(),
+                    },
+                },
+            ),
+        };
+
+        store
+            .upsert_throughput_bridge_submission(
+                workflow_event_id,
+                THROUGHPUT_BRIDGE_PROTOCOL_VERSION,
+                ThroughputBridgeOperationKind::BulkRun,
+                "tenant-a",
+                "instance-a",
+                "run-a",
+                "batch-ledger",
+                "stream-v2",
+                "throughput-bridge:tenant-a:instance-a:run-a:batch-ledger",
+                &command.dedupe_key,
+                Some(command.command_id),
+                Some(&command.partition_key),
+                now,
+            )
+            .await?;
+        store
+            .upsert_throughput_run(&ThroughputRunRecord {
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "instance-a".to_owned(),
+                run_id: "run-a".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                batch_id: "batch-ledger".to_owned(),
+                bridge_protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                bridge_operation_kind: ThroughputBridgeOperationKind::BulkRun.as_str().to_owned(),
+                bridge_request_id: "throughput-bridge:tenant-a:instance-a:run-a:batch-ledger"
+                    .to_owned(),
+                throughput_backend: "stream-v2".to_owned(),
+                execution_path: "native_stream_v2".to_owned(),
+                status: ThroughputRunStatus::Scheduled.as_str().to_owned(),
+                command_dedupe_key: command.dedupe_key.clone(),
+                command: command.clone(),
+                command_published_at: None,
+                started_at: None,
+                terminal_at: None,
+                bridge_terminal_status: None,
+                bridge_terminal_event_id: None,
+                bridge_terminal_owner_epoch: None,
+                bridge_terminal_accepted_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+
+        let ledger = store
+            .load_throughput_bridge_ledger_for_batch(
+                "tenant-a",
+                "instance-a",
+                "run-a",
+                "batch-ledger",
+            )
+            .await?
+            .context("bridge ledger should exist")?;
+        assert_eq!(ledger.workflow_event_id, Some(workflow_event_id));
+        assert_eq!(ledger.protocol_version, THROUGHPUT_BRIDGE_PROTOCOL_VERSION);
+        assert_eq!(ledger.operation_kind, ThroughputBridgeOperationKind::BulkRun.as_str());
+        assert_eq!(ledger.command_id, Some(command.command_id));
+        assert_eq!(ledger.command_partition_key.as_deref(), Some("batch-ledger:0"));
+        assert_eq!(ledger.next_repair(), Some(ThroughputBridgeRepairKind::PublishStart));
+
+        let repairs =
+            store.list_pending_throughput_bridge_repairs_for_backend("stream-v2", 10).await?;
+        assert_eq!(repairs.len(), 1);
+        assert_eq!(repairs[0].batch_id, "batch-ledger");
+        assert_eq!(repairs[0].next_repair(), Some(ThroughputBridgeRepairKind::PublishStart));
+
+        store
+            .mark_throughput_bridge_command_published(
+                workflow_event_id,
+                now + chrono::Duration::seconds(1),
+            )
+            .await?;
+        assert!(
+            store
+                .mark_throughput_run_command_published(
+                    "tenant-a",
+                    "instance-a",
+                    "run-a",
+                    "batch-ledger",
+                    now + chrono::Duration::seconds(1),
+                )
+                .await?
+        );
+        assert!(
+            store
+                .mark_throughput_run_started(
+                    "tenant-a",
+                    "instance-a",
+                    "run-a",
+                    "batch-ledger",
+                    now + chrono::Duration::seconds(2),
+                )
+                .await?
+        );
+        assert!(
+            store
+                .mark_throughput_run_terminal(
+                    "tenant-a",
+                    "instance-a",
+                    "run-a",
+                    "batch-ledger",
+                    ThroughputRunStatus::Completed,
+                    now + chrono::Duration::seconds(3),
+                )
+                .await?
+        );
+
+        let terminal_pending = store
+            .load_throughput_bridge_ledger_for_batch(
+                "tenant-a",
+                "instance-a",
+                "run-a",
+                "batch-ledger",
+            )
+            .await?
+            .context("terminal-pending ledger should exist")?;
+        assert_eq!(
+            terminal_pending.next_repair(),
+            Some(ThroughputBridgeRepairKind::AcceptTerminal)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_job_bridge_records_round_trip() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+        let handle = StreamJobBridgeHandleRecord {
+            workflow_event_id: Uuid::now_v7(),
+            protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "instance-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            job_id: "job-a".to_owned(),
+            handle_id: "stream-job-handle:tenant-a:instance-a:run-a:job-a".to_owned(),
+            bridge_request_id: "stream-job-bridge:tenant-a:instance-a:run-a:job-a".to_owned(),
+            definition_id: "demo".to_owned(),
+            definition_version: Some(1),
+            artifact_hash: Some("artifact-a".to_owned()),
+            job_name: "fraud-detector".to_owned(),
+            input_ref: "topic:payments".to_owned(),
+            config_ref: Some("config:fraud-detector:v1".to_owned()),
+            checkpoint_policy: None,
+            view_definitions: None,
+            status: StreamJobBridgeHandleStatus::Running.as_str().to_owned(),
+            workflow_owner_epoch: Some(3),
+            stream_owner_epoch: Some(8),
+            cancellation_requested_at: None,
+            cancellation_reason: None,
+            terminal_event_id: None,
+            terminal_at: None,
+            workflow_accepted_at: None,
+            terminal_output: None,
+            terminal_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        store.upsert_stream_job_bridge_handle(&handle).await?;
+
+        let checkpoint = StreamJobCheckpointRecord {
+            workflow_event_id: Uuid::now_v7(),
+            protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "instance-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            job_id: "job-a".to_owned(),
+            handle_id: handle.handle_id.clone(),
+            bridge_request_id: handle.bridge_request_id.clone(),
+            await_request_id: "stream-job-await:job-a:hourly-rollup-ready:event-a".to_owned(),
+            checkpoint_name: "hourly-rollup-ready".to_owned(),
+            checkpoint_sequence: Some(7),
+            status: StreamJobCheckpointStatus::Reached.as_str().to_owned(),
+            workflow_owner_epoch: Some(3),
+            stream_owner_epoch: Some(8),
+            reached_at: Some(now),
+            output: Some(json!({"ready": true})),
+            accepted_at: None,
+            cancelled_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        store.upsert_stream_job_bridge_checkpoint(&checkpoint).await?;
+
+        let query = StreamJobQueryRecord {
+            workflow_event_id: Uuid::now_v7(),
+            protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "instance-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            job_id: "job-a".to_owned(),
+            handle_id: handle.handle_id.clone(),
+            bridge_request_id: handle.bridge_request_id.clone(),
+            query_id: "stream-job-query:job-a:currentStats:event-a".to_owned(),
+            query_name: "currentStats".to_owned(),
+            query_args: Some(json!({"window": "1h"})),
+            consistency: StreamJobQueryConsistency::Strong.as_str().to_owned(),
+            status: StreamJobQueryStatus::Completed.as_str().to_owned(),
+            workflow_owner_epoch: Some(3),
+            stream_owner_epoch: Some(8),
+            output: Some(json!({"anomalies": 2})),
+            error: None,
+            requested_at: now,
+            completed_at: Some(now + chrono::Duration::seconds(1)),
+            accepted_at: None,
+            cancelled_at: None,
+            created_at: now,
+            updated_at: now + chrono::Duration::seconds(1),
+        };
+        store.upsert_stream_job_bridge_query(&query).await?;
+
+        let stored_handle = store
+            .get_stream_job_bridge_handle("tenant-a", "instance-a", "run-a", "job-a")
+            .await?
+            .context("stream job bridge handle should exist")?;
+        assert_eq!(
+            stored_handle.parsed_operation_kind(),
+            Some(ThroughputBridgeOperationKind::StreamJob)
+        );
+        assert_eq!(stored_handle.parsed_status(), Some(StreamJobBridgeHandleStatus::Running));
+        assert_eq!(stored_handle.handle_id, handle.handle_id);
+
+        let stored_checkpoint = store
+            .get_stream_job_bridge_checkpoint(&checkpoint.await_request_id)
+            .await?
+            .context("stream job checkpoint should exist")?;
+        assert_eq!(
+            stored_checkpoint.parsed_operation_kind(),
+            Some(ThroughputBridgeOperationKind::StreamJob)
+        );
+        assert_eq!(stored_checkpoint.parsed_status(), Some(StreamJobCheckpointStatus::Reached));
+        assert_eq!(stored_checkpoint.checkpoint_sequence, Some(7));
+        assert_eq!(stored_checkpoint.output, Some(json!({"ready": true})));
+
+        let stored_query = store
+            .get_stream_job_bridge_query(&query.query_id)
+            .await?
+            .context("stream job query should exist")?;
+        assert_eq!(
+            stored_query.parsed_operation_kind(),
+            Some(ThroughputBridgeOperationKind::StreamJob)
+        );
+        assert_eq!(stored_query.parsed_status(), Some(StreamJobQueryStatus::Completed));
+        assert_eq!(stored_query.parsed_consistency(), Some(StreamJobQueryConsistency::Strong));
+        assert_eq!(stored_query.output, Some(json!({"anomalies": 2})));
+
+        let listed_handles = store
+            .list_stream_job_bridge_handles_for_run_page("tenant-a", "instance-a", "run-a", 10, 0)
+            .await?;
+        assert_eq!(listed_handles.len(), 1);
+        assert_eq!(listed_handles[0].handle_id, handle.handle_id);
+
+        let listed_checkpoints = store
+            .list_stream_job_bridge_checkpoints_for_handle_page(&handle.handle_id, 10, 0)
+            .await?;
+        assert_eq!(listed_checkpoints.len(), 1);
+        assert_eq!(listed_checkpoints[0].await_request_id, checkpoint.await_request_id);
+
+        let listed_queries =
+            store.list_stream_job_bridge_queries_for_handle_page(&handle.handle_id, 10, 0).await?;
+        assert_eq!(listed_queries.len(), 1);
+        assert_eq!(listed_queries[0].query_id, query.query_id);
+        assert_eq!(
+            listed_queries[0].next_repair(),
+            Some(ThroughputBridgeRepairKind::AcceptStreamQuery)
+        );
+
+        let pending_query_repairs = store.list_pending_stream_job_query_repairs(10).await?;
+        assert_eq!(pending_query_repairs.len(), 1);
+        assert_eq!(pending_query_repairs[0].query_id, query.query_id);
+
+        let pending_checkpoint_repairs =
+            store.list_pending_stream_job_checkpoint_repairs(10).await?;
+        assert_eq!(pending_checkpoint_repairs.len(), 1);
+        assert_eq!(pending_checkpoint_repairs[0].await_request_id, checkpoint.await_request_id);
+
+        let by_handle_id = store
+            .get_stream_job_bridge_handle_by_handle_id(&handle.handle_id)
+            .await?
+            .context("stream job bridge handle should be addressable by handle id")?;
+        assert_eq!(by_handle_id.job_id, "job-a");
+
+        let ledger = store
+            .load_stream_job_bridge_ledger_for_handle(&handle.handle_id)
+            .await?
+            .context("stream job bridge ledger should exist")?;
+        assert_eq!(ledger.job_id, "job-a");
+        assert_eq!(ledger.checkpoint_count, 1);
+        assert_eq!(ledger.query_count, 1);
+        assert_eq!(ledger.pending_checkpoint_repairs, 1);
+        assert_eq!(ledger.pending_query_repairs, 1);
+        assert_eq!(ledger.next_repair(), Some(ThroughputBridgeRepairKind::AcceptStreamCheckpoint));
+
+        let listed_ledgers = store
+            .list_stream_job_bridge_ledgers_for_run_page("tenant-a", "instance-a", "run-a", 10, 0)
+            .await?;
+        assert_eq!(listed_ledgers.len(), 1);
+        assert_eq!(listed_ledgers[0].handle_id, handle.handle_id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_job_bridge_retention_prunes_only_accepted_handles() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+        let accepted_handle = StreamJobBridgeHandleRecord {
+            workflow_event_id: Uuid::now_v7(),
+            protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "instance-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            job_id: "job-prune".to_owned(),
+            handle_id: "stream-job-handle:tenant-a:instance-a:run-a:job-prune".to_owned(),
+            bridge_request_id: "stream-job-bridge:tenant-a:instance-a:run-a:job-prune".to_owned(),
+            definition_id: "demo".to_owned(),
+            definition_version: Some(1),
+            artifact_hash: Some("artifact-a".to_owned()),
+            job_name: "fraud-detector".to_owned(),
+            input_ref: "topic:payments".to_owned(),
+            config_ref: None,
+            checkpoint_policy: None,
+            view_definitions: None,
+            status: StreamJobBridgeHandleStatus::Completed.as_str().to_owned(),
+            workflow_owner_epoch: Some(1),
+            stream_owner_epoch: Some(2),
+            cancellation_requested_at: None,
+            cancellation_reason: None,
+            terminal_event_id: Some(Uuid::now_v7()),
+            terminal_at: Some(now - chrono::Duration::hours(2)),
+            workflow_accepted_at: Some(now - chrono::Duration::hours(1)),
+            terminal_output: Some(json!({"ok": true})),
+            terminal_error: None,
+            created_at: now - chrono::Duration::hours(3),
+            updated_at: now - chrono::Duration::hours(1),
+        };
+        store.upsert_stream_job_bridge_handle(&accepted_handle).await?;
+        store
+            .upsert_stream_job_bridge_checkpoint(&StreamJobCheckpointRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "instance-a".to_owned(),
+                run_id: "run-a".to_owned(),
+                job_id: "job-prune".to_owned(),
+                handle_id: accepted_handle.handle_id.clone(),
+                bridge_request_id: accepted_handle.bridge_request_id.clone(),
+                await_request_id: "await-prune".to_owned(),
+                checkpoint_name: "ready".to_owned(),
+                checkpoint_sequence: Some(1),
+                status: StreamJobCheckpointStatus::Accepted.as_str().to_owned(),
+                workflow_owner_epoch: Some(1),
+                stream_owner_epoch: Some(2),
+                reached_at: Some(now - chrono::Duration::hours(2)),
+                output: Some(json!({"ready": true})),
+                accepted_at: Some(now - chrono::Duration::hours(1)),
+                cancelled_at: None,
+                created_at: now - chrono::Duration::hours(2),
+                updated_at: now - chrono::Duration::hours(1),
+            })
+            .await?;
+        store
+            .upsert_stream_job_bridge_query(&StreamJobQueryRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "instance-a".to_owned(),
+                run_id: "run-a".to_owned(),
+                job_id: "job-prune".to_owned(),
+                handle_id: accepted_handle.handle_id.clone(),
+                bridge_request_id: accepted_handle.bridge_request_id.clone(),
+                query_id: "query-prune".to_owned(),
+                query_name: "currentStats".to_owned(),
+                query_args: None,
+                consistency: StreamJobQueryConsistency::Strong.as_str().to_owned(),
+                status: StreamJobQueryStatus::Accepted.as_str().to_owned(),
+                workflow_owner_epoch: Some(1),
+                stream_owner_epoch: Some(2),
+                output: Some(json!({"anomalies": 0})),
+                error: None,
+                requested_at: now - chrono::Duration::hours(2),
+                completed_at: Some(now - chrono::Duration::hours(2)),
+                accepted_at: Some(now - chrono::Duration::hours(1)),
+                cancelled_at: None,
+                created_at: now - chrono::Duration::hours(2),
+                updated_at: now - chrono::Duration::hours(1),
+            })
+            .await?;
+
+        let active_handle = StreamJobBridgeHandleRecord {
+            workflow_event_id: Uuid::now_v7(),
+            job_id: "job-keep".to_owned(),
+            handle_id: "stream-job-handle:tenant-a:instance-a:run-a:job-keep".to_owned(),
+            bridge_request_id: "stream-job-bridge:tenant-a:instance-a:run-a:job-keep".to_owned(),
+            status: StreamJobBridgeHandleStatus::Running.as_str().to_owned(),
+            stream_owner_epoch: Some(3),
+            terminal_event_id: None,
+            terminal_at: None,
+            workflow_accepted_at: None,
+            terminal_output: None,
+            terminal_error: None,
+            created_at: now,
+            updated_at: now,
+            ..accepted_handle.clone()
+        };
+        store.upsert_stream_job_bridge_handle(&active_handle).await?;
+
+        let summary =
+            store.prune_stream_job_bridge_retention(now - chrono::Duration::minutes(30)).await?;
+        assert_eq!(summary.pruned_handles, 1);
+        assert_eq!(summary.pruned_checkpoints, 1);
+        assert_eq!(summary.pruned_queries, 1);
+        assert!(
+            store
+                .get_stream_job_bridge_handle_by_handle_id(&accepted_handle.handle_id)
+                .await?
+                .is_none()
+        );
+        assert!(
+            store
+                .get_stream_job_bridge_handle_by_handle_id(&active_handle.handle_id)
+                .await?
+                .is_some()
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_jobs_round_trip() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+        let job = StreamJobRecord {
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "instance-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            job_id: "job-a".to_owned(),
+            handle_id: "stream-job-handle:tenant-a:instance-a:run-a:job-a".to_owned(),
+            protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+            workflow_event_id: Uuid::now_v7(),
+            bridge_request_id: "stream-job-bridge:tenant-a:instance-a:run-a:job-a".to_owned(),
+            definition_id: "demo".to_owned(),
+            definition_version: Some(1),
+            artifact_hash: Some("artifact-a".to_owned()),
+            job_name: "fraud-detector".to_owned(),
+            input_ref: "topic:payments".to_owned(),
+            config_ref: Some("config:fraud-detector:v1".to_owned()),
+            checkpoint_policy: None,
+            view_definitions: None,
+            status: StreamJobStatus::Running.as_str().to_owned(),
+            workflow_owner_epoch: Some(2),
+            stream_owner_epoch: Some(5),
+            starting_at: Some(now),
+            running_at: Some(now + chrono::Duration::seconds(1)),
+            draining_at: None,
+            latest_checkpoint_name: Some("hourly-rollup-ready".to_owned()),
+            latest_checkpoint_sequence: Some(7),
+            latest_checkpoint_at: Some(now + chrono::Duration::seconds(2)),
+            latest_checkpoint_output: Some(json!({"ready": true})),
+            cancellation_requested_at: None,
+            cancellation_reason: None,
+            workflow_accepted_at: None,
+            terminal_event_id: None,
+            terminal_at: None,
+            terminal_output: None,
+            terminal_error: None,
+            created_at: now,
+            updated_at: now + chrono::Duration::seconds(2),
+        };
+        store.upsert_stream_job(&job).await?;
+
+        let stored = store
+            .get_stream_job("tenant-a", "instance-a", "run-a", "job-a")
+            .await?
+            .context("stream job should exist")?;
+        assert_eq!(stored.parsed_status(), Some(StreamJobStatus::Running));
+        assert_eq!(stored.latest_checkpoint_name.as_deref(), Some("hourly-rollup-ready"));
+        assert_eq!(stored.latest_checkpoint_sequence, Some(7));
+        assert_eq!(stored.latest_checkpoint_output, Some(json!({"ready": true})));
+
+        let listed =
+            store.list_stream_jobs_for_run_page("tenant-a", "instance-a", "run-a", 10, 0).await?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].job_id, "job-a");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn throughput_run_round_trips_and_tracks_lifecycle() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
@@ -22177,6 +25057,10 @@ mod tests {
                 fabrik_throughput::StartThroughputRunCommand {
                     dedupe_key: "throughput-start:test".to_owned(),
                     bridge_request_id: "throughput-bridge:tenant-a:instance-a:run-a:batch-a"
+                        .to_owned(),
+                    bridge_protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                    bridge_operation_kind: ThroughputBridgeOperationKind::BulkRun
+                        .as_str()
                         .to_owned(),
                     tenant_id: "tenant-a".to_owned(),
                     definition_id: "demo".to_owned(),
@@ -22218,6 +25102,8 @@ mod tests {
                 definition_version: Some(1),
                 artifact_hash: Some("artifact-a".to_owned()),
                 batch_id: "batch-a".to_owned(),
+                bridge_protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                bridge_operation_kind: ThroughputBridgeOperationKind::BulkRun.as_str().to_owned(),
                 bridge_request_id: "throughput-bridge:tenant-a:instance-a:run-a:batch-a".to_owned(),
                 throughput_backend: "stream-v2".to_owned(),
                 execution_path: "native_stream_v2".to_owned(),
@@ -22464,6 +25350,10 @@ mod tests {
                     dedupe_key: "throughput-start:test-terminal".to_owned(),
                     bridge_request_id: "throughput-bridge:tenant-a:instance-a:run-a:batch-a"
                         .to_owned(),
+                    bridge_protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                    bridge_operation_kind: ThroughputBridgeOperationKind::BulkRun
+                        .as_str()
+                        .to_owned(),
                     tenant_id: "tenant-a".to_owned(),
                     definition_id: "demo".to_owned(),
                     definition_version: Some(1),
@@ -22504,6 +25394,8 @@ mod tests {
                 definition_version: Some(1),
                 artifact_hash: Some("artifact-a".to_owned()),
                 batch_id: "batch-a".to_owned(),
+                bridge_protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                bridge_operation_kind: ThroughputBridgeOperationKind::BulkRun.as_str().to_owned(),
                 bridge_request_id: "throughput-bridge:tenant-a:instance-a:run-a:batch-a".to_owned(),
                 throughput_backend: "stream-v2".to_owned(),
                 execution_path: "native_stream_v2".to_owned(),

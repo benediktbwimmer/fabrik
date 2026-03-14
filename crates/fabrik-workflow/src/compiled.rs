@@ -9,6 +9,7 @@ use fabrik_throughput::{
     bulk_reducer_default_summary_value, bulk_reducer_reduce_values,
     bulk_reducer_requires_success_outputs, bulk_reducer_settles as throughput_bulk_reducer_settles,
     bulk_reducer_summary_field_name, parse_benchmark_compact_input_meta,
+    stream_job_query_request_id,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, json};
@@ -233,6 +234,50 @@ pub enum CompiledStateNode {
     },
     WaitForBulkActivity {
         bulk_ref_var: String,
+        next: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_var: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on_error: Option<ErrorTransition>,
+    },
+    StartStreamJob {
+        job_name: String,
+        input: Expression,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config: Option<Expression>,
+        next: String,
+        handle_var: String,
+    },
+    WaitForStreamCheckpoint {
+        stream_job_ref_var: String,
+        checkpoint_name: String,
+        next: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_var: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on_error: Option<ErrorTransition>,
+    },
+    QueryStreamJob {
+        stream_job_ref_var: String,
+        query_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args: Option<Expression>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consistency: Option<String>,
+        next: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_var: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on_error: Option<ErrorTransition>,
+    },
+    CancelStreamJob {
+        stream_job_ref_var: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<Expression>,
+        next: String,
+    },
+    AwaitStreamJobTerminal {
+        stream_job_ref_var: String,
         next: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_var: Option<String>,
@@ -584,6 +629,16 @@ impl ArtifactExecutionState {
             (bulk.wait_state == wait_state).then_some(bulk)
         })
     }
+
+    #[allow(dead_code)]
+    fn stream_job_wait_binding(&self, wait_state: &str) -> Option<StreamJobExecutionState> {
+        self.bindings.values().find_map(|value| {
+            let stream_job = decode_stream_job_state(value)?;
+            (stream_job.wait_state == wait_state
+                || stream_job.terminal_wait_state.as_deref() == Some(wait_state))
+            .then_some(stream_job)
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -682,6 +737,20 @@ struct BulkActivityExecutionState {
     pub chunk_size: u32,
     pub max_attempts: u32,
     pub retry_delay_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamJobExecutionState {
+    pub job_id: String,
+    pub origin_state: String,
+    pub wait_state: String,
+    pub job_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_wait_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checkpoint_sequence: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1512,6 +1581,255 @@ impl CompiledWorkflowArtifact {
         }
     }
 
+    pub fn execute_after_stream_checkpoint_with_turn(
+        &self,
+        wait_state: &str,
+        job_id: &str,
+        checkpoint_name: &str,
+        checkpoint_sequence: i64,
+        output: Option<&Value>,
+        mut execution_state: ArtifactExecutionState,
+        turn_context: ExecutionTurnContext,
+    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
+        execution_state.turn_context = Some(turn_context);
+        let states = self
+            .states_for(wait_state, &execution_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
+        let state = states
+            .get(wait_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
+        match state {
+            CompiledStateNode::WaitForStreamCheckpoint {
+                stream_job_ref_var,
+                checkpoint_name: expected_checkpoint_name,
+                next,
+                output_var,
+                ..
+            } => {
+                let mut stream_job =
+                    self.stream_job_binding(wait_state, stream_job_ref_var, &execution_state)?;
+                if stream_job.job_id != job_id {
+                    return Err(CompiledWorkflowError::UnexpectedStreamJob {
+                        expected: stream_job.job_id,
+                        received: job_id.to_owned(),
+                    });
+                }
+                if expected_checkpoint_name != checkpoint_name {
+                    return Err(CompiledWorkflowError::UnexpectedStreamCheckpoint {
+                        expected: expected_checkpoint_name.clone(),
+                        received: checkpoint_name.to_owned(),
+                    });
+                }
+                stream_job.last_checkpoint_name = Some(checkpoint_name.to_owned());
+                stream_job.last_checkpoint_sequence = Some(checkpoint_sequence);
+                execution_state.bindings.insert(
+                    stream_job_ref_var.clone(),
+                    serde_json::to_value(stream_job).expect("stream job state serializes"),
+                );
+                if let Some(output_var) = output_var
+                    && let Some(output) = output
+                {
+                    execution_state.bindings.insert(output_var.clone(), output.clone());
+                }
+                self.execute_from_state_in_graph(states, next, execution_state, false)
+            }
+            _ => Err(CompiledWorkflowError::NotWaitingOnStreamJob(wait_state.to_owned())),
+        }
+    }
+
+    pub fn execute_after_stream_terminal_with_turn(
+        &self,
+        wait_state: &str,
+        job_id: &str,
+        terminal_output: Option<&Value>,
+        error: Option<&str>,
+        mut execution_state: ArtifactExecutionState,
+        turn_context: ExecutionTurnContext,
+    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
+        execution_state.turn_context = Some(turn_context);
+        let states = self
+            .states_for(wait_state, &execution_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
+        let state = states
+            .get(wait_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
+        match state {
+            CompiledStateNode::WaitForStreamCheckpoint {
+                stream_job_ref_var,
+                checkpoint_name,
+                on_error,
+                ..
+            } => {
+                let stream_job =
+                    self.stream_job_binding(wait_state, stream_job_ref_var, &execution_state)?;
+                if stream_job.job_id != job_id {
+                    return Err(CompiledWorkflowError::UnexpectedStreamJob {
+                        expected: stream_job.job_id,
+                        received: job_id.to_owned(),
+                    });
+                }
+                let reason = error.map(ToOwned::to_owned).unwrap_or_else(|| {
+                    format!("stream job terminated before checkpoint {checkpoint_name}")
+                });
+                if let Some(on_error) = on_error {
+                    if let Some(error_var) = &on_error.error_var {
+                        execution_state
+                            .bindings
+                            .insert(error_var.clone(), Value::String(reason.clone()));
+                    }
+                    execution_state.bindings.remove(stream_job_ref_var);
+                    return self.execute_from_state_in_graph(
+                        states,
+                        &on_error.next,
+                        execution_state,
+                        false,
+                    );
+                }
+                Err(CompiledWorkflowError::StreamJobTerminalBeforeCheckpoint {
+                    state: wait_state.to_owned(),
+                    job_id: job_id.to_owned(),
+                    checkpoint_name: checkpoint_name.clone(),
+                    reason,
+                })
+            }
+            CompiledStateNode::AwaitStreamJobTerminal {
+                stream_job_ref_var,
+                next,
+                output_var,
+                on_error,
+            } => {
+                let stream_job =
+                    self.stream_job_binding(wait_state, stream_job_ref_var, &execution_state)?;
+                if stream_job.job_id != job_id {
+                    return Err(CompiledWorkflowError::UnexpectedStreamJob {
+                        expected: stream_job.job_id,
+                        received: job_id.to_owned(),
+                    });
+                }
+                execution_state.bindings.remove(stream_job_ref_var);
+                if let Some(error) = error {
+                    if let Some(on_error) = on_error {
+                        if let Some(error_var) = &on_error.error_var {
+                            execution_state
+                                .bindings
+                                .insert(error_var.clone(), Value::String(error.to_owned()));
+                        }
+                        return self.execute_from_state_in_graph(
+                            states,
+                            &on_error.next,
+                            execution_state,
+                            false,
+                        );
+                    }
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: wait_state.to_owned(),
+                        emissions: vec![ExecutionEmission {
+                            event: WorkflowEvent::WorkflowFailed { reason: error.to_owned() },
+                            state: Some(wait_state.to_owned()),
+                        }],
+                        execution_state,
+                        context: Some(Value::String(error.to_owned())),
+                        output: Some(Value::String(error.to_owned())),
+                    });
+                }
+                if let Some(output_var) = output_var
+                    && let Some(output) = terminal_output
+                {
+                    execution_state.bindings.insert(output_var.clone(), output.clone());
+                }
+                self.execute_from_state_in_graph(states, next, execution_state, false)
+            }
+            _ => Err(CompiledWorkflowError::NotWaitingOnStreamJob(wait_state.to_owned())),
+        }
+    }
+
+    pub fn execute_after_stream_query_with_turn(
+        &self,
+        wait_state: &str,
+        job_id: &str,
+        query_id: &str,
+        query_name: &str,
+        query_output: Option<&Value>,
+        error: Option<&str>,
+        mut execution_state: ArtifactExecutionState,
+        turn_context: ExecutionTurnContext,
+    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
+        execution_state.turn_context = Some(turn_context);
+        let states = self
+            .states_for(wait_state, &execution_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
+        let state = states
+            .get(wait_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(wait_state.to_owned()))?;
+        match state {
+            CompiledStateNode::QueryStreamJob {
+                stream_job_ref_var,
+                query_name: expected_query_name,
+                next,
+                output_var,
+                on_error,
+                ..
+            } => {
+                let stream_job =
+                    self.stream_job_binding(wait_state, stream_job_ref_var, &execution_state)?;
+                if stream_job.job_id != job_id {
+                    return Err(CompiledWorkflowError::UnexpectedStreamJob {
+                        expected: stream_job.job_id,
+                        received: job_id.to_owned(),
+                    });
+                }
+                if expected_query_name != query_name {
+                    return Err(CompiledWorkflowError::UnexpectedStreamQuery {
+                        expected: expected_query_name.clone(),
+                        received: query_name.to_owned(),
+                    });
+                }
+                if let Some(error) = error {
+                    if let Some(on_error) = on_error {
+                        if let Some(error_var) = &on_error.error_var {
+                            execution_state
+                                .bindings
+                                .insert(error_var.clone(), Value::String(error.to_owned()));
+                        }
+                        return self.execute_from_state_in_graph(
+                            states,
+                            &on_error.next,
+                            execution_state,
+                            false,
+                        );
+                    }
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: wait_state.to_owned(),
+                        emissions: vec![ExecutionEmission {
+                            event: WorkflowEvent::WorkflowFailed {
+                                reason: format!(
+                                    "stream job query {query_name} failed for {job_id}: {error}"
+                                ),
+                            },
+                            state: Some(wait_state.to_owned()),
+                        }],
+                        execution_state,
+                        context: Some(Value::String(error.to_owned())),
+                        output: Some(Value::String(error.to_owned())),
+                    });
+                }
+                if let Some(output_var) = output_var
+                    && let Some(query_output) = query_output
+                {
+                    execution_state.bindings.insert(output_var.clone(), query_output.clone());
+                }
+                execution_state.bindings.insert(
+                    "__last_stream_job_query_id".to_owned(),
+                    Value::String(query_id.to_owned()),
+                );
+                self.execute_from_state_in_graph(states, next, execution_state, false)
+            }
+            _ => Err(CompiledWorkflowError::NotWaitingOnStreamJob(wait_state.to_owned())),
+        }
+    }
+
     pub fn execute_after_step_completion(
         &self,
         step_state: &str,
@@ -2134,6 +2452,20 @@ impl CompiledWorkflowArtifact {
         })
     }
 
+    fn stream_job_binding(
+        &self,
+        state_id: &str,
+        binding: &str,
+        execution_state: &ArtifactExecutionState,
+    ) -> Result<StreamJobExecutionState, CompiledWorkflowError> {
+        execution_state.bindings.get(binding).and_then(decode_stream_job_state).ok_or_else(|| {
+            CompiledWorkflowError::MissingStreamJobBinding {
+                state: state_id.to_owned(),
+                binding: binding.to_owned(),
+            }
+        })
+    }
+
     fn find_fanout_member(
         &self,
         execution_state: &ArtifactExecutionState,
@@ -2173,6 +2505,47 @@ impl CompiledWorkflowArtifact {
         self.bulk_binding(wait_state, bulk_ref_var, execution_state)
             .map(|bulk| bulk.wait_state == wait_state)
             .unwrap_or(false)
+    }
+
+    pub fn waits_on_stream_job(
+        &self,
+        wait_state: &str,
+        execution_state: &ArtifactExecutionState,
+    ) -> bool {
+        let Some(states) = self.states_for(wait_state, execution_state) else {
+            return false;
+        };
+        let Some(
+            CompiledStateNode::WaitForStreamCheckpoint { stream_job_ref_var, .. }
+            | CompiledStateNode::AwaitStreamJobTerminal { stream_job_ref_var, .. },
+        ) = states.get(wait_state)
+        else {
+            return false;
+        };
+        self.stream_job_binding(wait_state, stream_job_ref_var, execution_state)
+            .map(|stream_job| {
+                stream_job.wait_state == wait_state
+                    || stream_job.terminal_wait_state.as_deref() == Some(wait_state)
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn rehydrate_stream_job_wait_binding(
+        &self,
+        wait_state: &str,
+        execution_state: &ArtifactExecutionState,
+    ) -> Option<StreamJobExecutionState> {
+        let states = self.states_for(wait_state, execution_state)?;
+        let state = states.get(wait_state)?;
+        let stream_job_ref_var = match state {
+            CompiledStateNode::WaitForStreamCheckpoint { stream_job_ref_var, .. }
+            | CompiledStateNode::QueryStreamJob { stream_job_ref_var, .. }
+            | CompiledStateNode::AwaitStreamJobTerminal { stream_job_ref_var, .. } => {
+                stream_job_ref_var
+            }
+            _ => return None,
+        };
+        self.stream_job_binding(wait_state, stream_job_ref_var, execution_state).ok()
     }
 
     pub fn rehydrate_bulk_wait_context(
@@ -3078,6 +3451,151 @@ impl CompiledWorkflowArtifact {
                         output,
                     });
                 }
+                CompiledStateNode::StartStreamJob { job_name, input, config, next, handle_var } => {
+                    let input = evaluate_expression(input, &mut execution_state, &self.helpers)?;
+                    let config = config
+                        .as_ref()
+                        .map(|expr| evaluate_expression(expr, &mut execution_state, &self.helpers))
+                        .transpose()?;
+                    let job_id = build_stream_job_id(
+                        execution_state.turn_context.as_ref().ok_or_else(|| {
+                            CompiledWorkflowError::MissingTurnContext(
+                                "ctx.startStreamJob()".to_owned(),
+                            )
+                        })?,
+                        &current_state,
+                    );
+                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+                    emissions.push(ExecutionEmission {
+                        event: WorkflowEvent::StreamJobScheduled {
+                            job_id: job_id.clone(),
+                            job_name: job_name.clone(),
+                            input,
+                            config,
+                            state: Some(next.clone()),
+                        },
+                        state: Some(next.clone()),
+                    });
+                    let terminal_wait_state =
+                        states.iter().find_map(|(state_id, state)| match state {
+                            CompiledStateNode::AwaitStreamJobTerminal {
+                                stream_job_ref_var,
+                                ..
+                            } if stream_job_ref_var == handle_var => Some(state_id.clone()),
+                            _ => None,
+                        });
+                    execution_state.bindings.insert(
+                        handle_var.clone(),
+                        serde_json::to_value(StreamJobExecutionState {
+                            job_id,
+                            origin_state: current_state.clone(),
+                            wait_state: next.clone(),
+                            job_name: job_name.clone(),
+                            terminal_wait_state,
+                            last_checkpoint_name: None,
+                            last_checkpoint_sequence: None,
+                        })
+                        .expect("stream job state serializes"),
+                    );
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: next.clone(),
+                        emissions,
+                        execution_state,
+                        context,
+                        output,
+                    });
+                }
+                CompiledStateNode::WaitForStreamCheckpoint { .. }
+                | CompiledStateNode::AwaitStreamJobTerminal { .. } => {
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: current_state,
+                        emissions,
+                        execution_state,
+                        context,
+                        output,
+                    });
+                }
+                CompiledStateNode::QueryStreamJob {
+                    stream_job_ref_var,
+                    query_name,
+                    args,
+                    consistency,
+                    ..
+                } => {
+                    let stream_job = self.stream_job_binding(
+                        &current_state,
+                        stream_job_ref_var,
+                        &execution_state,
+                    )?;
+                    let args = args
+                        .as_ref()
+                        .map(|expr| evaluate_expression(expr, &mut execution_state, &self.helpers))
+                        .transpose()?;
+                    let query_id = stream_job_query_request_id(
+                        &stream_job.job_id,
+                        query_name,
+                        execution_state
+                            .turn_context
+                            .as_ref()
+                            .ok_or_else(|| {
+                                CompiledWorkflowError::MissingTurnContext(
+                                    "ctx.queryStreamJob()".to_owned(),
+                                )
+                            })?
+                            .event_id,
+                    );
+                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+                    emissions.push(ExecutionEmission {
+                        event: WorkflowEvent::StreamJobQueryRequested {
+                            job_id: stream_job.job_id,
+                            query_id,
+                            query_name: query_name.clone(),
+                            args,
+                            consistency: consistency.clone().unwrap_or_else(|| "strong".to_owned()),
+                            state: Some(current_state.clone()),
+                        },
+                        state: Some(current_state.clone()),
+                    });
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: current_state,
+                        emissions,
+                        execution_state,
+                        context,
+                        output,
+                    });
+                }
+                CompiledStateNode::CancelStreamJob { stream_job_ref_var, reason, next } => {
+                    let stream_job = self.stream_job_binding(
+                        &current_state,
+                        stream_job_ref_var,
+                        &execution_state,
+                    )?;
+                    let reason = reason
+                        .as_ref()
+                        .map(|expr| evaluate_expression(expr, &mut execution_state, &self.helpers))
+                        .transpose()?
+                        .and_then(|value| stringify_value(&value));
+                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+                    emissions.push(ExecutionEmission {
+                        event: WorkflowEvent::StreamJobCancellationRequested {
+                            job_id: stream_job.job_id.clone(),
+                            reason,
+                            state: Some(next.clone()),
+                        },
+                        state: Some(next.clone()),
+                    });
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: next.clone(),
+                        emissions,
+                        execution_state,
+                        context,
+                        output,
+                    });
+                }
                 CompiledStateNode::WaitForAllActivities { .. } => {
                     return Ok(CompiledExecutionPlan {
                         workflow_version: self.definition_version,
@@ -3615,6 +4133,13 @@ impl CompiledStateNode {
             Self::WaitForBulkActivity { next, on_error, .. } => std::iter::once(next.as_str())
                 .chain(on_error.iter().map(|transition| transition.next.as_str()))
                 .collect(),
+            Self::StartStreamJob { next, .. } => vec![next.as_str()],
+            Self::WaitForStreamCheckpoint { next, on_error, .. }
+            | Self::QueryStreamJob { next, on_error, .. }
+            | Self::AwaitStreamJobTerminal { next, on_error, .. } => std::iter::once(next.as_str())
+                .chain(on_error.iter().map(|transition| transition.next.as_str()))
+                .collect(),
+            Self::CancelStreamJob { next, .. } => vec![next.as_str()],
             Self::WaitForAllActivities { next, on_error, .. } => std::iter::once(next.as_str())
                 .chain(on_error.iter().map(|transition| transition.next.as_str()))
                 .collect(),
@@ -4073,6 +4598,14 @@ fn build_bulk_batch_id(turn_context: &ExecutionTurnContext, state_id: &str) -> S
     .to_string()
 }
 
+fn build_stream_job_id(turn_context: &ExecutionTurnContext, state_id: &str) -> String {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("{}:{state_id}:stream-job", turn_context.event_id).as_bytes(),
+    )
+    .to_string()
+}
+
 fn build_background_timer_id(turn_context: &ExecutionTurnContext, state_id: &str) -> String {
     uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_URL,
@@ -4492,6 +5025,10 @@ fn decode_fanout_state(value: &Value) -> Option<FanOutExecutionState> {
 }
 
 fn decode_bulk_state(value: &Value) -> Option<BulkActivityExecutionState> {
+    serde_json::from_value(value.clone()).ok()
+}
+
+fn decode_stream_job_state(value: &Value) -> Option<StreamJobExecutionState> {
     serde_json::from_value(value.clone()).ok()
 }
 
@@ -5790,6 +6327,25 @@ pub enum CompiledWorkflowError {
     MissingBulkBinding { state: String, binding: String },
     #[error("unexpected bulk batch completion, expected {expected}, received {received}")]
     UnexpectedBulkBatch { expected: String, received: String },
+    #[error("compiled workflow state {0} is not waiting on a stream job")]
+    NotWaitingOnStreamJob(String),
+    #[error("compiled workflow state {state} is missing stream job binding {binding}")]
+    MissingStreamJobBinding { state: String, binding: String },
+    #[error("unexpected stream job completion, expected {expected}, received {received}")]
+    UnexpectedStreamJob { expected: String, received: String },
+    #[error("unexpected stream checkpoint, expected {expected}, received {received}")]
+    UnexpectedStreamCheckpoint { expected: String, received: String },
+    #[error("unexpected stream query, expected {expected}, received {received}")]
+    UnexpectedStreamQuery { expected: String, received: String },
+    #[error(
+        "compiled workflow state {state} stream job {job_id} terminated before checkpoint {checkpoint_name}: {reason}"
+    )]
+    StreamJobTerminalBeforeCheckpoint {
+        state: String,
+        job_id: String,
+        checkpoint_name: String,
+        reason: String,
+    },
     #[error("compiled workflow state {state} has invalid bulk retry delay: {details}")]
     InvalidBulkRetryDelay { state: String, details: String },
     #[error("compiled workflow bulk activity item count {count} exceeds u32")]
@@ -5846,6 +6402,8 @@ pub enum CompiledWorkflowError {
     InvalidNumericValue(String),
     #[error("compiled workflow state {0} evaluated dynamic signal name to a non-string value")]
     InvalidDynamicSignalName(String),
+    #[error("compiled workflow state {0} uses a stream-job primitive that is not implemented yet")]
+    UnsupportedStreamJobPrimitive(String),
 }
 
 #[cfg(test)]
@@ -8987,7 +9545,9 @@ mod tests {
                         "choice_children".to_owned(),
                         CompiledStateNode::Choice {
                             condition: Expression::Member {
-                                object: Box::new(Expression::Identifier { name: "node".to_owned() }),
+                                object: Box::new(Expression::Identifier {
+                                    name: "node".to_owned(),
+                                }),
                                 property: "children".to_owned(),
                             },
                             then_next: "init_join_index".to_owned(),
@@ -9009,10 +9569,14 @@ mod tests {
                         CompiledStateNode::Choice {
                             condition: Expression::Binary {
                                 op: BinaryOp::LessThan,
-                                left: Box::new(Expression::Identifier { name: "join_index".to_owned() }),
+                                left: Box::new(Expression::Identifier {
+                                    name: "join_index".to_owned(),
+                                }),
                                 right: Box::new(Expression::Member {
                                     object: Box::new(Expression::Member {
-                                        object: Box::new(Expression::Identifier { name: "node".to_owned() }),
+                                        object: Box::new(Expression::Identifier {
+                                            name: "node".to_owned(),
+                                        }),
                                         property: "children".to_owned(),
                                     }),
                                     property: "length".to_owned(),
@@ -9029,10 +9593,14 @@ mod tests {
                                 target: "child".to_owned(),
                                 expr: Expression::Index {
                                     object: Box::new(Expression::Member {
-                                        object: Box::new(Expression::Identifier { name: "node".to_owned() }),
+                                        object: Box::new(Expression::Identifier {
+                                            name: "node".to_owned(),
+                                        }),
                                         property: "children".to_owned(),
                                     }),
-                                    index: Box::new(Expression::Identifier { name: "join_index".to_owned() }),
+                                    index: Box::new(Expression::Identifier {
+                                        name: "join_index".to_owned(),
+                                    }),
                                 },
                             }],
                             next: "call_child".to_owned(),
@@ -9055,7 +9623,9 @@ mod tests {
                                 target: "join_index".to_owned(),
                                 expr: Expression::Binary {
                                     op: BinaryOp::Add,
-                                    left: Box::new(Expression::Identifier { name: "join_index".to_owned() }),
+                                    left: Box::new(Expression::Identifier {
+                                        name: "join_index".to_owned(),
+                                    }),
                                     right: Box::new(Expression::Literal { value: json!(1) }),
                                 },
                             }],
@@ -9069,7 +9639,9 @@ mod tests {
                             input: Expression::Logical {
                                 op: LogicalOp::Coalesce,
                                 left: Box::new(Expression::Member {
-                                    object: Box::new(Expression::Identifier { name: "node".to_owned() }),
+                                    object: Box::new(Expression::Identifier {
+                                        name: "node".to_owned(),
+                                    }),
                                     property: "value".to_owned(),
                                 }),
                                 right: Box::new(Expression::Literal { value: json!("leaf") }),
@@ -9162,10 +9734,11 @@ mod tests {
         }
 
         assert_eq!(plan.final_state, "complete");
-        assert!(plan
-            .emissions
-            .iter()
-            .any(|emission| matches!(emission.event, WorkflowEvent::WorkflowCompleted { .. })));
+        assert!(
+            plan.emissions
+                .iter()
+                .any(|emission| matches!(emission.event, WorkflowEvent::WorkflowCompleted { .. }))
+        );
         assert!(plan.execution_state.async_frames.is_empty());
         assert!(!plan.execution_state.bindings.contains_key("child"));
         assert!(!plan.execution_state.bindings.contains_key("join_index"));
@@ -9372,6 +9945,288 @@ mod tests {
             completed.execution_state.bindings.get("timer"),
             Some(Value::Object(value))
                 if value.get("status") == Some(&Value::String("completed".to_owned()))
+        ));
+    }
+
+    #[test]
+    fn stream_job_start_checkpoint_and_terminal_nodes_execute() {
+        let artifact = CompiledWorkflowArtifact::new(
+            "stream-job-placeholder",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "start_stream".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "start_stream".to_owned(),
+                        CompiledStateNode::StartStreamJob {
+                            job_name: "fraud-detector".to_owned(),
+                            input: Expression::Literal { value: json!({"input": "payments"}) },
+                            config: Some(Expression::Literal { value: json!({"threshold": 0.97}) }),
+                            next: "wait_checkpoint".to_owned(),
+                            handle_var: "job".to_owned(),
+                        },
+                    ),
+                    (
+                        "wait_checkpoint".to_owned(),
+                        CompiledStateNode::WaitForStreamCheckpoint {
+                            stream_job_ref_var: "job".to_owned(),
+                            checkpoint_name: "hourly-rollup-ready".to_owned(),
+                            next: "await_terminal".to_owned(),
+                            output_var: Some("checkpoint".to_owned()),
+                            on_error: None,
+                        },
+                    ),
+                    (
+                        "await_terminal".to_owned(),
+                        CompiledStateNode::AwaitStreamJobTerminal {
+                            stream_job_ref_var: "job".to_owned(),
+                            next: "done".to_owned(),
+                            output_var: Some("result".to_owned()),
+                            on_error: None,
+                        },
+                    ),
+                    ("done".to_owned(), CompiledStateNode::Succeed { output: None }),
+                ]),
+                async_helpers: BTreeMap::new(),
+                params: Vec::new(),
+                non_cancellable_states: BTreeSet::new(),
+            },
+        );
+
+        artifact.validate().expect("stream job placeholder artifact should validate");
+        let waiting = artifact
+            .execute_trigger_with_turn(
+                &json!({}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .expect("stream job start should execute");
+        assert!(waiting.emissions.iter().any(|emission| matches!(
+            emission,
+            ExecutionEmission {
+                event: WorkflowEvent::StreamJobScheduled { job_name, .. },
+                ..
+            } if job_name == "fraud-detector"
+        )));
+        let job = waiting
+            .execution_state
+            .bindings
+            .get("job")
+            .and_then(decode_stream_job_state)
+            .expect("stream job binding should exist");
+
+        let checkpoint = artifact
+            .execute_after_stream_checkpoint_with_turn(
+                "wait_checkpoint",
+                &job.job_id,
+                "hourly-rollup-ready",
+                7,
+                Some(&json!({"ready": true})),
+                waiting.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_500).unwrap(),
+                },
+            )
+            .expect("checkpoint callback should resume workflow");
+        assert_eq!(
+            checkpoint.execution_state.bindings.get("checkpoint"),
+            Some(&json!({"ready": true}))
+        );
+
+        let resumed_job = checkpoint
+            .execution_state
+            .bindings
+            .get("job")
+            .and_then(decode_stream_job_state)
+            .expect("stream job binding should survive checkpoint");
+        assert_eq!(resumed_job.last_checkpoint_sequence, Some(7));
+
+        let completed = artifact
+            .execute_after_stream_terminal_with_turn(
+                "await_terminal",
+                &job.job_id,
+                Some(&json!({"score": 0.97})),
+                None,
+                checkpoint.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_001_000).unwrap(),
+                },
+            )
+            .expect("terminal callback should resume workflow");
+        assert_eq!(completed.execution_state.bindings.get("result"), Some(&json!({"score": 0.97})));
+        assert!(matches!(
+            completed.emissions.last(),
+            Some(ExecutionEmission { event: WorkflowEvent::WorkflowCompleted { .. }, .. })
+        ));
+    }
+
+    #[test]
+    fn stream_job_cancel_node_emits_bridge_request_and_advances() {
+        let artifact = CompiledWorkflowArtifact::new(
+            "stream-job-cancel",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "start_stream".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "start_stream".to_owned(),
+                        CompiledStateNode::StartStreamJob {
+                            job_name: "fraud-detector".to_owned(),
+                            input: Expression::Literal { value: json!({"input": "payments"}) },
+                            config: None,
+                            next: "cancel_stream".to_owned(),
+                            handle_var: "job".to_owned(),
+                        },
+                    ),
+                    (
+                        "cancel_stream".to_owned(),
+                        CompiledStateNode::CancelStreamJob {
+                            stream_job_ref_var: "job".to_owned(),
+                            reason: Some(Expression::Literal { value: json!("manual stop") }),
+                            next: "done".to_owned(),
+                        },
+                    ),
+                    ("done".to_owned(), CompiledStateNode::Succeed { output: None }),
+                ]),
+                async_helpers: BTreeMap::new(),
+                params: Vec::new(),
+                non_cancellable_states: BTreeSet::new(),
+            },
+        );
+
+        let started = artifact
+            .execute_trigger_with_turn(
+                &json!({}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .expect("stream job start should execute");
+        let job = started
+            .execution_state
+            .bindings
+            .get("job")
+            .and_then(decode_stream_job_state)
+            .expect("stream job binding should exist");
+
+        let cancelled = artifact
+            .execute_from_state("cancel_stream", started.execution_state, false)
+            .expect("stream job cancel should execute");
+
+        assert_eq!(cancelled.final_state, "done");
+        assert!(cancelled.emissions.iter().any(|emission| matches!(
+            emission,
+            ExecutionEmission {
+                event: WorkflowEvent::StreamJobCancellationRequested { job_id, reason, .. },
+                state,
+            } if job_id == &job.job_id
+                && reason.as_deref() == Some("manual stop")
+                && state.as_deref() == Some("done")
+        )));
+    }
+
+    #[test]
+    fn stream_job_query_node_requests_and_resumes_with_output() {
+        let artifact = CompiledWorkflowArtifact::new(
+            "stream-job-query",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "start_stream".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "start_stream".to_owned(),
+                        CompiledStateNode::StartStreamJob {
+                            job_name: "fraud-detector".to_owned(),
+                            input: Expression::Literal { value: json!({"input": "payments"}) },
+                            config: None,
+                            next: "query_stream".to_owned(),
+                            handle_var: "job".to_owned(),
+                        },
+                    ),
+                    (
+                        "query_stream".to_owned(),
+                        CompiledStateNode::QueryStreamJob {
+                            stream_job_ref_var: "job".to_owned(),
+                            query_name: "currentStats".to_owned(),
+                            args: Some(Expression::Literal { value: json!({"window": "1h"}) }),
+                            consistency: Some("strong".to_owned()),
+                            next: "done".to_owned(),
+                            output_var: Some("stats".to_owned()),
+                            on_error: None,
+                        },
+                    ),
+                    (
+                        "done".to_owned(),
+                        CompiledStateNode::Succeed {
+                            output: Some(Expression::Identifier { name: "stats".to_owned() }),
+                        },
+                    ),
+                ]),
+                async_helpers: BTreeMap::new(),
+                params: Vec::new(),
+                non_cancellable_states: BTreeSet::new(),
+            },
+        );
+
+        let started = artifact
+            .execute_trigger_with_turn(
+                &json!({}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .expect("stream job start should execute");
+        let requested = artifact
+            .execute_from_state("query_stream", started.execution_state, false)
+            .expect("stream job query should request");
+        let query_id = requested
+            .emissions
+            .iter()
+            .find_map(|emission| match &emission.event {
+                WorkflowEvent::StreamJobQueryRequested { query_id, .. } => Some(query_id.clone()),
+                _ => None,
+            })
+            .expect("stream job query request should be emitted");
+        let job = requested
+            .execution_state
+            .bindings
+            .get("job")
+            .and_then(decode_stream_job_state)
+            .expect("stream job binding should exist");
+        let resumed = artifact
+            .execute_after_stream_query_with_turn(
+                "query_stream",
+                &job.job_id,
+                &query_id,
+                "currentStats",
+                Some(&json!({"anomalies": 2})),
+                None,
+                requested.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_500).unwrap(),
+                },
+            )
+            .expect("stream job query callback should resume");
+        assert_eq!(resumed.execution_state.bindings.get("stats"), Some(&json!({"anomalies": 2})));
+        assert!(matches!(
+            resumed.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output == &json!({"anomalies": 2})
         ));
     }
 }

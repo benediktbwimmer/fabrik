@@ -216,6 +216,7 @@ Migration policy and generated output contract:
 - [Architecture Decision Record 0006](/Users/bene/code/fabrik/docs/adr/0006-workflows-bridge-streams-split.md)
 - [SDK + Compiler Direction](/Users/bene/code/fabrik/docs/sdk-compiler.md)
 - [Streams Bridge Protocol](/Users/bene/code/fabrik/docs/spec/streams-bridge.md)
+- [Stream Jobs Contract](/Users/bene/code/fabrik/docs/spec/stream-jobs.md)
 - [Streams Transition Plan](/Users/bene/code/fabrik/docs/streams-transition-plan.md)
 - [Temporal TypeScript Equivalence Contract](/Users/bene/code/fabrik/docs/temporal-typescript-equivalence-contract.md)
 - [Temporal TS Replacement Priorities](/Users/bene/code/fabrik/docs/temporal-ts-replacement-priorities.md)

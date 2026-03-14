@@ -28,23 +28,32 @@ use fabrik_config::{
 };
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
+#[cfg(test)]
+use fabrik_store::ThroughputRunRecord;
 use fabrik_store::{
     ActivityScheduleUpdate, ActivityStartUpdate, ActivityTerminalPayload, ActivityTerminalUpdate,
     BulkChunkTerminalPayload, BulkChunkTerminalUpdate, ConsumedSignalRecord, TaskQueueKind,
-    ThroughputRunInputRecord, ThroughputRunRecord, WorkflowActivityStatus, WorkflowBulkChunkRecord,
+    ThroughputRunInputRecord, WorkflowActivityStatus, WorkflowBulkChunkRecord,
     WorkflowFastStartStatus, WorkflowFastStartTerminalUpdate, WorkflowMailboxKind,
     WorkflowMailboxRecord, WorkflowStore,
 };
 use fabrik_throughput::{
     ADMISSION_POLICY_VERSION, ActivityCapabilityRegistry, ActivityExecutionCapabilities,
-    PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind, StartThroughputRunCommand,
-    ThroughputBackend, ThroughputCommand, ThroughputCommandEnvelope, ThroughputExecutionPath,
-    TinyWorkflowExecutionMode, TinyWorkflowStartItem, bulk_reducer_class,
-    bulk_reducer_is_mergeable, bulk_reducer_materializes_results, can_inline_durable_tiny_fanout,
-    can_use_payloadless_bulk_transport, decode_cbor, encode_cbor,
+    AwaitStreamCheckpointRequest, AwaitStreamJobTerminalRequest, PayloadHandle, PayloadStore,
+    PayloadStoreConfig, PayloadStoreKind, QueryStreamJobRequest, SubmitStreamJobRequest,
+    THROUGHPUT_BRIDGE_PROTOCOL_VERSION, ThroughputBackend, ThroughputBridgeOperationKind,
+    ThroughputCommand, ThroughputCommandEnvelope, TinyWorkflowExecutionMode, TinyWorkflowStartItem,
+    bulk_reducer_class, bulk_reducer_is_mergeable, bulk_reducer_materializes_results,
+    can_inline_durable_tiny_fanout, can_use_payloadless_bulk_transport, decode_cbor, encode_cbor,
     load_activity_capability_registry_from_env, parse_benchmark_compact_input_meta_from_handle,
     parse_benchmark_compact_total_items_from_handle, planned_reduction_tree_depth,
-    resolve_activity_capabilities, stream_v2_fast_lane_enabled, throughput_bridge_request_id,
+    resolve_activity_capabilities, stream_job_bridge_request_id,
+    stream_job_checkpoint_await_request_id, stream_job_handle_id, stream_v2_fast_lane_enabled,
+};
+#[cfg(test)]
+use fabrik_throughput::{
+    StartThroughputRunCommand, ThroughputExecutionPath, ThroughputRunStatus,
+    throughput_bridge_request_id,
 };
 use fabrik_worker_protocol::activity_worker::{
     Ack, ActivityTask, ActivityTaskCancelledResult, ActivityTaskCompletedResult,
@@ -58,10 +67,10 @@ use fabrik_worker_protocol::activity_worker::{
 };
 use fabrik_workflow::{
     ArtifactExecutionState, CompiledExecutionPlan, CompiledStateNode, CompiledWorkflowArtifact,
-    CompiledWorkflowError, ExecutionTurnContext, RetryPolicy, WorkflowInstanceState,
-    WorkflowStatus, execution_state_for_event, parse_timer_ref, replay_compiled_history_trace,
-    replay_compiled_history_trace_from_snapshot, replay_history_trace_from_snapshot,
-    retry_policy_allows_failure_retry,
+    CompiledWorkflowError, ExecutionTurnContext, RetryPolicy, StreamJobExecutionState,
+    WorkflowInstanceState, WorkflowStatus, evaluate_expression, execution_state_for_event,
+    parse_timer_ref, replay_compiled_history_trace, replay_compiled_history_trace_from_snapshot,
+    replay_history_trace_from_snapshot, retry_policy_allows_failure_retry,
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -94,7 +103,6 @@ struct AppState {
     store: WorkflowStore,
     publisher: Option<WorkflowPublisher>,
     throughput_command_publisher: Option<JsonTopicPublisher<ThroughputCommandEnvelope>>,
-    payload_store: PayloadStore,
     throughput_runtime: ThroughputRuntimeConfig,
     inner: Arc<StdMutex<RuntimeInner>>,
     ownership: Arc<StdMutex<UnifiedOwnershipState>>,
@@ -231,6 +239,15 @@ struct UnifiedDebugState {
     ignored_stale_owner_epoch_bulk_terminal_callbacks: u64,
     ignored_missing_bulk_terminal_callbacks: u64,
     ignored_closed_bulk_terminal_callbacks: u64,
+    repaired_bridge_start_commands: u64,
+    repaired_bridge_cancel_commands: u64,
+    repaired_bridge_terminal_callbacks: u64,
+    repaired_bridge_stream_job_query_callbacks: u64,
+    repaired_bridge_stream_job_checkpoint_callbacks: u64,
+    repaired_bridge_stream_job_terminal_callbacks: u64,
+    last_bridge_repair_at: Option<DateTime<Utc>>,
+    last_bridge_repair_kind: Option<String>,
+    last_bridge_repair_batch_id: Option<String>,
     poll_requests: u64,
     poll_responses: u64,
     leased_tasks: u64,
@@ -693,7 +710,6 @@ async fn main() -> Result<()> {
             JsonTopicPublisher::new(&throughput_commands, "unified-runtime-throughput-commands")
                 .await?,
         ),
-        payload_store,
         throughput_runtime,
         inner: Arc::new(StdMutex::new(inner)),
         ownership: Arc::new(StdMutex::new(UnifiedOwnershipState::inactive(
@@ -1451,6 +1467,24 @@ async fn run_trigger_consumer(
             | WorkflowEvent::BulkActivityBatchCancelled { .. } => {
                 if let Err(error) = handle_bulk_batch_terminal_event(&state, event).await {
                     error!(error = %error, "unified-runtime failed to handle bulk terminal");
+                }
+            }
+            WorkflowEvent::StreamJobCheckpointReached { .. } => {
+                if let Err(error) = handle_stream_job_checkpoint_event(&state, event).await {
+                    error!(error = %error, "unified-runtime failed to handle stream checkpoint");
+                }
+            }
+            WorkflowEvent::StreamJobQueryCompleted { .. }
+            | WorkflowEvent::StreamJobQueryFailed { .. } => {
+                if let Err(error) = handle_stream_job_query_event(&state, event).await {
+                    error!(error = %error, "unified-runtime failed to handle stream query");
+                }
+            }
+            WorkflowEvent::StreamJobCompleted { .. }
+            | WorkflowEvent::StreamJobFailed { .. }
+            | WorkflowEvent::StreamJobCancelled { .. } => {
+                if let Err(error) = handle_stream_job_terminal_event(&state, event).await {
+                    error!(error = %error, "unified-runtime failed to handle stream terminal");
                 }
             }
             WorkflowEvent::ActivityTaskCancellationRequested { .. } => {
@@ -2507,6 +2541,57 @@ async fn handle_bulk_batch_terminal_event(
             debug.ignored_closed_bulk_terminal_callbacks =
                 debug.ignored_closed_bulk_terminal_callbacks.saturating_add(1);
         }
+    }
+    Ok(())
+}
+
+async fn handle_stream_job_checkpoint_event(
+    state: &AppState,
+    event: EventEnvelope<WorkflowEvent>,
+) -> Result<()> {
+    match bridge::accept_stream_job_checkpoint_via_bridge(state, event).await? {
+        bridge::StreamJobBridgeAcceptance::Applied => {
+            state.notify.notify_waiters();
+            state.persist_notify.notify_one();
+        }
+        bridge::StreamJobBridgeAcceptance::PersistedOnly
+        | bridge::StreamJobBridgeAcceptance::IgnoredStaleOwnerEpoch
+        | bridge::StreamJobBridgeAcceptance::IgnoredMissingRun
+        | bridge::StreamJobBridgeAcceptance::IgnoredClosedRun => {}
+    }
+    Ok(())
+}
+
+async fn handle_stream_job_query_event(
+    state: &AppState,
+    event: EventEnvelope<WorkflowEvent>,
+) -> Result<()> {
+    match bridge::accept_stream_job_query_via_bridge(state, event).await? {
+        bridge::StreamJobBridgeAcceptance::Applied => {
+            state.notify.notify_waiters();
+            state.persist_notify.notify_one();
+        }
+        bridge::StreamJobBridgeAcceptance::PersistedOnly
+        | bridge::StreamJobBridgeAcceptance::IgnoredStaleOwnerEpoch
+        | bridge::StreamJobBridgeAcceptance::IgnoredMissingRun
+        | bridge::StreamJobBridgeAcceptance::IgnoredClosedRun => {}
+    }
+    Ok(())
+}
+
+async fn handle_stream_job_terminal_event(
+    state: &AppState,
+    event: EventEnvelope<WorkflowEvent>,
+) -> Result<()> {
+    match bridge::accept_stream_job_terminal_via_bridge(state, event).await? {
+        bridge::StreamJobBridgeAcceptance::Applied => {
+            state.notify.notify_waiters();
+            state.persist_notify.notify_one();
+        }
+        bridge::StreamJobBridgeAcceptance::PersistedOnly
+        | bridge::StreamJobBridgeAcceptance::IgnoredStaleOwnerEpoch
+        | bridge::StreamJobBridgeAcceptance::IgnoredMissingRun
+        | bridge::StreamJobBridgeAcceptance::IgnoredClosedRun => {}
     }
     Ok(())
 }
@@ -5070,6 +5155,15 @@ async fn apply_post_plan_effects_with_options(
         effect.occurred_at,
     )
     .await?;
+    let materialized_stream_jobs = materialize_stream_jobs_from_plan(
+        state,
+        &effect.artifact,
+        &effect.instance,
+        &effect.plan,
+        effect.source_event_id,
+        effect.occurred_at,
+    )
+    .await?;
     if persist_instance {
         general.push(PreparedDbAction::UpsertInstance(effect.instance.clone()));
     }
@@ -5080,6 +5174,9 @@ async fn apply_post_plan_effects_with_options(
     }
     if published_bulk_batches > 0 {
         state.bulk_notify.notify_waiters();
+    }
+    if materialized_stream_jobs > 0 {
+        state.notify.notify_waiters();
     }
 
     for emission in &effect.plan.emissions {
@@ -5236,6 +5333,344 @@ async fn apply_post_plan_effects_with_options(
     if notifies {
         state.notify.notify_waiters();
     }
+    Ok(())
+}
+
+fn decode_stream_job_binding(
+    artifact: &CompiledWorkflowArtifact,
+    instance: &WorkflowInstanceState,
+) -> Option<(StreamJobExecutionState, CompiledStateNode)> {
+    let current_state = instance.current_state.as_ref()?;
+    let execution_state = instance.artifact_execution.as_ref()?;
+    let binding = artifact.rehydrate_stream_job_wait_binding(current_state, execution_state)?;
+    let node = artifact.workflow.states.get(current_state)?.clone();
+    Some((binding, node))
+}
+
+fn stream_job_metadata(job_name: &str) -> (Option<Value>, Option<Value>) {
+    match job_name {
+        "keyed-rollup" => (
+            Some(serde_json::json!({
+                "kind": "named_checkpoints",
+                "checkpoints": [
+                    {
+                        "name": "hourly-rollup-ready",
+                        "delivery": "workflow_awaitable",
+                        "sequence": 1
+                    }
+                ]
+            })),
+            Some(serde_json::json!([
+                {
+                    "name": "accountTotals",
+                    "consistency": "strong",
+                    "queryMode": "by_key",
+                    "keyField": "accountId",
+                    "valueFields": ["accountId", "totalAmount", "asOfCheckpoint"]
+                }
+            ])),
+        ),
+        _ => (None, None),
+    }
+}
+
+async fn materialize_stream_jobs_from_plan(
+    state: &AppState,
+    artifact: &CompiledWorkflowArtifact,
+    instance: &WorkflowInstanceState,
+    plan: &CompiledExecutionPlan,
+    source_event_id: Uuid,
+    occurred_at: DateTime<Utc>,
+) -> Result<u64> {
+    let mut materialized = 0_u64;
+    for emission in &plan.emissions {
+        let WorkflowEvent::StreamJobScheduled { job_id, job_name, input, config, .. } =
+            &emission.event
+        else {
+            continue;
+        };
+        let (checkpoint_policy, view_definitions) = stream_job_metadata(job_name);
+        bridge::submit_stream_job_via_bridge(
+            state,
+            &SubmitStreamJobRequest {
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob,
+                bridge_request_id: stream_job_bridge_request_id(
+                    &instance.tenant_id,
+                    &instance.instance_id,
+                    &instance.run_id,
+                    job_id,
+                ),
+                handle_id: stream_job_handle_id(
+                    &instance.tenant_id,
+                    &instance.instance_id,
+                    &instance.run_id,
+                    job_id,
+                ),
+                workflow_event_id: source_event_id,
+                workflow_owner_epoch: None,
+                stream_owner_epoch: None,
+                identity: fabrik_throughput::StreamJobBridgeIdentity {
+                    tenant_id: instance.tenant_id.clone(),
+                    instance_id: instance.instance_id.clone(),
+                    run_id: instance.run_id.clone(),
+                    job_id: job_id.clone(),
+                },
+                definition_id: instance.definition_id.clone(),
+                definition_version: instance.definition_version,
+                artifact_hash: instance.artifact_hash.clone(),
+                job_name: job_name.clone(),
+                input_ref: serde_json::to_string(input)
+                    .context("failed to serialize stream job input for bridge submission")?,
+                config_ref: config
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .context("failed to serialize stream job config for bridge submission")?,
+                checkpoint_policy,
+                view_definitions,
+                admitted_at: occurred_at,
+            },
+        )
+        .await?;
+        materialized = materialized.saturating_add(1);
+    }
+
+    for emission in &plan.emissions {
+        let WorkflowEvent::StreamJobCancellationRequested { job_id, reason, .. } = &emission.event
+        else {
+            continue;
+        };
+        bridge::cancel_stream_job_via_bridge(
+            state,
+            &fabrik_throughput::CancelStreamJobRequest {
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob,
+                bridge_request_id: stream_job_bridge_request_id(
+                    &instance.tenant_id,
+                    &instance.instance_id,
+                    &instance.run_id,
+                    job_id,
+                ),
+                handle_id: stream_job_handle_id(
+                    &instance.tenant_id,
+                    &instance.instance_id,
+                    &instance.run_id,
+                    job_id,
+                ),
+                workflow_event_id: source_event_id,
+                workflow_owner_epoch: None,
+                reason: reason.clone(),
+                requested_at: occurred_at,
+            },
+        )
+        .await?;
+        materialized = materialized.saturating_add(1);
+    }
+
+    for emission in &plan.emissions {
+        let WorkflowEvent::StreamJobQueryRequested {
+            job_id,
+            query_id,
+            query_name,
+            args,
+            consistency,
+            ..
+        } = &emission.event
+        else {
+            continue;
+        };
+        let query = bridge::query_stream_job_via_bridge(
+            state,
+            &fabrik_throughput::QueryStreamJobRequest {
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob,
+                bridge_request_id: stream_job_bridge_request_id(
+                    &instance.tenant_id,
+                    &instance.instance_id,
+                    &instance.run_id,
+                    job_id,
+                ),
+                handle_id: stream_job_handle_id(
+                    &instance.tenant_id,
+                    &instance.instance_id,
+                    &instance.run_id,
+                    job_id,
+                ),
+                query_id: query_id.clone(),
+                query_name: query_name.clone(),
+                args: args.clone(),
+                consistency: fabrik_throughput::StreamJobQueryConsistency::parse(consistency)
+                    .unwrap_or(fabrik_throughput::StreamJobQueryConsistency::Strong),
+                workflow_event_id: source_event_id,
+                workflow_owner_epoch: None,
+                requested_at: occurred_at,
+            },
+        )
+        .await?;
+        let handle = state
+            .store
+            .get_stream_job_bridge_handle_by_handle_id(&query.handle_id)
+            .await?
+            .with_context(|| {
+                format!("stream job handle {} should exist for query replay", query.handle_id)
+            })?;
+        enqueue_stream_job_callback_if_ready(
+            state,
+            bridge::stream_job_query_callback_event(&handle, &query),
+        )
+        .await?;
+        materialized = materialized.saturating_add(1);
+    }
+
+    let Some((stream_job, node)) = decode_stream_job_binding(artifact, instance) else {
+        return Ok(materialized);
+    };
+    let handle_id = stream_job_handle_id(
+        &instance.tenant_id,
+        &instance.instance_id,
+        &instance.run_id,
+        &stream_job.job_id,
+    );
+    match node {
+        CompiledStateNode::QueryStreamJob { query_name, args, consistency, .. } => {
+            let query = bridge::query_stream_job_via_bridge(
+                state,
+                &QueryStreamJobRequest {
+                    protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                    operation_kind: ThroughputBridgeOperationKind::StreamJob,
+                    bridge_request_id: stream_job_bridge_request_id(
+                        &instance.tenant_id,
+                        &instance.instance_id,
+                        &instance.run_id,
+                        &stream_job.job_id,
+                    ),
+                    handle_id,
+                    query_id: fabrik_throughput::stream_job_query_request_id(
+                        &stream_job.job_id,
+                        &query_name,
+                        source_event_id,
+                    ),
+                    query_name,
+                    args: args
+                        .as_ref()
+                        .map(|expr| {
+                            let mut execution_state =
+                                instance.artifact_execution.clone().unwrap_or_default();
+                            execution_state.turn_context = Some(ExecutionTurnContext {
+                                event_id: source_event_id,
+                                occurred_at,
+                            });
+                            evaluate_expression(expr, &mut execution_state, &artifact.helpers)
+                        })
+                        .transpose()?,
+                    consistency: fabrik_throughput::StreamJobQueryConsistency::parse(
+                        consistency.as_deref().unwrap_or("strong"),
+                    )
+                    .unwrap_or(fabrik_throughput::StreamJobQueryConsistency::Strong),
+                    workflow_event_id: source_event_id,
+                    workflow_owner_epoch: None,
+                    requested_at: occurred_at,
+                },
+            )
+            .await?;
+            let handle = state
+                .store
+                .get_stream_job_bridge_handle_by_handle_id(&query.handle_id)
+                .await?
+                .with_context(|| {
+                    format!("stream job handle {} should exist for query replay", query.handle_id)
+                })?;
+            enqueue_stream_job_callback_if_ready(
+                state,
+                bridge::stream_job_query_callback_event(&handle, &query),
+            )
+            .await?;
+            materialized = materialized.saturating_add(1);
+        }
+        CompiledStateNode::WaitForStreamCheckpoint { checkpoint_name, .. } => {
+            let checkpoint = bridge::await_stream_job_checkpoint_via_bridge(
+                state,
+                &AwaitStreamCheckpointRequest {
+                    protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                    operation_kind: ThroughputBridgeOperationKind::StreamJob,
+                    bridge_request_id: stream_job_bridge_request_id(
+                        &instance.tenant_id,
+                        &instance.instance_id,
+                        &instance.run_id,
+                        &stream_job.job_id,
+                    ),
+                    handle_id: handle_id.clone(),
+                    await_request_id: stream_job_checkpoint_await_request_id(
+                        &handle_id,
+                        &checkpoint_name,
+                        source_event_id,
+                    ),
+                    checkpoint_name,
+                    workflow_event_id: source_event_id,
+                    workflow_owner_epoch: None,
+                    requested_at: occurred_at,
+                },
+            )
+            .await?;
+            let handle = state
+                .store
+                .get_stream_job_bridge_handle_by_handle_id(&checkpoint.handle_id)
+                .await?
+                .with_context(|| {
+                    format!(
+                        "stream job handle {} should exist for checkpoint replay",
+                        checkpoint.handle_id
+                    )
+                })?;
+            enqueue_stream_job_callback_if_ready(
+                state,
+                bridge::stream_job_checkpoint_callback_event(&handle, &checkpoint),
+            )
+            .await?;
+            materialized = materialized.saturating_add(1);
+        }
+        CompiledStateNode::AwaitStreamJobTerminal { .. } => {
+            let handle = bridge::await_stream_job_terminal_via_bridge(
+                state,
+                &AwaitStreamJobTerminalRequest {
+                    protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                    operation_kind: ThroughputBridgeOperationKind::StreamJob,
+                    bridge_request_id: stream_job_bridge_request_id(
+                        &instance.tenant_id,
+                        &instance.instance_id,
+                        &instance.run_id,
+                        &stream_job.job_id,
+                    ),
+                    handle_id,
+                    workflow_event_id: source_event_id,
+                    workflow_owner_epoch: None,
+                    requested_at: occurred_at,
+                },
+            )
+            .await?;
+            enqueue_stream_job_callback_if_ready(
+                state,
+                bridge::stream_job_terminal_callback_event(&handle),
+            )
+            .await?;
+            materialized = materialized.saturating_add(1);
+        }
+        _ => {}
+    }
+
+    Ok(materialized)
+}
+
+async fn enqueue_stream_job_callback_if_ready(
+    state: &AppState,
+    envelope: Option<EventEnvelope<WorkflowEvent>>,
+) -> Result<()> {
+    let Some(envelope) = envelope else {
+        return Ok(());
+    };
+    state.store.put_workflow_event_outbox(&envelope, envelope.occurred_at).await?;
+    state.outbox_notify.notify_waiters();
     Ok(())
 }
 
@@ -8516,7 +8951,13 @@ mod tests {
     use chrono::Duration as ChronoDuration;
     use fabrik_broker::WorkflowPublisher;
     use fabrik_events::WorkflowIdentity;
-    use fabrik_store::{ThroughputTerminalRecord, WorkflowMailboxStatus, WorkflowUpdateStatus};
+    use fabrik_store::{
+        StreamJobBridgeHandleRecord, StreamJobCheckpointRecord, StreamJobQueryRecord,
+        ThroughputTerminalRecord, WorkflowMailboxStatus, WorkflowUpdateStatus,
+    };
+    use fabrik_throughput::{
+        StreamJobBridgeHandleStatus, StreamJobCheckpointStatus, StreamJobQueryStatus,
+    };
     use fabrik_workflow::{
         ArtifactEntrypoint, CompiledStateNode, CompiledUpdateHandler, CompiledWorkflow,
         ErrorTransition, Expression, ParentClosePolicy,
@@ -8528,6 +8969,7 @@ mod tests {
         process::Command,
         time::{Duration as StdDuration, Instant},
     };
+    use tokio::sync::oneshot;
     use tokio::time::sleep;
     use tonic::Request;
 
@@ -9104,6 +9546,374 @@ mod tests {
         )
     }
 
+    fn stream_job_artifact() -> CompiledWorkflowArtifact {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "start_stream".to_owned(),
+            CompiledStateNode::StartStreamJob {
+                job_name: "fraud-detector".to_owned(),
+                input: Expression::Literal { value: json!({"topic": "payments"}) },
+                config: Some(Expression::Literal { value: json!({"threshold": 0.97}) }),
+                next: "wait_checkpoint".to_owned(),
+                handle_var: "job".to_owned(),
+            },
+        );
+        states.insert(
+            "wait_checkpoint".to_owned(),
+            CompiledStateNode::WaitForStreamCheckpoint {
+                stream_job_ref_var: "job".to_owned(),
+                checkpoint_name: "hourly-rollup-ready".to_owned(),
+                next: "await_terminal".to_owned(),
+                output_var: Some("checkpoint".to_owned()),
+                on_error: None,
+            },
+        );
+        states.insert(
+            "await_terminal".to_owned(),
+            CompiledStateNode::AwaitStreamJobTerminal {
+                stream_job_ref_var: "job".to_owned(),
+                next: "done".to_owned(),
+                output_var: Some("result".to_owned()),
+                on_error: None,
+            },
+        );
+        states.insert(
+            "done".to_owned(),
+            CompiledStateNode::Succeed {
+                output: Some(Expression::Object {
+                    fields: BTreeMap::from([
+                        (
+                            "checkpoint".to_owned(),
+                            Expression::Identifier { name: "checkpoint".to_owned() },
+                        ),
+                        ("result".to_owned(), Expression::Identifier { name: "result".to_owned() }),
+                    ]),
+                }),
+            },
+        );
+
+        CompiledWorkflowArtifact::new(
+            "stream-job-handoff-demo".to_owned(),
+            1,
+            "unified-runtime-test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "start_stream".to_owned(),
+                states,
+                params: Vec::new(),
+                async_helpers: BTreeMap::new(),
+                non_cancellable_states: std::collections::BTreeSet::new(),
+            },
+        )
+    }
+
+    fn stream_job_query_artifact() -> CompiledWorkflowArtifact {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "start_stream".to_owned(),
+            CompiledStateNode::StartStreamJob {
+                job_name: "fraud-detector".to_owned(),
+                input: Expression::Literal { value: json!({"topic": "payments"}) },
+                config: Some(Expression::Literal { value: json!({"threshold": 0.97}) }),
+                next: "query_stream".to_owned(),
+                handle_var: "job".to_owned(),
+            },
+        );
+        states.insert(
+            "query_stream".to_owned(),
+            CompiledStateNode::QueryStreamJob {
+                stream_job_ref_var: "job".to_owned(),
+                query_name: "currentStats".to_owned(),
+                args: Some(Expression::Literal { value: json!({"window": "1h"}) }),
+                consistency: Some("strong".to_owned()),
+                next: "done".to_owned(),
+                output_var: Some("stats".to_owned()),
+                on_error: None,
+            },
+        );
+        states.insert(
+            "done".to_owned(),
+            CompiledStateNode::Succeed {
+                output: Some(Expression::Identifier { name: "stats".to_owned() }),
+            },
+        );
+
+        CompiledWorkflowArtifact::new(
+            "stream-job-query-demo".to_owned(),
+            1,
+            "unified-runtime-test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "start_stream".to_owned(),
+                states,
+                params: Vec::new(),
+                async_helpers: BTreeMap::new(),
+                non_cancellable_states: std::collections::BTreeSet::new(),
+            },
+        )
+    }
+
+    fn keyed_rollup_stream_job_artifact() -> CompiledWorkflowArtifact {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "start_stream".to_owned(),
+            CompiledStateNode::StartStreamJob {
+                job_name: "keyed-rollup".to_owned(),
+                input: Expression::Member {
+                    object: Box::new(Expression::Identifier { name: "input".to_owned() }),
+                    property: "streamInput".to_owned(),
+                },
+                config: None,
+                next: "wait_checkpoint".to_owned(),
+                handle_var: "job".to_owned(),
+            },
+        );
+        states.insert(
+            "wait_checkpoint".to_owned(),
+            CompiledStateNode::WaitForStreamCheckpoint {
+                stream_job_ref_var: "job".to_owned(),
+                checkpoint_name: "initial-rollup-ready".to_owned(),
+                next: "query_stream".to_owned(),
+                output_var: Some("checkpoint".to_owned()),
+                on_error: None,
+            },
+        );
+        states.insert(
+            "query_stream".to_owned(),
+            CompiledStateNode::QueryStreamJob {
+                stream_job_ref_var: "job".to_owned(),
+                query_name: "accountTotals".to_owned(),
+                args: Some(Expression::Literal { value: json!({"key": "acct_1"}) }),
+                consistency: Some("strong".to_owned()),
+                next: "await_terminal".to_owned(),
+                output_var: Some("account".to_owned()),
+                on_error: None,
+            },
+        );
+        states.insert(
+            "await_terminal".to_owned(),
+            CompiledStateNode::AwaitStreamJobTerminal {
+                stream_job_ref_var: "job".to_owned(),
+                next: "done".to_owned(),
+                output_var: Some("result".to_owned()),
+                on_error: None,
+            },
+        );
+        states.insert(
+            "done".to_owned(),
+            CompiledStateNode::Succeed {
+                output: Some(Expression::Object {
+                    fields: BTreeMap::from([
+                        (
+                            "checkpoint".to_owned(),
+                            Expression::Identifier { name: "checkpoint".to_owned() },
+                        ),
+                        (
+                            "account".to_owned(),
+                            Expression::Identifier { name: "account".to_owned() },
+                        ),
+                        ("result".to_owned(), Expression::Identifier { name: "result".to_owned() }),
+                    ]),
+                }),
+            },
+        );
+
+        CompiledWorkflowArtifact::new(
+            "keyed-rollup-stream-job-demo".to_owned(),
+            1,
+            "unified-runtime-test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "start_stream".to_owned(),
+                states,
+                params: Vec::new(),
+                async_helpers: BTreeMap::new(),
+                non_cancellable_states: BTreeSet::new(),
+            },
+        )
+    }
+
+    fn keyed_rollup_totals_from_input_ref(input_ref: &str) -> Result<BTreeMap<String, f64>> {
+        let value: Value =
+            serde_json::from_str(input_ref).context("failed to decode keyed-rollup input_ref")?;
+        let items = value
+            .as_object()
+            .and_then(|object| object.get("items"))
+            .and_then(Value::as_array)
+            .cloned()
+            .or_else(|| value.as_array().cloned())
+            .context("keyed-rollup input_ref must contain an items array")?;
+        let mut totals = BTreeMap::new();
+        for item in items {
+            let object = item.as_object().context("keyed-rollup item must be an object")?;
+            let account_id = object
+                .get("accountId")
+                .and_then(Value::as_str)
+                .context("keyed-rollup item must contain accountId")?;
+            let amount = object
+                .get("amount")
+                .and_then(Value::as_f64)
+                .context("keyed-rollup item must contain numeric amount")?;
+            *totals.entry(account_id.to_owned()).or_insert(0.0) += amount;
+        }
+        Ok(totals)
+    }
+
+    fn keyed_rollup_query_output_for_test(
+        query: &StreamJobQueryRecord,
+        totals: &BTreeMap<String, f64>,
+    ) -> Result<Value> {
+        let key = query
+            .query_args
+            .as_ref()
+            .and_then(|args| args.get("key"))
+            .and_then(Value::as_str)
+            .context("accountTotals query must include args.key")?;
+        let total = totals.get(key).copied().unwrap_or_default();
+        Ok(json!({
+            "accountId": key,
+            "totalAmount": total,
+            "asOfCheckpoint": 1,
+            "consistency": query.consistency,
+        }))
+    }
+
+    async fn wait_for_instance_completion(
+        store: &WorkflowStore,
+        tenant_id: &str,
+        instance_id: &str,
+    ) -> Result<WorkflowInstanceState> {
+        let deadline = Instant::now() + StdDuration::from_secs(15);
+        loop {
+            if let Some(instance) = store.get_instance(tenant_id, instance_id).await?
+                && instance.status == WorkflowStatus::Completed
+            {
+                return Ok(instance);
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for workflow instance {tenant_id}/{instance_id} to complete"
+                );
+            }
+            sleep(StdDuration::from_millis(50)).await;
+        }
+    }
+
+    async fn run_keyed_rollup_test_callback_agent(
+        store: WorkflowStore,
+        publisher: WorkflowPublisher,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        mut stop_rx: oneshot::Receiver<()>,
+    ) -> Result<()> {
+        let deadline = Instant::now() + StdDuration::from_secs(15);
+        let mut checkpoint_published = false;
+        let mut terminal_published = false;
+        let mut query_published = false;
+        loop {
+            tokio::select! {
+                _ = &mut stop_rx => return Ok(()),
+                _ = sleep(StdDuration::from_millis(50)) => {}
+            }
+
+            if Instant::now() >= deadline {
+                anyhow::bail!("timed out waiting for keyed-rollup bridge records");
+            }
+
+            let Some(handle) = store
+                .list_stream_job_bridge_handles_for_run_page(tenant_id, instance_id, run_id, 10, 0)
+                .await?
+                .into_iter()
+                .find(|handle| handle.job_name == "keyed-rollup")
+            else {
+                continue;
+            };
+            let totals = keyed_rollup_totals_from_input_ref(&handle.input_ref)?;
+
+            if !checkpoint_published {
+                if let Some(checkpoint) = store
+                    .list_stream_job_bridge_checkpoints_for_handle_page(&handle.handle_id, 10, 0)
+                    .await?
+                    .into_iter()
+                    .find(|checkpoint| checkpoint.checkpoint_name == "initial-rollup-ready")
+                {
+                    let reached_at = Utc::now();
+                    let checkpoint = StreamJobCheckpointRecord {
+                        status: StreamJobCheckpointStatus::Reached.as_str().to_owned(),
+                        checkpoint_sequence: Some(1),
+                        stream_owner_epoch: Some(1),
+                        reached_at: Some(reached_at),
+                        output: Some(json!({
+                            "jobId": handle.job_id,
+                            "jobName": handle.job_name,
+                            "checkpoint": "initial-rollup-ready",
+                            "sequence": 1,
+                        })),
+                        updated_at: reached_at,
+                        ..checkpoint
+                    };
+                    let event =
+                        crate::bridge::stream_job_checkpoint_callback_event(&handle, &checkpoint)
+                            .context("checkpoint callback event should materialize")?;
+                    publisher.publish(&event, &event.partition_key).await?;
+                    checkpoint_published = true;
+                }
+            }
+
+            if !terminal_published {
+                let terminal_at = Utc::now() + ChronoDuration::milliseconds(1);
+                let terminal_handle = StreamJobBridgeHandleRecord {
+                    status: StreamJobBridgeHandleStatus::Completed.as_str().to_owned(),
+                    stream_owner_epoch: Some(1),
+                    terminal_at: Some(terminal_at),
+                    terminal_output: Some(json!({
+                        "jobId": handle.job_id,
+                        "jobName": handle.job_name,
+                        "status": "completed",
+                    })),
+                    updated_at: terminal_at,
+                    ..handle.clone()
+                };
+                let event = crate::bridge::stream_job_terminal_callback_event(&terminal_handle)
+                    .context("terminal callback event should materialize")?;
+                publisher.publish(&event, &event.partition_key).await?;
+                terminal_published = true;
+            }
+
+            if !query_published {
+                if let Some(query) = store
+                    .list_stream_job_bridge_queries_for_handle_page(&handle.handle_id, 10, 0)
+                    .await?
+                    .into_iter()
+                    .find(|query| {
+                        query.query_name == "accountTotals"
+                            && query.parsed_status() == Some(StreamJobQueryStatus::Requested)
+                    })
+                {
+                    let completed_at = Utc::now();
+                    let query = StreamJobQueryRecord {
+                        status: StreamJobQueryStatus::Completed.as_str().to_owned(),
+                        stream_owner_epoch: Some(1),
+                        output: Some(keyed_rollup_query_output_for_test(&query, &totals)?),
+                        error: None,
+                        completed_at: Some(completed_at),
+                        updated_at: completed_at,
+                        ..query
+                    };
+                    let event = crate::bridge::stream_job_query_callback_event(&handle, &query)
+                        .context("query callback event should materialize")?;
+                    publisher.publish(&event, &event.partition_key).await?;
+                    query_published = true;
+                }
+            }
+
+            if checkpoint_published && terminal_published && query_published {
+                return Ok(());
+            }
+        }
+    }
+
     fn child_parent_artifact() -> CompiledWorkflowArtifact {
         let workflow = CompiledWorkflow {
             initial_state: "start_child".to_owned(),
@@ -9520,12 +10330,10 @@ mod tests {
         fs::create_dir_all(&state_dir).expect("create app state dir");
         let throughput_runtime =
             ThroughputRuntimeConfig::from_env().expect("load test throughput runtime config");
-        let payload_store = test_payload_store(&state_dir).await;
         AppState {
             store,
             publisher: None,
             throughput_command_publisher: None,
-            payload_store,
             throughput_runtime,
             inner: Arc::new(StdMutex::new(inner)),
             ownership: Arc::new(StdMutex::new(UnifiedOwnershipState::inactive(1, "test-owner"))),
@@ -9789,6 +10597,7 @@ mod tests {
     struct TestRedpanda {
         container_name: String,
         broker: BrokerConfig,
+        throughput_commands: JsonTopicConfig,
     }
 
     impl TestRedpanda {
@@ -9864,6 +10673,11 @@ mod tests {
             Ok(Some(Self {
                 container_name,
                 broker: BrokerConfig::new(format!("127.0.0.1:{kafka_port}"), topic, 1),
+                throughput_commands: JsonTopicConfig::new(
+                    format!("127.0.0.1:{kafka_port}"),
+                    format!("throughput-commands-test-{}", Uuid::now_v7()),
+                    1,
+                ),
             }))
         }
 
@@ -9886,6 +10700,98 @@ mod tests {
                         });
                     }
                 }
+            }
+        }
+
+        async fn connect_throughput_command_publisher(
+            &self,
+        ) -> Result<JsonTopicPublisher<ThroughputCommandEnvelope>> {
+            let deadline = Instant::now() + StdDuration::from_secs(45);
+            loop {
+                match JsonTopicPublisher::new(
+                    &self.throughput_commands,
+                    "unified-runtime-throughput-command-test",
+                )
+                .await
+                {
+                    Ok(publisher) => return Ok(publisher),
+                    Err(error) if Instant::now() < deadline => {
+                        let _ = error;
+                        sleep(StdDuration::from_millis(500)).await;
+                    }
+                    Err(error) => {
+                        let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        return Err(error).with_context(|| {
+                            format!(
+                                "redpanda test container {} did not become ready for throughput commands; logs:\n{}",
+                                self.container_name, logs
+                            )
+                        });
+                    }
+                }
+            }
+        }
+
+        async fn wait_for_throughput_command(
+            &self,
+            expected_batch_id: &str,
+        ) -> Result<ThroughputCommandEnvelope> {
+            let mut consumer = build_json_consumer(
+                &self.throughput_commands,
+                "unified-runtime-throughput-command-read-test",
+                &self.throughput_commands.all_partition_ids(),
+            )
+            .await?;
+            tokio::time::timeout(StdDuration::from_secs(15), async move {
+                while let Some(message) = consumer.next().await {
+                    let record = message?;
+                    let command = decode_json_record::<ThroughputCommandEnvelope>(&record.record)?;
+                    match &command.payload {
+                        ThroughputCommand::StartThroughputRun(start)
+                            if start.batch_id == expected_batch_id =>
+                        {
+                            return Ok(command);
+                        }
+                        ThroughputCommand::CancelBatch { identity, .. }
+                            if identity.batch_id == expected_batch_id =>
+                        {
+                            return Ok(command);
+                        }
+                        _ => {}
+                    }
+                }
+                anyhow::bail!("throughput command stream ended before matching command arrived")
+            })
+            .await
+            .context("timed out waiting for throughput command")?
+        }
+
+        async fn wait_for_workflow_history_event(
+            &self,
+            filter: &WorkflowHistoryFilter,
+            expected_event_type: &str,
+        ) -> Result<EventEnvelope<WorkflowEvent>> {
+            let deadline = Instant::now() + StdDuration::from_secs(15);
+            loop {
+                let history = read_workflow_history(
+                    &self.broker,
+                    "unified-runtime-workflow-history-read-test",
+                    filter,
+                    StdDuration::from_millis(500),
+                    StdDuration::from_secs(5),
+                )
+                .await?;
+                if let Some(event) =
+                    history.into_iter().find(|event| event.event_type == expected_event_type)
+                {
+                    return Ok(event);
+                }
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "timed out waiting for workflow history event {expected_event_type}"
+                    );
+                }
+                sleep(StdDuration::from_millis(250)).await;
             }
         }
     }
@@ -10730,6 +11636,8 @@ mod tests {
                 "batch-a",
             )
         );
+        assert_eq!(start.bridge_protocol_version, THROUGHPUT_BRIDGE_PROTOCOL_VERSION);
+        assert_eq!(start.bridge_operation_kind, ThroughputBridgeOperationKind::BulkRun.as_str());
         let PayloadHandle::Inline { key } = &start.input_handle else {
             panic!("expected db-backed native input handle reference");
         };
@@ -10847,8 +11755,817 @@ mod tests {
             panic!("expected start command");
         };
         assert_eq!(start_one.bridge_request_id, start_two.bridge_request_id);
+        assert_eq!(start_one.bridge_protocol_version, start_two.bridge_protocol_version);
+        assert_eq!(start_one.bridge_operation_kind, start_two.bridge_operation_kind);
         assert_eq!(command_one.command_id, command_two.command_id);
         assert_eq!(command_one.dedupe_key, command_two.dedupe_key);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_repair_republishes_missing_start_command() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-bridge-repair-start-{}", Uuid::now_v7()));
+        let mut app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        app_state.throughput_command_publisher =
+            Some(redpanda.connect_throughput_command_publisher().await?);
+
+        let now = Utc::now();
+        let workflow_event_id = Uuid::now_v7();
+        let command_id = Uuid::now_v7();
+        let command = ThroughputCommandEnvelope {
+            command_id,
+            occurred_at: now,
+            dedupe_key: "throughput-start:test-repair-start".to_owned(),
+            partition_key: "batch-repair-start:0".to_owned(),
+            payload: ThroughputCommand::StartThroughputRun(StartThroughputRunCommand {
+                dedupe_key: "throughput-start:test-repair-start".to_owned(),
+                bridge_request_id: throughput_bridge_request_id(
+                    "tenant",
+                    "instance-repair-start",
+                    "run-repair-start",
+                    "batch-repair-start",
+                ),
+                bridge_protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                bridge_operation_kind: ThroughputBridgeOperationKind::BulkRun.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                instance_id: "instance-repair-start".to_owned(),
+                run_id: "run-repair-start".to_owned(),
+                batch_id: "batch-repair-start".to_owned(),
+                activity_type: "benchmark.echo".to_owned(),
+                activity_capabilities: None,
+                task_queue: "bulk".to_owned(),
+                state: Some("join".to_owned()),
+                chunk_size: 2,
+                max_attempts: 1,
+                retry_delay_ms: 0,
+                total_items: 2,
+                aggregation_group_count: 1,
+                execution_policy: Some("parallel".to_owned()),
+                reducer: Some("count".to_owned()),
+                throughput_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
+                throughput_backend_version: ThroughputBackend::StreamV2
+                    .default_version()
+                    .to_owned(),
+                routing_reason: "stream_v2_selected".to_owned(),
+                admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
+                input_handle: PayloadHandle::Inline {
+                    key: "bulk-input:batch-repair-start".to_owned(),
+                },
+                result_handle: PayloadHandle::Inline {
+                    key: "bulk-result:batch-repair-start".to_owned(),
+                },
+            }),
+        };
+
+        store
+            .upsert_throughput_bridge_submission(
+                workflow_event_id,
+                THROUGHPUT_BRIDGE_PROTOCOL_VERSION,
+                ThroughputBridgeOperationKind::BulkRun,
+                "tenant",
+                "instance-repair-start",
+                "run-repair-start",
+                "batch-repair-start",
+                ThroughputBackend::StreamV2.as_str(),
+                &throughput_bridge_request_id(
+                    "tenant",
+                    "instance-repair-start",
+                    "run-repair-start",
+                    "batch-repair-start",
+                ),
+                &command.dedupe_key,
+                Some(command_id),
+                Some(&command.partition_key),
+                now,
+            )
+            .await?;
+        store
+            .upsert_throughput_run(&ThroughputRunRecord {
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-start".to_owned(),
+                run_id: "run-repair-start".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                batch_id: "batch-repair-start".to_owned(),
+                bridge_protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                bridge_operation_kind: ThroughputBridgeOperationKind::BulkRun.as_str().to_owned(),
+                bridge_request_id: throughput_bridge_request_id(
+                    "tenant",
+                    "instance-repair-start",
+                    "run-repair-start",
+                    "batch-repair-start",
+                ),
+                throughput_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
+                execution_path: ThroughputExecutionPath::NativeStreamV2.as_str().to_owned(),
+                status: ThroughputRunStatus::Scheduled.as_str().to_owned(),
+                command_dedupe_key: command.dedupe_key.clone(),
+                command,
+                command_published_at: None,
+                started_at: None,
+                terminal_at: None,
+                bridge_terminal_status: None,
+                bridge_terminal_event_id: None,
+                bridge_terminal_owner_epoch: None,
+                bridge_terminal_accepted_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+
+        let repaired = crate::bridge::repair_pending_stream_v2_bridge(&app_state).await?;
+        assert_eq!(repaired, (1, 0, 0, 0, 0, 0));
+
+        let published = redpanda.wait_for_throughput_command("batch-repair-start").await?;
+        assert_eq!(published.command_id, command_id);
+        let ThroughputCommand::StartThroughputRun(start) = published.payload else {
+            panic!("expected repaired start command");
+        };
+        assert_eq!(start.bridge_protocol_version, THROUGHPUT_BRIDGE_PROTOCOL_VERSION);
+        assert_eq!(start.bridge_operation_kind, ThroughputBridgeOperationKind::BulkRun.as_str());
+        assert_eq!(
+            start.bridge_request_id,
+            throughput_bridge_request_id(
+                "tenant",
+                "instance-repair-start",
+                "run-repair-start",
+                "batch-repair-start",
+            )
+        );
+
+        let bridge_progress = store
+            .get_throughput_bridge_progress(workflow_event_id)
+            .await?
+            .context("bridge progress should exist after repair")?;
+        assert!(bridge_progress.command_published_at.is_some());
+
+        let debug = app_state.debug.lock().expect("unified debug lock poisoned").clone();
+        assert_eq!(debug.repaired_bridge_start_commands, 1);
+        assert_eq!(debug.last_bridge_repair_kind.as_deref(), Some("publish_start"));
+        assert_eq!(debug.last_bridge_repair_batch_id.as_deref(), Some("batch-repair-start"));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_repair_republishes_terminal_callback() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-bridge-repair-terminal-{}", Uuid::now_v7()));
+        let app_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher,
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+
+        let now = Utc::now();
+        let identity = WorkflowIdentity::new(
+            "tenant".to_owned(),
+            "demo".to_owned(),
+            1,
+            "artifact-a".to_owned(),
+            "instance-repair-terminal".to_owned(),
+            "run-repair-terminal".to_owned(),
+            "unified-runtime-test",
+        );
+        let mut terminal_event = test_event(
+            &identity,
+            WorkflowEvent::BulkActivityBatchCompleted {
+                batch_id: "batch-repair-terminal".to_owned(),
+                total_items: 2,
+                succeeded_items: 2,
+                failed_items: 0,
+                cancelled_items: 0,
+                chunk_count: 1,
+                reducer_output: Some(json!(2)),
+            },
+            now,
+        );
+        terminal_event.metadata.insert(
+            "bridge_request_id".to_owned(),
+            throughput_bridge_request_id(
+                "tenant",
+                "instance-repair-terminal",
+                "run-repair-terminal",
+                "batch-repair-terminal",
+            ),
+        );
+        terminal_event.metadata.insert(
+            "bridge_protocol_version".to_owned(),
+            THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+        );
+        terminal_event.metadata.insert(
+            "bridge_operation_kind".to_owned(),
+            ThroughputBridgeOperationKind::BulkRun.as_str().to_owned(),
+        );
+        let command = ThroughputCommandEnvelope {
+            command_id: Uuid::now_v7(),
+            occurred_at: now,
+            dedupe_key: "throughput-start:test-repair-terminal".to_owned(),
+            partition_key: "batch-repair-terminal:0".to_owned(),
+            payload: ThroughputCommand::StartThroughputRun(StartThroughputRunCommand {
+                dedupe_key: "throughput-start:test-repair-terminal".to_owned(),
+                bridge_request_id: throughput_bridge_request_id(
+                    "tenant",
+                    "instance-repair-terminal",
+                    "run-repair-terminal",
+                    "batch-repair-terminal",
+                ),
+                bridge_protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                bridge_operation_kind: ThroughputBridgeOperationKind::BulkRun.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                instance_id: "instance-repair-terminal".to_owned(),
+                run_id: "run-repair-terminal".to_owned(),
+                batch_id: "batch-repair-terminal".to_owned(),
+                activity_type: "benchmark.echo".to_owned(),
+                activity_capabilities: None,
+                task_queue: "bulk".to_owned(),
+                state: Some("join".to_owned()),
+                chunk_size: 2,
+                max_attempts: 1,
+                retry_delay_ms: 0,
+                total_items: 2,
+                aggregation_group_count: 1,
+                execution_policy: Some("parallel".to_owned()),
+                reducer: Some("count".to_owned()),
+                throughput_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
+                throughput_backend_version: ThroughputBackend::StreamV2
+                    .default_version()
+                    .to_owned(),
+                routing_reason: "stream_v2_selected".to_owned(),
+                admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
+                input_handle: PayloadHandle::Inline {
+                    key: "bulk-input:batch-repair-terminal".to_owned(),
+                },
+                result_handle: PayloadHandle::Inline {
+                    key: "bulk-result:batch-repair-terminal".to_owned(),
+                },
+            }),
+        };
+
+        store
+            .upsert_throughput_run(&ThroughputRunRecord {
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-terminal".to_owned(),
+                run_id: "run-repair-terminal".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                batch_id: "batch-repair-terminal".to_owned(),
+                bridge_protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                bridge_operation_kind: ThroughputBridgeOperationKind::BulkRun.as_str().to_owned(),
+                bridge_request_id: throughput_bridge_request_id(
+                    "tenant",
+                    "instance-repair-terminal",
+                    "run-repair-terminal",
+                    "batch-repair-terminal",
+                ),
+                throughput_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
+                execution_path: ThroughputExecutionPath::NativeStreamV2.as_str().to_owned(),
+                status: ThroughputRunStatus::Completed.as_str().to_owned(),
+                command_dedupe_key: command.dedupe_key.clone(),
+                command,
+                command_published_at: Some(now),
+                started_at: Some(now),
+                terminal_at: Some(now),
+                bridge_terminal_status: None,
+                bridge_terminal_event_id: None,
+                bridge_terminal_owner_epoch: None,
+                bridge_terminal_accepted_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        assert!(
+            store
+                .commit_throughput_terminal_handoff(&ThroughputTerminalRecord {
+                    tenant_id: "tenant".to_owned(),
+                    instance_id: "instance-repair-terminal".to_owned(),
+                    run_id: "run-repair-terminal".to_owned(),
+                    batch_id: "batch-repair-terminal".to_owned(),
+                    status: "completed".to_owned(),
+                    terminal_at: now,
+                    terminal_event_id: terminal_event.event_id,
+                    terminal_event: terminal_event.clone(),
+                    created_at: now,
+                    updated_at: now,
+                })
+                .await?
+        );
+
+        let repaired = crate::bridge::repair_pending_stream_v2_bridge(&app_state).await?;
+        assert_eq!(repaired, (0, 0, 1, 0, 0, 0));
+
+        let repaired_event = redpanda
+            .wait_for_workflow_history_event(
+                &WorkflowHistoryFilter::new(
+                    "tenant",
+                    "instance-repair-terminal",
+                    "run-repair-terminal",
+                ),
+                "BulkActivityBatchCompleted",
+            )
+            .await?;
+        assert_eq!(repaired_event.event_id, terminal_event.event_id);
+        assert_eq!(
+            repaired_event.metadata.get("bridge_protocol_version").map(String::as_str),
+            Some(THROUGHPUT_BRIDGE_PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            repaired_event.metadata.get("bridge_operation_kind").map(String::as_str),
+            Some(ThroughputBridgeOperationKind::BulkRun.as_str())
+        );
+
+        let debug = app_state.debug.lock().expect("unified debug lock poisoned").clone();
+        assert_eq!(debug.repaired_bridge_terminal_callbacks, 1);
+        assert_eq!(debug.last_bridge_repair_kind.as_deref(), Some("accept_terminal"));
+        assert_eq!(debug.last_bridge_repair_batch_id.as_deref(), Some("batch-repair-terminal"));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_repair_republishes_cancel_command() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-bridge-repair-cancel-{}", Uuid::now_v7()));
+        let mut app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        app_state.throughput_command_publisher =
+            Some(redpanda.connect_throughput_command_publisher().await?);
+
+        let now = Utc::now();
+        let workflow_event_id = Uuid::now_v7();
+        let command = ThroughputCommandEnvelope {
+            command_id: Uuid::now_v7(),
+            occurred_at: now,
+            dedupe_key: "throughput-start:test-repair-cancel".to_owned(),
+            partition_key: "batch-repair-cancel:0".to_owned(),
+            payload: ThroughputCommand::StartThroughputRun(StartThroughputRunCommand {
+                dedupe_key: "throughput-start:test-repair-cancel".to_owned(),
+                bridge_request_id: throughput_bridge_request_id(
+                    "tenant",
+                    "instance-repair-cancel",
+                    "run-repair-cancel",
+                    "batch-repair-cancel",
+                ),
+                bridge_protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                bridge_operation_kind: ThroughputBridgeOperationKind::BulkRun.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                instance_id: "instance-repair-cancel".to_owned(),
+                run_id: "run-repair-cancel".to_owned(),
+                batch_id: "batch-repair-cancel".to_owned(),
+                activity_type: "benchmark.echo".to_owned(),
+                activity_capabilities: None,
+                task_queue: "bulk".to_owned(),
+                state: Some("join".to_owned()),
+                chunk_size: 2,
+                max_attempts: 1,
+                retry_delay_ms: 0,
+                total_items: 2,
+                aggregation_group_count: 1,
+                execution_policy: Some("parallel".to_owned()),
+                reducer: Some("count".to_owned()),
+                throughput_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
+                throughput_backend_version: ThroughputBackend::StreamV2
+                    .default_version()
+                    .to_owned(),
+                routing_reason: "stream_v2_selected".to_owned(),
+                admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
+                input_handle: PayloadHandle::Inline {
+                    key: "bulk-input:batch-repair-cancel".to_owned(),
+                },
+                result_handle: PayloadHandle::Inline {
+                    key: "bulk-result:batch-repair-cancel".to_owned(),
+                },
+            }),
+        };
+
+        store
+            .upsert_throughput_bridge_submission(
+                workflow_event_id,
+                THROUGHPUT_BRIDGE_PROTOCOL_VERSION,
+                ThroughputBridgeOperationKind::BulkRun,
+                "tenant",
+                "instance-repair-cancel",
+                "run-repair-cancel",
+                "batch-repair-cancel",
+                ThroughputBackend::StreamV2.as_str(),
+                &throughput_bridge_request_id(
+                    "tenant",
+                    "instance-repair-cancel",
+                    "run-repair-cancel",
+                    "batch-repair-cancel",
+                ),
+                &command.dedupe_key,
+                Some(command.command_id),
+                Some(&command.partition_key),
+                now,
+            )
+            .await?;
+        store.mark_throughput_bridge_command_published(workflow_event_id, now).await?;
+        store
+            .request_throughput_bridge_cancellation(
+                workflow_event_id,
+                now + ChronoDuration::seconds(1),
+                "operator stop",
+            )
+            .await?;
+        store
+            .upsert_throughput_run(&ThroughputRunRecord {
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-cancel".to_owned(),
+                run_id: "run-repair-cancel".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                batch_id: "batch-repair-cancel".to_owned(),
+                bridge_protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                bridge_operation_kind: ThroughputBridgeOperationKind::BulkRun.as_str().to_owned(),
+                bridge_request_id: throughput_bridge_request_id(
+                    "tenant",
+                    "instance-repair-cancel",
+                    "run-repair-cancel",
+                    "batch-repair-cancel",
+                ),
+                throughput_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
+                execution_path: ThroughputExecutionPath::NativeStreamV2.as_str().to_owned(),
+                status: ThroughputRunStatus::Running.as_str().to_owned(),
+                command_dedupe_key: command.dedupe_key.clone(),
+                command,
+                command_published_at: Some(now),
+                started_at: Some(now),
+                terminal_at: None,
+                bridge_terminal_status: None,
+                bridge_terminal_event_id: None,
+                bridge_terminal_owner_epoch: None,
+                bridge_terminal_accepted_at: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+
+        let repaired = crate::bridge::repair_pending_stream_v2_bridge(&app_state).await?;
+        assert_eq!(repaired, (0, 1, 0, 0, 0, 0));
+
+        let published = redpanda.wait_for_throughput_command("batch-repair-cancel").await?;
+        let ThroughputCommand::CancelBatch { identity, reason } = published.payload else {
+            panic!("expected repaired cancel command");
+        };
+        assert_eq!(identity.batch_id, "batch-repair-cancel");
+        assert_eq!(reason, "operator stop");
+
+        let bridge_progress = store
+            .get_throughput_bridge_progress(workflow_event_id)
+            .await?
+            .context("bridge progress should exist after cancel repair")?;
+        assert!(bridge_progress.cancel_command_published_at.is_some());
+
+        let debug = app_state.debug.lock().expect("unified debug lock poisoned").clone();
+        assert_eq!(debug.repaired_bridge_cancel_commands, 1);
+        assert_eq!(debug.last_bridge_repair_kind.as_deref(), Some("publish_cancel"));
+        assert_eq!(debug.last_bridge_repair_batch_id.as_deref(), Some("batch-repair-cancel"));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_repair_republishes_stream_job_query_callback() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-bridge-repair-stream-query-{}", Uuid::now_v7()));
+        let app_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher,
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+        let now = Utc::now();
+
+        store
+            .upsert_stream_job_bridge_handle(&StreamJobBridgeHandleRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-query".to_owned(),
+                run_id: "run-repair-stream-query".to_owned(),
+                job_id: "job-repair-stream-query".to_owned(),
+                handle_id: "stream-job-handle:tenant:instance-repair-stream-query:run-repair-stream-query:job-repair-stream-query".to_owned(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-query:run-repair-stream-query:job-repair-stream-query".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                job_name: "fraud-detector".to_owned(),
+                input_ref: "topic:payments".to_owned(),
+                config_ref: Some("config:fraud-detector:v1".to_owned()),
+                checkpoint_policy: None,
+                view_definitions: None,
+                status: fabrik_throughput::StreamJobBridgeHandleStatus::Running.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                cancellation_requested_at: None,
+                cancellation_reason: None,
+                terminal_event_id: None,
+                terminal_at: None,
+                workflow_accepted_at: None,
+                terminal_output: None,
+                terminal_error: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        store
+            .upsert_stream_job_bridge_query(&StreamJobQueryRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-query".to_owned(),
+                run_id: "run-repair-stream-query".to_owned(),
+                job_id: "job-repair-stream-query".to_owned(),
+                handle_id: "stream-job-handle:tenant:instance-repair-stream-query:run-repair-stream-query:job-repair-stream-query".to_owned(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-query:run-repair-stream-query:job-repair-stream-query".to_owned(),
+                query_id: "stream-job-query:job-repair-stream-query:currentStats:event-a".to_owned(),
+                query_name: "currentStats".to_owned(),
+                query_args: Some(json!({"window": "1h"})),
+                consistency: fabrik_throughput::StreamJobQueryConsistency::Strong.as_str().to_owned(),
+                status: fabrik_throughput::StreamJobQueryStatus::Completed.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                output: Some(json!({"anomalies": 2})),
+                error: None,
+                requested_at: now,
+                completed_at: Some(now + chrono::Duration::seconds(1)),
+                accepted_at: None,
+                cancelled_at: None,
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(1),
+            })
+            .await?;
+
+        let repaired = crate::bridge::repair_pending_stream_v2_bridge(&app_state).await?;
+        assert_eq!(repaired, (0, 0, 0, 1, 0, 0));
+
+        let repaired_event = redpanda
+            .wait_for_workflow_history_event(
+                &WorkflowHistoryFilter::new(
+                    "tenant",
+                    "instance-repair-stream-query",
+                    "run-repair-stream-query",
+                ),
+                "StreamJobQueryCompleted",
+            )
+            .await?;
+        assert_eq!(
+            repaired_event.metadata.get("bridge_protocol_version").map(String::as_str),
+            Some(THROUGHPUT_BRIDGE_PROTOCOL_VERSION)
+        );
+        assert_eq!(
+            repaired_event.metadata.get("bridge_operation_kind").map(String::as_str),
+            Some(ThroughputBridgeOperationKind::StreamJob.as_str())
+        );
+
+        let debug = app_state.debug.lock().expect("unified debug lock poisoned").clone();
+        assert_eq!(debug.repaired_bridge_stream_job_query_callbacks, 1);
+        assert_eq!(debug.last_bridge_repair_kind.as_deref(), Some("accept_stream_query"));
+        assert_eq!(
+            debug.last_bridge_repair_batch_id.as_deref(),
+            Some("stream-job-query:job-repair-stream-query:currentStats:event-a")
+        );
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_repair_republishes_stream_job_checkpoint_callback() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-bridge-repair-stream-checkpoint-{}", Uuid::now_v7()));
+        let app_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher,
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+        let now = Utc::now();
+
+        let handle_id = "stream-job-handle:tenant:instance-repair-stream-checkpoint:run-repair-stream-checkpoint:job-repair-stream-checkpoint".to_owned();
+        store
+            .upsert_stream_job_bridge_handle(&StreamJobBridgeHandleRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-checkpoint".to_owned(),
+                run_id: "run-repair-stream-checkpoint".to_owned(),
+                job_id: "job-repair-stream-checkpoint".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-checkpoint:run-repair-stream-checkpoint:job-repair-stream-checkpoint".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                job_name: "fraud-detector".to_owned(),
+                input_ref: "topic:payments".to_owned(),
+                config_ref: Some("config:fraud-detector:v1".to_owned()),
+                checkpoint_policy: None,
+                view_definitions: None,
+                status: fabrik_throughput::StreamJobBridgeHandleStatus::Running.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                cancellation_requested_at: None,
+                cancellation_reason: None,
+                terminal_event_id: None,
+                terminal_at: None,
+                workflow_accepted_at: None,
+                terminal_output: None,
+                terminal_error: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        store
+            .upsert_stream_job_bridge_checkpoint(&fabrik_store::StreamJobCheckpointRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-checkpoint".to_owned(),
+                run_id: "run-repair-stream-checkpoint".to_owned(),
+                job_id: "job-repair-stream-checkpoint".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-checkpoint:run-repair-stream-checkpoint:job-repair-stream-checkpoint".to_owned(),
+                await_request_id: "stream-job-await:job-repair-stream-checkpoint:hourly-rollup-ready:event-a".to_owned(),
+                checkpoint_name: "hourly-rollup-ready".to_owned(),
+                checkpoint_sequence: Some(7),
+                status: fabrik_throughput::StreamJobCheckpointStatus::Reached.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                reached_at: Some(now + chrono::Duration::seconds(1)),
+                output: Some(json!({"ready": true})),
+                accepted_at: None,
+                cancelled_at: None,
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(1),
+            })
+            .await?;
+
+        let repaired = crate::bridge::repair_pending_stream_v2_bridge(&app_state).await?;
+        assert_eq!(repaired, (0, 0, 0, 0, 1, 0));
+
+        let repaired_event = redpanda
+            .wait_for_workflow_history_event(
+                &WorkflowHistoryFilter::new(
+                    "tenant",
+                    "instance-repair-stream-checkpoint",
+                    "run-repair-stream-checkpoint",
+                ),
+                "StreamJobCheckpointReached",
+            )
+            .await?;
+        assert_eq!(
+            repaired_event.metadata.get("bridge_operation_kind").map(String::as_str),
+            Some(ThroughputBridgeOperationKind::StreamJob.as_str())
+        );
+        let debug = app_state.debug.lock().expect("unified debug lock poisoned").clone();
+        assert_eq!(debug.repaired_bridge_stream_job_checkpoint_callbacks, 1);
+        assert_eq!(debug.last_bridge_repair_kind.as_deref(), Some("accept_stream_checkpoint"));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_repair_republishes_stream_job_terminal_callback() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-bridge-repair-stream-terminal-{}", Uuid::now_v7()));
+        let app_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher,
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+        let now = Utc::now();
+
+        let handle_id = "stream-job-handle:tenant:instance-repair-stream-terminal:run-repair-stream-terminal:job-repair-stream-terminal".to_owned();
+        store
+            .upsert_stream_job_bridge_handle(&StreamJobBridgeHandleRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-terminal".to_owned(),
+                run_id: "run-repair-stream-terminal".to_owned(),
+                job_id: "job-repair-stream-terminal".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-terminal:run-repair-stream-terminal:job-repair-stream-terminal".to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                job_name: "fraud-detector".to_owned(),
+                input_ref: "topic:payments".to_owned(),
+                config_ref: Some("config:fraud-detector:v1".to_owned()),
+                checkpoint_policy: None,
+                view_definitions: None,
+                status: fabrik_throughput::StreamJobBridgeHandleStatus::Completed.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                cancellation_requested_at: None,
+                cancellation_reason: None,
+                terminal_event_id: Some(Uuid::now_v7()),
+                terminal_at: Some(now + chrono::Duration::seconds(1)),
+                workflow_accepted_at: None,
+                terminal_output: Some(json!({"score": 0.97})),
+                terminal_error: None,
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(1),
+            })
+            .await?;
+
+        let repaired = crate::bridge::repair_pending_stream_v2_bridge(&app_state).await?;
+        assert_eq!(repaired, (0, 0, 0, 0, 0, 1));
+
+        let repaired_event = redpanda
+            .wait_for_workflow_history_event(
+                &WorkflowHistoryFilter::new(
+                    "tenant",
+                    "instance-repair-stream-terminal",
+                    "run-repair-stream-terminal",
+                ),
+                "StreamJobCompleted",
+            )
+            .await?;
+        assert_eq!(
+            repaired_event.metadata.get("bridge_operation_kind").map(String::as_str),
+            Some(ThroughputBridgeOperationKind::StreamJob.as_str())
+        );
+        let debug = app_state.debug.lock().expect("unified debug lock poisoned").clone();
+        assert_eq!(debug.repaired_bridge_stream_job_terminal_callbacks, 1);
+        assert_eq!(debug.last_bridge_repair_kind.as_deref(), Some("accept_stream_terminal"));
 
         fs::remove_dir_all(state_dir).ok();
         Ok(())
@@ -11176,6 +12893,8 @@ mod tests {
                     "run-throughput-terminal",
                     "batch-a",
                 ),
+                bridge_protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                bridge_operation_kind: ThroughputBridgeOperationKind::BulkRun.as_str().to_owned(),
                 tenant_id: "tenant".to_owned(),
                 definition_id: "demo".to_owned(),
                 definition_version: Some(1),
@@ -11213,6 +12932,8 @@ mod tests {
                 definition_version: Some(1),
                 artifact_hash: Some("artifact-a".to_owned()),
                 batch_id: "batch-a".to_owned(),
+                bridge_protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                bridge_operation_kind: ThroughputBridgeOperationKind::BulkRun.as_str().to_owned(),
                 bridge_request_id: throughput_bridge_request_id(
                     "tenant",
                     "instance-throughput-terminal",
@@ -11322,6 +13043,8 @@ mod tests {
                     "run-throughput-terminal-no-acceptance",
                     "batch-a",
                 ),
+                bridge_protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                bridge_operation_kind: ThroughputBridgeOperationKind::BulkRun.as_str().to_owned(),
                 tenant_id: "tenant".to_owned(),
                 definition_id: "demo".to_owned(),
                 definition_version: Some(1),
@@ -11359,6 +13082,8 @@ mod tests {
                 definition_version: Some(1),
                 artifact_hash: Some("artifact-a".to_owned()),
                 batch_id: "batch-a".to_owned(),
+                bridge_protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                bridge_operation_kind: ThroughputBridgeOperationKind::BulkRun.as_str().to_owned(),
                 bridge_request_id: throughput_bridge_request_id(
                     "tenant",
                     "instance-throughput-terminal-no-acceptance",
@@ -11403,6 +13128,1181 @@ mod tests {
         let debug = app_state.debug.lock().expect("unified debug lock poisoned").clone();
         assert_eq!(debug.ignored_missing_bulk_terminal_callbacks, 1);
         assert_eq!(debug.ignored_closed_bulk_terminal_callbacks, 0);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_job_bridge_helpers_persist_handle_checkpoint_and_cancellation() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-stream-job-bridge-{}", Uuid::now_v7()));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+
+        let submit = fabrik_throughput::SubmitStreamJobRequest {
+            protocol_version: fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: fabrik_throughput::ThroughputBridgeOperationKind::StreamJob,
+            bridge_request_id: fabrik_throughput::stream_job_bridge_request_id(
+                "tenant",
+                "instance-stream-job",
+                "run-stream-job",
+                "job-a",
+            ),
+            handle_id: fabrik_throughput::stream_job_handle_id(
+                "tenant",
+                "instance-stream-job",
+                "run-stream-job",
+                "job-a",
+            ),
+            workflow_event_id: Uuid::now_v7(),
+            workflow_owner_epoch: Some(3),
+            stream_owner_epoch: None,
+            identity: fabrik_throughput::StreamJobBridgeIdentity {
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-stream-job".to_owned(),
+                run_id: "run-stream-job".to_owned(),
+                job_id: "job-a".to_owned(),
+            },
+            definition_id: "demo".to_owned(),
+            definition_version: Some(1),
+            artifact_hash: Some("artifact-a".to_owned()),
+            job_name: "fraud-detector".to_owned(),
+            input_ref: "topic:payments".to_owned(),
+            config_ref: Some("config:fraud-detector:v1".to_owned()),
+            checkpoint_policy: None,
+            view_definitions: None,
+            admitted_at: now,
+        };
+        let submitted = crate::bridge::submit_stream_job_via_bridge(&app_state, &submit).await?;
+        assert_eq!(submitted.status, fabrik_throughput::StreamJobBridgeHandleStatus::Admitted);
+
+        let await_request_id = fabrik_throughput::stream_job_checkpoint_await_request_id(
+            &submitted.handle_id,
+            "hourly-rollup-ready",
+            Uuid::now_v7(),
+        );
+        let checkpoint = crate::bridge::await_stream_job_checkpoint_via_bridge(
+            &app_state,
+            &fabrik_throughput::AwaitStreamCheckpointRequest {
+                protocol_version: fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: fabrik_throughput::ThroughputBridgeOperationKind::StreamJob,
+                bridge_request_id: submit.bridge_request_id.clone(),
+                handle_id: submitted.handle_id.clone(),
+                await_request_id: await_request_id.clone(),
+                checkpoint_name: "hourly-rollup-ready".to_owned(),
+                workflow_event_id: Uuid::now_v7(),
+                workflow_owner_epoch: Some(3),
+                requested_at: now + ChronoDuration::seconds(1),
+            },
+        )
+        .await?;
+        assert_eq!(
+            checkpoint.parsed_status(),
+            Some(fabrik_throughput::StreamJobCheckpointStatus::Awaiting)
+        );
+
+        let queried = crate::bridge::query_stream_job_via_bridge(
+            &app_state,
+            &fabrik_throughput::QueryStreamJobRequest {
+                protocol_version: fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: fabrik_throughput::ThroughputBridgeOperationKind::StreamJob,
+                bridge_request_id: submit.bridge_request_id.clone(),
+                handle_id: submitted.handle_id.clone(),
+                query_id: fabrik_throughput::stream_job_query_request_id(
+                    &submitted.handle_id,
+                    "currentStats",
+                    Uuid::now_v7(),
+                ),
+                query_name: "currentStats".to_owned(),
+                args: Some(json!({"window": "1h"})),
+                consistency: fabrik_throughput::StreamJobQueryConsistency::Strong,
+                workflow_event_id: Uuid::now_v7(),
+                workflow_owner_epoch: Some(3),
+                requested_at: now + ChronoDuration::milliseconds(500),
+            },
+        )
+        .await?;
+        assert_eq!(queried.handle_id, submitted.handle_id);
+
+        let awaited_terminal = crate::bridge::await_stream_job_terminal_via_bridge(
+            &app_state,
+            &fabrik_throughput::AwaitStreamJobTerminalRequest {
+                protocol_version: fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: fabrik_throughput::ThroughputBridgeOperationKind::StreamJob,
+                bridge_request_id: submit.bridge_request_id.clone(),
+                handle_id: submitted.handle_id.clone(),
+                workflow_event_id: Uuid::now_v7(),
+                workflow_owner_epoch: Some(3),
+                requested_at: now + ChronoDuration::seconds(2),
+            },
+        )
+        .await?;
+        assert_eq!(awaited_terminal.handle_id, submitted.handle_id);
+
+        let cancelled = crate::bridge::cancel_stream_job_via_bridge(
+            &app_state,
+            &fabrik_throughput::CancelStreamJobRequest {
+                protocol_version: fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: fabrik_throughput::ThroughputBridgeOperationKind::StreamJob,
+                bridge_request_id: submit.bridge_request_id.clone(),
+                handle_id: submitted.handle_id.clone(),
+                workflow_event_id: Uuid::now_v7(),
+                workflow_owner_epoch: Some(3),
+                reason: Some("manual stop".to_owned()),
+                requested_at: now + ChronoDuration::seconds(3),
+            },
+        )
+        .await?;
+        assert_eq!(
+            cancelled.parsed_status(),
+            Some(fabrik_throughput::StreamJobBridgeHandleStatus::CancellationRequested)
+        );
+
+        let stored_handle = store
+            .get_stream_job_bridge_handle_by_handle_id(&submitted.handle_id)
+            .await?
+            .context("stream job handle should exist")?;
+        assert_eq!(
+            stored_handle.parsed_status(),
+            Some(fabrik_throughput::StreamJobBridgeHandleStatus::CancellationRequested)
+        );
+        let stored_checkpoint = store
+            .get_stream_job_bridge_checkpoint(&await_request_id)
+            .await?
+            .context("stream job checkpoint should exist")?;
+        assert_eq!(
+            stored_checkpoint.parsed_status(),
+            Some(fabrik_throughput::StreamJobCheckpointStatus::Cancelled)
+        );
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_job_checkpoint_and_terminal_callbacks_advance_workflow() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = stream_job_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-stream-job-callbacks-{}", Uuid::now_v7()));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-stream-job",
+            "run-stream-job",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({}) },
+            Utc::now(),
+        );
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let handle = store
+            .get_stream_job_bridge_handle("tenant", "instance-stream-job", "run-stream-job", "")
+            .await?;
+        assert!(handle.is_none(), "job lookup should still require the actual job id");
+        let handle = store
+            .list_stream_job_bridge_handles_for_run_page(
+                "tenant",
+                "instance-stream-job",
+                "run-stream-job",
+                10,
+                0,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job bridge handle should exist")?;
+
+        let checkpoint = test_event(
+            &identity,
+            WorkflowEvent::StreamJobCheckpointReached {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                checkpoint_name: "hourly-rollup-ready".to_owned(),
+                checkpoint_sequence: 7,
+                output: Some(json!({"ready": true})),
+                stream_owner_epoch: Some(4),
+            },
+            Utc::now(),
+        );
+        handle_stream_job_checkpoint_event(&app_state, checkpoint).await?;
+
+        let waiting = store
+            .get_instance("tenant", "instance-stream-job")
+            .await?
+            .context("stream job instance should exist after checkpoint")?;
+        assert_eq!(waiting.current_state.as_deref(), Some("await_terminal"));
+        assert_eq!(
+            waiting
+                .artifact_execution
+                .as_ref()
+                .and_then(|execution| execution.bindings.get("checkpoint"))
+                .cloned(),
+            Some(json!({"ready": true}))
+        );
+
+        let accepted_checkpoint = store
+            .list_stream_job_bridge_checkpoints_for_handle_page(&handle.handle_id, 10, 0)
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job checkpoint should exist")?;
+        assert_eq!(
+            accepted_checkpoint.parsed_status(),
+            Some(fabrik_throughput::StreamJobCheckpointStatus::Accepted)
+        );
+
+        let terminal = test_event(
+            &identity,
+            WorkflowEvent::StreamJobCompleted {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                output: json!({"score": 0.97}),
+                stream_owner_epoch: Some(4),
+            },
+            Utc::now(),
+        );
+        handle_stream_job_terminal_event(&app_state, terminal).await?;
+
+        let completed = store
+            .get_instance("tenant", "instance-stream-job")
+            .await?
+            .context("stream job instance should complete")?;
+        assert_eq!(completed.status, WorkflowStatus::Completed);
+        assert_eq!(
+            completed.output,
+            Some(json!({
+                "checkpoint": { "ready": true },
+                "result": { "score": 0.97 }
+            }))
+        );
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn materialize_wait_for_stream_checkpoint_replays_existing_checkpoint_callback()
+    -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-stream-job-checkpoint-replay-{}", Uuid::now_v7()));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        let artifact = stream_job_artifact();
+        let now = Utc::now();
+        let run_id = "run-stream-job-checkpoint-replay";
+        let instance_id = "instance-stream-job-checkpoint-replay";
+        let job_id = "job-stream-job-checkpoint-replay";
+        let handle_id = stream_job_handle_id("tenant", instance_id, run_id, job_id);
+
+        let mut execution_state = ArtifactExecutionState::default();
+        execution_state.bindings.insert(
+            "job".to_owned(),
+            serde_json::to_value(StreamJobExecutionState {
+                job_id: job_id.to_owned(),
+                origin_state: "start_stream".to_owned(),
+                wait_state: "wait_checkpoint".to_owned(),
+                job_name: "fraud-detector".to_owned(),
+                terminal_wait_state: Some("await_terminal".to_owned()),
+                last_checkpoint_name: None,
+                last_checkpoint_sequence: None,
+            })?,
+        );
+        let mut instance = workflow_instance_for_run(run_id, WorkflowStatus::Running, 1, now);
+        instance.instance_id = instance_id.to_owned();
+        instance.definition_id = artifact.definition_id.clone();
+        instance.definition_version = Some(artifact.definition_version);
+        instance.artifact_hash = Some(artifact.artifact_hash.clone());
+        instance.current_state = Some("wait_checkpoint".to_owned());
+        instance.artifact_execution = Some(execution_state.clone());
+
+        let plan = CompiledExecutionPlan {
+            workflow_version: artifact.definition_version,
+            final_state: "wait_checkpoint".to_owned(),
+            emissions: Vec::new(),
+            execution_state,
+            context: None,
+            output: None,
+        };
+
+        store
+            .upsert_stream_job_bridge_handle(&StreamJobBridgeHandleRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: instance_id.to_owned(),
+                run_id: run_id.to_owned(),
+                job_id: job_id.to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: stream_job_bridge_request_id(
+                    "tenant",
+                    instance_id,
+                    run_id,
+                    job_id,
+                ),
+                definition_id: artifact.definition_id.clone(),
+                definition_version: Some(artifact.definition_version),
+                artifact_hash: Some(artifact.artifact_hash.clone()),
+                job_name: "fraud-detector".to_owned(),
+                input_ref: "topic:payments".to_owned(),
+                config_ref: Some("config:fraud-detector:v1".to_owned()),
+                checkpoint_policy: None,
+                view_definitions: None,
+                status: fabrik_throughput::StreamJobBridgeHandleStatus::Running.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                cancellation_requested_at: None,
+                cancellation_reason: None,
+                terminal_event_id: None,
+                terminal_at: None,
+                workflow_accepted_at: None,
+                terminal_output: None,
+                terminal_error: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        store
+            .upsert_stream_job_bridge_checkpoint(&fabrik_store::StreamJobCheckpointRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: instance_id.to_owned(),
+                run_id: run_id.to_owned(),
+                job_id: job_id.to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: stream_job_bridge_request_id(
+                    "tenant",
+                    instance_id,
+                    run_id,
+                    job_id,
+                ),
+                await_request_id: "stream-job-await-existing-checkpoint".to_owned(),
+                checkpoint_name: "hourly-rollup-ready".to_owned(),
+                checkpoint_sequence: Some(7),
+                status: fabrik_throughput::StreamJobCheckpointStatus::Reached.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                reached_at: Some(now + ChronoDuration::seconds(1)),
+                output: Some(json!({"ready": true})),
+                accepted_at: None,
+                cancelled_at: None,
+                created_at: now,
+                updated_at: now + ChronoDuration::seconds(1),
+            })
+            .await?;
+
+        let materialized = materialize_stream_jobs_from_plan(
+            &app_state,
+            &artifact,
+            &instance,
+            &plan,
+            Uuid::now_v7(),
+            now + ChronoDuration::seconds(2),
+        )
+        .await?;
+        assert_eq!(materialized, 1);
+
+        let outbox = store
+            .lease_workflow_event_outbox(
+                "checkpoint-replay-test",
+                ChronoDuration::seconds(30),
+                10,
+                now + ChronoDuration::seconds(2),
+            )
+            .await?;
+        let event = outbox
+            .into_iter()
+            .find(|record| record.event_type == "StreamJobCheckpointReached")
+            .context("checkpoint callback should be enqueued")?;
+        match event.event.payload {
+            WorkflowEvent::StreamJobCheckpointReached {
+                checkpoint_name,
+                checkpoint_sequence,
+                output,
+                ..
+            } => {
+                assert_eq!(checkpoint_name, "hourly-rollup-ready");
+                assert_eq!(checkpoint_sequence, 7);
+                assert_eq!(output, Some(json!({"ready": true})));
+            }
+            other => panic!("unexpected outbox payload: {other:?}"),
+        }
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn materialize_await_stream_job_terminal_replays_existing_terminal_callback() -> Result<()>
+    {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-stream-job-terminal-replay-{}", Uuid::now_v7()));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        let artifact = stream_job_artifact();
+        let now = Utc::now();
+        let run_id = "run-stream-job-terminal-replay";
+        let instance_id = "instance-stream-job-terminal-replay";
+        let job_id = "job-stream-job-terminal-replay";
+        let handle_id = stream_job_handle_id("tenant", instance_id, run_id, job_id);
+
+        let mut execution_state = ArtifactExecutionState::default();
+        execution_state.bindings.insert(
+            "job".to_owned(),
+            serde_json::to_value(StreamJobExecutionState {
+                job_id: job_id.to_owned(),
+                origin_state: "start_stream".to_owned(),
+                wait_state: "wait_checkpoint".to_owned(),
+                job_name: "fraud-detector".to_owned(),
+                terminal_wait_state: Some("await_terminal".to_owned()),
+                last_checkpoint_name: Some("hourly-rollup-ready".to_owned()),
+                last_checkpoint_sequence: Some(7),
+            })?,
+        );
+        let mut instance = workflow_instance_for_run(run_id, WorkflowStatus::Running, 1, now);
+        instance.instance_id = instance_id.to_owned();
+        instance.definition_id = artifact.definition_id.clone();
+        instance.definition_version = Some(artifact.definition_version);
+        instance.artifact_hash = Some(artifact.artifact_hash.clone());
+        instance.current_state = Some("await_terminal".to_owned());
+        instance.artifact_execution = Some(execution_state.clone());
+
+        let plan = CompiledExecutionPlan {
+            workflow_version: artifact.definition_version,
+            final_state: "await_terminal".to_owned(),
+            emissions: Vec::new(),
+            execution_state,
+            context: None,
+            output: None,
+        };
+
+        store
+            .upsert_stream_job_bridge_handle(&StreamJobBridgeHandleRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: instance_id.to_owned(),
+                run_id: run_id.to_owned(),
+                job_id: job_id.to_owned(),
+                handle_id,
+                bridge_request_id: stream_job_bridge_request_id(
+                    "tenant",
+                    instance_id,
+                    run_id,
+                    job_id,
+                ),
+                definition_id: artifact.definition_id.clone(),
+                definition_version: Some(artifact.definition_version),
+                artifact_hash: Some(artifact.artifact_hash.clone()),
+                job_name: "fraud-detector".to_owned(),
+                input_ref: "topic:payments".to_owned(),
+                config_ref: Some("config:fraud-detector:v1".to_owned()),
+                checkpoint_policy: None,
+                view_definitions: None,
+                status: fabrik_throughput::StreamJobBridgeHandleStatus::Completed
+                    .as_str()
+                    .to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                cancellation_requested_at: None,
+                cancellation_reason: None,
+                terminal_event_id: Some(Uuid::now_v7()),
+                terminal_at: Some(now + ChronoDuration::seconds(1)),
+                workflow_accepted_at: None,
+                terminal_output: Some(json!({"score": 0.97})),
+                terminal_error: None,
+                created_at: now,
+                updated_at: now + ChronoDuration::seconds(1),
+            })
+            .await?;
+
+        let materialized = materialize_stream_jobs_from_plan(
+            &app_state,
+            &artifact,
+            &instance,
+            &plan,
+            Uuid::now_v7(),
+            now + ChronoDuration::seconds(2),
+        )
+        .await?;
+        assert_eq!(materialized, 1);
+
+        let outbox = store
+            .lease_workflow_event_outbox(
+                "terminal-replay-test",
+                ChronoDuration::seconds(30),
+                10,
+                now + ChronoDuration::seconds(2),
+            )
+            .await?;
+        let event = outbox
+            .into_iter()
+            .find(|record| record.event_type == "StreamJobCompleted")
+            .context("terminal callback should be enqueued")?;
+        match event.event.payload {
+            WorkflowEvent::StreamJobCompleted { output, .. } => {
+                assert_eq!(output, json!({"score": 0.97}));
+            }
+            other => panic!("unexpected outbox payload: {other:?}"),
+        }
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_job_query_callback_advances_workflow() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = stream_job_query_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-stream-job-query-{}", Uuid::now_v7()));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-stream-query",
+            "run-stream-query",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({}) },
+            Utc::now(),
+        );
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let handle = store
+            .list_stream_job_bridge_handles_for_run_page(
+                "tenant",
+                "instance-stream-query",
+                "run-stream-query",
+                10,
+                0,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job bridge handle should exist")?;
+        let query = store
+            .list_stream_job_bridge_queries_for_handle_page(&handle.handle_id, 10, 0)
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job bridge query should exist")?;
+
+        let callback = test_event(
+            &identity,
+            WorkflowEvent::StreamJobQueryCompleted {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                query_id: query.query_id.clone(),
+                query_name: "currentStats".to_owned(),
+                output: json!({"anomalies": 2}),
+                stream_owner_epoch: Some(4),
+            },
+            Utc::now(),
+        );
+        handle_stream_job_query_event(&app_state, callback).await?;
+
+        let completed = store
+            .get_instance("tenant", "instance-stream-query")
+            .await?
+            .context("stream job query instance should complete")?;
+        assert_eq!(completed.status, WorkflowStatus::Completed);
+        assert_eq!(completed.output, Some(json!({"anomalies": 2})));
+
+        let stored_query = store
+            .get_stream_job_bridge_query(&query.query_id)
+            .await?
+            .context("stream job query should still exist")?;
+        assert_eq!(
+            stored_query.parsed_status(),
+            Some(fabrik_throughput::StreamJobQueryStatus::Accepted)
+        );
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_stream_job_query_callback_after_acceptance_is_noop() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = stream_job_query_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-stream-job-query-duplicate-{}", Uuid::now_v7()));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-stream-query-duplicate",
+            "run-stream-query-duplicate",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({}) },
+            Utc::now(),
+        );
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let handle = store
+            .list_stream_job_bridge_handles_for_run_page(
+                "tenant",
+                "instance-stream-query-duplicate",
+                "run-stream-query-duplicate",
+                10,
+                0,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job bridge handle should exist")?;
+        let query = store
+            .list_stream_job_bridge_queries_for_handle_page(&handle.handle_id, 10, 0)
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job bridge query should exist")?;
+
+        let callback = test_event(
+            &identity,
+            WorkflowEvent::StreamJobQueryCompleted {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                query_id: query.query_id.clone(),
+                query_name: "currentStats".to_owned(),
+                output: json!({"anomalies": 2}),
+                stream_owner_epoch: Some(4),
+            },
+            Utc::now(),
+        );
+        handle_stream_job_query_event(&app_state, callback).await?;
+
+        let accepted_once = store
+            .get_stream_job_bridge_query(&query.query_id)
+            .await?
+            .context("stream job query should still exist")?;
+        let first_completed_at = accepted_once.completed_at;
+        let first_accepted_at = accepted_once.accepted_at;
+        assert_eq!(
+            accepted_once.parsed_status(),
+            Some(fabrik_throughput::StreamJobQueryStatus::Accepted)
+        );
+
+        let duplicate_callback = test_event(
+            &identity,
+            WorkflowEvent::StreamJobQueryCompleted {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                query_id: query.query_id.clone(),
+                query_name: "currentStats".to_owned(),
+                output: json!({"anomalies": 999}),
+                stream_owner_epoch: Some(4),
+            },
+            Utc::now() + ChronoDuration::seconds(1),
+        );
+        handle_stream_job_query_event(&app_state, duplicate_callback).await?;
+
+        let completed = store
+            .get_instance("tenant", "instance-stream-query-duplicate")
+            .await?
+            .context("stream job query instance should still exist")?;
+        assert_eq!(completed.status, WorkflowStatus::Completed);
+        assert_eq!(completed.output, Some(json!({"anomalies": 2})));
+
+        let accepted_twice = store
+            .get_stream_job_bridge_query(&query.query_id)
+            .await?
+            .context("stream job query should still exist")?;
+        assert_eq!(
+            accepted_twice.parsed_status(),
+            Some(fabrik_throughput::StreamJobQueryStatus::Accepted)
+        );
+        assert_eq!(accepted_twice.completed_at, first_completed_at);
+        assert_eq!(accepted_twice.accepted_at, first_accepted_at);
+        assert_eq!(accepted_twice.output, Some(json!({"anomalies": 2})));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keyed_rollup_stream_job_callbacks_complete_workflow_end_to_end() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = keyed_rollup_stream_job_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-keyed-rollup-e2e-{}", Uuid::now_v7()));
+        let app_state = test_app_state_with_publisher(
+            store.clone(),
+            redpanda.connect_publisher().await?,
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+        let consumer = build_workflow_consumer(
+            &redpanda.broker,
+            "unified-runtime-keyed-rollup-e2e-consumer",
+            &redpanda.broker.all_partition_ids(),
+        )
+        .await?;
+        let trigger_loop = tokio::spawn(run_trigger_consumer(app_state.clone(), consumer));
+        let outbox_loop = tokio::spawn(run_workflow_event_outbox_publisher(app_state.clone()));
+
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let callback_agent = tokio::spawn(run_keyed_rollup_test_callback_agent(
+            store.clone(),
+            redpanda.connect_publisher().await?,
+            "tenant",
+            "instance-keyed-rollup",
+            "run-keyed-rollup",
+            stop_rx,
+        ));
+
+        let input = json!({
+            "streamInput": {
+                "kind": "bounded_items",
+                "items": [
+                    { "accountId": "acct_1", "amount": 2.0 },
+                    { "accountId": "acct_1", "amount": 3.0 },
+                    { "accountId": "acct_2", "amount": 11.0 }
+                ]
+            }
+        });
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-keyed-rollup",
+            "run-keyed-rollup",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(&identity, WorkflowEvent::WorkflowTriggered { input }, Utc::now());
+        redpanda.connect_publisher().await?.publish(&trigger, &trigger.partition_key).await?;
+
+        let completed =
+            wait_for_instance_completion(&store, "tenant", "instance-keyed-rollup").await?;
+        let handle = store
+            .list_stream_job_bridge_handles_for_run_page(
+                "tenant",
+                "instance-keyed-rollup",
+                "run-keyed-rollup",
+                10,
+                0,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job handle should exist")?;
+        assert_eq!(completed.status, WorkflowStatus::Completed);
+        assert_eq!(
+            completed.output,
+            Some(json!({
+                "checkpoint": {
+                    "jobId": handle.job_id.clone(),
+                    "jobName": "keyed-rollup",
+                    "checkpoint": "initial-rollup-ready",
+                    "sequence": 1
+                },
+                "account": {
+                    "accountId": "acct_1",
+                    "totalAmount": 5.0,
+                    "asOfCheckpoint": 1,
+                    "consistency": "strong"
+                },
+                "result": {
+                    "jobId": handle.job_id.clone(),
+                    "jobName": "keyed-rollup",
+                    "status": "completed"
+                }
+            }))
+        );
+        assert_eq!(handle.parsed_status(), Some(StreamJobBridgeHandleStatus::Completed));
+        let checkpoint = store
+            .list_stream_job_bridge_checkpoints_for_handle_page(&handle.handle_id, 10, 0)
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job checkpoint should exist")?;
+        assert_eq!(checkpoint.parsed_status(), Some(StreamJobCheckpointStatus::Accepted));
+        let query = store
+            .list_stream_job_bridge_queries_for_handle_page(&handle.handle_id, 10, 0)
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job query should exist")?;
+        assert_eq!(query.parsed_status(), Some(StreamJobQueryStatus::Accepted));
+
+        let filter =
+            WorkflowHistoryFilter::new("tenant", "instance-keyed-rollup", "run-keyed-rollup");
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobCheckpointReached").await?;
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobQueryCompleted").await?;
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobCompleted").await?;
+
+        let _ = stop_tx.send(());
+        callback_agent.await??;
+        trigger_loop.abort();
+        outbox_loop.abort();
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_owner_epoch_stream_job_query_callback_is_ignored() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = stream_job_query_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-stream-job-query-stale-{}", Uuid::now_v7()));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-stream-query-stale",
+            "run-stream-query-stale",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({}) },
+            Utc::now(),
+        );
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let mut handle = store
+            .list_stream_job_bridge_handles_for_run_page(
+                "tenant",
+                "instance-stream-query-stale",
+                "run-stream-query-stale",
+                10,
+                0,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job bridge handle should exist")?;
+        handle.stream_owner_epoch = Some(5);
+        store.upsert_stream_job_bridge_handle(&handle).await?;
+
+        let query = store
+            .list_stream_job_bridge_queries_for_handle_page(&handle.handle_id, 10, 0)
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job bridge query should exist")?;
+
+        let callback = test_event(
+            &identity,
+            WorkflowEvent::StreamJobQueryCompleted {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                query_id: query.query_id.clone(),
+                query_name: "currentStats".to_owned(),
+                output: json!({"anomalies": 2}),
+                stream_owner_epoch: Some(4),
+            },
+            Utc::now(),
+        );
+        handle_stream_job_query_event(&app_state, callback).await?;
+
+        let waiting = store
+            .get_instance("tenant", "instance-stream-query-stale")
+            .await?
+            .context("stream job query instance should still exist")?;
+        assert_ne!(waiting.status, WorkflowStatus::Completed);
+
+        let stored_query = store
+            .get_stream_job_bridge_query(&query.query_id)
+            .await?
+            .context("stream job query should still exist")?;
+        assert_eq!(
+            stored_query.parsed_status(),
+            Some(fabrik_throughput::StreamJobQueryStatus::Requested)
+        );
+        assert_eq!(stored_query.completed_at, None);
+
+        let stored_handle = store
+            .get_stream_job_bridge_handle_by_handle_id(&handle.handle_id)
+            .await?
+            .context("stream job bridge handle should still exist")?;
+        assert_eq!(stored_handle.stream_owner_epoch, Some(5));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_owner_epoch_stream_job_terminal_callback_is_ignored() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = stream_job_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-stream-job-terminal-stale-{}", Uuid::now_v7()));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-stream-terminal-stale",
+            "run-stream-terminal-stale",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({}) },
+            Utc::now(),
+        );
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let mut handle = store
+            .list_stream_job_bridge_handles_for_run_page(
+                "tenant",
+                "instance-stream-terminal-stale",
+                "run-stream-terminal-stale",
+                10,
+                0,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job bridge handle should exist")?;
+
+        let checkpoint = test_event(
+            &identity,
+            WorkflowEvent::StreamJobCheckpointReached {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                checkpoint_name: "hourly-rollup-ready".to_owned(),
+                checkpoint_sequence: 7,
+                output: Some(json!({"ready": true})),
+                stream_owner_epoch: Some(5),
+            },
+            Utc::now(),
+        );
+        handle_stream_job_checkpoint_event(&app_state, checkpoint).await?;
+
+        handle = store
+            .get_stream_job_bridge_handle_by_handle_id(&handle.handle_id)
+            .await?
+            .context("stream job bridge handle should still exist")?;
+        assert_eq!(handle.stream_owner_epoch, Some(5));
+
+        let terminal = test_event(
+            &identity,
+            WorkflowEvent::StreamJobCompleted {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                output: json!({"score": 0.97}),
+                stream_owner_epoch: Some(4),
+            },
+            Utc::now(),
+        );
+        handle_stream_job_terminal_event(&app_state, terminal).await?;
+
+        let waiting = store
+            .get_instance("tenant", "instance-stream-terminal-stale")
+            .await?
+            .context("stream job instance should still exist")?;
+        assert_eq!(waiting.current_state.as_deref(), Some("await_terminal"));
+        assert_ne!(waiting.status, WorkflowStatus::Completed);
+
+        let stored_handle = store
+            .get_stream_job_bridge_handle_by_handle_id(&handle.handle_id)
+            .await?
+            .context("stream job bridge handle should still exist")?;
+        assert_eq!(
+            stored_handle.parsed_status(),
+            Some(fabrik_throughput::StreamJobBridgeHandleStatus::Running)
+        );
+        assert_eq!(stored_handle.stream_owner_epoch, Some(5));
+        assert_eq!(stored_handle.terminal_at, None);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_stream_job_terminal_callback_after_acceptance_is_noop() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = stream_job_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-stream-job-terminal-duplicate-{}", Uuid::now_v7()));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-stream-terminal-duplicate",
+            "run-stream-terminal-duplicate",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({}) },
+            Utc::now(),
+        );
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let handle = store
+            .list_stream_job_bridge_handles_for_run_page(
+                "tenant",
+                "instance-stream-terminal-duplicate",
+                "run-stream-terminal-duplicate",
+                10,
+                0,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job bridge handle should exist")?;
+
+        let checkpoint = test_event(
+            &identity,
+            WorkflowEvent::StreamJobCheckpointReached {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                checkpoint_name: "hourly-rollup-ready".to_owned(),
+                checkpoint_sequence: 7,
+                output: Some(json!({"ready": true})),
+                stream_owner_epoch: Some(5),
+            },
+            Utc::now(),
+        );
+        handle_stream_job_checkpoint_event(&app_state, checkpoint).await?;
+
+        let terminal = test_event(
+            &identity,
+            WorkflowEvent::StreamJobCompleted {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                output: json!({"score": 0.97}),
+                stream_owner_epoch: Some(5),
+            },
+            Utc::now(),
+        );
+        handle_stream_job_terminal_event(&app_state, terminal).await?;
+
+        let accepted_once = store
+            .get_stream_job_bridge_handle_by_handle_id(&handle.handle_id)
+            .await?
+            .context("stream job bridge handle should still exist")?;
+        let first_accepted_at = accepted_once.workflow_accepted_at;
+        assert_eq!(
+            accepted_once.parsed_status(),
+            Some(fabrik_throughput::StreamJobBridgeHandleStatus::Completed)
+        );
+        assert!(first_accepted_at.is_some());
+
+        let duplicate_terminal = test_event(
+            &identity,
+            WorkflowEvent::StreamJobCompleted {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                output: json!({"score": 9.99}),
+                stream_owner_epoch: Some(5),
+            },
+            Utc::now() + ChronoDuration::seconds(1),
+        );
+        handle_stream_job_terminal_event(&app_state, duplicate_terminal).await?;
+
+        let completed = store
+            .get_instance("tenant", "instance-stream-terminal-duplicate")
+            .await?
+            .context("stream job instance should still exist")?;
+        assert_eq!(completed.status, WorkflowStatus::Completed);
+        assert_eq!(
+            completed.output,
+            Some(json!({
+                "checkpoint": { "ready": true },
+                "result": { "score": 0.97 }
+            }))
+        );
+
+        let accepted_twice = store
+            .get_stream_job_bridge_handle_by_handle_id(&handle.handle_id)
+            .await?
+            .context("stream job bridge handle should still exist")?;
+        assert_eq!(
+            accepted_twice.parsed_status(),
+            Some(fabrik_throughput::StreamJobBridgeHandleStatus::Completed)
+        );
+        assert_eq!(accepted_twice.workflow_accepted_at, first_accepted_at);
+        assert_eq!(accepted_twice.terminal_output, Some(json!({"score": 0.97})));
 
         fs::remove_dir_all(state_dir).ok();
         Ok(())

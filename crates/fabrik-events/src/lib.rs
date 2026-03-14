@@ -211,6 +211,32 @@ pub enum WorkflowEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<String>,
     },
+    StreamJobScheduled {
+        job_id: String,
+        job_name: String,
+        input: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        config: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<String>,
+    },
+    StreamJobCancellationRequested {
+        job_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<String>,
+    },
+    StreamJobQueryRequested {
+        job_id: String,
+        query_id: String,
+        query_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args: Option<Value>,
+        consistency: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        state: Option<String>,
+    },
     BulkActivityBatchCompleted {
         batch_id: String,
         total_items: u32,
@@ -242,6 +268,55 @@ pub enum WorkflowEvent {
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reducer_output: Option<Value>,
+    },
+    StreamJobCheckpointReached {
+        job_id: String,
+        handle_id: String,
+        checkpoint_name: String,
+        checkpoint_sequence: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_owner_epoch: Option<u64>,
+    },
+    StreamJobCompleted {
+        job_id: String,
+        handle_id: String,
+        output: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_owner_epoch: Option<u64>,
+    },
+    StreamJobFailed {
+        job_id: String,
+        handle_id: String,
+        error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_owner_epoch: Option<u64>,
+    },
+    StreamJobCancelled {
+        job_id: String,
+        handle_id: String,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_owner_epoch: Option<u64>,
+    },
+    StreamJobQueryCompleted {
+        job_id: String,
+        handle_id: String,
+        query_id: String,
+        query_name: String,
+        output: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_owner_epoch: Option<u64>,
+    },
+    StreamJobQueryFailed {
+        job_id: String,
+        handle_id: String,
+        query_id: String,
+        query_name: String,
+        error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_owner_epoch: Option<u64>,
     },
     WorkflowContinuedAsNew {
         new_run_id: String,
@@ -375,9 +450,18 @@ impl WorkflowEvent {
             Self::ActivityTaskTimedOut { .. } => "ActivityTaskTimedOut",
             Self::ActivityTaskCancelled { .. } => "ActivityTaskCancelled",
             Self::BulkActivityBatchScheduled { .. } => "BulkActivityBatchScheduled",
+            Self::StreamJobScheduled { .. } => "StreamJobScheduled",
+            Self::StreamJobCancellationRequested { .. } => "StreamJobCancellationRequested",
+            Self::StreamJobQueryRequested { .. } => "StreamJobQueryRequested",
             Self::BulkActivityBatchCompleted { .. } => "BulkActivityBatchCompleted",
             Self::BulkActivityBatchFailed { .. } => "BulkActivityBatchFailed",
             Self::BulkActivityBatchCancelled { .. } => "BulkActivityBatchCancelled",
+            Self::StreamJobCheckpointReached { .. } => "StreamJobCheckpointReached",
+            Self::StreamJobCompleted { .. } => "StreamJobCompleted",
+            Self::StreamJobFailed { .. } => "StreamJobFailed",
+            Self::StreamJobCancelled { .. } => "StreamJobCancelled",
+            Self::StreamJobQueryCompleted { .. } => "StreamJobQueryCompleted",
+            Self::StreamJobQueryFailed { .. } => "StreamJobQueryFailed",
             Self::WorkflowContinuedAsNew { .. } => "WorkflowContinuedAsNew",
             Self::SignalQueued { .. } => "SignalQueued",
             Self::SignalReceived { .. } => "SignalReceived",
@@ -429,6 +513,12 @@ pub fn workflow_turn_routing(payload: &WorkflowEvent) -> WorkflowTurnRouting {
         | WorkflowEvent::BulkActivityBatchCompleted { .. }
         | WorkflowEvent::BulkActivityBatchFailed { .. }
         | WorkflowEvent::BulkActivityBatchCancelled { .. }
+        | WorkflowEvent::StreamJobCheckpointReached { .. }
+        | WorkflowEvent::StreamJobCompleted { .. }
+        | WorkflowEvent::StreamJobFailed { .. }
+        | WorkflowEvent::StreamJobCancelled { .. }
+        | WorkflowEvent::StreamJobQueryCompleted { .. }
+        | WorkflowEvent::StreamJobQueryFailed { .. }
         | WorkflowEvent::ChildWorkflowSignalRequested { .. }
         | WorkflowEvent::ChildWorkflowCancellationRequested { .. }
         | WorkflowEvent::ExternalWorkflowSignalRequested { .. }

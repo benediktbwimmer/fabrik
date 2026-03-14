@@ -337,6 +337,32 @@ test("compiler lowers dynamic ctx.bulkActivity calls into dynamic bulk descripto
   assert.match(serialized, /"activity_capabilities":\{"kind":"object","fields":\{"payloadless_transport":\{"kind":"literal","value":true\}\}\}/);
 });
 
+test("compiler lowers stream job handles, checkpoint waits, and strong queries", async () => {
+  const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/stream-job-workflow.ts");
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "streamJobWorkflow",
+    "--definition-id",
+    "stream-job-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"start_stream_job"/);
+  assert.match(serialized, /"job_name":"keyed-rollup"/);
+  assert.match(serialized, /"type":"wait_for_stream_checkpoint"/);
+  assert.match(serialized, /"checkpoint_name":"initial-rollup-ready"/);
+  assert.match(serialized, /"output_var":"checkpoint"/);
+  assert.match(serialized, /"type":"query_stream_job"/);
+  assert.match(serialized, /"query_name":"accountTotals"/);
+  assert.match(serialized, /"consistency":"strong"/);
+  assert.match(serialized, /"output_var":"account"/);
+});
+
 test("compiler rejects non-static bulk options", async () => {
   const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/invalid-bulk-workflow.ts");
   await assert.rejects(
