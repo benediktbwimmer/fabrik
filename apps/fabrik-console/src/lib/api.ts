@@ -524,6 +524,13 @@ export type TopicAdapterDetailResponse = {
   watch_cursor?: string;
 };
 
+export type TopicAdapterDeleteResponse = {
+  tenant_id: string;
+  adapter_id: string;
+  deleted: boolean;
+  forced: boolean;
+};
+
 export type TopicAdapterPreviewResponse = {
   ok: boolean;
   dispatch: unknown | null;
@@ -985,6 +992,13 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(payload)
     }),
+  deleteTopicAdapter: (tenantId: string, adapterId: string, force = false) =>
+    request<TopicAdapterDeleteResponse>(
+      `/admin/tenants/${tenantId}/topic-adapters/${adapterId}${force ? "?force=true" : ""}`,
+      {
+        method: "DELETE"
+      }
+    ),
   pauseTopicAdapter: (tenantId: string, adapterId: string) =>
     request<TopicAdapter>(`/admin/tenants/${tenantId}/topic-adapters/${adapterId}/pause`, {
       method: "POST",

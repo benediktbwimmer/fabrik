@@ -12,7 +12,8 @@ use fabrik_config::{GrpcServiceConfig, ThroughputPayloadStoreConfig, ThroughputP
 use fabrik_throughput::{
     BENCHMARK_ECHO_ACTIVITY, PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
     benchmark_echo_item_requires_output, can_complete_payloadless_benchmark_chunk, decode_cbor,
-    encode_cbor, execute_benchmark_echo,
+    encode_cbor, execute_benchmark_echo, parse_benchmark_compact_input_meta_from_handle,
+    synthesize_benchmark_echo_items,
 };
 use fabrik_worker_protocol::activity_worker::{
     ActivityTaskCancelledResult, ActivityTaskCompletedResult, ActivityTaskFailedResult,
@@ -1222,6 +1223,17 @@ async fn resolve_bulk_task_items(
     input_handle: Option<&PayloadHandle>,
 ) -> Result<Vec<Value>> {
     if let Some(handle) = input_handle {
+        if task.activity_type == BENCHMARK_ECHO_ACTIVITY {
+            if let Some(meta) = parse_benchmark_compact_input_meta_from_handle(handle) {
+                if meta.payload_size.is_some() {
+                    return Ok(synthesize_benchmark_echo_items(
+                        meta,
+                        task.chunk_index,
+                        task.item_count,
+                    ));
+                }
+            }
+        }
         return payload_store.read_items(handle).await;
     }
     if !task.items_cbor.is_empty() {

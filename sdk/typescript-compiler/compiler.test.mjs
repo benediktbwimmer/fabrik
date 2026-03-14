@@ -891,7 +891,32 @@ test("compiler lowers awaited local async helpers into workflow states", async (
   const serialized = JSON.stringify(artifact.workflow.states);
 
   assert.match(serialized, /"handler":"greet"/);
-  assert.match(serialized, /__helper_name/);
+  assert.match(serialized, /"type":"call_async_helper"/);
+  assert.match(JSON.stringify(artifact.workflow.async_helpers), /"entry_state"/);
+});
+
+test("compiler lowers recursive async helpers and Promise.all helper joins", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-recursive-async-helper-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalRecursiveAsyncHelperWorkflow",
+    "--definition-id",
+    "temporal-recursive-async-helper-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serializedStates = JSON.stringify(artifact.workflow.states);
+  const serializedHelpers = JSON.stringify(artifact.workflow.async_helpers);
+
+  assert.match(serializedStates, /"type":"call_async_helper"/);
+  assert.match(serializedStates, /"type":"return_async_helper"/);
+  assert.match(serializedHelpers, /"execute"/);
 });
 
 test("compiler accepts static top-level proxyActivities option constants", async () => {
@@ -1010,29 +1035,6 @@ test("compiler lowers mapped executeChild Promise.all joins", async () => {
   assert.match(serialized, /"callee":"__builtin_array_append"/);
   assert.match(serialized, /"type":"wait_for_child"/);
   assert.match(serialized, /"property":"length"/);
-});
-
-test("compiler lowers Promise.all over mapped async local helpers", async () => {
-  const fixture = path.join(
-    root,
-    "sdk/typescript-compiler/test-fixtures/temporal-async-helper-promise-all-workflow.ts",
-  );
-  const { stdout } = await runCompiler([
-    "--entry",
-    fixture,
-    "--export",
-    "temporalAsyncHelperPromiseAllWorkflow",
-    "--definition-id",
-    "temporal-async-helper-promise-all-workflow",
-    "--version",
-    "1",
-  ]);
-  const artifact = JSON.parse(stdout);
-  const serialized = JSON.stringify(artifact.workflow.states);
-
-  assert.match(serialized, /"property":"length"/);
-  assert.match(serialized, /__helper_item/);
-  assert.match(serialized, /"type":"wait_for_timer"/);
 });
 
 test("compiler lowers Temporal Promise.all proxy activity maps into fan-out plus barrier", async () => {

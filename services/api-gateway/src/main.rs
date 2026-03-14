@@ -157,6 +157,11 @@ struct TopicAdapterDeadLetterQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct TopicAdapterDeleteQuery {
+    force: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct TopicAdapterPreviewRequest {
     payload: Value,
     #[serde(default)]
@@ -448,7 +453,7 @@ fn build_app(state: AppState, service_name: String) -> Router {
     )
     .route(
         "/admin/tenants/{tenant_id}/topic-adapters/{adapter_id}",
-        get(get_topic_adapter).put(upsert_topic_adapter),
+        get(get_topic_adapter).put(upsert_topic_adapter).delete(delete_topic_adapter),
     )
     .route(
         "/admin/tenants/{tenant_id}/topic-adapters/{adapter_id}/pause",
@@ -1633,6 +1638,82 @@ async fn pause_topic_adapter(
     Ok(Json(serde_json::to_value(record).expect("topic adapter serializes")))
 }
 
+async fn delete_topic_adapter(
+    Path((tenant_id, adapter_id)): Path<(String, String)>,
+    Query(query): Query<TopicAdapterDeleteQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let adapter = state
+        .store
+        .get_topic_adapter(&tenant_id, &adapter_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("topic adapter {adapter_id} not found for tenant {tenant_id}"),
+            )
+        })?;
+    let ownership = state
+        .store
+        .get_topic_adapter_ownership(&tenant_id, &adapter_id)
+        .await
+        .map_err(internal_error)?;
+    let offsets = state
+        .store
+        .load_topic_adapter_offsets(&tenant_id, &adapter_id)
+        .await
+        .map_err(internal_error)?;
+    let lag = topic_adapter_lag_snapshot(&adapter, &offsets).await;
+    let now = Utc::now();
+    let force = query.force.unwrap_or(false);
+    let ownership_active = ownership
+        .as_ref()
+        .is_some_and(|record| record.lease_expires_at > now);
+    let lag_total = lag
+        .get("total_lag_records")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let lag_blocked = lag
+        .get("available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && lag_total > 0;
+    if !force && (ownership_active || lag_blocked) {
+        let mut blockers = Vec::new();
+        if ownership_active {
+            if let Some(record) = &ownership {
+                blockers.push(format!(
+                    "active ownership by {} until {}",
+                    record.owner_id,
+                    record.lease_expires_at.to_rfc3339()
+                ));
+            }
+        }
+        if lag_blocked {
+            blockers.push(format!("broker lag still present ({lag_total})"));
+        }
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "topic adapter {adapter_id} cannot be deleted without force: {}",
+                blockers.join(", ")
+            ),
+        ));
+    }
+    let deleted = state
+        .store
+        .delete_topic_adapter(&tenant_id, &adapter_id)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(json!({
+        "tenant_id": tenant_id,
+        "adapter_id": adapter_id,
+        "deleted": deleted,
+        "forced": force,
+    })))
+}
+
 async fn resume_topic_adapter(
     Path((tenant_id, adapter_id)): Path<(String, String)>,
     State(state): State<AppState>,
@@ -2810,6 +2891,7 @@ mod tests {
         assert_eq!(pause_response.status(), StatusCode::OK);
 
         let dead_letters_response = app
+            .clone()
             .oneshot(
                 Request::get("/admin/tenants/tenant-a/topic-adapters/orders/dead-letters")
                     .body(Body::empty())
@@ -2820,6 +2902,44 @@ mod tests {
         let dead_letters_body = to_bytes(dead_letters_response.into_body(), usize::MAX).await?;
         let dead_letters_json: Value = serde_json::from_slice(&dead_letters_body)?;
         assert_eq!(dead_letters_json["items"][0]["record_key"], "order-7");
+
+        store
+            .claim_topic_adapter_ownership("tenant-a", "orders", "ingest-a", StdDuration::from_secs(30))
+            .await?;
+
+        let blocked_delete_response = app
+            .clone()
+            .oneshot(
+                Request::delete("/admin/tenants/tenant-a/topic-adapters/orders")
+                    .body(Body::empty())
+                    .expect("topic adapter guarded delete request"),
+            )
+            .await?;
+        assert_eq!(blocked_delete_response.status(), StatusCode::CONFLICT);
+        let blocked_delete_body = to_bytes(blocked_delete_response.into_body(), usize::MAX).await?;
+        let blocked_delete_text = String::from_utf8(blocked_delete_body.to_vec())?;
+        assert!(blocked_delete_text.contains("cannot be deleted without force"));
+
+        let force_delete_response = app
+            .clone()
+            .oneshot(
+                Request::delete("/admin/tenants/tenant-a/topic-adapters/orders?force=true")
+                    .body(Body::empty())
+                    .expect("topic adapter force delete request"),
+            )
+            .await?;
+        assert_eq!(force_delete_response.status(), StatusCode::OK);
+        let force_delete_body = to_bytes(force_delete_response.into_body(), usize::MAX).await?;
+        let force_delete_json: Value = serde_json::from_slice(&force_delete_body)?;
+        assert_eq!(force_delete_json["deleted"], true);
+        assert_eq!(force_delete_json["forced"], true);
+        assert!(store.get_topic_adapter("tenant-a", "orders").await?.is_none());
+        assert!(store.get_topic_adapter_ownership("tenant-a", "orders").await?.is_none());
+        assert!(store.load_topic_adapter_offsets("tenant-a", "orders").await?.is_empty());
+        assert!(store
+            .list_topic_adapter_dead_letters("tenant-a", "orders", 10, 0)
+            .await?
+            .is_empty());
 
         Ok(())
     }

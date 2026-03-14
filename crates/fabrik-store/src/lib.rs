@@ -6759,6 +6759,64 @@ impl WorkflowStore {
         self.get_topic_adapter(tenant_id, adapter_id).await
     }
 
+    pub async fn delete_topic_adapter(&self, tenant_id: &str, adapter_id: &str) -> Result<bool> {
+        let mut tx =
+            self.pool.begin().await.context("failed to begin topic adapter delete transaction")?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM topic_adapter_dead_letters
+            WHERE tenant_id = $1 AND adapter_id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to delete topic adapter dead letters")?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM topic_adapter_offsets
+            WHERE tenant_id = $1 AND adapter_id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to delete topic adapter offsets")?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM topic_adapter_ownership
+            WHERE tenant_id = $1 AND adapter_id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to delete topic adapter ownership")?;
+
+        let result = sqlx::query(
+            r#"
+            DELETE FROM topic_adapters
+            WHERE tenant_id = $1 AND adapter_id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .execute(&mut *tx)
+        .await
+        .context("failed to delete topic adapter")?;
+
+        tx.commit()
+            .await
+            .context("failed to commit topic adapter delete transaction")?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn claim_topic_adapter_ownership(
         &self,
         tenant_id: &str,
@@ -20818,6 +20876,68 @@ mod tests {
         assert!(updated.last_handoff_at.is_some());
         assert!(updated.last_takeover_latency_ms.is_some());
         assert_eq!(store.load_topic_adapter_offsets("tenant-a", "orders").await?[0].log_offset, 7);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_topic_adapter_removes_owned_state() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+
+        store
+            .upsert_topic_adapter(&TopicAdapterUpsert {
+                tenant_id: "tenant-a".to_owned(),
+                adapter_id: "orders".to_owned(),
+                adapter_kind: TopicAdapterKind::Redpanda,
+                brokers: "127.0.0.1:9092".to_owned(),
+                topic_name: "orders.events".to_owned(),
+                topic_partitions: 1,
+                action: TopicAdapterAction::StartWorkflow,
+                definition_id: Some("order-workflow".to_owned()),
+                signal_type: None,
+                workflow_task_queue: Some("orders".to_owned()),
+                workflow_instance_id_json_pointer: None,
+                payload_json_pointer: Some("/payload".to_owned()),
+                payload_template_json: None,
+                memo_json_pointer: None,
+                memo_template_json: None,
+                search_attributes_json_pointer: None,
+                search_attributes_template_json: None,
+                request_id_json_pointer: None,
+                dedupe_key_json_pointer: None,
+                dead_letter_policy: TopicAdapterDeadLetterPolicy::Store,
+                is_paused: false,
+            })
+            .await?;
+
+        store
+            .claim_topic_adapter_ownership("tenant-a", "orders", "ingest-a", StdDuration::from_secs(30))
+            .await?;
+        store.record_topic_adapter_success("tenant-a", "orders", 0, 5, Utc::now()).await?;
+        store
+            .record_topic_adapter_dead_letter(
+                "tenant-a",
+                "orders",
+                0,
+                6,
+                Some("order-6"),
+                &json!({"bad": true}),
+                "bad payload",
+                Utc::now(),
+            )
+            .await?;
+
+        assert!(store.delete_topic_adapter("tenant-a", "orders").await?);
+        assert!(store.get_topic_adapter("tenant-a", "orders").await?.is_none());
+        assert!(store.get_topic_adapter_ownership("tenant-a", "orders").await?.is_none());
+        assert!(store.load_topic_adapter_offsets("tenant-a", "orders").await?.is_empty());
+        assert!(store
+            .list_topic_adapter_dead_letters("tenant-a", "orders", 10, 0)
+            .await?
+            .is_empty());
 
         Ok(())
     }

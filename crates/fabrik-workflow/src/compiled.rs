@@ -5,9 +5,10 @@ use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_throughput::{
     DEFAULT_AGGREGATION_GROUP_COUNT, PayloadHandle, ThroughputBackend,
-    benchmark_compact_input_handle, bulk_reducer_default_summary_value, bulk_reducer_reduce_values,
+    benchmark_compact_input_handle_with_meta, bulk_reducer_default_summary_value,
+    bulk_reducer_reduce_values,
     bulk_reducer_requires_success_outputs, bulk_reducer_settles as throughput_bulk_reducer_settles,
-    bulk_reducer_summary_field_name, parse_benchmark_compact_input_spec,
+    bulk_reducer_summary_field_name, parse_benchmark_compact_input_meta,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, json};
@@ -56,6 +57,8 @@ pub struct SourceLocation {
 pub struct CompiledWorkflow {
     pub initial_state: String,
     pub states: BTreeMap<String, CompiledStateNode>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub async_helpers: BTreeMap<String, CompiledAsyncHelper>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<CompiledWorkflowParam>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -69,6 +72,15 @@ pub struct CompiledWorkflowParam {
     pub rest: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Expression>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompiledAsyncHelper {
+    pub entry_state: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<CompiledWorkflowParam>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scoped_bindings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -145,6 +157,23 @@ pub enum CompiledStateNode {
         output_var: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         on_error: Option<ErrorTransition>,
+    },
+    CallAsyncHelper {
+        helper_name: String,
+        args: Vec<Expression>,
+        next: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_var: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on_error: Option<ErrorTransition>,
+    },
+    ReturnAsyncHelper {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<Expression>,
+    },
+    RaiseAsyncHelper {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<Expression>,
     },
     StartStepHandle {
         descriptor: Expression,
@@ -447,6 +476,11 @@ pub enum HelperStatement {
         target: String,
         expr: Expression,
     },
+    AssignMember {
+        target: String,
+        path: Vec<String>,
+        expr: Expression,
+    },
     AssignIndex {
         target: String,
         index: Expression,
@@ -486,6 +520,8 @@ pub struct ArtifactExecutionState {
     pub pending_workflow_cancellation: Option<String>,
     #[serde(default)]
     pub condition_timers: BTreeSet<String>,
+    #[serde(default)]
+    pub async_frames: Vec<AsyncHelperFrame>,
     #[serde(skip)]
     pub turn_context: Option<ExecutionTurnContext>,
     #[serde(skip)]
@@ -494,6 +530,19 @@ pub struct ArtifactExecutionState {
     pub pending_version_markers: Vec<(String, u32)>,
     #[serde(skip)]
     pub pending_search_attribute_updates: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AsyncHelperFrame {
+    pub return_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_var: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_error: Option<ErrorTransition>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub scoped_bindings: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_bindings: Vec<String>,
 }
 
 impl ArtifactExecutionState {
@@ -2333,6 +2382,110 @@ impl CompiledWorkflowArtifact {
                         output,
                     });
                 }
+                CompiledStateNode::CallAsyncHelper {
+                    helper_name,
+                    args,
+                    next,
+                    output_var,
+                    on_error,
+                } => {
+                    let helper = self
+                        .workflow
+                        .async_helpers
+                        .get(helper_name)
+                        .ok_or_else(|| CompiledWorkflowError::UnknownState(helper_name.clone()))?;
+                    let mut saved = BTreeMap::new();
+                    let mut missing = Vec::new();
+                    for binding in &helper.scoped_bindings {
+                        if let Some(value) = execution_state.bindings.get(binding).cloned() {
+                            saved.insert(binding.clone(), value);
+                        } else {
+                            missing.push(binding.clone());
+                        }
+                    }
+                    let evaluated_args = args
+                        .iter()
+                        .map(|expr| evaluate_expression(expr, &mut execution_state, &self.helpers))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    for (index, param) in helper.params.iter().enumerate() {
+                        let value = if let Some(provided) = evaluated_args.get(index) {
+                            provided.clone()
+                        } else if let Some(default) = &param.default {
+                            evaluate_expression(default, &mut execution_state, &self.helpers)?
+                        } else {
+                            Value::Null
+                        };
+                        execution_state.bindings.insert(param.name.clone(), value);
+                    }
+                    execution_state.async_frames.push(AsyncHelperFrame {
+                        return_state: next.clone(),
+                        output_var: output_var.clone(),
+                        on_error: on_error.clone(),
+                        scoped_bindings: saved,
+                        missing_bindings: missing,
+                    });
+                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+                    current_state = helper.entry_state.clone();
+                }
+                CompiledStateNode::ReturnAsyncHelper { output: expression } => {
+                    let value = expression
+                        .as_ref()
+                        .map(|expression| {
+                            evaluate_expression(expression, &mut execution_state, &self.helpers)
+                        })
+                        .transpose()?
+                        .unwrap_or(Value::Null);
+                    let frame = execution_state
+                        .async_frames
+                        .pop()
+                        .ok_or_else(|| CompiledWorkflowError::UnknownState(current_state.clone()))?;
+                    restore_async_helper_bindings(&mut execution_state, frame.scoped_bindings, frame.missing_bindings);
+                    if let Some(output_var) = frame.output_var {
+                        execution_state.bindings.insert(output_var, value);
+                    }
+                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+                    current_state = frame.return_state;
+                }
+                CompiledStateNode::RaiseAsyncHelper { reason } => {
+                    let reason = reason
+                        .as_ref()
+                        .map(|expression| {
+                            evaluate_expression(expression, &mut execution_state, &self.helpers)
+                        })
+                        .transpose()?
+                        .and_then(|value| stringify_value(&value))
+                        .unwrap_or_else(|| format!("async helper failed in state {current_state}"));
+                    let frame = execution_state
+                        .async_frames
+                        .pop()
+                        .ok_or_else(|| CompiledWorkflowError::UnknownState(current_state.clone()))?;
+                    restore_async_helper_bindings(&mut execution_state, frame.scoped_bindings, frame.missing_bindings);
+                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+                    if let Some(on_error) = frame.on_error {
+                        if let Some(error_var) = on_error.error_var {
+                            execution_state
+                                .bindings
+                                .insert(error_var, Value::String(reason));
+                        }
+                        current_state = on_error.next;
+                    } else {
+                        output = Some(Value::String(reason.clone()));
+                        context = Some(Value::String(reason.clone()));
+                        execution_state.active_signal = None;
+                        emissions.push(ExecutionEmission {
+                            event: WorkflowEvent::WorkflowFailed { reason },
+                            state: Some(current_state.clone()),
+                        });
+                        return Ok(CompiledExecutionPlan {
+                            workflow_version: self.definition_version,
+                            final_state: current_state,
+                            emissions,
+                            execution_state,
+                            context,
+                            output,
+                        });
+                    }
+                }
                 CompiledStateNode::StartStepHandle {
                     descriptor,
                     handle_var,
@@ -2567,15 +2720,17 @@ impl CompiledWorkflowArtifact {
                     let (items, total_items, input_handle, compact_context) = if throughput_backend
                         == ThroughputBackend::StreamV2.as_str()
                     {
-                        if let Some(total_items) =
-                            parse_benchmark_compact_input_spec(&evaluated_items)
+                        if let Some(compact_meta) =
+                            parse_benchmark_compact_input_meta(&evaluated_items)
                         {
                             (
                                 Vec::new(),
-                                total_items,
-                                serde_json::to_value(benchmark_compact_input_handle(
+                                compact_meta.total_items,
+                                serde_json::to_value(benchmark_compact_input_handle_with_meta(
                                     &batch_id,
-                                    total_items,
+                                    compact_meta.total_items,
+                                    compact_meta.payload_size,
+                                    Some(chunk_size),
                                 ))
                                 .expect("compact benchmark input handle serializes"),
                                 Some(evaluated_items.clone()),
@@ -3247,6 +3402,9 @@ impl CompiledStateNode {
                 .map(String::as_str)
                 .chain(on_error.iter().map(|transition| transition.next.as_str()))
                 .collect(),
+            Self::CallAsyncHelper { next, on_error, .. } => std::iter::once(next.as_str())
+                .chain(on_error.iter().map(|transition| transition.next.as_str()))
+                .collect(),
             Self::StartStepHandle { next, .. } => vec![next.as_str()],
             Self::FanOut { next, .. } => vec![next.as_str()],
             Self::StartBulkActivity { next, .. } => vec![next.as_str()],
@@ -3268,7 +3426,11 @@ impl CompiledStateNode {
             Self::WaitForCondition { next, timeout_next, .. } => std::iter::once(next.as_str())
                 .chain(timeout_next.iter().map(String::as_str))
                 .collect(),
-            Self::Succeed { .. } | Self::Fail { .. } | Self::ContinueAsNew { .. } => Vec::new(),
+            Self::ReturnAsyncHelper { .. }
+            | Self::RaiseAsyncHelper { .. }
+            | Self::Succeed { .. }
+            | Self::Fail { .. }
+            | Self::ContinueAsNew { .. } => Vec::new(),
         }
     }
 }
@@ -4917,6 +5079,12 @@ fn execute_helper_statements(
                 let value = evaluate_expression(expr, execution_state, helpers)?;
                 apply_assignment_value(target, value, execution_state);
             }
+            HelperStatement::AssignMember { target, path, expr } => {
+                let current = execution_state.bindings.get(target).cloned().unwrap_or(Value::Null);
+                let value = evaluate_expression(expr, execution_state, helpers)?;
+                let updated = assign_member_path_value(current, path, value);
+                execution_state.bindings.insert(target.clone(), updated);
+            }
             HelperStatement::AssignIndex { target, index, expr } => {
                 let current = execution_state.bindings.get(target).cloned().unwrap_or(Value::Null);
                 let index = evaluate_expression(index, execution_state, helpers)?;
@@ -4955,6 +5123,25 @@ fn execute_helper_statements(
     Ok(())
 }
 
+fn assign_member_path_value(current: Value, path: &[String], value: Value) -> Value {
+    if path.is_empty() {
+        return value;
+    }
+    let mut map = match current {
+        Value::Object(existing) => existing,
+        _ => serde_json::Map::new(),
+    };
+    let key = path[0].clone();
+    let next = map.remove(&key).unwrap_or(Value::Null);
+    let updated = if path.len() == 1 {
+        value
+    } else {
+        assign_member_path_value(next, &path[1..], value)
+    };
+    map.insert(key, updated);
+    Value::Object(map)
+}
+
 fn apply_assignment_value(
     target: &str,
     value: Value,
@@ -4966,6 +5153,19 @@ fn apply_assignment_value(
         return;
     }
     execution_state.bindings.insert(target.to_owned(), value);
+}
+
+fn restore_async_helper_bindings(
+    execution_state: &mut ArtifactExecutionState,
+    scoped_bindings: BTreeMap<String, Value>,
+    missing_bindings: Vec<String>,
+) {
+    for (name, value) in scoped_bindings {
+        execution_state.bindings.insert(name, value);
+    }
+    for name in missing_bindings {
+        execution_state.bindings.remove(&name);
+    }
 }
 
 fn assign_index_value(current: Value, index: Value, value: Value) -> Value {

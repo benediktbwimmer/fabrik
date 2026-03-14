@@ -37,7 +37,8 @@ use fabrik_throughput::{
     StartThroughputRunCommand, ThroughputBackend, ThroughputCommand, ThroughputCommandEnvelope,
     bulk_reducer_class, bulk_reducer_is_mergeable, bulk_reducer_materializes_results,
     can_use_payloadless_benchmark_transport, decode_cbor, encode_cbor,
-    parse_benchmark_compact_total_items_from_handle, planned_reduction_tree_depth,
+    parse_benchmark_compact_input_meta_from_handle, parse_benchmark_compact_total_items_from_handle,
+    planned_reduction_tree_depth,
     stream_v2_fast_lane_enabled, throughput_partition_key,
 };
 use fabrik_worker_protocol::activity_worker::{
@@ -4607,12 +4608,17 @@ async fn materialize_bulk_batches_from_plan(
             state: workflow_state.clone(),
         };
         if native_stream_v2 {
+            let compact_benchmark_input = parse_benchmark_compact_input_meta_from_handle(
+                &scheduled_input_handle,
+            )
+            .is_some_and(|meta| meta.payload_size.is_some());
             let native_input_handle = if can_use_payloadless_benchmark_transport(
                 activity_type,
                 reducer.as_deref(),
                 *max_attempts,
                 items,
-            ) {
+            ) || compact_benchmark_input
+            {
                 scheduled_input_handle.clone()
             } else {
                 state

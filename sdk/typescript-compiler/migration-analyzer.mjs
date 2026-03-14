@@ -26,6 +26,7 @@ const WORKFLOW_SUPPORTED_IMPORTS = new Set([
   "proxySinks",
   "SearchAttributes",
   "Sinks",
+  "WorkflowInterceptors",
   "deprecatePatch",
   "setWorkflowOptions",
   "setHandler",
@@ -58,7 +59,6 @@ const WORKER_BLOCKING_PROPERTIES = new Map([
   ["payloadCodec", "custom payload codecs are not supported by the migration pipeline"],
   ["payloadConverterPath", "custom payload converters are not supported by the migration pipeline"],
   ["codecServer", "codec servers are not supported by the migration pipeline"],
-  ["interceptors", "worker interceptors are not migration-ready yet"],
   ["workflowInterceptorModules", "workflow interceptors are not migration-ready yet"],
 ]);
 
@@ -846,6 +846,22 @@ function analyzeActivitiesRegistration(sourceFile, activitiesProperty, currentBi
   return { supported: false };
 }
 
+function supportsStaticWorkflowInterceptors(interceptorsProperty, currentBindings, checker) {
+  if (!ts.isPropertyAssignment(interceptorsProperty)) {
+    return false;
+  }
+  const resolved = resolveStaticExpression(interceptorsProperty.initializer, currentBindings, checker);
+  if (!ts.isObjectLiteralExpression(resolved)) {
+    return false;
+  }
+  const workflowModules = findObjectProperty(resolved, "workflowModules");
+  if (workflowModules == null || !ts.isPropertyAssignment(workflowModules)) {
+    return false;
+  }
+  const rendered = staticBootstrapArgExpression(workflowModules.initializer, currentBindings, checker);
+  return rendered != null;
+}
+
 function resolveProjectModulePath(projectRoot, fromFileName, specifier) {
   const compilerOptions = parseCompilerOptionsForFile(projectRoot, fromFileName);
   const resolved = ts.resolveModuleName(specifier, fromFileName, compilerOptions, ts.sys).resolvedModule;
@@ -1472,6 +1488,13 @@ async function main() {
           for (const [propertyName, remediation] of WORKER_BLOCKING_PROPERTIES.entries()) {
             const property = findObjectProperty(firstArg, propertyName);
             if (property) {
+              if (
+                propertyName === "interceptors" &&
+                supportsStaticWorkflowInterceptors(property, currentBindings, checker)
+              ) {
+                fileUses.add("interceptors_middleware");
+                continue;
+              }
               findings.push(
                 createFinding(
                   projectRoot,

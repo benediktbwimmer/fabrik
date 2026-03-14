@@ -42,7 +42,8 @@ use fabrik_throughput::{
     can_complete_payloadless_benchmark_chunk, can_use_payloadless_benchmark_transport,
     decode_cbor, effective_aggregation_group_count, encode_cbor, execute_benchmark_echo,
     group_id_for_chunk_index,
-    parse_benchmark_compact_total_items_from_handle, planned_reduction_tree_depth,
+    parse_benchmark_compact_input_meta_from_handle, parse_benchmark_compact_total_items_from_handle,
+    planned_reduction_tree_depth, synthesize_benchmark_echo_items,
     stream_v2_fast_lane_enabled, throughput_execution_mode, throughput_partition_key,
     throughput_reducer_execution_path, throughput_reducer_version, throughput_routing_reason,
 };
@@ -1737,6 +1738,17 @@ async fn resolve_local_benchmark_chunk_items(
     }
     let handle = serde_json::from_value::<PayloadHandle>(chunk.input_handle.clone())
         .context("failed to decode local benchmark chunk input handle")?;
+    if chunk.activity_type == BENCHMARK_ECHO_ACTIVITY {
+        if let Some(meta) = parse_benchmark_compact_input_meta_from_handle(&handle) {
+            if meta.payload_size.is_some() {
+                return Ok(synthesize_benchmark_echo_items(
+                    meta,
+                    chunk.chunk_index,
+                    chunk.item_count,
+                ));
+            }
+        }
+    }
     state
         .payload_store
         .read_items(&handle)
@@ -2532,6 +2544,18 @@ async fn build_stream_projection_records_from_parts(
     .await?;
     let payloadless_chunk_transport =
         can_use_payloadless_benchmark_transport(activity_type, reducer, max_attempts, &items);
+    let uses_compact_chunk_input_handle =
+        !materialize_inline_chunk_items
+            && !payloadless_chunk_transport
+            && parse_benchmark_compact_total_items_from_handle(&batch_input_handle).is_some();
+    let compact_chunk_input_handle = if uses_compact_chunk_input_handle {
+        Some(
+            serde_json::to_value(&batch_input_handle)
+                .context("failed to serialize compact stream-v2 chunk input handle")?,
+        )
+    } else {
+        None
+    };
     let batch = fabrik_store::WorkflowBulkBatchRecord {
         tenant_id: tenant_id.to_owned(),
         instance_id: instance_id.to_owned(),
@@ -2581,10 +2605,14 @@ async fn build_stream_projection_records_from_parts(
         terminal_at: None,
         updated_at: occurred_at,
     };
-    let payload_key = (!materialize_inline_chunk_items && !payloadless_chunk_transport)
+    let payload_key = (!materialize_inline_chunk_items
+        && !payloadless_chunk_transport
+        && !uses_compact_chunk_input_handle)
         .then(|| payload_handle_key(&batch_input_handle).map(str::to_owned))
         .transpose()?;
-    let payload_store = (!materialize_inline_chunk_items && !payloadless_chunk_transport)
+    let payload_store = (!materialize_inline_chunk_items
+        && !payloadless_chunk_transport
+        && !uses_compact_chunk_input_handle)
         .then(|| payload_handle_store(&batch_input_handle).map(str::to_owned))
         .transpose()?;
     let mut chunks = Vec::with_capacity(usize::try_from(chunk_count).unwrap_or_default());
@@ -2594,13 +2622,15 @@ async fn build_stream_projection_records_from_parts(
         let group_id = group_id_for_chunk_index(chunk_index, effective_group_count);
         let chunk_start = chunk_index_usize.saturating_mul(chunk_size_usize);
         let item_count = total_items.saturating_sub(chunk_start).min(chunk_size_usize);
-        let chunk_items = if payloadless_chunk_transport {
+        let chunk_items = if payloadless_chunk_transport || !materialize_inline_chunk_items {
             &[][..]
         } else {
             &items[chunk_start..chunk_start + item_count]
         };
         let input_handle = if materialize_inline_chunk_items || payloadless_chunk_transport {
             Value::Null
+        } else if let Some(handle) = compact_chunk_input_handle.as_ref() {
+            handle.clone()
         } else {
             serde_json::to_value(PayloadHandle::ManifestSlice {
                 key: payload_key.clone().expect("stream batch payload key available"),
@@ -2747,6 +2777,7 @@ async fn load_native_stream_run_items(
     command: &StartThroughputRunCommand,
 ) -> Result<Vec<Value>> {
     match &command.input_handle {
+        handle if parse_benchmark_compact_total_items_from_handle(handle).is_some() => Ok(Vec::new()),
         PayloadHandle::Manifest { .. } | PayloadHandle::ManifestSlice { .. } => {
             state.payload_store.read_items(&command.input_handle).await.with_context(|| {
                 format!(
@@ -2772,9 +2803,6 @@ async fn load_native_stream_run_items(
                     )
                 })?;
             Ok(input.items)
-        }
-        handle if parse_benchmark_compact_total_items_from_handle(handle).is_some() => {
-            Ok(Vec::new())
         }
         PayloadHandle::Inline { key } => {
             anyhow::bail!("unsupported native stream-v2 inline input handle key {key}")
@@ -2818,7 +2846,7 @@ async fn build_stream_projection_records_from_start_command(
         &command.routing_reason,
         &command.admission_policy_version,
         occurred_at,
-        true,
+        !compact_count_only_input,
     )
     .await
 }

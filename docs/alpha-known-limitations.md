@@ -6,8 +6,9 @@ This document lists the highest-signal limitations for the current design-partne
 
 - Search attributes and memo are only supported in the alpha slice for static start-time values, the narrow compiled `upsertSearchAttributes(...)` subset, and exact-match visibility filters.
 - Static-evaluable start-time memo/search-attribute shapes are supported, but broader dynamic runtime-shaped visibility writes are still blocked.
-- Payload/data converter support is limited to static default-compatible `dataConverter` declarations and static `payloadConverterPath` modules that export a named `payloadConverter`; custom payload codecs, codec-bearing `dataConverter` objects, and codec servers are still blocked.
-- Interceptors and middleware are still blocked.
+- Payload/data converter support is limited to static default-compatible `dataConverter` declarations, static zero-argument `dataConverter` factory helpers, and static `payloadConverterPath` modules that export a named `payloadConverter`; codec servers and full transport parity are still out of scope.
+- Interceptors and middleware are only supported through a narrow static `interceptors.workflowModules` bridge; runtime interceptor behavior is still caveated and not trust-backed parity.
+- Arbitrary external async SDK execution inside workflow code is still out of scope for the current Temporal replacement claim.
 - Dynamic `Worker.create(...)` bootstraps are still blocked.
 - Unsupported Temporal workflow APIs remain blocked until they are explicitly implemented and trusted.
 - The migration path targets the compiled Temporal TypeScript subset, not the full Temporal SDK surface.

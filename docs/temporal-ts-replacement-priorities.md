@@ -11,20 +11,20 @@ Current source snapshot:
 ## Current State
 
 - Samples analyzed: `48`
-- Qualified with caveats: `44`
-- Blocked: `4`
+- Qualified with caveats: `47`
+- Blocked: `1`
 - Status counts:
-  - `compatible_ready_not_deployed`: `44`
-  - `incompatible_blocked`: `4`
+  - `compatible_ready_not_deployed`: `47`
+  - `incompatible_blocked`: `1`
 
 ## What Moved
 
 The latest compiler, runtime, and packaging passes materially shifted the remaining replacement frontier:
 
-- `unsupported_api` blocker occurrences dropped from `51` to `8`
+- `unsupported_api` blocker occurrences dropped from `51` to `3`
 - `unsupported_temporal_api` hard blocks dropped from `34` to `4`
 - `unsupported_packaging_bootstrap` blocker occurrences dropped from `72` to `1`
-- qualified official samples rose from `4` to `43`
+- qualified official samples rose from `4` to `47`
 - `log`, `workflowInfo`, `uuid4`, `ApplicationFailure`, `ActivityFailure`, `ParentClosePolicy`, `ActivityCancellationType`, `patched`, `deprecatePatch`, `setWorkflowOptions`, `SearchAttributes`, and `upsertSearchAttributes` are no longer explicit hard-block imports in the official sample frontier
 - workflow-only workers no longer falsely block packaging, which moved `continue-as-new`, `nexus-hello`, and several other sample repos into the qualified set
 - `batch-sliding-window`, `child-workflows`, `cron-workflows`, `patching-api`, `saga`, `search-attributes`, and `worker-versioning` now compile cleanly in the refreshed official census
@@ -45,80 +45,66 @@ The latest compiler, runtime, and packaging passes materially shifted the remain
 - `eager-workflow-start` now qualifies after `proxyLocalActivities` moved onto the same supported proxy-activity path as `proxyActivities`
 - `ejson` and `protobufs` now qualify after static `payloadConverterPath` modules broadened from the default-compatible-only slice to a packageable static path-based adapter slice
 - `sinks` now qualifies after `proxySinks()` declarations and fire-and-forget sink calls moved onto a caveated no-op migration bridge and worker `sinks` configuration stopped hard-blocking packaging
+- `encryption` now qualifies after static zero-argument `dataConverter` factory helpers moved into the supported packaging adapter slice
+- `query-subscriptions` now qualifies after static workflow-module interceptor bootstraps moved onto the caveated packaging path and helper-side interceptor scaffolding (`setHandler`, `enablePatches`, `Object.defineProperty`) stopped hard-blocking compilation
+- `dsl-interpreter` now qualifies after adding persisted async-helper call frames plus a sequential helper-join lowering for recursive `Promise.all(map(asyncHelper(...)))` patterns; this is explicitly a caveated adapter path, not trust-backed helper-level parallel semantics
 - The remaining explicit unsupported-import census is now dominated by:
   - `WorkflowInterceptors`: `1`
   - `Sinks`: `1`
   - `proxySinks`: `1`
 
 This means broad import coverage is no longer the main hard-blocker class. The next replacement bottlenecks are:
-- sinks/interceptor-specific parity
-- broader payload/codec parity
-- a very small set of still-unfinished worker-bootstrap edge cases
-- payload/codec and interceptor-specific parity gaps
+- external non-Temporal async SDK execution inside workflow code
+- trust-bounded caveat cleanup around the adapter-backed interceptor/sink slice
+- deciding whether the remaining `dsl-interpreter` caveat is acceptable or worth upgrading into full trust-backed helper-parallel semantics
 
 ## Priority Order
 
 1. Unsupported Temporal workflow/runtime APIs
-- Hard-block findings: `4`
-- Affected samples: `4`
-- Blocker-category occurrences: `8`
-- The explicit import backlog is now narrow. The bigger problem inside this category is no longer generic syntax; it is the dedicated interceptor/sink surface and one remaining recursive orchestration compiler gap.
+- Hard-block findings: `1`
+- Affected samples: `1`
+- Blocker-category occurrences: `3`
+- The explicit import backlog is now narrow. The bigger problem inside this category is no longer generic syntax; it is one out-of-thesis external SDK workflow pattern plus one remaining trust caveat around recursive helper joins.
 - Remaining frontier:
-  - interceptor shapes: `WorkflowInterceptors`
-  - recursive orchestration compile gap in `dsl-interpreter`
   - broader external-library async orchestration in `ai-sdk`
-- Recommendation: focus this category on `dsl-interpreter`, `query-subscriptions`, and `ai-sdk` rather than generic workflow syntax.
+- Recommendation: treat `ai-sdk` as a separate product decision because it embeds non-Temporal AI SDK execution directly in workflow code.
 
-2. Broader payload/data-converter parity
-- Hard-block findings: `2`
-- Affected samples: `1`
-- Main sample: `encryption`
-- Current alpha support covers the default-compatible subset plus static `payloadConverterPath` modules that can be packaged into worker bootstrap artifacts. Codec-bearing async `dataConverter` objects are still blocked.
-- Recommendation: scope the next payload slice specifically around static `payloadCodecs` / codec-loader support if `encryption` is worth the added trust surface.
+2. Recursive async helper trust upgrade
+- Hard-block findings: `0`
+- Affected samples: `0`
+- Qualified sample with caveat: `dsl-interpreter`
+- Current support uses persisted async-helper call frames and a sequential helper-join lowering for recursive `Promise.all(map(asyncHelper(...)))` patterns. That is enough for migration/package qualification, but it is not yet trust-backed helper-parallel equivalence.
+- Recommendation: only upgrade this further if a real repo needs trusted helper-level parallel semantics.
 
-3. Remaining worker bootstrap edge cases
+3. External SDK execution inside workflows
 - Hard-block findings: `1`
 - Affected samples: `1`
-- Blocker-category occurrences: `1`
-- The broad static-evaluation and packaging passes removed most of this class, but a few shapes remain.
-- Remaining hotspots:
-  - activity registration factories that require runtime dependencies
-  - bootstrap wrapped in runtime helper calls
-- Recommendation: only implement the next slice if it unblocks a real repo or a high-value official sample cluster.
+- Remaining sample: `ai-sdk`
+- The blocking workflows directly `await generateText(...)`, `await mcpClient.tools()`, and other external AI SDK orchestration inside workflow code. That is not a normal Temporal replacement target unless Fabrik chooses to support arbitrary external async SDK execution inside workflows.
+- Recommendation: treat this as a thesis decision, not a routine parity slice.
 
-4. Visibility/search expansion
-- Hard-block findings: `2`
-- Affected sample: none in the latest direct checks; `search-attributes` now qualifies outside the last full census snapshot
-- Current alpha slice supports static start-time memo/search plus exact-match filtering, plus workflow-side `upsertSearchAttributes` within the compiler subset.
-- Recommendation: expand only if a target repo needs richer query or update-time search semantics beyond the current alpha slice.
-
-5. Interceptors and middleware
-- Hard-block findings: `1`
-- Affected sample: `query-subscriptions`
-- Recommendation: leave blocked until a real repo makes this urgent or until the unsupported API backlog has materially shrunk.
-
-6. Workflow-local state and date subsets
-- Status: landed in direct official-sample checks after the latest census refresh
-- Affected samples moved by this pass:
-  - `state`
-  - `nestjs-exchange-rates`
-- Current frontier: payload/data conversion and a few remaining integration hooks rather than plain local state mutation.
-- Recommendation: keep this area stable and spend time on the remaining blocked sample classes instead.
+4. Caveated adapter cleanup
+- Hard-block findings: `0`
+- Affected samples: `0`
+- Payload/data-converter and interceptor/sink slices now qualify in the official sample set, but some of them are still caveated adapter paths rather than trust-backed parity.
+- Recommendation: keep these slices stable, add trust evidence only when a real repo requires it, and avoid reopening them while the last blocked samples remain.
 
 ## Near-Term Execution
 
-1. Burn down the next blocked sample cluster, not generic syntax lists.
-- Best first targets:
-  - `dsl-interpreter`
-  - `query-subscriptions`
-  - `encryption`
-- Success criterion: reduce the remaining blocked sample count below `4` without widening trust debt.
+1. Make an explicit product decision on `ai-sdk`.
+- Either:
+  - keep it blocked as out-of-thesis external SDK execution inside workflow code
+  - or start a separate project for arbitrary external async library execution in workflows
+- Success criterion: stop treating `ai-sdk` as if it were just one more compiler-sugar gap.
 
-2. Re-run the blocker census after every parity slice.
+2. Decide whether to leave `dsl-interpreter` caveated or invest in a trust upgrade.
+- Success criterion: be explicit about whether sequential helper-join semantics are acceptable for the replacement claim.
+
+3. Re-run the blocker census after every parity slice.
 - Use `/Users/bene/code/fabrik/scripts/run-temporal-ts-blocker-census.sh`
 - Treat the official samples repo as a standing external regression set.
 
-3. Keep parity work gated by trust.
+4. Keep parity work gated by trust.
 - Every new supported slice needs:
   - analyzer support
   - CLI packaging or runtime support

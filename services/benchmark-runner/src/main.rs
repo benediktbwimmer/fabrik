@@ -15,7 +15,7 @@ use fabrik_store::{
 };
 use fabrik_throughput::{
     BENCHMARK_ECHO_ACTIVITY, BENCHMARK_FAST_COUNT_ACTIVITY, PG_V1_BACKEND, STREAM_V2_BACKEND,
-    benchmark_compact_input_spec,
+    benchmark_compact_input_spec, benchmark_compact_input_spec_with_payload,
 };
 use fabrik_workflow::{
     ArtifactEntrypoint, Assignment, CompiledStateNode, CompiledWorkflow, CompiledWorkflowArtifact,
@@ -1562,6 +1562,7 @@ fn benchmark_artifact(
                 CompiledWorkflow {
                     initial_state: "init".to_owned(),
                     states,
+                    async_helpers: BTreeMap::new(),
                     params: Vec::new(),
                     non_cancellable_states: Default::default(),
                 },
@@ -1627,6 +1628,7 @@ fn benchmark_artifact(
                 CompiledWorkflow {
                     initial_state: "init".to_owned(),
                     states,
+                    async_helpers: BTreeMap::new(),
                     params: Vec::new(),
                     non_cancellable_states: Default::default(),
                 },
@@ -1750,6 +1752,7 @@ fn benchmark_artifact(
         CompiledWorkflow {
             initial_state,
             states,
+            async_helpers: BTreeMap::new(),
             params: Vec::new(),
             non_cancellable_states: Default::default(),
         },
@@ -1885,6 +1888,7 @@ fn benchmark_child_artifact(definition_id: &str) -> CompiledWorkflowArtifact {
                     output: Some(Expression::Literal { value: json!({ "ok": true }) }),
                 },
             )]),
+            async_helpers: BTreeMap::new(),
             params: Vec::new(),
             non_cancellable_states: Default::default(),
         },
@@ -1906,7 +1910,14 @@ fn benchmark_input(
     let retry_count = ((activities_per_workflow as f64) * retry_rate).round() as usize;
     let cancel_count = ((activities_per_workflow as f64) * cancel_rate).round() as usize;
     let items_value = if should_use_compact_benchmark_input(args, retry_count, cancel_count) {
-        benchmark_compact_input_spec(activities_per_workflow as u32)
+        if args.bulk_reducer == "collect_results" && args.activity_type == BENCHMARK_ECHO_ACTIVITY {
+            benchmark_compact_input_spec_with_payload(
+                activities_per_workflow as u32,
+                payload_size as u32,
+            )
+        } else {
+            benchmark_compact_input_spec(activities_per_workflow as u32)
+        }
     } else if args.activity_type == BENCHMARK_FAST_COUNT_ACTIVITY {
         Value::Array((0..activities_per_workflow).map(|_| Value::from(0)).collect())
     } else {
@@ -1953,7 +1964,7 @@ fn should_use_compact_benchmark_input(
 ) -> bool {
     args.execution_mode == ExecutionMode::Throughput
         && args.throughput_backend.as_deref() == Some(STREAM_V2_BACKEND)
-        && matches!(args.bulk_reducer.as_str(), "count" | "all_settled")
+        && matches!(args.bulk_reducer.as_str(), "count" | "all_settled" | "collect_results")
         && retry_count == 0
         && cancel_count == 0
         && matches!(

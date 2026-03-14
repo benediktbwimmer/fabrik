@@ -199,6 +199,13 @@ pub fn execute_benchmark_echo(attempt: u32, input: &Value) -> Result<Value> {
     Ok(input.clone())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BenchmarkCompactInputMeta {
+    pub total_items: u32,
+    pub payload_size: Option<u32>,
+    pub chunk_size: Option<u32>,
+}
+
 pub fn benchmark_compact_input_spec(total_items: u32) -> Value {
     serde_json::json!({
         "kind": BENCHMARK_COMPACT_INPUT_KIND,
@@ -206,27 +213,106 @@ pub fn benchmark_compact_input_spec(total_items: u32) -> Value {
     })
 }
 
-pub fn parse_benchmark_compact_input_spec(value: &Value) -> Option<u32> {
+pub fn benchmark_compact_input_spec_with_payload(total_items: u32, payload_size: u32) -> Value {
+    serde_json::json!({
+        "kind": BENCHMARK_COMPACT_INPUT_KIND,
+        "count": total_items,
+        "payload_size": payload_size,
+    })
+}
+
+pub fn parse_benchmark_compact_input_meta(value: &Value) -> Option<BenchmarkCompactInputMeta> {
     let object = value.as_object()?;
     if object.get("kind").and_then(Value::as_str) != Some(BENCHMARK_COMPACT_INPUT_KIND) {
         return None;
     }
-    object.get("count").and_then(Value::as_u64).and_then(|count| u32::try_from(count).ok())
+    Some(BenchmarkCompactInputMeta {
+        total_items: object
+            .get("count")
+            .and_then(Value::as_u64)
+            .and_then(|count| u32::try_from(count).ok())?,
+        payload_size: object
+            .get("payload_size")
+            .and_then(Value::as_u64)
+            .and_then(|size| u32::try_from(size).ok()),
+        chunk_size: object
+            .get("chunk_size")
+            .and_then(Value::as_u64)
+            .and_then(|size| u32::try_from(size).ok()),
+    })
+}
+
+pub fn parse_benchmark_compact_input_spec(value: &Value) -> Option<u32> {
+    parse_benchmark_compact_input_meta(value).map(|meta| meta.total_items)
 }
 
 pub fn benchmark_compact_input_handle(batch_id: &str, total_items: u32) -> PayloadHandle {
+    benchmark_compact_input_handle_with_meta(batch_id, total_items, None, None)
+}
+
+pub fn benchmark_compact_input_handle_with_meta(
+    batch_id: &str,
+    total_items: u32,
+    payload_size: Option<u32>,
+    chunk_size: Option<u32>,
+) -> PayloadHandle {
+    let mut key = format!("{BENCHMARK_COMPACT_INPUT_HANDLE_PREFIX}:{batch_id}:{total_items}");
+    if let Some(payload_size) = payload_size {
+        key.push_str(&format!(":p{payload_size}"));
+    }
+    if let Some(chunk_size) = chunk_size {
+        key.push_str(&format!(":c{chunk_size}"));
+    }
     PayloadHandle::Inline {
-        key: format!("{BENCHMARK_COMPACT_INPUT_HANDLE_PREFIX}:{batch_id}:{total_items}"),
+        key,
     }
 }
 
-pub fn parse_benchmark_compact_total_items_from_handle(handle: &PayloadHandle) -> Option<u32> {
+pub fn parse_benchmark_compact_input_meta_from_handle(
+    handle: &PayloadHandle,
+) -> Option<BenchmarkCompactInputMeta> {
     let PayloadHandle::Inline { key } = handle else {
         return None;
     };
-    let prefix = format!("{BENCHMARK_COMPACT_INPUT_HANDLE_PREFIX}:");
-    let suffix = key.strip_prefix(&prefix)?.rsplit(':').next()?;
-    suffix.parse::<u32>().ok()
+    let rest = key.strip_prefix(&format!("{BENCHMARK_COMPACT_INPUT_HANDLE_PREFIX}:"))?;
+    let mut parts = rest.split(':');
+    let _batch_id = parts.next()?;
+    let total_items = parts.next()?.parse::<u32>().ok()?;
+    let mut payload_size = None;
+    let mut chunk_size = None;
+    for part in parts {
+        if let Some(value) = part.strip_prefix('p') {
+            payload_size = value.parse::<u32>().ok();
+        } else if let Some(value) = part.strip_prefix('c') {
+            chunk_size = value.parse::<u32>().ok();
+        }
+    }
+    Some(BenchmarkCompactInputMeta { total_items, payload_size, chunk_size })
+}
+
+pub fn parse_benchmark_compact_total_items_from_handle(handle: &PayloadHandle) -> Option<u32> {
+    parse_benchmark_compact_input_meta_from_handle(handle).map(|meta| meta.total_items)
+}
+
+pub fn synthesize_benchmark_echo_items(
+    meta: BenchmarkCompactInputMeta,
+    chunk_index: u32,
+    item_count: u32,
+) -> Vec<Value> {
+    let chunk_size = meta.chunk_size.unwrap_or(item_count.max(1));
+    let start = usize::try_from(chunk_index).unwrap_or_default()
+        .saturating_mul(usize::try_from(chunk_size).unwrap_or_default().max(1));
+    let payload = "x".repeat(usize::try_from(meta.payload_size.unwrap_or_default()).unwrap_or_default());
+    (0..usize::try_from(item_count).unwrap_or_default())
+        .map(|offset| {
+            serde_json::json!({
+                "index": start.saturating_add(offset),
+                "payload": payload,
+                "fail_until_attempt": 0,
+                "cancel": false,
+            })
+        })
+        .collect()
 }
 
 pub fn bulk_reducer_settles(reducer: Option<&str>) -> bool {

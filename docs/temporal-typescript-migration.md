@@ -38,9 +38,10 @@ Current headline policy:
 
 - `proxyActivities`, signals, queries, updates, conditions, child workflows, cancellation scopes, continue-as-new, and workflow evolution markers are in scope for migration
 - worker bootstraps are adapter-backed only when they are static `Worker.create({ ... })` calls
-- payload/data converter usage is supported for static default-compatible `dataConverter` declarations and static `payloadConverterPath` modules that package a named `payloadConverter`; codec-bearing `dataConverter` objects and codec servers remain blocked
+- payload/data converter usage is supported for static default-compatible `dataConverter` declarations, static zero-argument `dataConverter` factory helpers, and static `payloadConverterPath` modules that package a named `payloadConverter`; codec servers and broader transport parity remain caveated
 - search attributes and memo are supported only for the alpha slice of static start-time values, the narrow compiled `upsertSearchAttributes(...)` subset, and exact-match visibility filters
-- interceptors and middleware are blocked by default
+- interceptors and middleware are supported only through a narrow static `workflowModules` bridge; runtime interceptor behavior is still caveated and not trust-backed parity
+- arbitrary external async SDK execution inside workflow code remains out of scope for the current Temporal replacement claim
 - unsupported Temporal APIs are blocked by default
 
 Feature entries now also carry milestone-facing trust metadata:

@@ -221,23 +221,23 @@
       "semantic_fixtures": false,
       "trust_fixtures": true,
       "upgrade_fixtures": true,
-      "semantic_caveats": ["alpha support covers static default-compatible dataConverter declarations and static payloadConverterPath modules that export payloadConverter; payloadCodecs, codec-bearing dataConverter objects, failureConverterPath, and codec servers remain blocked"],
+      "semantic_caveats": ["alpha support covers static default-compatible dataConverter declarations, static zero-argument dataConverter factory helpers, and static payloadConverterPath modules that export payloadConverter; failureConverterPath, codec servers, and broader transport parity remain caveated"],
       "blocking_severity": "warning"
     },
     {
       "feature": "interceptors_middleware",
       "label": "Interceptors and middleware",
-      "milestone_status": "blocked",
-      "support_level": "blocked",
-      "confidence_class": "blocked",
+      "milestone_status": "supported",
+      "support_level": "adapter",
+      "confidence_class": "supported",
       "replay_validation": false,
       "deploy_validation": false,
       "support_fixtures": true,
       "semantic_fixtures": false,
       "trust_fixtures": false,
       "upgrade_fixtures": false,
-      "semantic_caveats": ["interceptor behavior is not migration-ready yet"],
-      "blocking_severity": "hard_block"
+      "semantic_caveats": ["only static workflowModules interceptor bootstraps and workflow-side interceptor scaffolding are accepted today; interceptor behavior is treated as a caveated migration bridge, not trust-backed parity"],
+      "blocking_severity": "warning"
     },
     {
       "feature": "unsupported_temporal_api",

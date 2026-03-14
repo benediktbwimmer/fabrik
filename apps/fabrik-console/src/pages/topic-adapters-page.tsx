@@ -64,6 +64,7 @@ export function TopicAdaptersPage() {
   const isCreating = selectedAdapterId === NEW_ADAPTER_KEY;
   const watchedAdapterId = selectedAdapterId !== "" && !isCreating ? selectedAdapterId : "";
   const [controlPending, setControlPending] = useState(false);
+  const [deletePending, setDeletePending] = useState(false);
   const [savePending, setSavePending] = useState(false);
   const [previewPending, setPreviewPending] = useState(false);
   const [latestOwnershipTransition, setLatestOwnershipTransition] = useState<OwnershipTransition | null>(null);
@@ -182,6 +183,15 @@ export function TopicAdaptersPage() {
     setSearchParams({ adapter_id: adapterId });
   }
 
+  function cloneSelectedAdapter() {
+    if (!selectedAdapter) return;
+    setDraft(cloneDraftFromAdapter(selectedAdapter));
+    setFormError(null);
+    setPreviewResult(null);
+    setSearchParams({ adapter_id: NEW_ADAPTER_KEY });
+    toast.success("Draft cloned from adapter");
+  }
+
   async function saveDraft() {
     if (tenantId === "") return;
     setSavePending(true);
@@ -257,6 +267,48 @@ export function TopicAdaptersPage() {
     setDraft(sourceDraft ?? createEmptyDraft());
     setFormError(null);
     setPreviewResult(null);
+  }
+
+  async function deleteSelectedAdapter() {
+    if (tenantId === "" || watchedAdapterId === "") return;
+    const warnings: string[] = [];
+    const detail = detailQuery.data;
+    const now = Date.now();
+    if (detail?.ownership && Date.parse(detail.ownership.lease_expires_at) > now) {
+      warnings.push(`active owner ${detail.ownership.owner_id} still holds the lease`);
+    }
+    if (detail?.lag.available && (detail.lag.total_lag_records ?? 0) > 0) {
+      warnings.push(`${formatNumber(detail.lag.total_lag_records ?? 0)} records of broker lag remain`);
+    }
+    const force = warnings.length > 0;
+    const confirmed = window.confirm(
+      force
+        ? `Delete ${watchedAdapterId} with force?\n\n${warnings.join("\n")}\n\nThis removes offsets, dead letters, and ownership state.`
+        : `Delete ${watchedAdapterId}?\n\nThis removes offsets, dead letters, and ownership state.`
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setDeletePending(true);
+    try {
+      await api.deleteTopicAdapter(tenantId, watchedAdapterId, force);
+      client.setQueryData<TopicAdapter[] | undefined>(["topic-adapters", tenantId], (current) =>
+        (current ?? []).filter((adapter) => adapter.adapter_id !== watchedAdapterId)
+      );
+      client.removeQueries({ queryKey: ["topic-adapter", tenantId, watchedAdapterId] });
+      setLatestOwnershipTransition(null);
+      setLiveProcessedRate(null);
+      setPreviewResult(null);
+      setFormError(null);
+      setSearchParams({});
+      toast.success("Adapter deleted");
+    } catch (error) {
+      const message = extractErrorMessage(error);
+      toast.error(message);
+    } finally {
+      setDeletePending(false);
+    }
   }
 
   const canShowDetail = !isCreating && detailQuery.data;
@@ -351,6 +403,20 @@ export function TopicAdaptersPage() {
               <div className="row space-between">
                 <h3>Editor</h3>
                 <div className="row">
+                  {!isCreating && selectedAdapter ? (
+                    <button className="button ghost" disabled={deletePending || savePending} onClick={cloneSelectedAdapter}>
+                      Clone
+                    </button>
+                  ) : null}
+                  {!isCreating && watchedAdapterId !== "" ? (
+                    <button
+                      className="button danger"
+                      disabled={deletePending || savePending}
+                      onClick={() => void deleteSelectedAdapter()}
+                    >
+                      {deletePending ? "Deleting..." : "Delete"}
+                    </button>
+                  ) : null}
                   <button className="button ghost" disabled={savePending} onClick={resetDraft}>
                     Reset
                   </button>
@@ -877,6 +943,14 @@ function draftFromAdapter(adapter: TopicAdapter): AdapterDraft {
     dedupeKeyPointer: adapter.dedupe_key_json_pointer ?? "",
     deadLetterPolicy: adapter.dead_letter_policy,
     isPaused: adapter.is_paused
+  };
+}
+
+function cloneDraftFromAdapter(adapter: TopicAdapter): AdapterDraft {
+  return {
+    ...draftFromAdapter(adapter),
+    adapterId: "",
+    isPaused: false
   };
 }
 

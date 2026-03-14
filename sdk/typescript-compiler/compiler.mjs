@@ -1516,6 +1516,38 @@ function compileHelperStatements(statements) {
         );
         continue;
       }
+      if (
+        (ts.isPostfixUnaryExpression(statement.expression) || ts.isPrefixUnaryExpression(statement.expression)) &&
+        (
+          statement.expression.operator === ts.SyntaxKind.PlusPlusToken ||
+          statement.expression.operator === ts.SyntaxKind.MinusMinusToken
+        )
+      ) {
+        compiled.push(compileHelperUpdateStatement(statement.expression));
+        continue;
+      }
+      if (
+        ts.isCallExpression(statement.expression) &&
+        temporalImportedCallMatches(statement.expression, currentTemporalApi.setHandler, "setHandler", currentTemporalApi)
+      ) {
+        continue;
+      }
+      if (
+        ts.isCallExpression(statement.expression) &&
+        ts.isIdentifier(statement.expression.expression) &&
+        statement.expression.expression.text === "enablePatches"
+      ) {
+        continue;
+      }
+      if (
+        ts.isCallExpression(statement.expression) &&
+        ts.isPropertyAccessExpression(statement.expression.expression) &&
+        ts.isIdentifier(statement.expression.expression.expression) &&
+        statement.expression.expression.expression.text === "Object" &&
+        statement.expression.expression.name.text === "defineProperty"
+      ) {
+        continue;
+      }
       throw compilerError(`unsupported helper expression statement: ${statement.getText()}`, statement);
     }
     if (ts.isForStatement(statement)) {
@@ -1529,6 +1561,16 @@ function compileHelperStatements(statements) {
     throw compilerError(`unsupported helper statement: ${statement.getText()}`, statement);
   }
   return compiled;
+}
+
+function helperMemberPath(expression) {
+  const path = [];
+  let current = expression;
+  while (ts.isPropertyAccessExpression(current)) {
+    path.unshift(current.name.text);
+    current = current.expression;
+  }
+  return ts.isIdentifier(current) ? { target: current.text, path } : null;
 }
 
 function compileHelperIfStatement(statement) {
@@ -1585,7 +1627,56 @@ function compileHelperAssignmentStatement(statement, left, operatorKind, right) 
       expr,
     };
   }
+  const memberPath = helperMemberPath(left);
+  if (memberPath) {
+    const expr =
+      operatorKind === ts.SyntaxKind.EqualsToken
+        ? compileExpression(right)
+        : {
+            kind: "binary",
+            op: "add",
+            left: compileExpression(left),
+            right: compileExpression(right),
+          };
+    return {
+      type: "assign_member",
+      target: memberPath.target,
+      path: memberPath.path,
+      expr,
+    };
+  }
   throw compilerError(`unsupported helper assignment target: ${statement.getText()}`, statement);
+}
+
+function compileHelperUpdateStatement(expression) {
+  const delta = expression.operator === ts.SyntaxKind.PlusPlusToken ? 1 : -1;
+  if (ts.isIdentifier(expression.operand)) {
+    return {
+      type: "assign",
+      target: expression.operand.text,
+      expr: {
+        kind: "binary",
+        op: "add",
+        left: { kind: "identifier", name: expression.operand.text },
+        right: { kind: "literal", value: delta },
+      },
+    };
+  }
+  const memberPath = helperMemberPath(expression.operand);
+  if (memberPath) {
+    return {
+      type: "assign_member",
+      target: memberPath.target,
+      path: memberPath.path,
+      expr: {
+        kind: "binary",
+        op: "add",
+        left: compileExpression(expression.operand),
+        right: { kind: "literal", value: delta },
+      },
+    };
+  }
+  throw compilerError(`unsupported helper update expression: ${expression.getText()}`, expression);
 }
 
 function compileHelperForStatement(statement) {
@@ -1688,6 +1779,21 @@ function collectAsyncHelperBindingNames(declaration) {
   return names;
 }
 
+function compileAsyncHelperParams(parameters) {
+  return (parameters ?? []).map((parameter) => {
+    if (parameter.dotDotDotToken) {
+      throw compilerError(`async helpers do not support rest parameters`, parameter);
+    }
+    if (!ts.isIdentifier(parameter.name)) {
+      throw compilerError(`async helper parameters must be plain identifiers`, parameter.name);
+    }
+    return {
+      name: parameter.name.text,
+      default: parameter.initializer ? compileExpression(parameter.initializer) : null,
+    };
+  });
+}
+
 function shouldRenameIdentifierNode(node) {
   const parent = node.parent;
   if (!parent) {
@@ -1724,255 +1830,6 @@ function ensureAwaitedReturnExpression(expression) {
   )
     ? expression
     : ts.setTextRange(ts.factory.createAwaitExpression(expression), expression);
-}
-
-function cloneAsyncHelperBindingName(name, renames) {
-  if (ts.isIdentifier(name)) {
-    return ts.factory.createIdentifier(renames.get(name.text) ?? name.text);
-  }
-  throw compilerError(`async helper bindings must be plain identifiers`, name);
-}
-
-function cloneAsyncHelperExpression(node, renames) {
-  if (ts.isIdentifier(node)) {
-    return ts.factory.createIdentifier(renames.get(node.text) ?? node.text);
-  }
-  if (
-    ts.isStringLiteral(node) ||
-    ts.isNoSubstitutionTemplateLiteral(node) ||
-    ts.isNumericLiteral(node)
-  ) {
-    return node;
-  }
-  if (
-    node.kind === ts.SyntaxKind.TrueKeyword ||
-    node.kind === ts.SyntaxKind.FalseKeyword ||
-    node.kind === ts.SyntaxKind.NullKeyword ||
-    node.kind === ts.SyntaxKind.ThisKeyword ||
-    node.kind === ts.SyntaxKind.SuperKeyword
-  ) {
-    return node;
-  }
-  if (ts.isAwaitExpression(node)) {
-    return ts.factory.createAwaitExpression(cloneAsyncHelperExpression(node.expression, renames));
-  }
-  if (ts.isCallExpression(node)) {
-    return ts.factory.createCallExpression(
-      cloneAsyncHelperExpression(node.expression, renames),
-      node.typeArguments,
-      node.arguments.map((arg) => cloneAsyncHelperExpression(arg, renames)),
-    );
-  }
-  if (ts.isSpreadElement(node)) {
-    return ts.factory.createSpreadElement(cloneAsyncHelperExpression(node.expression, renames));
-  }
-  if (ts.isPropertyAccessExpression(node)) {
-    return ts.factory.createPropertyAccessExpression(
-      cloneAsyncHelperExpression(node.expression, renames),
-      node.name,
-    );
-  }
-  if (ts.isElementAccessExpression(node)) {
-    return ts.factory.createElementAccessExpression(
-      cloneAsyncHelperExpression(node.expression, renames),
-      cloneAsyncHelperExpression(node.argumentExpression, renames),
-    );
-  }
-  if (ts.isBinaryExpression(node)) {
-    return ts.factory.createBinaryExpression(
-      cloneAsyncHelperExpression(node.left, renames),
-      node.operatorToken.kind,
-      cloneAsyncHelperExpression(node.right, renames),
-    );
-  }
-  if (ts.isPrefixUnaryExpression(node)) {
-    return ts.factory.createPrefixUnaryExpression(
-      node.operator,
-      cloneAsyncHelperExpression(node.operand, renames),
-    );
-  }
-  if (ts.isPostfixUnaryExpression(node)) {
-    return ts.factory.createPostfixUnaryExpression(
-      cloneAsyncHelperExpression(node.operand, renames),
-      node.operator,
-    );
-  }
-  if (ts.isParenthesizedExpression(node)) {
-    return ts.factory.createParenthesizedExpression(
-      cloneAsyncHelperExpression(node.expression, renames),
-    );
-  }
-  if (ts.isArrayLiteralExpression(node)) {
-    return ts.factory.createArrayLiteralExpression(
-      node.elements.map((element) => cloneAsyncHelperExpression(element, renames)),
-      node.multiLine,
-    );
-  }
-  if (ts.isPropertyAssignment(node)) {
-    return ts.factory.createPropertyAssignment(
-      node.name,
-      cloneAsyncHelperExpression(node.initializer, renames),
-    );
-  }
-  if (ts.isShorthandPropertyAssignment(node)) {
-    return ts.factory.createPropertyAssignment(
-      node.name,
-      ts.factory.createIdentifier(renames.get(node.name.text) ?? node.name.text),
-    );
-  }
-  if (ts.isObjectLiteralExpression(node)) {
-    return ts.factory.createObjectLiteralExpression(
-      node.properties.map((property) => cloneAsyncHelperExpression(property, renames)),
-      node.multiLine,
-    );
-  }
-  if (ts.isArrowFunction(node)) {
-    return ts.factory.createArrowFunction(
-      node.modifiers,
-      node.typeParameters,
-      node.parameters.map((parameter) =>
-        ts.factory.createParameterDeclaration(
-          parameter.modifiers,
-          parameter.dotDotDotToken,
-          cloneAsyncHelperBindingName(parameter.name, renames),
-          parameter.questionToken,
-          parameter.type,
-          parameter.initializer ? cloneAsyncHelperExpression(parameter.initializer, renames) : undefined,
-        )
-      ),
-      node.type,
-      node.equalsGreaterThanToken,
-      ts.isBlock(node.body)
-        ? cloneAsyncHelperBlock(node.body, renames)
-        : cloneAsyncHelperExpression(node.body, renames),
-    );
-  }
-  if (ts.isTemplateExpression(node)) {
-    return ts.factory.createTemplateExpression(
-      node.head,
-      node.templateSpans.map((span) =>
-        ts.factory.createTemplateSpan(
-          cloneAsyncHelperExpression(span.expression, renames),
-          span.literal,
-        )
-      ),
-    );
-  }
-  if (ts.isAsExpression(node)) {
-    return ts.factory.createAsExpression(
-      cloneAsyncHelperExpression(node.expression, renames),
-      node.type,
-    );
-  }
-  if (ts.isNonNullExpression(node)) {
-    return ts.factory.createNonNullExpression(cloneAsyncHelperExpression(node.expression, renames));
-  }
-  throw compilerError(`unsupported async helper expression: ${node.getText()}`, node);
-}
-
-function cloneAsyncHelperStatement(statement, renames) {
-  if (ts.isExpressionStatement(statement)) {
-    return ts.factory.createExpressionStatement(
-      cloneAsyncHelperExpression(statement.expression, renames),
-    );
-  }
-  if (ts.isReturnStatement(statement)) {
-    return ts.factory.createReturnStatement(
-      statement.expression
-        ? ensureAwaitedReturnExpression(cloneAsyncHelperExpression(statement.expression, renames))
-        : undefined,
-    );
-  }
-  if (ts.isVariableStatement(statement)) {
-    return ts.factory.createVariableStatement(
-      statement.modifiers,
-      ts.factory.createVariableDeclarationList(
-        statement.declarationList.declarations.map((declaration) =>
-          ts.factory.createVariableDeclaration(
-            cloneAsyncHelperBindingName(declaration.name, renames),
-            declaration.exclamationToken,
-            declaration.type,
-            declaration.initializer
-              ? cloneAsyncHelperExpression(declaration.initializer, renames)
-              : undefined,
-          )
-        ),
-        statement.declarationList.flags,
-      ),
-    );
-  }
-  if (ts.isIfStatement(statement)) {
-    return ts.factory.createIfStatement(
-      cloneAsyncHelperExpression(statement.expression, renames),
-      cloneAsyncHelperStatement(statement.thenStatement, renames),
-      statement.elseStatement
-        ? cloneAsyncHelperStatement(statement.elseStatement, renames)
-        : undefined,
-    );
-  }
-  if (ts.isForOfStatement(statement)) {
-    const initializer = ts.isVariableDeclarationList(statement.initializer)
-      ? ts.factory.createVariableDeclarationList(
-          statement.initializer.declarations.map((declaration) =>
-            ts.factory.createVariableDeclaration(
-              cloneAsyncHelperBindingName(declaration.name, renames),
-              declaration.exclamationToken,
-              declaration.type,
-              declaration.initializer
-                ? cloneAsyncHelperExpression(declaration.initializer, renames)
-                : undefined,
-            )
-          ),
-          statement.initializer.flags,
-        )
-      : cloneAsyncHelperExpression(statement.initializer, renames);
-    return ts.factory.createForOfStatement(
-      statement.awaitModifier,
-      initializer,
-      cloneAsyncHelperExpression(statement.expression, renames),
-      cloneAsyncHelperStatement(statement.statement, renames),
-    );
-  }
-  if (ts.isBlock(statement)) {
-    return cloneAsyncHelperBlock(statement, renames);
-  }
-  throw compilerError(`unsupported async helper statement: ${statement.getText()}`, statement);
-}
-
-function cloneAsyncHelperBlock(block, renames) {
-  return ts.factory.createBlock(
-    block.statements.map((statement) => cloneAsyncHelperStatement(statement, renames)),
-    true,
-  );
-}
-
-function rewriteAsyncHelperSourceText(sourceText, renames) {
-  if (renames.size === 0) {
-    return sourceText;
-  }
-  const scanner = ts.createScanner(ts.ScriptTarget.Latest, true, ts.LanguageVariant.Standard, sourceText);
-  let output = "";
-  let lastPos = 0;
-  let previousToken = ts.SyntaxKind.Unknown;
-  for (let token = scanner.scan(); token !== ts.SyntaxKind.EndOfFileToken; token = scanner.scan()) {
-    const tokenPos = scanner.getTokenPos();
-    const textPos = scanner.getTextPos();
-    output += sourceText.slice(lastPos, tokenPos);
-    let text = sourceText.slice(tokenPos, textPos);
-    if (
-      token === ts.SyntaxKind.Identifier &&
-      renames.has(text) &&
-      previousToken !== ts.SyntaxKind.DotToken &&
-      previousToken !== ts.SyntaxKind.QuestionDotToken
-    ) {
-      text = renames.get(text);
-    }
-    output += text;
-    lastPos = textPos;
-    previousToken = token;
-  }
-  output += sourceText.slice(lastPos);
-  return output;
 }
 
 function extractWrappedAwaitExpression(expression) {
@@ -2022,25 +1879,42 @@ function extractWrappedAwaitExpression(expression) {
 }
 
 function prepareAsyncHelperStatements(declaration, renames) {
-  const helperBodySource =
+  const sourceStatements =
     declaration.body && ts.isBlock(declaration.body)
-      ? declaration.body.statements.map((statement) => statement.getText()).join("\n")
-      : `return await (${declaration.body ? declaration.body.getText() : "undefined"});`;
-  const rewritten = rewriteAsyncHelperSourceText(helperBodySource, renames);
-  const wrapper = ts.createSourceFile(
-    "__async_helper.ts",
-    `async function __helper__() {\n${rewritten}\n}`,
-    ts.ScriptTarget.Latest,
-    true,
-    ts.ScriptKind.TS,
-  );
-  const fn = wrapper.statements.find(
-    (statement) => ts.isFunctionDeclaration(statement) && statement.name?.text === "__helper__",
-  );
-  if (!fn?.body) {
-    throw compilerError(`failed to reparse async helper body`, declaration);
+      ? declaration.body.statements
+      : [
+          ts.setTextRange(
+            ts.factory.createReturnStatement(
+              ensureAwaitedReturnExpression(declaration.body),
+            ),
+            declaration.body ?? declaration,
+          ),
+        ];
+  const transformer = (context) => {
+    const visit = (node) => {
+      if (ts.isReturnStatement(node) && node.expression) {
+        return ts.visitEachChild(
+          ts.setTextRange(
+            ts.factory.createReturnStatement(ensureAwaitedReturnExpression(node.expression)),
+            node,
+          ),
+          visit,
+          context,
+        );
+      }
+      if (ts.isIdentifier(node) && renames.has(node.text) && shouldRenameIdentifierNode(node)) {
+        return ts.setTextRange(ts.factory.createIdentifier(renames.get(node.text)), node);
+      }
+      return ts.visitEachChild(node, visit, context);
+    };
+    return (root) => ts.visitNode(root, visit);
+  };
+  const result = ts.transform(sourceStatements, [transformer]);
+  try {
+    return result.transformed;
+  } finally {
+    result.dispose();
   }
-  return [...fn.body.statements];
 }
 
 function compileAssignmentAction(statement, left, operatorKind, right) {
@@ -3189,6 +3063,8 @@ class WorkflowLowerer {
     this.promiseLikeTimerClasses = sourceFile ? this.discoverPromiseLikeTimerClasses(sourceFile) : new Map();
     this.callbackHelpers = sourceFile ? this.discoverCallbackHelpers(sourceFile) : new Map();
     this.asyncLocalHelpers = sourceFile ? this.discoverAsyncLocalHelpers(sourceFile) : new Map();
+    this.compiledAsyncHelpers = new Map();
+    this.compilingAsyncHelpers = new Set();
     this.discoverHandleDeclarations(workflowDeclaration.body);
   }
 
@@ -3757,6 +3633,54 @@ class WorkflowLowerer {
     return this.asyncLocalHelpers.get(callExpression.expression.text) ?? null;
   }
 
+  resolveMappedAsyncHelperPromiseAll(call) {
+    if (
+      !ts.isPropertyAccessExpression(call.expression) ||
+      !ts.isIdentifier(call.expression.expression) ||
+      call.expression.expression.text !== "Promise" ||
+      call.expression.name.text !== "all" ||
+      call.arguments.length !== 1
+    ) {
+      return null;
+    }
+    const mapCall = call.arguments[0];
+    if (
+      !ts.isCallExpression(mapCall) ||
+      !ts.isPropertyAccessExpression(mapCall.expression) ||
+      mapCall.expression.name.text !== "map" ||
+      mapCall.arguments.length !== 1
+    ) {
+      return null;
+    }
+    const mapper = mapCall.arguments[0];
+    if (!ts.isArrowFunction(mapper) && !ts.isFunctionExpression(mapper)) {
+      return null;
+    }
+    if (mapper.parameters.length !== 1 || !ts.isIdentifier(mapper.parameters[0].name)) {
+      return null;
+    }
+    const mappedExpression = functionBodyExpression(mapper.body);
+    if (!mappedExpression) {
+      return null;
+    }
+    const asyncHelperCall =
+      ts.isAwaitExpression(mappedExpression) ? mappedExpression.expression : mappedExpression;
+    if (!ts.isCallExpression(asyncHelperCall) || !ts.isIdentifier(asyncHelperCall.expression)) {
+      return null;
+    }
+    const helperDeclaration = this.resolveAsyncLocalHelperCall(asyncHelperCall);
+    if (!helperDeclaration) {
+      return null;
+    }
+    return {
+      helperDeclaration,
+      helperName: asyncHelperCall.expression.text,
+      itemsExpr: compileExpression(mapCall.expression.expression),
+      mapperVar: mapper.parameters[0].name.text,
+      argExprs: asyncHelperCall.arguments.map((arg) => compileExpression(arg)),
+    };
+  }
+
   resolveTemporalPromiseFanout(call) {
     if (
       !ts.isPropertyAccessExpression(call.expression) ||
@@ -4261,6 +4185,7 @@ class WorkflowLowerer {
     return {
       initialState,
       states: this.states,
+      asyncHelpers: Object.fromEntries(this.compiledAsyncHelpers.entries()),
       sourceMap: this.sourceMap,
       queries: this.queries,
       signals: this.signals,
@@ -5474,70 +5399,140 @@ class WorkflowLowerer {
   }
 
   lowerAsyncLocalHelperCall(helperDeclaration, call, targetVar, nextState, errorTarget, originNode) {
+    const helperName = this.ensureCompiledAsyncHelper(helperDeclaration, originNode);
+    const helper = this.compiledAsyncHelpers.get(helperName);
+    if (call.arguments.length > helper.params.length) {
+      throw compilerError(
+        `async helper ${helperName} received too many arguments for the current subset`,
+        call.arguments[helper.params.length],
+      );
+    }
+    return this.addState("call_async_helper", {
+      type: "call_async_helper",
+      helper_name: helperName,
+      args: call.arguments.map((arg) => compileExpression(arg)),
+      next: nextState,
+      output_var: targetVar ?? undefined,
+      on_error: errorTarget ?? undefined,
+    }, originNode);
+  }
+
+  lowerMappedAsyncHelperPromiseAll(mappedAsyncHelper, targetVar, nextState, errorTarget, node) {
+    const indexVar = this.nextId("async_helper_join_index", node);
+    const choiceState = this.nextId("async_helper_join_choice", node);
+    const incrementState = this.addState("assign", {
+      type: "assign",
+      actions: [{
+        target: indexVar,
+        expr: {
+          kind: "binary",
+          op: "add",
+          left: { kind: "identifier", name: indexVar },
+          right: { kind: "literal", value: 1 },
+        },
+      }],
+      next: choiceState,
+    }, node);
+    const helperCallState = this.addState("call_async_helper", {
+      type: "call_async_helper",
+      helper_name: mappedAsyncHelper.helperName,
+      args: mappedAsyncHelper.argExprs,
+      next: incrementState,
+      on_error: errorTarget ?? undefined,
+    }, node);
+    const mapperAssignState = this.addState("assign", {
+      type: "assign",
+      actions: [{
+        target: mappedAsyncHelper.mapperVar,
+        expr: {
+          kind: "index",
+          object: mappedAsyncHelper.itemsExpr,
+          index: { kind: "identifier", name: indexVar },
+        },
+      }],
+      next: helperCallState,
+    }, node);
+    this.states[choiceState] = {
+      type: "choice",
+      condition: {
+        kind: "binary",
+        op: "less_than",
+        left: { kind: "identifier", name: indexVar },
+        right: {
+          kind: "member",
+          object: mappedAsyncHelper.itemsExpr,
+          property: "length",
+        },
+      },
+      then_next: mapperAssignState,
+      else_next: nextState,
+    };
+    this.sourceMap[choiceState] = sourceLocation(node);
+    const initActions = [{ target: indexVar, expr: { kind: "literal", value: 0 } }];
+    if (targetVar) {
+      initActions.push({ target: targetVar, expr: { kind: "literal", value: [] } });
+    }
+    return this.addState("assign", {
+      type: "assign",
+      actions: initActions,
+      next: choiceState,
+    }, node);
+  }
+
+  ensureCompiledAsyncHelper(helperDeclaration, originNode = helperDeclaration) {
     const helperName =
       ts.isFunctionDeclaration(helperDeclaration) && helperDeclaration.name
         ? helperDeclaration.name.text
         : originNode.getText();
-    const renames = new Map();
-    for (const name of collectAsyncHelperBindingNames(helperDeclaration)) {
-      renames.set(name, this.nextId(`__helper_${name}`, originNode));
+    if (this.compiledAsyncHelpers.has(helperName) || this.compilingAsyncHelpers.has(helperName)) {
+      return helperName;
     }
-    const statements = prepareAsyncHelperStatements(helperDeclaration, renames);
-    const helperBlock = ts.factory.createBlock(statements, true);
-    this.discoverHandleDeclarations(helperBlock);
-
-    const parameterActions = [];
-    const parameters = helperDeclaration.parameters ?? [];
-    for (let index = 0; index < parameters.length; index += 1) {
-      const parameter = parameters[index];
-      if (parameter.dotDotDotToken) {
-        throw compilerError(`async helper ${helperName} does not support rest parameters`, parameter);
-      }
-      if (!ts.isIdentifier(parameter.name)) {
-        throw compilerError(`async helper ${helperName} parameters must be plain identifiers`, parameter.name);
-      }
-      const target = renames.get(parameter.name.text) ?? parameter.name.text;
-      const provided = call.arguments[index];
-      parameterActions.push({
-        target,
-        expr: provided
-          ? compileExpression(provided)
-          : parameter.initializer
-            ? compileExpression(parameter.initializer)
-            : { kind: "literal", value: null },
+    this.compilingAsyncHelpers.add(helperName);
+    try {
+      const scopedBindings = Array.from(collectAsyncHelperBindingNames(helperDeclaration));
+      const returnVar = this.nextId(`__async_helper_${helperName}_return`, helperDeclaration);
+      const errorVar = this.nextId(`__async_helper_${helperName}_error`, helperDeclaration);
+      scopedBindings.push(returnVar, errorVar);
+      const params = compileAsyncHelperParams(helperDeclaration.parameters ?? []);
+      this.compiledAsyncHelpers.set(helperName, {
+        entry_state: "",
+        params,
+        scoped_bindings: scopedBindings,
       });
-    }
-    if (call.arguments.length > parameters.length) {
-      throw compilerError(
-        `async helper ${helperName} received too many arguments for the current subset`,
-        call.arguments[parameters.length],
-      );
-    }
+      const statements = prepareAsyncHelperStatements(helperDeclaration, new Map());
+      const helperBlock = ts.factory.createBlock(statements, true);
+      this.discoverHandleDeclarations(helperBlock);
 
-    const helperResultVar = targetVar ?? this.nextId("__helper_result", originNode);
-    const fallthroughState = targetVar
-      ? this.addState("assign", {
-          type: "assign",
-          actions: [{ target: helperResultVar, expr: { kind: "literal", value: null } }],
-          next: nextState,
-        }, originNode)
-      : nextState;
-    const bodyStart = this.lowerBlock(
-      statements,
-      fallthroughState,
-      null,
-      null,
-      errorTarget,
-      { next: nextState, targetVar: helperResultVar },
-    );
-    if (parameterActions.length === 0) {
-      return bodyStart;
+      const returnState = this.addState(`async_helper_${helperName}_return`, {
+        type: "return_async_helper",
+        output: { kind: "identifier", name: returnVar },
+      }, helperDeclaration);
+      const raiseState = this.addState(`async_helper_${helperName}_raise`, {
+        type: "raise_async_helper",
+        reason: { kind: "identifier", name: errorVar },
+      }, helperDeclaration);
+      const fallthroughState = this.addState(`async_helper_${helperName}_fallthrough`, {
+        type: "assign",
+        actions: [{ target: returnVar, expr: { kind: "literal", value: null } }],
+        next: returnState,
+      }, helperDeclaration);
+      const entryState = this.lowerBlock(
+        statements,
+        fallthroughState,
+        null,
+        null,
+        { next: raiseState, error_var: errorVar },
+        { next: returnState, targetVar: returnVar },
+      );
+      this.compiledAsyncHelpers.set(helperName, {
+        entry_state: entryState,
+        params,
+        scoped_bindings: scopedBindings,
+      });
+      return helperName;
+    } finally {
+      this.compilingAsyncHelpers.delete(helperName);
     }
-    return this.addState("assign", {
-      type: "assign",
-      actions: parameterActions,
-      next: bodyStart,
-    }, originNode);
   }
 
   lowerAwaitedHandle(handleName, targetVar, nextState, errorTarget, originNode) {
@@ -6441,53 +6436,6 @@ class WorkflowLowerer {
     };
   }
 
-  resolveMappedAsyncHelperPromiseAll(call) {
-    if (
-      !ts.isPropertyAccessExpression(call.expression) ||
-      !ts.isIdentifier(call.expression.expression) ||
-      call.expression.expression.text !== "Promise" ||
-      call.expression.name.text !== "all" ||
-      call.arguments.length !== 1
-    ) {
-      return null;
-    }
-    const mapCall = call.arguments[0];
-    if (
-      !ts.isCallExpression(mapCall) ||
-      !ts.isPropertyAccessExpression(mapCall.expression) ||
-      mapCall.expression.name.text !== "map" ||
-      mapCall.arguments.length !== 1
-    ) {
-      return null;
-    }
-    const mapper = mapCall.arguments[0];
-    if (!ts.isArrowFunction(mapper) && !ts.isFunctionExpression(mapper)) {
-      return null;
-    }
-    if (mapper.parameters.length !== 1 || !ts.isIdentifier(mapper.parameters[0].name)) {
-      return null;
-    }
-    const mappedExpression = functionBodyExpression(mapper.body);
-    if (!mappedExpression) {
-      return null;
-    }
-    const helperCall =
-      ts.isAwaitExpression(mappedExpression) ? mappedExpression.expression : mappedExpression;
-    if (!ts.isCallExpression(helperCall)) {
-      return null;
-    }
-    const helperDeclaration = this.resolveAsyncLocalHelperCall(helperCall);
-    if (!helperDeclaration) {
-      return null;
-    }
-    return {
-      itemsExpr: compileExpression(mapCall.expression.expression),
-      mapperVar: mapper.parameters[0].name.text,
-      helperDeclaration,
-      helperCall,
-    };
-  }
-
   lowerLocalChildPromiseAll(arrayVar, targetVar, nextState, errorTarget, node) {
     const indexVar = this.nextId("child_join_index", node);
     const handleVar = this.nextId("child_join_handle", node);
@@ -6647,87 +6595,6 @@ class WorkflowLowerer {
         { target: indexVar, expr: { kind: "literal", value: 0 } },
         { target: handleArrayVar, expr: { kind: "literal", value: [] } },
       ],
-      next: choiceState,
-    }, node);
-  }
-
-  lowerMappedAsyncHelperPromiseAll(mappedAsyncHelperPromiseAll, targetVar, nextState, errorTarget, node) {
-    const indexVar = this.nextId("helper_map_index", node);
-    const helperResultVar = this.nextId("helper_map_result", node);
-    const choiceState = this.nextId("helper_map_choice", node);
-    const incrementState = this.addState("assign", {
-      type: "assign",
-      actions: [{
-        target: indexVar,
-        expr: {
-          kind: "binary",
-          op: "add",
-          left: { kind: "identifier", name: indexVar },
-          right: { kind: "literal", value: 1 },
-        },
-      }],
-      next: choiceState,
-    }, node);
-    const afterHelperState = targetVar
-      ? this.addState("assign", {
-          type: "assign",
-          actions: [{
-            target: targetVar,
-            expr: {
-              kind: "call",
-              callee: "__builtin_array_append",
-              args: [
-                { kind: "identifier", name: targetVar },
-                { kind: "identifier", name: helperResultVar },
-              ],
-            },
-          }],
-          next: incrementState,
-        }, node)
-      : incrementState;
-    const helperState = this.lowerAsyncLocalHelperCall(
-      mappedAsyncHelperPromiseAll.helperDeclaration,
-      mappedAsyncHelperPromiseAll.helperCall,
-      targetVar ? helperResultVar : null,
-      afterHelperState,
-      errorTarget,
-      node,
-    );
-    const assignMapperState = this.addState("assign", {
-      type: "assign",
-      actions: [{
-        target: mappedAsyncHelperPromiseAll.mapperVar,
-        expr: {
-          kind: "index",
-          object: mappedAsyncHelperPromiseAll.itemsExpr,
-          index: { kind: "identifier", name: indexVar },
-        },
-      }],
-      next: helperState,
-    }, node);
-    this.states[choiceState] = {
-      type: "choice",
-      condition: {
-        kind: "binary",
-        op: "less_than",
-        left: { kind: "identifier", name: indexVar },
-        right: {
-          kind: "member",
-          object: mappedAsyncHelperPromiseAll.itemsExpr,
-          property: "length",
-        },
-      },
-      then_next: assignMapperState,
-      else_next: nextState,
-    };
-    this.sourceMap[choiceState] = sourceLocation(node);
-    const initActions = [{ target: indexVar, expr: { kind: "literal", value: 0 } }];
-    if (targetVar) {
-      initActions.push({ target: targetVar, expr: { kind: "literal", value: [] } });
-    }
-    return this.addState("assign", {
-      type: "assign",
-      actions: initActions,
       next: choiceState,
     }, node);
   }
@@ -7242,6 +7109,11 @@ function validateArtifactCalls(artifact) {
     validateHelperStatements(helper.statements);
     validateExpression(helper.body);
   });
+  Object.values(artifact.workflow.async_helpers ?? {}).forEach((helper) => {
+    for (const param of helper.params ?? []) {
+      if (param.default) validateExpression(param.default);
+    }
+  });
   Object.values(artifact.workflow.states).forEach((state) => validateCompiledState(state, validateExpression));
   Object.values(artifact.signals ?? {}).forEach((signal) => {
     Object.values(signal.states).forEach((state) => validateCompiledState(state, validateExpression));
@@ -7272,6 +7144,15 @@ function validateCompiledState(state, validateExpression) {
       break;
     case "dynamic_step":
       validateExpression(state.descriptor);
+      break;
+    case "call_async_helper":
+      state.args.forEach((arg) => validateExpression(arg));
+      break;
+    case "return_async_helper":
+      if (state.output) validateExpression(state.output);
+      break;
+    case "raise_async_helper":
+      if (state.reason) validateExpression(state.reason);
       break;
     case "fan_out":
       validateExpression(state.items);
@@ -7318,7 +7199,7 @@ async function main() {
   currentTemporalActivityBindings = lowerer.temporalActivityBindings;
   currentPromiseLikeTimerClasses = lowerer.promiseLikeTimerClasses;
   const helpers = injectTemporalBuiltinHelpers(buildHelperRegistry(program, workflow), temporalApi);
-  const { initialState, states, sourceMap, queries, signals, updates, params, nonCancellableStates } =
+  const { initialState, states, asyncHelpers, sourceMap, queries, signals, updates, params, nonCancellableStates } =
     lowerer.lower();
 
   const artifact = {
@@ -7341,6 +7222,7 @@ async function main() {
     workflow: {
       initial_state: initialState,
       states,
+      async_helpers: asyncHelpers,
       params,
       non_cancellable_states: nonCancellableStates,
     },

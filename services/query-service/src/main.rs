@@ -2656,6 +2656,9 @@ fn compiled_state_kind(state: &CompiledStateNode) -> &'static str {
         CompiledStateNode::Choice { .. } => "choice",
         CompiledStateNode::Step { .. } => "step",
         CompiledStateNode::DynamicStep { .. } => "dynamic_step",
+        CompiledStateNode::CallAsyncHelper { .. } => "call_async_helper",
+        CompiledStateNode::ReturnAsyncHelper { .. } => "return_async_helper",
+        CompiledStateNode::RaiseAsyncHelper { .. } => "raise_async_helper",
         CompiledStateNode::StartStepHandle { .. } => "start_step_handle",
         CompiledStateNode::FanOut { .. } => "fan_out",
         CompiledStateNode::StartBulkActivity { .. } => "start_bulk_activity",
@@ -2684,6 +2687,9 @@ fn semantic_module_kind(_graph: &str, state: &CompiledStateNode) -> &'static str
         | CompiledStateNode::Choice { .. } => "assign_decision",
         CompiledStateNode::Step { .. }
         | CompiledStateNode::DynamicStep { .. }
+        | CompiledStateNode::CallAsyncHelper { .. }
+        | CompiledStateNode::ReturnAsyncHelper { .. }
+        | CompiledStateNode::RaiseAsyncHelper { .. }
         | CompiledStateNode::StartStepHandle { .. } => "activity_step",
         CompiledStateNode::FanOut { .. } | CompiledStateNode::WaitForAllActivities { .. } => {
             "fan_out"
@@ -2733,6 +2739,11 @@ fn compiled_state_subtitle(state: &CompiledStateNode) -> Option<String> {
                 .unwrap_or_else(|| handler.clone()),
         ),
         CompiledStateNode::DynamicStep { .. } => Some("dynamic step".to_owned()),
+        CompiledStateNode::CallAsyncHelper { helper_name, .. } => {
+            Some(format!("call async helper · {helper_name}"))
+        }
+        CompiledStateNode::ReturnAsyncHelper { .. } => Some("return async helper".to_owned()),
+        CompiledStateNode::RaiseAsyncHelper { .. } => Some("raise async helper".to_owned()),
         CompiledStateNode::StartStepHandle { handle_var, .. } => {
             Some(format!("start step handle · {handle_var}"))
         }
@@ -2805,6 +2816,15 @@ fn state_transition_targets(state: &CompiledStateNode) -> Vec<(String, String)> 
             }
             transitions
         }
+        CompiledStateNode::CallAsyncHelper { next, on_error, .. } => {
+            let mut transitions = vec![("return".to_owned(), next.clone())];
+            if let Some(on_error) = on_error {
+                transitions.push(("error".to_owned(), on_error.next.clone()));
+            }
+            transitions
+        }
+        CompiledStateNode::ReturnAsyncHelper { .. }
+        | CompiledStateNode::RaiseAsyncHelper { .. } => Vec::new(),
         CompiledStateNode::StartStepHandle { next, .. } => vec![("next".to_owned(), next.clone())],
         CompiledStateNode::FanOut { next, .. } => vec![("await".to_owned(), next.clone())],
         CompiledStateNode::StartBulkActivity { next, .. } => {
