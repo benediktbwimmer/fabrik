@@ -212,15 +212,13 @@ Bad fits:
 - late reports from previously leased chunks are ignored by fencing once cancellation clears active leases
 - exactly one terminal batch cancellation outcome is emitted into workflow history
 
-## Backends
+## Backend
 
-Throughput mode supports multiple backend implementations behind a stable internal interface. Backend selection is server-controlled per batch and pinned for the lifetime of that batch.
+Throughput mode uses a single backend implementation behind a stable internal interface. Backend selection remains server-controlled per batch and pinned for the lifetime of that batch, but new bulk work is admitted only to `stream-v2`.
 
-Workflow code does not select `pg-v1` vs `stream-v2`. Selection is made by task-queue policy or other server-side admission and routing rules.
+### Backend Interface
 
-### Common Backend Interface
-
-Both backends implement the same operations:
+The backend implements these operations:
 
 | Operation | Description |
 |---|---|
@@ -231,38 +229,16 @@ Both backends implement the same operations:
 | `get_batch_summary` | Read batch metadata and counters |
 | `get_batch_results` | Paginated chunk outputs in chunk order |
 
-Both backends preserve these stable identifiers:
+The backend preserves these stable identifiers:
 
 - `batch_id`, `chunk_id`, `attempt`, `group_id`
 - `lease_epoch`, `owner_epoch`, `report_id`
 - `input_handle`, `result_handle`
 - `throughput_backend`, `throughput_backend_version`
 
-### `pg-v1` — Postgres-First Backend
+### `stream-v2` — Streaming Backend
 
-The Postgres-first backend is suitable for most bulk workloads up to hundreds of thousands of items.
-
-Infrastructure requirements:
-
-- Postgres
-
-Behavior:
-
-- batch and chunk state is stored in `workflow_bulk_batches` and `workflow_bulk_chunks`
-- chunk scheduling and leasing runs through Postgres queries
-- chunk terminal results apply atomic counter updates in Postgres
-- batch terminal events publish through the async `workflow_event_outbox`
-- query results are immediately consistent
-
-Tradeoffs:
-
-- no additional infrastructure beyond what `fabrik` already requires
-- operationally simple and queryable with standard SQL
-- Postgres becomes the throughput ceiling for very large batches or very high completion rates
-
-### `stream-v2` — Streaming Throughput Backend
-
-The streaming backend removes Postgres from the throughput hot path and is suitable for batches with millions of items or sustained high completion rates.
+The streaming backend is the active execution path for throughput mode. It removes Postgres from the throughput hot path and is suitable for batches with millions of items or sustained high completion rates.
 
 Infrastructure requirements:
 
@@ -298,7 +274,7 @@ Every leased chunk carries `(chunk_id, attempt, lease_epoch, lease_token, owner_
 
 Tradeoffs:
 
-- significantly higher throughput ceiling than `pg-v1`
+- significantly higher throughput ceiling than the durable workflow path
 - requires additional infrastructure
 - batch/chunk visibility is eventually consistent by default
 - operationally more complex
@@ -318,7 +294,7 @@ Ownership and rebalancing:
 
 ### Backend Pinning
 
-`throughput_backend` and `throughput_backend_version` are recorded on every batch. In-flight batches always finish on the backend that started them. Batches are never migrated across backends while active.
+`throughput_backend` and `throughput_backend_version` are recorded on every batch. In-flight batches always finish on the backend version that started them.
 
 ## Execution Model
 
@@ -393,7 +369,7 @@ Eventual reads:
 - chunk progress
 - lag-aware operator and UI views
 
-For `pg-v1`, query results are immediately consistent. For `stream-v2`, default query results are eventually consistent projections and may lag authoritative shard state.
+For `stream-v2`, default query results are eventually consistent projections and may lag authoritative shard state. Strong reads route to the throughput owner.
 
 ## Worker Protocol
 

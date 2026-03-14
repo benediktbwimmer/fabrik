@@ -1239,6 +1239,7 @@ name = "fabrik-events"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "fabrik-throughput",
  "serde",
  "serde_json",
  "uuid",

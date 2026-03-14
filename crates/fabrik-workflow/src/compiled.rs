@@ -4,11 +4,11 @@ use anyhow::Context;
 use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_throughput::{
-    DEFAULT_AGGREGATION_GROUP_COUNT, PayloadHandle, ThroughputBackend,
-    benchmark_compact_input_handle_with_meta, bulk_reducer_default_summary_value,
-    bulk_reducer_reduce_values, bulk_reducer_requires_success_outputs,
-    bulk_reducer_settles as throughput_bulk_reducer_settles, bulk_reducer_summary_field_name,
-    parse_benchmark_compact_input_meta,
+    ActivityExecutionCapabilities, DEFAULT_AGGREGATION_GROUP_COUNT, PayloadHandle,
+    ThroughputBackend, benchmark_compact_input_handle_with_meta,
+    bulk_reducer_default_summary_value, bulk_reducer_reduce_values,
+    bulk_reducer_requires_success_outputs, bulk_reducer_settles as throughput_bulk_reducer_settles,
+    bulk_reducer_summary_field_name, parse_benchmark_compact_input_meta,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, json};
@@ -188,6 +188,8 @@ pub enum CompiledStateNode {
         next: String,
         handle_var: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity_capabilities: Option<ActivityExecutionCapabilities>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         task_queue: Option<Expression>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reducer: Option<String>,
@@ -210,6 +212,8 @@ pub enum CompiledStateNode {
         next: String,
         handle_var: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity_capabilities: Option<ActivityExecutionCapabilities>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         task_queue: Option<Expression>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         execution_policy: Option<String>,
@@ -221,6 +225,11 @@ pub enum CompiledStateNode {
         chunk_size: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry: Option<RetryPolicy>,
+    },
+    DynamicStartBulkActivity {
+        descriptor: Expression,
+        next: String,
+        handle_var: String,
     },
     WaitForBulkActivity {
         bulk_ref_var: String,
@@ -651,6 +660,19 @@ struct DynamicActivityDescriptor {
     heartbeat_timeout_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct DynamicBulkActivityDescriptor {
+    activity_type: String,
+    items: Value,
+    task_queue: Option<String>,
+    execution_policy: Option<String>,
+    reducer: Option<String>,
+    throughput_backend: Option<String>,
+    chunk_size: Option<u32>,
+    retry: Option<RetryPolicy>,
+    activity_capabilities: Option<ActivityExecutionCapabilities>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct BulkActivityExecutionState {
     pub batch_id: String,
@@ -660,6 +682,8 @@ struct BulkActivityExecutionState {
     pub task_queue: String,
     pub execution_policy: Option<String>,
     pub reducer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_capabilities: Option<ActivityExecutionCapabilities>,
     pub total_items: u32,
     pub chunk_size: u32,
     pub max_attempts: u32,
@@ -989,11 +1013,18 @@ impl CompiledWorkflowArtifact {
             Value::Array(items) => items.clone(),
             value => vec![value.clone()],
         };
-        for (index, param) in self.workflow.params.iter().enumerate() {
-            let value = if param.rest {
-                Value::Array(args.iter().skip(index).cloned().collect())
+        let mut next_arg_index = 0usize;
+        for param in &self.workflow.params {
+            let value = if param.name == "ctx" {
+                Value::Null
+            } else if param.name == "input" {
+                input.clone()
+            } else if param.rest {
+                let value = Value::Array(args.iter().skip(next_arg_index).cloned().collect());
+                next_arg_index = args.len();
+                value
             } else {
-                match args.get(index) {
+                let value = match args.get(next_arg_index) {
                     Some(value) => value.clone(),
                     None => match &param.default {
                         Some(default) => {
@@ -1001,7 +1032,9 @@ impl CompiledWorkflowArtifact {
                         }
                         None => Value::Null,
                     },
-                }
+                };
+                next_arg_index += 1;
+                value
             };
             execution_state.bindings.insert(param.name.clone(), value);
         }
@@ -2156,12 +2189,21 @@ impl CompiledWorkflowArtifact {
     ) -> Option<Value> {
         let states = self.states_for(wait_state, execution_state)?;
         let bulk = execution_state.bulk_wait_binding(wait_state)?;
-        let CompiledStateNode::StartBulkActivity { items, .. } = states.get(&bulk.origin_state)?
-        else {
-            return None;
-        };
-        let mut execution_state = execution_state.clone();
-        evaluate_expression(items, &mut execution_state, &self.helpers).ok()
+        match states.get(&bulk.origin_state)? {
+            CompiledStateNode::StartBulkActivity { items, .. } => {
+                let mut execution_state = execution_state.clone();
+                evaluate_expression(items, &mut execution_state, &self.helpers).ok()
+            }
+            CompiledStateNode::DynamicStartBulkActivity { descriptor, .. } => {
+                let mut execution_state = execution_state.clone();
+                let descriptor =
+                    evaluate_expression(descriptor, &mut execution_state, &self.helpers).ok()?;
+                parse_dynamic_bulk_activity_descriptor(&bulk.origin_state, descriptor)
+                    .ok()
+                    .map(|descriptor| descriptor.items)
+            }
+            _ => None,
+        }
     }
 
     fn execute_from_state(
@@ -2323,6 +2365,7 @@ impl CompiledWorkflowArtifact {
                         event: WorkflowEvent::ActivityTaskScheduled {
                             activity_id: current_state.clone(),
                             activity_type,
+                            activity_capabilities: None,
                             task_queue,
                             attempt: 1,
                             input,
@@ -2357,6 +2400,7 @@ impl CompiledWorkflowArtifact {
                         event: WorkflowEvent::ActivityTaskScheduled {
                             activity_id: current_state.clone(),
                             activity_type: descriptor.activity_type,
+                            activity_capabilities: None,
                             task_queue,
                             attempt: 1,
                             input: descriptor.input,
@@ -2501,6 +2545,7 @@ impl CompiledWorkflowArtifact {
                         event: WorkflowEvent::ActivityTaskScheduled {
                             activity_id: current_state.clone(),
                             activity_type: descriptor.activity_type,
+                            activity_capabilities: None,
                             task_queue,
                             attempt: 1,
                             input: descriptor.input,
@@ -2536,6 +2581,7 @@ impl CompiledWorkflowArtifact {
                     items,
                     next,
                     handle_var,
+                    activity_capabilities,
                     task_queue,
                     reducer,
                     config,
@@ -2614,6 +2660,7 @@ impl CompiledWorkflowArtifact {
                             event: WorkflowEvent::ActivityTaskScheduled {
                                 activity_id,
                                 activity_type: activity_type.clone(),
+                                activity_capabilities: activity_capabilities.clone(),
                                 task_queue: task_queue.clone(),
                                 attempt: 1,
                                 input: item.clone(),
@@ -2673,6 +2720,7 @@ impl CompiledWorkflowArtifact {
                     items,
                     next,
                     handle_var,
+                    activity_capabilities,
                     task_queue,
                     execution_policy,
                     reducer,
@@ -2801,6 +2849,7 @@ impl CompiledWorkflowArtifact {
                         event: WorkflowEvent::BulkActivityBatchScheduled {
                             batch_id: batch_id.clone(),
                             activity_type: activity_type.clone(),
+                            activity_capabilities: activity_capabilities.clone(),
                             task_queue: task_queue.clone(),
                             items: items.clone(),
                             input_handle,
@@ -2815,8 +2864,6 @@ impl CompiledWorkflowArtifact {
                                 == ThroughputBackend::StreamV2.as_str()
                             {
                                 ThroughputBackend::StreamV2.default_version().to_owned()
-                            } else if throughput_backend == ThroughputBackend::PgV1.as_str() {
-                                ThroughputBackend::PgV1.default_version().to_owned()
                             } else {
                                 String::new()
                             },
@@ -2832,9 +2879,185 @@ impl CompiledWorkflowArtifact {
                             origin_state: current_state.clone(),
                             wait_state: next.clone(),
                             activity_type: activity_type.clone(),
+                            activity_capabilities: activity_capabilities.clone(),
                             task_queue,
                             execution_policy: execution_policy.clone(),
                             reducer: reducer.clone(),
+                            total_items,
+                            chunk_size,
+                            max_attempts,
+                            retry_delay_ms,
+                        })
+                        .expect("bulk execution state serializes"),
+                    );
+                    context = compact_context.or_else(|| Some(Value::Array(items.clone())));
+                    return Ok(CompiledExecutionPlan {
+                        workflow_version: self.definition_version,
+                        final_state: next.clone(),
+                        emissions,
+                        execution_state,
+                        context,
+                        output,
+                    });
+                }
+                CompiledStateNode::DynamicStartBulkActivity { descriptor, next, handle_var } => {
+                    let descriptor =
+                        evaluate_expression(descriptor, &mut execution_state, &self.helpers)?;
+                    let descriptor =
+                        parse_dynamic_bulk_activity_descriptor(&current_state, descriptor)?;
+                    let evaluated_items = descriptor.items.clone();
+                    let task_queue =
+                        descriptor.task_queue.clone().unwrap_or_else(|| "default".to_owned());
+                    let chunk_size =
+                        descriptor.chunk_size.unwrap_or(256).clamp(1, MAX_BULK_CHUNK_SIZE);
+                    let max_attempts =
+                        descriptor.retry.as_ref().map(|policy| policy.max_attempts).unwrap_or(1);
+                    let retry_delay_ms = descriptor
+                        .retry
+                        .as_ref()
+                        .map(|policy| {
+                            parse_timer_ref(&policy.delay)
+                                .map(|duration| duration.num_milliseconds().max(0) as u64)
+                        })
+                        .transpose()
+                        .map_err(|error| CompiledWorkflowError::InvalidBulkRetryDelay {
+                            state: current_state.clone(),
+                            details: error.to_string(),
+                        })?
+                        .unwrap_or_default();
+                    let batch_id = build_bulk_batch_id(
+                        execution_state.turn_context.as_ref().ok_or_else(|| {
+                            CompiledWorkflowError::MissingTurnContext(
+                                "ctx.bulkActivity()".to_owned(),
+                            )
+                        })?,
+                        &current_state,
+                    );
+                    let throughput_backend =
+                        descriptor.throughput_backend.clone().unwrap_or_default();
+                    let (items, total_items, input_handle, compact_context) = if throughput_backend
+                        == ThroughputBackend::StreamV2.as_str()
+                    {
+                        if let Some(compact_meta) =
+                            parse_benchmark_compact_input_meta(&evaluated_items)
+                        {
+                            (
+                                Vec::new(),
+                                compact_meta.total_items,
+                                serde_json::to_value(benchmark_compact_input_handle_with_meta(
+                                    &batch_id,
+                                    compact_meta.total_items,
+                                    compact_meta.payload_size,
+                                    Some(chunk_size),
+                                ))
+                                .expect("compact benchmark input handle serializes"),
+                                Some(evaluated_items.clone()),
+                            )
+                        } else {
+                            let Value::Array(items) = evaluated_items else {
+                                return Err(CompiledWorkflowError::InvalidBulkItems {
+                                    state: current_state.clone(),
+                                });
+                            };
+                            validate_bulk_items(&current_state, &items, chunk_size as usize)?;
+                            let total_items = items_len_to_u32(items.len())?;
+                            (
+                                items,
+                                total_items,
+                                serde_json::to_value(PayloadHandle::inline_batch_input(&batch_id))
+                                    .expect("bulk input handle serializes"),
+                                None,
+                            )
+                        }
+                    } else {
+                        let Value::Array(items) = evaluated_items else {
+                            return Err(CompiledWorkflowError::InvalidBulkItems {
+                                state: current_state.clone(),
+                            });
+                        };
+                        validate_bulk_items(&current_state, &items, chunk_size as usize)?;
+                        let total_items = items_len_to_u32(items.len())?;
+                        (
+                            items,
+                            total_items,
+                            serde_json::to_value(PayloadHandle::inline_batch_input(&batch_id))
+                                .expect("bulk input handle serializes"),
+                            None,
+                        )
+                    };
+                    if total_items == 0 {
+                        let wait_state = states
+                            .get(next)
+                            .ok_or_else(|| CompiledWorkflowError::UnknownState(next.clone()))?;
+                        if let CompiledStateNode::WaitForBulkActivity {
+                            bulk_ref_var,
+                            next: after_wait,
+                            output_var,
+                            ..
+                        } = wait_state
+                        {
+                            execution_state.bindings.remove(bulk_ref_var);
+                            if let Some(output_var) = output_var {
+                                execution_state.bindings.insert(
+                                    output_var.clone(),
+                                    bulk_success_summary(
+                                        &batch_id,
+                                        descriptor.reducer.as_deref(),
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                    ),
+                                );
+                            }
+                            current_state = after_wait.clone();
+                            continue;
+                        }
+                        return Err(CompiledWorkflowError::NotWaitingOnBulk(next.clone()));
+                    }
+                    let result_handle =
+                        serde_json::to_value(PayloadHandle::inline_batch_result(&batch_id))
+                            .expect("bulk result handle serializes");
+                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+                    emissions.push(ExecutionEmission {
+                        event: WorkflowEvent::BulkActivityBatchScheduled {
+                            batch_id: batch_id.clone(),
+                            activity_type: descriptor.activity_type.clone(),
+                            activity_capabilities: descriptor.activity_capabilities.clone(),
+                            task_queue: task_queue.clone(),
+                            items: items.clone(),
+                            input_handle,
+                            result_handle,
+                            chunk_size,
+                            max_attempts,
+                            retry_delay_ms,
+                            aggregation_group_count: DEFAULT_AGGREGATION_GROUP_COUNT,
+                            execution_policy: descriptor.execution_policy.clone(),
+                            reducer: descriptor.reducer.clone(),
+                            throughput_backend_version: if throughput_backend
+                                == ThroughputBackend::StreamV2.as_str()
+                            {
+                                ThroughputBackend::StreamV2.default_version().to_owned()
+                            } else {
+                                String::new()
+                            },
+                            throughput_backend,
+                            state: Some(next.clone()),
+                        },
+                        state: Some(next.clone()),
+                    });
+                    execution_state.bindings.insert(
+                        handle_var.clone(),
+                        serde_json::to_value(BulkActivityExecutionState {
+                            batch_id,
+                            origin_state: current_state.clone(),
+                            wait_state: next.clone(),
+                            activity_type: descriptor.activity_type,
+                            task_queue,
+                            execution_policy: descriptor.execution_policy,
+                            reducer: descriptor.reducer,
+                            activity_capabilities: descriptor.activity_capabilities,
                             total_items,
                             chunk_size,
                             max_attempts,
@@ -3395,6 +3618,7 @@ impl CompiledStateNode {
             Self::StartStepHandle { next, .. } => vec![next.as_str()],
             Self::FanOut { next, .. } => vec![next.as_str()],
             Self::StartBulkActivity { next, .. } => vec![next.as_str()],
+            Self::DynamicStartBulkActivity { next, .. } => vec![next.as_str()],
             Self::WaitForBulkActivity { next, on_error, .. } => std::iter::once(next.as_str())
                 .chain(on_error.iter().map(|transition| transition.next.as_str()))
                 .collect(),
@@ -3638,6 +3862,49 @@ fn parse_descriptor_retry(
     }))
 }
 
+fn parse_descriptor_activity_capabilities(
+    descriptor: &serde_json::Map<String, Value>,
+    state: &str,
+) -> Result<Option<ActivityExecutionCapabilities>, CompiledWorkflowError> {
+    let Some(capabilities) = descriptor.get("activity_capabilities") else {
+        return Ok(None);
+    };
+    if capabilities.is_null() {
+        return Ok(None);
+    }
+    let Value::Object(capabilities) = capabilities else {
+        return Err(CompiledWorkflowError::InvalidDynamicStepDescriptor {
+            state: state.to_owned(),
+            details: "activity_capabilities must be an object".to_owned(),
+        });
+    };
+    let payloadless_transport = match capabilities.get("payloadless_transport") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(CompiledWorkflowError::InvalidDynamicStepDescriptor {
+                state: state.to_owned(),
+                details: "activity_capabilities.payloadless_transport must be a boolean".to_owned(),
+            });
+        }
+    };
+    let tiny_inline_completion = match capabilities.get("tiny_inline_completion") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => {
+            return Err(CompiledWorkflowError::InvalidDynamicStepDescriptor {
+                state: state.to_owned(),
+                details: "activity_capabilities.tiny_inline_completion must be a boolean"
+                    .to_owned(),
+            });
+        }
+    };
+    Ok(Some(
+        ActivityExecutionCapabilities { payloadless_transport, tiny_inline_completion }
+            .normalized(),
+    ))
+}
+
 fn parse_dynamic_activity_descriptor(
     state: &str,
     descriptor: Value,
@@ -3703,6 +3970,58 @@ fn parse_dynamic_activity_descriptor(
             state,
         )?,
         heartbeat_timeout_ms: parse_descriptor_u64(&descriptor, "heartbeat_timeout_ms", state)?,
+    })
+}
+
+fn parse_dynamic_bulk_activity_descriptor(
+    state: &str,
+    descriptor: Value,
+) -> Result<DynamicBulkActivityDescriptor, CompiledWorkflowError> {
+    let Value::Object(descriptor) = descriptor else {
+        return Err(CompiledWorkflowError::InvalidDynamicStepDescriptor {
+            state: state.to_owned(),
+            details: "bulk descriptor must evaluate to an object".to_owned(),
+        });
+    };
+    let Some(Value::String(kind)) = descriptor.get("__kind") else {
+        return Err(CompiledWorkflowError::InvalidDynamicStepDescriptor {
+            state: state.to_owned(),
+            details: "bulk descriptor must include __kind".to_owned(),
+        });
+    };
+    if kind != "bulk_activity_descriptor" {
+        return Err(CompiledWorkflowError::InvalidDynamicStepDescriptor {
+            state: state.to_owned(),
+            details: format!("unsupported bulk descriptor kind {kind}"),
+        });
+    }
+    let activity_type = descriptor
+        .get("activity_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CompiledWorkflowError::InvalidDynamicStepDescriptor {
+            state: state.to_owned(),
+            details: "bulk descriptor must include activity_type string".to_owned(),
+        })?
+        .to_owned();
+    Ok(DynamicBulkActivityDescriptor {
+        activity_type,
+        items: descriptor.get("items").cloned().unwrap_or(Value::Array(Vec::new())),
+        task_queue: descriptor
+            .get("task_queue")
+            .and_then(|value| if value.is_null() { None } else { stringify_value(value) }),
+        execution_policy: descriptor
+            .get("execution_policy")
+            .and_then(|value| if value.is_null() { None } else { stringify_value(value) }),
+        reducer: descriptor
+            .get("reducer")
+            .and_then(|value| if value.is_null() { None } else { stringify_value(value) }),
+        throughput_backend: descriptor
+            .get("throughput_backend")
+            .and_then(|value| if value.is_null() { None } else { stringify_value(value) }),
+        chunk_size: parse_descriptor_u64(&descriptor, "chunk_size", state)?
+            .map(|value| value.min(MAX_BULK_CHUNK_SIZE as u64) as u32),
+        retry: parse_descriptor_retry(&descriptor, state)?,
+        activity_capabilities: parse_descriptor_activity_capabilities(&descriptor, state)?,
     })
 }
 
@@ -5575,6 +5894,7 @@ mod tests {
                     },
                 ),
             ]),
+            async_helpers: BTreeMap::new(),
             params: Vec::new(),
             non_cancellable_states: BTreeSet::new(),
         };
@@ -5608,6 +5928,7 @@ mod tests {
                     output_var: None,
                 },
             )]),
+            async_helpers: BTreeMap::new(),
             params: Vec::new(),
             non_cancellable_states: BTreeSet::new(),
         };
@@ -5670,6 +5991,7 @@ mod tests {
                     next: "done".to_owned(),
                 },
             )]),
+            async_helpers: BTreeMap::new(),
             params: Vec::new(),
             non_cancellable_states: BTreeSet::new(),
         };
@@ -5729,6 +6051,7 @@ mod tests {
                     },
                 ),
             ]),
+            async_helpers: BTreeMap::new(),
             params: vec![CompiledWorkflowParam {
                 name: "seconds".to_owned(),
                 rest: false,
@@ -5768,6 +6091,7 @@ mod tests {
                         next: "done".to_owned(),
                         timeout_ref: None,
                         timeout_next: None,
+                        timer_expr: None,
                     },
                 ),
                 (
@@ -5777,6 +6101,7 @@ mod tests {
                     },
                 ),
             ]),
+            async_helpers: BTreeMap::new(),
             params: Vec::new(),
             non_cancellable_states: BTreeSet::new(),
         };
@@ -5835,6 +6160,7 @@ mod tests {
                         },
                         next: "join".to_owned(),
                         handle_var: "fanout".to_owned(),
+                        activity_capabilities: None,
                         task_queue: None,
                         reducer: reducer.map(str::to_owned),
                         retry: enable_retry.then_some(RetryPolicy {
@@ -5876,6 +6202,7 @@ mod tests {
                     },
                 ),
             ]),
+            async_helpers: BTreeMap::new(),
             params: Vec::new(),
             non_cancellable_states: BTreeSet::new(),
         };
@@ -5930,6 +6257,7 @@ mod tests {
                         },
                         next: "join".to_owned(),
                         handle_var: "bulk".to_owned(),
+                        activity_capabilities: None,
                         task_queue: None,
                         execution_policy: Some("eager".to_owned()),
                         reducer: Some(reducer.to_owned()),
@@ -5969,6 +6297,7 @@ mod tests {
                     },
                 ),
             ]),
+            async_helpers: BTreeMap::new(),
             params: Vec::new(),
             non_cancellable_states: BTreeSet::new(),
         };
@@ -6036,6 +6365,7 @@ mod tests {
                         }),
                     },
                 )]),
+                async_helpers: BTreeMap::new(),
                 params: vec![
                     CompiledWorkflowParam { name: "name".to_owned(), rest: false, default: None },
                     CompiledWorkflowParam {
@@ -6089,6 +6419,7 @@ mod tests {
                         }),
                     },
                 )]),
+                async_helpers: BTreeMap::new(),
                 params: vec![
                     CompiledWorkflowParam { name: "prefix".to_owned(), rest: false, default: None },
                     CompiledWorkflowParam { name: "names".to_owned(), rest: true, default: None },
@@ -6107,6 +6438,105 @@ mod tests {
             }) if output == &json!({
                 "prefix": "team",
                 "names": ["a", "b"],
+            })
+        ));
+    }
+
+    #[test]
+    fn execute_trigger_preserves_input_binding_for_reserved_params() {
+        let artifact = CompiledWorkflowArtifact::new(
+            "workflow-reserved-params",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "done".to_owned(),
+                states: BTreeMap::from([(
+                    "done".to_owned(),
+                    CompiledStateNode::Succeed {
+                        output: Some(Expression::Object {
+                            fields: BTreeMap::from([
+                                (
+                                    "ctx".to_owned(),
+                                    Expression::Identifier { name: "ctx".to_owned() },
+                                ),
+                                (
+                                    "input".to_owned(),
+                                    Expression::Identifier { name: "input".to_owned() },
+                                ),
+                            ]),
+                        }),
+                    },
+                )]),
+                async_helpers: BTreeMap::new(),
+                params: vec![
+                    CompiledWorkflowParam { name: "ctx".to_owned(), rest: false, default: None },
+                    CompiledWorkflowParam { name: "input".to_owned(), rest: false, default: None },
+                ],
+                non_cancellable_states: BTreeSet::new(),
+            },
+        );
+
+        let plan = artifact.execute_trigger(&json!({"items": ["a", "b"]})).unwrap();
+
+        assert!(matches!(
+            plan.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output == &json!({
+                "ctx": Value::Null,
+                "input": {"items": ["a", "b"]},
+            })
+        ));
+    }
+
+    #[test]
+    fn execute_trigger_skips_reserved_params_when_binding_rest_args() {
+        let artifact = CompiledWorkflowArtifact::new(
+            "workflow-reserved-rest-params",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "done".to_owned(),
+                states: BTreeMap::from([(
+                    "done".to_owned(),
+                    CompiledStateNode::Succeed {
+                        output: Some(Expression::Object {
+                            fields: BTreeMap::from([
+                                (
+                                    "input".to_owned(),
+                                    Expression::Identifier { name: "input".to_owned() },
+                                ),
+                                (
+                                    "suffix".to_owned(),
+                                    Expression::Identifier { name: "suffix".to_owned() },
+                                ),
+                            ]),
+                        }),
+                    },
+                )]),
+                async_helpers: BTreeMap::new(),
+                params: vec![
+                    CompiledWorkflowParam { name: "ctx".to_owned(), rest: false, default: None },
+                    CompiledWorkflowParam { name: "input".to_owned(), rest: false, default: None },
+                    CompiledWorkflowParam { name: "suffix".to_owned(), rest: true, default: None },
+                ],
+                non_cancellable_states: BTreeSet::new(),
+            },
+        );
+
+        let plan = artifact.execute_trigger(&json!(["root", "a", "b"])).unwrap();
+
+        assert!(matches!(
+            plan.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output == &json!({
+                "input": ["root", "a", "b"],
+                "suffix": ["root", "a", "b"],
             })
         ));
     }
@@ -6160,9 +6590,11 @@ mod tests {
             markers: BTreeMap::new(),
             version_markers: BTreeMap::new(),
             active_signal: None,
+            dynamic_signal_handlers: BTreeMap::new(),
             active_update: None,
             pending_workflow_cancellation: None,
             condition_timers: BTreeSet::new(),
+            async_frames: Vec::new(),
             turn_context: Some(turn_context.clone()),
             pending_markers: Vec::new(),
             pending_version_markers: Vec::new(),
@@ -6462,6 +6894,7 @@ mod tests {
                     },
                 ),
             ]),
+            async_helpers: BTreeMap::new(),
             params: Vec::new(),
             non_cancellable_states: BTreeSet::new(),
         };
@@ -6517,9 +6950,11 @@ mod tests {
             markers: BTreeMap::new(),
             version_markers: BTreeMap::new(),
             active_signal: None,
+            dynamic_signal_handlers: BTreeMap::new(),
             active_update: None,
             pending_workflow_cancellation: None,
             condition_timers: BTreeSet::new(),
+            async_frames: Vec::new(),
             turn_context: Some(turn_context),
             pending_markers: Vec::new(),
             pending_version_markers: Vec::new(),
@@ -6673,6 +7108,7 @@ mod tests {
                     ),
                     ("done".to_owned(), CompiledStateNode::Succeed { output: None }),
                 ]),
+                async_helpers: BTreeMap::new(),
                 params: Vec::new(),
                 non_cancellable_states: BTreeSet::new(),
             },
@@ -7672,6 +8108,7 @@ mod tests {
                         },
                     ),
                 ]),
+                async_helpers: BTreeMap::new(),
                 params: Vec::new(),
                 non_cancellable_states: BTreeSet::new(),
             },
@@ -7709,6 +8146,136 @@ mod tests {
         let retry = artifact.step_retry("cleanup", &plan.execution_state).unwrap().unwrap();
         assert_eq!(retry.max_attempts, 3);
         assert_eq!(retry.delay, "2s");
+    }
+
+    #[test]
+    fn dynamic_bulk_descriptor_emits_bulk_schedule_metadata() {
+        let artifact = CompiledWorkflowArtifact::new(
+            "dynamic-bulk-demo".to_owned(),
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "dispatch".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "dispatch".to_owned(),
+                        CompiledStateNode::DynamicStartBulkActivity {
+                            descriptor: Expression::Object {
+                                fields: BTreeMap::from([
+                                    (
+                                        "__kind".to_owned(),
+                                        Expression::Literal {
+                                            value: json!("bulk_activity_descriptor"),
+                                        },
+                                    ),
+                                    (
+                                        "activity_type".to_owned(),
+                                        Expression::Member {
+                                            object: Box::new(Expression::Identifier {
+                                                name: "input".to_owned(),
+                                            }),
+                                            property: "activityName".to_owned(),
+                                        },
+                                    ),
+                                    (
+                                        "items".to_owned(),
+                                        Expression::Member {
+                                            object: Box::new(Expression::Identifier {
+                                                name: "input".to_owned(),
+                                            }),
+                                            property: "items".to_owned(),
+                                        },
+                                    ),
+                                    (
+                                        "task_queue".to_owned(),
+                                        Expression::Literal { value: json!("bulk") },
+                                    ),
+                                    (
+                                        "chunk_size".to_owned(),
+                                        Expression::Literal { value: json!(32) },
+                                    ),
+                                    (
+                                        "reducer".to_owned(),
+                                        Expression::Literal { value: json!("count") },
+                                    ),
+                                    (
+                                        "execution_policy".to_owned(),
+                                        Expression::Literal { value: json!("eager") },
+                                    ),
+                                    (
+                                        "activity_capabilities".to_owned(),
+                                        Expression::Object {
+                                            fields: BTreeMap::from([(
+                                                "payloadless_transport".to_owned(),
+                                                Expression::Literal { value: json!(true) },
+                                            )]),
+                                        },
+                                    ),
+                                ]),
+                            },
+                            next: "join".to_owned(),
+                            handle_var: "bulk".to_owned(),
+                        },
+                    ),
+                    (
+                        "join".to_owned(),
+                        CompiledStateNode::WaitForBulkActivity {
+                            bulk_ref_var: "bulk".to_owned(),
+                            next: "done".to_owned(),
+                            output_var: Some("summary".to_owned()),
+                            on_error: None,
+                        },
+                    ),
+                    (
+                        "done".to_owned(),
+                        CompiledStateNode::Succeed {
+                            output: Some(Expression::Identifier { name: "summary".to_owned() }),
+                        },
+                    ),
+                ]),
+                async_helpers: BTreeMap::new(),
+                params: Vec::new(),
+                non_cancellable_states: BTreeSet::new(),
+            },
+        );
+
+        let plan = artifact
+            .execute_trigger_with_turn(
+                &json!({
+                    "activityName": "custom.echo",
+                    "items": [{"value": 1}, {"value": 2}],
+                }),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            plan.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::BulkActivityBatchScheduled {
+                    activity_type,
+                    activity_capabilities,
+                    task_queue,
+                    chunk_size,
+                    execution_policy,
+                    reducer,
+                    ..
+                },
+                ..
+            }) if activity_type == "custom.echo"
+                && activity_capabilities == &Some(ActivityExecutionCapabilities {
+                    payloadless_transport: true,
+                    tiny_inline_completion: false,
+                })
+                && task_queue == "bulk"
+                && chunk_size == &32
+                && execution_policy.as_deref() == Some("eager")
+                && reducer.as_deref() == Some("count")
+        ));
     }
 
     #[test]
@@ -8208,6 +8775,7 @@ mod tests {
                     ),
                     ("finish".to_owned(), CompiledStateNode::Succeed { output: None }),
                 ]),
+                async_helpers: BTreeMap::new(),
                 params: Vec::new(),
                 non_cancellable_states: BTreeSet::from(["shielded_step".to_owned()]),
             },
@@ -8256,6 +8824,7 @@ mod tests {
                             next: "assign_true".to_owned(),
                             timeout_ref: Some("5s".to_owned()),
                             timeout_next: Some("assign_false".to_owned()),
+                            timer_expr: None,
                         },
                     ),
                     (
@@ -8285,6 +8854,7 @@ mod tests {
                         },
                     ),
                 ]),
+                async_helpers: BTreeMap::new(),
                 params: Vec::new(),
                 non_cancellable_states: BTreeSet::new(),
             },
@@ -8370,6 +8940,7 @@ mod tests {
                                 }),
                             },
                             next: "done".to_owned(),
+                            timer_expr: None,
                             timeout_ref: None,
                             timeout_next: None,
                         },
@@ -8383,6 +8954,7 @@ mod tests {
                         },
                     ),
                 ]),
+                async_helpers: BTreeMap::new(),
                 params: Vec::new(),
                 non_cancellable_states: BTreeSet::new(),
             },

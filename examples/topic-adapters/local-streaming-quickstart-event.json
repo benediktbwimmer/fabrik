@@ -1,0 +1,15 @@
+{
+  "event_id": "evt-local-quickstart",
+  "instance_id": "wf-local-quickstart",
+  "request_id": "req-local-quickstart",
+  "payload": {
+    "items": [
+      "alpha",
+      "beta",
+      "beta",
+      "gold",
+      "gold",
+      "gold"
+    ]
+  }
+}

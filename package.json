@@ -12,6 +12,7 @@
     "test:benchmarks": "node --test benchmarks/temporal-comparison/helpers.test.mjs",
     "benchmark:compare-temporal": "bash scripts/run-temporal-comparison-benchmark.sh --profile gate",
     "benchmark:compare-temporal:target": "bash scripts/run-temporal-comparison-benchmark.sh --profile target",
+    "benchmark:streaming-release-gate": "bash scripts/run-streaming-release-gate.sh",
     "ui:dev": "npm --prefix apps/fabrik-console run dev",
     "ui:build": "npm --prefix apps/fabrik-console run build",
     "ui:test": "npm --prefix apps/fabrik-console run test"

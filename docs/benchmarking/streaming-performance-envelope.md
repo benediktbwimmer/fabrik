@@ -9,6 +9,9 @@ This document captures the current benchmark-backed operating envelope for Fabri
 
 These numbers are intended as product guidance, not as a hard SLA.
 
+For the blocking `gate` checks used as the current release contract, see [streaming-release-scorecard.md](streaming-release-scorecard.md).
+For an example-driven setup path that uses these surfaces, see [../streaming-getting-started.md](../streaming-getting-started.md).
+
 ## Read The Numbers Correctly
 
 The benchmark runner reports `activity_throughput_per_second`.
@@ -43,27 +46,22 @@ These runs measure throughput while forcing owner restart during execution.
 
 ### Reducer target runs
 
-The `stream-v2` reducer path now materially outperforms `pg-v1` on the supported mergeable reducers.
+The supported mergeable reducers on `stream-v2` now sustain a clear high-throughput envelope.
 
-| Reducer | `pg-v1` | `stream-v2` |
-|---|---:|---:|
-| `sum` | about `4,788 APS` | about `20,382 APS` |
-| `min` | about `4,960 APS` | about `21,135 APS` |
-| `max` | about `4,910 APS` | about `20,305 APS` |
-| `avg` | about `4,781 APS` | about `19,930 APS` |
-| `histogram` | about `4,573 APS` | about `17,187 APS` |
+| Reducer | `stream-v2` |
+|---|---:|
+| `sum` | about `20,382 APS` |
+| `min` | about `21,135 APS` |
+| `max` | about `20,305 APS` |
+| `avg` | about `19,930 APS` |
+| `histogram` | about `17,187 APS` |
 
 Source reports:
 
-- [`streaming-reducers-target-w8-throughput-pg-v1-sum-pg-v1-sum.json`](/Users/bene/code/fabrik/target/benchmark-reports/streaming-reducers-target-w8-throughput-pg-v1-sum-pg-v1-sum.json)
 - [`streaming-reducers-target-w8-throughput-stream-v2-sum-stream-v2-sum.json`](/Users/bene/code/fabrik/target/benchmark-reports/streaming-reducers-target-w8-throughput-stream-v2-sum-stream-v2-sum.json)
-- [`streaming-reducers-target-w8-throughput-pg-v1-min-pg-v1-min.json`](/Users/bene/code/fabrik/target/benchmark-reports/streaming-reducers-target-w8-throughput-pg-v1-min-pg-v1-min.json)
 - [`streaming-reducers-target-w8-throughput-stream-v2-min-stream-v2-min.json`](/Users/bene/code/fabrik/target/benchmark-reports/streaming-reducers-target-w8-throughput-stream-v2-min-stream-v2-min.json)
-- [`streaming-reducers-target-w8-throughput-pg-v1-max-pg-v1-max.json`](/Users/bene/code/fabrik/target/benchmark-reports/streaming-reducers-target-w8-throughput-pg-v1-max-pg-v1-max.json)
 - [`streaming-reducers-target-w8-throughput-stream-v2-max-stream-v2-max.json`](/Users/bene/code/fabrik/target/benchmark-reports/streaming-reducers-target-w8-throughput-stream-v2-max-stream-v2-max.json)
-- [`streaming-reducers-target-w8-throughput-pg-v1-avg-pg-v1-avg.json`](/Users/bene/code/fabrik/target/benchmark-reports/streaming-reducers-target-w8-throughput-pg-v1-avg-pg-v1-avg.json)
 - [`streaming-reducers-target-w8-throughput-stream-v2-avg-stream-v2-avg.json`](/Users/bene/code/fabrik/target/benchmark-reports/streaming-reducers-target-w8-throughput-stream-v2-avg-stream-v2-avg.json)
-- [`streaming-reducers-target-w8-throughput-pg-v1-histogram-pg-v1-histogram.json`](/Users/bene/code/fabrik/target/benchmark-reports/streaming-reducers-target-w8-throughput-pg-v1-histogram-pg-v1-histogram.json)
 - [`streaming-reducers-target-w8-throughput-stream-v2-histogram-stream-v2-histogram.json`](/Users/bene/code/fabrik/target/benchmark-reports/streaming-reducers-target-w8-throughput-stream-v2-histogram-stream-v2-histogram.json)
 
 ### Workload-shape sensitivity

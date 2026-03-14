@@ -57,6 +57,10 @@ When external repos are scarce, use the internal pressure-repo set for engineeri
   - `target/pressure-repo-qualification/summary.json`
   - `target/pressure-repo-qualification/summary.md`
 - current pressure-batch status: `5/5` qualified with caveats
+- `temporal-versioning-upgrade-pressure` now has a passing internal mixed-build/restart/rollback drill in:
+  - `target/alpha-drills/temporal-versioning-upgrade-pressure/versioning-pressure-mixed-build-drill-report.json`
+  - current drill status: `passed`
+  - old/new/rollback replay divergence counts: `0 / 0 / 0`
 
 Current app-style batch signal:
 

@@ -1,6 +1,6 @@
 # Streaming Backend Benchmarks
 
-Use `benchmark-runner` to compare the durable engine, `pg-v1`, and `stream-v2` under the same workload.
+Use `benchmark-runner` to compare the durable engine and `stream-v2` under the same workload.
 
 For the current benchmark-backed product envelope and workload-shape guidance, see [streaming-performance-envelope.md](streaming-performance-envelope.md).
 
@@ -48,10 +48,9 @@ cargo run -p benchmark-runner -- \
   --output target/benchmark-reports/streaming-suite.json
 ```
 
-This executes three scenarios sequentially:
+This executes the baseline streaming scenarios sequentially:
 
 - `durable`
-- `throughput-pg-v1`
 - `throughput-stream-v2`
 
 The suite writes one JSON/TXT pair per scenario plus a suite JSON aggregate.
@@ -69,16 +68,6 @@ cargo run -p benchmark-runner -- \
 That suite exercises the `count` and `all_settled` reducers on `stream-v2` with smaller chunks so grouped fan-in and owner-first apply show up in the control-plane metrics.
 
 ## Single-scenario runs
-
-`pg-v1` throughput:
-
-```bash
-cargo run -p benchmark-runner -- \
-  --execution-mode throughput \
-  --throughput-backend pg-v1 \
-  --profile target \
-  --chunk-size 256
-```
 
 `stream-v2` throughput:
 

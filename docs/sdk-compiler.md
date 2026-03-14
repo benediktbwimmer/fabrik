@@ -188,7 +188,7 @@ For throughput mode, the compiler additionally lowers `ctx.bulkActivity()` into:
 
 Bulk activity options (`taskQueue`, `chunkSize`, `execution`, `reducer`, `retry`) must be static literals in the compiled artifact. The `items` expression is evaluated at runtime.
 
-Backend selection is server-controlled and pinned per batch. Workflow code does not select `pg-v1` vs `stream-v2`.
+Backend selection is server-controlled and pinned per batch. Workflow code does not select the backend, and new bulk work is admitted only to `stream-v2`.
 
 The compiler must reject workflow code that breaks determinism, while activity code remains unconstrained.
 

@@ -893,6 +893,7 @@ async fn execute_bulk_activity_task(
 ) -> Result<BulkActivityTaskResult> {
     if can_complete_payloadless_bulk_chunk(
         &task.activity_type,
+        None,
         task.omit_success_output,
         task.item_count,
         !task.items_json.is_empty() || !task.items_cbor.is_empty(),

@@ -1,0 +1,25 @@
+{
+  "adapter_kind": "redpanda",
+  "brokers": "localhost:29092",
+  "topic_name": "streaming.quickstart.events",
+  "topic_partitions": 1,
+  "action": "start_workflow",
+  "definition_id": "local-streaming-quickstart-workflow",
+  "workflow_task_queue": "bulk",
+  "workflow_instance_id_json_pointer": "/instance_id",
+  "payload_json_pointer": "/payload/items",
+  "memo_template_json": {
+    "source": "local-quickstart",
+    "request_id": {
+      "$from": "/request_id"
+    }
+  },
+  "search_attributes_template_json": {
+    "instance_id": {
+      "$from": "/instance_id"
+    },
+    "event_type": "streaming.quickstart"
+  },
+  "request_id_json_pointer": "/request_id",
+  "dead_letter_policy": "store"
+}

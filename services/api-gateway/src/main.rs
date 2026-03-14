@@ -2311,7 +2311,7 @@ mod tests {
 
     fn test_admission_config() -> AdmissionDebugConfig {
         AdmissionDebugConfig {
-            default_backend: "pg-v1".to_owned(),
+            default_backend: "stream-v2".to_owned(),
             task_queue_backends: BTreeMap::new(),
             max_active_chunks_per_tenant: 4_096,
             max_active_chunks_per_task_queue: 2_048,
@@ -2741,7 +2741,7 @@ mod tests {
         assert_eq!(inspection["throughput_policy"]["backend"], "stream-v2");
         assert_eq!(inspection["admission"]["effective_preferred_backend"], "stream-v2");
         assert_eq!(inspection["admission"]["stream_v2_capacity"]["state"], "available");
-        assert_eq!(inspection["admission"]["configured_default_backend"], "pg-v1");
+        assert_eq!(inspection["admission"]["configured_default_backend"], "stream-v2");
 
         Ok(())
     }

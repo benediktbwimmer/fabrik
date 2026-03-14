@@ -405,6 +405,7 @@ async fn process_event(
             schedule_to_close_timeout_ms,
             start_to_close_timeout_ms,
             heartbeat_timeout_ms,
+            ..
         } => {
             state
                 .store
@@ -455,8 +456,9 @@ async fn process_event(
             throughput_backend,
             throughput_backend_version,
             state: workflow_state,
+            ..
         } => {
-            if throughput_backend != ThroughputBackend::PgV1.as_str() {
+            if throughput_backend != ThroughputBackend::StreamV2.as_str() {
                 return Ok(());
             }
             let reducer_class = bulk_reducer_class(reducer.as_deref());
@@ -559,7 +561,7 @@ async fn process_event(
                 &event.tenant_id,
                 &event.instance_id,
                 &event.run_id,
-                ThroughputBackend::PgV1.as_str(),
+                ThroughputBackend::StreamV2.as_str(),
                 reason,
                 None,
             )
@@ -702,7 +704,7 @@ async fn sweep_activities(state: &AppState) -> Result<()> {
         .store
         .list_started_bulk_chunks_for_backend(
             state.runtime.max_rebuild_tasks as usize,
-            ThroughputBackend::PgV1.as_str(),
+            ThroughputBackend::StreamV2.as_str(),
         )
         .await?
     {
@@ -1110,7 +1112,7 @@ async fn report_bulk_activity_results(
             &result.instance_id,
             &result.run_id,
             &result.batch_id,
-            ThroughputBackend::PgV1.as_str(),
+            ThroughputBackend::StreamV2.as_str(),
         )
         .await?;
         let update = prepare_bulk_result(result)?;
@@ -2333,6 +2335,7 @@ fn scheduled_activity_record(event: &EventEnvelope<WorkflowEvent>) -> WorkflowAc
         schedule_to_close_timeout_ms,
         start_to_close_timeout_ms,
         heartbeat_timeout_ms,
+        ..
     } = &event.payload
     else {
         unreachable!("scheduled_activity_record only accepts ActivityTaskScheduled");
@@ -2992,6 +2995,7 @@ mod tests {
             workflow_turn_routing(&WorkflowEvent::ActivityTaskScheduled {
                 activity_id: "a1".to_owned(),
                 activity_type: "demo".to_owned(),
+                activity_capabilities: None,
                 task_queue: "default".to_owned(),
                 attempt: 1,
                 input: Value::Null,
@@ -3289,6 +3293,7 @@ mod tests {
             demo_event(WorkflowEvent::ActivityTaskScheduled {
                 activity_id: "a1".to_owned(),
                 activity_type: "charge".to_owned(),
+                activity_capabilities: None,
                 task_queue: "payments".to_owned(),
                 attempt: 1,
                 input: json!({"amount": 10}),
@@ -3332,6 +3337,7 @@ mod tests {
             demo_event(WorkflowEvent::ActivityTaskScheduled {
                 activity_id: "a2".to_owned(),
                 activity_type: "charge".to_owned(),
+                activity_capabilities: None,
                 task_queue: "payments".to_owned(),
                 attempt: 1,
                 input: json!({"amount": 20}),
@@ -3397,6 +3403,7 @@ mod tests {
         let mut event = demo_event(WorkflowEvent::ActivityTaskScheduled {
             activity_id: "a1".to_owned(),
             activity_type: "charge".to_owned(),
+            activity_capabilities: None,
             task_queue: "payments".to_owned(),
             attempt: 1,
             input: json!({"amount": 10}),
@@ -3463,6 +3470,7 @@ mod tests {
                 demo_event(WorkflowEvent::ActivityTaskScheduled {
                     activity_id: activity_id.to_owned(),
                     activity_type: "charge".to_owned(),
+                    activity_capabilities: None,
                     task_queue: "payments".to_owned(),
                     attempt: 1,
                     input: json!({"amount": amount}),
@@ -3583,17 +3591,16 @@ mod tests {
             )
             .await?;
 
-        let error = ensure_bulk_batch_backend(
+        ensure_bulk_batch_backend(
             &store,
             "tenant-a",
             "wf-stream-bulk",
             "run-stream-bulk",
             "batch-stream",
-            ThroughputBackend::PgV1.as_str(),
+            ThroughputBackend::StreamV2.as_str(),
         )
         .await
-        .expect_err("stream-v2 batch should be rejected by pg-v1 matcher");
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        .expect("stream-v2 batch should be accepted by stream-v2 matcher");
 
         Ok(())
     }

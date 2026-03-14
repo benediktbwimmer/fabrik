@@ -279,13 +279,13 @@ This phase exists to keep storage, RPC, and failover semantics from drifting whi
 ## Non-Goals
 
 - changing the product-facing `ctx.bulkActivity()` API
-- changing `pg-v1`
+- changing historical batch semantics
 - changing workflow-visible barrier semantics
 - making per-item workflow history durable for throughput mode
 
 ## Guardrails
 
-- `pg-v1` remains the compatibility backend during the rewrite
+- historical rows remain readable during the rewrite
 - in-flight `stream-v2` runs must finish on the execution model they started with
 - restore must be validated under owner failover before removing any legacy path
 - benchmark success is not enough on its own; crash recovery and exactly-once terminal barrier emission must remain intact

@@ -59,6 +59,7 @@ const WORKER_BLOCKING_PROPERTIES = new Map([
   ["payloadCodec", "custom payload codecs are not supported by the migration pipeline"],
   ["payloadConverterPath", "custom payload converters are not supported by the migration pipeline"],
   ["codecServer", "codec servers are not supported by the migration pipeline"],
+  ["interceptors", "workflow interceptors are not migration-ready yet"],
   ["workflowInterceptorModules", "workflow interceptors are not migration-ready yet"],
 ]);
 
@@ -84,6 +85,12 @@ function parseArgs(argv) {
 
 function relativeProjectPath(projectRoot, fileName) {
   return path.relative(projectRoot, fileName).split(path.sep).join("/");
+}
+
+function normalizeProjectModuleKey(fileName) {
+  return fileName
+    .replace(/\.(mts|cts|ts|mjs|cjs|js)$/u, "")
+    .replace(/\/index$/u, "");
 }
 
 function formatNodeLocation(projectRoot, node) {
@@ -877,23 +884,64 @@ function analyzeActivitiesRegistration(sourceFile, activitiesProperty, currentBi
   return { supported: false };
 }
 
-function supportsStaticWorkflowInterceptors(interceptorsProperty, currentBindings, checker) {
+function staticWorkflowInterceptorModulePaths(projectRoot, sourceFile, interceptorsProperty, currentBindings, checker) {
   if (!ts.isPropertyAssignment(interceptorsProperty)) {
-    return false;
+    return null;
   }
   const resolved = resolveStaticExpression(interceptorsProperty.initializer, currentBindings, checker);
   if (!ts.isObjectLiteralExpression(resolved)) {
-    return false;
+    return null;
   }
   const workflowModules = findObjectProperty(resolved, "workflowModules");
   if (workflowModules == null || !ts.isPropertyAssignment(workflowModules)) {
-    return false;
+    return null;
   }
   const rendered = staticBootstrapArgExpression(workflowModules.initializer, currentBindings, checker);
-  return rendered != null;
+  if (rendered == null) {
+    return null;
+  }
+  const values = evaluateStaticValue(workflowModules.initializer, currentBindings, checker);
+  if (!Array.isArray(values) || !values.every((value) => typeof value === "string")) {
+    return [];
+  }
+  const resolvedPaths = values
+    .map((specifier) => resolveProjectModulePath(projectRoot, sourceFile.fileName, specifier))
+    .filter((resolvedModulePath) => typeof resolvedModulePath === "string")
+    .map((resolvedModulePath) => relativeProjectPath(projectRoot, resolvedModulePath));
+  if (resolvedPaths.length > 0) {
+    return resolvedPaths;
+  }
+  if (!ts.isArrayLiteralExpression(workflowModules.initializer)) {
+    return [];
+  }
+  return workflowModules.initializer.elements
+    .map((element) => findStaticString(element, currentBindings, checker))
+    .filter((specifier) => typeof specifier === "string")
+    .map((specifier) => resolveProjectModulePath(projectRoot, sourceFile.fileName, specifier))
+    .filter((resolvedModulePath) => typeof resolvedModulePath === "string")
+    .map((resolvedModulePath) => relativeProjectPath(projectRoot, resolvedModulePath));
 }
 
 function resolveProjectModulePath(projectRoot, fromFileName, specifier) {
+  if (path.isAbsolute(specifier)) {
+    if (ts.sys.fileExists(specifier)) {
+      return specifier;
+    }
+    if (!path.extname(specifier)) {
+      for (const extension of [".ts", ".mts", ".cts", ".js", ".mjs", ".cjs"]) {
+        const candidate = `${specifier}${extension}`;
+        if (ts.sys.fileExists(candidate)) {
+          return candidate;
+        }
+      }
+      for (const indexName of ["index.ts", "index.mts", "index.cts", "index.js", "index.mjs", "index.cjs"]) {
+        const candidate = path.join(specifier, indexName);
+        if (ts.sys.fileExists(candidate)) {
+          return candidate;
+        }
+      }
+    }
+  }
   const compilerOptions = parseCompilerOptionsForFile(projectRoot, fromFileName);
   const resolved = ts.resolveModuleName(specifier, fromFileName, compilerOptions, ts.sys).resolvedModule;
   if (resolved?.resolvedFileName && ts.sys.fileExists(resolved.resolvedFileName)) {
@@ -1236,7 +1284,86 @@ function collectWorkflowOptionAnnotations(sourceFile, workflowImports) {
   return annotations;
 }
 
-function extractExportedAsyncWorkflows(projectRoot, program, sourceFile, fileUses, workflowAnnotations = new Map()) {
+function resolveAsyncWorkflowImplementation(node, checker, workflowImports, seen = new Set()) {
+  if (!node) {
+    return null;
+  }
+  if (ts.isParenthesizedExpression(node)) {
+    return resolveAsyncWorkflowImplementation(node.expression, checker, workflowImports, seen);
+  }
+  if (ts.isFunctionExpression(node) || ts.isArrowFunction(node)) {
+    return node.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword) ? node : null;
+  }
+  if (ts.isIdentifier(node)) {
+    const symbol = checker.getSymbolAtLocation(node);
+    if (!symbol) {
+      return null;
+    }
+    const resolvedSymbol = symbol.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(symbol) : symbol;
+    const declaration = resolvedSymbol.valueDeclaration ?? resolvedSymbol.declarations?.[0];
+    if (!declaration || seen.has(declaration)) {
+      return null;
+    }
+    seen.add(declaration);
+    try {
+      if (ts.isFunctionDeclaration(declaration)) {
+        return declaration.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)
+          ? declaration
+          : null;
+      }
+      if (ts.isVariableDeclaration(declaration) && declaration.initializer) {
+        return resolveAsyncWorkflowImplementation(declaration.initializer, checker, workflowImports, seen);
+      }
+      return null;
+    } finally {
+      seen.delete(declaration);
+    }
+  }
+  if (
+    ts.isCallExpression(node) &&
+    resolveImportedTemporalName(node.expression, workflowImports) === "setWorkflowOptions" &&
+    node.arguments.length === 2
+  ) {
+    return resolveAsyncWorkflowImplementation(node.arguments[1], checker, workflowImports, seen);
+  }
+  return null;
+}
+
+function extractVersioningBehaviorAnnotation(node, workflowImports) {
+  if (
+    !ts.isCallExpression(node) ||
+    resolveImportedTemporalName(node.expression, workflowImports) !== "setWorkflowOptions" ||
+    node.arguments.length !== 2
+  ) {
+    return null;
+  }
+  const optionsArg = node.arguments[0];
+  if (!ts.isObjectLiteralExpression(optionsArg)) {
+    return null;
+  }
+  const versioningBehaviorProperty = findObjectProperty(optionsArg, "versioningBehavior");
+  if (
+    versioningBehaviorProperty == null ||
+    !ts.isPropertyAssignment(versioningBehaviorProperty) ||
+    !ts.isStringLiteralLike(versioningBehaviorProperty.initializer)
+  ) {
+    return null;
+  }
+  const versioningBehavior = versioningBehaviorProperty.initializer.text;
+  if (!["AUTO_UPGRADE", "PINNED"].includes(versioningBehavior)) {
+    return null;
+  }
+  return { versioning_behavior: versioningBehavior };
+}
+
+function extractExportedAsyncWorkflows(
+  projectRoot,
+  program,
+  sourceFile,
+  fileUses,
+  workflowImports,
+  workflowAnnotations = new Map(),
+) {
   const checker = program.getTypeChecker();
   const symbol = checker.getSymbolAtLocation(sourceFile);
   if (!symbol) return [];
@@ -1245,22 +1372,27 @@ function extractExportedAsyncWorkflows(projectRoot, program, sourceFile, fileUse
   for (const candidate of exports) {
     const declaration = candidate.valueDeclaration ?? candidate.declarations?.[0];
     if (!declaration) continue;
-    if (
+    const implementation = (
       ts.isFunctionDeclaration(declaration) ||
       ts.isFunctionExpression(declaration) ||
       ts.isArrowFunction(declaration)
-    ) {
-      if (!declaration.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) {
-        continue;
-      }
-      workflows.push({
-        file: relativeProjectPath(projectRoot, sourceFile.fileName),
-        export_name: candidate.getName(),
-        definition_id_suggestion: definitionIdSuggestion(projectRoot, sourceFile.fileName, candidate.getName()),
-        uses: [...fileUses].sort(),
-        ...(workflowAnnotations.get(candidate.getName()) ?? {}),
-      });
-    }
+    )
+      ? declaration
+      : ts.isVariableDeclaration(declaration) && declaration.initializer
+        ? resolveAsyncWorkflowImplementation(declaration.initializer, checker, workflowImports)
+        : null;
+    if (!implementation) continue;
+    const inlineAnnotation =
+      ts.isVariableDeclaration(declaration) && declaration.initializer
+        ? extractVersioningBehaviorAnnotation(declaration.initializer, workflowImports)
+        : null;
+    workflows.push({
+      file: relativeProjectPath(projectRoot, sourceFile.fileName),
+      export_name: candidate.getName(),
+      definition_id_suggestion: definitionIdSuggestion(projectRoot, sourceFile.fileName, candidate.getName()),
+      uses: [...fileUses].sort(),
+      ...(workflowAnnotations.get(candidate.getName()) ?? inlineAnnotation ?? {}),
+    });
   }
   return workflows;
 }
@@ -1301,6 +1433,7 @@ async function main() {
   const analyzedFiles = [];
   const workflows = [];
   const workers = [];
+  const interceptorWorkflowModuleFiles = new Set();
   let findings = [];
   const supportedPayloadConverterPathNodes = new WeakSet();
 
@@ -1522,11 +1655,26 @@ async function main() {
           for (const [propertyName, remediation] of WORKER_BLOCKING_PROPERTIES.entries()) {
             const property = findObjectProperty(firstArg, propertyName);
             if (property) {
+              const workflowModulePaths =
+                propertyName === "interceptors"
+                  ? staticWorkflowInterceptorModulePaths(
+                      projectRoot,
+                      sourceFile,
+                      property,
+                      currentBindings,
+                      checker,
+                    )
+                  : null;
               if (
                 propertyName === "interceptors" &&
-                supportsStaticWorkflowInterceptors(property, currentBindings, checker)
+                workflowModulePaths != null
               ) {
                 fileUses.add("interceptors_middleware");
+                for (const workflowModulePath of workflowModulePaths) {
+                  interceptorWorkflowModuleFiles.add(
+                    normalizeProjectModuleKey(workflowModulePath),
+                  );
+                }
                 continue;
               }
               findings.push(
@@ -1666,7 +1814,14 @@ async function main() {
     visit(sourceFile, new Map());
 
     const exportedWorkflows = workflowImports.size > 0
-      ? extractExportedAsyncWorkflows(projectRoot, program, sourceFile, fileUses, workflowAnnotations)
+      ? extractExportedAsyncWorkflows(
+          projectRoot,
+          program,
+          sourceFile,
+          fileUses,
+          workflowImports,
+          workflowAnnotations,
+        )
       : [];
     workflows.push(...exportedWorkflows);
 
@@ -1677,6 +1832,21 @@ async function main() {
       uses: [...fileUses].sort(),
     });
   }
+
+  const filteredWorkflows = workflows.filter(
+    (workflow) =>
+      !interceptorWorkflowModuleFiles.has(
+        normalizeProjectModuleKey(workflow.file),
+      ),
+  );
+  const filteredAnalyzedFiles = analyzedFiles.map((file) => ({
+    ...file,
+    exported_workflows: interceptorWorkflowModuleFiles.has(
+      normalizeProjectModuleKey(file.path),
+    )
+      ? []
+      : file.exported_workflows,
+  }));
 
   findings = dedupeFindings(findings);
   const hasNonTestWorker = workers.some((worker) => !isTestSupportFile(worker.file));
@@ -1714,14 +1884,14 @@ async function main() {
           promotion_requirements: supportMatrixDocument.promotion_requirements,
         },
         support_matrix: supportMatrixDocument.features,
-        files: analyzedFiles.sort((left, right) => left.path.localeCompare(right.path)),
-        workflows: workflows.sort((left, right) =>
+        files: filteredAnalyzedFiles.sort((left, right) => left.path.localeCompare(right.path)),
+        workflows: filteredWorkflows.sort((left, right) =>
           `${left.file}:${left.export_name}`.localeCompare(`${right.file}:${right.export_name}`),
         ),
         workers: workers.sort((left, right) => left.file.localeCompare(right.file)),
         findings,
         summary: {
-          workflow_count: workflows.length,
+          workflow_count: filteredWorkflows.length,
           worker_count: workers.length,
           hard_block_count: hardBlockCount,
           warning_count: warningCount,

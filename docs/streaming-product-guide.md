@@ -105,6 +105,8 @@ The intended operator loop is:
 4. Drill into **Task Queues** when capacity pressure or backend routing needs explanation.
 5. Drill into **Runs** and **Run detail** when a specific workflow or throughput batch needs batch-level progress, reducer output, or routing inspection.
 
+For a concrete setup path with example workflows and adapter configs, see [streaming-getting-started.md](streaming-getting-started.md).
+
 ## Product Positioning
 
 The clean way to describe Fabrik's streaming story is:
@@ -156,8 +158,10 @@ The goal is straightforward:
 
 For engineers:
 
+- [streaming-getting-started.md](streaming-getting-started.md)
 - [spec/throughput-mode.md](spec/throughput-mode.md)
 - [benchmarking/streaming-performance-envelope.md](benchmarking/streaming-performance-envelope.md)
+- [benchmarking/streaming-release-scorecard.md](benchmarking/streaming-release-scorecard.md)
 
 For operators:
 

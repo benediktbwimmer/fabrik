@@ -251,7 +251,7 @@ terminate_pid() {
     return 0
   fi
   kill "$pid" >/dev/null 2>&1 || true
-  local deadline=$((SECONDS + 15))
+  local deadline=$((SECONDS + 5))
   while kill -0 "$pid" >/dev/null 2>&1 && (( SECONDS < deadline )); do
     sleep 1
   done

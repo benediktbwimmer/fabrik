@@ -83,6 +83,14 @@ test("migration analyzer supports default-compatible payload converters and bloc
     root,
     "crates/fabrik-cli/test-fixtures/temporal-worker-versioning-qualified",
   );
+  const versioningPressureFixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-versioning-upgrade-pressure",
+  );
+  const interceptorPressureFixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-interceptor-pressure",
+  );
   const searchAttributesQualifiedFixture = path.join(
     root,
     "crates/fabrik-cli/test-fixtures/temporal-search-attributes-qualified",
@@ -114,6 +122,8 @@ test("migration analyzer supports default-compatible payload converters and bloc
   const supportedApiQualified = await analyze(supportedApiQualifiedFixture);
   const activityFailureQualified = await analyze(activityFailureQualifiedFixture);
   const workerVersioningQualified = await analyze(workerVersioningQualifiedFixture);
+  const versioningPressureQualified = await analyze(versioningPressureFixture);
+  const interceptorPressureQualified = await analyze(interceptorPressureFixture);
   const searchAttributesQualified = await analyze(searchAttributesQualifiedFixture);
   const patchingQualified = await analyze(patchingQualifiedFixture);
   const payloadPathQualifiedV2 = await analyze(payloadPathQualifiedV2Fixture);
@@ -182,6 +192,18 @@ test("migration analyzer supports default-compatible payload converters and bloc
   assert.equal(workerVersioningQualified.workers[0].task_queue, "worker-versioning-qualified");
   assert.equal(workerVersioningQualified.workflows[0].versioning_behavior, "AUTO_UPGRADE");
   assert.equal(workerVersioningQualified.workflows[1].versioning_behavior, "PINNED");
+  assert.equal(versioningPressureQualified.summary.hard_block_count, 0);
+  assert.equal(versioningPressureQualified.summary.workflow_count, 1);
+  assert.equal(versioningPressureQualified.workflows[0].export_name, "versioningPressureWorkflow");
+  assert.equal(versioningPressureQualified.workflows[0].versioning_behavior, "AUTO_UPGRADE");
+  assert.equal(interceptorPressureQualified.summary.hard_block_count, 0);
+  assert.equal(interceptorPressureQualified.summary.workflow_count, 1);
+  assert.equal(interceptorPressureQualified.workflows[0].export_name, "interceptorPressureWorkflow");
+  assert.ok(
+    interceptorPressureQualified.files.some(
+      (file) => file.path === "src/interceptors.ts" && file.exported_workflows.length === 0,
+    ),
+  );
   assert.equal(searchAttributesQualified.summary.hard_block_count, 0);
   assert.equal(searchAttributesQualified.workers[0].task_queue, "search-attributes-qualified");
   assert.ok(searchAttributesQualified.files.some((file) => file.uses.includes("search_attributes_memo")));

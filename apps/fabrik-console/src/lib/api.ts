@@ -20,7 +20,7 @@ export type WorkflowListItem = {
   sticky_workflow_build_id: string | null;
   sticky_workflow_poller_id: string | null;
   routing_status: string;
-  execution_path: string | null;
+  admission_mode: string | null;
   fast_path_rejection_reason: string | null;
   current_state: string | null;
   status: string;
@@ -248,7 +248,7 @@ export type WorkflowRun = {
   search_attributes: unknown;
   sticky_workflow_build_id: string | null;
   sticky_workflow_poller_id: string | null;
-  execution_path: string;
+  admission_mode: string;
   fast_path_rejection_reason: string | null;
   started_at: string;
   closed_at: string | null;
@@ -276,7 +276,7 @@ export type RunListItem = {
   sticky_workflow_build_id: string | null;
   sticky_workflow_poller_id: string | null;
   routing_status: string;
-  execution_path: string;
+  admission_mode: string;
   fast_path_rejection_reason: string | null;
   sticky_updated_at: string | null;
   previous_run_id: string | null;

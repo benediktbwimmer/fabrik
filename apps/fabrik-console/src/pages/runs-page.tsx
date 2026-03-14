@@ -34,6 +34,17 @@ function labelFromSnakeCase(value: string | null | undefined) {
     .join(" ");
 }
 
+function workflowModeLabel(admissionMode: string | null | undefined) {
+  if (!admissionMode) return "-";
+  if (admissionMode === "inline_fast_start") {
+    return "Inline Fast Start";
+  }
+  if (admissionMode === "durable_workflow") {
+    return "Durable Workflow";
+  }
+  return labelFromSnakeCase(admissionMode);
+}
+
 function buildParams(searchParams: URLSearchParams) {
   const params = new URLSearchParams();
   for (const key of [
@@ -294,9 +305,9 @@ export function RunsPage() {
                 </td>
                 <td>
                   <Badge value={item.routing_status} />
-                  <div className="muted">engine {labelFromSnakeCase(item.execution_path)}</div>
+                  <div className="muted">mode {workflowModeLabel(item.admission_mode)}</div>
                   {item.fast_path_rejection_reason ? (
-                    <div className="muted">fallback {labelFromSnakeCase(item.fast_path_rejection_reason)}</div>
+                    <div className="muted">fast-start fallback {labelFromSnakeCase(item.fast_path_rejection_reason)}</div>
                   ) : null}
                 </td>
                 <td>

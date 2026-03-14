@@ -98,6 +98,17 @@ function labelFromSnakeCase(value: string | null | undefined) {
     .join(" ");
 }
 
+function workflowModeLabel(admissionMode: string | null | undefined) {
+  if (!admissionMode) return "-";
+  if (admissionMode === "inline_fast_start") {
+    return "Inline Fast Start";
+  }
+  if (admissionMode === "durable_workflow") {
+    return "Durable Workflow";
+  }
+  return labelFromSnakeCase(admissionMode);
+}
+
 function reducerOutputPreview(value: unknown) {
   if (value == null) return "-";
   if (typeof value === "number" || typeof value === "boolean" || typeof value === "string") {
@@ -588,8 +599,8 @@ export function WorkflowDetailPage() {
                     <div>Definition version {formatInlineValue(routing?.definition_version ?? selectedRun?.definition_version)}</div>
                     <div>Artifact hash {routing?.artifact_hash ?? selectedRun?.artifact_hash ?? "-"}</div>
                     <div>Routing status {routing?.routing_status ?? "-"}</div>
-                    <div>Execution path {labelFromSnakeCase(selectedRun?.execution_path)}</div>
-                    <div>Fast-path fallback {labelFromSnakeCase(selectedRun?.fast_path_rejection_reason)}</div>
+                    <div>Workflow mode {workflowModeLabel(selectedRun?.admission_mode)}</div>
+                    <div>Fast-start fallback {labelFromSnakeCase(selectedRun?.fast_path_rejection_reason)}</div>
                     <div>Default set {routing?.default_compatibility_set_id ?? "-"}</div>
                     <div>Sticky build {routing?.sticky_workflow_build_id ?? selectedRun?.sticky_workflow_build_id ?? "-"}</div>
                     <div>Sticky poller {routing?.sticky_workflow_poller_id ?? selectedRun?.sticky_workflow_poller_id ?? "-"}</div>

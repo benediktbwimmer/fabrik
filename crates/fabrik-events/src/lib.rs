@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
+use fabrik_throughput::ActivityExecutionCapabilities;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -120,6 +121,8 @@ pub enum WorkflowEvent {
     ActivityTaskScheduled {
         activity_id: String,
         activity_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity_capabilities: Option<ActivityExecutionCapabilities>,
         task_queue: String,
         attempt: u32,
         input: Value,
@@ -189,6 +192,8 @@ pub enum WorkflowEvent {
     BulkActivityBatchScheduled {
         batch_id: String,
         activity_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        activity_capabilities: Option<ActivityExecutionCapabilities>,
         task_queue: String,
         items: Vec<Value>,
         input_handle: Value,
@@ -489,6 +494,7 @@ mod tests {
             workflow_turn_routing(&WorkflowEvent::ActivityTaskScheduled {
                 activity_id: "a1".to_owned(),
                 activity_type: "demo".to_owned(),
+                activity_capabilities: None,
                 task_queue: "default".to_owned(),
                 attempt: 1,
                 input: json!(null),

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_throughput::{
-    ADMISSION_POLICY_VERSION, ThroughputChunkReport, ThroughputCommandEnvelope,
+    ADMISSION_POLICY_VERSION, ThroughputBackend, ThroughputChunkReport, ThroughputCommandEnvelope,
     bulk_reducer_default_summary_value, bulk_reducer_name, bulk_reducer_reduce_errors,
     bulk_reducer_reduce_values, bulk_reducer_requires_error_outputs,
     bulk_reducer_requires_success_outputs, bulk_reducer_settles, throughput_execution_mode,
@@ -592,7 +592,7 @@ pub struct WorkflowRunRecord {
     pub trigger_event_id: Uuid,
     pub continued_event_id: Option<Uuid>,
     pub triggered_by_run_id: Option<String>,
-    pub execution_path: String,
+    pub admission_mode: String,
     pub fast_path_rejection_reason: Option<String>,
     pub started_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
@@ -614,7 +614,7 @@ pub struct WorkflowRunStartRecord {
     pub started_at: DateTime<Utc>,
     pub previous_run_id: Option<String>,
     pub triggered_by_run_id: Option<String>,
-    pub execution_path: Option<String>,
+    pub admission_mode: Option<String>,
     pub fast_path_rejection_reason: Option<String>,
 }
 
@@ -623,7 +623,7 @@ pub struct WorkflowRunRoutingMetadata {
     pub tenant_id: String,
     pub instance_id: String,
     pub run_id: String,
-    pub execution_path: String,
+    pub admission_mode: String,
     pub fast_path_rejection_reason: Option<String>,
 }
 
@@ -689,7 +689,7 @@ pub struct WorkflowFastStartRecord {
     pub artifact_hash: String,
     pub workflow_task_queue: String,
     pub mode: WorkflowFastStartMode,
-    pub execution_path: String,
+    pub admission_mode: String,
     pub status: WorkflowFastStartStatus,
     pub input: Value,
     pub memo: Option<Value>,
@@ -733,7 +733,7 @@ pub struct WorkflowRunSummaryRecord {
     pub previous_run_id: Option<String>,
     pub next_run_id: Option<String>,
     pub continue_reason: Option<String>,
-    pub execution_path: String,
+    pub admission_mode: String,
     pub fast_path_rejection_reason: Option<String>,
     pub started_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
@@ -2384,8 +2384,8 @@ impl WorkflowStore {
                 state TEXT,
                 input_handle JSONB NOT NULL DEFAULT '{}'::jsonb,
                 result_handle JSONB NOT NULL DEFAULT '{}'::jsonb,
-                throughput_backend TEXT NOT NULL DEFAULT 'pg-v1',
-                throughput_backend_version TEXT NOT NULL DEFAULT '1.0.0',
+                throughput_backend TEXT NOT NULL DEFAULT 'stream-v2',
+                throughput_backend_version TEXT NOT NULL DEFAULT '2.0.0',
                 routing_reason TEXT NOT NULL DEFAULT '',
                 admission_policy_version TEXT NOT NULL DEFAULT '2026-03-13.1',
                 execution_policy TEXT,
@@ -2421,8 +2421,8 @@ impl WorkflowStore {
             ALTER TABLE workflow_bulk_batches
             ADD COLUMN IF NOT EXISTS input_handle JSONB NOT NULL DEFAULT '{}'::jsonb,
             ADD COLUMN IF NOT EXISTS result_handle JSONB NOT NULL DEFAULT '{}'::jsonb,
-            ADD COLUMN IF NOT EXISTS throughput_backend TEXT NOT NULL DEFAULT 'pg-v1',
-            ADD COLUMN IF NOT EXISTS throughput_backend_version TEXT NOT NULL DEFAULT '1.0.0',
+            ADD COLUMN IF NOT EXISTS throughput_backend TEXT NOT NULL DEFAULT 'stream-v2',
+            ADD COLUMN IF NOT EXISTS throughput_backend_version TEXT NOT NULL DEFAULT '2.0.0',
             ADD COLUMN IF NOT EXISTS routing_reason TEXT NOT NULL DEFAULT '',
             ADD COLUMN IF NOT EXISTS admission_policy_version TEXT NOT NULL DEFAULT '2026-03-13.1',
             ADD COLUMN IF NOT EXISTS execution_policy TEXT,
@@ -2437,6 +2437,18 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to ensure workflow_bulk_batches throughput metadata columns")?;
+        sqlx::query(
+            "ALTER TABLE workflow_bulk_batches ALTER COLUMN throughput_backend SET DEFAULT 'stream-v2'",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to set workflow_bulk_batches.throughput_backend default")?;
+        sqlx::query(
+            "ALTER TABLE workflow_bulk_batches ALTER COLUMN throughput_backend_version SET DEFAULT '2.0.0'",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to set workflow_bulk_batches.throughput_backend_version default")?;
 
         sqlx::query(
             r#"
@@ -2578,7 +2590,7 @@ impl WorkflowStore {
                 artifact_hash TEXT,
                 batch_id TEXT NOT NULL,
                 throughput_backend TEXT NOT NULL,
-                execution_path TEXT NOT NULL DEFAULT '',
+                admission_mode TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL,
                 command_dedupe_key TEXT NOT NULL,
                 command JSONB NOT NULL,
@@ -2936,7 +2948,7 @@ impl WorkflowStore {
                 trigger_event_id UUID NOT NULL,
                 continued_event_id UUID,
                 triggered_by_run_id TEXT,
-                execution_path TEXT NOT NULL DEFAULT '',
+                admission_mode TEXT NOT NULL DEFAULT '',
                 fast_path_rejection_reason TEXT,
                 started_at TIMESTAMPTZ NOT NULL,
                 closed_at TIMESTAMPTZ,
@@ -2983,11 +2995,37 @@ impl WorkflowStore {
             .await
             .context("failed to add workflow_runs.search_attributes")?;
         sqlx::query(
-            "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS execution_path TEXT NOT NULL DEFAULT ''",
+            r#"
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'workflow_runs'
+                      AND column_name = 'execution_path'
+                ) AND NOT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'workflow_runs'
+                      AND column_name = 'admission_mode'
+                ) THEN
+                    ALTER TABLE workflow_runs RENAME COLUMN execution_path TO admission_mode;
+                END IF;
+            END
+            $$;
+            "#,
         )
         .execute(&self.pool)
         .await
-        .context("failed to add workflow_runs.execution_path")?;
+        .context("failed to rename workflow_runs.execution_path to admission_mode")?;
+        sqlx::query(
+            "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS admission_mode TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add workflow_runs.admission_mode")?;
         sqlx::query(
             "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS fast_path_rejection_reason TEXT",
         )
@@ -3007,7 +3045,7 @@ impl WorkflowStore {
                 artifact_hash TEXT NOT NULL,
                 workflow_task_queue TEXT NOT NULL,
                 mode TEXT NOT NULL,
-                execution_path TEXT NOT NULL DEFAULT '',
+                admission_mode TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL,
                 input JSONB NOT NULL,
                 memo JSONB,
@@ -3039,11 +3077,37 @@ impl WorkflowStore {
         .await
         .context("failed to initialize workflow_fast_starts request index")?;
         sqlx::query(
-            "ALTER TABLE workflow_fast_starts ADD COLUMN IF NOT EXISTS execution_path TEXT NOT NULL DEFAULT ''",
+            r#"
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'workflow_fast_starts'
+                      AND column_name = 'execution_path'
+                ) AND NOT EXISTS (
+                    SELECT 1
+                    FROM information_schema.columns
+                    WHERE table_schema = 'public'
+                      AND table_name = 'workflow_fast_starts'
+                      AND column_name = 'admission_mode'
+                ) THEN
+                    ALTER TABLE workflow_fast_starts RENAME COLUMN execution_path TO admission_mode;
+                END IF;
+            END
+            $$;
+            "#,
         )
         .execute(&self.pool)
         .await
-        .context("failed to add workflow_fast_starts.execution_path")?;
+        .context("failed to rename workflow_fast_starts.execution_path to admission_mode")?;
+        sqlx::query(
+            "ALTER TABLE workflow_fast_starts ADD COLUMN IF NOT EXISTS admission_mode TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add workflow_fast_starts.admission_mode")?;
         sqlx::query(
             "ALTER TABLE workflow_fast_starts ADD COLUMN IF NOT EXISTS fast_path_rejection_reason TEXT",
         )
@@ -5439,7 +5503,7 @@ impl WorkflowStore {
                 trigger_event_id,
                 continued_event_id,
                 triggered_by_run_id,
-                execution_path,
+                admission_mode,
                 fast_path_rejection_reason,
                 started_at,
                 closed_at,
@@ -5459,7 +5523,7 @@ impl WorkflowStore {
                 previous_run_id = EXCLUDED.previous_run_id,
                 trigger_event_id = EXCLUDED.trigger_event_id,
                 triggered_by_run_id = EXCLUDED.triggered_by_run_id,
-                execution_path = EXCLUDED.execution_path,
+                admission_mode = EXCLUDED.admission_mode,
                 fast_path_rejection_reason = EXCLUDED.fast_path_rejection_reason,
                 started_at = EXCLUDED.started_at,
                 updated_at = EXCLUDED.updated_at
@@ -5513,7 +5577,7 @@ impl WorkflowStore {
                     trigger_event_id,
                     continued_event_id,
                     triggered_by_run_id,
-                    execution_path,
+                    admission_mode,
                     fast_path_rejection_reason,
                     started_at,
                     closed_at,
@@ -5541,7 +5605,7 @@ impl WorkflowStore {
                     .push_bind(record.trigger_event_id)
                     .push("NULL")
                     .push_bind(record.triggered_by_run_id.as_deref())
-                    .push_bind(record.execution_path.as_deref().unwrap_or_default())
+                    .push_bind(record.admission_mode.as_deref().unwrap_or_default())
                     .push_bind(record.fast_path_rejection_reason.as_deref())
                     .push_bind(record.started_at)
                     .push("NULL")
@@ -5560,7 +5624,7 @@ impl WorkflowStore {
                     previous_run_id = EXCLUDED.previous_run_id,
                     trigger_event_id = EXCLUDED.trigger_event_id,
                     triggered_by_run_id = EXCLUDED.triggered_by_run_id,
-                    execution_path = EXCLUDED.execution_path,
+                    admission_mode = EXCLUDED.admission_mode,
                     fast_path_rejection_reason = EXCLUDED.fast_path_rejection_reason,
                     started_at = EXCLUDED.started_at,
                     updated_at = EXCLUDED.updated_at
@@ -5580,13 +5644,13 @@ impl WorkflowStore {
         tenant_id: &str,
         instance_id: &str,
         run_id: &str,
-        execution_path: &str,
+        admission_mode: &str,
         fast_path_rejection_reason: Option<&str>,
     ) -> Result<()> {
         sqlx::query(
             r#"
             UPDATE workflow_runs
-            SET execution_path = $4,
+            SET admission_mode = $4,
                 fast_path_rejection_reason = $5,
                 updated_at = GREATEST(updated_at, NOW())
             WHERE tenant_id = $1
@@ -5597,7 +5661,7 @@ impl WorkflowStore {
         .bind(tenant_id)
         .bind(instance_id)
         .bind(run_id)
-        .bind(execution_path)
+        .bind(admission_mode)
         .bind(fast_path_rejection_reason)
         .execute(&self.pool)
         .await
@@ -5616,7 +5680,7 @@ impl WorkflowStore {
             let mut query = QueryBuilder::<Postgres>::new(
                 r#"
                 UPDATE workflow_runs AS runs
-                SET execution_path = payload.execution_path,
+                SET admission_mode = payload.admission_mode,
                     fast_path_rejection_reason = payload.fast_path_rejection_reason,
                     updated_at = GREATEST(runs.updated_at, NOW())
                 FROM (
@@ -5627,7 +5691,7 @@ impl WorkflowStore {
                     .push_bind(&record.tenant_id)
                     .push_bind(&record.instance_id)
                     .push_bind(&record.run_id)
-                    .push_bind(&record.execution_path)
+                    .push_bind(&record.admission_mode)
                     .push_bind(record.fast_path_rejection_reason.as_deref());
             });
             query.push(
@@ -5636,7 +5700,7 @@ impl WorkflowStore {
                     tenant_id,
                     workflow_instance_id,
                     run_id,
-                    execution_path,
+                    admission_mode,
                     fast_path_rejection_reason
                 )
                 WHERE runs.tenant_id = payload.tenant_id
@@ -5673,7 +5737,7 @@ impl WorkflowStore {
                     artifact_hash,
                     workflow_task_queue,
                     mode,
-                    execution_path,
+                    admission_mode,
                     status,
                     input,
                     memo,
@@ -5700,7 +5764,7 @@ impl WorkflowStore {
                     .push_bind(&record.artifact_hash)
                     .push_bind(&record.workflow_task_queue)
                     .push_bind(record.mode.as_str())
-                    .push_bind(&record.execution_path)
+                    .push_bind(&record.admission_mode)
                     .push_bind(record.status.as_str())
                     .push_bind(Json(&record.input))
                     .push_bind(record.memo.as_ref().map(|value| Json(value.clone())))
@@ -5724,7 +5788,7 @@ impl WorkflowStore {
                     artifact_hash = EXCLUDED.artifact_hash,
                     workflow_task_queue = EXCLUDED.workflow_task_queue,
                     mode = EXCLUDED.mode,
-                    execution_path = EXCLUDED.execution_path,
+                    admission_mode = EXCLUDED.admission_mode,
                     status = EXCLUDED.status,
                     input = EXCLUDED.input,
                     memo = EXCLUDED.memo,
@@ -5839,7 +5903,7 @@ impl WorkflowStore {
                 trigger_event_id,
                 continued_event_id,
                 triggered_by_run_id,
-                execution_path,
+                admission_mode,
                 fast_path_rejection_reason,
                 started_at,
                 closed_at,
@@ -5859,7 +5923,7 @@ impl WorkflowStore {
                 previous_run_id = EXCLUDED.previous_run_id,
                 trigger_event_id = EXCLUDED.trigger_event_id,
                 triggered_by_run_id = EXCLUDED.triggered_by_run_id,
-                execution_path = EXCLUDED.execution_path,
+                admission_mode = EXCLUDED.admission_mode,
                 fast_path_rejection_reason = EXCLUDED.fast_path_rejection_reason,
                 started_at = EXCLUDED.started_at,
                 updated_at = EXCLUDED.updated_at
@@ -5877,7 +5941,7 @@ impl WorkflowStore {
         .bind(run_start.previous_run_id.as_deref())
         .bind(run_start.trigger_event_id)
         .bind(run_start.triggered_by_run_id.as_deref())
-        .bind(run_start.execution_path.as_deref().unwrap_or_default())
+        .bind(run_start.admission_mode.as_deref().unwrap_or_default())
         .bind(run_start.fast_path_rejection_reason.as_deref())
         .bind(run_start.started_at)
         .execute(&mut *tx)
@@ -5953,7 +6017,7 @@ impl WorkflowStore {
                 artifact_hash,
                 workflow_task_queue,
                 mode,
-                execution_path,
+                admission_mode,
                 status,
                 input,
                 memo,
@@ -5978,7 +6042,7 @@ impl WorkflowStore {
                 artifact_hash = EXCLUDED.artifact_hash,
                 workflow_task_queue = EXCLUDED.workflow_task_queue,
                 mode = EXCLUDED.mode,
-                execution_path = EXCLUDED.execution_path,
+                admission_mode = EXCLUDED.admission_mode,
                 status = EXCLUDED.status,
                 input = EXCLUDED.input,
                 memo = EXCLUDED.memo,
@@ -6002,7 +6066,7 @@ impl WorkflowStore {
         .bind(&fast_start.artifact_hash)
         .bind(&fast_start.workflow_task_queue)
         .bind(fast_start.mode.as_str())
-        .bind(&fast_start.execution_path)
+        .bind(&fast_start.admission_mode)
         .bind(terminal.status.as_str())
         .bind(Json(&fast_start.input))
         .bind(fast_start.memo.as_ref().map(|value| Json(value.clone())))
@@ -6272,7 +6336,7 @@ impl WorkflowStore {
                 trigger_event_id,
                 continued_event_id,
                 triggered_by_run_id,
-                execution_path,
+                admission_mode,
                 fast_path_rejection_reason,
                 started_at,
                 closed_at,
@@ -6320,7 +6384,7 @@ impl WorkflowStore {
                     runs.previous_run_id,
                     runs.next_run_id,
                     runs.continue_reason,
-                    COALESCE(NULLIF(runs.execution_path, ''), 'unrecorded') AS execution_path,
+                    COALESCE(NULLIF(runs.admission_mode, ''), 'unrecorded') AS admission_mode,
                     runs.fast_path_rejection_reason,
                     runs.started_at,
                     runs.closed_at,
@@ -6373,7 +6437,7 @@ impl WorkflowStore {
                 previous_run_id,
                 next_run_id,
                 continue_reason,
-                execution_path,
+                admission_mode,
                 fast_path_rejection_reason,
                 started_at,
                 closed_at,
@@ -6462,7 +6526,7 @@ impl WorkflowStore {
                 trigger_event_id,
                 continued_event_id,
                 triggered_by_run_id,
-                execution_path,
+                admission_mode,
                 fast_path_rejection_reason,
                 started_at,
                 closed_at,
@@ -12985,7 +13049,7 @@ impl WorkflowStore {
             worker_build_id,
             lease_ttl,
             limit,
-            "pg-v1",
+            ThroughputBackend::StreamV2.as_str(),
         )
         .await
     }
@@ -13350,7 +13414,7 @@ impl WorkflowStore {
         &self,
         limit: usize,
     ) -> Result<Vec<WorkflowBulkChunkRecord>> {
-        self.list_started_bulk_chunks_for_backend(limit, "pg-v1").await
+        self.list_started_bulk_chunks_for_backend(limit, ThroughputBackend::StreamV2.as_str()).await
     }
 
     pub async fn list_started_bulk_chunks_for_backend(
@@ -15822,18 +15886,20 @@ impl WorkflowStore {
             r#"
             SELECT COUNT(*)
             FROM (
-                SELECT batch_id
-                FROM workflow_bulk_batches
-                WHERE tenant_id = $1
-                  AND workflow_instance_id = $2
-                  AND run_id = $3
-                  AND throughput_backend = 'pg-v1'
-                UNION ALL
-                SELECT batch_id
-                FROM throughput_projection_batches
-                WHERE tenant_id = $1
-                  AND workflow_instance_id = $2
-                  AND run_id = $3
+                SELECT DISTINCT batch_id
+                FROM (
+                    SELECT batch_id
+                    FROM workflow_bulk_batches
+                    WHERE tenant_id = $1
+                      AND workflow_instance_id = $2
+                      AND run_id = $3
+                    UNION ALL
+                    SELECT batch_id
+                    FROM throughput_projection_batches
+                    WHERE tenant_id = $1
+                      AND workflow_instance_id = $2
+                      AND run_id = $3
+                ) all_batches
             ) batches
             "#,
         )
@@ -15856,42 +15922,7 @@ impl WorkflowStore {
     ) -> Result<Vec<WorkflowBulkBatchRecord>> {
         let rows = sqlx::query(
             r#"
-            SELECT
-                tenant_id,
-                workflow_instance_id,
-                run_id,
-                workflow_id,
-                workflow_version,
-                artifact_hash,
-                batch_id,
-                activity_type,
-                task_queue,
-                state,
-                input_handle,
-                result_handle,
-                throughput_backend,
-                throughput_backend_version,
-                execution_policy,
-                reducer,
-                reducer_class,
-                aggregation_tree_depth,
-                fast_lane_enabled,
-                aggregation_group_count,
-                status,
-                total_items,
-                chunk_size,
-                chunk_count,
-                succeeded_items,
-                failed_items,
-                cancelled_items,
-                max_attempts,
-                retry_delay_ms,
-                error,
-                reducer_output,
-                scheduled_at,
-                terminal_at,
-                updated_at
-            FROM (
+            WITH all_batches AS (
                 SELECT
                     tenant_id,
                     workflow_instance_id,
@@ -15926,12 +15957,12 @@ impl WorkflowStore {
                     reducer_output,
                     scheduled_at,
                     terminal_at,
-                    updated_at
+                    updated_at,
+                    0 AS source_priority
                 FROM workflow_bulk_batches
                 WHERE tenant_id = $1
                   AND workflow_instance_id = $2
                   AND run_id = $3
-                  AND throughput_backend = 'pg-v1'
                 UNION ALL
                 SELECT
                     tenant_id,
@@ -15967,12 +15998,54 @@ impl WorkflowStore {
                     reducer_output,
                     scheduled_at,
                     terminal_at,
-                    updated_at
+                    updated_at,
+                    1 AS source_priority
                 FROM throughput_projection_batches
                 WHERE tenant_id = $1
                   AND workflow_instance_id = $2
                   AND run_id = $3
-            ) batches
+            ),
+            deduped AS (
+                SELECT DISTINCT ON (batch_id)
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    workflow_id,
+                    workflow_version,
+                    artifact_hash,
+                    batch_id,
+                    activity_type,
+                    task_queue,
+                    state,
+                    input_handle,
+                    result_handle,
+                    throughput_backend,
+                    throughput_backend_version,
+                    execution_policy,
+                    reducer,
+                    reducer_class,
+                    aggregation_tree_depth,
+                    fast_lane_enabled,
+                    aggregation_group_count,
+                    status,
+                    total_items,
+                    chunk_size,
+                    chunk_count,
+                    succeeded_items,
+                    failed_items,
+                    cancelled_items,
+                    max_attempts,
+                    retry_delay_ms,
+                    error,
+                    reducer_output,
+                    scheduled_at,
+                    terminal_at,
+                    updated_at
+                FROM all_batches
+                ORDER BY batch_id ASC, source_priority DESC, updated_at DESC
+            )
+            SELECT *
+            FROM deduped
             ORDER BY scheduled_at ASC, batch_id ASC
             LIMIT $4 OFFSET $5
             "#,
@@ -15997,42 +16070,7 @@ impl WorkflowStore {
     ) -> Result<Option<WorkflowBulkBatchRecord>> {
         let row = sqlx::query(
             r#"
-            SELECT
-                tenant_id,
-                workflow_instance_id,
-                run_id,
-                workflow_id,
-                workflow_version,
-                artifact_hash,
-                batch_id,
-                activity_type,
-                task_queue,
-                state,
-                input_handle,
-                result_handle,
-                throughput_backend,
-                throughput_backend_version,
-                execution_policy,
-                reducer,
-                reducer_class,
-                aggregation_tree_depth,
-                fast_lane_enabled,
-                aggregation_group_count,
-                status,
-                total_items,
-                chunk_size,
-                chunk_count,
-                succeeded_items,
-                failed_items,
-                cancelled_items,
-                max_attempts,
-                retry_delay_ms,
-                error,
-                reducer_output,
-                scheduled_at,
-                terminal_at,
-                updated_at
-            FROM (
+            WITH all_batches AS (
                 SELECT
                     tenant_id,
                     workflow_instance_id,
@@ -16067,13 +16105,13 @@ impl WorkflowStore {
                     reducer_output,
                     scheduled_at,
                     terminal_at,
-                    updated_at
+                    updated_at,
+                    0 AS source_priority
                 FROM workflow_bulk_batches
                 WHERE tenant_id = $1
                   AND workflow_instance_id = $2
                   AND run_id = $3
                   AND batch_id = $4
-                  AND throughput_backend = 'pg-v1'
                 UNION ALL
                 SELECT
                     tenant_id,
@@ -16109,13 +16147,51 @@ impl WorkflowStore {
                     reducer_output,
                     scheduled_at,
                     terminal_at,
-                    updated_at
+                    updated_at,
+                    1 AS source_priority
                 FROM throughput_projection_batches
                 WHERE tenant_id = $1
                   AND workflow_instance_id = $2
                   AND run_id = $3
                   AND batch_id = $4
-            ) batch
+            )
+            SELECT
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                workflow_id,
+                workflow_version,
+                artifact_hash,
+                batch_id,
+                activity_type,
+                task_queue,
+                state,
+                input_handle,
+                result_handle,
+                throughput_backend,
+                throughput_backend_version,
+                execution_policy,
+                reducer,
+                reducer_class,
+                aggregation_tree_depth,
+                fast_lane_enabled,
+                aggregation_group_count,
+                status,
+                total_items,
+                chunk_size,
+                chunk_count,
+                succeeded_items,
+                failed_items,
+                cancelled_items,
+                max_attempts,
+                retry_delay_ms,
+                error,
+                reducer_output,
+                scheduled_at,
+                terminal_at,
+                updated_at
+            FROM all_batches
+            ORDER BY source_priority DESC, updated_at DESC
             LIMIT 1
             "#,
         )
@@ -17078,6 +17154,17 @@ impl WorkflowStore {
         })
     }
 
+    fn decode_workflow_admission_mode(
+        row: &sqlx::postgres::PgRow,
+        field_context: &'static str,
+    ) -> Result<String> {
+        let admission_mode = row
+            .try_get::<String, _>("admission_mode")
+            .with_context(|| field_context.to_owned())?;
+
+        Ok(admission_mode)
+    }
+
     fn decode_run_row(row: sqlx::postgres::PgRow) -> Result<WorkflowRunRecord> {
         Ok(WorkflowRunRecord {
             tenant_id: row.try_get("tenant_id").context("run tenant_id missing")?,
@@ -17123,7 +17210,10 @@ impl WorkflowStore {
             triggered_by_run_id: row
                 .try_get("triggered_by_run_id")
                 .context("run triggered_by_run_id missing")?,
-            execution_path: row.try_get("execution_path").context("run execution_path missing")?,
+            admission_mode: Self::decode_workflow_admission_mode(
+                &row,
+                "run admission_mode missing",
+            )?,
             fast_path_rejection_reason: row
                 .try_get("fast_path_rejection_reason")
                 .context("run fast_path_rejection_reason missing")?,
@@ -17159,9 +17249,10 @@ impl WorkflowStore {
             mode: WorkflowFastStartMode::from_db(
                 &row.try_get::<String, _>("mode").context("workflow_fast_starts.mode")?,
             )?,
-            execution_path: row
-                .try_get("execution_path")
-                .context("workflow_fast_starts.execution_path")?,
+            admission_mode: Self::decode_workflow_admission_mode(
+                &row,
+                "workflow_fast_starts.admission_mode missing",
+            )?,
             status: WorkflowFastStartStatus::from_db(
                 &row.try_get::<String, _>("status").context("workflow_fast_starts.status")?,
             )?,
@@ -17236,9 +17327,10 @@ impl WorkflowStore {
             continue_reason: row
                 .try_get("continue_reason")
                 .context("run summary continue_reason missing")?,
-            execution_path: row
-                .try_get("execution_path")
-                .context("run summary execution_path missing")?,
+            admission_mode: Self::decode_workflow_admission_mode(
+                &row,
+                "run summary admission_mode missing",
+            )?,
             fast_path_rejection_reason: row
                 .try_get("fast_path_rejection_reason")
                 .context("run summary fast_path_rejection_reason missing")?,
@@ -19049,6 +19141,7 @@ mod tests {
             .await?
             .context("stored workflow instance should exist")?;
         let mut expected = newer.clone();
+        expected.compact_for_persistence();
         expected.expand_after_persistence();
         assert_eq!(restored, expected);
 
@@ -19838,8 +19931,8 @@ mod tests {
                 1,
                 false,
                 1,
-                "pg-v1",
-                "1.0.0",
+                "stream-v2",
+                "2.0.0",
                 Utc::now(),
             )
             .await?;
@@ -19951,8 +20044,8 @@ mod tests {
                 1,
                 false,
                 1,
-                "pg-v1",
-                "1.0.0",
+                "stream-v2",
+                "2.0.0",
                 Utc::now(),
             )
             .await?;
@@ -20044,8 +20137,8 @@ mod tests {
                 1,
                 false,
                 1,
-                "pg-v1",
-                "1.0.0",
+                "stream-v2",
+                "2.0.0",
                 Utc::now(),
             )
             .await?;
@@ -20139,8 +20232,8 @@ mod tests {
                 1,
                 false,
                 1,
-                "pg-v1",
-                "1.0.0",
+                "compat-backend",
+                "0.0.0",
                 now,
             )
             .await?;
@@ -20185,7 +20278,7 @@ mod tests {
             )
             .await?;
         assert_eq!(pg_leased.len(), 1);
-        assert_eq!(pg_leased[0].batch_id, "batch-pg");
+        assert_eq!(pg_leased[0].batch_id, "batch-stream");
 
         let stream_leased = store
             .lease_next_bulk_chunks_for_backend(
@@ -20195,11 +20288,11 @@ mod tests {
                 "build-a",
                 chrono::Duration::seconds(30),
                 10,
-                "stream-v2",
+                "compat-backend",
             )
             .await?;
         assert_eq!(stream_leased.len(), 1);
-        assert_eq!(stream_leased[0].batch_id, "batch-stream");
+        assert_eq!(stream_leased[0].batch_id, "batch-pg");
 
         Ok(())
     }
@@ -20250,7 +20343,7 @@ mod tests {
                     "run-bulk-stream-query",
                 )
                 .await?,
-            0
+            1
         );
 
         store.upsert_throughput_projection_batch(&batch).await?;
@@ -21014,6 +21107,7 @@ mod tests {
                     run_id: "run-a".to_owned(),
                     batch_id: "batch-a".to_owned(),
                     activity_type: "benchmark.echo".to_owned(),
+                    activity_capabilities: None,
                     task_queue: "bulk".to_owned(),
                     state: Some("join".to_owned()),
                     chunk_size: 16,
@@ -21269,6 +21363,7 @@ mod tests {
                     run_id: "run-a".to_owned(),
                     batch_id: "batch-a".to_owned(),
                     activity_type: "benchmark.echo".to_owned(),
+                    activity_capabilities: None,
                     task_queue: "bulk".to_owned(),
                     state: Some("join".to_owned()),
                     chunk_size: 2,

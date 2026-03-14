@@ -233,6 +233,33 @@ fn static_data_converter_factory_usage_is_qualified_for_alpha() {
 }
 
 #[test]
+fn interceptor_workflow_modules_do_not_register_helper_exports_as_workflows() {
+    let output_dir = temp_output_dir("interceptor-pressure");
+    let (status, report) =
+        run_cli(&fixture("temporal-interceptor-pressure"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["compiled_workflows"].as_array().expect("compiled workflows").len(), 1);
+    assert_eq!(
+        report["compiled_workflows"][0]["definition_id"],
+        "src-workflows-interceptorpressureworkflow"
+    );
+    assert_eq!(
+        report["discovered"]["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .find(|file| file["path"] == "src/interceptors.ts")
+            .expect("interceptor file")["exported_workflows"]
+            .as_array()
+            .expect("exported workflows")
+            .len(),
+        0
+    );
+}
+
+#[test]
 fn static_payload_converter_module_usage_is_qualified_for_alpha() {
     let output_dir = temp_output_dir("payload");
     let (status, report) = run_cli(&fixture("temporal-payload-blocked"), &output_dir, &[]);
@@ -324,6 +351,20 @@ fn temporal_worker_versioning_annotations_qualify_and_package() {
     assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
     assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
     assert_eq!(report["worker_packages"][0]["task_queue"], "worker-versioning-qualified");
+}
+
+#[test]
+fn temporal_wrapped_worker_versioning_workflow_qualifies_and_packages() {
+    let output_dir = temp_output_dir("versioning-upgrade-pressure");
+    let (status, report) =
+        run_cli(&fixture("temporal-versioning-upgrade-pressure"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
+    assert_eq!(report["compiled_workflows"][0]["export_name"], "versioningPressureWorkflow");
+    assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
+    assert_eq!(report["worker_packages"][0]["task_queue"], "versioning-pressure");
 }
 
 #[test]

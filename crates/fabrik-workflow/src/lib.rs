@@ -340,6 +340,7 @@ impl WorkflowDefinition {
                         event: WorkflowEvent::ActivityTaskScheduled {
                             activity_id: current_state.clone(),
                             activity_type: handler,
+                            activity_capabilities: None,
                             task_queue: "default".to_owned(),
                             attempt: 1,
                             input: last_output.clone(),
@@ -2430,6 +2431,7 @@ mod tests {
             CompiledWorkflow {
                 initial_state: "wait_signal".to_owned(),
                 states,
+                async_helpers: BTreeMap::new(),
                 params: Vec::new(),
                 non_cancellable_states: std::collections::BTreeSet::new(),
             },
@@ -2479,6 +2481,7 @@ mod tests {
                     },
                 ),
             ]),
+            async_helpers: BTreeMap::new(),
             params: Vec::new(),
             non_cancellable_states: BTreeSet::new(),
         };
@@ -2504,6 +2507,7 @@ mod tests {
                         next: "greet".to_owned(),
                         timeout_ref: None,
                         timeout_next: None,
+                        timer_expr: None,
                     },
                 ),
                 (
@@ -2530,6 +2534,7 @@ mod tests {
                     },
                 ),
             ]),
+            async_helpers: BTreeMap::new(),
             params: vec![crate::compiled::CompiledWorkflowParam {
                 name: "name".to_owned(),
                 rest: false,
@@ -2578,6 +2583,7 @@ mod tests {
                     output: Some(Expression::Literal { value: json!({"mode": "modern"}) }),
                 },
             )]),
+            async_helpers: BTreeMap::new(),
             params: Vec::new(),
             non_cancellable_states: BTreeSet::new(),
         };
@@ -3093,6 +3099,7 @@ mod tests {
             WorkflowEvent::ActivityTaskScheduled {
                 activity_id: "echo".to_owned(),
                 activity_type: "core.echo".to_owned(),
+                activity_capabilities: None,
                 task_queue: "default".to_owned(),
                 attempt: 1,
                 input: echoed.clone(),
@@ -3241,6 +3248,7 @@ mod tests {
                 WorkflowEvent::ActivityTaskScheduled {
                     activity_id: "echo".to_owned(),
                     activity_type: "core.echo".to_owned(),
+                    activity_capabilities: None,
                     task_queue: "default".to_owned(),
                     attempt: 1,
                     input: echoed.clone(),
@@ -3873,6 +3881,7 @@ mod tests {
                             },
                             next: "join".to_owned(),
                             handle_var: "fanout".to_owned(),
+                            activity_capabilities: None,
                             task_queue: None,
                             execution_policy: None,
                             reducer: None,
@@ -3897,6 +3906,7 @@ mod tests {
                         },
                     ),
                 ]),
+                async_helpers: BTreeMap::new(),
                 params: Vec::new(),
                 non_cancellable_states: Default::default(),
             },
@@ -3962,6 +3972,7 @@ mod tests {
                             },
                             next: "join".to_owned(),
                             handle_var: "fanout".to_owned(),
+                            activity_capabilities: None,
                             task_queue: None,
                             execution_policy: Some("eager".to_owned()),
                             reducer: None,
@@ -3986,6 +3997,7 @@ mod tests {
                         },
                     ),
                 ]),
+                async_helpers: BTreeMap::new(),
                 params: Vec::new(),
                 non_cancellable_states: Default::default(),
             },

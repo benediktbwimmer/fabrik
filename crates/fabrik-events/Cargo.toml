@@ -6,7 +6,7 @@ version.workspace = true
 
 [dependencies]
 chrono.workspace = true
+fabrik-throughput = { path = "../fabrik-throughput" }
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
-

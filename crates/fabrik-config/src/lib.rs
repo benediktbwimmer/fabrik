@@ -484,7 +484,7 @@ impl ExecutorRuntimeConfig {
             )?,
             throughput_default_backend: read_throughput_backend_with_default(
                 "EXECUTOR_THROUGHPUT_DEFAULT_BACKEND",
-                "pg-v1",
+                "stream-v2",
             )?,
             throughput_task_queue_backends: read_task_queue_backend_overrides(
                 "EXECUTOR_THROUGHPUT_TASK_QUEUE_BACKENDS",
@@ -652,7 +652,7 @@ fn read_throughput_backend_with_default(key: &str, default: &str) -> Result<Stri
 
 fn validate_throughput_backend(key: &str, raw: String) -> Result<String, ConfigError> {
     match raw.trim() {
-        "pg-v1" | "stream-v2" => Ok(raw.trim().to_owned()),
+        "stream-v2" => Ok(raw.trim().to_owned()),
         _ => Err(ConfigError::InvalidThroughputBackend { key: key.to_owned(), value: raw }),
     }
 }
@@ -734,7 +734,7 @@ pub enum ConfigError {
     InvalidBool { key: String, value: String },
     #[error("environment variable {key} must be one of localfs or s3, got {value}")]
     InvalidPayloadStoreKind { key: String, value: String },
-    #[error("environment variable {key} must be pg-v1 or stream-v2, got {value}")]
+    #[error("environment variable {key} must be stream-v2, got {value}")]
     InvalidThroughputBackend { key: String, value: String },
     #[error(
         "environment variable {key} must be a comma-separated list of task-queue=backend mappings, got {value}"

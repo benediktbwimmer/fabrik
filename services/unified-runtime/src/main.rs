@@ -34,10 +34,11 @@ use fabrik_store::{
     WorkflowMailboxRecord, WorkflowStore,
 };
 use fabrik_throughput::{
-    ADMISSION_POLICY_VERSION, BENCHMARK_ECHO_ACTIVITY, BENCHMARK_FAST_COUNT_ACTIVITY,
-    PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind, StartThroughputRunCommand,
-    ThroughputBackend, ThroughputCommand, ThroughputCommandEnvelope, TinyWorkflowExecutionMode,
-    TinyWorkflowStartItem, WorkflowExecutionPath, bulk_reducer_class, bulk_reducer_is_mergeable,
+    ADMISSION_POLICY_VERSION, ActivityExecutionCapabilities, BENCHMARK_ECHO_ACTIVITY,
+    BENCHMARK_FAST_COUNT_ACTIVITY, PayloadHandle, PayloadStore, PayloadStoreConfig,
+    PayloadStoreKind, StartThroughputRunCommand, ThroughputBackend, ThroughputCommand,
+    ThroughputCommandEnvelope, ThroughputExecutionPath, TinyWorkflowExecutionMode,
+    TinyWorkflowStartItem, bulk_reducer_class, bulk_reducer_is_mergeable,
     bulk_reducer_materializes_results, can_inline_durable_tiny_fanout,
     can_use_payloadless_bulk_transport, decode_cbor, encode_cbor, execute_benchmark_echo,
     parse_benchmark_compact_input_meta_from_handle,
@@ -1747,10 +1748,16 @@ fn try_inline_durable_tiny_workflow_completion(
     plan: &CompiledExecutionPlan,
     occurred_at: DateTime<Utc>,
 ) -> Result<bool> {
-    let Some((activity_type, reducer)) =
+    let Some((activity_type, activity_capabilities, reducer)) =
         artifact.workflow.states.values().find_map(|state| match state {
-            CompiledStateNode::FanOut { activity_type, reducer, retry, .. } if retry.is_none() => {
-                Some((activity_type.clone(), reducer.clone()))
+            CompiledStateNode::FanOut {
+                activity_type,
+                activity_capabilities,
+                reducer,
+                retry,
+                ..
+            } if retry.is_none() => {
+                Some((activity_type.clone(), activity_capabilities.clone(), reducer.clone()))
             }
             _ => None,
         })
@@ -1771,7 +1778,13 @@ fn try_inline_durable_tiny_workflow_completion(
         }
     }
     let inputs = scheduled.iter().map(|(_, input)| input.clone()).collect::<Vec<_>>();
-    if !can_inline_durable_tiny_fanout(&activity_type, reducer.as_deref(), 1, &inputs) {
+    if !can_inline_durable_tiny_fanout(
+        &activity_type,
+        activity_capabilities.as_ref(),
+        reducer.as_deref(),
+        1,
+        &inputs,
+    ) {
         return Ok(false);
     }
     for (activity_id, input) in scheduled {
@@ -5048,6 +5061,7 @@ async fn materialize_bulk_batches_from_plan(
         let WorkflowEvent::BulkActivityBatchScheduled {
             batch_id,
             activity_type,
+            activity_capabilities,
             task_queue,
             items,
             input_handle,
@@ -5061,6 +5075,7 @@ async fn materialize_bulk_batches_from_plan(
             throughput_backend,
             throughput_backend_version: _,
             state: workflow_state,
+            ..
         } = &emission.event
         else {
             continue;
@@ -5096,8 +5111,11 @@ async fn materialize_bulk_batches_from_plan(
         }
         let selected_backend = admission.selected_backend.as_str();
         let selected_backend_version = admission.selected_backend_version.as_str();
+        let native_stream_v2 = selected_backend == ThroughputBackend::StreamV2.as_str()
+            && native_stream_v2_engine_enabled(state);
 
-        if selected_backend == ThroughputBackend::PgV1.as_str() {
+        // Keep a compatibility metadata row only when there is no stream-v2 owner path available.
+        if !native_stream_v2 && state.publisher.is_none() {
             let pg_materialize_started_at = Instant::now();
             let reducer_class = bulk_reducer_class(reducer.as_deref());
             let fast_lane_enabled = stream_v2_fast_lane_enabled(
@@ -5153,13 +5171,12 @@ async fn materialize_bulk_batches_from_plan(
         }
 
         let publish_started_at = Instant::now();
-        let native_stream_v2 = selected_backend == ThroughputBackend::StreamV2.as_str()
-            && native_stream_v2_engine_enabled(state);
         let chunk_count =
             if *chunk_size == 0 { 0 } else { total_items.div_ceil(*chunk_size as usize) as u32 };
         let scheduled_event = WorkflowEvent::BulkActivityBatchScheduled {
             batch_id: batch_id.clone(),
             activity_type: activity_type.clone(),
+            activity_capabilities: activity_capabilities.clone(),
             task_queue: task_queue.clone(),
             items: items.clone(),
             input_handle: input_handle.clone(),
@@ -5177,6 +5194,7 @@ async fn materialize_bulk_batches_from_plan(
         if native_stream_v2 {
             if can_inline_stream_v2_microbatch(
                 activity_type,
+                activity_capabilities.as_ref(),
                 reducer.as_deref(),
                 *max_attempts,
                 items,
@@ -5212,6 +5230,7 @@ async fn materialize_bulk_batches_from_plan(
                     .is_some_and(|meta| meta.payload_size.is_some());
             let native_input_handle = if can_use_payloadless_bulk_transport(
                 activity_type,
+                activity_capabilities.as_ref(),
                 reducer.as_deref(),
                 *max_attempts,
                 items,
@@ -5243,6 +5262,7 @@ async fn materialize_bulk_batches_from_plan(
                 instance,
                 batch_id,
                 activity_type,
+                activity_capabilities.clone(),
                 task_queue,
                 total_items,
                 result_handle,
@@ -5272,7 +5292,7 @@ async fn materialize_bulk_batches_from_plan(
                     artifact_hash: instance.artifact_hash.clone(),
                     batch_id: batch_id.clone(),
                     throughput_backend: selected_backend.to_owned(),
-                    execution_path: WorkflowExecutionPath::NativeStreamV2.as_str().to_owned(),
+                    execution_path: ThroughputExecutionPath::NativeStreamV2.as_str().to_owned(),
                     status: "scheduled".to_owned(),
                     command_dedupe_key: command.dedupe_key.clone(),
                     command: command.clone(),
@@ -5325,6 +5345,7 @@ async fn materialize_bulk_batches_from_plan(
 
 fn can_inline_stream_v2_microbatch(
     activity_type: &str,
+    activity_capabilities: Option<&ActivityExecutionCapabilities>,
     reducer: Option<&str>,
     max_attempts: u32,
     items: &[Value],
@@ -5335,7 +5356,13 @@ fn can_inline_stream_v2_microbatch(
         && total_items > 0
         && total_items <= STREAM_V2_INLINE_MICROBATCH_MAX_ITEMS
         && matches!(reducer.unwrap_or("collect_results"), "all_settled" | "count")
-        && can_use_payloadless_bulk_transport(activity_type, reducer, max_attempts, items)
+        && can_use_payloadless_bulk_transport(
+            activity_type,
+            activity_capabilities,
+            reducer,
+            max_attempts,
+            items,
+        )
 }
 
 fn unified_inline_bulk_terminal_event(
@@ -5439,10 +5466,7 @@ async fn admit_bulk_batch(
         if state.admission.max_active_chunks_per_tenant > 0
             && tenant_started >= state.admission.max_active_chunks_per_tenant as u64
         {
-            decision = bulk_admission_decision(
-                ThroughputBackend::PgV1.as_str(),
-                "tenant_capacity_fallback",
-            );
+            decision.routing_reason = "tenant_capacity_observed".to_owned();
         } else {
             let task_queue_started = state
                 .store
@@ -5456,10 +5480,7 @@ async fn admit_bulk_batch(
             if state.admission.max_active_chunks_per_task_queue > 0
                 && task_queue_started >= state.admission.max_active_chunks_per_task_queue as u64
             {
-                decision = bulk_admission_decision(
-                    ThroughputBackend::PgV1.as_str(),
-                    "task_queue_capacity_fallback",
-                );
+                decision.routing_reason = "task_queue_capacity_observed".to_owned();
             }
         }
     }
@@ -5519,7 +5540,10 @@ fn choose_bulk_admission_backend(
         return bulk_admission_decision(backend, "workflow_backend_hint");
     }
     if bulk_reducer_materializes_results(reducer) {
-        return bulk_admission_decision(ThroughputBackend::PgV1.as_str(), "materialized_results");
+        return bulk_admission_decision(
+            ThroughputBackend::StreamV2.as_str(),
+            "materialized_results",
+        );
     }
     if bulk_reducer_is_mergeable(reducer)
         && (item_count >= config.stream_v2_min_items || chunk_count >= config.stream_v2_min_chunks)
@@ -5530,16 +5554,9 @@ fn choose_bulk_admission_backend(
 }
 
 fn bulk_admission_decision(backend: &str, routing_reason: &str) -> BulkAdmissionDecision {
-    let selected_backend = if backend == ThroughputBackend::StreamV2.as_str() {
-        ThroughputBackend::StreamV2.as_str().to_owned()
-    } else {
-        ThroughputBackend::PgV1.as_str().to_owned()
-    };
-    let selected_backend_version = if selected_backend == ThroughputBackend::StreamV2.as_str() {
-        ThroughputBackend::StreamV2.default_version().to_owned()
-    } else {
-        ThroughputBackend::PgV1.default_version().to_owned()
-    };
+    let _ = backend;
+    let selected_backend = ThroughputBackend::StreamV2.as_str().to_owned();
+    let selected_backend_version = ThroughputBackend::StreamV2.default_version().to_owned();
     BulkAdmissionDecision {
         selected_backend,
         selected_backend_version,
@@ -5549,11 +5566,7 @@ fn bulk_admission_decision(backend: &str, routing_reason: &str) -> BulkAdmission
 }
 
 fn is_supported_throughput_backend(backend: &str) -> bool {
-    matches!(
-        backend,
-        value if value == ThroughputBackend::PgV1.as_str()
-            || value == ThroughputBackend::StreamV2.as_str()
-    )
+    backend == ThroughputBackend::StreamV2.as_str()
 }
 
 async fn run_workflow_event_outbox_publisher(state: AppState) {
@@ -6373,7 +6386,7 @@ impl ActivityWorkerApi for WorkerApi {
                 &result.instance_id,
                 &result.run_id,
                 &result.batch_id,
-                ThroughputBackend::PgV1.as_str(),
+                ThroughputBackend::StreamV2.as_str(),
             )
             .await?;
             let update = prepare_bulk_result(result)?;
@@ -8089,6 +8102,7 @@ async fn start_throughput_run_command(
     instance: &WorkflowInstanceState,
     batch_id: &str,
     activity_type: &str,
+    activity_capabilities: Option<ActivityExecutionCapabilities>,
     task_queue: &str,
     total_items: usize,
     result_handle: &Value,
@@ -8127,6 +8141,7 @@ async fn start_throughput_run_command(
             run_id: instance.run_id.clone(),
             batch_id: batch_id.to_owned(),
             activity_type: activity_type.to_owned(),
+            activity_capabilities,
             task_queue: task_queue.to_owned(),
             state: workflow_state,
             chunk_size,
@@ -8264,6 +8279,7 @@ fn try_inline_stream_v2_microbatch_trigger_completion(
     let WorkflowEvent::BulkActivityBatchScheduled {
         batch_id,
         activity_type,
+        activity_capabilities,
         items,
         input_handle,
         chunk_size,
@@ -8294,6 +8310,7 @@ fn try_inline_stream_v2_microbatch_trigger_completion(
         if *chunk_size == 0 { 0 } else { total_items.div_ceil(*chunk_size as usize) as u32 };
     if !can_inline_stream_v2_microbatch(
         activity_type,
+        activity_capabilities.as_ref(),
         reducer.as_deref(),
         *max_attempts,
         items,
@@ -8457,6 +8474,7 @@ mod tests {
                     ),
                 ]),
                 params: Vec::new(),
+                async_helpers: BTreeMap::new(),
                 non_cancellable_states: std::collections::BTreeSet::new(),
             },
         )
@@ -8487,6 +8505,7 @@ mod tests {
                     ),
                 ]),
                 params: Vec::new(),
+                async_helpers: BTreeMap::new(),
                 non_cancellable_states: std::collections::BTreeSet::new(),
             },
         )
@@ -8513,6 +8532,7 @@ mod tests {
                             },
                             next: "join".to_owned(),
                             handle_var: "fanout".to_owned(),
+                            activity_capabilities: None,
                             task_queue: None,
                             reducer: reducer.map(str::to_owned),
                             retry: None,
@@ -8540,6 +8560,7 @@ mod tests {
                     ),
                 ]),
                 params: Vec::new(),
+                async_helpers: BTreeMap::new(),
                 non_cancellable_states: std::collections::BTreeSet::new(),
             },
         )
@@ -8615,7 +8636,7 @@ mod tests {
     fn admission_prefers_stream_v2_for_large_mergeable_batches() {
         let decision = choose_bulk_admission_backend(
             &BulkAdmissionConfig {
-                default_backend: ThroughputBackend::PgV1.as_str().to_owned(),
+                default_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
                 task_queue_backends: BTreeMap::new(),
                 stream_v2_min_items: 64,
                 stream_v2_min_chunks: 8,
@@ -8638,7 +8659,7 @@ mod tests {
     fn admission_respects_task_queue_backend_override() {
         let decision = choose_bulk_admission_backend(
             &BulkAdmissionConfig {
-                default_backend: ThroughputBackend::PgV1.as_str().to_owned(),
+                default_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
                 task_queue_backends: BTreeMap::new(),
                 stream_v2_min_items: 512,
                 stream_v2_min_chunks: 8,
@@ -8660,7 +8681,7 @@ mod tests {
     fn admission_routes_numeric_mergeable_reducer_to_stream_v2() {
         let decision = choose_bulk_admission_backend(
             &BulkAdmissionConfig {
-                default_backend: ThroughputBackend::PgV1.as_str().to_owned(),
+                default_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
                 task_queue_backends: BTreeMap::new(),
                 stream_v2_min_items: 64,
                 stream_v2_min_chunks: 8,
@@ -8679,8 +8700,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admission_bypasses_stale_task_queue_cache_for_explicit_backend_requests() -> Result<()>
-    {
+    async fn admission_bypasses_stale_task_queue_cache_for_explicit_stream_v2_requests()
+    -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
         };
@@ -8708,7 +8729,7 @@ mod tests {
                 tenant_id,
                 TaskQueueKind::Activity,
                 task_queue,
-                ThroughputBackend::PgV1.as_str(),
+                ThroughputBackend::StreamV2.as_str(),
             )
             .await?;
 
@@ -8716,7 +8737,7 @@ mod tests {
             &state,
             tenant_id,
             task_queue,
-            Some(ThroughputBackend::PgV1.as_str()),
+            Some(ThroughputBackend::StreamV2.as_str()),
             None,
             Some("max"),
             1024,
@@ -8724,7 +8745,7 @@ mod tests {
         )
         .await?;
 
-        assert_eq!(decision.selected_backend, ThroughputBackend::PgV1.as_str());
+        assert_eq!(decision.selected_backend, ThroughputBackend::StreamV2.as_str());
         assert_eq!(decision.routing_reason, "task_queue_policy_override");
         Ok(())
     }
@@ -8815,6 +8836,7 @@ mod tests {
                 },
                 next: "join".to_owned(),
                 handle_var: "fanout".to_owned(),
+                activity_capabilities: None,
                 task_queue: Some(Expression::Literal {
                     value: Value::String(task_queue.to_owned()),
                 }),
@@ -8852,6 +8874,7 @@ mod tests {
                 initial_state: "dispatch".to_owned(),
                 states,
                 params: Vec::new(),
+                async_helpers: BTreeMap::new(),
                 non_cancellable_states: std::collections::BTreeSet::new(),
             },
         )
@@ -8860,7 +8883,7 @@ mod tests {
     fn throughput_artifact(task_queue: &str) -> CompiledWorkflowArtifact {
         throughput_artifact_with_options(
             task_queue,
-            Some(ThroughputBackend::PgV1.as_str()),
+            Some(ThroughputBackend::StreamV2.as_str()),
             Some("all_settled"),
             16,
         )
@@ -8883,6 +8906,7 @@ mod tests {
                 },
                 next: "join".to_owned(),
                 handle_var: "fanout".to_owned(),
+                activity_capabilities: None,
                 task_queue: Some(Expression::Literal {
                     value: Value::String(task_queue.to_owned()),
                 }),
@@ -8918,6 +8942,7 @@ mod tests {
                 initial_state: "dispatch".to_owned(),
                 states,
                 params: Vec::new(),
+                async_helpers: BTreeMap::new(),
                 non_cancellable_states: std::collections::BTreeSet::new(),
             },
         )
@@ -8958,6 +8983,7 @@ mod tests {
                 ),
             ]),
             params: Vec::new(),
+            async_helpers: BTreeMap::new(),
             non_cancellable_states: std::collections::BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -8984,6 +9010,7 @@ mod tests {
                 },
             )]),
             params: Vec::new(),
+            async_helpers: BTreeMap::new(),
             non_cancellable_states: std::collections::BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -9017,6 +9044,7 @@ mod tests {
                 ),
             ]),
             params: Vec::new(),
+            async_helpers: BTreeMap::new(),
             non_cancellable_states: std::collections::BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -9072,6 +9100,7 @@ mod tests {
                 ),
             ]),
             params: Vec::new(),
+            async_helpers: BTreeMap::new(),
             non_cancellable_states: BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -9134,6 +9163,7 @@ mod tests {
                 ),
             ]),
             params: Vec::new(),
+            async_helpers: BTreeMap::new(),
             non_cancellable_states: std::collections::BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -9198,6 +9228,7 @@ mod tests {
                 ),
             ]),
             params: Vec::new(),
+            async_helpers: BTreeMap::new(),
             non_cancellable_states: std::collections::BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -9226,6 +9257,7 @@ mod tests {
                 },
             )]),
             params: Vec::new(),
+            async_helpers: BTreeMap::new(),
             non_cancellable_states: std::collections::BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -9297,6 +9329,7 @@ mod tests {
                 ("done".to_owned(), CompiledStateNode::Succeed { output: None }),
             ]),
             params: Vec::new(),
+            async_helpers: BTreeMap::new(),
             non_cancellable_states: std::collections::BTreeSet::new(),
         };
         let mut artifact = CompiledWorkflowArtifact::new(
@@ -9349,7 +9382,7 @@ mod tests {
             persist_lock: Arc::new(Mutex::new(())),
             persistence: persistence_config_for(state_dir),
             admission: BulkAdmissionConfig {
-                default_backend: ThroughputBackend::PgV1.as_str().to_owned(),
+                default_backend: ThroughputBackend::StreamV2.as_str().to_owned(),
                 task_queue_backends: BTreeMap::new(),
                 stream_v2_min_items: 512,
                 stream_v2_min_chunks: 8,
@@ -10095,7 +10128,7 @@ mod tests {
             .await?
             .context("stored instance should exist")?;
         assert_ne!(stored.status, WorkflowStatus::Cancelled);
-        assert_eq!(stored.status, WorkflowStatus::Completed);
+        assert_eq!(stored.status, WorkflowStatus::Running);
 
         let activities = store
             .list_activities_for_run("tenant", "instance-cancel-unwind", "run-cancel-unwind")
@@ -10349,9 +10382,10 @@ mod tests {
             "run-throughput-batch",
             "unified-runtime-test",
         );
+        let items = (0..33).map(|index| json!({"value": format!("x-{index}")})).collect::<Vec<_>>();
         let trigger = test_event(
             &identity,
-            WorkflowEvent::WorkflowTriggered { input: json!({"items": [json!({"value": "x"})]}) },
+            WorkflowEvent::WorkflowTriggered { input: json!({ "items": items }) },
             Utc::now(),
         );
 
@@ -10375,7 +10409,7 @@ mod tests {
             .await?;
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].status.as_str(), "scheduled");
-        assert_eq!(batches[0].throughput_backend, ThroughputBackend::PgV1.as_str());
+        assert_eq!(batches[0].throughput_backend, ThroughputBackend::StreamV2.as_str());
 
         let inner = app_state.inner.lock().expect("unified runtime lock poisoned");
         assert!(inner.instances.contains_key(&RunKey {
@@ -10493,6 +10527,7 @@ mod tests {
             &instance,
             "batch-a",
             "benchmark.echo",
+            None,
             "bulk",
             2,
             &serde_json::to_value(PayloadHandle::inline_batch_result("batch-a"))?,
@@ -10557,11 +10592,10 @@ mod tests {
             "run-throughput-routing",
             "unified-runtime-test",
         );
+        let items = (0..33).map(|index| json!({"value": format!("x-{index}")})).collect::<Vec<_>>();
         let trigger = test_event(
             &identity,
-            WorkflowEvent::WorkflowTriggered {
-                input: json!({"items": [json!({"value": "x"}), json!({"value": "y"})]}),
-            },
+            WorkflowEvent::WorkflowTriggered { input: json!({ "items": items }) },
             Utc::now(),
         );
 
@@ -10578,8 +10612,8 @@ mod tests {
             .await?;
         assert_eq!(batches.len(), 1);
         let batch = &batches[0];
-        assert_eq!(batch.throughput_backend, ThroughputBackend::PgV1.as_str());
-        assert_eq!(batch.routing_reason, "materialized_results");
+        assert_eq!(batch.throughput_backend, ThroughputBackend::StreamV2.as_str());
+        assert_eq!(batch.routing_reason, "workflow_backend_hint");
         assert_eq!(batch.admission_policy_version, ADMISSION_POLICY_VERSION);
 
         fs::remove_dir_all(state_dir).ok();
@@ -10608,9 +10642,10 @@ mod tests {
             "run-throughput-complete",
             "unified-runtime-test",
         );
+        let items = (0..33).map(|index| json!({"value": format!("x-{index}")})).collect::<Vec<_>>();
         let trigger = test_event(
             &identity,
-            WorkflowEvent::WorkflowTriggered { input: json!({"items": [json!({"value": "x"})]}) },
+            WorkflowEvent::WorkflowTriggered { input: json!({ "items": items }) },
             Utc::now(),
         );
         handle_trigger_event(&app_state, trigger).await?;
@@ -11229,6 +11264,23 @@ mod tests {
             WorkflowEvent::WorkflowTriggered { input: json!({ "remaining": 1 }) },
             Utc::now(),
         );
+        store
+            .put_run_start(
+                "tenant",
+                "instance-continue",
+                "run-continue-1",
+                &artifact.definition_id,
+                Some(artifact.definition_version),
+                Some(&artifact.artifact_hash),
+                "default",
+                None,
+                None,
+                trigger.event_id,
+                trigger.occurred_at,
+                None,
+                None,
+            )
+            .await?;
 
         handle_trigger_event(&app_state, trigger).await?;
 
@@ -11836,6 +11888,7 @@ mod tests {
                     },
                 )]),
                 params: Vec::new(),
+                async_helpers: BTreeMap::new(),
                 non_cancellable_states: BTreeSet::new(),
             },
         );
@@ -11870,6 +11923,7 @@ mod tests {
                 event: WorkflowEvent::ActivityTaskScheduled {
                     activity_id: "start".to_owned(),
                     activity_type: "greet".to_owned(),
+                    activity_capabilities: None,
                     task_queue: "default".to_owned(),
                     attempt: 1,
                     input: Value::String("fiona".to_owned()),

@@ -157,6 +157,12 @@ node sdk/typescript-compiler/compiler.mjs \
   --out /tmp/order-workflow-artifact.json
 ```
 
+Run the local streaming quickstart:
+
+```bash
+./scripts/run-streaming-local-quickstart.sh
+```
+
 Analyze or package an existing Temporal TypeScript repo for Fabrik migration:
 
 ```bash
@@ -188,6 +194,7 @@ Migration policy and generated output contract:
 - [Architecture](/Users/bene/code/fabrik/docs/architecture.md)
 - [Product Model](/Users/bene/code/fabrik/docs/product-model.md)
 - [Roadmap](/Users/bene/code/fabrik/docs/roadmap.md)
+- [Streaming Local Quickstart](/Users/bene/code/fabrik/docs/streaming-local-quickstart.md)
 - [Temporal Comparison Benchmarking](/Users/bene/code/fabrik/docs/benchmarking/temporal-comparison.md)
 - [Architecture Decision Record 0001](/Users/bene/code/fabrik/docs/adr/0001-log-first-rust-wasm-platform.md)
 - [Architecture Decision Record 0002](/Users/bene/code/fabrik/docs/adr/0002-code-authored-compiled-workflows.md)

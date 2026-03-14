@@ -235,7 +235,7 @@ struct WorkflowListItem {
     sticky_workflow_build_id: Option<String>,
     sticky_workflow_poller_id: Option<String>,
     routing_status: String,
-    execution_path: Option<String>,
+    admission_mode: Option<String>,
     fast_path_rejection_reason: Option<String>,
     current_state: Option<String>,
     status: String,
@@ -271,7 +271,7 @@ struct RunListItem {
     sticky_workflow_build_id: Option<String>,
     sticky_workflow_poller_id: Option<String>,
     routing_status: String,
-    execution_path: String,
+    admission_mode: String,
     fast_path_rejection_reason: Option<String>,
     sticky_updated_at: Option<DateTime<Utc>>,
     previous_run_id: Option<String>,
@@ -2665,6 +2665,7 @@ fn compiled_state_kind(state: &CompiledStateNode) -> &'static str {
         CompiledStateNode::StartStepHandle { .. } => "start_step_handle",
         CompiledStateNode::FanOut { .. } => "fan_out",
         CompiledStateNode::StartBulkActivity { .. } => "start_bulk_activity",
+        CompiledStateNode::DynamicStartBulkActivity { .. } => "dynamic_start_bulk_activity",
         CompiledStateNode::WaitForBulkActivity { .. } => "wait_for_bulk_activity",
         CompiledStateNode::WaitForAllActivities { .. } => "wait_for_all_activities",
         CompiledStateNode::StartChild { .. } => "start_child",
@@ -2698,6 +2699,7 @@ fn semantic_module_kind(_graph: &str, state: &CompiledStateNode) -> &'static str
             "fan_out"
         }
         CompiledStateNode::StartBulkActivity { .. }
+        | CompiledStateNode::DynamicStartBulkActivity { .. }
         | CompiledStateNode::WaitForBulkActivity { .. } => "bulk_activity",
         CompiledStateNode::StartChild { .. }
         | CompiledStateNode::SignalChild { .. }
@@ -2722,6 +2724,7 @@ fn module_collapsed_by_default(state: &CompiledStateNode) -> bool {
         state,
         CompiledStateNode::FanOut { .. }
             | CompiledStateNode::StartBulkActivity { .. }
+            | CompiledStateNode::DynamicStartBulkActivity { .. }
             | CompiledStateNode::WaitForBulkActivity { .. }
             | CompiledStateNode::StartChild { .. }
             | CompiledStateNode::WaitForChild { .. }
@@ -2756,6 +2759,7 @@ fn compiled_state_subtitle(state: &CompiledStateNode) -> Option<String> {
         CompiledStateNode::StartBulkActivity { activity_type, .. } => {
             Some(format!("bulk · {activity_type}"))
         }
+        CompiledStateNode::DynamicStartBulkActivity { .. } => Some("bulk · dynamic".to_owned()),
         CompiledStateNode::WaitForBulkActivity { bulk_ref_var, .. } => {
             Some(format!("await bulk {bulk_ref_var}"))
         }
@@ -2830,7 +2834,8 @@ fn state_transition_targets(state: &CompiledStateNode) -> Vec<(String, String)> 
         | CompiledStateNode::RaiseAsyncHelper { .. } => Vec::new(),
         CompiledStateNode::StartStepHandle { next, .. } => vec![("next".to_owned(), next.clone())],
         CompiledStateNode::FanOut { next, .. } => vec![("await".to_owned(), next.clone())],
-        CompiledStateNode::StartBulkActivity { next, .. } => {
+        CompiledStateNode::StartBulkActivity { next, .. }
+        | CompiledStateNode::DynamicStartBulkActivity { next, .. } => {
             vec![("await".to_owned(), next.clone())]
         }
         CompiledStateNode::WaitForBulkActivity { next, on_error, .. }
@@ -3400,7 +3405,7 @@ async fn workflow_list_item_from_state(
         sticky_workflow_build_id: state.sticky_workflow_build_id,
         sticky_workflow_poller_id: state.sticky_workflow_poller_id,
         routing_status,
-        execution_path: run_metadata.as_ref().map(|run| run.execution_path.clone()),
+        admission_mode: run_metadata.as_ref().map(|run| run.admission_mode.clone()),
         fast_path_rejection_reason: run_metadata
             .as_ref()
             .and_then(|run| run.fast_path_rejection_reason.clone()),
@@ -3440,7 +3445,7 @@ async fn run_list_item_from_record(
         sticky_workflow_build_id: record.sticky_workflow_build_id,
         sticky_workflow_poller_id: record.sticky_workflow_poller_id,
         routing_status,
-        execution_path: record.execution_path,
+        admission_mode: record.admission_mode,
         fast_path_rejection_reason: record.fast_path_rejection_reason,
         sticky_updated_at: record.sticky_updated_at,
         previous_run_id: record.previous_run_id,
@@ -3528,7 +3533,11 @@ fn projection_lag_ms_from_times(
 }
 
 fn authoritative_bulk_source(throughput_backend: &str) -> &'static str {
-    if throughput_backend == "stream-v2" { "stream-v2-owner-state" } else { "pg-v1-postgres" }
+    if throughput_backend == ThroughputBackend::StreamV2.as_str() {
+        "stream-v2-owner-state"
+    } else {
+        "projection"
+    }
 }
 
 fn parse_read_consistency(raw: Option<&str>) -> Result<ReadConsistency> {
@@ -3720,31 +3729,8 @@ async fn load_workflow_bulk_batches(
             (total, batches)
         }
     };
-    let authoritative_source = if consistency == ReadConsistency::Strong {
-        if batches
-            .iter()
-            .any(|batch| batch.throughput_backend == ThroughputBackend::StreamV2.as_str())
-            && batches
-                .iter()
-                .any(|batch| batch.throughput_backend != ThroughputBackend::StreamV2.as_str())
-        {
-            "mixed-bulk-backends"
-        } else if batches
-            .iter()
-            .any(|batch| batch.throughput_backend == ThroughputBackend::StreamV2.as_str())
-        {
-            "stream-v2-owner-state"
-        } else {
-            "pg-v1-postgres"
-        }
-    } else if batches
-        .iter()
-        .any(|batch| batch.throughput_backend == ThroughputBackend::StreamV2.as_str())
-    {
-        "mixed-bulk-backends"
-    } else {
-        "pg-v1-postgres"
-    };
+    let authoritative_source =
+        if consistency == ReadConsistency::Strong { "stream-v2-owner-state" } else { "projection" };
     Ok(WorkflowBulkBatchesResponse {
         tenant_id: tenant_id.to_owned(),
         instance_id: instance_id.to_owned(),
@@ -5114,6 +5100,7 @@ mod tests {
                             retry: None,
                             config: None,
                             schedule_to_start_timeout_ms: None,
+                            schedule_to_close_timeout_ms: None,
                             start_to_close_timeout_ms: None,
                             heartbeat_timeout_ms: None,
                             output_var: None,
@@ -5138,6 +5125,7 @@ mod tests {
                             items: Expression::Literal { value: json!([1, 2, 3]) },
                             next: "await-refund".to_owned(),
                             handle_var: "refund-batch".to_owned(),
+                            activity_capabilities: None,
                             task_queue: None,
                             execution_policy: None,
                             reducer: Some("count".to_owned()),
@@ -5185,6 +5173,7 @@ mod tests {
                     ),
                 ]),
                 params: Vec::new(),
+                async_helpers: BTreeMap::new(),
                 non_cancellable_states: BTreeSet::new(),
             },
         );
@@ -5281,12 +5270,14 @@ mod tests {
             WorkflowEvent::ActivityTaskScheduled {
                 activity_id: "charge-card".to_owned(),
                 activity_type: "payments.charge".to_owned(),
+                activity_capabilities: None,
                 task_queue: "payments".to_owned(),
                 attempt: 2,
                 input: json!({"orderId": 7}),
                 config: None,
                 state: Some("charge-card".to_owned()),
                 schedule_to_start_timeout_ms: None,
+                schedule_to_close_timeout_ms: None,
                 start_to_close_timeout_ms: None,
                 heartbeat_timeout_ms: None,
             },
@@ -5337,6 +5328,7 @@ mod tests {
                 lease_expires_at: None,
                 completed_at: Some(now),
                 schedule_to_start_timeout_ms: None,
+                schedule_to_close_timeout_ms: None,
                 start_to_close_timeout_ms: None,
                 heartbeat_timeout_ms: None,
                 last_event_id: Uuid::now_v7(),
@@ -5609,6 +5601,7 @@ mod tests {
                 artifact_execution: None,
                 status: WorkflowStatus::Running,
                 input: Some(json!({"orderId": 2})),
+                persisted_input_handle: None,
                 memo: None,
                 search_attributes: None,
                 output: None,

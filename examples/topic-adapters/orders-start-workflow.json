@@ -1,0 +1,40 @@
+{
+  "adapter_kind": "redpanda",
+  "brokers": "127.0.0.1:9092",
+  "topic_name": "orders.events",
+  "topic_partitions": 3,
+  "action": "start_workflow",
+  "definition_id": "bulk-enrichment-workflow",
+  "workflow_task_queue": "streaming-bulk",
+  "payload_template_json": {
+    "tenantId": {
+      "$from": "/tenant_id"
+    },
+    "items": {
+      "$from": "/payload/items"
+    },
+    "sourceEvent": {
+      "topic": "orders.events",
+      "offset": {
+        "$from": "/offset"
+      }
+    }
+  },
+  "memo_template_json": {
+    "source": "topic-adapter",
+    "customerId": {
+      "$from": "/payload/customer_id"
+    }
+  },
+  "search_attributes_template_json": {
+    "order_id": {
+      "$from": "/payload/order_id"
+    },
+    "event_type": {
+      "$from": "/event_type"
+    }
+  },
+  "request_id_json_pointer": "/request_id",
+  "dedupe_key_json_pointer": "/payload/order_id",
+  "dead_letter_policy": "store"
+}

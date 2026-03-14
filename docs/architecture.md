@@ -241,12 +241,9 @@ For high-cardinality fan-out beyond what durable per-activity execution supports
 
 Throughput mode may run with an eager execution policy. In eager mode, chunk work may execute ahead of workflow observation, but it does not directly mutate workflow state. The workflow still observes only deterministic batch barrier outcomes.
 
-Throughput mode supports two interchangeable backends:
+Throughput mode uses the `stream-v2` backend. It removes Postgres from the throughput hot path and uses a dedicated `throughput-runtime` service with RocksDB for shard-local state, Redpanda for command/report/changelog logs, and S3 for durable checkpoints. The workflow-visible contract stays batch-level and deterministic even though the throughput engine owns the nonterminal chunk lifecycle.
 
-- **`pg-v1`** (default): Postgres-first backend. Chunk scheduling and state management run entirely in Postgres. No additional infrastructure required. Suitable for batches up to ~100K items.
-- **`stream-v2`**: Streaming backend. Removes Postgres from the throughput hot path. Uses a dedicated `throughput-runtime` service with RocksDB for shard-local state, Redpanda for command/report/changelog logs, and S3 for durable checkpoints. Suitable for batches with millions of items.
-
-Backend selection is server-controlled per batch and pinned for the lifetime of that batch. Workflow code does not select `pg-v1` vs `stream-v2`. Both backends implement the same internal interface and produce the same workflow-visible batch lifecycle events.
+Backend selection remains server-controlled, but the active product architecture now admits only `stream-v2` for new bulk work.
 
 See [throughput-mode.md](spec/throughput-mode.md) for the full specification.
 See [streaming-product-guide.md](streaming-product-guide.md) for the product-level operator story and [benchmarking/streaming-performance-envelope.md](benchmarking/streaming-performance-envelope.md) for the current benchmark-backed workload guidance.

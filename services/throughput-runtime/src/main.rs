@@ -32,17 +32,16 @@ use fabrik_store::{
     WorkflowBulkChunkRecord, WorkflowBulkChunkStatus, WorkflowStore,
 };
 use fabrik_throughput::{
-    ADMISSION_POLICY_VERSION, BENCHMARK_ECHO_ACTIVITY, BENCHMARK_FAST_COUNT_ACTIVITY,
-    CORE_ACCEPT_ACTIVITY, CORE_ECHO_ACTIVITY, CORE_NOOP_ACTIVITY, CollectResultsBatchManifest,
-    CollectResultsChunkSegmentRef, PayloadHandle, PayloadStore, PayloadStoreConfig,
-    PayloadStoreKind, StartThroughputRunCommand, ThroughputBackend, ThroughputBatchIdentity,
-    ThroughputChangelogEntry, ThroughputChangelogPayload, ThroughputChunkReport,
-    ThroughputChunkReportPayload, ThroughputCommand, ThroughputCommandEnvelope,
-    benchmark_echo_item_requires_output, bulk_reducer_class, bulk_reducer_name,
-    bulk_reducer_settles, bulk_reducer_summary_field_name, can_complete_payloadless_bulk_chunk,
-    can_use_payloadless_bulk_transport, decode_cbor, effective_aggregation_group_count,
-    encode_cbor, execute_benchmark_echo, group_id_for_chunk_index,
-    parse_benchmark_compact_input_meta_from_handle,
+    ADMISSION_POLICY_VERSION, ActivityExecutionCapabilities, BENCHMARK_ECHO_ACTIVITY,
+    CollectResultsBatchManifest, CollectResultsChunkSegmentRef, PayloadHandle, PayloadStore,
+    PayloadStoreConfig, PayloadStoreKind, StartThroughputRunCommand, ThroughputBackend,
+    ThroughputBatchIdentity, ThroughputChangelogEntry, ThroughputChangelogPayload,
+    ThroughputChunkReport, ThroughputChunkReportPayload, ThroughputCommand,
+    ThroughputCommandEnvelope, benchmark_echo_item_requires_output, bulk_reducer_class,
+    bulk_reducer_name, bulk_reducer_settles, bulk_reducer_summary_field_name,
+    can_complete_payloadless_bulk_chunk, can_use_payloadless_bulk_transport, decode_cbor,
+    effective_aggregation_group_count, encode_cbor, execute_benchmark_echo,
+    group_id_for_chunk_index, parse_benchmark_compact_input_meta_from_handle,
     parse_benchmark_compact_total_items_from_handle, planned_reduction_tree_depth,
     stream_v2_fast_lane_enabled, synthesize_benchmark_echo_items, throughput_execution_mode,
     throughput_partition_key, throughput_reducer_execution_path, throughput_reducer_version,
@@ -538,6 +537,7 @@ async fn handle_bridge_event(state: AppState, event: EventEnvelope<WorkflowEvent
         throughput_backend,
         throughput_backend_version: _,
         state: _,
+        ..
     } = &event.payload
     else {
         return Ok(());
@@ -1698,6 +1698,7 @@ async fn run_local_benchmark_fastlane_once(
 fn is_local_benchmark_fastlane_chunk(chunk: &LeasedChunkSnapshot) -> bool {
     can_complete_payloadless_bulk_chunk(
         &chunk.activity_type,
+        None,
         chunk.omit_success_output,
         chunk.item_count,
         !chunk.items.is_empty(),
@@ -1712,6 +1713,7 @@ async fn execute_local_benchmark_chunk(
 ) -> Result<ThroughputChunkReport> {
     if can_complete_payloadless_bulk_chunk(
         &chunk.activity_type,
+        None,
         chunk.omit_success_output,
         chunk.item_count,
         !chunk.items.is_empty(),
@@ -2503,6 +2505,7 @@ async fn build_stream_projection_records_from_parts(
     artifact_hash: Option<&str>,
     batch_id: &str,
     activity_type: &str,
+    activity_capabilities: Option<&ActivityExecutionCapabilities>,
     task_queue: &str,
     workflow_state: Option<&str>,
     items: Vec<Value>,
@@ -2548,8 +2551,13 @@ async fn build_stream_projection_records_from_parts(
         reducer,
     )
     .await?;
-    let payloadless_chunk_transport =
-        can_use_payloadless_bulk_transport(activity_type, reducer, max_attempts, &items);
+    let payloadless_chunk_transport = can_use_payloadless_bulk_transport(
+        activity_type,
+        activity_capabilities,
+        reducer,
+        max_attempts,
+        &items,
+    );
     let uses_compact_chunk_input_handle = !materialize_inline_chunk_items
         && !payloadless_chunk_transport
         && parse_benchmark_compact_total_items_from_handle(&batch_input_handle).is_some();
@@ -2700,6 +2708,7 @@ async fn build_stream_projection_records(
     let WorkflowEvent::BulkActivityBatchScheduled {
         batch_id,
         activity_type,
+        activity_capabilities,
         task_queue,
         items,
         input_handle,
@@ -2713,6 +2722,7 @@ async fn build_stream_projection_records(
         throughput_backend,
         throughput_backend_version,
         state,
+        ..
     } = &event.payload
     else {
         anyhow::bail!("expected BulkActivityBatchScheduled event");
@@ -2755,6 +2765,7 @@ async fn build_stream_projection_records(
         Some(event.artifact_hash.as_str()),
         batch_id,
         activity_type,
+        activity_capabilities.as_ref(),
         task_queue,
         state.as_deref(),
         items,
@@ -2835,6 +2846,7 @@ async fn build_stream_projection_records_from_start_command(
         command.artifact_hash.as_deref(),
         &command.batch_id,
         &command.activity_type,
+        command.activity_capabilities.as_ref(),
         &command.task_queue,
         command.state.as_deref(),
         items,
@@ -2873,6 +2885,7 @@ fn workflow_event_from_throughput_command(
     let payload = WorkflowEvent::BulkActivityBatchScheduled {
         batch_id: command.batch_id.clone(),
         activity_type: command.activity_type.clone(),
+        activity_capabilities: command.activity_capabilities.clone(),
         task_queue: command.task_queue.clone(),
         items: command.items.clone(),
         input_handle: serde_json::to_value(&command.input_handle)
@@ -4396,6 +4409,7 @@ fn bulk_chunk_to_proto(
 ) -> BulkActivityTask {
     let payloadless_chunk_transport = can_complete_payloadless_bulk_chunk(
         &record.activity_type,
+        None,
         record.omit_success_output,
         record.item_count,
         !record.items.is_empty(),

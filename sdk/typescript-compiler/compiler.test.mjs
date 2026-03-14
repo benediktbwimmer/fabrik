@@ -138,6 +138,52 @@ test("compiler accepts static top-level Temporal setWorkflowOptions annotations"
   assert.match(serialized, /"handler":"greet"/);
 });
 
+test("compiler accepts exported workflows wrapped in Temporal setWorkflowOptions", async () => {
+  const fixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-versioning-upgrade-pressure/src/workflows.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "versioningPressureWorkflow",
+    "--definition-id",
+    "versioning-pressure-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.equal(artifact.definition_id, "versioning-pressure-workflow");
+  assert.match(serialized, /"kind":"version"/);
+  assert.match(serialized, /"handler":"renderGreeting"/);
+});
+
+test("compiler lowers wrapped await expressions inside returned template strings", async () => {
+  const fixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-versioning-upgrade-pressure-v2/src/workflows.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "versioningPressureWorkflow",
+    "--definition-id",
+    "versioning-pressure-workflow-v2",
+    "--version",
+    "2",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.equal(artifact.definition_id, "versioning-pressure-workflow-v2");
+  assert.match(serialized, /"handler":"renderGreeting"/);
+  assert.match(serialized, /"op":"add"/);
+});
+
 test("compiler lowers Temporal search attribute upserts onto durable workflow effects", async () => {
   const fixture = path.join(
     root,
@@ -223,6 +269,29 @@ test("compiler lowers awaited ctx.activity calls into activity states", async ()
   assert.match(serialized, /"output_var":"echoed"/);
 });
 
+test("compiler lowers awaited dynamic ctx.activity calls into dynamic activity descriptors", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/dynamic-ctx-activity-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "dynamicCtxActivityWorkflow",
+    "--definition-id",
+    "dynamic-ctx-activity-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"dynamic_step"/);
+  assert.match(serialized, /"__kind":\{"kind":"literal","value":"activity_descriptor"\}/);
+  assert.match(serialized, /"activity_type":\{"kind":"identifier","name":"activityName"\}/);
+});
+
 test("compiler lowers bulk activity handles and waits", async () => {
   const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/bulk-workflow.ts");
   const { stdout } = await runCompiler([
@@ -245,6 +314,27 @@ test("compiler lowers bulk activity handles and waits", async () => {
   assert.match(serialized, /"chunk_size":128/);
   assert.match(serialized, /"type":"wait_for_bulk_activity"/);
   assert.match(serialized, /"output_var":"summary"/);
+});
+
+test("compiler lowers dynamic ctx.bulkActivity calls into dynamic bulk descriptors", async () => {
+  const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/dynamic-bulk-workflow.ts");
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "dynamicBulkWorkflow",
+    "--definition-id",
+    "dynamic-bulk-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"dynamic_start_bulk_activity"/);
+  assert.match(serialized, /"__kind":\{"kind":"literal","value":"bulk_activity_descriptor"\}/);
+  assert.match(serialized, /"activity_type":\{"kind":"identifier","name":"activityName"\}/);
+  assert.match(serialized, /"activity_capabilities":\{"kind":"object","fields":\{"payloadless_transport":\{"kind":"literal","value":true\}\}\}/);
 });
 
 test("compiler rejects non-static bulk options", async () => {
@@ -512,6 +602,28 @@ test("compiler lowers dynamic proxy activity member calls with spread args", asy
   assert.match(serialized, /"type":"dynamic_step"/);
   assert.match(serialized, /"activity_type":\{"kind":"identifier","name":"activityName"\}/);
   assert.match(serialized, /"input":\{"kind":"identifier","name":"args"\}/);
+});
+
+test("compiler lowers proxy activity fanout capabilities into fan-out state metadata", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-fanout-capabilities-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalFanoutCapabilitiesWorkflow",
+    "--definition-id",
+    "temporal-fanout-capabilities-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"fan_out"/);
+  assert.match(serialized, /"activity_capabilities":\{"payloadless_transport":true\}/);
 });
 
 test("compiler lowers dynamic Temporal sleep durations", async () => {

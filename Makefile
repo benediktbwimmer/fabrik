@@ -1,4 +1,4 @@
-.PHONY: up down status smoke-eager-count benchmark-compare-temporal benchmark-compare-temporal-target
+.PHONY: up down status smoke-eager-count benchmark-compare-temporal benchmark-compare-temporal-target benchmark-streaming-release-gate
 
 up:
 	./scripts/dev-stack.sh up
@@ -17,3 +17,6 @@ benchmark-compare-temporal:
 
 benchmark-compare-temporal-target:
 	./scripts/run-temporal-comparison-benchmark.sh --profile target
+
+benchmark-streaming-release-gate:
+	./scripts/run-streaming-release-gate.sh

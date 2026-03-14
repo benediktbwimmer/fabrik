@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use uuid::Uuid;
 
-pub const PG_V1_BACKEND: &str = "pg-v1";
 pub const STREAM_V2_BACKEND: &str = "stream-v2";
 pub const CORE_ECHO_ACTIVITY: &str = "core.echo";
 pub const CORE_NOOP_ACTIVITY: &str = "core.noop";
@@ -47,18 +46,30 @@ const REDUCTION_GROUP_SLOT_MASK: u32 = (1 << REDUCTION_GROUP_LEVEL_SHIFT) - 1;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
-pub enum WorkflowExecutionPath {
-    TinyWorkflowEngine,
-    NativeStreamV2,
-    LegacyWorkflow,
+pub enum WorkflowAdmissionMode {
+    InlineFastStart,
+    DurableWorkflow,
 }
 
-impl WorkflowExecutionPath {
+impl WorkflowAdmissionMode {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::TinyWorkflowEngine => "tiny_workflow_engine",
+            Self::InlineFastStart => "inline_fast_start",
+            Self::DurableWorkflow => "durable_workflow",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ThroughputExecutionPath {
+    NativeStreamV2,
+}
+
+impl ThroughputExecutionPath {
+    pub fn as_str(&self) -> &'static str {
+        match self {
             Self::NativeStreamV2 => "native_stream_v2",
-            Self::LegacyWorkflow => "legacy_workflow",
         }
     }
 }
@@ -105,30 +116,76 @@ impl VectorizedBulkActivityCapability {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ActivityExecutionCapabilities {
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub payloadless_transport: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub tiny_inline_completion: bool,
+}
+
+impl ActivityExecutionCapabilities {
+    pub fn normalized(mut self) -> Self {
+        if self.tiny_inline_completion {
+            self.payloadless_transport = true;
+        }
+        self
+    }
+
+    pub fn merged_with_builtin(activity_type: &str, declared: Option<&Self>) -> Self {
+        let mut capabilities = builtin_activity_execution_capabilities(activity_type);
+        if let Some(declared) = declared {
+            capabilities.payloadless_transport |= declared.payloadless_transport;
+            capabilities.tiny_inline_completion |= declared.tiny_inline_completion;
+        }
+        capabilities.normalized()
+    }
+}
+
+pub fn builtin_activity_execution_capabilities(
+    activity_type: &str,
+) -> ActivityExecutionCapabilities {
+    match activity_type {
+        BENCHMARK_FAST_COUNT_ACTIVITY => ActivityExecutionCapabilities {
+            payloadless_transport: true,
+            tiny_inline_completion: true,
+        },
+        BENCHMARK_ECHO_ACTIVITY
+        | CORE_ECHO_ACTIVITY
+        | CORE_NOOP_ACTIVITY
+        | CORE_ACCEPT_ACTIVITY => ActivityExecutionCapabilities {
+            payloadless_transport: true,
+            tiny_inline_completion: false,
+        },
+        _ => ActivityExecutionCapabilities::default(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TinyWorkflowRoutingDecision {
-    pub execution_path: WorkflowExecutionPath,
+    pub admission_mode: WorkflowAdmissionMode,
     pub execution_mode: TinyWorkflowExecutionMode,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ThroughputBackend {
-    PgV1,
     StreamV2,
 }
 
 impl ThroughputBackend {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::PgV1 => PG_V1_BACKEND,
             Self::StreamV2 => STREAM_V2_BACKEND,
         }
     }
 
     pub fn default_version(&self) -> &'static str {
         match self {
-            Self::PgV1 => "1.0.0",
             Self::StreamV2 => STREAM_V2_BACKEND_VERSION,
         }
     }
@@ -215,16 +272,17 @@ pub fn activity_can_short_circuit_omitted_success_output(activity_type: &str) ->
 
 pub fn can_use_payloadless_bulk_transport(
     activity_type: &str,
+    declared_capabilities: Option<&ActivityExecutionCapabilities>,
     reducer: Option<&str>,
     max_attempts: u32,
     items: &[Value],
 ) -> bool {
-    if vectorized_bulk_activity_capability(activity_type)
+    if vectorized_bulk_activity_capability(activity_type, declared_capabilities)
         == VectorizedBulkActivityCapability::TinyInlineCompletion
     {
         return true;
     }
-    if vectorized_bulk_activity_capability(activity_type)
+    if vectorized_bulk_activity_capability(activity_type, declared_capabilities)
         != VectorizedBulkActivityCapability::PayloadlessTransport
         || max_attempts > 1
     {
@@ -247,6 +305,7 @@ pub fn can_use_payloadless_bulk_transport(
 
 pub fn can_complete_payloadless_bulk_chunk(
     activity_type: &str,
+    declared_capabilities: Option<&ActivityExecutionCapabilities>,
     omit_success_output: bool,
     item_count: u32,
     has_inline_items: bool,
@@ -256,12 +315,12 @@ pub fn can_complete_payloadless_bulk_chunk(
     if cancellation_requested || !omit_success_output || item_count == 0 {
         return false;
     }
-    if vectorized_bulk_activity_capability(activity_type)
+    if vectorized_bulk_activity_capability(activity_type, declared_capabilities)
         == VectorizedBulkActivityCapability::TinyInlineCompletion
     {
         return true;
     }
-    vectorized_bulk_activity_capability(activity_type)
+    vectorized_bulk_activity_capability(activity_type, declared_capabilities)
         == VectorizedBulkActivityCapability::PayloadlessTransport
         && !has_inline_items
         && !has_input_handle
@@ -269,15 +328,23 @@ pub fn can_complete_payloadless_bulk_chunk(
 
 pub fn can_use_payloadless_benchmark_transport(
     activity_type: &str,
+    declared_capabilities: Option<&ActivityExecutionCapabilities>,
     reducer: Option<&str>,
     max_attempts: u32,
     items: &[Value],
 ) -> bool {
-    can_use_payloadless_bulk_transport(activity_type, reducer, max_attempts, items)
+    can_use_payloadless_bulk_transport(
+        activity_type,
+        declared_capabilities,
+        reducer,
+        max_attempts,
+        items,
+    )
 }
 
 pub fn can_complete_payloadless_benchmark_chunk(
     activity_type: &str,
+    declared_capabilities: Option<&ActivityExecutionCapabilities>,
     omit_success_output: bool,
     item_count: u32,
     has_inline_items: bool,
@@ -286,6 +353,7 @@ pub fn can_complete_payloadless_benchmark_chunk(
 ) -> bool {
     can_complete_payloadless_bulk_chunk(
         activity_type,
+        declared_capabilities,
         omit_success_output,
         item_count,
         has_inline_items,
@@ -296,6 +364,7 @@ pub fn can_complete_payloadless_benchmark_chunk(
 
 pub fn can_inline_stream_v2_microbatch(
     activity_type: &str,
+    declared_capabilities: Option<&ActivityExecutionCapabilities>,
     reducer: Option<&str>,
     max_attempts: u32,
     items: &[Value],
@@ -309,11 +378,18 @@ pub fn can_inline_stream_v2_microbatch(
             reducer.unwrap_or(BULK_REDUCER_COLLECT_RESULTS),
             BULK_REDUCER_ALL_SETTLED | BULK_REDUCER_COUNT
         )
-        && can_use_payloadless_bulk_transport(activity_type, reducer, max_attempts, items)
+        && can_use_payloadless_bulk_transport(
+            activity_type,
+            declared_capabilities,
+            reducer,
+            max_attempts,
+            items,
+        )
 }
 
 pub fn can_inline_durable_tiny_fanout(
     activity_type: &str,
+    declared_capabilities: Option<&ActivityExecutionCapabilities>,
     reducer: Option<&str>,
     max_attempts: u32,
     items: &[Value],
@@ -324,24 +400,33 @@ pub fn can_inline_durable_tiny_fanout(
             reducer.unwrap_or(BULK_REDUCER_COLLECT_RESULTS),
             BULK_REDUCER_ALL_SETTLED | BULK_REDUCER_COUNT
         )
-        && can_use_payloadless_bulk_transport(activity_type, reducer, max_attempts, items)
+        && can_use_payloadless_bulk_transport(
+            activity_type,
+            declared_capabilities,
+            reducer,
+            max_attempts,
+            items,
+        )
 }
 
 pub fn vectorized_bulk_activity_capability(
     activity_type: &str,
+    declared_capabilities: Option<&ActivityExecutionCapabilities>,
 ) -> VectorizedBulkActivityCapability {
-    match activity_type {
-        BENCHMARK_FAST_COUNT_ACTIVITY => VectorizedBulkActivityCapability::TinyInlineCompletion,
-        BENCHMARK_ECHO_ACTIVITY
-        | CORE_ECHO_ACTIVITY
-        | CORE_NOOP_ACTIVITY
-        | CORE_ACCEPT_ACTIVITY => VectorizedBulkActivityCapability::PayloadlessTransport,
-        _ => VectorizedBulkActivityCapability::None,
+    let capabilities =
+        ActivityExecutionCapabilities::merged_with_builtin(activity_type, declared_capabilities);
+    if capabilities.tiny_inline_completion {
+        VectorizedBulkActivityCapability::TinyInlineCompletion
+    } else if capabilities.payloadless_transport {
+        VectorizedBulkActivityCapability::PayloadlessTransport
+    } else {
+        VectorizedBulkActivityCapability::None
     }
 }
 
 pub fn tiny_workflow_routing_decision(
     activity_type: &str,
+    declared_capabilities: Option<&ActivityExecutionCapabilities>,
     reducer: Option<&str>,
     throughput_backend: Option<&str>,
     max_attempts: u32,
@@ -355,7 +440,8 @@ pub fn tiny_workflow_routing_decision(
     if !matches!(bulk_reducer_name(reducer), BULK_REDUCER_ALL_SETTLED | BULK_REDUCER_COUNT) {
         return Err(FastPathRejectionReason::UnsupportedReducer);
     }
-    if vectorized_bulk_activity_capability(activity_type) == VectorizedBulkActivityCapability::None
+    if vectorized_bulk_activity_capability(activity_type, declared_capabilities)
+        == VectorizedBulkActivityCapability::None
     {
         return Err(FastPathRejectionReason::UnsupportedActivity);
     }
@@ -367,20 +453,32 @@ pub fn tiny_workflow_routing_decision(
             return Err(FastPathRejectionReason::UnsupportedBackend);
         }
         if chunk_count != 1
-            || !can_use_payloadless_bulk_transport(activity_type, reducer, max_attempts, items)
+            || !can_use_payloadless_bulk_transport(
+                activity_type,
+                declared_capabilities,
+                reducer,
+                max_attempts,
+                items,
+            )
         {
             return Err(FastPathRejectionReason::NotTinyWorkflow);
         }
         return Ok(TinyWorkflowRoutingDecision {
-            execution_path: WorkflowExecutionPath::TinyWorkflowEngine,
+            admission_mode: WorkflowAdmissionMode::InlineFastStart,
             execution_mode: TinyWorkflowExecutionMode::Throughput,
         });
     }
-    if !can_use_payloadless_bulk_transport(activity_type, reducer, max_attempts, items) {
+    if !can_use_payloadless_bulk_transport(
+        activity_type,
+        declared_capabilities,
+        reducer,
+        max_attempts,
+        items,
+    ) {
         return Err(FastPathRejectionReason::NotTinyWorkflow);
     }
     Ok(TinyWorkflowRoutingDecision {
-        execution_path: WorkflowExecutionPath::TinyWorkflowEngine,
+        admission_mode: WorkflowAdmissionMode::InlineFastStart,
         execution_mode: TinyWorkflowExecutionMode::Durable,
     })
 }
@@ -654,10 +752,8 @@ pub fn throughput_routing_reason(
 ) -> &'static str {
     if stream_v2_fast_lane_enabled(backend, execution_policy, reducer) {
         "stream_v2_fast_lane"
-    } else if backend == STREAM_V2_BACKEND {
-        "stream_v2_selected"
     } else {
-        "pg_v1_selected"
+        "stream_v2_selected"
     }
 }
 
@@ -909,6 +1005,8 @@ pub struct StartThroughputRunCommand {
     pub run_id: String,
     pub batch_id: String,
     pub activity_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_capabilities: Option<ActivityExecutionCapabilities>,
     pub task_queue: String,
     pub state: Option<String>,
     pub chunk_size: u32,
@@ -937,6 +1035,8 @@ pub struct CreateBatchCommand {
     pub run_id: String,
     pub batch_id: String,
     pub activity_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_capabilities: Option<ActivityExecutionCapabilities>,
     pub task_queue: String,
     pub state: Option<String>,
     pub chunk_size: u32,
@@ -967,6 +1067,7 @@ impl CreateBatchCommand {
             run_id: self.run_id.clone(),
             batch_id: self.batch_id.clone(),
             activity_type: self.activity_type.clone(),
+            activity_capabilities: self.activity_capabilities.clone(),
             task_queue: self.task_queue.clone(),
             state: self.state.clone(),
             chunk_size: self.chunk_size,
@@ -1701,6 +1802,7 @@ mod tests {
                 run_id: "run-a".to_owned(),
                 batch_id: "batch-a".to_owned(),
                 activity_type: "benchmark.echo".to_owned(),
+                activity_capabilities: None,
                 task_queue: "bulk".to_owned(),
                 state: Some("join".to_owned()),
                 chunk_size: 16,
@@ -1742,6 +1844,7 @@ mod tests {
             run_id: "run-a".to_owned(),
             batch_id: "batch-a".to_owned(),
             activity_type: "benchmark.echo".to_owned(),
+            activity_capabilities: None,
             task_queue: "bulk".to_owned(),
             state: Some("join".to_owned()),
             chunk_size: 16,
@@ -1803,12 +1906,14 @@ mod tests {
         assert!(activity_can_short_circuit_omitted_success_output(CORE_ACCEPT_ACTIVITY));
         assert!(can_use_payloadless_bulk_transport(
             CORE_ECHO_ACTIVITY,
+            None,
             Some(BULK_REDUCER_COUNT),
             1,
             &items,
         ));
         assert!(can_inline_durable_tiny_fanout(
             CORE_ACCEPT_ACTIVITY,
+            None,
             Some(BULK_REDUCER_ALL_SETTLED),
             1,
             &items,
@@ -1816,6 +1921,7 @@ mod tests {
         assert_eq!(
             tiny_workflow_routing_decision(
                 CORE_NOOP_ACTIVITY,
+                None,
                 Some(BULK_REDUCER_COUNT),
                 None,
                 1,
@@ -1824,8 +1930,8 @@ mod tests {
                 1,
             )
             .expect("core.noop should route through tiny workflow fast lane")
-            .execution_path,
-            WorkflowExecutionPath::TinyWorkflowEngine
+            .admission_mode,
+            WorkflowAdmissionMode::InlineFastStart
         );
     }
 
@@ -1834,12 +1940,52 @@ mod tests {
         assert!(!activity_can_short_circuit_omitted_success_output(BENCHMARK_FAST_COUNT_ACTIVITY));
         assert!(can_complete_payloadless_bulk_chunk(
             BENCHMARK_FAST_COUNT_ACTIVITY,
+            None,
             true,
             128,
             true,
             false,
             false,
         ));
+    }
+
+    #[test]
+    fn declared_capabilities_enable_arbitrary_activity_fast_paths() {
+        let items = vec![serde_json::json!({"value": 1}), serde_json::json!({"value": 2})];
+        let capabilities = ActivityExecutionCapabilities {
+            payloadless_transport: true,
+            tiny_inline_completion: false,
+        };
+
+        assert!(can_use_payloadless_bulk_transport(
+            "custom.echo",
+            Some(&capabilities),
+            Some(BULK_REDUCER_COUNT),
+            1,
+            &items,
+        ));
+        assert!(can_inline_durable_tiny_fanout(
+            "custom.echo",
+            Some(&capabilities),
+            Some(BULK_REDUCER_ALL_SETTLED),
+            1,
+            &items,
+        ));
+        assert_eq!(
+            tiny_workflow_routing_decision(
+                "custom.echo",
+                Some(&capabilities),
+                Some(BULK_REDUCER_COUNT),
+                None,
+                1,
+                &items,
+                items.len(),
+                1,
+            )
+            .expect("declared custom activity should route through tiny workflow fast lane")
+            .admission_mode,
+            WorkflowAdmissionMode::InlineFastStart
+        );
     }
 
     #[test]

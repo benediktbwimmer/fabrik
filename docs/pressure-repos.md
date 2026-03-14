@@ -16,6 +16,7 @@ They exist to exercise the remaining trust and packaging surfaces once the offic
   - purpose: multi-worker monorepo packaging, workspace resolution, and tsconfig-path handling
 - `crates/fabrik-cli/test-fixtures/temporal-versioning-upgrade-pressure`
   - purpose: versioning behavior, patch markers, and mixed-build drill preparation
+  - passing drill bundle: `target/alpha-drills/temporal-versioning-upgrade-pressure/versioning-pressure-mixed-build-drill-report.json`
 
 ## How To Run
 

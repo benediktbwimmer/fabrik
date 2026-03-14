@@ -14,7 +14,7 @@ use fabrik_store::{
     TopicAdapterRecord, TopicAdapterUpsert, WorkflowStore,
 };
 use fabrik_throughput::{
-    BENCHMARK_ECHO_ACTIVITY, BENCHMARK_FAST_COUNT_ACTIVITY, PG_V1_BACKEND, STREAM_V2_BACKEND,
+    BENCHMARK_ECHO_ACTIVITY, BENCHMARK_FAST_COUNT_ACTIVITY, STREAM_V2_BACKEND,
     benchmark_compact_input_spec, benchmark_compact_input_spec_with_payload,
 };
 use fabrik_workflow::{
@@ -196,7 +196,7 @@ struct BatchRoutingMetrics {
     backend_counts: BTreeMap<String, u64>,
     routing_reason_counts: BTreeMap<String, u64>,
     admission_policy_version_counts: BTreeMap<String, u64>,
-    workflow_execution_path_counts: BTreeMap<String, u64>,
+    workflow_admission_mode_counts: BTreeMap<String, u64>,
     workflow_fast_path_rejection_reason_counts: BTreeMap<String, u64>,
     throughput_execution_path_counts: BTreeMap<String, u64>,
 }
@@ -379,7 +379,7 @@ fn warn_suite_selection(args: &Args, suite_name: &str) {
     }
     if args.execution_mode != ExecutionMode::Durable || args.throughput_backend.is_some() {
         eprintln!(
-            "warning: --suite streaming ignores single-scenario selection and runs durable, throughput-pg-v1, and throughput-stream-v2 scenarios"
+            "warning: --suite streaming ignores single-scenario selection and runs durable and throughput-stream-v2 scenarios"
         );
     }
 }
@@ -1395,11 +1395,10 @@ fn parse_args() -> Result<Args> {
             }
             "--throughput-backend" => {
                 throughput_backend = Some(match value.as_str() {
-                    PG_V1_BACKEND => PG_V1_BACKEND.to_owned(),
                     STREAM_V2_BACKEND => STREAM_V2_BACKEND.to_owned(),
-                    other => bail!(
-                        "unknown --throughput-backend {other}; expected {PG_V1_BACKEND} or {STREAM_V2_BACKEND}"
-                    ),
+                    other => {
+                        bail!("unknown --throughput-backend {other}; expected {STREAM_V2_BACKEND}")
+                    }
                 })
             }
             "--workload-kind" => workload_kind = BenchmarkWorkloadKind::parse(&value)?,
@@ -1801,6 +1800,7 @@ fn insert_dispatch_graph(
                     },
                     next: "join".to_owned(),
                     handle_var: "fanout".to_owned(),
+                    activity_capabilities: None,
                     task_queue: Some(Expression::Literal {
                         value: Value::String(task_queue.to_owned()),
                     }),
@@ -1843,6 +1843,7 @@ fn insert_dispatch_graph(
                     },
                     next: "join".to_owned(),
                     handle_var: "fanout".to_owned(),
+                    activity_capabilities: None,
                     task_queue: Some(Expression::Literal {
                         value: Value::String(task_queue.to_owned()),
                     }),
@@ -2132,17 +2133,12 @@ fn benchmark_suite_scenarios(args: &Args, suite_name: &str) -> Result<Vec<Args>>
             durable.execution_mode = ExecutionMode::Durable;
             durable.throughput_backend = None;
 
-            let mut throughput_pg = args.clone();
-            throughput_pg.suite_name = None;
-            throughput_pg.execution_mode = ExecutionMode::Throughput;
-            throughput_pg.throughput_backend = Some(PG_V1_BACKEND.to_owned());
-
             let mut throughput_stream = args.clone();
             throughput_stream.suite_name = None;
             throughput_stream.execution_mode = ExecutionMode::Throughput;
             throughput_stream.throughput_backend = Some(STREAM_V2_BACKEND.to_owned());
 
-            Ok(vec![durable, throughput_pg, throughput_stream])
+            Ok(vec![durable, throughput_stream])
         }
         "stream-v2-robustness" => {
             let mut throughput_stream = args.clone();
@@ -2240,18 +2236,8 @@ fn benchmark_suite_scenarios(args: &Args, suite_name: &str) -> Result<Vec<Args>>
         }
         "streaming-reducers" => {
             let reducers = ["sum", "min", "max", "avg", "histogram"];
-            let mut scenarios = Vec::with_capacity((reducers.len() * 2) + 4);
+            let mut scenarios = Vec::with_capacity(reducers.len() + 2);
             for reducer in reducers {
-                let mut pg = args.clone();
-                pg.suite_name = None;
-                pg.execution_mode = ExecutionMode::Throughput;
-                pg.throughput_backend = Some(PG_V1_BACKEND.to_owned());
-                pg.bulk_reducer = reducer.to_owned();
-                pg.chunk_size = pg.chunk_size.min(64);
-                pg.profile.activities_per_workflow = pg.profile.activities_per_workflow.max(1_024);
-                pg.scenario_tag = Some(format!("{reducer}-pg-v1"));
-                scenarios.push(pg);
-
                 let mut stream = args.clone();
                 stream.suite_name = None;
                 stream.execution_mode = ExecutionMode::Throughput;
@@ -2264,37 +2250,32 @@ fn benchmark_suite_scenarios(args: &Args, suite_name: &str) -> Result<Vec<Args>>
                 scenarios.push(stream);
             }
 
-            for backend in [PG_V1_BACKEND, STREAM_V2_BACKEND] {
-                let backend_tag = if backend == PG_V1_BACKEND { "pg-v1" } else { "stream-v2" };
+            let mut cancel_only = args.clone();
+            cancel_only.suite_name = None;
+            cancel_only.execution_mode = ExecutionMode::Throughput;
+            cancel_only.throughput_backend = Some(STREAM_V2_BACKEND.to_owned());
+            cancel_only.bulk_reducer = "sample_errors".to_owned();
+            cancel_only.chunk_size = cancel_only.chunk_size.min(64);
+            cancel_only.profile.activities_per_workflow =
+                cancel_only.profile.activities_per_workflow.max(1_024);
+            cancel_only.retry_rate = 0.0;
+            cancel_only.cancel_rate = cancel_only.cancel_rate.max(0.01);
+            cancel_only.scenario_tag = Some("sample-errors-cancel-only-stream-v2".to_owned());
+            scenarios.push(cancel_only);
 
-                let mut cancel_only = args.clone();
-                cancel_only.suite_name = None;
-                cancel_only.execution_mode = ExecutionMode::Throughput;
-                cancel_only.throughput_backend = Some(backend.to_owned());
-                cancel_only.bulk_reducer = "sample_errors".to_owned();
-                cancel_only.chunk_size = cancel_only.chunk_size.min(64);
-                cancel_only.profile.activities_per_workflow =
-                    cancel_only.profile.activities_per_workflow.max(1_024);
-                cancel_only.retry_rate = 0.0;
-                cancel_only.cancel_rate = cancel_only.cancel_rate.max(0.01);
-                cancel_only.scenario_tag = Some(format!("sample-errors-cancel-only-{backend_tag}"));
-                scenarios.push(cancel_only);
-
-                let mut retry_cancel = args.clone();
-                retry_cancel.suite_name = None;
-                retry_cancel.execution_mode = ExecutionMode::Throughput;
-                retry_cancel.throughput_backend = Some(backend.to_owned());
-                retry_cancel.bulk_reducer = "sample_errors".to_owned();
-                retry_cancel.chunk_size = retry_cancel.chunk_size.min(64);
-                retry_cancel.profile.activities_per_workflow =
-                    retry_cancel.profile.activities_per_workflow.max(1_024);
-                retry_cancel.retry_rate = retry_cancel.retry_rate.max(0.01);
-                retry_cancel.cancel_rate = retry_cancel.cancel_rate.max(0.01);
-                retry_cancel.retry_delay_ms = retry_cancel.retry_delay_ms.min(25);
-                retry_cancel.scenario_tag =
-                    Some(format!("sample-errors-retry-cancel-{backend_tag}"));
-                scenarios.push(retry_cancel);
-            }
+            let mut retry_cancel = args.clone();
+            retry_cancel.suite_name = None;
+            retry_cancel.execution_mode = ExecutionMode::Throughput;
+            retry_cancel.throughput_backend = Some(STREAM_V2_BACKEND.to_owned());
+            retry_cancel.bulk_reducer = "sample_errors".to_owned();
+            retry_cancel.chunk_size = retry_cancel.chunk_size.min(64);
+            retry_cancel.profile.activities_per_workflow =
+                retry_cancel.profile.activities_per_workflow.max(1_024);
+            retry_cancel.retry_rate = retry_cancel.retry_rate.max(0.01);
+            retry_cancel.cancel_rate = retry_cancel.cancel_rate.max(0.01);
+            retry_cancel.retry_delay_ms = retry_cancel.retry_delay_ms.min(25);
+            retry_cancel.scenario_tag = Some("sample-errors-retry-cancel-stream-v2".to_owned());
+            scenarios.push(retry_cancel);
             Ok(scenarios)
         }
         "topic-adapters" => {
@@ -2891,7 +2872,7 @@ async fn activity_metrics(
             .bind(excluded_child_pattern.clone())
             .fetch_one(pool)
             .await
-            .context("failed to query pg-v1 bulk activity metrics")?
+            .context("failed to query compatibility bulk activity metrics")?
         };
         let throughput = if duration_ms == 0 {
             0.0
@@ -3069,15 +3050,15 @@ async fn batch_routing_metrics(
     let workflow_path_rows = sqlx::query_as::<_, (String, Option<String>, i64)>(
         r#"
         SELECT
-            COALESCE(NULLIF(execution_path, ''), 'unrecorded') AS execution_path,
+            COALESCE(NULLIF(admission_mode, ''), 'unrecorded') AS admission_mode,
             fast_path_rejection_reason,
             COUNT(*)::bigint AS run_count
         FROM workflow_runs
         WHERE tenant_id = $1
           AND workflow_instance_id LIKE $2
           AND ($3::text IS NULL OR workflow_instance_id NOT LIKE $3)
-        GROUP BY execution_path, fast_path_rejection_reason
-        ORDER BY run_count DESC, execution_path ASC
+        GROUP BY admission_mode, fast_path_rejection_reason
+        ORDER BY run_count DESC, admission_mode ASC
         "#,
     )
     .bind(tenant_id)
@@ -3085,10 +3066,10 @@ async fn batch_routing_metrics(
     .bind(excluded_child_pattern.clone())
     .fetch_all(pool)
     .await
-    .context("failed to query workflow execution path metrics")?;
-    for (execution_path, rejection_reason, count) in workflow_path_rows {
+    .context("failed to query workflow admission mode metrics")?;
+    for (admission_mode, rejection_reason, count) in workflow_path_rows {
         let count = count as u64;
-        *metrics.workflow_execution_path_counts.entry(execution_path).or_default() += count;
+        *metrics.workflow_admission_mode_counts.entry(admission_mode).or_default() += count;
         if let Some(rejection_reason) = rejection_reason {
             *metrics
                 .workflow_fast_path_rejection_reason_counts
@@ -3447,8 +3428,8 @@ fn summary_text(report: &BenchmarkReport) -> String {
     let routing_reason_counts = format_counts(&report.batch_routing_metrics.routing_reason_counts);
     let admission_policy_versions =
         format_counts(&report.batch_routing_metrics.admission_policy_version_counts);
-    let workflow_execution_path_counts =
-        format_counts(&report.batch_routing_metrics.workflow_execution_path_counts);
+    let workflow_admission_mode_counts =
+        format_counts(&report.batch_routing_metrics.workflow_admission_mode_counts);
     let workflow_fast_path_rejection_reason_counts =
         format_counts(&report.batch_routing_metrics.workflow_fast_path_rejection_reason_counts);
     let throughput_execution_path_counts =
@@ -3509,7 +3490,7 @@ fn summary_text(report: &BenchmarkReport) -> String {
         )
     }).unwrap_or_default();
     format!(
-        "scenario={scenario}\nprofile={profile}\nexecution_mode={execution_mode}\nthroughput_backend={throughput_backend}\nbulk_reducer={bulk_reducer}\nretry_rate={retry_rate}\ncancel_rate={cancel_rate}\nretry_delay_ms={retry_delay_ms}\nchunk_size={chunk_size}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nexecution_duration_ms={execution_duration_ms}\nprojection_convergence_duration_ms={projection_convergence_duration_ms}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nprojection_batch_rows={projection_batch_rows}\nprojection_chunk_rows={projection_chunk_rows}\nmax_aggregation_group_count={max_aggregation_group_count}\ngrouped_batch_rows={grouped_batch_rows}\nadmission_backend_counts={backend_counts}\nadmission_routing_reason_counts={routing_reason_counts}\nadmission_policy_versions={admission_policy_versions}\nworkflow_execution_path_counts={workflow_execution_path_counts}\nworkflow_fast_path_rejection_reason_counts={workflow_fast_path_rejection_reason_counts}\nthroughput_execution_path_counts={throughput_execution_path_counts}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n{ingress_request_latency}{failover}{adapter}{control_plane}{executor_debug_delta}",
+        "scenario={scenario}\nprofile={profile}\nexecution_mode={execution_mode}\nthroughput_backend={throughput_backend}\nbulk_reducer={bulk_reducer}\nretry_rate={retry_rate}\ncancel_rate={cancel_rate}\nretry_delay_ms={retry_delay_ms}\nchunk_size={chunk_size}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nexecution_duration_ms={execution_duration_ms}\nprojection_convergence_duration_ms={projection_convergence_duration_ms}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nprojection_batch_rows={projection_batch_rows}\nprojection_chunk_rows={projection_chunk_rows}\nmax_aggregation_group_count={max_aggregation_group_count}\ngrouped_batch_rows={grouped_batch_rows}\nadmission_backend_counts={backend_counts}\nadmission_routing_reason_counts={routing_reason_counts}\nadmission_policy_versions={admission_policy_versions}\nworkflow_admission_mode_counts={workflow_admission_mode_counts}\nworkflow_fast_path_rejection_reason_counts={workflow_fast_path_rejection_reason_counts}\nthroughput_execution_path_counts={throughput_execution_path_counts}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n{ingress_request_latency}{failover}{adapter}{control_plane}{executor_debug_delta}",
         scenario = report.scenario,
         profile = report.profile,
         execution_mode = match report.execution_mode {
@@ -3544,7 +3525,7 @@ fn summary_text(report: &BenchmarkReport) -> String {
         backend_counts = backend_counts,
         routing_reason_counts = routing_reason_counts,
         admission_policy_versions = admission_policy_versions,
-        workflow_execution_path_counts = workflow_execution_path_counts,
+        workflow_admission_mode_counts = workflow_admission_mode_counts,
         workflow_fast_path_rejection_reason_counts = workflow_fast_path_rejection_reason_counts,
         throughput_execution_path_counts = throughput_execution_path_counts,
         max_workflow_backlog = report.backlog_metrics.max_workflow_backlog,
@@ -3669,12 +3650,6 @@ mod tests {
 
     #[test]
     fn throughput_artifact_uses_backend_specific_execution_policy() {
-        let mut pg_args = demo_args();
-        pg_args.execution_mode = ExecutionMode::Throughput;
-        pg_args.throughput_backend = Some(PG_V1_BACKEND.to_owned());
-        let pg_artifact =
-            benchmark_artifact("fanout-benchmark-target-throughput-pg-v1", "default", &pg_args);
-
         let mut stream_args = demo_args();
         stream_args.execution_mode = ExecutionMode::Throughput;
         stream_args.throughput_backend = Some(STREAM_V2_BACKEND.to_owned());
@@ -3684,19 +3659,8 @@ mod tests {
             &stream_args,
         );
 
-        let pg_dispatch = pg_artifact.workflow.states.get("dispatch").expect("pg dispatch state");
         let stream_dispatch =
             stream_artifact.workflow.states.get("dispatch").expect("stream dispatch state");
-
-        match pg_dispatch {
-            CompiledStateNode::StartBulkActivity {
-                execution_policy, throughput_backend, ..
-            } => {
-                assert_eq!(execution_policy.as_deref(), None);
-                assert_eq!(throughput_backend.as_deref(), Some(PG_V1_BACKEND));
-            }
-            other => panic!("expected bulk dispatch state, got {other:?}"),
-        }
 
         match stream_dispatch {
             CompiledStateNode::StartBulkActivity {
@@ -3785,33 +3749,24 @@ mod tests {
     fn streaming_reducers_suite_emits_backend_pairs_for_numeric_reducers() {
         let scenarios =
             benchmark_suite_scenarios(&demo_args(), "streaming-reducers").expect("suite");
-        assert_eq!(scenarios.len(), 14);
+        assert_eq!(scenarios.len(), 7);
         assert_eq!(scenarios[0].bulk_reducer, "sum");
-        assert_eq!(scenarios[0].throughput_backend.as_deref(), Some(PG_V1_BACKEND));
-        assert_eq!(scenarios[1].bulk_reducer, "sum");
-        assert_eq!(scenarios[1].throughput_backend.as_deref(), Some(STREAM_V2_BACKEND));
-        assert_eq!(scenarios[8].bulk_reducer, "histogram");
-        assert_eq!(scenarios[10].bulk_reducer, "sample_errors");
-        assert_eq!(scenarios[10].scenario_tag.as_deref(), Some("sample-errors-cancel-only-pg-v1"));
-        assert_eq!(scenarios[10].retry_rate, 0.0);
-        assert!(scenarios[10].cancel_rate >= 0.01);
-        assert_eq!(scenarios[11].scenario_tag.as_deref(), Some("sample-errors-retry-cancel-pg-v1"));
-        assert!(scenarios[11].retry_rate >= 0.01);
-        assert!(scenarios[11].cancel_rate >= 0.01);
-        assert!(scenarios[11].retry_delay_ms <= 25);
+        assert_eq!(scenarios[0].throughput_backend.as_deref(), Some(STREAM_V2_BACKEND));
+        assert_eq!(scenarios[4].bulk_reducer, "histogram");
+        assert_eq!(scenarios[5].bulk_reducer, "sample_errors");
         assert_eq!(
-            scenarios[12].scenario_tag.as_deref(),
+            scenarios[5].scenario_tag.as_deref(),
             Some("sample-errors-cancel-only-stream-v2")
         );
-        assert_eq!(scenarios[12].retry_rate, 0.0);
-        assert!(scenarios[12].cancel_rate >= 0.01);
+        assert_eq!(scenarios[5].retry_rate, 0.0);
+        assert!(scenarios[5].cancel_rate >= 0.01);
         assert_eq!(
-            scenarios[13].scenario_tag.as_deref(),
+            scenarios[6].scenario_tag.as_deref(),
             Some("sample-errors-retry-cancel-stream-v2")
         );
-        assert!(scenarios[13].retry_rate >= 0.01);
-        assert!(scenarios[13].cancel_rate >= 0.01);
-        assert!(scenarios[13].retry_delay_ms <= 25);
+        assert!(scenarios[6].retry_rate >= 0.01);
+        assert!(scenarios[6].cancel_rate >= 0.01);
+        assert!(scenarios[6].retry_delay_ms <= 25);
         assert!(scenarios.iter().all(|scenario| scenario.profile.activities_per_workflow >= 1_024));
     }
 
@@ -3872,7 +3827,9 @@ mod tests {
 
     #[test]
     fn non_numeric_reducer_inputs_preserve_object_outputs() {
-        let args = demo_args();
+        let mut args = demo_args();
+        args.execution_mode = ExecutionMode::Durable;
+        args.throughput_backend = None;
 
         let input = benchmark_input(&args, 2, 8, 0.0, 0.0, "instance-1");
         let items = input.get("items").and_then(Value::as_array).expect("items array");
@@ -3882,8 +3839,8 @@ mod tests {
 
     #[test]
     fn format_counts_renders_compact_summary() {
-        let counts = BTreeMap::from([("pg-v1".to_owned(), 2_u64), ("stream-v2".to_owned(), 5_u64)]);
-        assert_eq!(format_counts(&counts), "pg-v1:2,stream-v2:5");
+        let counts = BTreeMap::from([("stream-v2".to_owned(), 5_u64)]);
+        assert_eq!(format_counts(&counts), "stream-v2:5");
         assert_eq!(format_counts(&BTreeMap::new()), "none");
     }
 

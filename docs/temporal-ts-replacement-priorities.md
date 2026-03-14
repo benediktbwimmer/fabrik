@@ -56,6 +56,7 @@ The latest compiler, runtime, and packaging passes materially shifted the remain
   - definition doc: `docs/pressure-repos.md`
   - batch summary: `target/pressure-repo-qualification/summary.json`
   - current status: `5/5` qualified with caveats
+  - `temporal-versioning-upgrade-pressure` now also has a passing mixed-build/restart/rollback drill in `target/alpha-drills/temporal-versioning-upgrade-pressure/versioning-pressure-mixed-build-drill-report.json`
 - The remaining explicit unsupported-import census is now dominated by:
   - `WorkflowInterceptors`: `1`
   - `Sinks`: `1`

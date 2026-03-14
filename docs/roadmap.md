@@ -145,9 +145,7 @@ Deliverables:
 - `ctx.bulkActivity()` workflow primitive
 - `start_bulk_activity` and `wait_for_bulk_activity` IR nodes
 - batch-level workflow history events
-- `pg-v1` Postgres-first backend (default)
 - `stream-v2` streaming backend with dedicated throughput-runtime service
-- configurable backend selection per call-site
 - chunk-level retry and coarse cancellation
 - batch/chunk visibility query endpoints
 - dedicated bulk worker gRPC protocol
@@ -156,7 +154,6 @@ Deliverables:
 Exit criteria:
 
 - throughput mode outperforms durable mode by at least 5x on fan-out benchmarks
-- `pg-v1` handles batches up to 100K items
 - `stream-v2` handles batches with millions of items
 - mixed durable and bulk steps work correctly in one workflow
 

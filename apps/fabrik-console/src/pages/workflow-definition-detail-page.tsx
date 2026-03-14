@@ -21,6 +21,17 @@ function labelFromSnakeCase(value: string | null | undefined) {
     .join(" ");
 }
 
+function workflowModeLabel(admissionMode: string | null | undefined) {
+  if (!admissionMode) return "-";
+  if (admissionMode === "inline_fast_start") {
+    return "Inline Fast Start";
+  }
+  if (admissionMode === "durable_workflow") {
+    return "Durable Workflow";
+  }
+  return labelFromSnakeCase(admissionMode);
+}
+
 export function WorkflowDefinitionDetailPage() {
   const { definitionId = "" } = useParams();
   const { tenantId } = useTenant();
@@ -191,8 +202,10 @@ export function WorkflowDefinitionDetailPage() {
                     {run.run_id} · {formatDate(run.last_transition_at)}
                   </div>
                   <div className="muted">
-                    {labelFromSnakeCase(run.execution_path)} · {run.routing_status}
-                    {run.fast_path_rejection_reason ? ` · fallback ${labelFromSnakeCase(run.fast_path_rejection_reason)}` : ""}
+                    {workflowModeLabel(run.admission_mode)} · {run.routing_status}
+                    {run.fast_path_rejection_reason
+                      ? ` · fast-start fallback ${labelFromSnakeCase(run.fast_path_rejection_reason)}`
+                      : ""}
                   </div>
                 </Link>
               ))}

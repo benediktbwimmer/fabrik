@@ -100,14 +100,65 @@ json_post() {
   curl -fsS -X POST "${API_URL}$1" -H "content-type: application/json" --data-binary "$2" -o "$3"
 }
 
+relaunch_managed_workers() {
+  local workspace_dir=$1
+  local matching_endpoint=${FABRIK_UNIFIED_RUNTIME_ENDPOINT:-http://127.0.0.1:50054}
+  python3 - "$workspace_dir" "$TENANT_ID" "$matching_endpoint" <<'PY'
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+workspace_dir = pathlib.Path(sys.argv[1])
+tenant_id = sys.argv[2]
+matching_endpoint = sys.argv[3]
+
+worker_packages = sorted(workspace_dir.glob("workers/*/worker-package.json"))
+for package_path in worker_packages:
+    package = json.loads(package_path.read_text(encoding="utf-8"))
+    pid_path = pathlib.Path(package["pid_path"])
+    log_path = pathlib.Path(package["log_path"])
+    bootstrap_path = package["bootstrap_path"]
+    task_queue = package["task_queue"]
+    build_id = package["build_id"]
+    env = os.environ.copy()
+    env.update({
+        "ACTIVITY_WORKER_SERVICE_PORT": "0",
+        "MATCHING_SERVICE_ENDPOINT": matching_endpoint,
+        "ACTIVITY_TASK_QUEUE": task_queue,
+        "ACTIVITY_WORKER_TENANT_ID": tenant_id,
+        "ACTIVITY_WORKER_BUILD_ID": build_id,
+        "ACTIVITY_ENABLE_BULK_LANES": "false",
+        "ACTIVITY_WORKER_CONCURRENCY": "1",
+        "ACTIVITY_RESULT_FLUSHER_CONCURRENCY": "1",
+        "ACTIVITY_NODE_BOOTSTRAP": bootstrap_path,
+        "ACTIVITY_NODE_EXECUTABLE": "node",
+    })
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "ab", buffering=0) as log_handle:
+        proc = subprocess.Popen(
+            ["/Users/bene/code/fabrik/target/debug/activity-worker-service"],
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            env=env,
+            start_new_session=True,
+            close_fds=True,
+        )
+    pid_path.write_text(f"{proc.pid}\n", encoding="utf-8")
+PY
+}
+
 poll_json_path() {
   local path=$1
   local expr=$2
   local dest=$3
-  python3 - "$API_URL" "$path" "$expr" "$dest" <<'PY'
+  local timeout_seconds=${4:-120}
+  python3 - "$API_URL" "$path" "$expr" "$dest" "$timeout_seconds" <<'PY'
 import json, sys, time, urllib.error, urllib.request
-api_url, path, expr, dest = sys.argv[1:5]
-deadline = time.time() + 120
+api_url, path, expr, dest, timeout_seconds = sys.argv[1:6]
+deadline = time.time() + float(timeout_seconds)
 url = f"{api_url}{path}"
 while time.time() < deadline:
     try:
@@ -343,7 +394,7 @@ wait_for_http "$API_URL/health" "api gateway"
 
 echo "[versioning-pressure-drill] running v1 migration and deployment"
 mkdir -p "$OUTPUT_DIR_ABS/migration-v1"
-FABRIK_WORKFLOW_BUILD_ID="$BUILD_V1" cargo run -p fabrik-cli -- migrate temporal "$REPO_V1" --deploy --output-dir "$OUTPUT_DIR_ABS/migration-v1" --api-url "$API_URL" --tenant "$TENANT_ID"
+FABRIK_WORKFLOW_BUILD_ID="$BUILD_V1" cargo run -p fabrik-cli --bin fabrik -- migrate temporal "$REPO_V1" --deploy --output-dir "$OUTPUT_DIR_ABS/migration-v1" --api-url "$API_URL" --tenant "$TENANT_ID"
 extract_report_fields "$OUTPUT_DIR_ABS/migration-v1/migration-report.json" > "$OUTPUT_DIR_ABS/report-fields-v1.json"
 
 DEFINITION_ID_V1="$(extract_field "$OUTPUT_DIR_ABS/report-fields-v1.json" definition_id)"
@@ -369,7 +420,7 @@ json_get "/tenants/${TENANT_ID}/workflows/${OLD_INSTANCE_ID}/routing" "$OUTPUT_D
 
 echo "[versioning-pressure-drill] running v2 migration and deployment"
 mkdir -p "$OUTPUT_DIR_ABS/migration-v2"
-FABRIK_WORKFLOW_BUILD_ID="$BUILD_V2" cargo run -p fabrik-cli -- migrate temporal "$REPO_V2" --deploy --output-dir "$OUTPUT_DIR_ABS/migration-v2" --api-url "$API_URL" --tenant "$TENANT_ID"
+FABRIK_WORKFLOW_BUILD_ID="$BUILD_V2" cargo run -p fabrik-cli --bin fabrik -- migrate temporal "$REPO_V2" --deploy --output-dir "$OUTPUT_DIR_ABS/migration-v2" --api-url "$API_URL" --tenant "$TENANT_ID"
 extract_report_fields "$OUTPUT_DIR_ABS/migration-v2/migration-report.json" > "$OUTPUT_DIR_ABS/report-fields-v2.json"
 
 DEFINITION_ID_V2="$(extract_field "$OUTPUT_DIR_ABS/report-fields-v2.json" definition_id)"
@@ -399,9 +450,17 @@ if [[ "$SKIP_RESTART" != "1" ]]; then
   echo "[versioning-pressure-drill] restarting dev stack"
   scripts/dev-stack.sh down
   DEV_STACK_BUILD=0 scripts/dev-stack.sh up
+  echo "[versioning-pressure-drill] relaunching managed migrated workers"
+  relaunch_managed_workers "$OUTPUT_DIR_ABS/migration-v1"
+  relaunch_managed_workers "$OUTPUT_DIR_ABS/migration-v2"
 fi
 
 wait_for_http "$API_URL/health" "api gateway after restart"
+poll_json_path \
+  "/admin/tenants/${TENANT_ID}/task-queues/activity/${WORKFLOW_TASK_QUEUE}" \
+  "data.get('pollers')" \
+  "$OUTPUT_DIR_ABS/task-queue-activity-post-restart.json" \
+  300
 poll_json_path "/tenants/${TENANT_ID}/workflows/${OLD_INSTANCE_ID}" "data.get('run_id') == '${OLD_RUN_ID}' and data.get('status') == 'running'" "$OUTPUT_DIR_ABS/old-run-workflow-post-restart.json"
 poll_json_path "/tenants/${TENANT_ID}/workflows/${NEW_INSTANCE_ID}" "data.get('run_id') == '${NEW_RUN_ID}' and data.get('status') == 'running'" "$OUTPUT_DIR_ABS/new-run-workflow-post-restart.json"
 json_get "/tenants/${TENANT_ID}/workflows/${OLD_INSTANCE_ID}/routing" "$OUTPUT_DIR_ABS/old-run-routing-post-restart.json"

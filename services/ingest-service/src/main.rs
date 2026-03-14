@@ -24,7 +24,7 @@ use fabrik_throughput::{
     ADMISSION_POLICY_VERSION, BENCHMARK_ECHO_ACTIVITY, BENCHMARK_FAST_COUNT_ACTIVITY,
     FastPathRejectionReason, PayloadHandle, ThroughputBackend, ThroughputCommand,
     ThroughputCommandEnvelope, TinyWorkflowExecutionMode, TinyWorkflowStartBatchCommand,
-    TinyWorkflowStartCommand, TinyWorkflowStartItem, WorkflowExecutionPath,
+    TinyWorkflowStartCommand, TinyWorkflowStartItem, WorkflowAdmissionMode,
     can_inline_durable_tiny_fanout, can_inline_stream_v2_microbatch, execute_benchmark_echo,
     parse_benchmark_compact_input_spec, parse_benchmark_compact_total_items_from_handle,
     tiny_workflow_routing_decision,
@@ -91,7 +91,7 @@ struct TinyStartQueueItem {
 #[derive(Debug, Clone, Copy)]
 struct TinyWorkflowRoutingOutcome {
     mode: TinyWorkflowExecutionMode,
-    execution_path: WorkflowExecutionPath,
+    admission_mode: WorkflowAdmissionMode,
 }
 
 #[derive(Debug)]
@@ -578,7 +578,7 @@ async fn execute_inline_tiny_workflow_group(
                 TinyWorkflowExecutionMode::Throughput => WorkflowFastStartMode::Throughput,
                 TinyWorkflowExecutionMode::Durable => WorkflowFastStartMode::Durable,
             },
-            execution_path: WorkflowExecutionPath::TinyWorkflowEngine.as_str().to_owned(),
+            admission_mode: WorkflowAdmissionMode::InlineFastStart.as_str().to_owned(),
             status: WorkflowFastStartStatus::Accepted,
             input: queued.item.input.clone(),
             memo: queued.item.memo.clone(),
@@ -616,8 +616,8 @@ async fn execute_inline_tiny_workflow_group(
                     started_at: queued.item.accepted_at,
                     previous_run_id: None,
                     triggered_by_run_id: None,
-                    execution_path: Some(
-                        WorkflowExecutionPath::TinyWorkflowEngine.as_str().to_owned(),
+                    admission_mode: Some(
+                        WorkflowAdmissionMode::InlineFastStart.as_str().to_owned(),
                     ),
                     fast_path_rejection_reason: None,
                 });
@@ -1402,7 +1402,7 @@ async fn handle_trigger_workflow(
                     started_at: accepted_at,
                     previous_run_id: None,
                     triggered_by_run_id: None,
-                    execution_path: Some(routing.execution_path.as_str().to_owned()),
+                    admission_mode: Some(routing.admission_mode.as_str().to_owned()),
                     fast_path_rejection_reason: None,
                 }])
                 .await
@@ -1457,8 +1457,8 @@ async fn handle_trigger_workflow(
             .insert("search_attributes_json".to_owned(), search_attributes.to_string());
     }
     envelope.metadata.insert(
-        "execution_path".to_owned(),
-        WorkflowExecutionPath::LegacyWorkflow.as_str().to_owned(),
+        "admission_mode".to_owned(),
+        WorkflowAdmissionMode::DurableWorkflow.as_str().to_owned(),
     );
     if let Some(reason) = fast_path_rejection_reason.as_deref() {
         envelope.metadata.insert("fast_path_rejection_reason".to_owned(), reason.to_owned());
@@ -1490,7 +1490,7 @@ async fn handle_trigger_workflow(
             &envelope.tenant_id,
             &envelope.instance_id,
             &envelope.run_id,
-            WorkflowExecutionPath::LegacyWorkflow.as_str(),
+            WorkflowAdmissionMode::DurableWorkflow.as_str(),
             fast_path_rejection_reason.as_deref(),
         )
         .await
@@ -1608,7 +1608,7 @@ async fn handle_trigger_workflow_batch(
                 started_at: item.accepted_at,
                 previous_run_id: None,
                 triggered_by_run_id: None,
-                execution_path: Some(WorkflowExecutionPath::TinyWorkflowEngine.as_str().to_owned()),
+                admission_mode: Some(WorkflowAdmissionMode::InlineFastStart.as_str().to_owned()),
                 fast_path_rejection_reason: None,
             }
         })
@@ -1723,6 +1723,7 @@ fn tiny_workflow_throughput_mode(
     };
     let WorkflowEvent::BulkActivityBatchScheduled {
         activity_type,
+        activity_capabilities,
         items,
         input_handle,
         chunk_size,
@@ -1751,6 +1752,7 @@ fn tiny_workflow_throughput_mode(
     Some(
         tiny_workflow_routing_decision(
             activity_type,
+            activity_capabilities.as_ref(),
             reducer.as_deref(),
             Some(throughput_backend.as_str()),
             *max_attempts,
@@ -1760,7 +1762,7 @@ fn tiny_workflow_throughput_mode(
         )
         .map(|decision| TinyWorkflowRoutingOutcome {
             mode: decision.execution_mode,
-            execution_path: decision.execution_path,
+            admission_mode: decision.admission_mode,
         }),
     )
 }
@@ -1772,11 +1774,17 @@ fn tiny_workflow_durable_mode(
     if plan.emissions.is_empty() {
         return None;
     }
-    let Some((activity_type, reducer)) =
+    let Some((activity_type, activity_capabilities, reducer)) =
         artifact.workflow.states.values().find_map(|state| match state {
             fabrik_workflow::CompiledStateNode::FanOut {
-                activity_type, reducer, retry, ..
-            } if retry.is_none() => Some((activity_type.clone(), reducer.clone())),
+                activity_type,
+                activity_capabilities,
+                reducer,
+                retry,
+                ..
+            } if retry.is_none() => {
+                Some((activity_type.clone(), activity_capabilities.clone(), reducer.clone()))
+            }
             _ => None,
         })
     else {
@@ -1803,6 +1811,7 @@ fn tiny_workflow_durable_mode(
     Some(
         tiny_workflow_routing_decision(
             &activity_type,
+            activity_capabilities.as_ref(),
             reducer.as_deref(),
             None,
             1,
@@ -1812,7 +1821,7 @@ fn tiny_workflow_durable_mode(
         )
         .map(|decision| TinyWorkflowRoutingOutcome {
             mode: decision.execution_mode,
-            execution_path: decision.execution_path,
+            admission_mode: decision.admission_mode,
         }),
     )
 }
@@ -1836,7 +1845,7 @@ async fn try_execute_tiny_workflow_start_inline(
             TinyWorkflowExecutionMode::Throughput => WorkflowFastStartMode::Throughput,
             TinyWorkflowExecutionMode::Durable => WorkflowFastStartMode::Durable,
         },
-        execution_path: WorkflowExecutionPath::TinyWorkflowEngine.as_str().to_owned(),
+        admission_mode: WorkflowAdmissionMode::InlineFastStart.as_str().to_owned(),
         status: WorkflowFastStartStatus::Accepted,
         input: item.input.clone(),
         memo: item.memo.clone(),
@@ -1864,7 +1873,7 @@ async fn try_execute_tiny_workflow_start_inline(
         started_at: item.accepted_at,
         previous_run_id: None,
         triggered_by_run_id: None,
-        execution_path: Some(WorkflowExecutionPath::TinyWorkflowEngine.as_str().to_owned()),
+        admission_mode: Some(WorkflowAdmissionMode::InlineFastStart.as_str().to_owned()),
         fast_path_rejection_reason: None,
     };
 
@@ -2063,11 +2072,17 @@ fn try_inline_durable_tiny_workflow_completion(
     plan: &CompiledExecutionPlan,
     occurred_at: DateTime<Utc>,
 ) -> Result<bool> {
-    let Some((activity_type, reducer)) =
+    let Some((activity_type, activity_capabilities, reducer)) =
         artifact.workflow.states.values().find_map(|state| match state {
             fabrik_workflow::CompiledStateNode::FanOut {
-                activity_type, reducer, retry, ..
-            } if retry.is_none() => Some((activity_type.clone(), reducer.clone())),
+                activity_type,
+                activity_capabilities,
+                reducer,
+                retry,
+                ..
+            } if retry.is_none() => {
+                Some((activity_type.clone(), activity_capabilities.clone(), reducer.clone()))
+            }
             _ => None,
         })
     else {
@@ -2087,7 +2102,13 @@ fn try_inline_durable_tiny_workflow_completion(
         }
     }
     let inputs = scheduled.iter().map(|(_, input)| input.clone()).collect::<Vec<_>>();
-    if !can_inline_durable_tiny_fanout(&activity_type, reducer.as_deref(), 1, &inputs) {
+    if !can_inline_durable_tiny_fanout(
+        &activity_type,
+        activity_capabilities.as_ref(),
+        reducer.as_deref(),
+        1,
+        &inputs,
+    ) {
         return Ok(false);
     }
     for (activity_id, input) in scheduled {
@@ -2158,6 +2179,7 @@ fn try_inline_stream_v2_microbatch_trigger_completion(
     let WorkflowEvent::BulkActivityBatchScheduled {
         batch_id,
         activity_type,
+        activity_capabilities,
         items,
         input_handle,
         chunk_size,
@@ -2188,6 +2210,7 @@ fn try_inline_stream_v2_microbatch_trigger_completion(
         if *chunk_size == 0 { 0 } else { total_items.div_ceil(*chunk_size as usize) as u32 };
     if !can_inline_stream_v2_microbatch(
         activity_type,
+        activity_capabilities.as_ref(),
         reducer.as_deref(),
         *max_attempts,
         items,
@@ -2348,7 +2371,7 @@ async fn publish_tiny_workflow_start(
             TinyWorkflowExecutionMode::Throughput => WorkflowFastStartMode::Throughput,
             TinyWorkflowExecutionMode::Durable => WorkflowFastStartMode::Durable,
         },
-        execution_path: WorkflowExecutionPath::TinyWorkflowEngine.as_str().to_owned(),
+        admission_mode: WorkflowAdmissionMode::InlineFastStart.as_str().to_owned(),
         status: WorkflowFastStartStatus::Accepted,
         input: item.input.clone(),
         memo: item.memo.clone(),
@@ -2405,7 +2428,7 @@ async fn publish_tiny_workflow_batch(
                 TinyWorkflowExecutionMode::Throughput => WorkflowFastStartMode::Throughput,
                 TinyWorkflowExecutionMode::Durable => WorkflowFastStartMode::Durable,
             },
-            execution_path: WorkflowExecutionPath::TinyWorkflowEngine.as_str().to_owned(),
+            admission_mode: WorkflowAdmissionMode::InlineFastStart.as_str().to_owned(),
             status: WorkflowFastStartStatus::Accepted,
             input: item.input.clone(),
             memo: item.memo.clone(),
@@ -3126,10 +3149,13 @@ mod tests {
     use super::*;
     use anyhow::Context;
     use fabrik_broker::{JsonTopicPublisher, WorkflowHistoryFilter, read_workflow_history};
-    use fabrik_workflow::{StateNode, WorkflowInstanceState, WorkflowStatus};
+    use fabrik_workflow::{
+        ArtifactEntrypoint, CompiledStateNode, CompiledWorkflow, CompiledWorkflowArtifact,
+        StateNode, WorkflowInstanceState, WorkflowStatus,
+    };
     use serde_json::json;
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         process::Command,
         time::{Duration as StdDuration, Instant},
     };
@@ -3333,6 +3359,40 @@ mod tests {
                 }
             }
         }
+
+        async fn connect_throughput_command_publisher(
+            &self,
+        ) -> Result<JsonTopicPublisher<ThroughputCommandEnvelope>> {
+            let config = JsonTopicConfig::new(
+                self.broker.brokers.clone(),
+                format!("throughput-commands-test-{}", Uuid::now_v7()),
+                1,
+            );
+            let deadline = Instant::now() + StdDuration::from_secs(45);
+            loop {
+                match JsonTopicPublisher::<ThroughputCommandEnvelope>::new(
+                    &config,
+                    "ingest-service-test-throughput-commands",
+                )
+                .await
+                {
+                    Ok(publisher) => return Ok(publisher),
+                    Err(error) if Instant::now() < deadline => {
+                        let _ = error;
+                        sleep(StdDuration::from_millis(500)).await;
+                    }
+                    Err(error) => {
+                        let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        return Err(error).with_context(|| {
+                            format!(
+                                "redpanda test container {} did not become ready for throughput command topic; logs:\n{}",
+                                self.container_name, logs
+                            )
+                        });
+                    }
+                }
+            }
+        }
     }
 
     impl Drop for TestRedpanda {
@@ -3424,11 +3484,17 @@ mod tests {
         redpanda: &TestRedpanda,
         runtime_id: &str,
     ) -> Result<AppState> {
+        let throughput_command_publisher = redpanda.connect_throughput_command_publisher().await?;
+        let (tiny_start_sender, tiny_start_receiver) =
+            mpsc::channel(TINY_WORKFLOW_SINGLE_START_QUEUE_CAPACITY);
+        drop(tiny_start_receiver);
         Ok(AppState {
             broker: redpanda.broker.clone(),
             publisher: redpanda.connect_workflow_publisher().await?,
+            throughput_command_publisher,
             store,
             runtime_id: runtime_id.to_owned(),
+            tiny_start_sender,
         })
     }
 
@@ -3457,6 +3523,25 @@ mod tests {
             initial_state: "done".to_owned(),
             states: BTreeMap::from([("done".to_owned(), StateNode::Succeed)]),
         }
+    }
+
+    fn simple_artifact(definition_id: &str) -> CompiledWorkflowArtifact {
+        CompiledWorkflowArtifact::new(
+            definition_id.to_owned(),
+            1,
+            "ingest-test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "done".to_owned(),
+                states: BTreeMap::from([(
+                    "done".to_owned(),
+                    CompiledStateNode::Succeed { output: None },
+                )]),
+                async_helpers: BTreeMap::new(),
+                params: Vec::new(),
+                non_cancellable_states: BTreeSet::new(),
+            },
+        )
     }
 
     async fn wait_for_adapter_counts(
@@ -3519,6 +3604,7 @@ mod tests {
 
         let definition = simple_definition("order-workflow");
         store.put_definition("tenant-a", &definition).await?;
+        store.put_artifact("tenant-a", &simple_artifact("order-workflow")).await?;
 
         let adapter = store
             .upsert_topic_adapter(&fabrik_store::TopicAdapterUpsert {
@@ -3756,6 +3842,7 @@ mod tests {
 
         let definition = simple_definition("order-workflow");
         store.put_definition("tenant-a", &definition).await?;
+        store.put_artifact("tenant-a", &simple_artifact("order-workflow")).await?;
 
         let adapter = store
             .upsert_topic_adapter(&fabrik_store::TopicAdapterUpsert {
@@ -3807,7 +3894,7 @@ mod tests {
             wait_for_adapter_counts(&store, "tenant-a", "orders-invalid", 0, 1).await?;
         assert_eq!(
             adapter_state.last_error.as_deref(),
-            Some("400: missing required field input at json pointer /payload")
+            Some("400: mapping input: missing required field input at json pointer /payload")
         );
         let dead_letters =
             store.list_topic_adapter_dead_letters("tenant-a", "orders-invalid", 10, 0).await?;
@@ -3836,6 +3923,7 @@ mod tests {
 
         let definition = simple_definition("order-workflow");
         store.put_definition("tenant-a", &definition).await?;
+        store.put_artifact("tenant-a", &simple_artifact("order-workflow")).await?;
 
         let adapter = store
             .upsert_topic_adapter(&fabrik_store::TopicAdapterUpsert {
@@ -3935,6 +4023,7 @@ mod tests {
 
         let definition = simple_definition("order-workflow");
         store.put_definition("tenant-a", &definition).await?;
+        store.put_artifact("tenant-a", &simple_artifact("order-workflow")).await?;
 
         let adapter = store
             .upsert_topic_adapter(&fabrik_store::TopicAdapterUpsert {

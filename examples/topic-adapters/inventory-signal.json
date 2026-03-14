@@ -1,0 +1,24 @@
+{
+  "adapter_kind": "redpanda",
+  "brokers": "127.0.0.1:9092",
+  "topic_name": "inventory.adjustments",
+  "topic_partitions": 2,
+  "action": "signal_workflow",
+  "signal_type": "inventory.adjusted",
+  "workflow_instance_id_json_pointer": "/warehouse_id",
+  "workflow_task_queue": "inventory-signals",
+  "payload_template_json": {
+    "warehouseId": {
+      "$from": "/warehouse_id"
+    },
+    "adjustments": {
+      "$from": "/adjustments"
+    },
+    "receivedAt": {
+      "$from": "/received_at"
+    }
+  },
+  "request_id_json_pointer": "/request_id",
+  "dedupe_key_json_pointer": "/event_id",
+  "dead_letter_policy": "store"
+}
