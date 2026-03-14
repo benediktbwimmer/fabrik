@@ -15,9 +15,9 @@ use axum::{
 };
 use chrono::Utc;
 use fabrik_broker::{
-    BrokerConfig, JsonTopicConfig, JsonTopicPublisher, WorkflowPublisher,
-    build_json_consumer, build_json_consumer_from_offsets, build_workflow_consumer,
-    decode_consumed_workflow_event, decode_json_record, partition_for_key,
+    BrokerConfig, JsonTopicConfig, JsonTopicPublisher, WorkflowPublisher, build_json_consumer,
+    build_json_consumer_from_offsets, build_workflow_consumer, decode_consumed_workflow_event,
+    decode_json_record, partition_for_key,
 };
 use fabrik_config::{
     GrpcServiceConfig, HttpServiceConfig, PostgresConfig, RedpandaConfig,
@@ -27,18 +27,22 @@ use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
     PartitionOwnershipRecord, TaskQueueKind, ThroughputProjectionBatchStateUpdate,
-    ThroughputProjectionChunkStateUpdate, ThroughputProjectionEvent, WorkflowBulkBatchRecord,
-    ThroughputTerminalRecord, WorkflowBulkBatchStatus, WorkflowBulkChunkRecord,
+    ThroughputProjectionChunkStateUpdate, ThroughputProjectionEvent, ThroughputTerminalRecord,
+    WorkflowBulkBatchRecord, WorkflowBulkBatchStatus, WorkflowBulkChunkRecord,
     WorkflowBulkChunkStatus, WorkflowStore,
 };
 use fabrik_throughput::{
-    ADMISSION_POLICY_VERSION, PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
-    StartThroughputRunCommand, ThroughputBackend, ThroughputBatchIdentity,
-    ThroughputChangelogEntry, ThroughputChangelogPayload, ThroughputChunkReport,
-    ThroughputChunkReportPayload, ThroughputCommand, ThroughputCommandEnvelope,
-    bulk_reducer_class, bulk_reducer_name, bulk_reducer_settles,
-    bulk_reducer_summary_field_name, decode_cbor, effective_aggregation_group_count,
-    encode_cbor, group_id_for_chunk_index, planned_reduction_tree_depth,
+    ADMISSION_POLICY_VERSION, BENCHMARK_ECHO_ACTIVITY, BENCHMARK_FAST_COUNT_ACTIVITY,
+    PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind, StartThroughputRunCommand,
+    ThroughputBackend,
+    ThroughputBatchIdentity, ThroughputChangelogEntry, ThroughputChangelogPayload,
+    ThroughputChunkReport, ThroughputChunkReportPayload, ThroughputCommand,
+    ThroughputCommandEnvelope, bulk_reducer_class, bulk_reducer_name, bulk_reducer_settles,
+    bulk_reducer_summary_field_name, benchmark_echo_item_requires_output,
+    can_complete_payloadless_benchmark_chunk, can_use_payloadless_benchmark_transport,
+    decode_cbor, effective_aggregation_group_count, encode_cbor, execute_benchmark_echo,
+    group_id_for_chunk_index,
+    parse_benchmark_compact_total_items_from_handle, planned_reduction_tree_depth,
     stream_v2_fast_lane_enabled, throughput_execution_mode, throughput_partition_key,
     throughput_reducer_execution_path, throughput_reducer_version, throughput_routing_reason,
 };
@@ -65,6 +69,9 @@ const BULK_EVENT_OUTBOX_BATCH_SIZE: usize = 128;
 const BULK_EVENT_OUTBOX_LEASE_SECONDS: i64 = 30;
 const BULK_EVENT_OUTBOX_RETRY_MS: i64 = 250;
 const BRIDGE_EVENT_CONCURRENCY: usize = 64;
+const LOCAL_BENCHMARK_FASTLANE_WORKER_ID: &str = "throughput-runtime-local-fastlane";
+const LOCAL_BENCHMARK_FASTLANE_WORKER_BUILD_ID: &str = "throughput-runtime-local-fastlane";
+const LOCAL_BENCHMARK_FASTLANE_BATCH_SIZE: usize = 256;
 #[derive(Clone)]
 struct AppState {
     store: WorkflowStore,
@@ -103,6 +110,8 @@ struct ThroughputDebugState {
     report_batches_applied: u64,
     report_batch_items_total: u64,
     reports_rejected: u64,
+    local_fastlane_chunks_completed: u64,
+    local_fastlane_batches_applied: u64,
     projection_events_published: u64,
     projection_events_skipped: u64,
     projection_events_applied_directly: u64,
@@ -336,9 +345,8 @@ async fn main() -> Result<()> {
     } else {
         restore_local_state_from_changelog(&state, &changelog_config, true).await?;
     }
-    let ownership_replay_timeout = Duration::from_secs(
-        u64::from(ownership_config.lease_ttl_seconds.max(1)).saturating_mul(2),
-    );
+    let ownership_replay_timeout =
+        Duration::from_secs(u64::from(ownership_config.lease_ttl_seconds.max(1)).saturating_mul(2));
     let debug_base_url = format!("http://127.0.0.1:{}", debug_config.port);
     if state.runtime.owner_first_apply {
         spawn_ownership_loop(
@@ -385,6 +393,7 @@ async fn main() -> Result<()> {
     }
     tokio::spawn(run_outbox_publisher(state.clone()));
     tokio::spawn(run_bulk_requeue_sweep(state.clone()));
+    tokio::spawn(run_local_benchmark_fastlane_loop(state.clone()));
     let debug_state = debug.clone();
     let debug_state_app = state.clone();
     let debug_app = default_router::<AppState>(ServiceInfo::new(
@@ -583,10 +592,7 @@ async fn handle_bridge_event(state: AppState, event: EventEnvelope<WorkflowEvent
     Ok(())
 }
 
-async fn run_command_loop(
-    state: AppState,
-    mut consumer: fabrik_broker::JsonConsumerStream,
-) {
+async fn run_command_loop(state: AppState, mut consumer: fabrik_broker::JsonConsumerStream) {
     while let Some(message) = consumer.next().await {
         let record = match message {
             Ok(record) => record,
@@ -632,12 +638,9 @@ async fn handle_throughput_command(
     if throughput_backend != ThroughputBackend::StreamV2.as_str() {
         return Ok(());
     }
-    if state
-        .store
-        .get_throughput_run(tenant_id, instance_id, run_id, batch_id)
-        .await?
-        .is_some_and(|run| matches!(run.status.as_str(), "running" | "completed" | "failed" | "cancelled"))
-    {
+    if state.store.get_throughput_run(tenant_id, instance_id, run_id, batch_id).await?.is_some_and(
+        |run| matches!(run.status.as_str(), "running" | "completed" | "failed" | "cancelled"),
+    ) {
         return Ok(());
     }
     match &command.payload {
@@ -1068,7 +1071,7 @@ async fn write_remote_checkpoint(state: &AppState) -> Result<()> {
         )
         .await?;
     prune_remote_checkpoints(state).await?;
-    if state.runtime.owner_first_apply {
+    if state.runtime.owner_first_apply && !state.local_state.has_collect_results_batches()? {
         let _ = state.store.delete_throughput_report_log_through(created_at).await?;
     }
     state.local_state.record_checkpoint_write(created_at);
@@ -1079,10 +1082,8 @@ async fn replay_report_log_tail(state: &AppState) -> Result<()> {
     let mut captured_after = state.local_state.debug_snapshot()?.last_checkpoint_at;
     let page_size = state.runtime.report_apply_batch_size.max(1).saturating_mul(32);
     loop {
-        let entries = state
-            .store
-            .list_throughput_report_log_since(captured_after, page_size)
-            .await?;
+        let entries =
+            state.store.list_throughput_report_log_since(captured_after, page_size).await?;
         if entries.is_empty() {
             break;
         }
@@ -1248,7 +1249,8 @@ async fn repair_stale_terminal_projection_batches_in_store(
         let Some(local_batch) = local_state.batch_snapshot(&identity)? else {
             continue;
         };
-        let Some(update) = local_terminal_projection_batch_update(local_state, &local_batch)? else {
+        let Some(update) = local_terminal_projection_batch_update(local_state, &local_batch)?
+        else {
             continue;
         };
         updates.push(update);
@@ -1393,6 +1395,14 @@ async fn load_owner_chunk_records(
         run_id: run_id.to_owned(),
         batch_id: batch_id.to_owned(),
     };
+    let collect_results_outputs = if batch.reducer.as_deref() == Some("collect_results") {
+        Some(
+            load_collect_results_outputs_from_report_log(state, tenant_id, instance_id, run_id, batch_id)
+                .await?,
+        )
+    } else {
+        None
+    };
     let chunk_snapshots = state.local_state.chunk_snapshots_for_batch(&identity)?;
     let chunk_snapshots = chunk_snapshots
         .into_iter()
@@ -1405,7 +1415,10 @@ async fn load_owner_chunk_records(
             chunk.lease_epoch = snapshot.lease_epoch;
             chunk.owner_epoch = snapshot.owner_epoch;
             chunk.result_handle = snapshot.result_handle.clone();
-            chunk.output = snapshot.output.clone();
+            chunk.output = snapshot
+                .output
+                .clone()
+                .or_else(|| collect_results_outputs.as_ref().and_then(|outputs| outputs.get(&chunk.chunk_id).cloned()));
             chunk.error = snapshot.error.clone();
             chunk.cancellation_requested = snapshot.cancellation_requested;
             chunk.cancellation_reason = snapshot.cancellation_reason.clone();
@@ -1562,6 +1575,210 @@ async fn run_bulk_requeue_sweep(state: AppState) {
             .await;
             state.bulk_notify.notify_waiters();
         }
+    }
+}
+
+async fn run_local_benchmark_fastlane_loop(state: AppState) {
+    let idle_wait = Duration::from_millis(50);
+    let batch_limit = (state.runtime.max_active_chunks_per_batch > 0)
+        .then_some(state.runtime.max_active_chunks_per_batch);
+    let lease_ttl = chrono::Duration::seconds(state.runtime.lease_ttl_seconds as i64);
+    let max_chunks = state
+        .runtime
+        .report_apply_batch_size
+        .max(state.runtime.poll_max_tasks)
+        .max(LOCAL_BENCHMARK_FASTLANE_BATCH_SIZE);
+    loop {
+        match run_local_benchmark_fastlane_once(&state, batch_limit, lease_ttl, max_chunks).await {
+            Ok(0) => {
+                let _ = tokio::time::timeout(idle_wait, state.bulk_notify.notified()).await;
+            }
+            Ok(_) => tokio::task::yield_now().await,
+            Err(error) => {
+                error!(error = %error, "throughput-runtime local benchmark fastlane failed");
+                let _ = tokio::time::timeout(idle_wait, state.bulk_notify.notified()).await;
+            }
+        }
+    }
+}
+
+async fn run_local_benchmark_fastlane_once(
+    state: &AppState,
+    batch_limit: Option<usize>,
+    lease_ttl: chrono::Duration,
+    max_chunks: usize,
+) -> Result<usize> {
+    let owned = owned_throughput_partitions(state);
+    if owned.is_empty() {
+        return Ok(0);
+    }
+    let leased = state.local_state.lease_ready_chunks_matching(
+        LOCAL_BENCHMARK_FASTLANE_WORKER_ID,
+        Utc::now(),
+        lease_ttl,
+        batch_limit,
+        &HashSet::new(),
+        Some(&owned),
+        state.throughput_partitions,
+        max_chunks,
+        is_local_benchmark_fastlane_chunk,
+    )?;
+    if leased.is_empty() {
+        return Ok(0);
+    }
+    let mut reports = Vec::with_capacity(leased.len());
+    for chunk in leased {
+        reports.push(execute_local_benchmark_chunk(state, chunk).await?);
+    }
+    {
+        let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
+        debug.local_fastlane_batches_applied =
+            debug.local_fastlane_batches_applied.saturating_add(1);
+        debug.local_fastlane_chunks_completed = debug
+            .local_fastlane_chunks_completed
+            .saturating_add(reports.len() as u64);
+        debug.report_batches_applied = debug.report_batches_applied.saturating_add(1);
+        debug.report_batch_items_total = debug
+            .report_batch_items_total
+            .saturating_add(reports.len() as u64);
+        debug.reports_received = debug.reports_received.saturating_add(reports.len() as u64);
+        debug.last_report_at = Some(Utc::now());
+    }
+    apply_throughput_report_batch(state, &reports, true).await?;
+    Ok(reports.len())
+}
+
+fn is_local_benchmark_fastlane_chunk(chunk: &LeasedChunkSnapshot) -> bool {
+    matches!(
+        chunk.activity_type.as_str(),
+        BENCHMARK_FAST_COUNT_ACTIVITY | BENCHMARK_ECHO_ACTIVITY
+    )
+}
+
+async fn execute_local_benchmark_chunk(
+    state: &AppState,
+    chunk: LeasedChunkSnapshot,
+) -> Result<ThroughputChunkReport> {
+    if chunk.activity_type == BENCHMARK_FAST_COUNT_ACTIVITY {
+        return Ok(local_benchmark_completed_report(chunk, Value::Null, None));
+    }
+    let items = resolve_local_benchmark_chunk_items(state, &chunk).await?;
+    let omit_success_output =
+        chunk.omit_success_output && !items.iter().any(benchmark_echo_item_requires_output);
+    let mut outputs = (!omit_success_output).then(|| Vec::with_capacity(items.len()));
+    for item in items {
+        match execute_benchmark_echo(chunk.attempt, &item) {
+            Ok(output) => {
+                if let Some(outputs) = outputs.as_mut() {
+                    outputs.push(output);
+                }
+            }
+            Err(error) if error.to_string() == "activity cancelled" => {
+                return Ok(local_benchmark_cancelled_report(chunk, error.to_string()));
+            }
+            Err(error) => {
+                return Ok(local_benchmark_failed_report(chunk, error.to_string()));
+            }
+        }
+    }
+    Ok(local_benchmark_completed_report(chunk, Value::Null, outputs))
+}
+
+async fn resolve_local_benchmark_chunk_items(
+    state: &AppState,
+    chunk: &LeasedChunkSnapshot,
+) -> Result<Vec<Value>> {
+    if !chunk.items.is_empty() {
+        return Ok(chunk.items.clone());
+    }
+    if chunk.input_handle.is_null() {
+        return Ok(Vec::new());
+    }
+    let handle = serde_json::from_value::<PayloadHandle>(chunk.input_handle.clone())
+        .context("failed to decode local benchmark chunk input handle")?;
+    state
+        .payload_store
+        .read_items(&handle)
+        .await
+        .with_context(|| format!("failed to read local benchmark chunk input for {}", chunk.chunk_id))
+}
+
+fn local_benchmark_completed_report(
+    chunk: LeasedChunkSnapshot,
+    result_handle: Value,
+    output: Option<Vec<Value>>,
+) -> ThroughputChunkReport {
+    ThroughputChunkReport {
+        report_id: Uuid::now_v7().to_string(),
+        tenant_id: chunk.identity.tenant_id,
+        instance_id: chunk.identity.instance_id,
+        run_id: chunk.identity.run_id,
+        batch_id: chunk.identity.batch_id,
+        chunk_id: chunk.chunk_id,
+        chunk_index: chunk.chunk_index,
+        group_id: chunk.group_id,
+        attempt: chunk.attempt,
+        lease_epoch: chunk.lease_epoch,
+        owner_epoch: chunk.owner_epoch,
+        worker_id: LOCAL_BENCHMARK_FASTLANE_WORKER_ID.to_owned(),
+        worker_build_id: LOCAL_BENCHMARK_FASTLANE_WORKER_BUILD_ID.to_owned(),
+        lease_token: chunk.lease_token.unwrap_or_default(),
+        occurred_at: Utc::now(),
+        payload: ThroughputChunkReportPayload::ChunkCompleted {
+            result_handle,
+            output,
+        },
+    }
+}
+
+fn local_benchmark_failed_report(
+    chunk: LeasedChunkSnapshot,
+    error: String,
+) -> ThroughputChunkReport {
+    ThroughputChunkReport {
+        report_id: Uuid::now_v7().to_string(),
+        tenant_id: chunk.identity.tenant_id,
+        instance_id: chunk.identity.instance_id,
+        run_id: chunk.identity.run_id,
+        batch_id: chunk.identity.batch_id,
+        chunk_id: chunk.chunk_id,
+        chunk_index: chunk.chunk_index,
+        group_id: chunk.group_id,
+        attempt: chunk.attempt,
+        lease_epoch: chunk.lease_epoch,
+        owner_epoch: chunk.owner_epoch,
+        worker_id: LOCAL_BENCHMARK_FASTLANE_WORKER_ID.to_owned(),
+        worker_build_id: LOCAL_BENCHMARK_FASTLANE_WORKER_BUILD_ID.to_owned(),
+        lease_token: chunk.lease_token.unwrap_or_default(),
+        occurred_at: Utc::now(),
+        payload: ThroughputChunkReportPayload::ChunkFailed { error },
+    }
+}
+
+fn local_benchmark_cancelled_report(
+    chunk: LeasedChunkSnapshot,
+    reason: String,
+) -> ThroughputChunkReport {
+    ThroughputChunkReport {
+        report_id: Uuid::now_v7().to_string(),
+        tenant_id: chunk.identity.tenant_id,
+        instance_id: chunk.identity.instance_id,
+        run_id: chunk.identity.run_id,
+        batch_id: chunk.identity.batch_id,
+        chunk_id: chunk.chunk_id,
+        chunk_index: chunk.chunk_index,
+        group_id: chunk.group_id,
+        attempt: chunk.attempt,
+        lease_epoch: chunk.lease_epoch,
+        owner_epoch: chunk.owner_epoch,
+        worker_id: LOCAL_BENCHMARK_FASTLANE_WORKER_ID.to_owned(),
+        worker_build_id: LOCAL_BENCHMARK_FASTLANE_WORKER_BUILD_ID.to_owned(),
+        lease_token: chunk.lease_token.unwrap_or_default(),
+        occurred_at: Utc::now(),
+        payload: ThroughputChunkReportPayload::ChunkCancelled {
+            reason,
+            metadata: None,
+        },
     }
 }
 
@@ -1987,10 +2204,7 @@ async fn apply_throughput_report_batch(
     capture_report_log: bool,
 ) -> Result<()> {
     if capture_report_log && state.runtime.owner_first_apply {
-        state
-            .store
-            .append_throughput_report_log_entries(report_batch, Utc::now())
-            .await?;
+        state.store.append_throughput_report_log_entries(report_batch, Utc::now()).await?;
     }
 
     let mut projection_records = Vec::with_capacity(report_batch.len() * 2);
@@ -2026,12 +2240,9 @@ async fn apply_throughput_report_batch(
             }
             PreparedReportApply::Accepted(projected) => projected,
         };
-        let terminal_artifacts = materialize_chunk_terminal_artifacts(
-            state,
-            report,
-            projected.batch_reducer.as_deref(),
-        )
-        .await?;
+        let terminal_artifacts =
+            materialize_chunk_terminal_artifacts(state, report, projected.batch_reducer.as_deref())
+                .await?;
         let batch_reducer_output = reduce_stream_batch_output(
             state,
             &identity,
@@ -2181,6 +2392,7 @@ async fn build_stream_projection_records_from_parts(
     task_queue: &str,
     workflow_state: Option<&str>,
     items: Vec<Value>,
+    total_items_override: Option<usize>,
     batch_input_handle: PayloadHandle,
     default_result_handle: Value,
     chunk_size: u32,
@@ -2198,16 +2410,14 @@ async fn build_stream_projection_records_from_parts(
 ) -> Result<(fabrik_store::WorkflowBulkBatchRecord, Vec<WorkflowBulkChunkRecord>)> {
     let chunk_size_usize =
         usize::try_from(chunk_size.max(1)).context("bulk chunk size exceeds usize")?;
-    let chunk_count = if items.is_empty() {
+    let total_items = total_items_override.unwrap_or(items.len());
+    let chunk_count = if total_items == 0 {
         0
     } else {
-        ((items.len() + chunk_size_usize - 1) / chunk_size_usize) as u32
+        ((total_items + chunk_size_usize - 1) / chunk_size_usize) as u32
     };
-    let fast_lane_enabled = stream_v2_fast_lane_enabled(
-        throughput_backend,
-        execution_policy,
-        reducer,
-    );
+    let fast_lane_enabled =
+        stream_v2_fast_lane_enabled(throughput_backend, execution_policy, reducer);
     let reducer_class = bulk_reducer_class(reducer);
     let effective_group_count = planned_aggregation_group_count(
         aggregation_group_count,
@@ -2215,7 +2425,8 @@ async fn build_stream_projection_records_from_parts(
         fast_lane_enabled,
         &app_state.runtime,
     );
-    let aggregation_tree_depth = planned_reduction_tree_depth(chunk_count, effective_group_count, reducer);
+    let aggregation_tree_depth =
+        planned_reduction_tree_depth(chunk_count, effective_group_count, reducer);
     let batch_result_handle = maybe_initialize_batch_result_manifest(
         app_state,
         batch_id,
@@ -2223,6 +2434,8 @@ async fn build_stream_projection_records_from_parts(
         reducer,
     )
     .await?;
+    let payloadless_chunk_transport =
+        can_use_payloadless_benchmark_transport(activity_type, reducer, max_attempts, &items);
     let batch = fabrik_store::WorkflowBulkBatchRecord {
         tenant_id: tenant_id.to_owned(),
         instance_id: instance_id.to_owned(),
@@ -2258,7 +2471,7 @@ async fn build_stream_projection_records_from_parts(
         fast_lane_enabled,
         aggregation_group_count: effective_group_count,
         status: WorkflowBulkBatchStatus::Scheduled,
-        total_items: items.len() as u32,
+        total_items: total_items as u32,
         chunk_size,
         chunk_count,
         succeeded_items: 0,
@@ -2272,27 +2485,32 @@ async fn build_stream_projection_records_from_parts(
         terminal_at: None,
         updated_at: occurred_at,
     };
-    let payload_key = (!materialize_inline_chunk_items)
+    let payload_key = (!materialize_inline_chunk_items && !payloadless_chunk_transport)
         .then(|| payload_handle_key(&batch_input_handle).map(str::to_owned))
         .transpose()?;
-    let payload_store = (!materialize_inline_chunk_items)
+    let payload_store = (!materialize_inline_chunk_items && !payloadless_chunk_transport)
         .then(|| payload_handle_store(&batch_input_handle).map(str::to_owned))
         .transpose()?;
     let mut chunks = Vec::with_capacity(usize::try_from(chunk_count).unwrap_or_default());
-    for (chunk_index, chunk_items) in items.chunks(chunk_size_usize).enumerate() {
-        let chunk_index = chunk_index as u32;
+    for chunk_index in 0..chunk_count {
+        let chunk_index_usize = usize::try_from(chunk_index).unwrap_or_default();
         let chunk_id = format!("{batch_id}::{chunk_index}");
         let group_id = group_id_for_chunk_index(chunk_index, effective_group_count);
-        let chunk_start =
-            usize::try_from(chunk_index).unwrap_or_default().saturating_mul(chunk_size_usize);
-        let input_handle = if materialize_inline_chunk_items {
+        let chunk_start = chunk_index_usize.saturating_mul(chunk_size_usize);
+        let item_count = total_items.saturating_sub(chunk_start).min(chunk_size_usize);
+        let chunk_items = if payloadless_chunk_transport {
+            &[][..]
+        } else {
+            &items[chunk_start..chunk_start + item_count]
+        };
+        let input_handle = if materialize_inline_chunk_items || payloadless_chunk_transport {
             Value::Null
         } else {
             serde_json::to_value(PayloadHandle::ManifestSlice {
                 key: payload_key.clone().expect("stream batch payload key available"),
                 store: payload_store.clone().expect("stream batch payload store available"),
                 start: chunk_start,
-                len: chunk_items.len(),
+                len: item_count,
             })
             .context("failed to serialize chunk input handle")?
         };
@@ -2307,7 +2525,7 @@ async fn build_stream_projection_records_from_parts(
             chunk_id,
             chunk_index,
             group_id,
-            item_count: chunk_items.len() as u32,
+            item_count: item_count as u32,
             activity_type: activity_type.to_owned(),
             task_queue: task_queue.to_owned(),
             state: workflow_state.map(str::to_owned),
@@ -2319,7 +2537,7 @@ async fn build_stream_projection_records_from_parts(
             retry_delay_ms,
             input_handle,
             result_handle: Value::Null,
-            items: if materialize_inline_chunk_items {
+            items: if materialize_inline_chunk_items && !payloadless_chunk_transport {
                 chunk_items.to_vec()
             } else {
                 Vec::new()
@@ -2369,11 +2587,26 @@ async fn build_stream_projection_records(
         anyhow::bail!("expected BulkActivityBatchScheduled event");
     };
 
-    let (items, batch_input_handle) =
-        resolve_stream_batch_input(&app_state.payload_store, batch_id, items, input_handle).await?;
+    let parsed_input_handle = serde_json::from_value::<PayloadHandle>(input_handle.clone())
+        .context("failed to decode stream batch input handle")?;
+    let compact_total_items = if items.is_empty() {
+        parse_benchmark_compact_total_items_from_handle(&parsed_input_handle)
+            .map(|count| count as usize)
+    } else {
+        None
+    };
+    let (items, batch_input_handle) = if compact_total_items.is_some() {
+        (Vec::new(), parsed_input_handle)
+    } else {
+        resolve_stream_batch_input(&app_state.payload_store, batch_id, items, input_handle).await?
+    };
     let routing_reason = event.metadata.get("routing_reason").cloned().unwrap_or_else(|| {
-        throughput_routing_reason(throughput_backend, execution_policy.as_deref(), reducer.as_deref())
-            .to_owned()
+        throughput_routing_reason(
+            throughput_backend,
+            execution_policy.as_deref(),
+            reducer.as_deref(),
+        )
+        .to_owned()
     });
     let admission_policy_version = event
         .metadata
@@ -2394,6 +2627,7 @@ async fn build_stream_projection_records(
         task_queue,
         state.as_deref(),
         items,
+        compact_total_items,
         batch_input_handle,
         result_handle.clone(),
         *chunk_size,
@@ -2417,16 +2651,14 @@ async fn load_native_stream_run_items(
     command: &StartThroughputRunCommand,
 ) -> Result<Vec<Value>> {
     match &command.input_handle {
-        PayloadHandle::Manifest { .. } | PayloadHandle::ManifestSlice { .. } => state
-            .payload_store
-            .read_items(&command.input_handle)
-            .await
-            .with_context(|| {
+        PayloadHandle::Manifest { .. } | PayloadHandle::ManifestSlice { .. } => {
+            state.payload_store.read_items(&command.input_handle).await.with_context(|| {
                 format!(
                     "failed to read native stream-v2 payload handle for batch {}",
                     command.batch_id
                 )
-            }),
+            })
+        }
         PayloadHandle::Inline { key } if key.starts_with("throughput-run-input:") => {
             let input = state
                 .store
@@ -2445,6 +2677,9 @@ async fn load_native_stream_run_items(
                 })?;
             Ok(input.items)
         }
+        handle if parse_benchmark_compact_total_items_from_handle(handle).is_some() => {
+            Ok(Vec::new())
+        }
         PayloadHandle::Inline { key } => {
             anyhow::bail!("unsupported native stream-v2 inline input handle key {key}")
         }
@@ -2456,6 +2691,8 @@ async fn build_stream_projection_records_from_start_command(
     command: &StartThroughputRunCommand,
     occurred_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(fabrik_store::WorkflowBulkBatchRecord, Vec<WorkflowBulkChunkRecord>)> {
+    let compact_count_only_input =
+        parse_benchmark_compact_total_items_from_handle(&command.input_handle).is_some();
     let items = load_native_stream_run_items(app_state, command).await?;
     build_stream_projection_records_from_parts(
         app_state,
@@ -2470,6 +2707,7 @@ async fn build_stream_projection_records_from_start_command(
         &command.task_queue,
         command.state.as_deref(),
         items,
+        compact_count_only_input.then_some(command.total_items as usize),
         command.input_handle.clone(),
         serde_json::to_value(&command.result_handle)
             .context("failed to serialize native stream-v2 result handle")?,
@@ -2495,7 +2733,9 @@ fn workflow_event_from_throughput_command(
     let command = match &envelope.payload {
         ThroughputCommand::CreateBatch(command) => command,
         ThroughputCommand::StartThroughputRun(_) => {
-            anyhow::bail!("native start-throughput-run command cannot be translated to workflow event")
+            anyhow::bail!(
+                "native start-throughput-run command cannot be translated to workflow event"
+            )
         }
         other => anyhow::bail!("unsupported throughput command for activation: {other:?}"),
     };
@@ -2540,13 +2780,10 @@ fn workflow_event_from_throughput_command(
     workflow_event
         .metadata
         .insert("throughput_backend".to_owned(), command.throughput_backend.clone());
+    workflow_event.metadata.insert("routing_reason".to_owned(), command.routing_reason.clone());
     workflow_event
         .metadata
-        .insert("routing_reason".to_owned(), command.routing_reason.clone());
-    workflow_event.metadata.insert(
-        "admission_policy_version".to_owned(),
-        command.admission_policy_version.clone(),
-    );
+        .insert("admission_policy_version".to_owned(), command.admission_policy_version.clone());
     Ok(workflow_event)
 }
 
@@ -2554,7 +2791,8 @@ async fn activate_stream_batch(
     state: &AppState,
     event: &EventEnvelope<WorkflowEvent>,
 ) -> Result<()> {
-    let WorkflowEvent::BulkActivityBatchScheduled { batch_id, task_queue, .. } = &event.payload else {
+    let WorkflowEvent::BulkActivityBatchScheduled { batch_id, task_queue, .. } = &event.payload
+    else {
         anyhow::bail!("activate_stream_batch expects BulkActivityBatchScheduled");
     };
     let (batch, chunks) =
@@ -2632,16 +2870,20 @@ async fn activate_native_stream_run(
         return Ok(());
     }
 
-    let (batch, chunks) = build_stream_projection_records_from_start_command(state, command, envelope.occurred_at)
-        .await
-        .with_context(|| format!("failed to build native stream-v2 records for {}", command.batch_id))?;
+    let (batch, chunks) =
+        build_stream_projection_records_from_start_command(state, command, envelope.occurred_at)
+            .await
+            .with_context(|| {
+                format!("failed to build native stream-v2 records for {}", command.batch_id)
+            })?;
     if let Err(error) = state.local_state.upsert_batch_with_chunks(&batch, &chunks) {
         error!(error = %error, batch_id = %command.batch_id, "failed to seed native stream-v2 batch state");
     }
     let projection_state = state.clone();
     let projection_batch = batch.clone();
     tokio::spawn(async move {
-        if let Err(error) = sync_stream_batch_projection(&projection_state, &projection_batch).await {
+        if let Err(error) = sync_stream_batch_projection(&projection_state, &projection_batch).await
+        {
             error!(
                 error = %error,
                 batch_id = %projection_batch.batch_id,
@@ -2918,6 +3160,13 @@ async fn materialize_chunk_terminal_artifacts(
                     cancellation_metadata: None,
                 });
             }
+            if collect_results_uses_batch_result_handle_only(reducer) && output.is_some() {
+                return Ok(ChunkTerminalArtifacts {
+                    result_handle: None,
+                    cancellation_reason: None,
+                    cancellation_metadata: None,
+                });
+            }
             let resolved_result_handle = if result_handle.is_null() {
                 let Some(output) = output else {
                     anyhow::bail!(
@@ -2957,6 +3206,9 @@ fn reduce_stream_batch_output(
     reducer: Option<&str>,
     pending_report: Option<&ThroughputChunkReport>,
 ) -> Result<Option<Value>> {
+    if collect_results_uses_batch_result_handle_only(reducer) {
+        return Ok(None);
+    }
     if bulk_reducer_summary_field_name(reducer).is_none() {
         return Ok(None);
     }
@@ -3682,6 +3934,56 @@ async fn sync_projection_batch_result_manifest(
     if !bulk_reducer_materializes_results(batch.reducer.as_deref()) {
         return Ok(());
     }
+    if collect_results_uses_batch_result_handle_only(batch.reducer.as_deref()) {
+        let handle = match serde_json::from_value::<PayloadHandle>(batch.result_handle.clone()) {
+            Ok(handle) => handle,
+            Err(_) => return Ok(()),
+        };
+        let key = match handle {
+            PayloadHandle::Manifest { key, .. } | PayloadHandle::ManifestSlice { key, .. } => key,
+            PayloadHandle::Inline { .. } => return Ok(()),
+        };
+        let identity = ThroughputBatchIdentity {
+            tenant_id: tenant_id.to_owned(),
+            instance_id: instance_id.to_owned(),
+            run_id: run_id.to_owned(),
+            batch_id: batch_id.to_owned(),
+        };
+        let chunk_snapshots = state.local_state.chunk_snapshots_for_batch(&identity)?;
+        let report_log_outputs = load_collect_results_outputs_from_report_log(
+            state,
+            tenant_id,
+            instance_id,
+            run_id,
+            batch_id,
+        )
+        .await?;
+        let mut chunk_outputs = report_log_outputs;
+        for chunk in chunk_snapshots {
+            if let Some(output) = chunk.output {
+                chunk_outputs.insert(chunk.chunk_id, output);
+            }
+        }
+        let ordered_chunks = state
+            .store
+            .list_bulk_chunks_for_batch_page_query_view(
+                tenant_id,
+                instance_id,
+                run_id,
+                batch_id,
+                i64::MAX,
+                0,
+            )
+            .await?;
+        let mut values = Vec::new();
+        for chunk in ordered_chunks {
+            if let Some(mut output) = chunk_outputs.get(&chunk.chunk_id).cloned() {
+                values.append(&mut output);
+            }
+        }
+        state.payload_store.write_value(&key, &Value::Array(values)).await?;
+        return Ok(());
+    }
     let chunks = state
         .store
         .list_bulk_chunks_for_batch_page_query_view(
@@ -3835,8 +4137,16 @@ fn bulk_chunk_to_proto(
     supports_cbor: bool,
     inline_chunk_input_threshold_bytes: usize,
 ) -> BulkActivityTask {
-    let must_inline_items = record.input_handle.is_null();
-    let inline_items_value = (!record.items.is_empty())
+    let payloadless_chunk_transport = can_complete_payloadless_benchmark_chunk(
+        &record.activity_type,
+        record.omit_success_output,
+        record.item_count,
+        !record.items.is_empty(),
+        !record.input_handle.is_null(),
+        record.cancellation_requested,
+    );
+    let must_inline_items = record.input_handle.is_null() && !payloadless_chunk_transport;
+    let inline_items_value = (!payloadless_chunk_transport && !record.items.is_empty())
         .then(|| Value::Array(record.items.clone()))
         .and_then(|value| {
             let json = serde_json::to_string(&value).expect("bulk chunk items serialize");
@@ -3863,12 +4173,12 @@ fn bulk_chunk_to_proto(
         items_json: if supports_cbor {
             String::new()
         } else {
-            inline_items_value
-                .as_ref()
-                .map(|(_, json)| json.clone())
-                .unwrap_or_default()
+            inline_items_value.as_ref().map(|(_, json)| json.clone()).unwrap_or_default()
         },
-        input_handle_json: if supports_cbor || inline_items_value.is_some() {
+        input_handle_json: if supports_cbor
+            || inline_items_value.is_some()
+            || payloadless_chunk_transport
+        {
             String::new()
         } else {
             serde_json::to_string(&record.input_handle).expect("bulk chunk input handle serializes")
@@ -3876,12 +4186,17 @@ fn bulk_chunk_to_proto(
         items_cbor: if supports_cbor {
             inline_items_value
                 .as_ref()
-                .map(|(value, _)| encode_cbor(value, "bulk chunk items").expect("bulk chunk items encode"))
+                .map(|(value, _)| {
+                    encode_cbor(value, "bulk chunk items").expect("bulk chunk items encode")
+                })
                 .unwrap_or_default()
         } else {
             Vec::new()
         },
-        input_handle_cbor: if supports_cbor && inline_items_value.is_none() {
+        input_handle_cbor: if supports_cbor
+            && inline_items_value.is_none()
+            && !payloadless_chunk_transport
+        {
             encode_cbor(&record.input_handle, "bulk chunk input handle")
                 .expect("bulk chunk input handle encodes as CBOR")
         } else {
@@ -3898,6 +4213,7 @@ fn bulk_chunk_to_proto(
         lease_epoch: record.lease_epoch,
         owner_epoch: record.owner_epoch,
         omit_success_output: record.omit_success_output,
+        item_count: record.item_count,
     }
 }
 
@@ -3914,6 +4230,14 @@ fn bulk_reducer_materializes_results(reducer: Option<&str>) -> bool {
     matches!(reducer.unwrap_or("collect_results"), "collect_results" | "collect_settled_results")
 }
 
+fn collect_results_uses_batch_result_handle_only(reducer: Option<&str>) -> bool {
+    reducer == Some("collect_results")
+}
+
+fn should_project_chunk_materialized_output(reducer: Option<&str>) -> bool {
+    !collect_results_uses_batch_result_handle_only(reducer)
+}
+
 fn projected_apply_projection_records(
     report: &ThroughputChunkReport,
     projected: &ProjectedTerminalApply,
@@ -3922,9 +4246,13 @@ fn projected_apply_projection_records(
     reducer_output: Option<Value>,
 ) -> Vec<StreamProjectionRecord> {
     let mut records = Vec::with_capacity(2);
-    for event in
-        projected_apply_projection_events(report, projected, artifacts, chunk_output, reducer_output)
-    {
+    for event in projected_apply_projection_events(
+        report,
+        projected,
+        artifacts,
+        chunk_output,
+        reducer_output,
+    ) {
         records.push(StreamProjectionRecord {
             key: throughput_partition_key(&report.batch_id, report.group_id),
             event,
@@ -3961,7 +4289,13 @@ fn append_projected_apply_projection_events(
     }
 
     events.push(ThroughputProjectionEvent::UpdateChunkState {
-        update: projected_apply_chunk_state_update(report, projected, artifacts, chunk_output),
+        update: projected_apply_chunk_state_update(
+            report,
+            projected,
+            artifacts,
+            chunk_output,
+            projected.batch_reducer.as_deref(),
+        ),
     });
 }
 
@@ -3989,6 +4323,7 @@ fn projected_apply_chunk_state_update(
     projected: &ProjectedTerminalApply,
     artifacts: &ChunkTerminalArtifacts,
     chunk_output: Option<Vec<Value>>,
+    reducer: Option<&str>,
 ) -> ThroughputProjectionChunkStateUpdate {
     ThroughputProjectionChunkStateUpdate {
         tenant_id: report.tenant_id.clone(),
@@ -4004,8 +4339,10 @@ fn projected_apply_chunk_state_update(
         lease_epoch: report.lease_epoch,
         owner_epoch: report.owner_epoch,
         input_handle: None,
-        result_handle: artifacts.result_handle.clone(),
-        output: chunk_output,
+        result_handle: should_project_chunk_materialized_output(reducer)
+            .then(|| artifacts.result_handle.clone())
+            .flatten(),
+        output: should_project_chunk_materialized_output(reducer).then_some(chunk_output).flatten(),
         error: projected.chunk_error.clone(),
         cancellation_requested: false,
         cancellation_reason: artifacts.cancellation_reason.clone(),
@@ -4036,6 +4373,50 @@ fn projected_apply_chunk_state_update(
 fn completed_chunk_output(report: &ThroughputChunkReport) -> Option<Vec<Value>> {
     match &report.payload {
         ThroughputChunkReportPayload::ChunkCompleted { output, .. } => output.clone(),
+        _ => None,
+    }
+}
+
+async fn load_collect_results_outputs_from_report_log(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    batch_id: &str,
+) -> Result<HashMap<String, Vec<Value>>> {
+    let entries = state
+        .store
+        .list_throughput_report_log_for_batch(tenant_id, instance_id, run_id, batch_id)
+        .await?;
+    let mut outputs = HashMap::new();
+    for entry in entries {
+        if let Some(output) = completed_chunk_output(&entry.report) {
+            outputs.insert(entry.report.chunk_id, output);
+        } else if let Some(handle) = completed_chunk_result_handle(&entry.report) {
+            let handle = serde_json::from_value::<PayloadHandle>(handle)
+                .context("failed to decode collect_results chunk result handle from report log")?;
+            let value = state
+                .payload_store
+                .read_value(&handle)
+                .await
+                .context("failed to read collect_results chunk result payload")?;
+            let items = match value {
+                Value::Array(items) => items,
+                _ => Vec::new(),
+            };
+            outputs.insert(entry.report.chunk_id, items);
+        }
+    }
+    Ok(outputs)
+}
+
+fn completed_chunk_result_handle(report: &ThroughputChunkReport) -> Option<Value> {
+    match &report.payload {
+        ThroughputChunkReportPayload::ChunkCompleted { result_handle, .. }
+            if !result_handle.is_null() =>
+        {
+            Some(result_handle.clone())
+        }
         _ => None,
     }
 }
@@ -4367,6 +4748,61 @@ mod tests {
         assert_eq!(output, Some(vec![serde_json::json!({"ok": true})]));
     }
 
+    #[test]
+    fn bulk_chunk_to_proto_omits_payload_handles_for_payloadless_benchmark_echo() {
+        let now = Utc::now();
+        let task = bulk_chunk_to_proto(
+            &LeasedChunkSnapshot {
+                identity: ThroughputBatchIdentity {
+                    tenant_id: "tenant-a".to_owned(),
+                    instance_id: "wf-a".to_owned(),
+                    run_id: "run-a".to_owned(),
+                    batch_id: "batch-a".to_owned(),
+                },
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                chunk_id: "chunk-a".to_owned(),
+                activity_type: "benchmark.echo".to_owned(),
+                task_queue: "bulk".to_owned(),
+                chunk_index: 0,
+                group_id: 0,
+                attempt: 1,
+                item_count: 256,
+                max_attempts: 1,
+                retry_delay_ms: 0,
+                items: Vec::new(),
+                input_handle: Value::Null,
+                omit_success_output: true,
+                cancellation_requested: false,
+                lease_epoch: 1,
+                owner_epoch: 1,
+                worker_id: Some("worker-a".to_owned()),
+                lease_token: Some("lease-a".to_owned()),
+                scheduled_at: now,
+                started_at: Some(now),
+                lease_expires_at: Some(now + chrono::Duration::seconds(5)),
+                updated_at: now,
+            },
+            false,
+            1024,
+        );
+
+        assert!(task.items_json.is_empty());
+        assert!(task.items_cbor.is_empty());
+        assert!(task.input_handle_json.is_empty());
+        assert!(task.input_handle_cbor.is_empty());
+        assert_eq!(task.item_count, 256);
+        assert!(task.omit_success_output);
+    }
+
+    #[test]
+    fn collect_results_projection_omits_chunk_materialized_output() {
+        assert!(!should_project_chunk_materialized_output(Some("collect_results")));
+        assert!(should_project_chunk_materialized_output(Some("collect_settled_results")));
+        assert!(should_project_chunk_materialized_output(Some("sum")));
+    }
+
     #[tokio::test]
     async fn resolve_stream_batch_input_reads_manifest_handles() -> Result<()> {
         let payload_root = temp_path("throughput-runtime-payload-store");
@@ -4401,7 +4837,6 @@ mod tests {
         fs::remove_dir_all(payload_root).ok();
         Ok(())
     }
-
 
     #[test]
     fn throughput_report_from_result_accepts_elided_completed_payloads() {
@@ -4444,17 +4879,9 @@ mod tests {
 
     #[test]
     fn stream_batch_terminal_identity_is_deterministic_for_report_terminals() {
-        let dedupe_key = stream_batch_terminal_dedupe_key(
-            "tenant-a",
-            "wf-a",
-            "run-a",
-            "batch-a",
-            "completed",
-        );
-        assert_eq!(
-            dedupe_key,
-            "throughput-terminal:tenant-a:wf-a:run-a:batch-a:completed"
-        );
+        let dedupe_key =
+            stream_batch_terminal_dedupe_key("tenant-a", "wf-a", "run-a", "batch-a", "completed");
+        assert_eq!(dedupe_key, "throughput-terminal:tenant-a:wf-a:run-a:batch-a:completed");
         assert_eq!(
             stream_batch_terminal_event_id(&dedupe_key),
             stream_batch_terminal_event_id(&dedupe_key)
@@ -4463,20 +4890,10 @@ mod tests {
 
     #[test]
     fn stream_batch_terminal_identity_changes_when_projected_terminal_changes() {
-        let completed = stream_batch_terminal_dedupe_key(
-            "tenant-a",
-            "wf-a",
-            "run-a",
-            "batch-a",
-            "completed",
-        );
-        let failed = stream_batch_terminal_dedupe_key(
-            "tenant-a",
-            "wf-a",
-            "run-a",
-            "batch-a",
-            "failed",
-        );
+        let completed =
+            stream_batch_terminal_dedupe_key("tenant-a", "wf-a", "run-a", "batch-a", "completed");
+        let failed =
+            stream_batch_terminal_dedupe_key("tenant-a", "wf-a", "run-a", "batch-a", "failed");
 
         assert_ne!(completed, failed);
         assert_ne!(
@@ -4673,9 +5090,7 @@ mod tests {
                 chunk
             })
             .collect::<Vec<_>>();
-        store
-            .upsert_throughput_projection_chunks(&completed_chunks)
-            .await?;
+        store.upsert_throughput_projection_chunks(&completed_chunks).await?;
         local_state.upsert_batch_with_chunks(&batch, &completed_chunks)?;
 
         let identity = ThroughputBatchIdentity {
@@ -4690,25 +5105,30 @@ mod tests {
         assert_eq!(local_batch.status, WorkflowBulkBatchStatus::Completed.as_str());
 
         let before = store
-            .get_bulk_batch_query_view(&batch.tenant_id, &batch.instance_id, &batch.run_id, batch_id)
+            .get_bulk_batch_query_view(
+                &batch.tenant_id,
+                &batch.instance_id,
+                &batch.run_id,
+                batch_id,
+            )
             .await?
             .context("projection batch missing before repair")?;
         assert_eq!(before.status, WorkflowBulkBatchStatus::Scheduled);
         assert_eq!(before.terminal_at, None);
 
-        let owned =
-            HashSet::from([throughput_partition_for_batch(batch_id, 0, 8)]);
-        let repaired = repair_stale_terminal_projection_batches_in_store(
-            &store,
-            &local_state,
-            &owned,
-            8,
-        )
-        .await?;
+        let owned = HashSet::from([throughput_partition_for_batch(batch_id, 0, 8)]);
+        let repaired =
+            repair_stale_terminal_projection_batches_in_store(&store, &local_state, &owned, 8)
+                .await?;
         assert_eq!(repaired, 1);
 
         let repaired_batch = store
-            .get_bulk_batch_query_view(&batch.tenant_id, &batch.instance_id, &batch.run_id, batch_id)
+            .get_bulk_batch_query_view(
+                &batch.tenant_id,
+                &batch.instance_id,
+                &batch.run_id,
+                batch_id,
+            )
             .await?
             .context("projection batch missing after repair")?;
         assert_eq!(repaired_batch.status, WorkflowBulkBatchStatus::Completed);

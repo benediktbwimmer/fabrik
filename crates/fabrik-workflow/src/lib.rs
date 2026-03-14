@@ -988,9 +988,13 @@ impl WorkflowInstanceState {
                     "cancelledItems": cancelled_items,
                     "chunkCount": chunk_count,
                 });
-                if let WorkflowEvent::BulkActivityBatchFailed { reducer_output: Some(value), .. }
-                | WorkflowEvent::BulkActivityBatchCancelled { reducer_output: Some(value), .. } =
-                    &event.payload
+                if let WorkflowEvent::BulkActivityBatchFailed {
+                    reducer_output: Some(value), ..
+                }
+                | WorkflowEvent::BulkActivityBatchCancelled {
+                    reducer_output: Some(value),
+                    ..
+                } = &event.payload
                 {
                     error["reducerOutput"] = value.clone();
                 }
@@ -1291,6 +1295,14 @@ pub fn replay_compiled_history_trace(
                             execution_state,
                             turn_context,
                         )?
+                    } else if artifact.has_dynamic_signal_handler(&execution_state, signal_type) {
+                        artifact.execute_dynamic_signal_handler_with_turn(
+                            current_state,
+                            signal_type,
+                            payload,
+                            execution_state,
+                            turn_context,
+                        )?
                     } else {
                         artifact.execute_after_signal_with_turn(
                             current_state,
@@ -1450,9 +1462,14 @@ pub fn replay_compiled_history_trace(
                         "cancelledItems": cancelled_items,
                         "chunkCount": chunk_count,
                     });
-                    if let WorkflowEvent::BulkActivityBatchFailed { reducer_output: Some(value), .. }
-                    | WorkflowEvent::BulkActivityBatchCancelled { reducer_output: Some(value), .. } =
-                        &event.payload
+                    if let WorkflowEvent::BulkActivityBatchFailed {
+                        reducer_output: Some(value),
+                        ..
+                    }
+                    | WorkflowEvent::BulkActivityBatchCancelled {
+                        reducer_output: Some(value),
+                        ..
+                    } = &event.payload
                     {
                         payload["reducerOutput"] = value.clone();
                     }
@@ -1578,6 +1595,14 @@ pub fn replay_compiled_history_trace_from_snapshot(
                         artifact.execute_signal_handler_with_turn(
                             current_state,
                             signal_id,
+                            signal_type,
+                            payload,
+                            execution_state,
+                            turn_context,
+                        )?
+                    } else if artifact.has_dynamic_signal_handler(&execution_state, signal_type) {
+                        artifact.execute_dynamic_signal_handler_with_turn(
+                            current_state,
                             signal_type,
                             payload,
                             execution_state,
@@ -1742,9 +1767,14 @@ pub fn replay_compiled_history_trace_from_snapshot(
                         "cancelledItems": cancelled_items,
                         "chunkCount": chunk_count,
                     });
-                    if let WorkflowEvent::BulkActivityBatchFailed { reducer_output: Some(value), .. }
-                    | WorkflowEvent::BulkActivityBatchCancelled { reducer_output: Some(value), .. } =
-                        &event.payload
+                    if let WorkflowEvent::BulkActivityBatchFailed {
+                        reducer_output: Some(value),
+                        ..
+                    }
+                    | WorkflowEvent::BulkActivityBatchCancelled {
+                        reducer_output: Some(value),
+                        ..
+                    } = &event.payload
                     {
                         payload["reducerOutput"] = value.clone();
                     }
@@ -2668,10 +2698,7 @@ mod tests {
             "WorkflowTriggered",
             "run-1",
             WorkflowEvent::WorkflowTriggered { input: json!({"approved": true}) },
-            &[(
-                "search_attributes_json",
-                "{\"CustomIntField\":[2],\"CustomBoolField\":[true]}",
-            )],
+            &[("search_attributes_json", "{\"CustomIntField\":[2],\"CustomBoolField\":[true]}")],
         );
         let upserted = test_event(
             "SearchAttributesUpserted",

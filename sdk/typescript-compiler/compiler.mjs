@@ -268,6 +268,7 @@ function collectTemporalWorkflowApi(sourceFile) {
   const api = {
     activityFailure: new Set(),
     proxyActivities: new Set(),
+    proxyLocalActivities: new Set(),
     sleep: new Set(),
     continueAsNew: new Set(),
     condition: new Set(),
@@ -313,6 +314,7 @@ function collectTemporalWorkflowApi(sourceFile) {
       const localName = element.name.text;
       if (importedName === "ActivityFailure") api.activityFailure.add(localName);
       if (importedName === "proxyActivities") api.proxyActivities.add(localName);
+      if (importedName === "proxyLocalActivities") api.proxyLocalActivities.add(localName);
       if (importedName === "sleep") api.sleep.add(localName);
       if (importedName === "continueAsNew") api.continueAsNew.add(localName);
       if (importedName === "condition") api.condition.add(localName);
@@ -354,6 +356,7 @@ let currentTemporalActivityBindings = {
   objectOptions: new Map(),
 };
 let currentStaticTopLevelInitializers = new Map();
+let currentPromiseLikeTimerClasses = new Map();
 
 function unwrapStaticReferenceExpression(expression) {
   if (
@@ -388,6 +391,127 @@ function collectStaticTopLevelInitializers(sourceFile) {
     }
   }
   return bindings;
+}
+
+function propertyNameText(name) {
+  if (ts.isIdentifier(name) || ts.isStringLiteral(name) || ts.isNumericLiteral(name)) {
+    return name.text;
+  }
+  return null;
+}
+
+function isThisPropertyReference(expression) {
+  return (
+    ts.isPropertyAccessExpression(expression) &&
+    expression.expression.kind === ts.SyntaxKind.ThisKeyword
+  );
+}
+
+function extractPromiseLikeTimerClassModel(statement, temporalApi) {
+  if (!ts.isClassDeclaration(statement) || !statement.name) {
+    return null;
+  }
+  let publicProperty = null;
+  let backingProperty = null;
+  let flagProperty = null;
+  let constructorArity = null;
+  let hasThen = false;
+  let hasRunLoop = false;
+  for (const member of statement.members) {
+    if (ts.isConstructorDeclaration(member)) {
+      constructorArity = member.parameters.length;
+      continue;
+    }
+    if (ts.isSetAccessorDeclaration(member) && member.body && member.parameters.length === 1) {
+      const propName = propertyNameText(member.name);
+      const valueParam = ts.isIdentifier(member.parameters[0].name) ? member.parameters[0].name.text : null;
+      const body = member.body.statements;
+      if (
+        propName &&
+        valueParam &&
+        body.length >= 2 &&
+        ts.isExpressionStatement(body[0]) &&
+        ts.isBinaryExpression(body[0].expression) &&
+        body[0].expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        ts.isIdentifier(body[0].expression.right) &&
+        body[0].expression.right.text === valueParam &&
+        (ts.isPropertyAccessExpression(body[0].expression.left) || ts.isPropertyAccessExpression(body[0].expression.left)) &&
+        ts.isExpressionStatement(body[1]) &&
+        ts.isBinaryExpression(body[1].expression) &&
+        body[1].expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        body[1].expression.right.kind === ts.SyntaxKind.TrueKeyword &&
+        isThisPropertyReference(body[1].expression.left)
+      ) {
+        publicProperty = propName;
+        backingProperty = isThisPropertyReference(body[0].expression.left)
+          ? body[0].expression.left.name.text
+          : null;
+        flagProperty = body[1].expression.left.name.text;
+      }
+      continue;
+    }
+    if (ts.isGetAccessorDeclaration(member) && member.body) {
+      const propName = propertyNameText(member.name);
+      const body = member.body.statements;
+      if (
+        publicProperty &&
+        propName === publicProperty &&
+        body.length === 1 &&
+        ts.isReturnStatement(body[0]) &&
+        body[0].expression &&
+        isThisPropertyReference(body[0].expression)
+      ) {
+        backingProperty = body[0].expression.name.text;
+      }
+      continue;
+    }
+    if (ts.isMethodDeclaration(member) && ts.isIdentifier(member.name) && member.name.text === "then") {
+      hasThen = true;
+      continue;
+    }
+    if (
+      ts.isMethodDeclaration(member) &&
+      member.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword) &&
+      member.body
+    ) {
+      const whileStatement = member.body.statements.find((node) => ts.isWhileStatement(node));
+      if (!whileStatement || !ts.isBlock(whileStatement.statement)) {
+        continue;
+      }
+      const statements = whileStatement.statement.statements;
+      if (
+        statements.length >= 2 &&
+        ts.isExpressionStatement(statements[0]) &&
+        ts.isBinaryExpression(statements[0].expression) &&
+        statements[0].expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        isThisPropertyReference(statements[0].expression.left) &&
+        statements[0].expression.right.kind === ts.SyntaxKind.FalseKeyword &&
+        ts.isIfStatement(statements[1]) &&
+        ts.isPrefixUnaryExpression(statements[1].expression) &&
+        statements[1].expression.operator === ts.SyntaxKind.ExclamationToken &&
+        ts.isParenthesizedExpression(statements[1].expression.operand) &&
+        ts.isAwaitExpression(statements[1].expression.operand.expression) &&
+        ts.isCallExpression(statements[1].expression.operand.expression.expression) &&
+        temporalImportedCallMatches(
+          statements[1].expression.operand.expression.expression,
+          temporalApi.condition,
+          "condition",
+          temporalApi,
+        )
+      ) {
+        hasRunLoop = true;
+      }
+    }
+  }
+  if (!publicProperty || !flagProperty || constructorArity !== 1 || !hasThen || !hasRunLoop) {
+    return null;
+  }
+  return {
+    className: statement.name.text,
+    publicProperty,
+    flagProperty,
+    backingProperty,
+  };
 }
 
 function temporalImportedReferenceMatches(expression, aliases, importedName, temporalApi = currentTemporalApi) {
@@ -429,7 +553,15 @@ function isTemporalProxyDeclaration(declaration, temporalApi) {
   if (!initializer || !ts.isCallExpression(initializer)) {
     return false;
   }
-  if (!temporalImportedCallMatches(initializer, temporalApi.proxyActivities, "proxyActivities", temporalApi)) {
+  if (
+    !temporalImportedCallMatches(initializer, temporalApi.proxyActivities, "proxyActivities", temporalApi) &&
+    !temporalImportedCallMatches(
+      initializer,
+      temporalApi.proxyLocalActivities,
+      "proxyLocalActivities",
+      temporalApi,
+    )
+  ) {
     return false;
   }
   if (ts.isIdentifier(declaration.name)) {
@@ -593,12 +725,43 @@ function compileApplicationFailureCreateExpression(expression) {
   return { kind: "object", fields };
 }
 
+function extractCallbackTimerHelper(declaration) {
+  if (declaration.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) {
+    return null;
+  }
+  if (declaration.parameters.length !== 1 || !ts.isIdentifier(declaration.parameters[0].name)) {
+    return null;
+  }
+  const callbackName = declaration.parameters[0].name.text;
+  const body = ts.isBlock(declaration.body)
+    ? declaration.body.statements
+    : [ts.factory.createExpressionStatement(declaration.body)];
+  if (body.length !== 1 || !ts.isExpressionStatement(body[0]) || !ts.isCallExpression(body[0].expression)) {
+    return null;
+  }
+  const call = body[0].expression;
+  if (
+    !ts.isIdentifier(call.expression) ||
+    call.expression.text !== "setTimeout" ||
+    call.arguments.length < 2 ||
+    !ts.isIdentifier(call.arguments[0]) ||
+    call.arguments[0].text !== callbackName
+  ) {
+    return null;
+  }
+  return { timeoutExpr: call.arguments[1] };
+}
+
 function parseTemporalRetryOptions(expression) {
   expression = unwrapStaticReferenceExpression(expression);
   if (!ts.isObjectLiteralExpression(expression)) {
     throw compilerError(`proxyActivities retry must be a static object`, expression);
   }
-  const retry = {};
+  const retry = {
+    max_attempts: 4294967295,
+    delay: "1s",
+    backoff_coefficient_millis: 2000,
+  };
   for (const property of expression.properties) {
     if (!ts.isPropertyAssignment(property)) {
       throw compilerError(`unsupported proxyActivities retry option ${property.getText()}`, property);
@@ -664,6 +827,18 @@ function parseTemporalProxyActivityOptions(callExpression) {
     throw compilerError(`proxyActivities options must be a static object`, optionsExpression);
   }
   const options = {};
+  const setDurationOption = (key, initializer, label) => {
+    const unwrapped = unwrapStaticReferenceExpression(initializer);
+    if (
+      ts.isNumericLiteral(unwrapped) ||
+      ts.isStringLiteral(unwrapped) ||
+      ts.isNoSubstitutionTemplateLiteral(unwrapped)
+    ) {
+      options[key] = parseTemporalDurationMs(unwrapped, label);
+      return;
+    }
+    options[`${key}_expr`] = compileExpression(initializer);
+  };
   for (const property of optionsExpression.properties) {
     if (!ts.isPropertyAssignment(property)) {
       throw compilerError(`unsupported proxyActivities option ${property.getText()}`, property);
@@ -674,28 +849,32 @@ function parseTemporalProxyActivityOptions(callExpression) {
       continue;
     }
     if (key === "scheduleToStartTimeout") {
-      options.schedule_to_start_timeout_ms = parseTemporalDurationMs(
+      setDurationOption(
+        "schedule_to_start_timeout_ms",
         property.initializer,
         "proxyActivities scheduleToStartTimeout",
       );
       continue;
     }
     if (key === "scheduleToCloseTimeout") {
-      options.schedule_to_close_timeout_ms = parseTemporalDurationMs(
+      setDurationOption(
+        "schedule_to_close_timeout_ms",
         property.initializer,
         "proxyActivities scheduleToCloseTimeout",
       );
       continue;
     }
     if (key === "startToCloseTimeout") {
-      options.start_to_close_timeout_ms = parseTemporalDurationMs(
+      setDurationOption(
+        "start_to_close_timeout_ms",
         property.initializer,
         "proxyActivities startToCloseTimeout",
       );
       continue;
     }
     if (key === "heartbeatTimeout") {
-      options.heartbeat_timeout_ms = parseTemporalDurationMs(
+      setDurationOption(
+        "heartbeat_timeout_ms",
         property.initializer,
         "proxyActivities heartbeatTimeout",
       );
@@ -718,6 +897,45 @@ function parseTemporalProxyActivityOptions(callExpression) {
     throw compilerError(`unsupported proxyActivities option ${key}`, property);
   }
   return options;
+}
+
+function activityOptionsRequireDynamicDescriptor(options) {
+  return Boolean(
+    options.schedule_to_start_timeout_ms_expr ||
+    options.schedule_to_close_timeout_ms_expr ||
+    options.start_to_close_timeout_ms_expr ||
+    options.heartbeat_timeout_ms_expr,
+  );
+}
+
+function buildActivityDescriptorFields(activityTypeExpr, inputExpr, options) {
+  return {
+    __kind: { kind: "literal", value: "activity_descriptor" },
+    activity_type: activityTypeExpr,
+    input: inputExpr,
+    ...(options.task_queue ? { task_queue: options.task_queue } : {}),
+    ...(options.retry ? { retry: jsonValueToExpression(options.retry) } : {}),
+    ...(options.schedule_to_start_timeout_ms != null
+      ? { schedule_to_start_timeout_ms: { kind: "literal", value: options.schedule_to_start_timeout_ms } }
+      : options.schedule_to_start_timeout_ms_expr
+        ? { schedule_to_start_timeout_ms: options.schedule_to_start_timeout_ms_expr }
+        : {}),
+    ...(options.schedule_to_close_timeout_ms != null
+      ? { schedule_to_close_timeout_ms: { kind: "literal", value: options.schedule_to_close_timeout_ms } }
+      : options.schedule_to_close_timeout_ms_expr
+        ? { schedule_to_close_timeout_ms: options.schedule_to_close_timeout_ms_expr }
+        : {}),
+    ...(options.start_to_close_timeout_ms != null
+      ? { start_to_close_timeout_ms: { kind: "literal", value: options.start_to_close_timeout_ms } }
+      : options.start_to_close_timeout_ms_expr
+        ? { start_to_close_timeout_ms: options.start_to_close_timeout_ms_expr }
+        : {}),
+    ...(options.heartbeat_timeout_ms != null
+      ? { heartbeat_timeout_ms: { kind: "literal", value: options.heartbeat_timeout_ms } }
+      : options.heartbeat_timeout_ms_expr
+        ? { heartbeat_timeout_ms: options.heartbeat_timeout_ms_expr }
+        : {}),
+  };
 }
 
 function isTemporalDefinitionDeclaration(declaration, temporalApi) {
@@ -1187,12 +1405,65 @@ function isAsyncHelperDeclaration(declaration) {
   );
 }
 
+function extractSingleReturnExpression(statement) {
+  if (ts.isReturnStatement(statement) && statement.expression) {
+    return statement.expression;
+  }
+  if (ts.isBlock(statement) && statement.statements.length === 1) {
+    return extractSingleReturnExpression(statement.statements[0]);
+  }
+  return null;
+}
+
+function compileGuardReturnHelperBody(statements) {
+  if (statements.length === 0) {
+    return null;
+  }
+  const finalReturn = statements.at(-1);
+  if (!finalReturn || !ts.isReturnStatement(finalReturn) || !finalReturn.expression) {
+    return null;
+  }
+  let expression = compileExpression(finalReturn.expression);
+  for (let index = statements.length - 2; index >= 0; index -= 1) {
+    const statement = statements[index];
+    if (!ts.isIfStatement(statement) || statement.elseStatement) {
+      return null;
+    }
+    const thenExpression = extractSingleReturnExpression(statement.thenStatement);
+    if (!thenExpression) {
+      return null;
+    }
+    expression = {
+      kind: "conditional",
+      condition: compileExpression(statement.expression),
+      then_expr: compileExpression(thenExpression),
+      else_expr: expression,
+    };
+  }
+  return expression;
+}
+
 function compileHelperFunction(name, declaration) {
   if (declaration.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) {
     throw compilerError(`helper ${name} must not be async`, declaration);
   }
   const params = declaration.parameters.map((parameter) => parameter.name.getText());
+  if (extractCallbackTimerHelper(declaration)) {
+    return {
+      params,
+      statements: [],
+      body: { kind: "literal", value: null },
+    };
+  }
   if (ts.isBlock(declaration.body)) {
+    const guardReturnBody = compileGuardReturnHelperBody(declaration.body.statements);
+    if (guardReturnBody) {
+      return {
+        params,
+        statements: [],
+        body: guardReturnBody,
+      };
+    }
     const last = declaration.body.statements.at(-1);
     if (!last || !ts.isReturnStatement(last) || !last.expression) {
       throw compilerError(`helper ${name} must end with a return expression`, declaration.body);
@@ -1736,6 +2007,56 @@ function compileWorkflowParam(parameter) {
   };
 }
 
+function compileWorkflowParamBinding(parameter, index) {
+  if (ts.isIdentifier(parameter.name)) {
+    return {
+      param: compileWorkflowParam(parameter),
+      preambleActions: [],
+    };
+  }
+  if (!ts.isObjectBindingPattern(parameter.name)) {
+    throw compilerError(`workflow parameters must be identifiers or object destructuring patterns`, parameter.name);
+  }
+  const syntheticName = `__param_${index}`;
+  const preambleActions = [];
+  for (const element of parameter.name.elements) {
+    if (element.dotDotDotToken) {
+      throw compilerError(`workflow parameter object rest bindings are not supported yet`, element);
+    }
+    if (!ts.isIdentifier(element.name)) {
+      throw compilerError(`workflow parameter destructuring must bind plain identifiers`, element.name);
+    }
+    const propertyName = element.propertyName
+      ? literalIdentifierOrString(element.propertyName, "workflow parameter property")
+      : element.name.text;
+    let expr = {
+      kind: "member",
+      object: { kind: "identifier", name: syntheticName },
+      property: propertyName,
+    };
+    if (element.initializer) {
+      expr = {
+        kind: "logical",
+        op: "coalesce",
+        left: expr,
+        right: compileExpression(element.initializer),
+      };
+    }
+    preambleActions.push({
+      target: element.name.text,
+      expr,
+    });
+  }
+  return {
+    param: {
+      name: syntheticName,
+      rest: Boolean(parameter.dotDotDotToken) || undefined,
+      default: parameter.initializer ? compileExpression(parameter.initializer) : undefined,
+    },
+    preambleActions,
+  };
+}
+
 function functionBodyExpression(body) {
   if (!ts.isBlock(body)) {
     return body;
@@ -2069,6 +2390,13 @@ function compileExpression(expression) {
       return { kind: "unary", op: "negate", expr: compileExpression(expression.operand) };
     }
   }
+  if (ts.isTypeOfExpression?.(expression)) {
+    return {
+      kind: "call",
+      callee: "__builtin_typeof",
+      args: [compileExpression(expression.expression)],
+    };
+  }
   if (ts.isBinaryExpression(expression)) {
     if (
       expression.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword &&
@@ -2095,6 +2423,17 @@ function compileExpression(expression) {
       return {
         kind: "call",
         callee: "__temporal_is_application_failure",
+        args: [compileExpression(expression.left)],
+      };
+    }
+    if (
+      expression.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword &&
+      ts.isIdentifier(expression.right) &&
+      expression.right.text === "Error"
+    ) {
+      return {
+        kind: "call",
+        callee: "__builtin_is_error",
         args: [compileExpression(expression.left)],
       };
     }
@@ -2487,6 +2826,20 @@ function compileExpression(expression) {
     }
   }
   if (ts.isNewExpression(expression)) {
+    if (ts.isIdentifier(expression.expression) && currentPromiseLikeTimerClasses.has(expression.expression.text)) {
+      const model = currentPromiseLikeTimerClasses.get(expression.expression.text);
+      if ((expression.arguments?.length ?? 0) !== 1) {
+        throw compilerError(`new ${model.className}() currently supports exactly one argument`, expression);
+      }
+      return {
+        kind: "object",
+        fields: {
+          __kind: { kind: "literal", value: "promise_like_timer" },
+          [model.publicProperty]: compileExpression(expression.arguments[0]),
+          [model.flagProperty]: { kind: "literal", value: false },
+        },
+      };
+    }
     if (ts.isIdentifier(expression.expression) && expression.expression.text === "Date") {
       if ((expression.arguments?.length ?? 0) > 1) {
         throw compilerError(`new Date() currently supports zero or one argument`, expression);
@@ -2575,6 +2928,14 @@ class WorkflowLowerer {
     this.childPromiseArrayVars = new Set();
     this.externalHandleVars = new Map();
     this.bulkHandleVars = new Set();
+    this.timerHandleVars = new Set();
+    this.stepHandleVars = new Set();
+    this.inlineAsyncResultVars = new Set();
+    this.cancellationScopeVars = new Set();
+    this.scopeHandleVars = new Map();
+    this.promiseLikeTimerInstanceVars = new Map();
+    this.localPureBindings = new Map();
+    this.currentCancellationScopeVars = [];
     this.temporalSignalHandlers = new Map();
     const sourceFile =
       workflowDeclaration && typeof workflowDeclaration.getSourceFile === "function"
@@ -2586,6 +2947,8 @@ class WorkflowLowerer {
     this.temporalActivityBindings = sourceFile
       ? this.discoverTemporalActivityBindings(sourceFile)
       : { direct: new Map(), objects: new Set() };
+    this.promiseLikeTimerClasses = sourceFile ? this.discoverPromiseLikeTimerClasses(sourceFile) : new Map();
+    this.callbackHelpers = sourceFile ? this.discoverCallbackHelpers(sourceFile) : new Map();
     this.asyncLocalHelpers = sourceFile ? this.discoverAsyncLocalHelpers(sourceFile) : new Map();
     this.discoverHandleDeclarations(workflowDeclaration.body);
   }
@@ -2677,32 +3040,33 @@ class WorkflowLowerer {
       objects: new Set(),
       objectOptions: new Map(),
     };
-    for (const statement of sourceFile.statements) {
-      if (!ts.isVariableStatement(statement)) {
-        continue;
+    const visit = (node) => {
+      if (ts.isVariableStatement(node)) {
+        for (const declaration of node.declarationList.declarations) {
+          if (!isTemporalProxyDeclaration(declaration, this.temporalApi)) {
+            continue;
+          }
+          const proxyCall = unwrapStaticReferenceExpression(declaration.initializer);
+          if (!ts.isCallExpression(proxyCall)) {
+            throw compilerError(`proxyActivities options must be declared inline`, declaration);
+          }
+          const options = parseTemporalProxyActivityOptions(proxyCall);
+          if (ts.isIdentifier(declaration.name)) {
+            bindings.objects.add(declaration.name.text);
+            bindings.objectOptions.set(declaration.name.text, options);
+            continue;
+          }
+          for (const element of declaration.name.elements) {
+            bindings.direct.set(element.name.text, {
+              activityType: element.name.text,
+              options,
+            });
+          }
+        }
       }
-      for (const declaration of statement.declarationList.declarations) {
-        if (!isTemporalProxyDeclaration(declaration, this.temporalApi)) {
-          continue;
-        }
-        const proxyCall = unwrapStaticReferenceExpression(declaration.initializer);
-        if (!ts.isCallExpression(proxyCall)) {
-          throw compilerError(`proxyActivities options must be declared inline`, declaration);
-        }
-        const options = parseTemporalProxyActivityOptions(proxyCall);
-        if (ts.isIdentifier(declaration.name)) {
-          bindings.objects.add(declaration.name.text);
-          bindings.objectOptions.set(declaration.name.text, options);
-          continue;
-        }
-        for (const element of declaration.name.elements) {
-          bindings.direct.set(element.name.text, {
-            activityType: element.name.text,
-            options,
-          });
-        }
-      }
-    }
+      ts.forEachChild(node, visit);
+    };
+    visit(sourceFile);
     return bindings;
   }
 
@@ -2733,6 +3097,48 @@ class WorkflowLowerer {
       }
     }
     return helpers;
+  }
+
+  discoverCallbackHelpers(sourceFile) {
+    const helpers = new Map();
+    const recordIfCallbackTimer = (name, declaration) => {
+      const resolved = extractCallbackTimerHelper(declaration);
+      if (resolved) {
+        helpers.set(name, resolved.timeoutExpr);
+      }
+    };
+    for (const statement of sourceFile.statements) {
+      if (ts.isFunctionDeclaration(statement) && statement.name && statement.body) {
+        recordIfCallbackTimer(statement.name.text, statement);
+        continue;
+      }
+      if (!ts.isVariableStatement(statement)) {
+        continue;
+      }
+      for (const declaration of statement.declarationList.declarations) {
+        if (!ts.isIdentifier(declaration.name) || !declaration.initializer) {
+          continue;
+        }
+        if (
+          (ts.isArrowFunction(declaration.initializer) || ts.isFunctionExpression(declaration.initializer))
+          && declaration.initializer.body
+        ) {
+          recordIfCallbackTimer(declaration.name.text, declaration.initializer);
+        }
+      }
+    }
+    return helpers;
+  }
+
+  discoverPromiseLikeTimerClasses(sourceFile) {
+    const classes = new Map();
+    for (const statement of sourceFile.statements) {
+      const model = extractPromiseLikeTimerClassModel(statement, this.temporalApi);
+      if (model) {
+        classes.set(model.className, model);
+      }
+    }
+    return classes;
   }
 
   resolveTemporalActivityCall(expression) {
@@ -2799,6 +3205,269 @@ class WorkflowLowerer {
       method === "current" &&
       expression.expression.arguments.length === 0
     );
+  }
+
+  resolveCallbackPromiseTimeout(expression) {
+    if (
+      !ts.isNewExpression(expression) ||
+      !ts.isIdentifier(expression.expression) ||
+      expression.expression.text !== "Promise" ||
+      expression.arguments?.length !== 1
+    ) {
+      return null;
+    }
+    const executor = expression.arguments[0];
+    if (!ts.isArrowFunction(executor) && !ts.isFunctionExpression(executor)) {
+      return null;
+    }
+    if (executor.parameters.length < 1 || executor.parameters.length > 2) {
+      return null;
+    }
+    if (!ts.isIdentifier(executor.parameters[0].name)) {
+      return null;
+    }
+    const resolveName = executor.parameters[0].name.text;
+    const rejectName =
+      executor.parameters[1] && ts.isIdentifier(executor.parameters[1].name)
+        ? executor.parameters[1].name.text
+        : null;
+    const statements = ts.isBlock(executor.body)
+      ? executor.body.statements
+      : [ts.factory.createExpressionStatement(executor.body)];
+    let timeoutExpr = null;
+    for (const statement of statements) {
+      if (!ts.isExpressionStatement(statement) || !ts.isCallExpression(statement.expression)) {
+        return null;
+      }
+      const call = statement.expression;
+      if (ts.isIdentifier(call.expression) && this.callbackHelpers.has(call.expression.text)) {
+        if (call.arguments.length !== 1 || !ts.isIdentifier(call.arguments[0]) || call.arguments[0].text !== resolveName) {
+          return null;
+        }
+        timeoutExpr = this.callbackHelpers.get(call.expression.text);
+        continue;
+      }
+      if (
+        ts.isIdentifier(call.expression) &&
+        call.expression.text === "setTimeout" &&
+        call.arguments.length >= 2 &&
+        ts.isIdentifier(call.arguments[0]) &&
+        call.arguments[0].text === resolveName
+      ) {
+        timeoutExpr = call.arguments[1];
+        continue;
+      }
+      if (
+        rejectName &&
+        ts.isPropertyAccessExpression(call.expression) &&
+        call.expression.name.text === "catch" &&
+        call.arguments.length === 1 &&
+        ts.isIdentifier(call.arguments[0]) &&
+        call.arguments[0].text === rejectName
+      ) {
+        continue;
+      }
+      return null;
+    }
+    return timeoutExpr ? { timeoutExpr } : null;
+  }
+
+  resolveCancellationScopeVar(expression) {
+    return ts.isIdentifier(expression) && this.cancellationScopeVars.has(expression.text)
+      ? expression.text
+      : null;
+  }
+
+  resolveTemporalCurrentCancellationScope(expression) {
+    if (
+      !ts.isCallExpression(expression) ||
+      !ts.isPropertyAccessExpression(expression.expression)
+    ) {
+      return null;
+    }
+    if (
+      temporalImportedReferenceMatches(
+        expression.expression.expression,
+        this.temporalApi.cancellationScope,
+        "CancellationScope",
+        this.temporalApi,
+      ) &&
+      expression.expression.name.text === "current" &&
+      expression.arguments.length === 0
+    ) {
+      return this.currentCancellationScopeVars[this.currentCancellationScopeVars.length - 1] ?? null;
+    }
+    return null;
+  }
+
+  parseCancellationScopeConstructor(initializer) {
+    if (
+      !ts.isNewExpression(initializer) ||
+      !temporalImportedReferenceMatches(
+        initializer.expression,
+        this.temporalApi.cancellationScope,
+        "CancellationScope",
+        this.temporalApi,
+      )
+    ) {
+      return null;
+    }
+    let cancellable = true;
+    if (initializer.arguments?.length) {
+      const [options] = initializer.arguments;
+      if (!ts.isObjectLiteralExpression(options)) {
+        throw compilerError(`CancellationScope options must be a static object`, options);
+      }
+      for (const property of options.properties) {
+        if (!ts.isPropertyAssignment(property) || !ts.isIdentifier(property.name)) {
+          throw compilerError(`unsupported CancellationScope option ${property.getText()}`, property);
+        }
+        if (property.name.text === "cancellable") {
+          if (property.initializer.kind !== ts.SyntaxKind.FalseKeyword && property.initializer.kind !== ts.SyntaxKind.TrueKeyword) {
+            throw compilerError(`CancellationScope cancellable must be a boolean literal`, property.initializer);
+          }
+          cancellable = property.initializer.kind === ts.SyntaxKind.TrueKeyword;
+          continue;
+        }
+        throw compilerError(`unsupported CancellationScope option ${property.name.text}`, property);
+      }
+    }
+    return { cancellable };
+  }
+
+  resolveScopeRunCall(callExpression) {
+    if (
+      !ts.isPropertyAccessExpression(callExpression.expression) ||
+      callExpression.expression.name.text !== "run"
+    ) {
+      return null;
+    }
+    const scopeVar = this.resolveCancellationScopeVar(callExpression.expression.expression);
+    if (!scopeVar) {
+      return null;
+    }
+    if (callExpression.arguments.length !== 1) {
+      throw compilerError(`scope.run requires exactly one inline function`, callExpression);
+    }
+    const handler = callExpression.arguments[0];
+    if (!ts.isArrowFunction(handler) && !ts.isFunctionExpression(handler)) {
+      throw compilerError(`scope.run requires an inline function`, handler);
+    }
+    if (handler.parameters.length !== 0) {
+      throw compilerError(`scope.run handlers must not declare parameters`, handler);
+    }
+    return { scopeVar, handler };
+  }
+
+  compileBackgroundHandleCompletionActions(handler) {
+    const body = ts.isBlock(handler.body)
+      ? handler.body.statements
+      : [ts.factory.createExpressionStatement(handler.body)];
+    const actions = [];
+    for (const statement of body) {
+      if (
+        ts.isExpressionStatement(statement) &&
+        ts.isBinaryExpression(statement.expression) &&
+        statement.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+        ts.isIdentifier(statement.expression.left)
+      ) {
+        actions.push(
+          compileAssignmentAction(
+            statement,
+            statement.expression.left,
+            statement.expression.operatorToken.kind,
+            statement.expression.right,
+          ),
+        );
+        continue;
+      }
+      if (
+        ts.isExpressionStatement(statement) &&
+        ts.isCallExpression(statement.expression) &&
+        temporalLogCallMatches(statement.expression, this.temporalApi)
+      ) {
+        continue;
+      }
+      throw compilerError(`background handle completion callbacks support only simple assignments`, statement);
+    }
+    return actions;
+  }
+
+  resolveBackgroundHandleInitializer(initializer) {
+    let completionActions = [];
+    let call = initializer;
+    if (ts.isCallExpression(call) && ts.isPropertyAccessExpression(call.expression) && call.expression.name.text === "then") {
+      if (call.arguments.length !== 1) {
+        throw compilerError(`promise.then support requires exactly one completion callback`, call);
+      }
+      const handler = call.arguments[0];
+      if (!ts.isArrowFunction(handler) && !ts.isFunctionExpression(handler)) {
+        throw compilerError(`promise.then support requires an inline function`, handler);
+      }
+      if (handler.parameters.length > 1) {
+        throw compilerError(`promise.then completion callbacks support at most one parameter`, handler);
+      }
+      completionActions = this.compileBackgroundHandleCompletionActions(handler);
+      call = call.expression.expression;
+      if (!ts.isCallExpression(call)) {
+        throw compilerError(`unsupported promise.then receiver for background handle`, initializer);
+      }
+    }
+    if (temporalImportedCallMatches(call, this.temporalApi.sleep, "sleep", this.temporalApi)) {
+      return {
+        kind: "timer",
+        timer: compileTemporalTimer(call.arguments[0], "sleep duration"),
+        scopeVar: null,
+        completionActions,
+      };
+    }
+    const scopeRun = this.resolveScopeRunCall(call);
+    if (scopeRun) {
+      const body = ts.isBlock(scopeRun.handler.body)
+        ? scopeRun.handler.body.statements
+        : [ts.factory.createReturnStatement(scopeRun.handler.body)];
+      if (body.length !== 1 || !ts.isReturnStatement(body[0]) || !body[0].expression || !ts.isCallExpression(body[0].expression)) {
+        throw compilerError(`scope.run currently supports a single returned timer or activity call`, scopeRun.handler.body);
+      }
+      const resolved = this.resolveBackgroundHandleInitializer(body[0].expression);
+      if (!resolved) {
+        throw compilerError(`scope.run currently supports a single returned timer or activity call`, scopeRun.handler.body);
+      }
+      return { ...resolved, scopeVar: scopeRun.scopeVar, completionActions: [...resolved.completionActions, ...completionActions] };
+    }
+    const temporalActivity = this.resolveTemporalActivityCall(call.expression);
+    if (temporalActivity) {
+      return {
+        kind: "step",
+        descriptor: {
+          kind: "object",
+          fields: buildActivityDescriptorFields(
+            { kind: "literal", value: temporalActivity.activityType },
+            compileCallArgumentsAsInput(call.arguments),
+            temporalActivity.options,
+          ),
+        },
+        scopeVar: null,
+        completionActions,
+      };
+    }
+    const dynamicTemporalActivity = this.resolveTemporalDynamicActivityCall(call.expression);
+    if (dynamicTemporalActivity) {
+      return {
+        kind: "step",
+        descriptor: {
+          kind: "object",
+          fields: buildActivityDescriptorFields(
+            dynamicTemporalActivity.activityTypeExpr,
+            compileCallArgumentsAsInput(call.arguments),
+            dynamicTemporalActivity.options,
+          ),
+        },
+        scopeVar: null,
+        completionActions,
+      };
+    }
+    return null;
   }
 
   resolveAsyncLocalHelperCall(callExpression) {
@@ -2913,6 +3582,44 @@ class WorkflowLowerer {
           temporalImportedCallMatches(awaitedCall, this.temporalApi.startChild, "startChild", this.temporalApi)
         ) {
           this.childHandleVars.add(current.name.text);
+        }
+      }
+      if (
+        ts.isVariableDeclaration(current) &&
+        ts.isIdentifier(current.name) &&
+        current.initializer
+      ) {
+        const scopeInit = this.parseCancellationScopeConstructor(current.initializer);
+        if (scopeInit) {
+          this.cancellationScopeVars.add(current.name.text);
+        }
+        if (ts.isCallExpression(current.initializer)) {
+          const scopeCall = this.parseTemporalCancellationScopeCall(current.initializer);
+          if (scopeCall) {
+            this.inlineAsyncResultVars.add(current.name.text);
+          }
+          const backgroundHandle = this.resolveBackgroundHandleInitializer(current.initializer);
+          if (backgroundHandle?.kind === "timer") {
+            this.timerHandleVars.add(current.name.text);
+          }
+          if (backgroundHandle?.kind === "step") {
+            this.stepHandleVars.add(current.name.text);
+          }
+          if (backgroundHandle?.scopeVar) {
+            const handles = this.scopeHandleVars.get(backgroundHandle.scopeVar) ?? new Set();
+            handles.add(current.name.text);
+            this.scopeHandleVars.set(backgroundHandle.scopeVar, handles);
+          }
+        }
+        if (
+          ts.isNewExpression(current.initializer) &&
+          ts.isIdentifier(current.initializer.expression) &&
+          this.promiseLikeTimerClasses.has(current.initializer.expression.text)
+        ) {
+          this.promiseLikeTimerInstanceVars.set(
+            current.name.text,
+            this.promiseLikeTimerClasses.get(current.initializer.expression.text),
+          );
         }
       }
       if (
@@ -3047,8 +3754,48 @@ class WorkflowLowerer {
     throw compilerError(`setHandler requires a Temporal query/update/signal definition`, definition);
   }
 
+  canRegisterTemporalNamedHandler(callExpression) {
+    const definition = callExpression.arguments[0];
+    if (!definition || (!ts.isIdentifier(definition) && !ts.isPropertyAccessExpression(definition))) {
+      return false;
+    }
+    return this.resolveTemporalDefinitionReference(definition) != null;
+  }
+
+  lowerDynamicTemporalHandlerRegistration(callExpression, nextState) {
+    const definition = callExpression.arguments[0];
+    const handler = callExpression.arguments[1];
+    if (
+      !definition ||
+      !ts.isCallExpression(definition) ||
+      !temporalImportedCallMatches(
+        definition,
+        this.temporalApi.defineSignal,
+        "defineSignal",
+        this.temporalApi,
+      )
+    ) {
+      return null;
+    }
+    const compiledHandler = compileSignalHandlerActions(handler);
+    const signalNameExpression =
+      definition.arguments[0] != null
+        ? compileExpression(definition.arguments[0])
+        : { kind: "literal", value: null };
+    return this.addState("register_dynamic_signal_handler", {
+      type: "register_dynamic_signal_handler",
+      signal_name: signalNameExpression,
+      arg_name: compiledHandler.argName,
+      actions: compiledHandler.actions,
+      next: nextState,
+    }, callExpression);
+  }
+
   lowerTemporalCondition(callExpression, targetVar, nextState) {
-    const predicate = callExpression.arguments[0];
+    let predicate = callExpression.arguments[0];
+    if (predicate && ts.isIdentifier(predicate) && this.localPureBindings.has(predicate.text)) {
+      predicate = this.localPureBindings.get(predicate.text);
+    }
     if (!predicate || (!ts.isArrowFunction(predicate) && !ts.isFunctionExpression(predicate))) {
       throw compilerError(`condition requires an inline function predicate`, callExpression);
     }
@@ -3064,8 +3811,14 @@ class WorkflowLowerer {
         next: nextState,
       }, callExpression);
     }
-    const timeoutRef = callExpression.arguments[1]
-      ? parseTemporalDurationRef(callExpression.arguments[1], "condition timeout")
+    const timeoutArg = callExpression.arguments[1] ?? null;
+    const timeoutRef = timeoutArg
+      ? ts.isStringLiteralLike(timeoutArg) || ts.isNoSubstitutionTemplateLiteral(timeoutArg)
+        ? parseTemporalDurationRef(timeoutArg, "condition timeout")
+        : "__dynamic_condition_timeout"
+      : null;
+    const timeoutExpr = timeoutArg && timeoutRef === "__dynamic_condition_timeout"
+      ? compileExpression(timeoutArg)
       : null;
     const timeoutState = timeoutRef
       ? targetVar
@@ -3081,8 +3834,113 @@ class WorkflowLowerer {
       condition: predicateExpr,
       next: continueState,
       timeout_ref: timeoutRef ?? undefined,
+      timer_expr: timeoutExpr ?? undefined,
       timeout_next: timeoutState ?? undefined,
     }, callExpression);
+  }
+
+  resolveTemporalConditionTimerRace(callExpression) {
+    if (
+      !ts.isPropertyAccessExpression(callExpression.expression) ||
+      !ts.isIdentifier(callExpression.expression.expression) ||
+      callExpression.expression.expression.text !== "Promise" ||
+      callExpression.expression.name.text !== "race"
+    ) {
+      return null;
+    }
+    if (
+      callExpression.arguments.length !== 1 ||
+      !ts.isArrayLiteralExpression(callExpression.arguments[0]) ||
+      callExpression.arguments[0].elements.length !== 2
+    ) {
+      return null;
+    }
+    let conditionCall = null;
+    let timeoutArgument = null;
+    for (const element of callExpression.arguments[0].elements) {
+      if (!ts.isCallExpression(element)) {
+        return null;
+      }
+      if (temporalImportedCallMatches(element, this.temporalApi.condition, "condition", this.temporalApi)) {
+        if (conditionCall) {
+          return null;
+        }
+        conditionCall = element;
+        continue;
+      }
+      if (temporalImportedCallMatches(element, this.temporalApi.sleep, "sleep", this.temporalApi)) {
+        if (timeoutArgument || element.arguments.length !== 1) {
+          return null;
+        }
+        timeoutArgument = element.arguments[0];
+        continue;
+      }
+      return null;
+    }
+    if (!conditionCall || !timeoutArgument) {
+      return null;
+    }
+    if (conditionCall.arguments.length > 1) {
+      throw compilerError(
+        `Promise.race([condition(...), sleep(...)]) does not support condition() calls that already declare a timeout`,
+        conditionCall,
+      );
+    }
+    return { conditionCall, timeoutArgument };
+  }
+
+  resolveBackgroundHandleRace(callExpression) {
+    if (
+      !ts.isPropertyAccessExpression(callExpression.expression) ||
+      !ts.isIdentifier(callExpression.expression.expression) ||
+      callExpression.expression.expression.text !== "Promise" ||
+      callExpression.expression.name.text !== "race"
+    ) {
+      return null;
+    }
+    if (
+      callExpression.arguments.length !== 1 ||
+      !ts.isArrayLiteralExpression(callExpression.arguments[0]) ||
+      callExpression.arguments[0].elements.length < 2
+    ) {
+      return null;
+    }
+    let timeoutArgument = null;
+    const handleVars = [];
+    let cancelScopeVar = null;
+    for (const element of callExpression.arguments[0].elements) {
+      if (ts.isCallExpression(element) && temporalImportedCallMatches(element, this.temporalApi.sleep, "sleep", this.temporalApi)) {
+        if (timeoutArgument || element.arguments.length !== 1) {
+          return null;
+        }
+        timeoutArgument = element.arguments[0];
+        continue;
+      }
+      if (ts.isIdentifier(element) && (this.timerHandleVars.has(element.text) || this.stepHandleVars.has(element.text))) {
+        if (!handleVars.includes(element.text)) {
+          handleVars.push(element.text);
+        }
+        continue;
+      }
+      if (ts.isPropertyAccessExpression(element) && element.name.text === "cancelRequested") {
+        const scopeVar =
+          this.resolveCancellationScopeVar(element.expression) ??
+          this.resolveTemporalCurrentCancellationScope(element.expression);
+        if (!scopeVar) {
+          return null;
+        }
+        if (cancelScopeVar) {
+          return null;
+        }
+        cancelScopeVar = scopeVar;
+        continue;
+      }
+      return null;
+    }
+    if (handleVars.length === 0 && !cancelScopeVar) {
+      return null;
+    }
+    return { timeoutArgument, handleVars, cancelScopeVar };
   }
 
   nextId(prefix, node = null) {
@@ -3105,13 +3963,21 @@ class WorkflowLowerer {
       type: "fail",
       reason: { kind: "literal", value: "workflow terminated without explicit completion" },
     });
-    const initialState = this.lowerBlock(
+    const { params, preambleActions } = this.compileWorkflowParams();
+    let initialState = this.lowerBlock(
       this.workflowDeclaration.body.statements,
       terminalFail,
       null,
       null,
       null,
     );
+    if (preambleActions.length > 0) {
+      initialState = this.addState("assign", {
+        type: "assign",
+        actions: preambleActions,
+        next: initialState,
+      }, this.workflowDeclaration);
+    }
     return {
       initialState,
       states: this.states,
@@ -3119,7 +3985,7 @@ class WorkflowLowerer {
       queries: this.queries,
       signals: this.signals,
       updates: this.updates,
-      params: this.compileWorkflowParams(),
+      params,
       nonCancellableStates: Array.from(this.nonCancellableStates),
     };
   }
@@ -3128,7 +3994,14 @@ class WorkflowLowerer {
     const parameters = Array.isArray(this.workflowDeclaration?.parameters)
       ? this.workflowDeclaration.parameters
       : [];
-    return parameters.map((parameter) => compileWorkflowParam(parameter));
+    const params = [];
+    const preambleActions = [];
+    for (const [index, parameter] of parameters.entries()) {
+      const compiled = compileWorkflowParamBinding(parameter, index);
+      params.push(compiled.param);
+      preambleActions.push(...compiled.preambleActions);
+    }
+    return { params, preambleActions };
   }
 
   addState(prefix, state, node = null) {
@@ -3144,11 +4017,25 @@ class WorkflowLowerer {
   }
 
   lowerBlock(statements, nextState, breakTarget, continueTarget, errorTarget, returnTarget = null) {
+    const previousPureBindings = this.localPureBindings;
+    this.localPureBindings = new Map(previousPureBindings);
+    for (const statement of statements) {
+      if (!ts.isVariableStatement(statement)) {
+        continue;
+      }
+      for (const declaration of statement.declarationList.declarations) {
+        if (!ts.isIdentifier(declaration.name) || !declaration.initializer) {
+          continue;
+        }
+        this.localPureBindings.set(declaration.name.text, declaration.initializer);
+      }
+    }
     for (const statement of statements) {
       if (
         ts.isExpressionStatement(statement) &&
         ts.isCallExpression(statement.expression) &&
-        temporalImportedCallMatches(statement.expression, this.temporalApi.setHandler, "setHandler", this.temporalApi)
+        temporalImportedCallMatches(statement.expression, this.temporalApi.setHandler, "setHandler", this.temporalApi) &&
+        this.canRegisterTemporalNamedHandler(statement.expression)
       ) {
         this.registerTemporalNamedHandler(statement.expression);
       }
@@ -3164,6 +4051,7 @@ class WorkflowLowerer {
         returnTarget,
       );
     }
+    this.localPureBindings = previousPureBindings;
     return cursor;
   }
 
@@ -3178,6 +4066,13 @@ class WorkflowLowerer {
         }, statement);
       }
       if (temporalImportedCallMatches(statement.expression, this.temporalApi.setHandler, "setHandler", this.temporalApi)) {
+        const dynamicHandlerRegistration = this.lowerDynamicTemporalHandlerRegistration(
+          statement.expression,
+          nextState,
+        );
+        if (dynamicHandlerRegistration) {
+          return dynamicHandlerRegistration;
+        }
         this.registerTemporalNamedHandler(statement.expression);
         return nextState;
       }
@@ -3302,6 +4197,48 @@ class WorkflowLowerer {
         declarations[0].initializer &&
         ts.isCallExpression(declarations[0].initializer)
       ) {
+        const scopeCall = this.parseTemporalCancellationScopeCall(declarations[0].initializer);
+        if (scopeCall) {
+          this.inlineAsyncResultVars.add(declarations[0].name.text);
+          return this.lowerTemporalCancellationScope(
+            scopeCall,
+            declarations[0].name.text,
+            nextState,
+            errorTarget,
+            declarations[0].initializer,
+          );
+        }
+        const backgroundHandle = this.resolveBackgroundHandleInitializer(declarations[0].initializer);
+        if (backgroundHandle) {
+          const handleName = declarations[0].name.text;
+          if (backgroundHandle.kind === "timer") {
+            this.timerHandleVars.add(handleName);
+            if (backgroundHandle.scopeVar) {
+              const handles = this.scopeHandleVars.get(backgroundHandle.scopeVar) ?? new Set();
+              handles.add(handleName);
+              this.scopeHandleVars.set(backgroundHandle.scopeVar, handles);
+            }
+            return this.addState("start_timer_handle", {
+              type: "start_timer_handle",
+              ...backgroundHandle.timer,
+              handle_var: handleName,
+              next: nextState,
+            }, declarations[0].initializer);
+          }
+          this.stepHandleVars.add(handleName);
+          if (backgroundHandle.scopeVar) {
+            const handles = this.scopeHandleVars.get(backgroundHandle.scopeVar) ?? new Set();
+            handles.add(handleName);
+            this.scopeHandleVars.set(backgroundHandle.scopeVar, handles);
+          }
+          return this.addState("start_step_handle", {
+            type: "start_step_handle",
+            descriptor: backgroundHandle.descriptor,
+            handle_var: handleName,
+            next: nextState,
+            completion_actions: backgroundHandle.completionActions,
+          }, declarations[0].initializer);
+        }
         const shiftedArray = resolveArrayShiftCall(declarations[0].initializer);
         if (shiftedArray) {
           const targetName = declarations[0].name.text;
@@ -3330,6 +4267,9 @@ class WorkflowLowerer {
         }
       }
       const actions = declarations.map((declaration) => {
+        if (isTemporalProxyDeclaration(declaration, this.temporalApi)) {
+          return null;
+        }
         if (!ts.isIdentifier(declaration.name)) {
           throw compilerError(`unsupported declaration: ${statement.getText()}`, declaration);
         }
@@ -3347,6 +4287,23 @@ class WorkflowLowerer {
             "getExternalWorkflowHandle",
             this.temporalApi,
           )
+        ) {
+          return null;
+        }
+        const scopeInit = this.parseCancellationScopeConstructor(declaration.initializer);
+        if (scopeInit) {
+          this.cancellationScopeVars.add(declaration.name.text);
+          return {
+            target: declaration.name.text,
+            expr: {
+              kind: "literal",
+              value: { __kind: "cancellation_scope", cancelRequested: false, cancellable: scopeInit.cancellable },
+            },
+          };
+        }
+        if (
+          (ts.isArrowFunction(declaration.initializer) || ts.isFunctionExpression(declaration.initializer)) &&
+          this.localPureBindings.has(declaration.name.text)
         ) {
           return null;
         }
@@ -3407,6 +4364,58 @@ class WorkflowLowerer {
           );
         }
         if (ts.isIdentifier(statement.expression.left)) {
+          if (
+            statement.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+            ts.isCallExpression(statement.expression.right)
+          ) {
+            const scopeCall = this.parseTemporalCancellationScopeCall(statement.expression.right);
+            if (scopeCall) {
+              this.inlineAsyncResultVars.add(statement.expression.left.text);
+              return this.lowerTemporalCancellationScope(
+                scopeCall,
+                statement.expression.left.text,
+                nextState,
+                errorTarget,
+                statement.expression.right,
+              );
+            }
+          }
+          if (
+            statement.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+            ts.isCallExpression(statement.expression.right)
+          ) {
+            const backgroundHandle = this.resolveBackgroundHandleInitializer(statement.expression.right);
+            if (backgroundHandle) {
+              const handleName = statement.expression.left.text;
+              if (backgroundHandle.kind === "timer") {
+                this.timerHandleVars.add(handleName);
+                if (backgroundHandle.scopeVar) {
+                  const handles = this.scopeHandleVars.get(backgroundHandle.scopeVar) ?? new Set();
+                  handles.add(handleName);
+                  this.scopeHandleVars.set(backgroundHandle.scopeVar, handles);
+                }
+                return this.addState("start_timer_handle", {
+                  type: "start_timer_handle",
+                  ...backgroundHandle.timer,
+                  handle_var: handleName,
+                  next: nextState,
+                }, statement.expression.right);
+              }
+              this.stepHandleVars.add(handleName);
+              if (backgroundHandle.scopeVar) {
+                const handles = this.scopeHandleVars.get(backgroundHandle.scopeVar) ?? new Set();
+                handles.add(handleName);
+                this.scopeHandleVars.set(backgroundHandle.scopeVar, handles);
+              }
+              return this.addState("start_step_handle", {
+                type: "start_step_handle",
+                descriptor: backgroundHandle.descriptor,
+                handle_var: handleName,
+                next: nextState,
+                completion_actions: backgroundHandle.completionActions,
+              }, statement.expression.right);
+            }
+          }
           const wrappedAwaitState = this.lowerWrappedAwaitExpression(
             statement.expression.right,
             statement.expression.left.text,
@@ -3439,6 +4448,57 @@ class WorkflowLowerer {
       }
       if (ts.isCallExpression(statement.expression) && temporalLogCallMatches(statement.expression, this.temporalApi)) {
         return nextState;
+      }
+      if (ts.isCallExpression(statement.expression) && ts.isPropertyAccessExpression(statement.expression.expression)) {
+        const property = statement.expression.expression.name.text;
+        let scopeVar = null;
+        if (property === "cancel") {
+          scopeVar =
+            this.resolveCancellationScopeVar(statement.expression.expression.expression) ??
+            this.resolveTemporalCurrentCancellationScope(statement.expression.expression.expression);
+        }
+        if (scopeVar) {
+          const actions = [
+            {
+              target: scopeVar,
+              expr: {
+                kind: "call",
+                callee: "__builtin_object_set",
+                args: [
+                  { kind: "identifier", name: scopeVar },
+                  { kind: "literal", value: "cancelRequested" },
+                  { kind: "literal", value: true },
+                ],
+              },
+            },
+          ];
+          for (const handleVar of this.scopeHandleVars.get(scopeVar) ?? []) {
+            actions.push({
+              target: handleVar,
+              expr: {
+                kind: "call",
+                callee: "__builtin_object_set",
+                args: [
+                  {
+                    kind: "call",
+                    callee: "__builtin_object_set",
+                    args: [
+                      { kind: "identifier", name: handleVar },
+                      { kind: "literal", value: "status" },
+                      { kind: "literal", value: "cancelled" },
+                    ],
+                  },
+                  { kind: "literal", value: "error" },
+                  {
+                    kind: "literal",
+                    value: { type: "CancelledFailure", message: "cancel requested" },
+                  },
+                ],
+              },
+            });
+          }
+          return this.addState("assign", { type: "assign", actions, next: nextState }, statement);
+        }
       }
       throw compilerError(`unsupported expression statement: ${statement.getText()}`, statement);
     }
@@ -3737,6 +4797,21 @@ class WorkflowLowerer {
       if (!statement.expression) {
         return this.addState("complete", { type: "succeed" }, statement);
       }
+      if (
+        ts.isIdentifier(statement.expression) &&
+        (this.timerHandleVars.has(statement.expression.text) || this.stepHandleVars.has(statement.expression.text))
+      ) {
+        const returnVar = this.nextId("return_value", statement.expression);
+        const completeState = this.addState("complete", {
+          type: "succeed",
+          output: { kind: "identifier", name: returnVar },
+        }, statement);
+        const syntheticAwait = ts.setTextRange(
+          ts.factory.createAwaitExpression(statement.expression),
+          statement.expression,
+        );
+        return this.lowerAwait(syntheticAwait, returnVar, completeState, errorTarget);
+      }
       if (ts.isAwaitExpression(statement.expression)) {
         const returnVar = this.nextId("return_value", statement.expression);
         const completeState = this.addState("complete", {
@@ -3750,6 +4825,19 @@ class WorkflowLowerer {
           type: "succeed",
           output: compileExpression(statement.expression),
         }, statement);
+      }
+      const scopeCall = this.parseTemporalCancellationScopeCall(statement.expression);
+      if (scopeCall) {
+        const returnVar = this.nextId("return_value", statement.expression);
+        const completeState = this.addState("complete", {
+          type: "succeed",
+          output: { kind: "identifier", name: returnVar },
+        }, statement);
+        const awaited =
+          ts.isAwaitExpression(statement.expression)
+            ? statement.expression
+            : ts.setTextRange(ts.factory.createAwaitExpression(statement.expression), statement.expression);
+        return this.lowerAwait(awaited, returnVar, completeState, errorTarget);
       }
       if (
         temporalImportedCallMatches(
@@ -3976,7 +5064,13 @@ class WorkflowLowerer {
         next: nextState,
       }, expression);
     }
-    if (ts.isPostfixUnaryExpression(expression) && ts.isIdentifier(expression.operand)) {
+    if (
+      (
+        ts.isPostfixUnaryExpression(expression) ||
+        ts.isPrefixUnaryExpression(expression)
+      ) &&
+      ts.isIdentifier(expression.operand)
+    ) {
       const op = expression.operator === ts.SyntaxKind.PlusPlusToken ? "add" : "subtract";
       return this.addState("assign", {
         type: "assign",
@@ -4022,9 +5116,6 @@ class WorkflowLowerer {
     if (!ts.isArrowFunction(handler) && !ts.isFunctionExpression(handler)) {
       throw compilerError(`CancellationScope.${method} requires an inline function`, handler);
     }
-    if (!handler.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) {
-      throw compilerError(`CancellationScope.${method} currently requires an async inline function`, handler);
-    }
     if (handler.parameters.length !== 0) {
       throw compilerError(`CancellationScope.${method} handlers must not declare parameters`, handler);
     }
@@ -4051,6 +5142,9 @@ class WorkflowLowerer {
     if (shielded) {
       this.nonCancellableDepth = (this.nonCancellableDepth ?? 0) + 1;
     }
+    const scopeVar = this.nextId("__scope", originNode);
+    this.cancellationScopeVars.add(scopeVar);
+    this.currentCancellationScopeVars.push(scopeVar);
     try {
       const fallthroughState = targetVar
         ? this.addState("assign", {
@@ -4059,7 +5153,7 @@ class WorkflowLowerer {
             next: nextState,
           }, originNode)
         : nextState;
-      return this.lowerBlock(
+      const bodyStart = this.lowerBlock(
         statements,
         fallthroughState,
         null,
@@ -4067,7 +5161,19 @@ class WorkflowLowerer {
         errorTarget,
         { next: nextState, targetVar: targetVar ?? null },
       );
+      return this.addState("assign", {
+        type: "assign",
+        actions: [{
+          target: scopeVar,
+          expr: {
+            kind: "literal",
+            value: { __kind: "cancellation_scope", cancelRequested: false, cancellable: !shielded },
+          },
+        }],
+        next: bodyStart,
+      }, originNode);
     } finally {
+      this.currentCancellationScopeVars.pop();
       if (shielded) {
         this.nonCancellableDepth -= 1;
       }
@@ -4141,13 +5247,394 @@ class WorkflowLowerer {
     }, originNode);
   }
 
+  lowerAwaitedHandle(handleName, targetVar, nextState, errorTarget, originNode) {
+    const completedState = targetVar
+      ? this.addState("assign", {
+          type: "assign",
+          actions: [{
+            target: targetVar,
+            expr: {
+              kind: "member",
+              object: { kind: "identifier", name: handleName },
+              property: "result",
+            },
+          }],
+          next: nextState,
+        }, originNode)
+      : nextState;
+    const failState = (() => {
+      if (errorTarget) {
+        const actions = errorTarget.error_var
+          ? [{
+              target: errorTarget.error_var,
+              expr: {
+                kind: "member",
+                object: { kind: "identifier", name: handleName },
+                property: "error",
+              },
+            }]
+          : [];
+        return this.addState("assign", { type: "assign", actions, next: errorTarget.next }, originNode);
+      }
+      return this.addState("fail", {
+        type: "fail",
+        reason: {
+          kind: "member",
+          object: { kind: "identifier", name: handleName },
+          property: "error",
+        },
+      }, originNode);
+    })();
+    const completedChoice = this.addState("choice", {
+      type: "choice",
+      condition: {
+        kind: "binary",
+        op: "equal",
+        left: {
+          kind: "member",
+          object: { kind: "identifier", name: handleName },
+          property: "status",
+        },
+        right: { kind: "literal", value: "completed" },
+      },
+      then_next: completedState,
+      else_next: failState,
+    }, originNode);
+    return this.addState("wait_handle", {
+      type: "wait_for_condition",
+      condition: {
+        kind: "binary",
+        op: "not_equal",
+        left: {
+          kind: "member",
+          object: { kind: "identifier", name: handleName },
+          property: "status",
+        },
+        right: { kind: "literal", value: "pending" },
+      },
+      next: completedChoice,
+    }, originNode);
+  }
+
+  lowerPromiseLikeTimerAwait(timerName, model, targetVar, nextState, originNode) {
+    const continueState = targetVar
+      ? this.addState("assign", {
+          type: "assign",
+          actions: [{ target: targetVar, expr: { kind: "literal", value: null } }],
+          next: nextState,
+        }, originNode)
+      : nextState;
+    const loopState = this.nextId("promise_like_timer_loop", originNode);
+    const timerHandleVar = this.nextId("__promise_timer_handle", originNode);
+    this.timerHandleVars.add(timerHandleVar);
+    const decideState = this.addState("choice", {
+      type: "choice",
+      condition: {
+        kind: "member",
+        object: { kind: "identifier", name: timerName },
+        property: model.flagProperty,
+      },
+      then_next: loopState,
+      else_next: continueState,
+    }, originNode);
+    const waitState = this.addState("wait_promise_like_timer", {
+      type: "wait_for_condition",
+      condition: {
+        kind: "logical",
+        op: "or",
+        left: {
+          kind: "member",
+          object: { kind: "identifier", name: timerName },
+          property: model.flagProperty,
+        },
+        right: {
+          kind: "binary",
+          op: "not_equal",
+          left: {
+            kind: "member",
+            object: { kind: "identifier", name: timerHandleVar },
+            property: "status",
+          },
+          right: { kind: "literal", value: "pending" },
+        },
+      },
+      next: decideState,
+    }, originNode);
+    const startTimerState = this.addState("start_promise_like_timer", {
+      type: "start_timer_handle",
+      timer_expr: {
+        kind: "binary",
+        op: "subtract",
+        left: {
+          kind: "member",
+          object: { kind: "identifier", name: timerName },
+          property: model.publicProperty,
+        },
+        right: { kind: "now" },
+      },
+      handle_var: timerHandleVar,
+      next: waitState,
+    }, originNode);
+    this.states[loopState] = {
+      type: "assign",
+      actions: [{
+        target: timerName,
+        expr: {
+          kind: "call",
+          callee: "__builtin_object_set",
+          args: [
+            { kind: "identifier", name: timerName },
+            { kind: "literal", value: model.flagProperty },
+            { kind: "literal", value: false },
+          ],
+        },
+      }],
+      next: startTimerState,
+    };
+    return loopState;
+  }
+
+  lowerBackgroundHandleTimerRace(race, targetVar, nextState, errorTarget, originNode) {
+    const timerVar = race.timeoutArgument ? this.nextId("__race_timer", originNode) : null;
+    if (timerVar) {
+      this.timerHandleVars.add(timerVar);
+    }
+    const afterWait = (() => {
+      let cursor = nextState;
+      for (let index = race.handleVars.length - 1; index >= 0; index -= 1) {
+        const handleVar = race.handleVars[index];
+        const completedState = targetVar
+          ? this.addState("assign", {
+              type: "assign",
+              actions: [{
+                target: targetVar,
+                expr: {
+                  kind: "member",
+                  object: { kind: "identifier", name: handleVar },
+                  property: "result",
+                },
+              }],
+              next: nextState,
+            }, originNode)
+          : nextState;
+        const failState = (() => {
+          if (errorTarget) {
+            const actions = errorTarget.error_var
+              ? [{
+                  target: errorTarget.error_var,
+                  expr: {
+                    kind: "member",
+                    object: { kind: "identifier", name: handleVar },
+                    property: "error",
+                  },
+                }]
+              : [];
+            return this.addState("assign", { type: "assign", actions, next: errorTarget.next }, originNode);
+          }
+          return this.addState("fail", {
+            type: "fail",
+            reason: {
+              kind: "member",
+              object: { kind: "identifier", name: handleVar },
+              property: "error",
+            },
+          }, originNode);
+        })();
+        const terminalState = this.addState("choice", {
+          type: "choice",
+          condition: {
+            kind: "binary",
+            op: "equal",
+            left: {
+              kind: "member",
+              object: { kind: "identifier", name: handleVar },
+              property: "status",
+            },
+            right: { kind: "literal", value: "completed" },
+          },
+          then_next: completedState,
+          else_next: failState,
+        }, originNode);
+        cursor = this.addState("choice", {
+          type: "choice",
+          condition: {
+            kind: "binary",
+            op: "not_equal",
+            left: {
+              kind: "member",
+              object: { kind: "identifier", name: handleVar },
+              property: "status",
+            },
+            right: { kind: "literal", value: "pending" },
+          },
+          then_next: terminalState,
+          else_next: cursor,
+        }, originNode);
+      }
+      if (race.cancelScopeVar) {
+        const cancelNext = (() => {
+          if (errorTarget) {
+            const actions = errorTarget.error_var
+              ? [{
+                  target: errorTarget.error_var,
+                  expr: { kind: "literal", value: { type: "CancelledFailure", message: "cancel requested" } },
+                }]
+              : [];
+            return this.addState("assign", { type: "assign", actions, next: errorTarget.next }, originNode);
+          }
+          return this.addState("fail", {
+            type: "fail",
+            reason: { kind: "literal", value: { type: "CancelledFailure", message: "cancel requested" } },
+          }, originNode);
+        })();
+        cursor = this.addState("choice", {
+          type: "choice",
+          condition: {
+            kind: "member",
+            object: { kind: "identifier", name: race.cancelScopeVar },
+            property: "cancelRequested",
+          },
+          then_next: cancelNext,
+          else_next: cursor,
+        }, originNode);
+      }
+      return cursor;
+    })();
+    const clauses = [];
+    for (const handleVar of race.handleVars) {
+      clauses.push({
+        kind: "binary",
+        op: "not_equal",
+        left: {
+          kind: "member",
+          object: { kind: "identifier", name: handleVar },
+          property: "status",
+        },
+        right: { kind: "literal", value: "pending" },
+      });
+    }
+    if (race.cancelScopeVar) {
+      clauses.push({
+        kind: "member",
+        object: { kind: "identifier", name: race.cancelScopeVar },
+        property: "cancelRequested",
+      });
+    }
+    if (timerVar) {
+      clauses.push({
+        kind: "binary",
+        op: "not_equal",
+        left: {
+          kind: "member",
+          object: { kind: "identifier", name: timerVar },
+          property: "status",
+        },
+        right: { kind: "literal", value: "pending" },
+      });
+    }
+    const condition = clauses.length === 1
+      ? clauses[0]
+      : {
+          kind: "logical",
+          op: "or",
+          left: clauses[0],
+          right: clauses.slice(2).reduce((acc, clause) => ({
+            kind: "logical",
+            op: "or",
+            left: acc,
+            right: clause,
+          }), clauses[1]),
+        };
+    const waitState = this.addState("wait_handle_race", {
+      type: "wait_for_condition",
+      condition,
+      next: afterWait,
+    }, originNode);
+    if (!timerVar) {
+      return waitState;
+    }
+    return this.addState("start_timer_handle", {
+      type: "start_timer_handle",
+      ...compileTemporalTimer(race.timeoutArgument, "Promise.race timeout"),
+      handle_var: timerVar,
+      next: waitState,
+    }, originNode);
+  }
+
   lowerAwait(awaitExpression, targetVar, nextState, errorTarget) {
+    const callbackPromiseTimeout = this.resolveCallbackPromiseTimeout(awaitExpression.expression);
+    if (callbackPromiseTimeout) {
+      const continueState = targetVar
+        ? this.addState("assign", {
+            type: "assign",
+            actions: [{ target: targetVar, expr: { kind: "literal", value: null } }],
+            next: nextState,
+          }, awaitExpression)
+        : nextState;
+      return this.addState("wait_timer", {
+        type: "wait_for_timer",
+        ...compileTemporalTimer(callbackPromiseTimeout.timeoutExpr, "Promise executor timeout"),
+        next: continueState,
+      }, awaitExpression);
+    }
     if (this.resolveTemporalCancellationRequestedAwait(awaitExpression.expression)) {
       return this.addState("wait_cancel", {
         type: "wait_for_event",
         event_type: "__workflow_cancellation_requested",
         next: nextState,
         output_var: targetVar ?? undefined,
+      }, awaitExpression);
+    }
+    if (
+      ts.isIdentifier(awaitExpression.expression) &&
+      this.timerHandleVars.has(awaitExpression.expression.text)
+    ) {
+      return this.lowerAwaitedHandle(
+        awaitExpression.expression.text,
+        targetVar,
+        nextState,
+        errorTarget,
+        awaitExpression,
+      );
+    }
+    if (
+      ts.isIdentifier(awaitExpression.expression) &&
+      this.stepHandleVars.has(awaitExpression.expression.text)
+    ) {
+      return this.lowerAwaitedHandle(
+        awaitExpression.expression.text,
+        targetVar,
+        nextState,
+        errorTarget,
+        awaitExpression,
+      );
+    }
+    if (
+      ts.isIdentifier(awaitExpression.expression) &&
+      this.promiseLikeTimerInstanceVars.has(awaitExpression.expression.text)
+    ) {
+      return this.lowerPromiseLikeTimerAwait(
+        awaitExpression.expression.text,
+        this.promiseLikeTimerInstanceVars.get(awaitExpression.expression.text),
+        targetVar,
+        nextState,
+        awaitExpression,
+      );
+    }
+    if (
+      ts.isIdentifier(awaitExpression.expression) &&
+      this.inlineAsyncResultVars.has(awaitExpression.expression.text)
+    ) {
+      if (!targetVar) {
+        return nextState;
+      }
+      return this.addState("assign", {
+        type: "assign",
+        actions: [{
+          target: targetVar,
+          expr: { kind: "identifier", name: awaitExpression.expression.text },
+        }],
+        next: nextState,
       }, awaitExpression);
     }
     if (!ts.isCallExpression(awaitExpression.expression)) {
@@ -4167,6 +5654,32 @@ class WorkflowLowerer {
       );
     }
     const call = awaitExpression.expression;
+    const conditionTimerRace = this.resolveTemporalConditionTimerRace(call);
+    if (conditionTimerRace) {
+      const racedCondition = ts.setTextRange(
+        ts.factory.updateCallExpression(
+          conditionTimerRace.conditionCall,
+          conditionTimerRace.conditionCall.expression,
+          conditionTimerRace.conditionCall.typeArguments,
+          [
+            conditionTimerRace.conditionCall.arguments[0],
+            conditionTimerRace.timeoutArgument,
+          ],
+        ),
+        call,
+      );
+      return this.lowerTemporalCondition(racedCondition, targetVar, nextState);
+    }
+    const backgroundHandleRace = this.resolveBackgroundHandleRace(call);
+    if (backgroundHandleRace) {
+      return this.lowerBackgroundHandleTimerRace(
+        backgroundHandleRace,
+        targetVar,
+        nextState,
+        errorTarget,
+        awaitExpression,
+      );
+    }
     const asyncLocalHelper = this.resolveAsyncLocalHelperCall(call);
     if (asyncLocalHelper) {
       return this.lowerAsyncLocalHelperCall(
@@ -4341,6 +5854,22 @@ class WorkflowLowerer {
     if (!ts.isPropertyAccessExpression(call.expression) || !isCtxReceiver(call.expression.expression)) {
       const temporalActivity = this.resolveTemporalActivityCall(call.expression);
       if (temporalActivity) {
+        if (activityOptionsRequireDynamicDescriptor(temporalActivity.options)) {
+          return this.addState("dynamic_step", {
+            type: "dynamic_step",
+            descriptor: {
+              kind: "object",
+              fields: buildActivityDescriptorFields(
+                { kind: "literal", value: temporalActivity.activityType },
+                compileCallArgumentsAsInput(call.arguments),
+                temporalActivity.options,
+              ),
+            },
+            next: nextState,
+            output_var: targetVar ?? undefined,
+            on_error: errorTarget ?? undefined,
+          }, awaitExpression);
+        }
         return this.addState("step", {
           type: "step",
           handler: temporalActivity.activityType,
@@ -4362,49 +5891,11 @@ class WorkflowLowerer {
           type: "dynamic_step",
           descriptor: {
             kind: "object",
-            fields: {
-              __kind: { kind: "literal", value: "activity_descriptor" },
-              activity_type: dynamicTemporalActivity.activityTypeExpr,
-              input: compileCallArgumentsAsInput(call.arguments),
-              ...(dynamicTemporalActivity.options.task_queue
-                ? { task_queue: dynamicTemporalActivity.options.task_queue }
-                : {}),
-              ...(dynamicTemporalActivity.options.retry
-                ? { retry: jsonValueToExpression(dynamicTemporalActivity.options.retry) }
-                : {}),
-              ...(dynamicTemporalActivity.options.schedule_to_start_timeout_ms != null
-                ? {
-                    schedule_to_start_timeout_ms: {
-                      kind: "literal",
-                      value: dynamicTemporalActivity.options.schedule_to_start_timeout_ms,
-                    },
-                  }
-                : {}),
-              ...(dynamicTemporalActivity.options.schedule_to_close_timeout_ms != null
-                ? {
-                    schedule_to_close_timeout_ms: {
-                      kind: "literal",
-                      value: dynamicTemporalActivity.options.schedule_to_close_timeout_ms,
-                    },
-                  }
-                : {}),
-              ...(dynamicTemporalActivity.options.start_to_close_timeout_ms != null
-                ? {
-                    start_to_close_timeout_ms: {
-                      kind: "literal",
-                      value: dynamicTemporalActivity.options.start_to_close_timeout_ms,
-                    },
-                  }
-                : {}),
-              ...(dynamicTemporalActivity.options.heartbeat_timeout_ms != null
-                ? {
-                    heartbeat_timeout_ms: {
-                      kind: "literal",
-                      value: dynamicTemporalActivity.options.heartbeat_timeout_ms,
-                    },
-                  }
-                : {}),
-            },
+            fields: buildActivityDescriptorFields(
+              dynamicTemporalActivity.activityTypeExpr,
+              compileCallArgumentsAsInput(call.arguments),
+              dynamicTemporalActivity.options,
+            ),
           },
           next: nextState,
           output_var: targetVar ?? undefined,
@@ -5285,6 +6776,8 @@ function validateArtifactCalls(artifact) {
     "__builtin_string",
     "__builtin_string_to_lowercase",
     "__builtin_string_to_uppercase",
+    "__builtin_typeof",
+    "__builtin_is_error",
   ]);
   const validateExpression = (expression) => {
     walkExpression(expression, (node) => {
@@ -5392,6 +6885,7 @@ async function main() {
     program.getTypeChecker(),
   );
   currentTemporalActivityBindings = lowerer.temporalActivityBindings;
+  currentPromiseLikeTimerClasses = lowerer.promiseLikeTimerClasses;
   const helpers = injectTemporalBuiltinHelpers(buildHelperRegistry(program, workflow), temporalApi);
   const { initialState, states, sourceMap, queries, signals, updates, params, nonCancellableStates } =
     lowerer.lower();

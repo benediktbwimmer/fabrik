@@ -17,8 +17,8 @@ use axum::{
 use chrono::{DateTime, Utc};
 use fabrik_broker::{
     BrokerConfig, JsonTopicConfig, JsonTopicPublisher, WorkflowHistoryFilter, WorkflowPublisher,
-    build_workflow_consumer,
-    decode_consumed_workflow_event, partition_for_instance, read_workflow_history,
+    build_workflow_consumer, decode_consumed_workflow_event, partition_for_instance,
+    read_workflow_history,
 };
 use fabrik_config::{
     ExecutorRuntimeConfig, GrpcServiceConfig, HttpServiceConfig, PostgresConfig, RedpandaConfig,
@@ -29,15 +29,16 @@ use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
     ActivityScheduleUpdate, ActivityStartUpdate, ActivityTerminalPayload, ActivityTerminalUpdate,
     BulkChunkTerminalPayload, BulkChunkTerminalUpdate, ConsumedSignalRecord, TaskQueueKind,
-    ThroughputRunInputRecord, ThroughputRunRecord, WorkflowActivityStatus,
-    WorkflowBulkChunkRecord, WorkflowMailboxKind, WorkflowMailboxRecord, WorkflowStore,
+    ThroughputRunInputRecord, ThroughputRunRecord, WorkflowActivityStatus, WorkflowBulkChunkRecord,
+    WorkflowMailboxKind, WorkflowMailboxRecord, WorkflowStore,
 };
 use fabrik_throughput::{
     ADMISSION_POLICY_VERSION, PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
     StartThroughputRunCommand, ThroughputBackend, ThroughputCommand, ThroughputCommandEnvelope,
     bulk_reducer_class, bulk_reducer_is_mergeable, bulk_reducer_materializes_results,
-    decode_cbor, encode_cbor, planned_reduction_tree_depth, stream_v2_fast_lane_enabled,
-    throughput_partition_key,
+    can_use_payloadless_benchmark_transport, decode_cbor, encode_cbor,
+    parse_benchmark_compact_total_items_from_handle, planned_reduction_tree_depth,
+    stream_v2_fast_lane_enabled, throughput_partition_key,
 };
 use fabrik_worker_protocol::activity_worker::{
     Ack, ActivityTask, ActivityTaskCancelledResult, ActivityTaskCompletedResult,
@@ -4498,6 +4499,15 @@ async fn materialize_bulk_batches_from_plan(
         else {
             continue;
         };
+        let scheduled_input_handle = serde_json::from_value::<PayloadHandle>(input_handle.clone())
+            .context("failed to decode scheduled bulk input handle")?;
+        let total_items = if items.is_empty() {
+            parse_benchmark_compact_total_items_from_handle(&scheduled_input_handle)
+                .map(|count| count as usize)
+                .unwrap_or_default()
+        } else {
+            items.len()
+        };
 
         let admission_started_at = Instant::now();
         let admission = admit_bulk_batch(
@@ -4508,7 +4518,7 @@ async fn materialize_bulk_batches_from_plan(
                 .then_some(throughput_backend.as_str()),
             execution_policy.as_deref(),
             reducer.as_deref(),
-            items.len(),
+            total_items,
             *chunk_size,
         )
         .await?;
@@ -4597,25 +4607,40 @@ async fn materialize_bulk_batches_from_plan(
             state: workflow_state.clone(),
         };
         if native_stream_v2 {
-            state
-                .store
-                .upsert_throughput_run_input(&ThroughputRunInputRecord {
-                    tenant_id: instance.tenant_id.clone(),
-                    instance_id: instance.instance_id.clone(),
-                    run_id: instance.run_id.clone(),
-                    batch_id: batch_id.clone(),
-                    items: items.clone(),
-                    created_at: occurred_at,
-                    updated_at: occurred_at,
-                })
-                .await?;
+            let native_input_handle = if can_use_payloadless_benchmark_transport(
+                activity_type,
+                reducer.as_deref(),
+                *max_attempts,
+                items,
+            ) {
+                scheduled_input_handle.clone()
+            } else {
+                state
+                    .store
+                    .upsert_throughput_run_input(&ThroughputRunInputRecord {
+                        tenant_id: instance.tenant_id.clone(),
+                        instance_id: instance.instance_id.clone(),
+                        run_id: instance.run_id.clone(),
+                        batch_id: batch_id.clone(),
+                        items: items.clone(),
+                        created_at: occurred_at,
+                        updated_at: occurred_at,
+                    })
+                    .await?;
+                native_stream_v2_run_input_handle(
+                    &instance.tenant_id,
+                    &instance.instance_id,
+                    &instance.run_id,
+                    batch_id,
+                )
+            };
             let command = start_throughput_run_command(
                 state,
                 instance,
                 batch_id,
                 activity_type,
                 task_queue,
-                items.len(),
+                total_items,
                 result_handle,
                 workflow_state.clone(),
                 *chunk_size,
@@ -4627,6 +4652,7 @@ async fn materialize_bulk_batches_from_plan(
                 selected_backend,
                 selected_backend_version,
                 &admission,
+                native_input_handle,
                 source_event_id,
                 occurred_at,
             )
@@ -5090,22 +5116,24 @@ async fn repair_unpublished_stream_v2_runs(state: &AppState) -> Result<usize> {
     };
     let runs = state
         .store
-        .list_unpublished_scheduled_throughput_runs_for_backend(ThroughputBackend::StreamV2.as_str(), 10_000)
+        .list_unpublished_scheduled_throughput_runs_for_backend(
+            ThroughputBackend::StreamV2.as_str(),
+            10_000,
+        )
         .await?;
     let mut repaired = 0_usize;
     for run in runs {
         let ThroughputCommand::StartThroughputRun(_) = &run.command.payload else {
             continue;
         };
-        command_publisher
-            .publish(&run.command, &run.command.partition_key)
-            .await
-            .with_context(|| {
+        command_publisher.publish(&run.command, &run.command.partition_key).await.with_context(
+            || {
                 format!(
                     "failed to republish native throughput run command for batch {}",
                     run.batch_id
                 )
-            })?;
+            },
+        )?;
         let published_at = Utc::now();
         let _ = state
             .store
@@ -6430,6 +6458,7 @@ fn bulk_chunk_to_proto(record: &WorkflowBulkChunkRecord, supports_cbor: bool) ->
         lease_epoch: record.lease_epoch,
         owner_epoch: record.owner_epoch,
         omit_success_output: false,
+        item_count: record.item_count,
     }
 }
 
@@ -6773,9 +6802,7 @@ fn build_retry_task(
         schedule_to_close_timeout_ms,
         start_to_close_timeout_ms,
         heartbeat_timeout_ms,
-    ) = runtime
-        .artifact
-        .step_timeouts(activity_id, &execution_state)?;
+    ) = runtime.artifact.step_timeouts(activity_id, &execution_state)?;
     let due_at = now + retry_delay_for_attempt(retry, next_attempt)?;
     Ok(Some(DelayedRetryTask {
         task: QueuedActivity {
@@ -6809,10 +6836,7 @@ fn build_retry_task(
     }))
 }
 
-fn retry_delay_for_attempt(
-    retry: &RetryPolicy,
-    next_attempt: u32,
-) -> Result<chrono::TimeDelta> {
+fn retry_delay_for_attempt(retry: &RetryPolicy, next_attempt: u32) -> Result<chrono::TimeDelta> {
     let base_delay = parse_timer_ref(&retry.delay)?;
     let Some(backoff_millis) = retry.backoff_coefficient_millis else {
         return Ok(cap_retry_delay(base_delay, retry.maximum_interval.as_deref())?);
@@ -6824,10 +6848,7 @@ fn retry_delay_for_attempt(
     let coefficient = backoff_millis as f64 / 1000.0;
     let scaled_ms = (base_delay.num_milliseconds() as f64) * coefficient.powi(exponent as i32);
     let scaled_ms = scaled_ms.round().clamp(0.0, i64::MAX as f64) as i64;
-    cap_retry_delay(
-        chrono::TimeDelta::milliseconds(scaled_ms),
-        retry.maximum_interval.as_deref(),
-    )
+    cap_retry_delay(chrono::TimeDelta::milliseconds(scaled_ms), retry.maximum_interval.as_deref())
 }
 
 fn cap_retry_delay(
@@ -7406,15 +7427,10 @@ async fn start_throughput_run_command(
     throughput_backend: &str,
     throughput_backend_version: &str,
     admission: &BulkAdmissionDecision,
+    input_handle: PayloadHandle,
     source_event_id: Uuid,
     occurred_at: DateTime<Utc>,
 ) -> Result<ThroughputCommandEnvelope> {
-    let input_handle = native_stream_v2_run_input_handle(
-        &instance.tenant_id,
-        &instance.instance_id,
-        &instance.run_id,
-        batch_id,
-    );
     let result_handle: PayloadHandle = serde_json::from_value(result_handle.clone())
         .context("failed to deserialize bulk result handle for throughput command")?;
     let dedupe_key = format!("throughput-start:{source_event_id}:{batch_id}");
@@ -7899,7 +7915,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admission_bypasses_stale_task_queue_cache_for_explicit_backend_requests() -> Result<()> {
+    async fn admission_bypasses_stale_task_queue_cache_for_explicit_backend_requests() -> Result<()>
+    {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
         };
@@ -7918,8 +7935,8 @@ mod tests {
                 ThroughputBackend::StreamV2.as_str(),
             )
             .await?;
-        let cached = cached_task_queue_throughput_backend(&state, tenant_id, task_queue, false)
-            .await?;
+        let cached =
+            cached_task_queue_throughput_backend(&state, tenant_id, task_queue, false).await?;
         assert_eq!(cached.as_deref(), Some(ThroughputBackend::StreamV2.as_str()));
 
         store
@@ -9615,8 +9632,7 @@ mod tests {
         let store = postgres.connect_store().await?;
         let state_dir = std::env::temp_dir()
             .join(format!("unified-runtime-native-start-command-{}", Uuid::now_v7()));
-        let mut app_state =
-            test_app_state(store, RuntimeInner::default(), state_dir.clone()).await;
+        let mut app_state = test_app_state(store, RuntimeInner::default(), state_dir.clone()).await;
         app_state.throughput_runtime.native_stream_v2_engine_enabled = true;
 
         let instance = WorkflowInstanceState {
@@ -9666,6 +9682,12 @@ mod tests {
                 routing_reason: "stream_v2_selected".to_owned(),
                 admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
             },
+            native_stream_v2_run_input_handle(
+                "tenant",
+                "instance-native-start",
+                "run-native-start",
+                "batch-a",
+            ),
             Uuid::now_v7(),
             Utc::now(),
         )

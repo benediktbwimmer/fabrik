@@ -39,9 +39,25 @@ test("migration analyzer supports default-compatible payload converters and bloc
     root,
     "crates/fabrik-cli/test-fixtures/temporal-bootstrap-qualified",
   );
+  const bootstrapDynamicTaskQueueQualifiedFixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-bootstrap-dynamic-taskqueue-qualified",
+  );
   const bootstrapEsmQualifiedFixture = path.join(
     root,
     "crates/fabrik-cli/test-fixtures/temporal-bootstrap-esm-qualified",
+  );
+  const bootstrapSelfFileQualifiedFixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-bootstrap-self-file-qualified",
+  );
+  const activityFactoryQualifiedFixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-activity-factory-qualified",
+  );
+  const testWorkerQualifiedFixture = path.join(
+    root,
+    "crates/fabrik-cli/test-fixtures/temporal-test-worker-qualified",
   );
   const payloadQualifiedFixture = path.join(
     root,
@@ -78,7 +94,13 @@ test("migration analyzer supports default-compatible payload converters and bloc
   const payloadFixture = path.join(root, "crates/fabrik-cli/test-fixtures/temporal-payload-blocked");
   const payloadQualified = await analyze(payloadQualifiedFixture);
   const bootstrapQualified = await analyze(bootstrapQualifiedFixture);
+  const bootstrapDynamicTaskQueueQualified = await analyze(
+    bootstrapDynamicTaskQueueQualifiedFixture,
+  );
   const bootstrapEsmQualified = await analyze(bootstrapEsmQualifiedFixture);
+  const bootstrapSelfFileQualified = await analyze(bootstrapSelfFileQualifiedFixture);
+  const activityFactoryQualified = await analyze(activityFactoryQualifiedFixture);
+  const testWorkerQualified = await analyze(testWorkerQualifiedFixture);
   const payloadPathQualified = await analyze(payloadPathQualifiedFixture);
   const supportedApiQualified = await analyze(supportedApiQualifiedFixture);
   const activityFailureQualified = await analyze(activityFailureQualifiedFixture);
@@ -95,9 +117,37 @@ test("migration analyzer supports default-compatible payload converters and bloc
   assert.equal(bootstrapQualified.summary.hard_block_count, 0);
   assert.equal(bootstrapQualified.workers[0].task_queue, "bootstrap-qualified");
   assert.equal(bootstrapQualified.workers[0].workflows_path, "./workflows");
+  assert.equal(bootstrapDynamicTaskQueueQualified.summary.hard_block_count, 0);
+  assert.equal(bootstrapDynamicTaskQueueQualified.workers[0].task_queue, null);
+  assert.equal(
+    bootstrapDynamicTaskQueueQualified.workers[0].workflows_path,
+    "./workflows",
+  );
   assert.equal(bootstrapEsmQualified.summary.hard_block_count, 0);
   assert.equal(bootstrapEsmQualified.workers[0].task_queue, "bootstrap-esm-qualified");
   assert.equal(bootstrapEsmQualified.workers[0].workflows_path, "./workflows.ts");
+  assert.equal(bootstrapSelfFileQualified.summary.hard_block_count, 0);
+  assert.equal(bootstrapSelfFileQualified.workers[0].task_queue, "bootstrap-self-file");
+  assert.match(
+    bootstrapSelfFileQualified.workers[0].workflows_path,
+    /src\/worker\.ts$/,
+  );
+  assert.equal(activityFactoryQualified.summary.hard_block_count, 0);
+  assert.equal(activityFactoryQualified.workers[0].task_queue, "activity-factory-qualified");
+  assert.equal(
+    activityFactoryQualified.workers[0].activity_factory_export,
+    "createActivities",
+  );
+  assert.equal(activityFactoryQualified.workers[0].activity_factory_args_js.length, 1);
+  assert.match(activityFactoryQualified.workers[0].activity_factory_args_js[0], /return "Temporal"/);
+  assert.equal(testWorkerQualified.summary.hard_block_count, 0);
+  assert.equal(testWorkerQualified.workers[0].task_queue, "test-worker-qualified");
+  assert.ok(
+    testWorkerQualified.findings.every(
+      (finding) =>
+        finding.file !== "src/workflows.test.ts" || finding.severity !== "hard_block",
+    ),
+  );
   assert.equal(payloadQualified.summary.hard_block_count, 0);
   assert.equal(payloadQualified.workers[0].data_converter_mode, "default_temporal");
   assert.equal(payloadPathQualified.summary.hard_block_count, 0);

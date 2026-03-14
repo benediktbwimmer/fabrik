@@ -463,8 +463,32 @@ test("compiler lowers Math.random and richer Temporal retry options", async () =
   const serialized = JSON.stringify(artifact.workflow.states);
 
   assert.match(serialized, /"kind":"random"/);
-  assert.match(serialized, /"maximum_interval":"5s"/);
+  assert.match(serialized, /"maximum_interval":"5 seconds"/);
   assert.match(serialized, /"backoff_coefficient_millis":1500/);
+});
+
+test("compiler materializes Temporal retry defaults for sparse retry overrides", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-sparse-retry-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalSparseRetryWorkflow",
+    "--definition-id",
+    "temporal-sparse-retry-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"maximum_interval":"5 seconds"/);
+  assert.match(serialized, /"max_attempts":4294967295/);
+  assert.match(serialized, /"delay":"1s"/);
+  assert.match(serialized, /"backoff_coefficient_millis":2000/);
 });
 
 test("compiler lowers dynamic proxy activity member calls with spread args", async () => {
@@ -577,6 +601,28 @@ test("compiler lowers uninitialized local let declarations", async () => {
 
   assert.match(serialized, /"target":"message"/);
   assert.match(serialized, /"value":null/);
+});
+
+test("compiler lowers typeof and instanceof Error in pure helpers", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-error-helper-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalErrorHelperWorkflow",
+    "--definition-id",
+    "temporal-error-helper-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serializedHelper = JSON.stringify(artifact.helpers.errorMessage);
+
+  assert.match(serializedHelper, /"callee":"__builtin_typeof"/);
+  assert.match(serializedHelper, /"callee":"__builtin_is_error"/);
 });
 
 test("compiler ignores top-level runtime guards gated by inWorkflowContext", async () => {
@@ -1164,6 +1210,141 @@ test("compiler lowers Temporal condition waits with timeout", async () => {
   assert.match(serializedWorkflowStates, /"timeout_next":"assign_/);
 });
 
+test("compiler lowers Promise.race over Temporal condition and sleep into timed condition waits", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-promise-race-condition-timeout-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalPromiseRaceConditionTimeoutWorkflow",
+    "--definition-id",
+    "temporal-promise-race-condition-timeout-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serializedWorkflowStates = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serializedWorkflowStates, /"type":"wait_for_condition"/);
+  assert.match(serializedWorkflowStates, /"timeout_ref":"30 days"/);
+  assert.match(serializedWorkflowStates, /"timeout_ref":"5s"/);
+});
+
+test("compiler accepts local predicate identifiers passed to Temporal condition", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-condition-local-predicate-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalConditionLocalPredicateWorkflow",
+    "--definition-id",
+    "temporal-condition-local-predicate-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serializedWorkflowStates = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serializedWorkflowStates, /"type":"wait_for_condition"/);
+});
+
+test("compiler lowers prefix increment in for-loop update expressions", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-prefix-increment-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalPrefixIncrementWorkflow",
+    "--definition-id",
+    "temporal-prefix-increment-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serializedWorkflowStates = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serializedWorkflowStates, /"op":"add"/);
+});
+
+test("compiler lowers stored Temporal sleep handles and later await", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-sleep-handle-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalSleepHandleWorkflow",
+    "--definition-id",
+    "temporal-sleep-handle-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serializedWorkflowStates = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serializedWorkflowStates, /"type":"start_timer_handle"/);
+  assert.match(serializedWorkflowStates, /"handle_var":"timer"/);
+  assert.match(serializedWorkflowStates, /"type":"wait_for_condition"/);
+  assert.match(serializedWorkflowStates, /"property":"status"/);
+});
+
+test("compiler lowers background activity handles raced against timers and awaited later", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-activity-handle-race-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalActivityHandleRaceWorkflow",
+    "--definition-id",
+    "temporal-activity-handle-race-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serializedWorkflowStates = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serializedWorkflowStates, /"type":"start_step_handle"/);
+  assert.match(serializedWorkflowStates, /"type":"start_timer_handle"/);
+  assert.match(serializedWorkflowStates, /"completion_actions"/);
+  assert.match(serializedWorkflowStates, /"handler":"sendNotificationEmail"/);
+});
+
+test("compiler lowers callback-backed Promise waits into timers", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-callback-promise-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalCallbackPromiseWorkflow",
+    "--definition-id",
+    "temporal-callback-promise-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serializedWorkflowStates = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serializedWorkflowStates, /"type":"wait_for_timer"/);
+  assert.match(serializedWorkflowStates, /"timer_ref":"10ms"/);
+});
+
 test("compiler emits real compiled signal handler graphs for async Temporal signal handlers", async () => {
   const fixture = path.join(
     root,
@@ -1366,6 +1547,49 @@ test("compiler lowers block-bodied Temporal cancellation scopes with multiple aw
   assert.match(serialized, /"output_var":"first"/);
   assert.match(serialized, /"output_var":"second"/);
   assert.match(serialized, /"on_error":\{"next":/);
+});
+
+test("compiler lowers synchronous Temporal nonCancellable scope handlers", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-cancellation-scope-sync-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalCancellationScopeSyncWorkflow",
+    "--definition-id",
+    "temporal-cancellation-scope-sync-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"handler":"cleanup"/);
+});
+
+test("compiler lowers return CancellationScope.nonCancellable calls", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/temporal-cancellation-scope-sync-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "temporalCancellationScopeSyncReturnWorkflow",
+    "--definition-id",
+    "temporal-cancellation-scope-sync-return-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"handler":"cleanup"/);
+  assert.match(serialized, /"type":"succeed"/);
 });
 
 test("compiler lowers multi-argument Temporal activity and continueAsNew calls", async () => {

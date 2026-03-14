@@ -658,6 +658,7 @@ impl LocalThroughputState {
         batch: &WorkflowBulkBatchRecord,
         chunks: &[WorkflowBulkChunkRecord],
     ) -> Result<()> {
+        let strip_collect_results_output = batch.reducer.as_deref() == Some("collect_results");
         let chunk_states = chunks
             .iter()
             .map(|chunk| LocalChunkState {
@@ -682,8 +683,12 @@ impl LocalThroughputState {
                 worker_id: chunk.worker_id.clone(),
                 lease_token: chunk.lease_token.map(|value| value.to_string()),
                 report_id: chunk.last_report_id.clone(),
-                result_handle: chunk.result_handle.clone(),
-                output: chunk.output.clone(),
+                result_handle: if strip_collect_results_output {
+                    Value::Null
+                } else {
+                    chunk.result_handle.clone()
+                },
+                output: if strip_collect_results_output { None } else { chunk.output.clone() },
                 error: chunk.error.clone(),
                 input_handle: chunk.input_handle.clone(),
                 items: chunk.items.clone(),
@@ -721,6 +726,11 @@ impl LocalThroughputState {
             run_id: chunk.run_id.clone(),
             batch_id: chunk.batch_id.clone(),
         };
+        let strip_collect_results_output = self
+            .load_batch_state(&identity)?
+            .and_then(|batch| batch.reducer)
+            .as_deref()
+            == Some("collect_results");
         let existing = self.load_chunk_state(&identity, &chunk.chunk_id)?;
         let state = LocalChunkState {
             identity,
@@ -739,8 +749,12 @@ impl LocalThroughputState {
             worker_id: chunk.worker_id.clone(),
             lease_token: chunk.lease_token.map(|value| value.to_string()),
             report_id: chunk.last_report_id.clone(),
-            result_handle: chunk.result_handle.clone(),
-            output: chunk.output.clone(),
+            result_handle: if strip_collect_results_output {
+                Value::Null
+            } else {
+                chunk.result_handle.clone()
+            },
+            output: if strip_collect_results_output { None } else { chunk.output.clone() },
             error: chunk.error.clone(),
             input_handle: chunk.input_handle.clone(),
             items: chunk.items.clone(),
@@ -846,6 +860,13 @@ impl LocalThroughputState {
         Ok(summarize_projected_groups(&groups))
     }
 
+    pub fn has_collect_results_batches(&self) -> Result<bool> {
+        Ok(self
+            .load_all_batches()?
+            .into_iter()
+            .any(|batch| batch.reducer.as_deref() == Some("collect_results")))
+    }
+
     pub fn chunk_snapshots_for_batch(
         &self,
         identity: &ThroughputBatchIdentity,
@@ -939,8 +960,9 @@ impl LocalThroughputState {
             }
 
             match chunk.status.as_str() {
-                status if status == WorkflowBulkChunkStatus::Completed.as_str()
-                    && bulk_reducer_requires_success_outputs(reducer) =>
+                status
+                    if status == WorkflowBulkChunkStatus::Completed.as_str()
+                        && bulk_reducer_requires_success_outputs(reducer) =>
                 {
                     let output = chunk.output.as_ref().ok_or_else(|| {
                         anyhow::anyhow!(
@@ -976,7 +998,8 @@ impl LocalThroughputState {
             return Ok(bulk_reducer_default_summary_value(reducer));
         }
 
-        bulk_reducer_reduce_values(reducer, &values).context("failed to reduce throughput batch success outputs")
+        bulk_reducer_reduce_values(reducer, &values)
+            .context("failed to reduce throughput batch success outputs")
     }
 
     pub fn count_started_chunks(
@@ -1018,8 +1041,12 @@ impl LocalThroughputState {
         owned_partitions: Option<&HashSet<i32>>,
         partition_count: i32,
     ) -> Result<Option<ReadyChunkCandidate>> {
-        let started_by_batch =
-            self.started_counts_by_batch(tenant_id, task_queue, owned_partitions, partition_count)?;
+        let started_by_batch = self.started_counts_by_batch(
+            Some(tenant_id),
+            Some(task_queue),
+            owned_partitions,
+            partition_count,
+        )?;
         for candidate in self.load_ready_chunk_entries(tenant_id, task_queue, now)? {
             if !owned_partitions
                 .map(|partitions| {
@@ -1099,11 +1126,80 @@ impl LocalThroughputState {
         max_chunks: usize,
     ) -> Result<Vec<LeasedChunkSnapshot>> {
         let _lease_guard = self.lease_lock.lock().expect("local throughput lease lock poisoned");
+        let mut started_by_batch = self.started_counts_by_batch(
+            Some(tenant_id),
+            Some(task_queue),
+            owned_partitions,
+            partition_count,
+        )?;
+        self.lease_ready_chunks_scoped(
+            Some(tenant_id),
+            Some(task_queue),
+            worker_id,
+            now,
+            lease_ttl,
+            max_active_chunks_per_batch,
+            paused_batch_ids,
+            owned_partitions,
+            partition_count,
+            max_chunks,
+            &mut started_by_batch,
+            None,
+        )
+    }
+
+    pub fn lease_ready_chunks_matching<F>(
+        &self,
+        worker_id: &str,
+        now: DateTime<Utc>,
+        lease_ttl: chrono::Duration,
+        max_active_chunks_per_batch: Option<usize>,
+        paused_batch_ids: &HashSet<String>,
+        owned_partitions: Option<&HashSet<i32>>,
+        partition_count: i32,
+        max_chunks: usize,
+        mut predicate: F,
+    ) -> Result<Vec<LeasedChunkSnapshot>>
+    where
+        F: FnMut(&LeasedChunkSnapshot) -> bool,
+    {
+        let _lease_guard = self.lease_lock.lock().expect("local throughput lease lock poisoned");
         let mut started_by_batch =
-            self.started_counts_by_batch(tenant_id, task_queue, owned_partitions, partition_count)?;
+            self.started_counts_by_batch(None, None, owned_partitions, partition_count)?;
+        self.lease_ready_chunks_scoped(
+            None,
+            None,
+            worker_id,
+            now,
+            lease_ttl,
+            max_active_chunks_per_batch,
+            paused_batch_ids,
+            owned_partitions,
+            partition_count,
+            max_chunks,
+            &mut started_by_batch,
+            Some(&mut predicate),
+        )
+    }
+
+    fn lease_ready_chunks_scoped(
+        &self,
+        tenant_id: Option<&str>,
+        task_queue: Option<&str>,
+        worker_id: &str,
+        now: DateTime<Utc>,
+        lease_ttl: chrono::Duration,
+        max_active_chunks_per_batch: Option<usize>,
+        paused_batch_ids: &HashSet<String>,
+        owned_partitions: Option<&HashSet<i32>>,
+        partition_count: i32,
+        max_chunks: usize,
+        started_by_batch: &mut HashMap<String, usize>,
+        mut predicate: Option<&mut dyn FnMut(&LeasedChunkSnapshot) -> bool>,
+    ) -> Result<Vec<LeasedChunkSnapshot>> {
         let mut leased_chunks = Vec::with_capacity(max_chunks.max(1));
         let mut write_batch = WriteBatch::default();
-        for candidate in self.load_ready_chunk_entries(tenant_id, task_queue, now)? {
+        for candidate in self.load_ready_chunk_entries_scoped(tenant_id, task_queue, now)? {
             if leased_chunks.len() >= max_chunks.max(1) {
                 break;
             }
@@ -1156,9 +1252,7 @@ impl LocalThroughputState {
             leased_chunk.lease_expires_at = Some(now + lease_ttl);
             leased_chunk.updated_at = now;
 
-            self.write_chunk_state(&mut write_batch, Some(&existing_chunk), &leased_chunk)?;
-            *started_by_batch.entry(batch_key).or_default() += 1;
-            leased_chunks.push(LeasedChunkSnapshot {
+            let snapshot = LeasedChunkSnapshot {
                 identity: leased_chunk.identity.clone(),
                 definition_id: batch.definition_id.clone(),
                 definition_version: batch.definition_version,
@@ -1186,7 +1280,16 @@ impl LocalThroughputState {
                 started_at: leased_chunk.started_at,
                 lease_expires_at: leased_chunk.lease_expires_at,
                 updated_at: leased_chunk.updated_at,
-            });
+            };
+            if predicate
+                .as_mut()
+                .is_some_and(|predicate| !(predicate)(&snapshot))
+            {
+                continue;
+            }
+            self.write_chunk_state(&mut write_batch, Some(&existing_chunk), &leased_chunk)?;
+            *started_by_batch.entry(batch_key).or_default() += 1;
+            leased_chunks.push(snapshot);
         }
         if !leased_chunks.is_empty() {
             self.db
@@ -1206,8 +1309,12 @@ impl LocalThroughputState {
         owned_partitions: Option<&HashSet<i32>>,
         partition_count: i32,
     ) -> Result<LeaseSelectionDebug> {
-        let started_by_batch =
-            self.started_counts_by_batch(tenant_id, task_queue, owned_partitions, partition_count)?;
+        let started_by_batch = self.started_counts_by_batch(
+            Some(tenant_id),
+            Some(task_queue),
+            owned_partitions,
+            partition_count,
+        )?;
         let mut debug = LeaseSelectionDebug::default();
         for candidate in self.load_ready_chunk_entries(tenant_id, task_queue, now)? {
             debug.indexed_candidates = debug.indexed_candidates.saturating_add(1);
@@ -2039,6 +2146,15 @@ impl LocalThroughputState {
         task_queue: &str,
         now: DateTime<Utc>,
     ) -> Result<Vec<ReadyChunkIndexEntry>> {
+        self.load_ready_chunk_entries_scoped(Some(tenant_id), Some(task_queue), now)
+    }
+
+    fn load_ready_chunk_entries_scoped(
+        &self,
+        tenant_id: Option<&str>,
+        task_queue: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ReadyChunkIndexEntry>> {
         let prefix = ready_index_scope_prefix(tenant_id, task_queue);
         let mut entries = Vec::new();
         let mut stale_keys = Vec::new();
@@ -2162,13 +2278,13 @@ impl LocalThroughputState {
 
     fn started_counts_by_batch(
         &self,
-        tenant_id: &str,
-        task_queue: &str,
+        tenant_id: Option<&str>,
+        task_queue: Option<&str>,
         owned_partitions: Option<&HashSet<i32>>,
         partition_count: i32,
     ) -> Result<HashMap<String, usize>> {
         let mut counts = HashMap::new();
-        for chunk in self.load_started_chunk_entries(Some(tenant_id), Some(task_queue))? {
+        for chunk in self.load_started_chunk_entries(tenant_id, task_queue)? {
             if !owned_partitions
                 .map(|partitions| {
                     partitions.contains(&throughput_partition_id(
@@ -2509,67 +2625,6 @@ impl LocalThroughputState {
                 cancellation_reason,
                 cancellation_metadata,
             } => {
-                let existing_chunk = self.load_chunk_state(identity, chunk_id)?;
-                let task_queue = existing_chunk
-                    .as_ref()
-                    .map(|chunk| chunk.task_queue.clone())
-                    .or_else(|| {
-                        self.load_batch_state(identity).ok().flatten().map(|batch| batch.task_queue)
-                    })
-                    .unwrap_or_default();
-                let previous_status = existing_chunk
-                    .as_ref()
-                    .map(|chunk| chunk.status.as_str())
-                    .unwrap_or("scheduled");
-                let state = LocalChunkState {
-                    identity: identity.clone(),
-                    chunk_id: chunk_id.clone(),
-                    activity_type: existing_chunk
-                        .as_ref()
-                        .map(|chunk| chunk.activity_type.clone())
-                        .unwrap_or_default(),
-                    task_queue,
-                    chunk_index: *chunk_index,
-                    group_id: *group_id,
-                    item_count: *item_count,
-                    attempt: *attempt,
-                    max_attempts: *max_attempts,
-                    retry_delay_ms: *retry_delay_ms,
-                    lease_epoch: *lease_epoch,
-                    owner_epoch: *owner_epoch,
-                    status: status.clone(),
-                    worker_id: None,
-                    lease_token: None,
-                    report_id: Some(report_id.clone()),
-                    result_handle: result_handle.clone().unwrap_or(Value::Null),
-                    output: output.clone(),
-                    error: error.clone(),
-                    input_handle: existing_chunk
-                        .as_ref()
-                        .map(|chunk| chunk.input_handle.clone())
-                        .unwrap_or(Value::Null),
-                    items: existing_chunk
-                        .as_ref()
-                        .map(|chunk| chunk.items.clone())
-                        .unwrap_or_default(),
-                    cancellation_requested: existing_chunk
-                        .as_ref()
-                        .map(|chunk| chunk.cancellation_requested)
-                        .unwrap_or(false),
-                    cancellation_reason: cancellation_reason.clone(),
-                    cancellation_metadata: cancellation_metadata.clone(),
-                    scheduled_at: existing_chunk
-                        .as_ref()
-                        .map(|chunk| chunk.scheduled_at)
-                        .unwrap_or(entry.occurred_at),
-                    available_at: *available_at,
-                    started_at: existing_chunk.as_ref().and_then(|chunk| chunk.started_at),
-                    lease_expires_at: None,
-                    completed_at: matches!(status.as_str(), "completed" | "failed" | "cancelled")
-                        .then_some(entry.occurred_at),
-                    updated_at: entry.occurred_at,
-                };
-                self.write_chunk_state(write_batch, existing_chunk.as_ref(), &state)?;
                 let mut batch_state =
                     self.load_batch_state(identity)?.unwrap_or_else(|| LocalBatchState {
                         identity: identity.clone(),
@@ -2597,6 +2652,71 @@ impl LocalThroughputState {
                         updated_at: entry.occurred_at,
                         terminal_at: None,
                     });
+                let existing_chunk = self.load_chunk_state(identity, chunk_id)?;
+                let task_queue = existing_chunk
+                    .as_ref()
+                    .map(|chunk| chunk.task_queue.clone())
+                    .or_else(|| Some(batch_state.task_queue.clone()))
+                    .unwrap_or_default();
+                let strip_collect_results_output =
+                    batch_state.reducer.as_deref() == Some("collect_results");
+                let previous_status = existing_chunk
+                    .as_ref()
+                    .map(|chunk| chunk.status.as_str())
+                    .unwrap_or("scheduled");
+                let state = LocalChunkState {
+                    identity: identity.clone(),
+                    chunk_id: chunk_id.clone(),
+                    activity_type: existing_chunk
+                        .as_ref()
+                        .map(|chunk| chunk.activity_type.clone())
+                        .unwrap_or_default(),
+                    task_queue,
+                    chunk_index: *chunk_index,
+                    group_id: *group_id,
+                    item_count: *item_count,
+                    attempt: *attempt,
+                    max_attempts: *max_attempts,
+                    retry_delay_ms: *retry_delay_ms,
+                    lease_epoch: *lease_epoch,
+                    owner_epoch: *owner_epoch,
+                    status: status.clone(),
+                    worker_id: None,
+                    lease_token: None,
+                    report_id: Some(report_id.clone()),
+                    result_handle: if strip_collect_results_output {
+                        Value::Null
+                    } else {
+                        result_handle.clone().unwrap_or(Value::Null)
+                    },
+                    output: if strip_collect_results_output { None } else { output.clone() },
+                    error: error.clone(),
+                    input_handle: existing_chunk
+                        .as_ref()
+                        .map(|chunk| chunk.input_handle.clone())
+                        .unwrap_or(Value::Null),
+                    items: existing_chunk
+                        .as_ref()
+                        .map(|chunk| chunk.items.clone())
+                        .unwrap_or_default(),
+                    cancellation_requested: existing_chunk
+                        .as_ref()
+                        .map(|chunk| chunk.cancellation_requested)
+                        .unwrap_or(false),
+                    cancellation_reason: cancellation_reason.clone(),
+                    cancellation_metadata: cancellation_metadata.clone(),
+                    scheduled_at: existing_chunk
+                        .as_ref()
+                        .map(|chunk| chunk.scheduled_at)
+                        .unwrap_or(entry.occurred_at),
+                    available_at: *available_at,
+                    started_at: existing_chunk.as_ref().and_then(|chunk| chunk.started_at),
+                    lease_expires_at: None,
+                    completed_at: matches!(status.as_str(), "completed" | "failed" | "cancelled")
+                        .then_some(entry.occurred_at),
+                    updated_at: entry.occurred_at,
+                };
+                self.write_chunk_state(write_batch, existing_chunk.as_ref(), &state)?;
                 // Replay safety depends on ordered, exactly-once application by partition offset.
                 // We only advance batch counters when the prior chunk state was `started`, which
                 // prevents double-counting if a checkpoint already includes the post-apply chunk.
@@ -2662,8 +2782,8 @@ impl LocalThroughputState {
                 retry_delay_ms,
                 lease_epoch,
                 owner_epoch,
-                available_at,
-            } => {
+                    available_at,
+                } => {
                 let existing_chunk = self.load_chunk_state(identity, chunk_id)?;
                 let task_queue = existing_chunk
                     .as_ref()
@@ -3618,8 +3738,14 @@ fn batch_group_index_key(identity: &ThroughputBatchIdentity, group_id: u32) -> S
     format!("{}{:010}", batch_group_index_prefix(identity), group_id)
 }
 
-fn ready_index_scope_prefix(tenant_id: &str, task_queue: &str) -> String {
-    format!("{READY_INDEX_PREFIX}{tenant_id}:{task_queue}:")
+fn ready_index_scope_prefix(tenant_id: Option<&str>, task_queue: Option<&str>) -> String {
+    match (tenant_id, task_queue) {
+        (Some(tenant_id), Some(task_queue)) => {
+            format!("{READY_INDEX_PREFIX}{tenant_id}:{task_queue}:")
+        }
+        (Some(tenant_id), None) => format!("{READY_INDEX_PREFIX}{tenant_id}:"),
+        (None, _) => READY_INDEX_PREFIX.to_owned(),
+    }
 }
 
 fn ready_index_key(state: &LocalChunkState) -> String {
@@ -5088,12 +5214,9 @@ mod tests {
         batch.reducer = Some("histogram".to_owned());
         batch.reducer_kind = bulk_reducer_name(Some("histogram")).to_owned();
         batch.reducer_version = throughput_reducer_version(Some("histogram")).to_owned();
-        batch.reducer_execution_path = throughput_reducer_execution_path(
-            "stream-v2",
-            Some("eager"),
-            Some("histogram"),
-        )
-        .to_owned();
+        batch.reducer_execution_path =
+            throughput_reducer_execution_path("stream-v2", Some("eager"), Some("histogram"))
+                .to_owned();
         state.upsert_batch_record(&batch)?;
 
         let mut completed =
@@ -5154,12 +5277,9 @@ mod tests {
         batch.reducer = Some("sample_errors".to_owned());
         batch.reducer_kind = bulk_reducer_name(Some("sample_errors")).to_owned();
         batch.reducer_version = throughput_reducer_version(Some("sample_errors")).to_owned();
-        batch.reducer_execution_path = throughput_reducer_execution_path(
-            "stream-v2",
-            Some("eager"),
-            Some("sample_errors"),
-        )
-        .to_owned();
+        batch.reducer_execution_path =
+            throughput_reducer_execution_path("stream-v2", Some("eager"), Some("sample_errors"))
+                .to_owned();
         state.upsert_batch_record(&batch)?;
 
         let mut failed =
@@ -5203,9 +5323,7 @@ mod tests {
                 worker_build_id: "build-a".to_owned(),
                 lease_token: TEST_LEASE_TOKEN.to_owned(),
                 occurred_at: now,
-                payload: ThroughputChunkReportPayload::ChunkFailed {
-                    error: "timeout".to_owned(),
-                },
+                payload: ThroughputChunkReportPayload::ChunkFailed { error: "timeout".to_owned() },
             }),
         )?;
         assert_eq!(

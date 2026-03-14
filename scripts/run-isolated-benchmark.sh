@@ -70,6 +70,7 @@ STATE_DIR="$RUN_DIR/state"
 CHECKPOINT_DIR="$RUN_DIR/checkpoints"
 PID_DIR="$RUN_DIR/pids"
 FAILOVER_INJECTION_PATH="$RUN_DIR/failover-injection.json"
+FAILOVER_ARM_PATH="$RUN_DIR/failover-arm"
 REPORT_PATH_DEFAULT="target/benchmark-reports/${NAMESPACE}.json"
 BUILD_RELEASE="${BUILD_RELEASE_BINARIES:-1}"
 KEEP_DATABASE="${KEEP_BENCHMARK_DATABASE:-0}"
@@ -91,7 +92,7 @@ def reserve():
     s.close()
     return port
 
-for _ in range(11):
+for _ in range(12):
     print(reserve())
 PY
 )
@@ -107,6 +108,7 @@ STREAM_ACTIVITY_WORKER_SERVICE_PORT="${STREAM_ACTIVITY_WORKER_SERVICE_PORT:-${PO
 TIMER_SERVICE_PORT="${TIMER_SERVICE_PORT:-${PORTS[8]}}"
 UNIFIED_RUNTIME_PORT="${UNIFIED_RUNTIME_PORT:-${PORTS[9]}}"
 UNIFIED_DEBUG_PORT="${UNIFIED_DEBUG_PORT:-${PORTS[10]}}"
+INGEST_SECONDARY_PORT="${INGEST_SECONDARY_PORT:-${PORTS[11]}}"
 
 PIDS=()
 REPORT_PATH=""
@@ -395,6 +397,37 @@ PY
   printf '%s\n' "$pid" >"$(pid_file_for "$name")"
 }
 
+start_ingest_service_instance() {
+  local name=$1
+  local port=$2
+  local log_file=$3
+  echo "[isolated-benchmark] starting $name"
+  start_service "$name" "$log_file" \
+    "${COMMON_ENV[@]}" \
+    "INGEST_SERVICE_PORT=$port" \
+    "INGEST_RUNTIME_ID=$name" \
+    -- \
+    target/release/ingest-service
+  wait_for_port 127.0.0.1 "$port" "$name"
+}
+
+ensure_ingest_service_instance() {
+  local name=$1
+  local port=$2
+  local log_file=$3
+  local pid_file
+  pid_file="$(pid_file_for "$name")"
+  if [[ -f "$pid_file" ]]; then
+    local pid
+    pid="$(cat "$pid_file")"
+    if kill -0 "$pid" >/dev/null 2>&1; then
+      return 0
+    fi
+    rm -f "$pid_file"
+  fi
+  start_ingest_service_instance "$name" "$port" "$log_file"
+}
+
 stop_service_by_name() {
   local name=$1
   local grace_seconds=${2:-10}
@@ -666,6 +699,13 @@ import sys
 print(int(float(sys.argv[1]) * 1000))
 PY
 )"
+TOPIC_ADAPTER_FAILOVER_INJECTION_DELAY_SECS="${TOPIC_ADAPTER_FAILOVER_INJECTION_DELAY_SECS:-0.01}"
+TOPIC_ADAPTER_FAILOVER_INJECTION_DELAY_MS="$(
+  python3 - "$TOPIC_ADAPTER_FAILOVER_INJECTION_DELAY_SECS" <<'PY'
+import sys
+print(int(float(sys.argv[1]) * 1000))
+PY
+)"
 
 COMMON_ENV=(
   "POSTGRES_URL=$POSTGRES_URL"
@@ -777,6 +817,72 @@ start_failover_injector() {
   FAILOVER_INJECTOR_PID=$!
 }
 
+start_topic_adapter_failover_injector() {
+  write_failover_record scheduled "$TOPIC_ADAPTER_FAILOVER_INJECTION_DELAY_MS"
+  (
+    local stop_requested_at_ms=""
+    local stop_completed_at_ms=""
+    local error_message=""
+    local target_service="ingest-service"
+    local arm_deadline=$((SECONDS + 60))
+    while [[ ! -f "$FAILOVER_ARM_PATH" ]] && (( SECONDS < arm_deadline )); do
+      sleep 0.1
+    done
+    if [[ ! -f "$FAILOVER_ARM_PATH" ]]; then
+      error_message="timed out waiting for topic adapter failover arm signal"
+      write_failover_record failed \
+        "$TOPIC_ADAPTER_FAILOVER_INJECTION_DELAY_MS" \
+        "$stop_requested_at_ms" \
+        "$stop_completed_at_ms" \
+        "" \
+        "" \
+        "$error_message"
+      exit 1
+    fi
+    target_service="$(
+      python3 - "$FAILOVER_ARM_PATH" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    print("ingest-service")
+    raise SystemExit(0)
+owner_id = str(payload.get("owner_id") or "")
+if owner_id == "ingest-service-secondary":
+    print("ingest-service-secondary")
+else:
+    print("ingest-service")
+PY
+    )"
+    sleep "$TOPIC_ADAPTER_FAILOVER_INJECTION_DELAY_SECS"
+    stop_requested_at_ms="$(now_ms)"
+    write_failover_record in_progress \
+      "$TOPIC_ADAPTER_FAILOVER_INJECTION_DELAY_MS" \
+      "$stop_requested_at_ms"
+    if ! stop_service_by_name "$target_service" 0; then
+      error_message="failed to stop topic adapter owner $target_service"
+      write_failover_record failed \
+        "$TOPIC_ADAPTER_FAILOVER_INJECTION_DELAY_MS" \
+        "$stop_requested_at_ms" \
+        "$stop_completed_at_ms" \
+        "" \
+        "" \
+        "$error_message"
+      exit 1
+    fi
+    stop_completed_at_ms="$(now_ms)"
+    write_failover_record completed \
+      "$TOPIC_ADAPTER_FAILOVER_INJECTION_DELAY_MS" \
+      "$stop_requested_at_ms" \
+      "$stop_completed_at_ms"
+  ) &
+  FAILOVER_INJECTOR_PID=$!
+}
+
 runner_args_without_output_and_scenario() {
   FILTERED_RUNNER_ARGS=()
   local index=0
@@ -851,22 +957,25 @@ PY
 }
 
 write_failover_suite_report() {
-  local suite_output=$1
+  local suite_name=$1
+  local suite_output=$2
   shift
-  python3 - "$suite_output" "$@" <<'PY'
+  shift
+  python3 - "$suite_name" "$suite_output" "$@" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-suite_output = Path(sys.argv[1])
-scenario_paths = [Path(value) for value in sys.argv[2:]]
+suite_name = sys.argv[1]
+suite_output = Path(sys.argv[2])
+scenario_paths = [Path(value) for value in sys.argv[3:]]
 scenarios = [
     json.loads(path.read_text(encoding="utf-8"))
     for path in scenario_paths
 ]
 payload = {
-    "suite": "stream-v2-failover",
+    "suite": suite_name,
     "profile": scenarios[0]["profile"] if scenarios else "unknown",
     "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     "scenarios": scenarios,
@@ -909,18 +1018,63 @@ run_failover_suite_isolated() {
     echo "scenario_report_path=$scenario_report"
     scenario_report_paths+=("$scenario_report")
   done
-  write_failover_suite_report "$final_output" "${scenario_report_paths[@]}"
+  write_failover_suite_report "stream-v2-failover" "$final_output" "${scenario_report_paths[@]}"
   REPORT_PATH="$final_output"
   echo "suite_report_path=$final_output"
 }
 
-echo "[isolated-benchmark] starting ingest-service"
-start_service ingest-service "$LOG_DIR/ingest-service.log" \
-  "${COMMON_ENV[@]}" \
-  "INGEST_SERVICE_PORT=$INGEST_PORT" \
-  -- \
-  target/release/ingest-service
-wait_for_port 127.0.0.1 "$INGEST_PORT" "ingest-service"
+run_topic_adapter_failover_suite_isolated() {
+  local final_output=$1
+  local requested_tag="${RUNNER_SCENARIO_TAG:-}"
+  runner_args_without_output_and_scenario
+  local -a scenario_tags=()
+  if [[ -n "$requested_tag" ]]; then
+    scenario_tags=("$requested_tag")
+  else
+    scenario_tags=("owner-crash" "lag-under-load-owner-crash")
+  fi
+  local -a scenario_report_paths=()
+  local scenario_tag temp_output scenario_report
+  for scenario_tag in "${scenario_tags[@]}"; do
+    ensure_ingest_service_instance ingest-service "$INGEST_PORT" "$LOG_DIR/ingest-service.log"
+    ensure_ingest_service_instance \
+      ingest-service-secondary \
+      "$INGEST_SECONDARY_PORT" \
+      "$LOG_DIR/ingest-service-secondary.log"
+    rm -f "$FAILOVER_INJECTION_PATH"
+    rm -f "$FAILOVER_ARM_PATH"
+    temp_output="$RUN_DIR/${scenario_tag}.json"
+    REPORT_PATH="$temp_output"
+    echo "[isolated-benchmark] scheduling ingest-service failover injection for $scenario_tag"
+    start_topic_adapter_failover_injector
+    run_benchmark_runner \
+      "BENCHMARK_FAILOVER_INJECTION_PATH=$FAILOVER_INJECTION_PATH" \
+      "BENCHMARK_FAILOVER_ARM_PATH=$FAILOVER_ARM_PATH" \
+      -- \
+      "${FILTERED_RUNNER_ARGS[@]}" \
+      --output "$temp_output" \
+      --scenario-tag "$scenario_tag"
+    if [[ -n "${FAILOVER_INJECTOR_PID:-}" ]]; then
+      wait "$FAILOVER_INJECTOR_PID"
+      refresh_failover_reports
+      FAILOVER_INJECTOR_PID=""
+    fi
+    scenario_report="$(materialize_isolated_scenario_report "$temp_output" "$final_output")"
+    echo "scenario_report_path=$scenario_report"
+    scenario_report_paths+=("$scenario_report")
+  done
+  write_failover_suite_report "topic-adapters-failover" "$final_output" "${scenario_report_paths[@]}"
+  REPORT_PATH="$final_output"
+  echo "suite_report_path=$final_output"
+}
+
+start_ingest_service_instance ingest-service "$INGEST_PORT" "$LOG_DIR/ingest-service.log"
+if [[ "$RUNNER_SUITE" == "topic-adapters-failover" ]]; then
+  start_ingest_service_instance \
+    ingest-service-secondary \
+    "$INGEST_SECONDARY_PORT" \
+    "$LOG_DIR/ingest-service-secondary.log"
+fi
 
 EXECUTION_MODE="durable"
 for ((i = 0; i < ${#RUNNER_ARGS[@]}; i++)); do
@@ -1094,6 +1248,8 @@ EOF
 
 if [[ "$RUNNER_SUITE" == "stream-v2-failover" ]]; then
   run_failover_suite_isolated "$REPORT_PATH"
+elif [[ "$RUNNER_SUITE" == "topic-adapters-failover" ]]; then
+  run_topic_adapter_failover_suite_isolated "$REPORT_PATH"
 else
   run_benchmark_runner -- "${RUNNER_ARGS[@]}"
 fi

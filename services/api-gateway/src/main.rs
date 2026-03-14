@@ -1,4 +1,9 @@
-use std::{collections::{BTreeMap, HashMap}, convert::Infallible, env, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    convert::Infallible,
+    env,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -10,11 +15,16 @@ use axum::{
     routing::{get, post, put},
 };
 use chrono::Utc;
+use fabrik_broker::{JsonTopicConfig, load_json_topic_latest_offsets};
 use fabrik_config::{
     ExecutorRuntimeConfig, HttpServiceConfig, PostgresConfig, ThroughputRuntimeConfig,
 };
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
-use fabrik_store::{BulkBatchRoutingCount, TaskQueueKind, WorkflowRunFilters, WorkflowStore};
+use fabrik_store::{
+    BulkBatchRoutingCount, TaskQueueKind, TopicAdapterAction, TopicAdapterDeadLetterPolicy,
+    TopicAdapterKind, TopicAdapterUpsert, WorkflowRunFilters, WorkflowStore,
+    resolve_topic_adapter_dispatch,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -101,6 +111,66 @@ struct BulkBatchRuntimeControlRequest {
     is_paused: bool,
     #[serde(default)]
     reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TopicAdapterRequest {
+    adapter_kind: TopicAdapterKind,
+    brokers: String,
+    topic_name: String,
+    topic_partitions: i32,
+    action: TopicAdapterAction,
+    #[serde(default)]
+    definition_id: Option<String>,
+    #[serde(default)]
+    signal_type: Option<String>,
+    #[serde(default)]
+    workflow_task_queue: Option<String>,
+    #[serde(default)]
+    workflow_instance_id_json_pointer: Option<String>,
+    #[serde(default)]
+    payload_json_pointer: Option<String>,
+    #[serde(default)]
+    payload_template_json: Option<Value>,
+    #[serde(default)]
+    memo_json_pointer: Option<String>,
+    #[serde(default)]
+    memo_template_json: Option<Value>,
+    #[serde(default)]
+    search_attributes_json_pointer: Option<String>,
+    #[serde(default)]
+    search_attributes_template_json: Option<Value>,
+    #[serde(default)]
+    request_id_json_pointer: Option<String>,
+    #[serde(default)]
+    dedupe_key_json_pointer: Option<String>,
+    #[serde(default = "default_topic_adapter_dead_letter_policy")]
+    dead_letter_policy: TopicAdapterDeadLetterPolicy,
+    #[serde(default)]
+    is_paused: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct TopicAdapterDeadLetterQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TopicAdapterPreviewRequest {
+    payload: Value,
+    #[serde(default)]
+    partition_id: i32,
+    #[serde(default)]
+    log_offset: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct TopicAdapterLagPartition {
+    partition_id: i32,
+    committed_offset: Option<i64>,
+    latest_offset: i64,
+    lag_records: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -359,6 +429,31 @@ fn build_app(state: AppState, service_name: String) -> Router {
         get(watch_task_queue),
     )
     .route("/admin/tenants/{tenant_id}/task-queues", get(list_task_queues))
+    .route("/admin/tenants/{tenant_id}/topic-adapters", get(list_topic_adapters))
+    .route(
+        "/admin/tenants/{tenant_id}/topic-adapters/{adapter_id}",
+        get(get_topic_adapter).put(upsert_topic_adapter),
+    )
+    .route(
+        "/admin/tenants/{tenant_id}/topic-adapters/{adapter_id}/pause",
+        post(pause_topic_adapter),
+    )
+    .route(
+        "/admin/tenants/{tenant_id}/topic-adapters/{adapter_id}/resume",
+        post(resume_topic_adapter),
+    )
+    .route(
+        "/admin/tenants/{tenant_id}/topic-adapters/{adapter_id}/dead-letters",
+        get(list_topic_adapter_dead_letters),
+    )
+    .route(
+        "/admin/tenants/{tenant_id}/topic-adapters/{adapter_id}/preview",
+        post(preview_topic_adapter),
+    )
+    .route(
+        "/admin/tenants/{tenant_id}/topic-adapters/{adapter_id}/watch",
+        get(watch_topic_adapter),
+    )
     .route(
         "/admin/tenants/{tenant_id}/workflows/{workflow_instance_id}/runs/{run_id}/bulk-batches/{batch_id}/runtime-control",
         put(upsert_bulk_batch_runtime_control),
@@ -994,7 +1089,9 @@ async fn watch_workflow_run(
                                             "throughput_batch_delta",
                                             &consistency,
                                             &authoritative_source,
-                                            batch_body.get("projection_lag_ms").and_then(Value::as_i64),
+                                            batch_body
+                                                .get("projection_lag_ms")
+                                                .and_then(Value::as_i64),
                                             cursor.clone(),
                                             delta_body,
                                         )
@@ -1007,8 +1104,9 @@ async fn watch_workflow_run(
                                     }
                                 }
                             }
-                            last_batch_deltas
-                                .retain(|batch_id, _| current_batch_ids.iter().any(|current| current == batch_id));
+                            last_batch_deltas.retain(|batch_id, _| {
+                                current_batch_ids.iter().any(|current| current == batch_id)
+                            });
                         }
                         if watch_closed {
                             break;
@@ -1125,6 +1223,70 @@ async fn send_watch_event(
         Err(_) => Event::default().event("watch_error").data("failed to encode watch event"),
     };
     tx.send(Ok(event)).await.is_err()
+}
+
+async fn topic_adapter_lag_snapshot(
+    adapter: &fabrik_store::TopicAdapterRecord,
+    offsets: &[fabrik_store::TopicAdapterOffsetRecord],
+) -> Value {
+    let latest_offsets = match tokio::time::timeout(
+        Duration::from_millis(500),
+        load_json_topic_latest_offsets(
+            &JsonTopicConfig::new(
+                adapter.brokers.clone(),
+                adapter.topic_name.clone(),
+                adapter.topic_partitions,
+            ),
+            &format!("api-gateway-topic-adapter-lag-{}", adapter.adapter_id),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(offsets)) => offsets,
+        Ok(Err(error)) => {
+            return json!({
+                "available": false,
+                "error": error.to_string(),
+                "total_lag_records": Value::Null,
+                "partitions": [],
+            });
+        }
+        Err(_) => {
+            return json!({
+                "available": false,
+                "error": "lag lookup timed out".to_owned(),
+                "total_lag_records": Value::Null,
+                "partitions": [],
+            });
+        }
+    };
+    let committed_by_partition = offsets
+        .iter()
+        .map(|offset| (offset.partition_id, offset.log_offset))
+        .collect::<HashMap<_, _>>();
+    let partitions = latest_offsets
+        .into_iter()
+        .map(|offset| {
+            let committed = committed_by_partition.get(&offset.partition_id).copied();
+            let lag_records = match committed {
+                Some(committed) => (offset.latest_offset - committed).max(0),
+                None if offset.latest_offset >= 0 => offset.latest_offset.saturating_add(1),
+                None => 0,
+            };
+            TopicAdapterLagPartition {
+                partition_id: offset.partition_id,
+                committed_offset: committed,
+                latest_offset: offset.latest_offset,
+                lag_records,
+            }
+        })
+        .collect::<Vec<_>>();
+    let total_lag_records = partitions.iter().map(|partition| partition.lag_records).sum::<i64>();
+    json!({
+        "available": true,
+        "total_lag_records": total_lag_records,
+        "partitions": partitions,
+    })
 }
 
 async fn query_json(state: &AppState, path: &str) -> Result<Value> {
@@ -1351,6 +1513,375 @@ async fn get_workflow_routing(
     }))
 }
 
+async fn list_topic_adapters(
+    Path(tenant_id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let adapters =
+        state.store.list_topic_adapters_for_tenant(&tenant_id).await.map_err(internal_error)?;
+    Ok(Json(serde_json::to_value(adapters).expect("topic adapters serialize")))
+}
+
+async fn get_topic_adapter(
+    Path((tenant_id, adapter_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let adapter = state
+        .store
+        .get_topic_adapter(&tenant_id, &adapter_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("topic adapter {adapter_id} not found for tenant {tenant_id}"),
+            )
+        })?;
+    let offsets = state
+        .store
+        .load_topic_adapter_offsets(&tenant_id, &adapter_id)
+        .await
+        .map_err(internal_error)?;
+    let dead_letters = state
+        .store
+        .list_topic_adapter_dead_letters(&tenant_id, &adapter_id, 20, 0)
+        .await
+        .map_err(internal_error)?;
+    let ownership = state
+        .store
+        .get_topic_adapter_ownership(&tenant_id, &adapter_id)
+        .await
+        .map_err(internal_error)?;
+    let lag = topic_adapter_lag_snapshot(&adapter, &offsets).await;
+    Ok(Json(json!({
+        "adapter": adapter,
+        "offsets": offsets,
+        "recent_dead_letters": dead_letters,
+        "ownership": ownership,
+        "lag": lag,
+        "watch_cursor": Utc::now().to_rfc3339(),
+    })))
+}
+
+async fn upsert_topic_adapter(
+    Path((tenant_id, adapter_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<TopicAdapterRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    validate_topic_adapter_request(&request)?;
+    let record = state
+        .store
+        .upsert_topic_adapter(&TopicAdapterUpsert {
+            tenant_id,
+            adapter_id,
+            adapter_kind: request.adapter_kind,
+            brokers: request.brokers,
+            topic_name: request.topic_name,
+            topic_partitions: request.topic_partitions,
+            action: request.action,
+            definition_id: request.definition_id,
+            signal_type: request.signal_type,
+            workflow_task_queue: request.workflow_task_queue,
+            workflow_instance_id_json_pointer: request.workflow_instance_id_json_pointer,
+            payload_json_pointer: request.payload_json_pointer,
+            payload_template_json: request.payload_template_json,
+            memo_json_pointer: request.memo_json_pointer,
+            memo_template_json: request.memo_template_json,
+            search_attributes_json_pointer: request.search_attributes_json_pointer,
+            search_attributes_template_json: request.search_attributes_template_json,
+            request_id_json_pointer: request.request_id_json_pointer,
+            dedupe_key_json_pointer: request.dedupe_key_json_pointer,
+            dead_letter_policy: request.dead_letter_policy,
+            is_paused: request.is_paused,
+        })
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(serde_json::to_value(record).expect("topic adapter serializes")))
+}
+
+async fn pause_topic_adapter(
+    Path((tenant_id, adapter_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let record = state
+        .store
+        .set_topic_adapter_paused(&tenant_id, &adapter_id, true)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("topic adapter {adapter_id} not found for tenant {tenant_id}"),
+            )
+        })?;
+    Ok(Json(serde_json::to_value(record).expect("topic adapter serializes")))
+}
+
+async fn resume_topic_adapter(
+    Path((tenant_id, adapter_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let record = state
+        .store
+        .set_topic_adapter_paused(&tenant_id, &adapter_id, false)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("topic adapter {adapter_id} not found for tenant {tenant_id}"),
+            )
+        })?;
+    Ok(Json(serde_json::to_value(record).expect("topic adapter serializes")))
+}
+
+async fn list_topic_adapter_dead_letters(
+    Path((tenant_id, adapter_id)): Path<(String, String)>,
+    Query(query): Query<TopicAdapterDeadLetterQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let offset = query.offset.unwrap_or(0).max(0);
+    let items = state
+        .store
+        .list_topic_adapter_dead_letters(&tenant_id, &adapter_id, limit, offset)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(json!({
+        "tenant_id": tenant_id,
+        "adapter_id": adapter_id,
+        "items": items,
+        "limit": limit,
+        "offset": offset,
+    })))
+}
+
+async fn preview_topic_adapter(
+    Path((tenant_id, adapter_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<TopicAdapterPreviewRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let adapter = state
+        .store
+        .get_topic_adapter(&tenant_id, &adapter_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("topic adapter {adapter_id} not found for tenant {tenant_id}"),
+            )
+        })?;
+    let response = match resolve_topic_adapter_dispatch(
+        &adapter,
+        &request.payload,
+        request.partition_id,
+        request.log_offset,
+    ) {
+        Ok(preview) => json!({
+            "ok": true,
+            "dispatch": preview.dispatch,
+            "diagnostics": preview.diagnostics,
+            "error": Value::Null,
+        }),
+        Err(error) => json!({
+            "ok": false,
+            "dispatch": Value::Null,
+            "diagnostics": [],
+            "error": error,
+        }),
+    };
+    Ok(Json(response))
+}
+
+async fn watch_topic_adapter(
+    Path((tenant_id, adapter_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
+    let (tx, rx) = mpsc::channel(16);
+    spawn(async move {
+        let mut last_detail = None::<String>;
+        let mut last_lag = None::<String>;
+        let mut last_dead_letter = None::<String>;
+        let mut last_ownership = None::<fabrik_store::TopicAdapterOwnershipRecord>;
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            let adapter = state.store.get_topic_adapter(&tenant_id, &adapter_id).await;
+            if let Ok(Some(adapter)) = adapter {
+                let offsets = match state.store.load_topic_adapter_offsets(&tenant_id, &adapter_id).await {
+                    Ok(offsets) => offsets,
+                    Err(error) => {
+                        let _ = send_watch_event(
+                            &tx,
+                            "adapter_runtime_error",
+                            "eventual",
+                            "projection",
+                            None,
+                            Utc::now().to_rfc3339(),
+                            json!({ "error": error.to_string() }),
+                        )
+                        .await;
+                        interval.tick().await;
+                        continue;
+                    }
+                };
+                let dead_letters = match state
+                    .store
+                    .list_topic_adapter_dead_letters(&tenant_id, &adapter_id, 1, 0)
+                    .await
+                {
+                    Ok(dead_letters) => dead_letters,
+                    Err(error) => {
+                        let _ = send_watch_event(
+                            &tx,
+                            "adapter_runtime_error",
+                            "eventual",
+                            "projection",
+                            None,
+                            Utc::now().to_rfc3339(),
+                            json!({ "error": error.to_string() }),
+                        )
+                        .await;
+                        interval.tick().await;
+                        continue;
+                    }
+                };
+                let ownership = match state.store.get_topic_adapter_ownership(&tenant_id, &adapter_id).await {
+                    Ok(ownership) => ownership,
+                    Err(error) => {
+                        let _ = send_watch_event(
+                            &tx,
+                            "adapter_runtime_error",
+                            "eventual",
+                            "projection",
+                            None,
+                            Utc::now().to_rfc3339(),
+                            json!({ "error": error.to_string() }),
+                        )
+                        .await;
+                        interval.tick().await;
+                        continue;
+                    }
+                };
+                let lag = topic_adapter_lag_snapshot(&adapter, &offsets).await;
+
+                let cursor = Utc::now().to_rfc3339();
+                let detail_body = json!({
+                    "adapter": adapter,
+                    "offsets": offsets,
+                    "recent_dead_letters": dead_letters,
+                    "ownership": ownership,
+                    "lag": lag,
+                    "watch_cursor": cursor,
+                });
+                if let Ok(encoded) = serde_json::to_string(&detail_body) {
+                    if last_detail.as_ref() != Some(&encoded) {
+                        if send_watch_event(
+                            &tx,
+                            "adapter_state_changed",
+                            "eventual",
+                            "projection",
+                            None,
+                            cursor.clone(),
+                            detail_body.clone(),
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        last_detail = Some(encoded);
+                    }
+                }
+
+                if ownership != last_ownership {
+                    let previous_owner_id =
+                        last_ownership.as_ref().map(|record| record.owner_id.clone());
+                    let previous_owner_epoch =
+                        last_ownership.as_ref().map(|record| record.owner_epoch);
+                    let ownership_body = json!({
+                        "adapter_id": adapter_id,
+                        "ownership": ownership,
+                        "previous_owner_id": previous_owner_id,
+                        "previous_owner_epoch": previous_owner_epoch,
+                        "change_kind": match (&last_ownership, &ownership) {
+                            (None, Some(_)) => "claimed",
+                            (Some(_), None) => "released",
+                            (Some(previous), Some(current))
+                                if previous.owner_id != current.owner_id
+                                    || previous.owner_epoch != current.owner_epoch => "handoff",
+                            _ => "lease_updated",
+                        }
+                    });
+                    if send_watch_event(
+                        &tx,
+                        "adapter_ownership_changed",
+                        "eventual",
+                        "projection",
+                        None,
+                        cursor.clone(),
+                        ownership_body,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    last_ownership = ownership.clone();
+                }
+
+                let lag_body = json!({
+                    "adapter_id": adapter_id,
+                    "lag": lag,
+                });
+                if let Ok(encoded) = serde_json::to_string(&lag_body) {
+                    if last_lag.as_ref() != Some(&encoded) {
+                        if send_watch_event(
+                            &tx,
+                            "adapter_lag",
+                            "eventual",
+                            "broker",
+                            None,
+                            cursor.clone(),
+                            lag_body,
+                        )
+                        .await
+                        {
+                            break;
+                        }
+                        last_lag = Some(encoded);
+                    }
+                }
+
+                if let Some(dead_letter) = detail_body
+                    .get("recent_dead_letters")
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.first())
+                {
+                    if let Ok(encoded) = serde_json::to_string(dead_letter) {
+                        if last_dead_letter.as_ref() != Some(&encoded) {
+                            if send_watch_event(
+                                &tx,
+                                "adapter_dead_letter",
+                                "eventual",
+                                "projection",
+                                None,
+                                cursor,
+                                dead_letter.clone(),
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                            last_dead_letter = Some(encoded);
+                        }
+                    }
+                }
+            }
+            interval.tick().await;
+        }
+    });
+    Sse::new(ReceiverStream::new(rx))
+}
+
 async fn proxy_request(
     client: Client,
     base_url: String,
@@ -1402,6 +1933,46 @@ fn parse_queue_kind(raw: &str) -> Result<TaskQueueKind, (StatusCode, String)> {
         "activity" => Ok(TaskQueueKind::Activity),
         _ => Err((StatusCode::BAD_REQUEST, format!("unknown queue kind {raw}"))),
     }
+}
+
+fn default_topic_adapter_dead_letter_policy() -> TopicAdapterDeadLetterPolicy {
+    TopicAdapterDeadLetterPolicy::Store
+}
+
+fn validate_topic_adapter_request(
+    request: &TopicAdapterRequest,
+) -> Result<(), (StatusCode, String)> {
+    if request.topic_partitions <= 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "topic_partitions must be greater than zero".to_owned(),
+        ));
+    }
+    match request.action {
+        TopicAdapterAction::StartWorkflow => {
+            if request.definition_id.as_deref().is_none_or(str::is_empty) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "start_workflow adapters require definition_id".to_owned(),
+                ));
+            }
+        }
+        TopicAdapterAction::SignalWorkflow => {
+            if request.signal_type.as_deref().is_none_or(str::is_empty) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "signal_workflow adapters require signal_type".to_owned(),
+                ));
+            }
+            if request.workflow_instance_id_json_pointer.as_deref().is_none_or(str::is_empty) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "signal_workflow adapters require workflow_instance_id_json_pointer".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn queue_kind_label(queue_kind: &TaskQueueKind) -> &'static str {
@@ -1965,6 +2536,129 @@ mod tests {
         assert_eq!(inspection["admission"]["effective_preferred_backend"], "stream-v2");
         assert_eq!(inspection["admission"]["stream_v2_capacity"]["state"], "available");
         assert_eq!(inspection["admission"]["configured_default_backend"], "pg-v1");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gateway_admin_endpoints_manage_topic_adapters() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let app = build_app(
+            AppState {
+                client: Client::new(),
+                ingest_base: "http://127.0.0.1:1".to_owned(),
+                query_base: "http://127.0.0.1:1".to_owned(),
+                matching_base: "http://127.0.0.1:1".to_owned(),
+                store: store.clone(),
+                admission: test_admission_config(),
+            },
+            "api-gateway-test".to_owned(),
+        );
+
+        let upsert_response = app
+            .clone()
+            .oneshot(
+                Request::put("/admin/tenants/tenant-a/topic-adapters/orders")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"adapter_kind":"redpanda","brokers":"127.0.0.1:9092","topic_name":"orders.events","topic_partitions":3,"action":"start_workflow","definition_id":"order-workflow","workflow_task_queue":"orders","payload_json_pointer":"/payload","payload_template_json":{"order":{"$from":"/payload"},"request":{"$from":"/request_id"}},"request_id_json_pointer":"/request_id"}"#,
+                    ))
+                    .expect("topic adapter upsert request"),
+            )
+            .await?;
+        assert_eq!(upsert_response.status(), StatusCode::OK);
+
+        store.record_topic_adapter_success("tenant-a", "orders", 0, 11, Utc::now()).await?;
+        store
+            .record_topic_adapter_dead_letter(
+                "tenant-a",
+                "orders",
+                1,
+                7,
+                Some("order-7"),
+                &json!({"bad": true}),
+                "400: missing required field input",
+                Utc::now(),
+            )
+            .await?;
+
+        let list_response = app
+            .clone()
+            .oneshot(
+                Request::get("/admin/tenants/tenant-a/topic-adapters")
+                    .body(Body::empty())
+                    .expect("topic adapter list request"),
+            )
+            .await?;
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body = to_bytes(list_response.into_body(), usize::MAX).await?;
+        let list_json: Value = serde_json::from_slice(&list_body)?;
+        assert_eq!(list_json[0]["adapter_id"], "orders");
+        assert_eq!(list_json[0]["processed_count"], 1);
+        assert_eq!(list_json[0]["failed_count"], 1);
+
+        let get_response = app
+            .clone()
+            .oneshot(
+                Request::get("/admin/tenants/tenant-a/topic-adapters/orders")
+                    .body(Body::empty())
+                    .expect("topic adapter get request"),
+            )
+            .await?;
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let get_body = to_bytes(get_response.into_body(), usize::MAX).await?;
+        let get_json: Value = serde_json::from_slice(&get_body)?;
+        assert_eq!(get_json["adapter"]["topic_name"], "orders.events");
+        assert_eq!(get_json["adapter"]["payload_template_json"]["order"]["$from"], "/payload");
+        assert_eq!(get_json["offsets"][0]["partition_id"], 0);
+        assert_eq!(get_json["recent_dead_letters"][0]["partition_id"], 1);
+
+        let preview_response = app
+            .clone()
+            .oneshot(
+                Request::post("/admin/tenants/tenant-a/topic-adapters/orders/preview")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"payload":{"payload":{"amount":125},"request_id":"req-42"},"partition_id":0,"log_offset":7}"#,
+                    ))
+                    .expect("topic adapter preview request"),
+            )
+            .await?;
+        assert_eq!(preview_response.status(), StatusCode::OK);
+        let preview_body = to_bytes(preview_response.into_body(), usize::MAX).await?;
+        let preview_json: Value = serde_json::from_slice(&preview_body)?;
+        assert_eq!(preview_json["ok"], true);
+        assert_eq!(preview_json["dispatch"]["action"], "start_workflow");
+        assert_eq!(preview_json["dispatch"]["input"]["order"]["amount"], 125);
+        assert_eq!(preview_json["dispatch"]["request_id"], "req-42");
+        assert!(preview_json["diagnostics"].as_array().is_some_and(|diagnostics| diagnostics
+            .iter()
+            .any(|entry| entry["field"] == "input" && entry["mode"] == "template")));
+
+        let pause_response = app
+            .clone()
+            .oneshot(
+                Request::post("/admin/tenants/tenant-a/topic-adapters/orders/pause")
+                    .body(Body::empty())
+                    .expect("topic adapter pause request"),
+            )
+            .await?;
+        assert_eq!(pause_response.status(), StatusCode::OK);
+
+        let dead_letters_response = app
+            .oneshot(
+                Request::get("/admin/tenants/tenant-a/topic-adapters/orders/dead-letters")
+                    .body(Body::empty())
+                    .expect("topic adapter dead letters request"),
+            )
+            .await?;
+        assert_eq!(dead_letters_response.status(), StatusCode::OK);
+        let dead_letters_body = to_bytes(dead_letters_response.into_body(), usize::MAX).await?;
+        let dead_letters_json: Value = serde_json::from_slice(&dead_letters_body)?;
+        assert_eq!(dead_letters_json["items"][0]["record_key"], "order-7");
 
         Ok(())
     }

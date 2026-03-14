@@ -18,6 +18,7 @@ use rskafka::{
     client::{
         Client, ClientBuilder,
         consumer::{StartOffset, StreamConsumer, StreamConsumerBuilder},
+        partition::OffsetAt,
         partition::UnknownTopicHandling,
         producer::{BatchProducer, BatchProducerBuilder, aggregator::RecordAggregator},
     },
@@ -71,6 +72,12 @@ pub struct JsonTopicConfig {
     pub brokers: String,
     pub topic_name: String,
     pub partitions: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TopicPartitionOffset {
+    pub partition_id: i32,
+    pub latest_offset: i64,
 }
 
 impl JsonTopicConfig {
@@ -573,6 +580,43 @@ pub async fn describe_workflow_topic(
         .await
         .context("failed to create kafka client")?;
     describe_workflow_topic_with_client(config, &client).await
+}
+
+pub async fn load_json_topic_latest_offsets(
+    config: &JsonTopicConfig,
+    client_id: &str,
+) -> Result<Vec<TopicPartitionOffset>> {
+    let client = ClientBuilder::new(vec![config.brokers.clone()])
+        .client_id(client_id)
+        .build()
+        .await
+        .context("failed to create kafka client")?;
+    ensure_topic(&client, &config.topic_name, config.partitions).await?;
+
+    let mut offsets = Vec::with_capacity(config.partitions as usize);
+    for partition_id in 0..config.partitions {
+        let partition_client = client
+            .partition_client(config.topic_name.clone(), partition_id, UnknownTopicHandling::Retry)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to create partition client for topic {} partition {partition_id}",
+                    config.topic_name
+                )
+            })?;
+        let latest_offset = partition_client
+            .get_offset(OffsetAt::Latest)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to load latest offset for topic {} partition {partition_id}",
+                    config.topic_name
+                )
+            })?;
+        offsets.push(TopicPartitionOffset { partition_id, latest_offset });
+    }
+
+    Ok(offsets)
 }
 
 pub fn partition_for_key(key: &str, partition_count: i32) -> i32 {

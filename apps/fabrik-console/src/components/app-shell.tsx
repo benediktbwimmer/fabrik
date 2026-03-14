@@ -1,4 +1,4 @@
-import { Activity, GitBranch, Home, Radar, RefreshCcw, Search, Workflow } from "lucide-react";
+import { Activity, GitBranch, Home, Radar, Radio, RefreshCcw, Search, Workflow } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 
@@ -13,7 +13,8 @@ const NAV_ITEMS = [
   { to: "/replay", label: "Replay", icon: RefreshCcw, chord: "G P" },
   { to: "/builds", label: "Builds", icon: GitBranch, chord: "G B" },
   { to: "/conformance", label: "Conformance", icon: Search, chord: "G C" },
-  { to: "/task-queues", label: "Task Queues", icon: Radar, chord: "G Q" }
+  { to: "/task-queues", label: "Task Queues", icon: Radar, chord: "G Q" },
+  { to: "/topic-adapters", label: "Topic Adapters", icon: Radio, chord: "G T" }
 ];
 
 export function AppShell() {
@@ -51,6 +52,7 @@ export function AppShell() {
             b: "/builds",
             c: "/conformance",
             q: "/task-queues",
+            t: "/topic-adapters",
           }[next.key.toLowerCase()];
           if (nav) navigate(nav);
         };

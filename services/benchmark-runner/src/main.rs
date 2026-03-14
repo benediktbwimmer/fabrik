@@ -7,8 +7,16 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
+use fabrik_broker::{JsonTopicConfig, JsonTopicPublisher, load_json_topic_latest_offsets};
 use fabrik_config::PostgresConfig;
-use fabrik_throughput::{PG_V1_BACKEND, STREAM_V2_BACKEND};
+use fabrik_store::{
+    TopicAdapterAction, TopicAdapterDeadLetterPolicy, TopicAdapterKind, TopicAdapterOffsetRecord,
+    TopicAdapterRecord, TopicAdapterUpsert, WorkflowStore,
+};
+use fabrik_throughput::{
+    BENCHMARK_ECHO_ACTIVITY, BENCHMARK_FAST_COUNT_ACTIVITY, PG_V1_BACKEND, STREAM_V2_BACKEND,
+    benchmark_compact_input_spec,
+};
 use fabrik_workflow::{
     ArtifactEntrypoint, Assignment, CompiledStateNode, CompiledWorkflow, CompiledWorkflowArtifact,
     ErrorTransition, Expression, RetryPolicy,
@@ -22,6 +30,8 @@ use uuid::Uuid;
 const DEFAULT_POLL_INTERVAL_MS: u64 = 250;
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_STREAM_PROJECTION_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_ADAPTER_READY_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_ADAPTER_FAILOVER_OBSERVATION_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Debug, Clone)]
 struct BenchmarkProfile {
@@ -35,6 +45,13 @@ enum ExecutionMode {
     Durable,
     Throughput,
     Unified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BenchmarkIngressDriver {
+    HttpTrigger,
+    TopicAdapterStart,
+    TopicAdapterSignal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,11 +102,14 @@ struct Args {
     payload_size: usize,
     retry_rate: f64,
     cancel_rate: f64,
+    retry_delay_ms: u64,
     tenant_id: String,
     task_queue: String,
     execution_mode: ExecutionMode,
     throughput_backend: Option<String>,
+    ingress_driver: BenchmarkIngressDriver,
     workload_kind: BenchmarkWorkloadKind,
+    activity_type: String,
     bulk_reducer: String,
     chunk_size: u32,
     timer_secs: u32,
@@ -114,6 +134,7 @@ struct BenchmarkReport {
     payload_size: usize,
     retry_rate: f64,
     cancel_rate: f64,
+    retry_delay_ms: u64,
     definition_id: String,
     task_queue: String,
     execution_mode: ExecutionMode,
@@ -143,8 +164,26 @@ struct BenchmarkReport {
     throughput_projector_debug_delta: Option<Value>,
     batch_routing_metrics: BatchRoutingMetrics,
     failover_injection: Option<FailoverInjectionMetrics>,
+    adapter_metrics: Option<AdapterMetrics>,
     control_plane_metrics: Option<ControlPlaneMetrics>,
     executor_debug_delta_metrics: Option<ExecutorDebugDeltaMetrics>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdapterMetrics {
+    ingress_driver: String,
+    adapter_id: String,
+    topic_name: String,
+    topic_partitions: i32,
+    processed_count: u64,
+    failed_count: u64,
+    final_lag_records: i64,
+    max_lag_records: i64,
+    ownership_handoff_count: u64,
+    last_takeover_latency_ms: Option<u64>,
+    last_handoff_at: Option<DateTime<Utc>>,
+    owner_id: Option<String>,
+    owner_epoch: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -319,6 +358,9 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
     let postgres = PostgresConfig::from_env()?;
     let pool = PgPool::connect(&postgres.url).await.context("failed to connect to postgres")?;
     let client = Client::new();
+    let store = WorkflowStore::connect(&postgres.url)
+        .await
+        .context("failed to connect benchmark workflow store")?;
 
     let ingest_base =
         env::var("INGEST_SERVICE_URL").unwrap_or_else(|_| "http://127.0.0.1:3001".to_owned());
@@ -328,6 +370,20 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         env::var("THROUGHPUT_PROJECTOR_URL").unwrap_or_else(|_| "http://127.0.0.1:3007".to_owned());
     let unified_runtime_debug_base = env::var("UNIFIED_RUNTIME_DEBUG_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:3008".to_owned());
+
+    if args.ingress_driver != BenchmarkIngressDriver::HttpTrigger {
+        return run_topic_adapter_benchmark(
+            args,
+            &pool,
+            &store,
+            &client,
+            &ingest_base,
+            &throughput_runtime_debug_base,
+            &throughput_projector_base,
+            &unified_runtime_debug_base,
+        )
+        .await;
+    }
 
     let scenario_name = scenario_name(args);
     let definition_id = benchmark_definition_id(args, &scenario_name);
@@ -580,6 +636,7 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         payload_size: args.payload_size,
         retry_rate: args.retry_rate,
         cancel_rate: args.cancel_rate,
+        retry_delay_ms: args.retry_delay_ms,
         definition_id,
         task_queue: args.task_queue.clone(),
         execution_mode: args.execution_mode,
@@ -616,7 +673,664 @@ async fn run_benchmark(args: &Args) -> Result<BenchmarkReport> {
         failover_injection,
         control_plane_metrics,
         executor_debug_delta_metrics,
+        adapter_metrics: None,
     })
+}
+
+async fn run_topic_adapter_benchmark(
+    args: &Args,
+    pool: &PgPool,
+    store: &WorkflowStore,
+    client: &Client,
+    ingest_base: &str,
+    throughput_runtime_debug_base: &str,
+    throughput_projector_base: &str,
+    unified_runtime_debug_base: &str,
+) -> Result<BenchmarkReport> {
+    let redpanda_brokers = env::var("REDPANDA_BROKERS")
+        .context("topic adapter benchmark requires REDPANDA_BROKERS in the environment")?;
+    let scenario_name = scenario_name(args);
+    let definition_id = benchmark_definition_id(args, &scenario_name);
+    let instance_prefix =
+        format!("fanout-{}-{}-{}", args.profile_name, scenario_name, Uuid::now_v7());
+
+    if args.execution_mode == ExecutionMode::Throughput {
+        apply_task_queue_throughput_policy(
+            pool,
+            &args.tenant_id,
+            &args.task_queue,
+            args.throughput_backend.as_deref(),
+        )
+        .await?;
+    }
+
+    for artifact in benchmark_artifacts(&definition_id, &args.task_queue, args) {
+        publish_artifact(client, ingest_base, &args.tenant_id, &artifact).await?;
+    }
+
+    if args.ingress_driver == BenchmarkIngressDriver::TopicAdapterSignal {
+        for workflow_index in 0..args.profile.workflow_count {
+            let instance_id = format!("{instance_prefix}-{workflow_index:04}");
+            let input = benchmark_input(
+                args,
+                args.profile.activities_per_workflow,
+                args.payload_size,
+                args.retry_rate,
+                args.cancel_rate,
+                &instance_id,
+            );
+            trigger_workflow(
+                client,
+                ingest_base,
+                &definition_id,
+                &args.tenant_id,
+                &instance_id,
+                &args.task_queue,
+                input,
+            )
+            .await?;
+        }
+        wait_for_signal_gate_ready(
+            pool,
+            &args.tenant_id,
+            &instance_prefix,
+            args.profile.workflow_count as u64,
+            Duration::from_secs(DEFAULT_ADAPTER_READY_TIMEOUT_SECS),
+        )
+        .await?;
+    }
+
+    let adapter = upsert_benchmark_topic_adapter(
+        store,
+        &redpanda_brokers,
+        &args.tenant_id,
+        &args.task_queue,
+        &definition_id,
+        &scenario_name,
+        args,
+    )
+    .await?;
+    let topic_config = JsonTopicConfig::new(
+        adapter.brokers.clone(),
+        adapter.topic_name.clone(),
+        adapter.topic_partitions,
+    );
+    let topic_publisher = JsonTopicPublisher::<Value>::new(
+        &topic_config,
+        &format!("benchmark-runner-topic-{}", Uuid::now_v7()),
+    )
+    .await
+    .context("failed to create topic adapter benchmark publisher")?;
+    wait_for_topic_adapter_ready(
+        store,
+        &args.tenant_id,
+        &adapter.adapter_id,
+        Duration::from_secs(DEFAULT_ADAPTER_READY_TIMEOUT_SECS),
+    )
+    .await?;
+    let initial_ownership = store
+        .get_topic_adapter_ownership(&args.tenant_id, &adapter.adapter_id)
+        .await
+        .context("failed to load initial benchmark topic adapter ownership")?
+        .context("benchmark topic adapter missing ownership after readiness")?;
+    write_failover_arm_file_if_configured(&initial_ownership.owner_id)?;
+
+    let started_at = Utc::now();
+    let started = Instant::now();
+    let executor_debug_url = format!("{unified_runtime_debug_base}/debug/unified");
+    let executor_debug_before = Some(fetch_optional_debug(client, &executor_debug_url).await);
+    let throughput_runtime_debug_before = if args.execution_mode == ExecutionMode::Throughput
+        && args.throughput_backend.as_deref() == Some(STREAM_V2_BACKEND)
+    {
+        Some(
+            fetch_optional_debug(
+                client,
+                &format!("{throughput_runtime_debug_base}/debug/throughput"),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let throughput_projector_debug_before = if args.execution_mode == ExecutionMode::Throughput
+        && args.throughput_backend.as_deref() == Some(STREAM_V2_BACKEND)
+    {
+        Some(
+            fetch_optional_debug(
+                client,
+                &format!("{throughput_projector_base}/debug/throughput-projector"),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+
+    publish_topic_adapter_inputs(
+        &topic_publisher,
+        args,
+        &instance_prefix,
+        &definition_id,
+        started_at,
+    )
+    .await?;
+
+    let mut max_workflow_backlog = 0_u64;
+    let mut max_activity_backlog = 0_u64;
+    let mut max_adapter_lag_records = 0_i64;
+    loop {
+        let outcomes =
+            workflow_outcomes(pool, &args.tenant_id, &instance_prefix, args.workload_kind).await?;
+        let (workflow_backlog, activity_backlog) = backlog_snapshot(
+            pool,
+            &args.tenant_id,
+            &instance_prefix,
+            args.workload_kind,
+            args.execution_mode,
+            args.throughput_backend.as_deref(),
+        )
+        .await?;
+        max_workflow_backlog = max_workflow_backlog.max(workflow_backlog);
+        max_activity_backlog = max_activity_backlog.max(activity_backlog);
+        let adapter_lag_records =
+            current_topic_adapter_lag_records(store, &adapter, &topic_config).await?;
+        max_adapter_lag_records = max_adapter_lag_records.max(adapter_lag_records);
+
+        if outcomes.completed + outcomes.failed + outcomes.cancelled
+            == args.profile.workflow_count as u64
+        {
+            break;
+        }
+        if started.elapsed() >= args.timeout {
+            bail!(
+                "timed out waiting for topic adapter benchmark completion: completed={} failed={} cancelled={} expected={}",
+                outcomes.completed,
+                outcomes.failed,
+                outcomes.cancelled,
+                args.profile.workflow_count
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(DEFAULT_POLL_INTERVAL_MS)).await;
+    }
+
+    let execution_completed_at = Utc::now();
+    let execution_duration_ms = started.elapsed().as_millis();
+
+    if args.execution_mode == ExecutionMode::Throughput
+        && args.throughput_backend.as_deref() == Some(STREAM_V2_BACKEND)
+    {
+        wait_for_stream_projection_convergence(
+            pool,
+            &args.tenant_id,
+            &instance_prefix,
+            args.workload_kind,
+            args.profile.workflow_count as u64,
+            (args.profile.workflow_count * args.profile.activities_per_workflow) as u64,
+            Duration::from_secs(DEFAULT_STREAM_PROJECTION_TIMEOUT_SECS),
+        )
+        .await?;
+    }
+    if topic_adapter_failover_expected(args) {
+        wait_for_topic_adapter_failover_observed(
+            store,
+            &args.tenant_id,
+            &adapter.adapter_id,
+            &initial_ownership.owner_id,
+            initial_ownership.owner_epoch,
+            Duration::from_secs(DEFAULT_ADAPTER_FAILOVER_OBSERVATION_TIMEOUT_SECS),
+        )
+        .await?;
+    }
+
+    let completed_at = Utc::now();
+    let duration_ms = started.elapsed().as_millis();
+    let projection_convergence_duration_ms = duration_ms.saturating_sub(execution_duration_ms);
+    let workflow_outcomes =
+        workflow_outcomes(pool, &args.tenant_id, &instance_prefix, args.workload_kind).await?;
+    let activity_metrics = activity_metrics(
+        pool,
+        &args.tenant_id,
+        &instance_prefix,
+        args.workload_kind,
+        duration_ms,
+        args.profile.workflow_count * args.profile.activities_per_workflow,
+        args.execution_mode,
+        args.throughput_backend.as_deref(),
+    )
+    .await?;
+    let coalescing_metrics =
+        coalescing_metrics(pool, &args.tenant_id, &instance_prefix, args.workload_kind).await?;
+    let batch_routing_metrics =
+        batch_routing_metrics(pool, &args.tenant_id, &instance_prefix, args.workload_kind).await?;
+    let (final_workflow_backlog, final_activity_backlog) = backlog_snapshot(
+        pool,
+        &args.tenant_id,
+        &instance_prefix,
+        args.workload_kind,
+        args.execution_mode,
+        args.throughput_backend.as_deref(),
+    )
+    .await?;
+    let executor_debug = client
+        .get(&executor_debug_url)
+        .send()
+        .await
+        .context("failed to fetch benchmark control-plane debug summary")?
+        .error_for_status()
+        .context("benchmark control-plane debug endpoint returned error")?
+        .json::<Value>()
+        .await
+        .context("failed to decode benchmark control-plane debug summary")?;
+    let executor_debug_after = Some(executor_debug.clone());
+    let executor_debug_delta = executor_debug_before
+        .as_ref()
+        .zip(executor_debug_after.as_ref())
+        .map(|(before, after)| json_numeric_delta(before, after));
+    let throughput_runtime_debug_after = if args.execution_mode == ExecutionMode::Throughput
+        && args.throughput_backend.as_deref() == Some(STREAM_V2_BACKEND)
+    {
+        Some(
+            fetch_optional_debug(
+                client,
+                &format!("{throughput_runtime_debug_base}/debug/throughput"),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let throughput_runtime_debug_delta = throughput_runtime_debug_before
+        .as_ref()
+        .zip(throughput_runtime_debug_after.as_ref())
+        .map(|(before, after)| json_numeric_delta(before, after));
+    let throughput_projector_debug_after = if args.execution_mode == ExecutionMode::Throughput
+        && args.throughput_backend.as_deref() == Some(STREAM_V2_BACKEND)
+    {
+        Some(
+            fetch_optional_debug(
+                client,
+                &format!("{throughput_projector_base}/debug/throughput-projector"),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let throughput_projector_debug_delta = throughput_projector_debug_before
+        .as_ref()
+        .zip(throughput_projector_debug_after.as_ref())
+        .map(|(before, after)| json_numeric_delta(before, after));
+    let (
+        bulk_batch_rows,
+        bulk_chunk_rows,
+        projection_batch_rows,
+        projection_chunk_rows,
+        max_aggregation_group_count,
+        grouped_batch_rows,
+    ) = bulk_metrics(pool, &args.tenant_id, &instance_prefix, args.workload_kind).await?;
+    let control_plane_metrics = control_plane_metrics(
+        throughput_runtime_debug_delta.as_ref(),
+        throughput_projector_debug_delta.as_ref(),
+        &activity_metrics,
+    );
+    let executor_debug_delta_metrics =
+        executor_debug_delta_metrics(executor_debug_delta.as_ref(), &activity_metrics);
+    let failover_injection = load_failover_injection_metrics()?;
+    let adapter_metrics =
+        Some(load_topic_adapter_metrics(store, &adapter, &topic_config, max_adapter_lag_records).await?);
+
+    Ok(BenchmarkReport {
+        scenario: scenario_name,
+        profile: args.profile_name.clone(),
+        started_at,
+        execution_completed_at,
+        completed_at,
+        execution_duration_ms,
+        projection_convergence_duration_ms,
+        duration_ms,
+        workflow_count: args.profile.workflow_count,
+        activities_per_workflow: args.profile.activities_per_workflow,
+        total_activities: args.profile.workflow_count * args.profile.activities_per_workflow,
+        worker_count: args.worker_count,
+        payload_size: args.payload_size,
+        retry_rate: args.retry_rate,
+        cancel_rate: args.cancel_rate,
+        retry_delay_ms: args.retry_delay_ms,
+        definition_id,
+        task_queue: args.task_queue.clone(),
+        execution_mode: args.execution_mode,
+        throughput_backend: args.throughput_backend.clone(),
+        bulk_reducer: args.bulk_reducer.clone(),
+        chunk_size: args.chunk_size,
+        instance_prefix,
+        workflow_outcomes,
+        activity_metrics,
+        coalescing_metrics,
+        backlog_metrics: BacklogMetrics {
+            final_workflow_backlog,
+            final_activity_backlog,
+            max_workflow_backlog,
+            max_activity_backlog,
+        },
+        bulk_batch_rows,
+        bulk_chunk_rows,
+        projection_batch_rows,
+        projection_chunk_rows,
+        max_aggregation_group_count,
+        grouped_batch_rows,
+        executor_debug,
+        executor_debug_before,
+        executor_debug_after,
+        executor_debug_delta,
+        throughput_runtime_debug_before,
+        throughput_runtime_debug: throughput_runtime_debug_after,
+        throughput_runtime_debug_delta,
+        throughput_projector_debug_before,
+        throughput_projector_debug: throughput_projector_debug_after,
+        throughput_projector_debug_delta,
+        batch_routing_metrics,
+        failover_injection,
+        adapter_metrics,
+        control_plane_metrics,
+        executor_debug_delta_metrics,
+    })
+}
+
+async fn wait_for_signal_gate_ready(
+    pool: &PgPool,
+    tenant_id: &str,
+    instance_prefix: &str,
+    expected_count: u64,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let ready = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM workflow_instances
+            WHERE tenant_id = $1
+              AND workflow_instance_id LIKE $2
+              AND state->>'current_state' = 'wait_signal'
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(format!("{instance_prefix}%"))
+        .fetch_one(pool)
+        .await
+        .context("failed to count signal-gate workflows waiting for signal")?;
+        if ready as u64 >= expected_count {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for signal-gate workflows to reach wait_signal: ready={} expected={}",
+                ready,
+                expected_count
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(DEFAULT_POLL_INTERVAL_MS)).await;
+    }
+}
+
+async fn upsert_benchmark_topic_adapter(
+    store: &WorkflowStore,
+    brokers: &str,
+    tenant_id: &str,
+    task_queue: &str,
+    definition_id: &str,
+    scenario_name: &str,
+    args: &Args,
+) -> Result<TopicAdapterRecord> {
+    let adapter_id = format!("adapter-{}-{}", scenario_name, Uuid::now_v7());
+    let topic_name = format!("benchmark.{}.{}", tenant_id.replace('_', "-"), adapter_id);
+    let action = match args.ingress_driver {
+        BenchmarkIngressDriver::TopicAdapterStart => TopicAdapterAction::StartWorkflow,
+        BenchmarkIngressDriver::TopicAdapterSignal => TopicAdapterAction::SignalWorkflow,
+        BenchmarkIngressDriver::HttpTrigger => bail!("http trigger benchmark cannot upsert topic adapter"),
+    };
+    store
+        .upsert_topic_adapter(&TopicAdapterUpsert {
+            tenant_id: tenant_id.to_owned(),
+            adapter_id,
+            adapter_kind: TopicAdapterKind::Redpanda,
+            brokers: brokers.to_owned(),
+            topic_name,
+            topic_partitions: 1,
+            action,
+            definition_id: (args.ingress_driver == BenchmarkIngressDriver::TopicAdapterStart)
+                .then(|| definition_id.to_owned()),
+            signal_type: (args.ingress_driver == BenchmarkIngressDriver::TopicAdapterSignal)
+                .then(|| "approve".to_owned()),
+            workflow_task_queue: Some(task_queue.to_owned()),
+            workflow_instance_id_json_pointer: Some("/instance_id".to_owned()),
+            payload_json_pointer: Some("/payload".to_owned()),
+            payload_template_json: None,
+            memo_json_pointer: None,
+            memo_template_json: None,
+            search_attributes_json_pointer: None,
+            search_attributes_template_json: None,
+            request_id_json_pointer: Some("/request_id".to_owned()),
+            dedupe_key_json_pointer: None,
+            dead_letter_policy: TopicAdapterDeadLetterPolicy::Store,
+            is_paused: false,
+        })
+        .await
+        .context("failed to upsert benchmark topic adapter")
+}
+
+async fn wait_for_topic_adapter_ready(
+    store: &WorkflowStore,
+    tenant_id: &str,
+    adapter_id: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(ownership) = store
+            .get_topic_adapter_ownership(tenant_id, adapter_id)
+            .await
+            .context("failed to load topic adapter ownership during readiness check")?
+        {
+            if ownership.is_active_at(Utc::now()) {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for topic adapter {tenant_id}/{adapter_id} to become owned");
+        }
+        tokio::time::sleep(Duration::from_millis(DEFAULT_POLL_INTERVAL_MS)).await;
+    }
+}
+
+async fn publish_topic_adapter_inputs(
+    publisher: &JsonTopicPublisher<Value>,
+    args: &Args,
+    instance_prefix: &str,
+    definition_id: &str,
+    started_at: DateTime<Utc>,
+) -> Result<()> {
+    for workflow_index in 0..args.profile.workflow_count {
+        let instance_id = format!("{instance_prefix}-{workflow_index:04}");
+        let payload = match args.ingress_driver {
+            BenchmarkIngressDriver::TopicAdapterStart => json!({
+                "instance_id": instance_id,
+                "request_id": format!("adapter-start:{definition_id}:{workflow_index}"),
+                "payload": benchmark_input(
+                    args,
+                    args.profile.activities_per_workflow,
+                    args.payload_size,
+                    args.retry_rate,
+                    args.cancel_rate,
+                    &instance_id,
+                ),
+                "published_at": started_at,
+            }),
+            BenchmarkIngressDriver::TopicAdapterSignal => json!({
+                "instance_id": instance_id,
+                "request_id": format!("adapter-signal:{definition_id}:{workflow_index}"),
+                "payload": { "approved": true },
+                "published_at": started_at,
+            }),
+            BenchmarkIngressDriver::HttpTrigger => bail!("http trigger benchmark cannot publish topic adapter input"),
+        };
+        publisher
+            .publish(&payload, &instance_id)
+            .await
+            .with_context(|| format!("failed to publish benchmark adapter input for {instance_id}"))?;
+    }
+    Ok(())
+}
+
+async fn current_topic_adapter_lag_records(
+    store: &WorkflowStore,
+    adapter: &TopicAdapterRecord,
+    topic_config: &JsonTopicConfig,
+) -> Result<i64> {
+    let offsets = store
+        .load_topic_adapter_offsets(&adapter.tenant_id, &adapter.adapter_id)
+        .await
+        .context("failed to load topic adapter offsets for lag check")?;
+    let latest_offsets = load_json_topic_latest_offsets(
+        topic_config,
+        &format!("benchmark-runner-adapter-lag-{}", adapter.adapter_id),
+    )
+    .await
+    .context("failed to load latest topic adapter offsets")?;
+    Ok(topic_adapter_total_lag_records(&offsets, &latest_offsets))
+}
+
+fn topic_adapter_total_lag_records(
+    offsets: &[TopicAdapterOffsetRecord],
+    latest_offsets: &[fabrik_broker::TopicPartitionOffset],
+) -> i64 {
+    let committed_by_partition =
+        offsets.iter().map(|offset| (offset.partition_id, offset.log_offset)).collect::<BTreeMap<_, _>>();
+    latest_offsets
+        .iter()
+        .map(|offset| match committed_by_partition.get(&offset.partition_id).copied() {
+            Some(committed) => (offset.latest_offset - committed).max(0),
+            None if offset.latest_offset >= 0 => offset.latest_offset.saturating_add(1),
+            None => 0,
+        })
+        .sum()
+}
+
+async fn load_topic_adapter_metrics(
+    store: &WorkflowStore,
+    adapter: &TopicAdapterRecord,
+    topic_config: &JsonTopicConfig,
+    max_lag_records: i64,
+) -> Result<AdapterMetrics> {
+    let adapter = store
+        .get_topic_adapter(&adapter.tenant_id, &adapter.adapter_id)
+        .await
+        .context("failed to load final benchmark topic adapter state")?
+        .context("benchmark topic adapter missing at completion")?;
+    let ownership = store
+        .get_topic_adapter_ownership(&adapter.tenant_id, &adapter.adapter_id)
+        .await
+        .context("failed to load final benchmark topic adapter ownership")?;
+    let offsets = store
+        .load_topic_adapter_offsets(&adapter.tenant_id, &adapter.adapter_id)
+        .await
+        .context("failed to load final benchmark topic adapter offsets")?;
+    let latest_offsets = load_json_topic_latest_offsets(
+        topic_config,
+        &format!("benchmark-runner-adapter-final-{}", adapter.adapter_id),
+    )
+    .await
+    .context("failed to load final benchmark topic latest offsets")?;
+    Ok(AdapterMetrics {
+        ingress_driver: match adapter.action {
+            TopicAdapterAction::StartWorkflow => "topic_adapter_start".to_owned(),
+            TopicAdapterAction::SignalWorkflow => "topic_adapter_signal".to_owned(),
+        },
+        adapter_id: adapter.adapter_id.clone(),
+        topic_name: adapter.topic_name.clone(),
+        topic_partitions: adapter.topic_partitions,
+        processed_count: adapter.processed_count,
+        failed_count: adapter.failed_count,
+        final_lag_records: topic_adapter_total_lag_records(&offsets, &latest_offsets),
+        max_lag_records,
+        ownership_handoff_count: adapter.ownership_handoff_count,
+        last_takeover_latency_ms: adapter.last_takeover_latency_ms,
+        last_handoff_at: adapter.last_handoff_at,
+        owner_id: ownership.as_ref().map(|record| record.owner_id.clone()),
+        owner_epoch: ownership.as_ref().map(|record| record.owner_epoch),
+    })
+}
+
+fn write_failover_arm_file_if_configured(owner_id: &str) -> Result<()> {
+    let path = match env::var("BENCHMARK_FAILOVER_ARM_PATH") {
+        Ok(value) if !value.is_empty() => PathBuf::from(value),
+        _ => return Ok(()),
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create benchmark failover arm directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let payload = json!({
+        "owner_id": owner_id,
+    });
+    fs::write(&path, serde_json::to_vec(&payload).context("failed to encode benchmark failover arm payload")?)
+        .with_context(|| {
+        format!(
+            "failed to write benchmark failover arm file {}",
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn topic_adapter_failover_expected(args: &Args) -> bool {
+    args.scenario_tag
+        .as_deref()
+        .is_some_and(|tag| tag.contains("owner-crash"))
+        && env::var("BENCHMARK_FAILOVER_INJECTION_PATH")
+            .map(|value| !value.is_empty())
+            .unwrap_or(false)
+}
+
+async fn wait_for_topic_adapter_failover_observed(
+    store: &WorkflowStore,
+    tenant_id: &str,
+    adapter_id: &str,
+    initial_owner_id: &str,
+    initial_owner_epoch: u64,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let adapter = store
+            .get_topic_adapter(tenant_id, adapter_id)
+            .await
+            .context("failed to load topic adapter while waiting for failover observation")?
+            .context("topic adapter missing while waiting for failover observation")?;
+        let ownership = store
+            .get_topic_adapter_ownership(tenant_id, adapter_id)
+            .await
+            .context("failed to load topic adapter ownership while waiting for failover observation")?;
+        if adapter.ownership_handoff_count > 0
+            || ownership
+                .as_ref()
+                .is_some_and(|record| {
+                    record.owner_epoch > initial_owner_epoch || record.owner_id != initial_owner_id
+                })
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for topic adapter {tenant_id}/{adapter_id} to observe failover from owner {initial_owner_id} epoch {initial_owner_epoch}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(DEFAULT_POLL_INTERVAL_MS)).await;
+    }
 }
 
 fn parse_args() -> Result<Args> {
@@ -628,10 +1342,12 @@ fn parse_args() -> Result<Args> {
     let mut payload_size = 128_usize;
     let mut retry_rate = 0.0_f64;
     let mut cancel_rate = 0.0_f64;
+    let mut retry_delay_ms = 1_000_u64;
     let mut tenant_id = "benchmark".to_owned();
     let mut task_queue = "default".to_owned();
     let mut execution_mode = ExecutionMode::Durable;
     let mut throughput_backend = None;
+    let ingress_driver = BenchmarkIngressDriver::HttpTrigger;
     let mut workload_kind = BenchmarkWorkloadKind::Fanout;
     let mut bulk_reducer = "collect_results".to_owned();
     let mut bulk_reducer_explicit = false;
@@ -654,6 +1370,9 @@ fn parse_args() -> Result<Args> {
             "--payload-size" => payload_size = value.parse().context("invalid --payload-size")?,
             "--retry-rate" => retry_rate = value.parse().context("invalid --retry-rate")?,
             "--cancel-rate" => cancel_rate = value.parse().context("invalid --cancel-rate")?,
+            "--retry-delay-ms" => {
+                retry_delay_ms = value.parse().context("invalid --retry-delay-ms")?
+            }
             "--tenant-id" => tenant_id = value,
             "--task-queue" => task_queue = value,
             "--execution-mode" => {
@@ -740,11 +1459,14 @@ fn parse_args() -> Result<Args> {
         payload_size,
         retry_rate,
         cancel_rate,
+        retry_delay_ms,
         tenant_id,
         task_queue,
         execution_mode,
         throughput_backend,
+        ingress_driver,
         workload_kind,
+        activity_type: BENCHMARK_ECHO_ACTIVITY.to_owned(),
         bulk_reducer,
         chunk_size,
         timer_secs,
@@ -1055,12 +1777,13 @@ fn insert_dispatch_graph(
     args: &Args,
 ) {
     let enable_retry = args.retry_rate > 0.0;
+    let activity_type = args.activity_type.clone();
     match args.execution_mode {
         ExecutionMode::Durable | ExecutionMode::Unified => {
             states.insert(
                 "dispatch".to_owned(),
                 CompiledStateNode::FanOut {
-                    activity_type: "benchmark.echo".to_owned(),
+                    activity_type: activity_type.clone(),
                     items: Expression::Member {
                         object: Box::new(Expression::Identifier { name: "input".to_owned() }),
                         property: "items".to_owned(),
@@ -1073,7 +1796,7 @@ fn insert_dispatch_graph(
                     reducer: Some(args.bulk_reducer.clone()),
                     retry: enable_retry.then_some(RetryPolicy {
                         max_attempts: 2,
-                        delay: "1s".to_owned(),
+                        delay: format!("{}ms", args.retry_delay_ms),
                         maximum_interval: None,
                         backoff_coefficient_millis: None,
                         non_retryable_error_types: Vec::new(),
@@ -1102,7 +1825,7 @@ fn insert_dispatch_graph(
             states.insert(
                 "dispatch".to_owned(),
                 CompiledStateNode::StartBulkActivity {
-                    activity_type: "benchmark.echo".to_owned(),
+                    activity_type,
                     items: Expression::Member {
                         object: Box::new(Expression::Identifier { name: "input".to_owned() }),
                         property: "items".to_owned(),
@@ -1120,7 +1843,7 @@ fn insert_dispatch_graph(
                     chunk_size: Some(args.chunk_size),
                     retry: enable_retry.then_some(RetryPolicy {
                         max_attempts: 2,
-                        delay: "1s".to_owned(),
+                        delay: format!("{}ms", args.retry_delay_ms),
                         maximum_interval: None,
                         backoff_coefficient_millis: None,
                         non_retryable_error_types: Vec::new(),
@@ -1180,9 +1903,12 @@ fn benchmark_input(
 ) -> Value {
     let retry_count = ((activities_per_workflow as f64) * retry_rate).round() as usize;
     let cancel_count = ((activities_per_workflow as f64) * cancel_rate).round() as usize;
-    let payload = "x".repeat(payload_size);
-    let mut object = serde_json::Map::from_iter([(
-        "items".to_owned(),
+    let items_value = if should_use_compact_benchmark_input(args, retry_count, cancel_count) {
+        benchmark_compact_input_spec(activities_per_workflow as u32)
+    } else if args.activity_type == BENCHMARK_FAST_COUNT_ACTIVITY {
+        Value::Array((0..activities_per_workflow).map(|_| Value::from(0)).collect())
+    } else {
+        let payload = "x".repeat(payload_size);
         Value::Array(
             (0..activities_per_workflow)
                 .map(|index| {
@@ -1205,8 +1931,9 @@ fn benchmark_input(
                     Value::Object(item)
                 })
                 .collect(),
-        ),
-    )]);
+        )
+    };
+    let mut object = serde_json::Map::from_iter([("items".to_owned(), items_value)]);
     if args.workload_kind == BenchmarkWorkloadKind::ContinueAsNew {
         object.insert("remaining".to_owned(), json!(args.continue_rounds));
     }
@@ -1215,6 +1942,22 @@ fn benchmark_input(
             .insert("child_instance_id".to_owned(), Value::String(format!("{instance_id}-child")));
     }
     Value::Object(object)
+}
+
+fn should_use_compact_benchmark_input(
+    args: &Args,
+    retry_count: usize,
+    cancel_count: usize,
+) -> bool {
+    args.execution_mode == ExecutionMode::Throughput
+        && args.throughput_backend.as_deref() == Some(STREAM_V2_BACKEND)
+        && matches!(args.bulk_reducer.as_str(), "count" | "all_settled")
+        && retry_count == 0
+        && cancel_count == 0
+        && matches!(
+            args.activity_type.as_str(),
+            BENCHMARK_ECHO_ACTIVITY | BENCHMARK_FAST_COUNT_ACTIVITY
+        )
 }
 
 async fn apply_task_queue_throughput_policy(
@@ -1365,6 +2108,22 @@ fn benchmark_suite_scenarios(args: &Args, suite_name: &str) -> Result<Vec<Args>>
 
             Ok(vec![count, settled])
         }
+        "stream-v2-fast-ceiling" => {
+            let mut ceiling = args.clone();
+            ceiling.suite_name = None;
+            ceiling.execution_mode = ExecutionMode::Throughput;
+            ceiling.throughput_backend = Some(STREAM_V2_BACKEND.to_owned());
+            ceiling.activity_type = BENCHMARK_FAST_COUNT_ACTIVITY.to_owned();
+            ceiling.bulk_reducer = "count".to_owned();
+            ceiling.payload_size = 0;
+            ceiling.retry_rate = 0.0;
+            ceiling.cancel_rate = 0.0;
+            ceiling.chunk_size = ceiling.chunk_size.max(256);
+            ceiling.profile.activities_per_workflow =
+                ceiling.profile.activities_per_workflow.max(4_096);
+            ceiling.scenario_tag = Some("fast-ceiling".to_owned());
+            Ok(vec![ceiling])
+        }
         "stream-v2-failover" => {
             let mut failover = args.clone();
             failover.suite_name = None;
@@ -1419,8 +2178,8 @@ fn benchmark_suite_scenarios(args: &Args, suite_name: &str) -> Result<Vec<Args>>
             Ok(vec![auto_small, auto_large, auto_materialized])
         }
         "streaming-reducers" => {
-            let reducers = ["sum", "min", "max", "avg", "histogram", "sample_errors"];
-            let mut scenarios = Vec::with_capacity(reducers.len() * 2);
+            let reducers = ["sum", "min", "max", "avg", "histogram"];
+            let mut scenarios = Vec::with_capacity((reducers.len() * 2) + 4);
             for reducer in reducers {
                 let mut pg = args.clone();
                 pg.suite_name = None;
@@ -1429,10 +2188,6 @@ fn benchmark_suite_scenarios(args: &Args, suite_name: &str) -> Result<Vec<Args>>
                 pg.bulk_reducer = reducer.to_owned();
                 pg.chunk_size = pg.chunk_size.min(64);
                 pg.profile.activities_per_workflow = pg.profile.activities_per_workflow.max(1_024);
-                if reducer == "sample_errors" {
-                    pg.retry_rate = pg.retry_rate.max(0.01);
-                    pg.cancel_rate = pg.cancel_rate.max(0.01);
-                }
                 pg.scenario_tag = Some(format!("{reducer}-pg-v1"));
                 scenarios.push(pg);
 
@@ -1444,17 +2199,92 @@ fn benchmark_suite_scenarios(args: &Args, suite_name: &str) -> Result<Vec<Args>>
                 stream.chunk_size = stream.chunk_size.min(64);
                 stream.profile.activities_per_workflow =
                     stream.profile.activities_per_workflow.max(1_024);
-                if reducer == "sample_errors" {
-                    stream.retry_rate = stream.retry_rate.max(0.01);
-                    stream.cancel_rate = stream.cancel_rate.max(0.01);
-                }
                 stream.scenario_tag = Some(format!("{reducer}-stream-v2"));
                 scenarios.push(stream);
             }
+
+            for backend in [PG_V1_BACKEND, STREAM_V2_BACKEND] {
+                let backend_tag = if backend == PG_V1_BACKEND { "pg-v1" } else { "stream-v2" };
+
+                let mut cancel_only = args.clone();
+                cancel_only.suite_name = None;
+                cancel_only.execution_mode = ExecutionMode::Throughput;
+                cancel_only.throughput_backend = Some(backend.to_owned());
+                cancel_only.bulk_reducer = "sample_errors".to_owned();
+                cancel_only.chunk_size = cancel_only.chunk_size.min(64);
+                cancel_only.profile.activities_per_workflow =
+                    cancel_only.profile.activities_per_workflow.max(1_024);
+                cancel_only.retry_rate = 0.0;
+                cancel_only.cancel_rate = cancel_only.cancel_rate.max(0.01);
+                cancel_only.scenario_tag = Some(format!("sample-errors-cancel-only-{backend_tag}"));
+                scenarios.push(cancel_only);
+
+                let mut retry_cancel = args.clone();
+                retry_cancel.suite_name = None;
+                retry_cancel.execution_mode = ExecutionMode::Throughput;
+                retry_cancel.throughput_backend = Some(backend.to_owned());
+                retry_cancel.bulk_reducer = "sample_errors".to_owned();
+                retry_cancel.chunk_size = retry_cancel.chunk_size.min(64);
+                retry_cancel.profile.activities_per_workflow =
+                    retry_cancel.profile.activities_per_workflow.max(1_024);
+                retry_cancel.retry_rate = retry_cancel.retry_rate.max(0.01);
+                retry_cancel.cancel_rate = retry_cancel.cancel_rate.max(0.01);
+                retry_cancel.retry_delay_ms = retry_cancel.retry_delay_ms.min(25);
+                retry_cancel.scenario_tag =
+                    Some(format!("sample-errors-retry-cancel-{backend_tag}"));
+                scenarios.push(retry_cancel);
+            }
             Ok(scenarios)
         }
+        "topic-adapters" => {
+            let mut start = args.clone();
+            start.suite_name = None;
+            start.execution_mode = ExecutionMode::Throughput;
+            start.throughput_backend = Some(STREAM_V2_BACKEND.to_owned());
+            start.ingress_driver = BenchmarkIngressDriver::TopicAdapterStart;
+            start.workload_kind = BenchmarkWorkloadKind::Fanout;
+            start.bulk_reducer = "all_settled".to_owned();
+            start.chunk_size = start.chunk_size.min(64);
+            start.profile.activities_per_workflow = start.profile.activities_per_workflow.max(512);
+            start.scenario_tag = Some("start-workflow".to_owned());
+
+            let mut signal = args.clone();
+            signal.suite_name = None;
+            signal.execution_mode = ExecutionMode::Throughput;
+            signal.throughput_backend = Some(STREAM_V2_BACKEND.to_owned());
+            signal.ingress_driver = BenchmarkIngressDriver::TopicAdapterSignal;
+            signal.workload_kind = BenchmarkWorkloadKind::SignalGate;
+            signal.bulk_reducer = "all_settled".to_owned();
+            signal.chunk_size = signal.chunk_size.min(64);
+            signal.profile.activities_per_workflow =
+                signal.profile.activities_per_workflow.max(512);
+            signal.scenario_tag = Some("signal-workflow".to_owned());
+
+            Ok(vec![start, signal])
+        }
+        "topic-adapters-failover" => {
+            let mut failover = args.clone();
+            failover.suite_name = None;
+            failover.execution_mode = ExecutionMode::Throughput;
+            failover.throughput_backend = Some(STREAM_V2_BACKEND.to_owned());
+            failover.ingress_driver = BenchmarkIngressDriver::TopicAdapterStart;
+            failover.workload_kind = BenchmarkWorkloadKind::Fanout;
+            failover.bulk_reducer = "all_settled".to_owned();
+            failover.chunk_size = failover.chunk_size.min(64);
+            failover.profile.workflow_count = failover.profile.workflow_count.max(12);
+            failover.profile.activities_per_workflow =
+                failover.profile.activities_per_workflow.max(4_096);
+            failover.scenario_tag = Some("owner-crash".to_owned());
+
+            let mut lag_under_load = failover.clone();
+            lag_under_load.profile.workflow_count = 256;
+            lag_under_load.profile.activities_per_workflow = 512;
+            lag_under_load.scenario_tag = Some("lag-under-load-owner-crash".to_owned());
+
+            Ok(vec![failover, lag_under_load])
+        }
         other => bail!(
-            "unknown suite {other}; expected streaming, stream-v2-robustness, stream-v2-fast-lane, stream-v2-failover, streaming-admission, or streaming-reducers"
+            "unknown suite {other}; expected streaming, stream-v2-robustness, stream-v2-fast-lane, stream-v2-fast-ceiling, stream-v2-failover, streaming-admission, streaming-reducers, topic-adapters, or topic-adapters-failover"
         ),
     }
 }
@@ -1467,10 +2297,7 @@ fn load_failover_injection_metrics() -> Result<Option<FailoverInjectionMetrics>>
     let payload = fs::read(&path)
         .with_context(|| format!("failed to read failover injection report {}", path.display()))?;
     let metrics = serde_json::from_slice(&payload).with_context(|| {
-        format!(
-            "failed to decode failover injection report {}",
-            path.display()
-        )
+        format!("failed to decode failover injection report {}", path.display())
     })?;
     Ok(Some(metrics))
 }
@@ -1496,6 +2323,11 @@ fn scenario_name(args: &Args) -> String {
         }
         ExecutionMode::Unified => "unified-experiment".to_owned(),
     };
+    match args.ingress_driver {
+        BenchmarkIngressDriver::HttpTrigger => {}
+        BenchmarkIngressDriver::TopicAdapterStart => scenario.push_str("-adapter-start"),
+        BenchmarkIngressDriver::TopicAdapterSignal => scenario.push_str("-adapter-signal"),
+    }
     if let Some(tag) = args.scenario_tag.as_deref() {
         scenario.push('-');
         scenario.push_str(tag);
@@ -2356,8 +3188,39 @@ fn summary_text(report: &BenchmarkReport) -> String {
             error,
         )
     }).unwrap_or_default();
+    let adapter = report.adapter_metrics.as_ref().map(|metrics| {
+        let last_takeover_latency_ms = metrics
+            .last_takeover_latency_ms
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_owned());
+        let last_handoff_at = metrics
+            .last_handoff_at
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_else(|| "n/a".to_owned());
+        let owner_id = metrics.owner_id.clone().unwrap_or_else(|| "n/a".to_owned());
+        let owner_epoch = metrics
+            .owner_epoch
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_owned());
+        format!(
+            "adapter_ingress_driver={}\nadapter_id={}\nadapter_topic={}\nadapter_topic_partitions={}\nadapter_processed_count={}\nadapter_failed_count={}\nadapter_final_lag_records={}\nadapter_max_lag_records={}\nadapter_handoff_count={}\nadapter_last_takeover_latency_ms={}\nadapter_last_handoff_at={}\nadapter_owner_id={}\nadapter_owner_epoch={}\n",
+            metrics.ingress_driver,
+            metrics.adapter_id,
+            metrics.topic_name,
+            metrics.topic_partitions,
+            metrics.processed_count,
+            metrics.failed_count,
+            metrics.final_lag_records,
+            metrics.max_lag_records,
+            metrics.ownership_handoff_count,
+            last_takeover_latency_ms,
+            last_handoff_at,
+            owner_id,
+            owner_epoch,
+        )
+    }).unwrap_or_default();
     format!(
-        "scenario={scenario}\nprofile={profile}\nexecution_mode={execution_mode}\nthroughput_backend={throughput_backend}\nbulk_reducer={bulk_reducer}\nretry_rate={retry_rate}\ncancel_rate={cancel_rate}\nchunk_size={chunk_size}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nexecution_duration_ms={execution_duration_ms}\nprojection_convergence_duration_ms={projection_convergence_duration_ms}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nprojection_batch_rows={projection_batch_rows}\nprojection_chunk_rows={projection_chunk_rows}\nmax_aggregation_group_count={max_aggregation_group_count}\ngrouped_batch_rows={grouped_batch_rows}\nadmission_backend_counts={backend_counts}\nadmission_routing_reason_counts={routing_reason_counts}\nadmission_policy_versions={admission_policy_versions}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n{failover}{control_plane}{executor_debug_delta}",
+        "scenario={scenario}\nprofile={profile}\nexecution_mode={execution_mode}\nthroughput_backend={throughput_backend}\nbulk_reducer={bulk_reducer}\nretry_rate={retry_rate}\ncancel_rate={cancel_rate}\nretry_delay_ms={retry_delay_ms}\nchunk_size={chunk_size}\nworkflows={workflows}\nactivities_per_workflow={activities_per_workflow}\ntotal_activities={total_activities}\nexecution_duration_ms={execution_duration_ms}\nprojection_convergence_duration_ms={projection_convergence_duration_ms}\nduration_ms={duration_ms}\nactivity_throughput_per_second={throughput:.2}\ncompleted_workflows={completed_workflows}\nfailed_workflows={failed_workflows}\nworkflow_task_rows={workflow_task_rows}\nresume_rows={resume_rows}\nresume_events_per_task_row={resume_ratio:.2}\nbulk_batch_rows={bulk_batch_rows}\nbulk_chunk_rows={bulk_chunk_rows}\nprojection_batch_rows={projection_batch_rows}\nprojection_chunk_rows={projection_chunk_rows}\nmax_aggregation_group_count={max_aggregation_group_count}\ngrouped_batch_rows={grouped_batch_rows}\nadmission_backend_counts={backend_counts}\nadmission_routing_reason_counts={routing_reason_counts}\nadmission_policy_versions={admission_policy_versions}\nmax_workflow_backlog={max_workflow_backlog}\nmax_activity_backlog={max_activity_backlog}\nfinal_workflow_backlog={final_workflow_backlog}\nfinal_activity_backlog={final_activity_backlog}\navg_activity_schedule_to_start_ms={avg_schedule:.2}\navg_activity_start_to_close_ms={avg_close:.2}\n{failover}{adapter}{control_plane}{executor_debug_delta}",
         scenario = report.scenario,
         profile = report.profile,
         execution_mode = match report.execution_mode {
@@ -2369,6 +3232,7 @@ fn summary_text(report: &BenchmarkReport) -> String {
         bulk_reducer = report.bulk_reducer,
         retry_rate = report.retry_rate,
         cancel_rate = report.cancel_rate,
+        retry_delay_ms = report.retry_delay_ms,
         chunk_size = report.chunk_size,
         workflows = report.workflow_count,
         activities_per_workflow = report.activities_per_workflow,
@@ -2398,6 +3262,7 @@ fn summary_text(report: &BenchmarkReport) -> String {
         avg_schedule = report.activity_metrics.avg_schedule_to_start_latency_ms,
         avg_close = report.activity_metrics.avg_start_to_close_latency_ms,
         failover = failover,
+        adapter = adapter,
         control_plane = control_plane,
         executor_debug_delta = executor_debug_delta,
     )
@@ -2425,11 +3290,14 @@ mod tests {
             payload_size: 128,
             retry_rate: 0.0,
             cancel_rate: 0.0,
+            retry_delay_ms: 1_000,
             tenant_id: "benchmark".to_owned(),
             task_queue: "default".to_owned(),
             execution_mode: ExecutionMode::Throughput,
             throughput_backend: Some(STREAM_V2_BACKEND.to_owned()),
+            ingress_driver: BenchmarkIngressDriver::HttpTrigger,
             workload_kind: BenchmarkWorkloadKind::Fanout,
+            activity_type: BENCHMARK_ECHO_ACTIVITY.to_owned(),
             bulk_reducer: "collect_results".to_owned(),
             chunk_size: 100,
             timer_secs: 1,
@@ -2572,6 +3440,28 @@ mod tests {
     }
 
     #[test]
+    fn stream_v2_fast_ceiling_suite_uses_native_fast_count_activity() {
+        let scenarios =
+            benchmark_suite_scenarios(&demo_args(), "stream-v2-fast-ceiling").expect("suite");
+        assert_eq!(scenarios.len(), 1);
+        assert_eq!(scenarios[0].throughput_backend.as_deref(), Some(STREAM_V2_BACKEND));
+        assert_eq!(scenarios[0].activity_type, BENCHMARK_FAST_COUNT_ACTIVITY);
+        assert_eq!(scenarios[0].bulk_reducer, "count");
+        assert_eq!(scenarios[0].payload_size, 0);
+        assert_eq!(scenarios[0].scenario_tag.as_deref(), Some("fast-ceiling"));
+        assert!(scenarios[0].profile.activities_per_workflow >= 4_096);
+    }
+
+    #[test]
+    fn benchmark_input_compacts_non_materializing_stream_v2_reducers() {
+        let mut args = demo_args();
+        args.bulk_reducer = "all_settled".to_owned();
+
+        let input = benchmark_input(&args, 4_096, 128, 0.0, 0.0, "instance-a");
+        assert_eq!(input.get("items"), Some(&benchmark_compact_input_spec(4_096)));
+    }
+
+    #[test]
     fn stream_v2_failover_suite_emits_owner_restart_variant() {
         let scenarios =
             benchmark_suite_scenarios(&demo_args(), "stream-v2-failover").expect("suite");
@@ -2581,10 +3471,7 @@ mod tests {
         assert_eq!(scenarios[0].scenario_tag.as_deref(), Some("owner-restart"));
         assert!(scenarios[0].profile.workflow_count >= 12);
         assert!(scenarios[0].profile.activities_per_workflow >= 4_096);
-        assert_eq!(
-            scenarios[1].scenario_tag.as_deref(),
-            Some("owner-restart-retry-cancel")
-        );
+        assert_eq!(scenarios[1].scenario_tag.as_deref(), Some("owner-restart-retry-cancel"));
         assert!(scenarios[1].retry_rate >= 0.01);
         assert!(scenarios[1].cancel_rate >= 0.01);
     }
@@ -2605,20 +3492,67 @@ mod tests {
     fn streaming_reducers_suite_emits_backend_pairs_for_numeric_reducers() {
         let scenarios =
             benchmark_suite_scenarios(&demo_args(), "streaming-reducers").expect("suite");
-        assert_eq!(scenarios.len(), 12);
+        assert_eq!(scenarios.len(), 14);
         assert_eq!(scenarios[0].bulk_reducer, "sum");
         assert_eq!(scenarios[0].throughput_backend.as_deref(), Some(PG_V1_BACKEND));
         assert_eq!(scenarios[1].bulk_reducer, "sum");
         assert_eq!(scenarios[1].throughput_backend.as_deref(), Some(STREAM_V2_BACKEND));
         assert_eq!(scenarios[8].bulk_reducer, "histogram");
         assert_eq!(scenarios[10].bulk_reducer, "sample_errors");
-        assert!(scenarios[10].retry_rate >= 0.01);
+        assert_eq!(scenarios[10].scenario_tag.as_deref(), Some("sample-errors-cancel-only-pg-v1"));
+        assert_eq!(scenarios[10].retry_rate, 0.0);
+        assert!(scenarios[10].cancel_rate >= 0.01);
+        assert_eq!(scenarios[11].scenario_tag.as_deref(), Some("sample-errors-retry-cancel-pg-v1"));
+        assert!(scenarios[11].retry_rate >= 0.01);
         assert!(scenarios[11].cancel_rate >= 0.01);
-        assert!(
-            scenarios
-                .iter()
-                .all(|scenario| scenario.profile.activities_per_workflow >= 1_024)
+        assert!(scenarios[11].retry_delay_ms <= 25);
+        assert_eq!(
+            scenarios[12].scenario_tag.as_deref(),
+            Some("sample-errors-cancel-only-stream-v2")
         );
+        assert_eq!(scenarios[12].retry_rate, 0.0);
+        assert!(scenarios[12].cancel_rate >= 0.01);
+        assert_eq!(
+            scenarios[13].scenario_tag.as_deref(),
+            Some("sample-errors-retry-cancel-stream-v2")
+        );
+        assert!(scenarios[13].retry_rate >= 0.01);
+        assert!(scenarios[13].cancel_rate >= 0.01);
+        assert!(scenarios[13].retry_delay_ms <= 25);
+        assert!(scenarios.iter().all(|scenario| scenario.profile.activities_per_workflow >= 1_024));
+    }
+
+    #[test]
+    fn topic_adapters_suite_emits_start_and_signal_variants() {
+        let scenarios = benchmark_suite_scenarios(&demo_args(), "topic-adapters").expect("suite");
+        assert_eq!(scenarios.len(), 2);
+        assert_eq!(scenarios[0].ingress_driver, BenchmarkIngressDriver::TopicAdapterStart);
+        assert_eq!(scenarios[0].workload_kind, BenchmarkWorkloadKind::Fanout);
+        assert_eq!(scenarios[0].scenario_tag.as_deref(), Some("start-workflow"));
+        assert_eq!(scenarios[1].ingress_driver, BenchmarkIngressDriver::TopicAdapterSignal);
+        assert_eq!(scenarios[1].workload_kind, BenchmarkWorkloadKind::SignalGate);
+        assert_eq!(scenarios[1].scenario_tag.as_deref(), Some("signal-workflow"));
+        assert_eq!(
+            scenario_name(&scenarios[0]),
+            "throughput-stream-v2-adapter-start-start-workflow-all-settled"
+        );
+    }
+
+    #[test]
+    fn topic_adapters_failover_suite_emits_owner_crash_variants() {
+        let scenarios =
+            benchmark_suite_scenarios(&demo_args(), "topic-adapters-failover").expect("suite");
+        assert_eq!(scenarios.len(), 2);
+        assert_eq!(scenarios[0].ingress_driver, BenchmarkIngressDriver::TopicAdapterStart);
+        assert_eq!(scenarios[0].scenario_tag.as_deref(), Some("owner-crash"));
+        assert!(scenarios[0].profile.workflow_count >= 12);
+        assert!(scenarios[0].profile.activities_per_workflow >= 4_096);
+        assert_eq!(
+            scenarios[1].scenario_tag.as_deref(),
+            Some("lag-under-load-owner-crash")
+        );
+        assert!(scenarios[1].profile.workflow_count >= 256);
+        assert!(scenarios[1].profile.activities_per_workflow >= 512);
     }
 
     #[test]
@@ -2627,10 +3561,7 @@ mod tests {
         args.bulk_reducer = "sum".to_owned();
 
         let input = benchmark_input(&args, 3, 8, 0.0, 0.0, "instance-1");
-        let items = input
-            .get("items")
-            .and_then(Value::as_array)
-            .expect("items array");
+        let items = input.get("items").and_then(Value::as_array).expect("items array");
 
         assert_eq!(items[0].get("reducer_value"), Some(&json!(1)));
         assert_eq!(items[2].get("reducer_value"), Some(&json!(3)));
@@ -2642,10 +3573,7 @@ mod tests {
         args.bulk_reducer = "histogram".to_owned();
 
         let input = benchmark_input(&args, 4, 8, 0.0, 0.0, "instance-1");
-        let items = input
-            .get("items")
-            .and_then(Value::as_array)
-            .expect("items array");
+        let items = input.get("items").and_then(Value::as_array).expect("items array");
 
         assert_eq!(items[0].get("reducer_value"), Some(&json!("alpha")));
         assert_eq!(items[1].get("reducer_value"), Some(&json!("beta")));
@@ -2657,10 +3585,7 @@ mod tests {
         let args = demo_args();
 
         let input = benchmark_input(&args, 2, 8, 0.0, 0.0, "instance-1");
-        let items = input
-            .get("items")
-            .and_then(Value::as_array)
-            .expect("items array");
+        let items = input.get("items").and_then(Value::as_array).expect("items array");
 
         assert_eq!(items[0].get("reducer_value"), None);
     }
@@ -2709,6 +3634,7 @@ mod tests {
             payload_size: 128,
             retry_rate: 0.0,
             cancel_rate: 0.0,
+            retry_delay_ms: 1_000,
             definition_id: "bench".to_owned(),
             task_queue: "default".to_owned(),
             execution_mode: ExecutionMode::Throughput,
@@ -2754,8 +3680,12 @@ mod tests {
             executor_debug_before: None,
             executor_debug_after: None,
             executor_debug_delta: None,
+            throughput_runtime_debug_before: None,
             throughput_runtime_debug: None,
+            throughput_runtime_debug_delta: None,
+            throughput_projector_debug_before: None,
             throughput_projector_debug: None,
+            throughput_projector_debug_delta: None,
             batch_routing_metrics: BatchRoutingMetrics::default(),
             failover_injection: Some(FailoverInjectionMetrics {
                 status: "completed".to_owned(),
@@ -2767,6 +3697,7 @@ mod tests {
                 downtime_ms: Some(160),
                 error: None,
             }),
+            adapter_metrics: None,
             control_plane_metrics: None,
             executor_debug_delta_metrics: None,
         };
@@ -2846,6 +3777,49 @@ mod tests {
         assert_eq!(metrics.report_batches_per_completed_activity, 4.0 / 24.0);
         assert_eq!(metrics.log_writes, 3);
         assert_eq!(metrics.snapshot_writes, 1);
+    }
+
+    #[test]
+    fn throughput_control_plane_metrics_are_derived_from_delta_snapshot() {
+        let runtime_delta = json!({
+            "runtime": {
+                "poll_requests": 4,
+                "leased_tasks": 20,
+                "report_rpcs_received": 5,
+                "reports_received": 15,
+                "report_batches_applied": 3,
+                "projection_events_published": 2,
+                "projection_events_skipped": 8,
+                "projection_events_applied_directly": 10,
+                "changelog_entries_published": 4
+            }
+        });
+        let projector_delta = json!({
+            "manifest_writes": 6
+        });
+        let activity_metrics = ActivityMetrics {
+            completed: 12,
+            failed: 2,
+            cancelled: 1,
+            timed_out: 0,
+            avg_schedule_to_start_latency_ms: 0.0,
+            max_schedule_to_start_latency_ms: 0,
+            avg_start_to_close_latency_ms: 0.0,
+            max_start_to_close_latency_ms: 0,
+            throughput_activities_per_second: 0.0,
+        };
+
+        let metrics =
+            control_plane_metrics(Some(&runtime_delta), Some(&projector_delta), &activity_metrics)
+                .expect("control plane metrics");
+
+        assert_eq!(metrics.avg_tasks_per_bulk_poll_response, 5.0);
+        assert_eq!(metrics.avg_results_per_bulk_report_rpc, 3.0);
+        assert_eq!(metrics.report_batches_applied, 3);
+        assert_eq!(metrics.avg_report_batch_size, 5.0);
+        assert_eq!(metrics.changelog_entries_per_completed_chunk, 4.0 / 15.0);
+        assert_eq!(metrics.projection_events_per_completed_chunk, 2.0 / 15.0);
+        assert_eq!(metrics.manifest_writes, 6);
     }
 
     #[test]

@@ -5,12 +5,12 @@ use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_throughput::{
     DEFAULT_AGGREGATION_GROUP_COUNT, PayloadHandle, ThroughputBackend,
-    bulk_reducer_default_summary_value, bulk_reducer_reduce_values,
+    benchmark_compact_input_handle, bulk_reducer_default_summary_value, bulk_reducer_reduce_values,
     bulk_reducer_requires_success_outputs, bulk_reducer_settles as throughput_bulk_reducer_settles,
-    bulk_reducer_summary_field_name,
+    bulk_reducer_summary_field_name, parse_benchmark_compact_input_spec,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -101,6 +101,13 @@ pub enum CompiledStateNode {
         actions: Vec<Assignment>,
         next: String,
     },
+    RegisterDynamicSignalHandler {
+        signal_name: Expression,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arg_name: Option<String>,
+        actions: Vec<Assignment>,
+        next: String,
+    },
     Choice {
         condition: Expression,
         then_next: String,
@@ -138,6 +145,13 @@ pub enum CompiledStateNode {
         output_var: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         on_error: Option<ErrorTransition>,
+    },
+    StartStepHandle {
+        descriptor: Expression,
+        handle_var: String,
+        next: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        completion_actions: Vec<Assignment>,
     },
     FanOut {
         activity_type: String,
@@ -254,7 +268,17 @@ pub enum CompiledStateNode {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_ref: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        timer_expr: Option<Expression>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         timeout_next: Option<String>,
+    },
+    StartTimerHandle {
+        #[serde(default)]
+        timer_ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timer_expr: Option<Expression>,
+        handle_var: String,
+        next: String,
     },
     WaitForTimer {
         #[serde(default)]
@@ -419,15 +443,27 @@ pub struct HelperFunction {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HelperStatement {
-    Assign { target: String, expr: Expression },
-    AssignIndex { target: String, index: Expression, expr: Expression },
+    Assign {
+        target: String,
+        expr: Expression,
+    },
+    AssignIndex {
+        target: String,
+        index: Expression,
+        expr: Expression,
+    },
     If {
         condition: Expression,
         then_body: Vec<HelperStatement>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         else_body: Vec<HelperStatement>,
     },
-    ForRange { index_var: String, start: Expression, end: Expression, body: Vec<HelperStatement> },
+    ForRange {
+        index_var: String,
+        start: Expression,
+        end: Expression,
+        body: Vec<HelperStatement>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -442,6 +478,8 @@ pub struct ArtifactExecutionState {
     pub version_markers: BTreeMap<String, u32>,
     #[serde(default)]
     pub active_signal: Option<ActiveSignalState>,
+    #[serde(default)]
+    pub dynamic_signal_handlers: BTreeMap<String, DynamicSignalHandlerState>,
     #[serde(default)]
     pub active_update: Option<ActiveUpdateState>,
     #[serde(default)]
@@ -509,6 +547,13 @@ pub struct ActiveSignalState {
     pub signal_id: String,
     pub signal_name: String,
     pub return_state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DynamicSignalHandlerState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arg_name: Option<String>,
+    pub actions: Vec<Assignment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -681,6 +726,14 @@ impl CompiledWorkflowArtifact {
         self.signals.contains_key(signal_name)
     }
 
+    pub fn has_dynamic_signal_handler(
+        &self,
+        execution_state: &ArtifactExecutionState,
+        signal_name: &str,
+    ) -> bool {
+        execution_state.dynamic_signal_handlers.contains_key(signal_name)
+    }
+
     pub fn has_update(&self, update_name: &str) -> bool {
         self.updates.contains_key(update_name)
     }
@@ -747,6 +800,50 @@ impl CompiledWorkflowArtifact {
             .values()
             .find(|handler| handler.states.contains_key(state_id))
             .map(|handler| &handler.states)
+    }
+
+    fn resume_after_background_progress(
+        &self,
+        current_state: &str,
+        execution_state: ArtifactExecutionState,
+    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
+        let states = self
+            .states_for(current_state, &execution_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(current_state.to_owned()))?;
+        let state = states
+            .get(current_state)
+            .ok_or_else(|| CompiledWorkflowError::UnknownState(current_state.to_owned()))?;
+        match state {
+            CompiledStateNode::WaitForCondition { .. } => {
+                self.execute_from_state_in_graph(states, current_state, execution_state, false)
+            }
+            _ => Ok(CompiledExecutionPlan {
+                workflow_version: self.definition_version,
+                final_state: current_state.to_owned(),
+                emissions: Vec::new(),
+                execution_state,
+                context: None,
+                output: None,
+            }),
+        }
+    }
+
+    fn apply_background_step_completion_actions(
+        &self,
+        step_id: &str,
+        execution_state: &mut ArtifactExecutionState,
+    ) -> Result<(), CompiledWorkflowError> {
+        let Some(CompiledStateNode::StartStepHandle {
+            completion_actions, ..
+        }) = self.state_by_id(step_id)
+        else {
+            return Ok(());
+        };
+        for action in completion_actions {
+            let value = evaluate_expression(&action.expr, execution_state, &self.helpers)?;
+            apply_assignment_value(&action.target, value, execution_state);
+        }
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<(), CompiledWorkflowError> {
@@ -983,6 +1080,32 @@ impl CompiledWorkflowArtifact {
         )
     }
 
+    pub fn execute_dynamic_signal_handler_with_turn(
+        &self,
+        current_state: &str,
+        signal_name: &str,
+        payload: &Value,
+        mut execution_state: ArtifactExecutionState,
+        turn_context: ExecutionTurnContext,
+    ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
+        execution_state.turn_context = Some(turn_context);
+        let handler = execution_state
+            .dynamic_signal_handlers
+            .get(signal_name)
+            .cloned()
+            .ok_or_else(|| CompiledWorkflowError::UnknownSignalHandler(signal_name.to_owned()))?;
+        if let Some(arg_name) = &handler.arg_name {
+            execution_state.bindings.insert(arg_name.clone(), payload.clone());
+        } else {
+            execution_state.bindings.insert("args".to_owned(), payload.clone());
+        }
+        for action in &handler.actions {
+            let value = evaluate_expression(&action.expr, &mut execution_state, &self.helpers)?;
+            apply_assignment_value(&action.target, value, &mut execution_state);
+        }
+        self.resume_after_background_progress(current_state, execution_state)
+    }
+
     pub fn execute_update_with_turn(
         &self,
         current_state: &str,
@@ -1060,6 +1183,9 @@ impl CompiledWorkflowArtifact {
                     });
                 };
                 self.execute_from_state_in_graph(states, next, execution_state, false)
+            }
+            _ if complete_timer_handle_binding(&mut execution_state, timer_id) => {
+                self.resume_after_background_progress(wait_state, execution_state)
             }
             CompiledStateNode::WaitForTimer { .. } => Err(CompiledWorkflowError::UnexpectedTimer {
                 expected: wait_state.to_owned(),
@@ -1498,11 +1624,15 @@ impl CompiledWorkflowArtifact {
                     })
                 }
             }
+            _ if complete_step_handle_binding(&mut execution_state, step_id, output) => {
+                self.apply_background_step_completion_actions(step_id, &mut execution_state)?;
+                self.resume_after_background_progress(step_state, execution_state)
+            }
             CompiledStateNode::Step { .. } | CompiledStateNode::DynamicStep { .. } => {
                 Err(CompiledWorkflowError::UnexpectedStep {
-                expected: step_state.to_owned(),
-                received: step_id.to_owned(),
-            })
+                    expected: step_state.to_owned(),
+                    received: step_id.to_owned(),
+                })
             }
             _ => Err(CompiledWorkflowError::NotWaitingOnStep(step_state.to_owned())),
         }
@@ -1578,14 +1708,10 @@ impl CompiledWorkflowArtifact {
             .get(step_state)
             .ok_or_else(|| CompiledWorkflowError::UnknownState(step_state.to_owned()))?;
         match state {
-            CompiledStateNode::Step {
-                on_error: Some(on_error),
-                ..
-            }
-            | CompiledStateNode::DynamicStep {
-                on_error: Some(on_error),
-                ..
-            } if step_state == step_id => {
+            CompiledStateNode::Step { on_error: Some(on_error), .. }
+            | CompiledStateNode::DynamicStep { on_error: Some(on_error), .. }
+                if step_state == step_id =>
+            {
                 if let Some(error_var) = &on_error.error_var {
                     execution_state
                         .bindings
@@ -1627,6 +1753,25 @@ impl CompiledWorkflowArtifact {
                     context: Some(Value::String(error.to_owned())),
                     output: Some(Value::String(error.to_owned())),
                 })
+            }
+            _ if match completion {
+                CompletionKind::Succeeded => false,
+                CompletionKind::Failed => fail_step_handle_binding(
+                    &mut execution_state,
+                    step_id,
+                    Value::String(error.to_owned()),
+                ),
+                CompletionKind::Cancelled => cancel_step_handle_binding(
+                    &mut execution_state,
+                    step_id,
+                    json!({
+                        "type": "CancelledFailure",
+                        "message": error,
+                    }),
+                ),
+            } =>
+            {
+                self.resume_after_background_progress(step_state, execution_state)
             }
             CompiledStateNode::WaitForAllActivities {
                 fanout_ref_var,
@@ -1730,9 +1875,9 @@ impl CompiledWorkflowArtifact {
             }
             CompiledStateNode::Step { .. } | CompiledStateNode::DynamicStep { .. } => {
                 Err(CompiledWorkflowError::UnexpectedStep {
-                expected: step_state.to_owned(),
-                received: step_id.to_owned(),
-            })
+                    expected: step_state.to_owned(),
+                    received: step_id.to_owned(),
+                })
             }
             _ => Err(CompiledWorkflowError::NotWaitingOnStep(step_state.to_owned())),
         }
@@ -2050,6 +2195,42 @@ impl CompiledWorkflowArtifact {
                         });
                     }
                 }
+                CompiledStateNode::RegisterDynamicSignalHandler {
+                    signal_name,
+                    arg_name,
+                    actions,
+                    next,
+                } => {
+                    let value =
+                        evaluate_expression(signal_name, &mut execution_state, &self.helpers)?;
+                    let Some(signal_name) = value.as_str() else {
+                        return Err(CompiledWorkflowError::InvalidDynamicSignalName(
+                            current_state.clone(),
+                        ));
+                    };
+                    execution_state.dynamic_signal_handlers.insert(
+                        signal_name.to_owned(),
+                        DynamicSignalHandlerState {
+                            arg_name: arg_name.clone(),
+                            actions: actions.clone(),
+                        },
+                    );
+                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+                    current_state = next.clone();
+                    if self
+                        .pending_workflow_cancellation_ready(&current_state, &execution_state)
+                        .is_some()
+                    {
+                        return Ok(CompiledExecutionPlan {
+                            workflow_version: self.definition_version,
+                            final_state: current_state,
+                            emissions,
+                            execution_state,
+                            context,
+                            output,
+                        });
+                    }
+                }
                 CompiledStateNode::Choice { condition, then_next, else_next } => {
                     let value =
                         evaluate_expression(condition, &mut execution_state, &self.helpers)?;
@@ -2118,19 +2299,13 @@ impl CompiledWorkflowArtifact {
                         output,
                     });
                 }
-                CompiledStateNode::DynamicStep {
-                    descriptor,
-                    ..
-                } => {
+                CompiledStateNode::DynamicStep { descriptor, .. } => {
                     let descriptor =
                         evaluate_expression(descriptor, &mut execution_state, &self.helpers)?;
-                    let descriptor =
-                        parse_dynamic_activity_descriptor(&current_state, descriptor)?;
+                    let descriptor = parse_dynamic_activity_descriptor(&current_state, descriptor)?;
                     context = Some(descriptor.input.clone());
                     emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
-                    let task_queue = descriptor
-                        .task_queue
-                        .unwrap_or_else(|| "default".to_owned());
+                    let task_queue = descriptor.task_queue.unwrap_or_else(|| "default".to_owned());
                     emissions.push(ExecutionEmission {
                         event: WorkflowEvent::ActivityTaskScheduled {
                             activity_id: current_state.clone(),
@@ -2138,10 +2313,9 @@ impl CompiledWorkflowArtifact {
                             task_queue,
                             attempt: 1,
                             input: descriptor.input,
-                            config: descriptor
-                                .config
-                                .as_ref()
-                                .map(|config| serde_json::to_value(config).expect("step config serializes")),
+                            config: descriptor.config.as_ref().map(|config| {
+                                serde_json::to_value(config).expect("step config serializes")
+                            }),
                             state: Some(current_state.clone()),
                             schedule_to_start_timeout_ms: descriptor.schedule_to_start_timeout_ms,
                             schedule_to_close_timeout_ms: descriptor.schedule_to_close_timeout_ms,
@@ -2158,6 +2332,56 @@ impl CompiledWorkflowArtifact {
                         context,
                         output,
                     });
+                }
+                CompiledStateNode::StartStepHandle {
+                    descriptor,
+                    handle_var,
+                    next,
+                    ..
+                } => {
+                    let descriptor =
+                        evaluate_expression(descriptor, &mut execution_state, &self.helpers)?;
+                    let descriptor = parse_dynamic_activity_descriptor(&current_state, descriptor)?;
+                    context = Some(descriptor.input.clone());
+                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+                    let task_queue = descriptor.task_queue.unwrap_or_else(|| "default".to_owned());
+                    execution_state.bindings.insert(
+                        handle_var.clone(),
+                        encode_step_handle_binding(&current_state),
+                    );
+                    emissions.push(ExecutionEmission {
+                        event: WorkflowEvent::ActivityTaskScheduled {
+                            activity_id: current_state.clone(),
+                            activity_type: descriptor.activity_type,
+                            task_queue,
+                            attempt: 1,
+                            input: descriptor.input,
+                            config: descriptor.config.as_ref().map(|config| {
+                                serde_json::to_value(config).expect("step config serializes")
+                            }),
+                            state: Some(current_state.clone()),
+                            schedule_to_start_timeout_ms: descriptor.schedule_to_start_timeout_ms,
+                            schedule_to_close_timeout_ms: descriptor.schedule_to_close_timeout_ms,
+                            start_to_close_timeout_ms: descriptor.start_to_close_timeout_ms,
+                            heartbeat_timeout_ms: descriptor.heartbeat_timeout_ms,
+                        },
+                        state: Some(current_state.clone()),
+                    });
+                    current_state = next.clone();
+                    if self
+                        .pending_workflow_cancellation_ready(&current_state, &execution_state)
+                        .is_some()
+                    {
+                        return Ok(CompiledExecutionPlan {
+                            workflow_version: self.definition_version,
+                            final_state: current_state,
+                            emissions,
+                            execution_state,
+                            context,
+                            output,
+                        });
+                    }
+                    continue;
                 }
                 CompiledStateNode::FanOut {
                     activity_type,
@@ -2308,12 +2532,8 @@ impl CompiledWorkflowArtifact {
                     chunk_size,
                     retry,
                 } => {
-                    let items = evaluate_expression(items, &mut execution_state, &self.helpers)?;
-                    let Value::Array(items) = items else {
-                        return Err(CompiledWorkflowError::InvalidBulkItems {
-                            state: current_state.clone(),
-                        });
-                    };
+                    let evaluated_items =
+                        evaluate_expression(items, &mut execution_state, &self.helpers)?;
                     let task_queue = task_queue
                         .as_ref()
                         .map(|expr| evaluate_expression(expr, &mut execution_state, &self.helpers))
@@ -2343,8 +2563,56 @@ impl CompiledWorkflowArtifact {
                         })?,
                         &current_state,
                     );
-                    validate_bulk_items(&current_state, &items, chunk_size as usize)?;
-                    if items.is_empty() {
+                    let throughput_backend = throughput_backend.clone().unwrap_or_default();
+                    let (items, total_items, input_handle, compact_context) = if throughput_backend
+                        == ThroughputBackend::StreamV2.as_str()
+                    {
+                        if let Some(total_items) =
+                            parse_benchmark_compact_input_spec(&evaluated_items)
+                        {
+                            (
+                                Vec::new(),
+                                total_items,
+                                serde_json::to_value(benchmark_compact_input_handle(
+                                    &batch_id,
+                                    total_items,
+                                ))
+                                .expect("compact benchmark input handle serializes"),
+                                Some(evaluated_items.clone()),
+                            )
+                        } else {
+                            let Value::Array(items) = evaluated_items else {
+                                return Err(CompiledWorkflowError::InvalidBulkItems {
+                                    state: current_state.clone(),
+                                });
+                            };
+                            validate_bulk_items(&current_state, &items, chunk_size as usize)?;
+                            let total_items = items_len_to_u32(items.len())?;
+                            (
+                                items,
+                                total_items,
+                                serde_json::to_value(PayloadHandle::inline_batch_input(&batch_id))
+                                    .expect("bulk input handle serializes"),
+                                None,
+                            )
+                        }
+                    } else {
+                        let Value::Array(items) = evaluated_items else {
+                            return Err(CompiledWorkflowError::InvalidBulkItems {
+                                state: current_state.clone(),
+                            });
+                        };
+                        validate_bulk_items(&current_state, &items, chunk_size as usize)?;
+                        let total_items = items_len_to_u32(items.len())?;
+                        (
+                            items,
+                            total_items,
+                            serde_json::to_value(PayloadHandle::inline_batch_input(&batch_id))
+                                .expect("bulk input handle serializes"),
+                            None,
+                        )
+                    };
+                    if total_items == 0 {
                         let wait_state = states
                             .get(next)
                             .ok_or_else(|| CompiledWorkflowError::UnknownState(next.clone()))?;
@@ -2375,11 +2643,6 @@ impl CompiledWorkflowArtifact {
                         }
                         return Err(CompiledWorkflowError::NotWaitingOnBulk(next.clone()));
                     }
-                    let total_items = items_len_to_u32(items.len())?;
-                    let throughput_backend = throughput_backend.clone().unwrap_or_default();
-                    let input_handle =
-                        serde_json::to_value(PayloadHandle::inline_batch_input(&batch_id))
-                            .expect("bulk input handle serializes");
                     let result_handle =
                         serde_json::to_value(PayloadHandle::inline_batch_result(&batch_id))
                             .expect("bulk result handle serializes");
@@ -2429,7 +2692,7 @@ impl CompiledWorkflowArtifact {
                         })
                         .expect("bulk execution state serializes"),
                     );
-                    context = Some(Value::Array(items));
+                    context = compact_context.or_else(|| Some(Value::Array(items.clone())));
                     return Ok(CompiledExecutionPlan {
                         workflow_version: self.definition_version,
                         final_state: next.clone(),
@@ -2673,7 +2936,13 @@ impl CompiledWorkflowArtifact {
                         output,
                     });
                 }
-                CompiledStateNode::WaitForCondition { condition, next, timeout_ref, .. } => {
+                CompiledStateNode::WaitForCondition {
+                    condition,
+                    next,
+                    timeout_ref,
+                    timer_expr,
+                    ..
+                } => {
                     let ready = truthy(&evaluate_expression(
                         condition,
                         &mut execution_state,
@@ -2700,13 +2969,13 @@ impl CompiledWorkflowArtifact {
                     if let Some(timeout_ref) = timeout_ref {
                         if !execution_state.condition_timers.contains(&current_state) {
                             let fire_at = Utc::now()
-                                + crate::parse_timer_ref(timeout_ref).map_err(|source| {
-                                    CompiledWorkflowError::InvalidTimer {
-                                        state: current_state.clone(),
-                                        timer_ref: timeout_ref.clone(),
-                                        details: source.to_string(),
-                                    }
-                                })?;
+                                + evaluate_timer_delay(
+                                    timeout_ref,
+                                    timer_expr.as_ref(),
+                                    &current_state,
+                                    &mut execution_state,
+                                    &self.helpers,
+                                )?;
                             execution_state.condition_timers.insert(current_state.clone());
                             emissions.push(ExecutionEmission {
                                 event: WorkflowEvent::TimerScheduled {
@@ -2725,6 +2994,55 @@ impl CompiledWorkflowArtifact {
                         context,
                         output,
                     });
+                }
+                CompiledStateNode::StartTimerHandle {
+                    timer_ref,
+                    timer_expr,
+                    handle_var,
+                    next,
+                } => {
+                    emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
+                    let timer_delay = evaluate_timer_delay(
+                        timer_ref,
+                        timer_expr.as_ref(),
+                        &current_state,
+                        &mut execution_state,
+                        &self.helpers,
+                    )?;
+                    let fire_at = Utc::now() + timer_delay;
+                    let timer_id = build_background_timer_id(
+                        execution_state.turn_context.as_ref().ok_or_else(|| {
+                            CompiledWorkflowError::MissingTurnContext(
+                                "start_timer_handle".to_owned(),
+                            )
+                        })?,
+                        &current_state,
+                    );
+                    execution_state
+                        .bindings
+                        .insert(handle_var.clone(), encode_timer_handle_binding(&timer_id));
+                    emissions.push(ExecutionEmission {
+                        event: WorkflowEvent::TimerScheduled {
+                            timer_id,
+                            fire_at,
+                        },
+                        state: Some(current_state.clone()),
+                    });
+                    current_state = next.clone();
+                    if self
+                        .pending_workflow_cancellation_ready(&current_state, &execution_state)
+                        .is_some()
+                    {
+                        return Ok(CompiledExecutionPlan {
+                            workflow_version: self.definition_version,
+                            final_state: current_state,
+                            emissions,
+                            execution_state,
+                            context,
+                            output,
+                        });
+                    }
+                    continue;
                 }
                 CompiledStateNode::WaitForTimer { timer_ref, timer_expr, .. } => {
                     emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
@@ -2915,6 +3233,7 @@ impl CompiledStateNode {
     fn next_states(&self) -> Vec<&str> {
         match self {
             Self::Assign { next, .. } => vec![next.as_str()],
+            Self::RegisterDynamicSignalHandler { next, .. } => vec![next.as_str()],
             Self::Choice { then_next, else_next, .. } => {
                 vec![then_next.as_str(), else_next.as_str()]
             }
@@ -2928,6 +3247,7 @@ impl CompiledStateNode {
                 .map(String::as_str)
                 .chain(on_error.iter().map(|transition| transition.next.as_str()))
                 .collect(),
+            Self::StartStepHandle { next, .. } => vec![next.as_str()],
             Self::FanOut { next, .. } => vec![next.as_str()],
             Self::StartBulkActivity { next, .. } => vec![next.as_str()],
             Self::WaitForBulkActivity { next, on_error, .. } => std::iter::once(next.as_str())
@@ -2936,6 +3256,7 @@ impl CompiledStateNode {
             Self::WaitForAllActivities { next, on_error, .. } => std::iter::once(next.as_str())
                 .chain(on_error.iter().map(|transition| transition.next.as_str()))
                 .collect(),
+            Self::StartTimerHandle { next, .. } => vec![next.as_str()],
             Self::StartChild { next, .. }
             | Self::SignalChild { next, .. }
             | Self::CancelChild { next, .. }
@@ -2950,6 +3271,111 @@ impl CompiledStateNode {
             Self::Succeed { .. } | Self::Fail { .. } | Self::ContinueAsNew { .. } => Vec::new(),
         }
     }
+}
+
+fn encode_timer_handle_binding(timer_id: &str) -> Value {
+    serde_json::json!({
+        "__kind": "timer_handle",
+        "timer_id": timer_id,
+        "status": "pending"
+    })
+}
+
+fn encode_step_handle_binding(step_id: &str) -> Value {
+    serde_json::json!({
+        "__kind": "step_handle",
+        "step_id": step_id,
+        "status": "pending"
+    })
+}
+
+fn complete_timer_handle_binding(execution_state: &mut ArtifactExecutionState, timer_id: &str) -> bool {
+    for value in execution_state.bindings.values_mut() {
+        let Some(object) = value.as_object_mut() else {
+            continue;
+        };
+        if object.get("__kind").and_then(Value::as_str) != Some("timer_handle") {
+            continue;
+        }
+        if object.get("timer_id").and_then(Value::as_str) != Some(timer_id) {
+            continue;
+        }
+        if object.get("status").and_then(Value::as_str) != Some("pending") {
+            continue;
+        }
+        object.insert("status".to_owned(), Value::String("completed".to_owned()));
+        return true;
+    }
+    false
+}
+
+fn complete_step_handle_binding(
+    execution_state: &mut ArtifactExecutionState,
+    step_id: &str,
+    output: &Value,
+) -> bool {
+    for value in execution_state.bindings.values_mut() {
+        let Some(object) = value.as_object_mut() else {
+            continue;
+        };
+        if object.get("__kind").and_then(Value::as_str) != Some("step_handle") {
+            continue;
+        }
+        if object.get("step_id").and_then(Value::as_str) != Some(step_id) {
+            continue;
+        }
+        object.insert("status".to_owned(), Value::String("completed".to_owned()));
+        object.insert("result".to_owned(), output.clone());
+        object.remove("error");
+        return true;
+    }
+    false
+}
+
+fn fail_step_handle_binding(
+    execution_state: &mut ArtifactExecutionState,
+    step_id: &str,
+    error: Value,
+) -> bool {
+    for value in execution_state.bindings.values_mut() {
+        let Some(object) = value.as_object_mut() else {
+            continue;
+        };
+        if object.get("__kind").and_then(Value::as_str) != Some("step_handle") {
+            continue;
+        }
+        if object.get("step_id").and_then(Value::as_str) != Some(step_id) {
+            continue;
+        }
+        object.insert("status".to_owned(), Value::String("failed".to_owned()));
+        object.insert("error".to_owned(), error);
+        object.remove("result");
+        return true;
+    }
+    false
+}
+
+fn cancel_step_handle_binding(
+    execution_state: &mut ArtifactExecutionState,
+    step_id: &str,
+    error: Value,
+) -> bool {
+    for value in execution_state.bindings.values_mut() {
+        let Some(object) = value.as_object_mut() else {
+            continue;
+        };
+        if object.get("__kind").and_then(Value::as_str) != Some("step_handle") {
+            continue;
+        }
+        if object.get("step_id").and_then(Value::as_str) != Some(step_id) {
+            continue;
+        }
+        object.insert("status".to_owned(), Value::String("cancelled".to_owned()));
+        object.insert("error".to_owned(), error);
+        object.remove("result");
+        return true;
+    }
+    false
 }
 
 fn parse_descriptor_u64(
@@ -2989,13 +3415,12 @@ fn parse_descriptor_retry(
             details: "retry must be an object".to_owned(),
         });
     };
-    let max_attempts = retry
-        .get("max_attempts")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| CompiledWorkflowError::InvalidDynamicStepDescriptor {
+    let max_attempts = retry.get("max_attempts").and_then(Value::as_u64).ok_or_else(|| {
+        CompiledWorkflowError::InvalidDynamicStepDescriptor {
             state: state.to_owned(),
             details: "retry.max_attempts must be an unsigned integer".to_owned(),
-        })? as u32;
+        }
+    })? as u32;
     let delay = retry
         .get("delay")
         .and_then(Value::as_str)
@@ -3012,8 +3437,7 @@ fn parse_descriptor_retry(
                 value.as_str().map(str::to_owned).ok_or_else(|| {
                     CompiledWorkflowError::InvalidDynamicStepDescriptor {
                         state: state.to_owned(),
-                        details: "retry.non_retryable_error_types must be string array"
-                            .to_owned(),
+                        details: "retry.non_retryable_error_types must be string array".to_owned(),
                     }
                 })
             })
@@ -3037,20 +3461,19 @@ fn parse_descriptor_retry(
     };
     let backoff_coefficient_millis = match retry.get("backoff_coefficient_millis") {
         None | Some(Value::Null) => None,
-        Some(Value::Number(value)) => Some(
-            value.as_u64().map(|value| value as u32).ok_or_else(|| {
+        Some(Value::Number(value)) => {
+            Some(value.as_u64().map(|value| value as u32).ok_or_else(|| {
                 CompiledWorkflowError::InvalidDynamicStepDescriptor {
                     state: state.to_owned(),
                     details: "retry.backoff_coefficient_millis must be an unsigned integer"
                         .to_owned(),
                 }
-            })?,
-        ),
+            })?)
+        }
         Some(_) => {
             return Err(CompiledWorkflowError::InvalidDynamicStepDescriptor {
                 state: state.to_owned(),
-                details: "retry.backoff_coefficient_millis must be an unsigned integer"
-                    .to_owned(),
+                details: "retry.backoff_coefficient_millis must be an unsigned integer".to_owned(),
             });
         }
     };
@@ -3164,6 +3587,14 @@ fn build_bulk_batch_id(turn_context: &ExecutionTurnContext, state_id: &str) -> S
     uuid::Uuid::new_v5(
         &uuid::Uuid::NAMESPACE_URL,
         format!("{}:{state_id}:bulk", turn_context.event_id).as_bytes(),
+    )
+    .to_string()
+}
+
+fn build_background_timer_id(turn_context: &ExecutionTurnContext, state_id: &str) -> String {
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("{}:{state_id}:timer", turn_context.event_id).as_bytes(),
     )
     .to_string()
 }
@@ -3895,9 +4326,7 @@ pub fn evaluate_expression(
                     _ => Map::new(),
                 };
                 map.insert(key, value);
-                execution_state
-                    .bindings
-                    .insert(binding_name.to_owned(), Value::Object(map));
+                execution_state.bindings.insert(binding_name.to_owned(), Value::Object(map));
                 return Ok(Value::Null);
             }
             if callee == "__builtin_date_new" {
@@ -3911,10 +4340,7 @@ pub fn evaluate_expression(
                 let millis = if let Some(arg) = args.first() {
                     let value = evaluate_expression(arg, execution_state, helpers)?;
                     if let Some(object) = value.as_object() {
-                        object
-                            .get("__fabrik_date_ms")
-                            .and_then(Value::as_i64)
-                            .unwrap_or(0)
+                        object.get("__fabrik_date_ms").and_then(Value::as_i64).unwrap_or(0)
                     } else if let Some(number) = value.as_i64() {
                         number
                     } else if let Some(text) = value.as_str() {
@@ -4015,17 +4441,20 @@ pub fn evaluate_expression(
                 let mut dt = Utc.timestamp_millis_opt(millis).single().unwrap_or_else(Utc::now);
                 let hour = evaluate_expression(&args[1], execution_state, helpers)?;
                 let minute = if args.len() > 2 {
-                    numeric(&evaluate_expression(&args[2], execution_state, helpers)?)?.trunc() as u32
+                    numeric(&evaluate_expression(&args[2], execution_state, helpers)?)?.trunc()
+                        as u32
                 } else {
                     dt.minute()
                 };
                 let second = if args.len() > 3 {
-                    numeric(&evaluate_expression(&args[3], execution_state, helpers)?)?.trunc() as u32
+                    numeric(&evaluate_expression(&args[3], execution_state, helpers)?)?.trunc()
+                        as u32
                 } else {
                     dt.second()
                 };
                 let millis_part = if args.len() > 4 {
-                    numeric(&evaluate_expression(&args[4], execution_state, helpers)?)?.trunc() as u32
+                    numeric(&evaluate_expression(&args[4], execution_state, helpers)?)?.trunc()
+                        as u32
                 } else {
                     dt.timestamp_subsec_millis()
                 };
@@ -4118,6 +4547,39 @@ pub fn evaluate_expression(
                 }
                 let value = evaluate_expression(&args[0], execution_state, helpers)?;
                 return Ok(Value::String(join_stringify_value(&value).to_uppercase()));
+            }
+            if callee == "__builtin_typeof" {
+                if args.len() != 1 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 1,
+                        received: args.len(),
+                    });
+                }
+                let value = evaluate_expression(&args[0], execution_state, helpers)?;
+                let kind = match value {
+                    Value::Null => "object",
+                    Value::Bool(_) => "boolean",
+                    Value::Number(_) => "number",
+                    Value::String(_) => "string",
+                    Value::Array(_) | Value::Object(_) => "object",
+                };
+                return Ok(Value::String(kind.to_owned()));
+            }
+            if callee == "__builtin_is_error" {
+                if args.len() != 1 {
+                    return Err(CompiledWorkflowError::HelperArityMismatch {
+                        helper: callee.clone(),
+                        expected: 1,
+                        received: args.len(),
+                    });
+                }
+                let value = evaluate_expression(&args[0], execution_state, helpers)?;
+                let is_error = value
+                    .as_object()
+                    .and_then(|object| object.get("message"))
+                    .is_some_and(Value::is_string);
+                return Ok(Value::Bool(is_error));
             }
             if callee == "__builtin_math_floor" {
                 if args.len() != 1 {
@@ -4493,7 +4955,11 @@ fn execute_helper_statements(
     Ok(())
 }
 
-fn apply_assignment_value(target: &str, value: Value, execution_state: &mut ArtifactExecutionState) {
+fn apply_assignment_value(
+    target: &str,
+    value: Value,
+    execution_state: &mut ArtifactExecutionState,
+) {
     if target == "__search_attributes" {
         set_workflow_info_search_attributes(execution_state, value.clone());
         execution_state.pending_search_attribute_updates.push(value);
@@ -4569,12 +5035,7 @@ fn is_activity_failure_value(value: &Value) -> bool {
     match value {
         Value::Object(object) => temporal_failure_type_matches(
             object,
-            &[
-                "activityfailure",
-                "temporal.activityfailure",
-                "activity_error",
-                "activityerror",
-            ],
+            &["activityfailure", "temporal.activityfailure", "activity_error", "activityerror"],
         ),
         _ => false,
     }
@@ -4605,9 +5066,7 @@ fn temporal_failure_type_matches(object: &Map<String, Value>, expected: &[&str])
     field_matches("type")
         || field_matches("name")
         || field_matches("errorType")
-        || object
-            .get("cause")
-            .is_some_and(is_application_failure_value)
+        || object.get("cause").is_some_and(is_application_failure_value)
 }
 
 fn emit_pending_markers(
@@ -4868,6 +5327,8 @@ pub enum CompiledWorkflowError {
     MissingTurnContext(String),
     #[error("value {0} cannot be treated as a number")]
     InvalidNumericValue(String),
+    #[error("compiled workflow state {0} evaluated dynamic signal name to a non-string value")]
+    InvalidDynamicSignalName(String),
 }
 
 #[cfg(test)]
@@ -5837,7 +6298,8 @@ mod tests {
                     ..ArtifactExecutionState::default()
                 },
                 ExecutionTurnContext {
-                    event_id: uuid::Uuid::parse_str("bbbbbbbb-cccc-dddd-eeee-ffffffffffff").unwrap(),
+                    event_id: uuid::Uuid::parse_str("bbbbbbbb-cccc-dddd-eeee-ffffffffffff")
+                        .unwrap(),
                     occurred_at: DateTime::from_timestamp_millis(1_700_000_000_123).unwrap(),
                 },
             )
@@ -6249,20 +6711,14 @@ mod tests {
                     expr: Expression::Conditional {
                         condition: Box::new(Expression::Logical {
                             op: LogicalOp::And,
-                            left: Box::new(Expression::Identifier {
-                                name: "err".to_owned(),
-                            }),
+                            left: Box::new(Expression::Identifier { name: "err".to_owned() }),
                             right: Box::new(Expression::Member {
-                                object: Box::new(Expression::Identifier {
-                                    name: "err".to_owned(),
-                                }),
+                                object: Box::new(Expression::Identifier { name: "err".to_owned() }),
                                 property: "message".to_owned(),
                             }),
                         }),
                         then_expr: Box::new(Expression::Member {
-                            object: Box::new(Expression::Identifier {
-                                name: "err".to_owned(),
-                            }),
+                            object: Box::new(Expression::Identifier { name: "err".to_owned() }),
                             property: "message".to_owned(),
                         }),
                         else_expr: Box::new(Expression::Literal {
@@ -6273,14 +6729,10 @@ mod tests {
                 HelperStatement::If {
                     condition: Expression::Logical {
                         op: LogicalOp::And,
-                        left: Box::new(Expression::Identifier {
-                            name: "err".to_owned(),
-                        }),
+                        left: Box::new(Expression::Identifier { name: "err".to_owned() }),
                         right: Box::new(Expression::Member {
                             object: Box::new(Expression::Member {
-                                object: Box::new(Expression::Identifier {
-                                    name: "err".to_owned(),
-                                }),
+                                object: Box::new(Expression::Identifier { name: "err".to_owned() }),
                                 property: "cause".to_owned(),
                             }),
                             property: "message".to_owned(),
@@ -6290,9 +6742,7 @@ mod tests {
                         target: "errMessage".to_owned(),
                         expr: Expression::Member {
                             object: Box::new(Expression::Member {
-                                object: Box::new(Expression::Identifier {
-                                    name: "err".to_owned(),
-                                }),
+                                object: Box::new(Expression::Identifier { name: "err".to_owned() }),
                                 property: "cause".to_owned(),
                             }),
                             property: "message".to_owned(),
@@ -6305,16 +6755,10 @@ mod tests {
                 op: BinaryOp::Add,
                 left: Box::new(Expression::Binary {
                     op: BinaryOp::Add,
-                    left: Box::new(Expression::Identifier {
-                        name: "message".to_owned(),
-                    }),
-                    right: Box::new(Expression::Literal {
-                        value: Value::String(": ".to_owned()),
-                    }),
+                    left: Box::new(Expression::Identifier { name: "message".to_owned() }),
+                    right: Box::new(Expression::Literal { value: Value::String(": ".to_owned()) }),
                 }),
-                right: Box::new(Expression::Identifier {
-                    name: "errMessage".to_owned(),
-                }),
+                right: Box::new(Expression::Identifier { name: "errMessage".to_owned() }),
             },
         };
         let helpers = BTreeMap::from([("prettyErrorMessage".to_owned(), helper)]);
@@ -6323,9 +6767,7 @@ mod tests {
             &Expression::Call {
                 callee: "prettyErrorMessage".to_owned(),
                 args: vec![
-                    Expression::Literal {
-                        value: Value::String("failed".to_owned()),
-                    },
+                    Expression::Literal { value: Value::String("failed".to_owned()) },
                     Expression::Literal {
                         value: json!({
                             "message": "fallback",
@@ -6979,10 +7421,7 @@ mod tests {
             "dynamic-step-demo".to_owned(),
             1,
             "test",
-            ArtifactEntrypoint {
-                module: "workflow.ts".to_owned(),
-                export: "workflow".to_owned(),
-            },
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
             CompiledWorkflow {
                 initial_state: "cleanup".to_owned(),
                 states: BTreeMap::from([
@@ -6993,9 +7432,7 @@ mod tests {
                                 fields: BTreeMap::from([
                                     (
                                         "__kind".to_owned(),
-                                        Expression::Literal {
-                                            value: json!("activity_descriptor"),
-                                        },
+                                        Expression::Literal { value: json!("activity_descriptor") },
                                     ),
                                     (
                                         "activity_type".to_owned(),
@@ -7003,9 +7440,7 @@ mod tests {
                                     ),
                                     (
                                         "input".to_owned(),
-                                        Expression::Identifier {
-                                            name: "input".to_owned(),
-                                        },
+                                        Expression::Identifier { name: "input".to_owned() },
                                     ),
                                     (
                                         "task_queue".to_owned(),
@@ -7084,10 +7519,7 @@ mod tests {
                 && start_to_close_timeout_ms == &Some(5_000)
         ));
 
-        let retry = artifact
-            .step_retry("cleanup", &plan.execution_state)
-            .unwrap()
-            .unwrap();
+        let retry = artifact.step_retry("cleanup", &plan.execution_state).unwrap().unwrap();
         assert_eq!(retry.max_attempts, 3);
         assert_eq!(retry.delay, "2s");
     }
@@ -7422,7 +7854,9 @@ mod tests {
             .emissions
             .iter()
             .find_map(|emission| match &emission.event {
-                WorkflowEvent::BulkActivityBatchScheduled { batch_id, .. } => Some(batch_id.clone()),
+                WorkflowEvent::BulkActivityBatchScheduled { batch_id, .. } => {
+                    Some(batch_id.clone())
+                }
                 _ => None,
             })
             .expect("expected bulk schedule event");
@@ -7478,7 +7912,9 @@ mod tests {
             .emissions
             .iter()
             .find_map(|emission| match &emission.event {
-                WorkflowEvent::BulkActivityBatchScheduled { batch_id, .. } => Some(batch_id.clone()),
+                WorkflowEvent::BulkActivityBatchScheduled { batch_id, .. } => {
+                    Some(batch_id.clone())
+                }
                 _ => None,
             })
             .expect("expected bulk schedule event");
@@ -7709,6 +8145,110 @@ mod tests {
                 event: WorkflowEvent::WorkflowCompleted { output },
                 ..
             }) if output == &json!(false)
+        ));
+    }
+
+    #[test]
+    fn start_timer_handle_can_be_awaited_after_background_fire() {
+        let artifact = CompiledWorkflowArtifact::new(
+            "timer-handle",
+            1,
+            "test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "start_timer".to_owned(),
+                states: BTreeMap::from([
+                    (
+                        "start_timer".to_owned(),
+                        CompiledStateNode::StartTimerHandle {
+                            timer_ref: "1s".to_owned(),
+                            timer_expr: None,
+                            handle_var: "timer".to_owned(),
+                            next: "wait_timer_done".to_owned(),
+                        },
+                    ),
+                    (
+                        "wait_timer_done".to_owned(),
+                        CompiledStateNode::WaitForCondition {
+                            condition: Expression::Binary {
+                                op: BinaryOp::NotEqual,
+                                left: Box::new(Expression::Member {
+                                    object: Box::new(Expression::Identifier {
+                                        name: "timer".to_owned(),
+                                    }),
+                                    property: "status".to_owned(),
+                                }),
+                                right: Box::new(Expression::Literal {
+                                    value: Value::String("pending".to_owned()),
+                                }),
+                            },
+                            next: "done".to_owned(),
+                            timeout_ref: None,
+                            timeout_next: None,
+                        },
+                    ),
+                    (
+                        "done".to_owned(),
+                        CompiledStateNode::Succeed {
+                            output: Some(Expression::Literal {
+                                value: Value::String("done".to_owned()),
+                            }),
+                        },
+                    ),
+                ]),
+                params: Vec::new(),
+                non_cancellable_states: BTreeSet::new(),
+            },
+        );
+
+        let waiting = artifact
+            .execute_trigger_with_turn(
+                &json!({}),
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_000_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(waiting.final_state, "wait_timer_done");
+        assert!(matches!(
+            waiting.execution_state.bindings.get("timer"),
+            Some(Value::Object(value))
+                if value.get("status") == Some(&Value::String("pending".to_owned()))
+        ));
+        let scheduled_timer_id = waiting
+            .emissions
+            .iter()
+            .find_map(|emission| match &emission.event {
+                WorkflowEvent::TimerScheduled { timer_id, .. } => Some(timer_id.clone()),
+                _ => None,
+            })
+            .expect("background timer scheduled");
+
+        let completed = artifact
+            .execute_after_timer_with_turn(
+                "wait_timer_done",
+                &scheduled_timer_id,
+                waiting.execution_state,
+                ExecutionTurnContext {
+                    event_id: uuid::Uuid::now_v7(),
+                    occurred_at: DateTime::from_timestamp_millis(1_700_000_001_000).unwrap(),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            completed.emissions.last(),
+            Some(ExecutionEmission {
+                event: WorkflowEvent::WorkflowCompleted { output },
+                ..
+            }) if output == &json!("done")
+        ));
+        assert!(matches!(
+            completed.execution_state.bindings.get("timer"),
+            Some(Value::Object(value))
+                if value.get("status") == Some(&Value::String("completed".to_owned()))
         ));
     }
 }

@@ -149,11 +149,15 @@ struct DiscoveredWorkflow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiscoveredWorker {
     file: String,
+    worker_index: usize,
     task_queue: Option<String>,
     build_id: Option<String>,
     workflows_path: Option<String>,
     activities_reference: Option<String>,
     activity_module: Option<String>,
+    activity_factory_export: Option<String>,
+    activity_factory_args_js: Vec<String>,
+    activity_runtime_helper: bool,
     data_converter_mode: Option<String>,
     payload_converter_module: Option<String>,
     bootstrap_pattern: String,
@@ -213,6 +217,7 @@ struct WorkflowMigrationRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkerPackageRecord {
     worker_file: String,
+    worker_index: usize,
     task_queue: Option<String>,
     build_id: String,
     package_dir: String,
@@ -220,6 +225,7 @@ struct WorkerPackageRecord {
     manifest_path: String,
     bootstrap_path: String,
     resolved_activity_module_path: Option<String>,
+    resolved_activity_runtime_helper_path: Option<String>,
     data_converter_mode: Option<String>,
     resolved_payload_converter_module_path: Option<String>,
     log_path: String,
@@ -1160,12 +1166,17 @@ fn build_worker_packages(
     workers: &[DiscoveredWorker],
 ) -> Result<Vec<WorkerPackageRecord>> {
     let mut packages = Vec::new();
-    for worker in workers {
-        let package_name = sanitize_segment(
-            Path::new(&worker.file)
-                .file_stem()
-                .and_then(|value| value.to_str())
-                .unwrap_or("worker"),
+    let package_workers = preferred_packaged_workers(workers);
+    for worker in package_workers {
+        let package_name = format!(
+            "{}-{}",
+            sanitize_segment(
+                Path::new(&worker.file)
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("worker"),
+            ),
+            worker.worker_index
         );
         let package_dir = workers_dir.join(&package_name);
         fs::create_dir_all(&package_dir)?;
@@ -1212,12 +1223,22 @@ fn build_worker_packages(
             } else {
                 None
             };
+        let resolved_activity_runtime_helper_path = if worker.activity_runtime_helper {
+            Some(generate_activity_runtime_helper(
+                project_root,
+                &dist_dir,
+                worker,
+            )?)
+        } else {
+            None
+        };
         fs::write(
             &bootstrap_path,
             render_worker_bootstrap(
                 worker,
                 &build_id,
                 resolved_activity_module_path.as_deref(),
+                resolved_activity_runtime_helper_path.as_deref(),
                 resolved_payload_converter_module_path.as_deref(),
             ),
         )
@@ -1227,17 +1248,22 @@ fn build_worker_packages(
             &json!({
                 "schema_version": 1,
                 "source_worker": worker.file,
+                "worker_index": worker.worker_index,
                 "task_queue": worker.task_queue,
                 "build_id": build_id,
                 "bootstrap_pattern": worker.bootstrap_pattern,
                 "workflows_path": worker.workflows_path,
                 "activities_reference": worker.activities_reference,
                 "activity_module": worker.activity_module,
+                "activity_factory_export": worker.activity_factory_export,
+                "activity_factory_args_js": worker.activity_factory_args_js,
+                "activity_runtime_helper": worker.activity_runtime_helper,
                 "data_converter_mode": worker.data_converter_mode,
                 "payload_converter_module": worker.payload_converter_module,
                 "project_root": project_root.display().to_string(),
                 "dist_dir": dist_dir.display().to_string(),
                 "resolved_activity_module_path": resolved_activity_module_path,
+                "resolved_activity_runtime_helper_path": resolved_activity_runtime_helper_path,
                 "resolved_payload_converter_module_path": resolved_payload_converter_module_path,
                 "bootstrap_path": bootstrap_path.display().to_string(),
                 "log_path": log_path.display().to_string(),
@@ -1246,6 +1272,7 @@ fn build_worker_packages(
         )?;
         packages.push(WorkerPackageRecord {
             worker_file: worker.file.clone(),
+            worker_index: worker.worker_index,
             task_queue: worker.task_queue.clone(),
             build_id,
             package_dir: package_dir.display().to_string(),
@@ -1253,6 +1280,7 @@ fn build_worker_packages(
             manifest_path: manifest_path.display().to_string(),
             bootstrap_path: bootstrap_path.display().to_string(),
             resolved_activity_module_path,
+            resolved_activity_runtime_helper_path,
             data_converter_mode: worker.data_converter_mode.clone(),
             resolved_payload_converter_module_path,
             log_path: log_path.display().to_string(),
@@ -1263,7 +1291,35 @@ fn build_worker_packages(
     Ok(packages)
 }
 
+fn preferred_packaged_workers(workers: &[DiscoveredWorker]) -> Vec<&DiscoveredWorker> {
+    let has_non_test = workers.iter().any(|worker| !is_test_worker_source(&worker.file));
+    workers
+        .iter()
+        .filter(|worker| !has_non_test || !is_test_worker_source(&worker.file))
+        .collect()
+}
+
+fn is_test_worker_source(file: &str) -> bool {
+    let path = Path::new(file);
+    if path.components().any(|component| {
+        matches!(
+            component.as_os_str().to_str(),
+            Some("test") | Some("tests") | Some("__tests__")
+        )
+    }) {
+        return true;
+    }
+    path.file_name().and_then(|value| value.to_str()).is_some_and(|name| {
+        name.contains(".test.") || name.contains(".spec.")
+    })
+}
+
 fn transpile_project_into(project_root: &Path, dist_dir: &Path) -> Result<()> {
+    let cwd = std::env::current_dir().context("failed to read current directory")?;
+    let project_root_abs =
+        if project_root.is_absolute() { project_root.to_path_buf() } else { cwd.join(project_root) };
+    let dist_dir_abs =
+        if dist_dir.is_absolute() { dist_dir.to_path_buf() } else { cwd.join(dist_dir) };
     if dist_dir.exists() && dist_dir.read_dir()?.next().is_some() {
         return Ok(());
     }
@@ -1273,23 +1329,23 @@ fn transpile_project_into(project_root: &Path, dist_dir: &Path) -> Result<()> {
         bail!("missing TypeScript compiler at {}", tsc.display());
     }
     let mut command = Command::new(tsc);
-    let tsconfig = project_root.join("tsconfig.json");
+    let tsconfig = project_root_abs.join("tsconfig.json");
     if tsconfig.exists() {
         command.arg("-p").arg(&tsconfig);
     } else {
-        let inputs = collect_transpile_inputs(project_root)?;
+        let inputs = collect_transpile_inputs(&project_root_abs)?;
         if inputs.is_empty() {
             bail!("no source files found to transpile in {}", project_root.display());
         }
         command.args(inputs);
         command.arg("--target").arg("es2022");
-        command.arg("--rootDir").arg(project_root);
+        command.arg("--rootDir").arg(&project_root_abs);
         command.arg("--esModuleInterop");
         command.arg("--resolveJsonModule");
     }
     let output = command
         .arg("--outDir")
-        .arg(dist_dir)
+        .arg(&dist_dir_abs)
         .arg("--module")
         .arg("es2022")
         .arg("--moduleResolution")
@@ -1302,7 +1358,7 @@ fn transpile_project_into(project_root: &Path, dist_dir: &Path) -> Result<()> {
         .arg("false")
         .arg("--pretty")
         .arg("false")
-        .current_dir(project_root)
+        .current_dir(&project_root_abs)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -1310,6 +1366,23 @@ fn transpile_project_into(project_root: &Path, dist_dir: &Path) -> Result<()> {
     if !output.status.success() {
         if dist_dir.read_dir()?.next().is_some() {
             return Ok(());
+        }
+        let relaxed_transpiler = Path::new("/Users/bene/code/fabrik/scripts/transpile-relaxed.mjs");
+        if relaxed_transpiler.exists() {
+            let relaxed = Command::new("node")
+                .arg(relaxed_transpiler)
+                .arg(&project_root_abs)
+                .arg(&dist_dir_abs)
+                .current_dir(&project_root_abs)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .with_context(|| {
+                    format!("failed to run relaxed transpiler for {}", project_root.display())
+                })?;
+            if relaxed.status.success() && dist_dir.read_dir()?.next().is_some() {
+                return Ok(());
+            }
         }
         bail!(
             "TypeScript transpile failed for {}: {}{}{}",
@@ -1322,12 +1395,52 @@ fn transpile_project_into(project_root: &Path, dist_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn generate_activity_runtime_helper(
+    project_root: &Path,
+    dist_dir: &Path,
+    worker: &DiscoveredWorker,
+) -> Result<String> {
+    let generator = Path::new(REPO_ROOT).join("scripts/generate-worker-runtime-helper.mjs");
+    if !generator.exists() {
+        bail!("missing worker runtime helper generator at {}", generator.display());
+    }
+    let worker_js = transpiled_output_path(project_root, dist_dir, &project_root.join(&worker.file))?;
+    let helper_path = worker_js.with_file_name(format!(
+        "{}.fabrik-runtime-helper.mjs",
+        worker_js
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("worker")
+    ));
+    let output = Command::new("node")
+        .arg(&generator)
+        .arg("--worker-js")
+        .arg(&worker_js)
+        .arg("--worker-index")
+        .arg(worker.worker_index.to_string())
+        .arg("--output")
+        .arg(&helper_path)
+        .current_dir(REPO_ROOT)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| format!("failed to run {} for {}", generator.display(), worker.file))?;
+    if !output.status.success() {
+        bail!(
+            "worker runtime helper generation failed for {}: {}",
+            worker.file,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(helper_path.display().to_string())
+}
+
 fn collect_transpile_inputs(project_root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let mut stack = vec![project_root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir)
-            .with_context(|| format!("failed to read {}", dir.display()))?
+        for entry in
+            fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
         {
             let entry = entry?;
             let path = entry.path();
@@ -1416,9 +1529,7 @@ fn resolve_module_specifier_with_typescript(
         );
     }
     let payload: Value = serde_json::from_slice(&output.stdout).with_context(|| {
-        format!(
-            "failed to decode module resolution helper output for {specifier}"
-        )
+        format!("failed to decode module resolution helper output for {specifier}")
     })?;
     let resolved = payload
         .get("resolved")
@@ -1905,6 +2016,7 @@ fn render_worker_bootstrap(
     worker: &DiscoveredWorker,
     build_id: &str,
     resolved_activity_module_path: Option<&str>,
+    resolved_activity_runtime_helper_path: Option<&str>,
     resolved_payload_converter_module_path: Option<&str>,
 ) -> String {
     let source_worker = serde_json::to_string(&worker.file).expect("worker file serializes");
@@ -1916,8 +2028,17 @@ fn render_worker_bootstrap(
         .expect("activities reference serializes");
     let activity_module =
         serde_json::to_string(&worker.activity_module).expect("activity module serializes");
+    let activity_factory_export = serde_json::to_string(&worker.activity_factory_export)
+        .expect("activity factory export serializes");
+    let activity_factory_args_js = serde_json::to_string(&worker.activity_factory_args_js)
+        .expect("activity factory args serialize");
+    let activity_runtime_helper = serde_json::to_string(&worker.activity_runtime_helper)
+        .expect("activity runtime helper serializes");
     let resolved_activity_module_path = serde_json::to_string(&resolved_activity_module_path)
         .expect("resolved activity module path serializes");
+    let resolved_activity_runtime_helper_path =
+        serde_json::to_string(&resolved_activity_runtime_helper_path)
+            .expect("resolved activity runtime helper path serializes");
     let resolved_payload_converter_module_path =
         serde_json::to_string(&resolved_payload_converter_module_path)
             .expect("resolved payload converter module path serializes");
@@ -1927,7 +2048,7 @@ fn render_worker_bootstrap(
         serde_json::to_string(&worker.bootstrap_pattern).expect("bootstrap pattern serializes");
     format!(
         "import {{ pathToFileURL }} from 'node:url';\n\
-         export const fabrikMigratedWorker = {{\n  sourceWorker: {source_worker},\n  taskQueue: {task_queue},\n  buildId: {build_id},\n  workflowsPath: {workflows_path},\n  activitiesReference: {activities_reference},\n  activityModule: {activity_module},\n  resolvedActivityModulePath: {resolved_activity_module_path},\n  dataConverterMode: {data_converter_mode},\n  resolvedPayloadConverterModulePath: {resolved_payload_converter_module_path},\n  bootstrapPattern: {bootstrap_pattern}\n}};\n\
+         export const fabrikMigratedWorker = {{\n  sourceWorker: {source_worker},\n  taskQueue: {task_queue},\n  buildId: {build_id},\n  workflowsPath: {workflows_path},\n  activitiesReference: {activities_reference},\n  activityModule: {activity_module},\n  activityFactoryExport: {activity_factory_export},\n  activityFactoryArgsJs: {activity_factory_args_js},\n  activityRuntimeHelper: {activity_runtime_helper},\n  resolvedActivityModulePath: {resolved_activity_module_path},\n  resolvedActivityRuntimeHelperPath: {resolved_activity_runtime_helper_path},\n  dataConverterMode: {data_converter_mode},\n  resolvedPayloadConverterModulePath: {resolved_payload_converter_module_path},\n  bootstrapPattern: {bootstrap_pattern}\n}};\n\
          async function loadPayloadConverterModule() {{\n\
            if (fabrikMigratedWorker.dataConverterMode !== 'path_default_temporal') {{\n\
              return null;\n\
@@ -1946,8 +2067,21 @@ fn render_worker_bootstrap(
            if (!fabrikMigratedWorker.resolvedActivityModulePath) {{\n\
              throw new Error(`worker ${{fabrikMigratedWorker.sourceWorker}} does not export activities for Fabrik dispatch`);\n\
            }}\n\
-           const mod = await import(pathToFileURL(fabrikMigratedWorker.resolvedActivityModulePath).href);\n\
-           const fn = mod[request.activity_type];\n\
+           let activityContainer;\n\
+           if (fabrikMigratedWorker.activityRuntimeHelper) {{\n\
+             if (!fabrikMigratedWorker.resolvedActivityRuntimeHelperPath) {{\n\
+               throw new Error(`worker ${{fabrikMigratedWorker.sourceWorker}} is missing its activity runtime helper`);\n\
+             }}\n\
+             const helper = await import(pathToFileURL(fabrikMigratedWorker.resolvedActivityRuntimeHelperPath).href);\n\
+             const runtime = await helper.createFabrikWorkerRuntime();\n\
+             activityContainer = runtime?.activities;\n\
+           }} else {{\n\
+             const mod = await import(pathToFileURL(fabrikMigratedWorker.resolvedActivityModulePath).href);\n\
+             activityContainer = fabrikMigratedWorker.activityFactoryExport\n\
+               ? mod[fabrikMigratedWorker.activityFactoryExport](...fabrikMigratedWorker.activityFactoryArgsJs.map((arg) => (0, eval)(arg)))\n\
+               : mod;\n\
+           }}\n\
+           const fn = activityContainer?.[request.activity_type];\n\
            if (typeof fn !== 'function') {{\n\
              throw new Error(`activity ${{request.activity_type}} is not exported by ${{fabrikMigratedWorker.resolvedActivityModulePath}}`);\n\
            }}\n\
@@ -1974,7 +2108,11 @@ fn render_worker_bootstrap(
         workflows_path = workflows_path,
         activities_reference = activities_reference,
         activity_module = activity_module,
+        activity_factory_export = activity_factory_export,
+        activity_factory_args_js = activity_factory_args_js,
+        activity_runtime_helper = activity_runtime_helper,
         resolved_activity_module_path = resolved_activity_module_path,
+        resolved_activity_runtime_helper_path = resolved_activity_runtime_helper_path,
         data_converter_mode = data_converter_mode,
         resolved_payload_converter_module_path = resolved_payload_converter_module_path,
         bootstrap_pattern = bootstrap_pattern,

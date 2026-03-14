@@ -7,12 +7,14 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+chrono.workspace = true
 fabrik-broker = { path = "../../crates/fabrik-broker" }
 fabrik-config = { path = "../../crates/fabrik-config" }
 fabrik-events = { path = "../../crates/fabrik-events" }
 fabrik-service = { path = "../../crates/fabrik-service" }
 fabrik-store = { path = "../../crates/fabrik-store" }
 fabrik-workflow = { path = "../../crates/fabrik-workflow" }
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

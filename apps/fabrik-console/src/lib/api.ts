@@ -438,6 +438,106 @@ export type TaskQueueInspection = {
   watch_cursor?: string;
 };
 
+export type TopicAdapter = {
+  tenant_id: string;
+  adapter_id: string;
+  adapter_kind: string;
+  brokers: string;
+  topic_name: string;
+  topic_partitions: number;
+  action: string;
+  definition_id: string | null;
+  signal_type: string | null;
+  workflow_task_queue: string | null;
+  workflow_instance_id_json_pointer: string | null;
+  payload_json_pointer: string | null;
+  payload_template_json: unknown | null;
+  memo_json_pointer: string | null;
+  memo_template_json: unknown | null;
+  search_attributes_json_pointer: string | null;
+  search_attributes_template_json: unknown | null;
+  request_id_json_pointer: string | null;
+  dedupe_key_json_pointer: string | null;
+  dead_letter_policy: string;
+  is_paused: boolean;
+  processed_count: number;
+  failed_count: number;
+  ownership_handoff_count: number;
+  last_processed_at: string | null;
+  last_handoff_at: string | null;
+  last_takeover_latency_ms: number | null;
+  last_error: string | null;
+  last_error_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type TopicAdapterOffset = {
+  tenant_id: string;
+  adapter_id: string;
+  partition_id: number;
+  log_offset: number;
+  updated_at: string;
+};
+
+export type TopicAdapterDeadLetter = {
+  tenant_id: string;
+  adapter_id: string;
+  partition_id: number;
+  log_offset: number;
+  record_key: string | null;
+  payload: unknown;
+  error: string;
+  occurred_at: string;
+  updated_at: string;
+};
+
+export type TopicAdapterOwnership = {
+  tenant_id: string;
+  adapter_id: string;
+  owner_id: string;
+  owner_epoch: number;
+  lease_expires_at: string;
+  acquired_at: string;
+  last_transition_at: string;
+  updated_at: string;
+};
+
+export type TopicAdapterLag = {
+  available: boolean;
+  error?: string | null;
+  total_lag_records: number | null;
+  partitions: Array<{
+    partition_id: number;
+    committed_offset: number | null;
+    latest_offset: number;
+    lag_records: number;
+  }>;
+};
+
+export type TopicAdapterDetailResponse = {
+  adapter: TopicAdapter;
+  offsets: TopicAdapterOffset[];
+  recent_dead_letters: TopicAdapterDeadLetter[];
+  ownership: TopicAdapterOwnership | null;
+  lag: TopicAdapterLag;
+  watch_cursor?: string;
+};
+
+export type TopicAdapterPreviewResponse = {
+  ok: boolean;
+  dispatch: unknown | null;
+  diagnostics: Array<{
+    field: string;
+    mode: string;
+    detail: string;
+  }>;
+  error: {
+    field: string;
+    detail: string;
+  } | null;
+};
+
 export type WatchEvent<T = unknown> = {
   event_type: string;
   occurred_at: string;
@@ -855,6 +955,63 @@ export const api = {
   listTaskQueues: (tenantId: string) => request<TaskQueueListResponse>(`/admin/tenants/${tenantId}/task-queues`),
   getTaskQueue: (tenantId: string, queueKind: string, taskQueue: string) =>
     request<TaskQueueInspection>(`/admin/tenants/${tenantId}/task-queues/${queueKind}/${taskQueue}`),
+  listTopicAdapters: (tenantId: string) => request<TopicAdapter[]>(`/admin/tenants/${tenantId}/topic-adapters`),
+  getTopicAdapter: (tenantId: string, adapterId: string) =>
+    request<TopicAdapterDetailResponse>(`/admin/tenants/${tenantId}/topic-adapters/${adapterId}`),
+  setTopicAdapter: (
+    tenantId: string,
+    adapterId: string,
+    payload: {
+      adapter_kind: string;
+      brokers: string;
+      topic_name: string;
+      topic_partitions: number;
+      action: string;
+      definition_id?: string | null;
+      signal_type?: string | null;
+      workflow_task_queue?: string | null;
+      workflow_instance_id_json_pointer?: string | null;
+      payload_json_pointer?: string | null;
+      payload_template_json?: unknown | null;
+      memo_json_pointer?: string | null;
+      memo_template_json?: unknown | null;
+      search_attributes_json_pointer?: string | null;
+      search_attributes_template_json?: unknown | null;
+      request_id_json_pointer?: string | null;
+      dedupe_key_json_pointer?: string | null;
+      dead_letter_policy?: string;
+      is_paused?: boolean;
+    }
+  ) =>
+    request<TopicAdapter>(`/admin/tenants/${tenantId}/topic-adapters/${adapterId}`, {
+      method: "PUT",
+      body: JSON.stringify(payload)
+    }),
+  pauseTopicAdapter: (tenantId: string, adapterId: string) =>
+    request<TopicAdapter>(`/admin/tenants/${tenantId}/topic-adapters/${adapterId}/pause`, {
+      method: "POST",
+      body: JSON.stringify({})
+    }),
+  resumeTopicAdapter: (tenantId: string, adapterId: string) =>
+    request<TopicAdapter>(`/admin/tenants/${tenantId}/topic-adapters/${adapterId}/resume`, {
+      method: "POST",
+      body: JSON.stringify({})
+    }),
+  listTopicAdapterDeadLetters: (tenantId: string, adapterId: string, limit = 100, offset = 0) =>
+    request<{ tenant_id: string; adapter_id: string; items: TopicAdapterDeadLetter[]; limit: number; offset: number }>(
+      `/admin/tenants/${tenantId}/topic-adapters/${adapterId}/dead-letters?limit=${limit}&offset=${offset}`
+    ),
+  previewTopicAdapter: (
+    tenantId: string,
+    adapterId: string,
+    payload: { payload: unknown; partition_id?: number; log_offset?: number }
+  ) =>
+    request<TopicAdapterPreviewResponse>(`/admin/tenants/${tenantId}/topic-adapters/${adapterId}/preview`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    }),
+  topicAdapterWatchPath: (tenantId: string, adapterId: string) =>
+    `${DEFAULT_API_BASE}/admin/tenants/${tenantId}/topic-adapters/${adapterId}/watch`,
   getTrustSummary: () => request<TrustSummary>("/conformance-reports/trust-summary.json"),
   getConformanceReport: (publicPath: string) => request<ConformanceReport>(publicPath),
   search: (tenantId: string, q: string, limit = 20) =>

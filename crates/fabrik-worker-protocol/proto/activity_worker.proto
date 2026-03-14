@@ -94,6 +94,7 @@ message BulkActivityTask {
   uint64 lease_epoch = 19;
   uint64 owner_epoch = 20;
   bool omit_success_output = 25;
+  uint32 item_count = 26;
 }
 
 message PollBulkActivityTaskResponse {

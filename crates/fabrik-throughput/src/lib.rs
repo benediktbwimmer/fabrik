@@ -18,6 +18,10 @@ use uuid::Uuid;
 
 pub const PG_V1_BACKEND: &str = "pg-v1";
 pub const STREAM_V2_BACKEND: &str = "stream-v2";
+pub const BENCHMARK_ECHO_ACTIVITY: &str = "benchmark.echo";
+pub const BENCHMARK_FAST_COUNT_ACTIVITY: &str = "benchmark.fast_count";
+pub const BENCHMARK_COMPACT_INPUT_KIND: &str = "benchmark_compact";
+pub const BENCHMARK_COMPACT_INPUT_HANDLE_PREFIX: &str = "benchmark-compact";
 pub const STREAM_V2_BACKEND_VERSION: &str = "2.0.0";
 pub const ADMISSION_POLICY_VERSION: &str = "2026-03-13.1";
 pub const BULK_REDUCER_ALL_SUCCEEDED: &str = "all_succeeded";
@@ -132,6 +136,99 @@ pub fn bulk_reducer_requires_error_outputs(reducer: Option<&str>) -> bool {
     matches!(bulk_reducer_name(reducer), BULK_REDUCER_SAMPLE_ERRORS)
 }
 
+pub fn can_use_payloadless_benchmark_transport(
+    activity_type: &str,
+    reducer: Option<&str>,
+    max_attempts: u32,
+    items: &[Value],
+) -> bool {
+    if activity_type == BENCHMARK_FAST_COUNT_ACTIVITY {
+        return true;
+    }
+    if activity_type != BENCHMARK_ECHO_ACTIVITY || max_attempts > 1 {
+        return false;
+    }
+    if bulk_reducer_requires_success_outputs(reducer)
+        || bulk_reducer_requires_error_outputs(reducer)
+    {
+        return false;
+    }
+    items.iter().all(|item| {
+        let Some(object) = item.as_object() else {
+            return false;
+        };
+        !object.get("cancel").and_then(Value::as_bool).unwrap_or(false)
+            && object.get("fail_until_attempt").and_then(Value::as_u64).unwrap_or_default() == 0
+            && !object.contains_key("reducer_value")
+    })
+}
+
+pub fn can_complete_payloadless_benchmark_chunk(
+    activity_type: &str,
+    omit_success_output: bool,
+    item_count: u32,
+    has_inline_items: bool,
+    has_input_handle: bool,
+    cancellation_requested: bool,
+) -> bool {
+    if cancellation_requested || !omit_success_output || item_count == 0 {
+        return false;
+    }
+    if activity_type == BENCHMARK_FAST_COUNT_ACTIVITY {
+        return true;
+    }
+    activity_type == BENCHMARK_ECHO_ACTIVITY && !has_inline_items && !has_input_handle
+}
+
+pub fn benchmark_echo_item_requires_output(item: &Value) -> bool {
+    item.get("reducer_value").is_some()
+}
+
+pub fn execute_benchmark_echo(attempt: u32, input: &Value) -> Result<Value> {
+    let fail_until_attempt =
+        input.get("fail_until_attempt").and_then(Value::as_u64).unwrap_or_default() as u32;
+    if input.get("cancel").and_then(Value::as_bool).unwrap_or(false) {
+        anyhow::bail!("activity cancelled");
+    }
+    if attempt <= fail_until_attempt {
+        anyhow::bail!("benchmark configured failure on attempt {attempt}");
+    }
+    if let Some(reducer_value) = input.get("reducer_value") {
+        return Ok(reducer_value.clone());
+    }
+    Ok(input.clone())
+}
+
+pub fn benchmark_compact_input_spec(total_items: u32) -> Value {
+    serde_json::json!({
+        "kind": BENCHMARK_COMPACT_INPUT_KIND,
+        "count": total_items,
+    })
+}
+
+pub fn parse_benchmark_compact_input_spec(value: &Value) -> Option<u32> {
+    let object = value.as_object()?;
+    if object.get("kind").and_then(Value::as_str) != Some(BENCHMARK_COMPACT_INPUT_KIND) {
+        return None;
+    }
+    object.get("count").and_then(Value::as_u64).and_then(|count| u32::try_from(count).ok())
+}
+
+pub fn benchmark_compact_input_handle(batch_id: &str, total_items: u32) -> PayloadHandle {
+    PayloadHandle::Inline {
+        key: format!("{BENCHMARK_COMPACT_INPUT_HANDLE_PREFIX}:{batch_id}:{total_items}"),
+    }
+}
+
+pub fn parse_benchmark_compact_total_items_from_handle(handle: &PayloadHandle) -> Option<u32> {
+    let PayloadHandle::Inline { key } = handle else {
+        return None;
+    };
+    let prefix = format!("{BENCHMARK_COMPACT_INPUT_HANDLE_PREFIX}:");
+    let suffix = key.strip_prefix(&prefix)?.rsplit(':').next()?;
+    suffix.parse::<u32>().ok()
+}
+
 pub fn bulk_reducer_settles(reducer: Option<&str>) -> bool {
     matches!(
         bulk_reducer_name(reducer),
@@ -188,9 +285,7 @@ pub fn bulk_reducer_reduce_values(
             *buckets.entry(histogram_bucket_key(value)?).or_default() += 1;
         }
         return Ok(Some(Value::Object(serde_json::Map::from_iter(
-            buckets
-                .into_iter()
-                .map(|(bucket, count)| (bucket, Value::from(count))),
+            buckets.into_iter().map(|(bucket, count)| (bucket, Value::from(count))),
         ))));
     }
 
@@ -1264,9 +1359,7 @@ mod tests {
                     key: "batches/batch-a/input".to_owned(),
                     store: LOCAL_FILESYSTEM_STORE.to_owned(),
                 },
-                result_handle: PayloadHandle::Inline {
-                    key: "bulk-result:batch-a".to_owned(),
-                },
+                result_handle: PayloadHandle::Inline { key: "bulk-result:batch-a".to_owned() },
             }),
         };
 
@@ -1303,12 +1396,8 @@ mod tests {
             throughput_backend_version: "2.0.0".to_owned(),
             routing_reason: "bridge".to_owned(),
             admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
-            input_handle: PayloadHandle::Inline {
-                key: "bulk-input:batch-a".to_owned(),
-            },
-            result_handle: PayloadHandle::Inline {
-                key: "bulk-result:batch-a".to_owned(),
-            },
+            input_handle: PayloadHandle::Inline { key: "bulk-input:batch-a".to_owned() },
+            result_handle: PayloadHandle::Inline { key: "bulk-result:batch-a".to_owned() },
             items: vec![Value::from(1)],
         };
 

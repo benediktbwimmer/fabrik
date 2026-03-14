@@ -10,7 +10,9 @@ use std::{
 use anyhow::{Context, Result};
 use fabrik_config::{GrpcServiceConfig, ThroughputPayloadStoreConfig, ThroughputPayloadStoreKind};
 use fabrik_throughput::{
-    PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind, decode_cbor, encode_cbor,
+    BENCHMARK_ECHO_ACTIVITY, PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
+    benchmark_echo_item_requires_output, can_complete_payloadless_benchmark_chunk, decode_cbor,
+    encode_cbor, execute_benchmark_echo,
 };
 use fabrik_worker_protocol::activity_worker::{
     ActivityTaskCancelledResult, ActivityTaskCompletedResult, ActivityTaskFailedResult,
@@ -876,9 +878,19 @@ async fn execute_bulk_activity_task(
     worker_build_id: String,
     managed_node: Option<&ManagedNodeActivityConfig>,
 ) -> Result<BulkActivityTaskResult> {
+    if can_complete_payloadless_benchmark_chunk(
+        &task.activity_type,
+        task.omit_success_output,
+        task.item_count,
+        !task.items_json.is_empty() || !task.items_cbor.is_empty(),
+        !task.input_handle_json.is_empty() || !task.input_handle_cbor.is_empty(),
+        task.cancellation_requested,
+    ) {
+        return execute_benchmark_fast_count_bulk_task(task, worker_id, worker_build_id);
+    }
     let input_handle = task_input_handle(&task)?;
     let items = resolve_bulk_task_items(payload_store, &task, input_handle.as_ref()).await?;
-    if task.activity_type == "benchmark.echo" {
+    if task.activity_type == BENCHMARK_ECHO_ACTIVITY {
         return execute_benchmark_echo_bulk_task(task, worker_id, worker_build_id, items);
     }
     let omit_success_output = task.omit_success_output;
@@ -965,6 +977,38 @@ async fn execute_bulk_activity_task(
         result: Some(
             fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
                 encode_bulk_completed_result(outputs.as_deref())?,
+            ),
+        ),
+    })
+}
+
+fn execute_benchmark_fast_count_bulk_task(
+    task: fabrik_worker_protocol::activity_worker::BulkActivityTask,
+    worker_id: String,
+    worker_build_id: String,
+) -> Result<BulkActivityTaskResult> {
+    if !task.omit_success_output {
+        anyhow::bail!("benchmark.fast_count requires omit_success_output");
+    }
+    let completed = encode_bulk_completed_result(None)?;
+    Ok(BulkActivityTaskResult {
+        tenant_id: task.tenant_id,
+        instance_id: task.instance_id,
+        run_id: task.run_id,
+        batch_id: task.batch_id,
+        chunk_id: task.chunk_id,
+        chunk_index: task.chunk_index,
+        group_id: task.group_id,
+        attempt: task.attempt,
+        worker_id,
+        worker_build_id,
+        lease_token: task.lease_token,
+        lease_epoch: task.lease_epoch,
+        owner_epoch: task.owner_epoch,
+        report_id: Uuid::now_v7().to_string(),
+        result: Some(
+            fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
+                completed,
             ),
         ),
     })
@@ -1062,10 +1106,6 @@ fn execute_benchmark_echo_bulk_task(
             ),
         ),
     })
-}
-
-fn benchmark_echo_item_requires_output(item: &Value) -> bool {
-    item.get("reducer_value").is_some()
 }
 
 fn bulk_output_should_remain_inline(output: &[Value]) -> bool {
@@ -1211,7 +1251,7 @@ async fn execute_activity(
     config: Option<Value>,
     input: &Value,
 ) -> Result<Value> {
-    if activity_type == "benchmark.echo" {
+    if activity_type == BENCHMARK_ECHO_ACTIVITY {
         return execute_benchmark_echo(attempt, input);
     }
     if activity_type == "http.request" {
@@ -1290,21 +1330,6 @@ fn build_payload_store_config() -> PayloadStoreConfig {
         s3_force_path_style: config.s3_force_path_style,
         s3_key_prefix: config.s3_key_prefix,
     }
-}
-
-fn execute_benchmark_echo(attempt: u32, input: &Value) -> Result<Value> {
-    let fail_until_attempt =
-        input.get("fail_until_attempt").and_then(Value::as_u64).unwrap_or_default() as u32;
-    if input.get("cancel").and_then(Value::as_bool).unwrap_or(false) {
-        anyhow::bail!("activity cancelled");
-    }
-    if attempt <= fail_until_attempt {
-        anyhow::bail!("benchmark configured failure on attempt {attempt}");
-    }
-    if let Some(reducer_value) = input.get("reducer_value") {
-        return Ok(reducer_value.clone());
-    }
-    Ok(input.clone())
 }
 
 async fn execute_http_request(
@@ -1397,6 +1422,7 @@ async fn response_body(response: Response) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fabrik_throughput::BENCHMARK_FAST_COUNT_ACTIVITY;
     use fabrik_worker_protocol::activity_worker::{ActivityTask, BulkActivityTask};
     use serde_json::json;
     use std::{
@@ -1536,6 +1562,7 @@ mod tests {
             chunk_id: "batch::0".to_owned(),
             attempt: 1,
             omit_success_output: true,
+            item_count: 1,
             ..BulkActivityTask::default()
         };
         let result = execute_benchmark_echo_bulk_task(
@@ -1554,6 +1581,89 @@ mod tests {
         };
 
         assert!(!completed.output_cbor.is_empty());
+    }
+
+    #[test]
+    fn bulk_benchmark_fast_count_skips_item_deserialization() {
+        let task = BulkActivityTask {
+            tenant_id: "tenant".to_owned(),
+            instance_id: "instance".to_owned(),
+            run_id: "run".to_owned(),
+            batch_id: "batch".to_owned(),
+            chunk_id: "batch::0".to_owned(),
+            activity_type: BENCHMARK_FAST_COUNT_ACTIVITY.to_owned(),
+            attempt: 1,
+            omit_success_output: true,
+            item_count: 512,
+            items_json: "[{\"unexpected\":true}]".to_owned(),
+            ..BulkActivityTask::default()
+        };
+
+        let result =
+            execute_benchmark_fast_count_bulk_task(task, "worker".to_owned(), "build".to_owned())
+                .expect("bulk fast count succeeds");
+
+        let completed = match result.result.expect("result present") {
+            fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
+                completed,
+            ) => completed,
+            other => panic!("expected completed result, got {other:?}"),
+        };
+
+        assert!(completed.output_json.is_empty());
+        assert!(completed.output_cbor.is_empty());
+    }
+
+    #[tokio::test]
+    async fn benchmark_echo_payloadless_chunk_uses_fast_completion() {
+        let temp_root = std::env::temp_dir()
+            .join(format!("fabrik-activity-worker-payload-test-{}", Uuid::now_v7()));
+        let payload_store = PayloadStore::from_config(PayloadStoreConfig {
+            default_store: PayloadStoreKind::LocalFilesystem,
+            local_dir: temp_root.to_string_lossy().into_owned(),
+            s3_bucket: None,
+            s3_region: "us-east-1".to_owned(),
+            s3_endpoint: None,
+            s3_access_key_id: None,
+            s3_secret_access_key: None,
+            s3_force_path_style: true,
+            s3_key_prefix: String::new(),
+        })
+        .await
+        .expect("payload store");
+        let task = BulkActivityTask {
+            tenant_id: "tenant".to_owned(),
+            instance_id: "instance".to_owned(),
+            run_id: "run".to_owned(),
+            batch_id: "batch".to_owned(),
+            chunk_id: "batch::0".to_owned(),
+            activity_type: BENCHMARK_ECHO_ACTIVITY.to_owned(),
+            attempt: 1,
+            omit_success_output: true,
+            item_count: 256,
+            ..BulkActivityTask::default()
+        };
+
+        let result = execute_bulk_activity_task(
+            &Client::new(),
+            &payload_store,
+            task,
+            "worker".to_owned(),
+            "build".to_owned(),
+            None,
+        )
+        .await
+        .expect("bulk benchmark echo succeeds");
+
+        let completed = match result.result.expect("result present") {
+            fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
+                completed,
+            ) => completed,
+            other => panic!("expected completed result, got {other:?}"),
+        };
+
+        assert!(completed.output_json.is_empty());
+        assert!(completed.output_cbor.is_empty());
     }
 
     #[test]
@@ -1603,5 +1713,4 @@ mod tests {
                 .expect("managed activity succeeds");
         assert_eq!(output, serde_json::json!("hello alice"));
     }
-
 }

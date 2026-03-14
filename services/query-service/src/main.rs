@@ -2654,6 +2654,8 @@ fn compiled_state_kind(state: &CompiledStateNode) -> &'static str {
         CompiledStateNode::Assign { .. } => "assign",
         CompiledStateNode::Choice { .. } => "choice",
         CompiledStateNode::Step { .. } => "step",
+        CompiledStateNode::DynamicStep { .. } => "dynamic_step",
+        CompiledStateNode::StartStepHandle { .. } => "start_step_handle",
         CompiledStateNode::FanOut { .. } => "fan_out",
         CompiledStateNode::StartBulkActivity { .. } => "start_bulk_activity",
         CompiledStateNode::WaitForBulkActivity { .. } => "wait_for_bulk_activity",
@@ -2666,6 +2668,7 @@ fn compiled_state_kind(state: &CompiledStateNode) -> &'static str {
         CompiledStateNode::WaitForChild { .. } => "wait_for_child",
         CompiledStateNode::WaitForEvent { .. } => "wait_for_event",
         CompiledStateNode::WaitForCondition { .. } => "wait_for_condition",
+        CompiledStateNode::StartTimerHandle { .. } => "start_timer_handle",
         CompiledStateNode::WaitForTimer { .. } => "wait_for_timer",
         CompiledStateNode::Succeed { .. } => "succeed",
         CompiledStateNode::Fail { .. } => "fail",
@@ -2676,7 +2679,9 @@ fn compiled_state_kind(state: &CompiledStateNode) -> &'static str {
 fn semantic_module_kind(_graph: &str, state: &CompiledStateNode) -> &'static str {
     match state {
         CompiledStateNode::Assign { .. } | CompiledStateNode::Choice { .. } => "assign_decision",
-        CompiledStateNode::Step { .. } => "activity_step",
+        CompiledStateNode::Step { .. }
+        | CompiledStateNode::DynamicStep { .. }
+        | CompiledStateNode::StartStepHandle { .. } => "activity_step",
         CompiledStateNode::FanOut { .. } | CompiledStateNode::WaitForAllActivities { .. } => {
             "fan_out"
         }
@@ -2691,7 +2696,9 @@ fn semantic_module_kind(_graph: &str, state: &CompiledStateNode) -> &'static str
         CompiledStateNode::WaitForEvent { .. } | CompiledStateNode::WaitForCondition { .. } => {
             "wait"
         }
-        CompiledStateNode::WaitForTimer { .. } => "timer",
+        CompiledStateNode::StartTimerHandle { .. } | CompiledStateNode::WaitForTimer { .. } => {
+            "timer"
+        }
         CompiledStateNode::Succeed { .. }
         | CompiledStateNode::Fail { .. }
         | CompiledStateNode::ContinueAsNew { .. } => "terminal",
@@ -2719,6 +2726,10 @@ fn compiled_state_subtitle(state: &CompiledStateNode) -> Option<String> {
                 .map(|_| format!("step · {handler}"))
                 .unwrap_or_else(|| handler.clone()),
         ),
+        CompiledStateNode::DynamicStep { .. } => Some("dynamic step".to_owned()),
+        CompiledStateNode::StartStepHandle { handle_var, .. } => {
+            Some(format!("start step handle · {handle_var}"))
+        }
         CompiledStateNode::FanOut { activity_type, .. } => {
             Some(format!("fan-out · {activity_type}"))
         }
@@ -2749,6 +2760,9 @@ fn compiled_state_subtitle(state: &CompiledStateNode) -> Option<String> {
             Some(format!("wait signal · {event_type}"))
         }
         CompiledStateNode::WaitForCondition { .. } => Some("wait condition".to_owned()),
+        CompiledStateNode::StartTimerHandle { timer_ref, .. } => {
+            Some(format!("start timer · {timer_ref}"))
+        }
         CompiledStateNode::WaitForTimer { timer_ref, .. } => Some(format!("timer · {timer_ref}")),
         CompiledStateNode::Succeed { .. } => Some("success".to_owned()),
         CompiledStateNode::Fail { .. } => Some("failure".to_owned()),
@@ -2772,6 +2786,17 @@ fn state_transition_targets(state: &CompiledStateNode) -> Vec<(String, String)> 
             }
             transitions
         }
+        CompiledStateNode::DynamicStep { next, on_error, .. } => {
+            let mut transitions = next
+                .iter()
+                .map(|target| ("success".to_owned(), target.clone()))
+                .collect::<Vec<_>>();
+            if let Some(on_error) = on_error {
+                transitions.push(("error".to_owned(), on_error.next.clone()));
+            }
+            transitions
+        }
+        CompiledStateNode::StartStepHandle { next, .. } => vec![("next".to_owned(), next.clone())],
         CompiledStateNode::FanOut { next, .. } => vec![("await".to_owned(), next.clone())],
         CompiledStateNode::StartBulkActivity { next, .. } => {
             vec![("await".to_owned(), next.clone())]
@@ -2790,6 +2815,7 @@ fn state_transition_targets(state: &CompiledStateNode) -> Vec<(String, String)> 
         | CompiledStateNode::CancelChild { next, .. }
         | CompiledStateNode::SignalExternal { next, .. }
         | CompiledStateNode::CancelExternal { next, .. }
+        | CompiledStateNode::StartTimerHandle { next, .. }
         | CompiledStateNode::WaitForEvent { next, .. }
         | CompiledStateNode::WaitForTimer { next, .. } => vec![("next".to_owned(), next.clone())],
         CompiledStateNode::WaitForCondition { next, timeout_next, .. } => {
@@ -3958,10 +3984,19 @@ async fn load_workflow_bulk_results(
             }
         }
     };
-    let mut resolved_chunks = Vec::new();
-    for chunk in chunks {
-        resolved_chunks.push(resolve_chunk_payloads(state, chunk, false, true).await?);
-    }
+    let resolved_chunks = if batch.throughput_backend == ThroughputBackend::StreamV2.as_str()
+        && consistency == ReadConsistency::Eventual
+        && batch.reducer.as_deref() == Some("collect_results")
+        && batch.status == WorkflowBulkBatchStatus::Completed
+    {
+        resolve_collect_results_page_from_batch_payload(state, &batch, chunks).await?
+    } else {
+        let mut resolved_chunks = Vec::new();
+        for chunk in chunks {
+            resolved_chunks.push(resolve_chunk_payloads(state, chunk, false, true).await?);
+        }
+        resolved_chunks
+    };
     let chunks =
         resolved_chunks.into_iter().filter(|chunk| chunk.output.is_some()).collect::<Vec<_>>();
     Ok(WorkflowBulkResultsResponse {
@@ -3986,6 +4021,54 @@ async fn load_workflow_bulk_results(
         chunk_count: total,
         chunks,
     })
+}
+
+async fn resolve_collect_results_page_from_batch_payload(
+    state: &AppState,
+    batch: &WorkflowBulkBatchRecord,
+    chunks: Vec<WorkflowBulkChunkRecord>,
+) -> Result<Vec<WorkflowBulkChunkRecord>> {
+    let handle = serde_json::from_value::<PayloadHandle>(batch.result_handle.clone())
+        .context("failed to decode collect_results batch result handle")?;
+    let value = state
+        .payload_store
+        .read_value(&handle)
+        .await
+        .context("failed to read collect_results batch result payload")?;
+    let items = match value {
+        Value::Array(items) => items,
+        _ => Vec::new(),
+    };
+    let chunk_size = batch.chunk_size.max(1);
+    let mut resolved = Vec::with_capacity(chunks.len());
+    for mut chunk in chunks {
+        chunk.output = Some(slice_collect_results_chunk_output(
+            &items,
+            chunk.chunk_index,
+            chunk_size,
+            chunk.item_count,
+        )?);
+        resolved.push(chunk);
+    }
+    Ok(resolved)
+}
+
+fn slice_collect_results_chunk_output(
+    items: &[Value],
+    chunk_index: u32,
+    chunk_size: u32,
+    item_count: u32,
+) -> Result<Vec<Value>> {
+    let chunk_size = usize::try_from(chunk_size.max(1)).context("chunk size exceeds usize")?;
+    let start = usize::try_from(chunk_index)
+        .context("chunk index exceeds usize")?
+        .saturating_mul(chunk_size);
+    let len = usize::try_from(item_count).context("chunk item count exceeds usize")?;
+    let end = start.saturating_add(len).min(items.len());
+    if start > items.len() {
+        return Ok(Vec::new());
+    }
+    Ok(items[start..end].to_vec())
 }
 
 async fn resolve_chunk_payloads(
@@ -4604,6 +4687,23 @@ mod tests {
         time::sleep,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn collect_results_page_slices_outputs_by_chunk_index() {
+        let items = vec![json!(1), json!(2), json!(3), json!(4), json!(5)];
+        assert_eq!(
+            slice_collect_results_chunk_output(&items, 0, 2, 2).unwrap(),
+            vec![json!(1), json!(2)]
+        );
+        assert_eq!(
+            slice_collect_results_chunk_output(&items, 1, 2, 2).unwrap(),
+            vec![json!(3), json!(4)]
+        );
+        assert_eq!(
+            slice_collect_results_chunk_output(&items, 2, 2, 1).unwrap(),
+            vec![json!(5)]
+        );
+    }
 
     struct TestPostgres {
         container_name: String,

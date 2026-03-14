@@ -34,6 +34,28 @@ fn run_cli(
     (output.status, payload)
 }
 
+fn run_cli_relative(
+    project_root: &Path,
+    output_dir: &Path,
+    extra_args: &[&str],
+) -> (std::process::ExitStatus, Value) {
+    let cwd = Path::new("/Users/bene/code/fabrik");
+    let relative_root = project_root
+        .strip_prefix(cwd)
+        .expect("fixture path should be under repo root");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fabrik"));
+    command.args(["migrate", "temporal"]);
+    command.arg(relative_root);
+    command.args(["--output-dir", output_dir.to_str().expect("utf8")]);
+    command.args(extra_args);
+    command.current_dir(cwd);
+    let output = command.output().expect("cli runs");
+    let report =
+        fs::read_to_string(output_dir.join("migration-report.json")).expect("report exists");
+    let payload: Value = serde_json::from_str(&report).expect("report json");
+    (output.status, payload)
+}
+
 #[test]
 fn supported_project_compiles_and_packages() {
     let output_dir = temp_output_dir("supported");
@@ -102,6 +124,74 @@ fn esm_workflows_path_bootstrap_pattern_is_qualified() {
     assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
     assert_eq!(report["worker_packages"][0]["task_queue"], "bootstrap-esm-qualified");
     assert_eq!(report["discovered"]["workers"][0]["workflows_path"], "./workflows.ts");
+}
+
+#[test]
+fn self_file_workflows_path_and_workflow_context_guard_qualify() {
+    let output_dir = temp_output_dir("bootstrap-self-file-qualified");
+    let (status, report) =
+        run_cli(&fixture("temporal-bootstrap-self-file-qualified"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
+    assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
+    assert_eq!(report["worker_packages"][0]["task_queue"], "bootstrap-self-file");
+}
+
+#[test]
+fn activity_factory_registration_with_static_bootstrap_args_is_packaged() {
+    let output_dir = temp_output_dir("activity-factory-qualified");
+    let (status, report) =
+        run_cli(&fixture("temporal-activity-factory-qualified"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
+    assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
+    assert_eq!(report["worker_packages"][0]["task_queue"], "activity-factory-qualified");
+    assert_eq!(
+        report["discovered"]["workers"][0]["activity_factory_export"],
+        "createActivities"
+    );
+    let factory_arg = report["discovered"]["workers"][0]["activity_factory_args_js"][0]
+        .as_str()
+        .expect("factory arg");
+    assert!(factory_arg.contains("async get(_key)"));
+    assert!(factory_arg.contains("\"Temporal\""));
+}
+
+#[test]
+fn test_only_worker_bootstrap_findings_do_not_block_production_worker() {
+    let output_dir = temp_output_dir("test-worker-qualified");
+    let (status, report) =
+        run_cli(&fixture("temporal-test-worker-qualified"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
+    assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
+    assert_eq!(report["worker_packages"][0]["task_queue"], "test-worker-qualified");
+    assert!(
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .all(|finding| !(finding["file"] == "src/workflows.test.ts" && finding["severity"] == "hard_block"))
+    );
+}
+
+#[test]
+fn dynamic_worker_task_queue_is_packaged_with_caveats() {
+    let output_dir = temp_output_dir("bootstrap-dynamic-taskqueue-qualified");
+    let (status, report) =
+        run_cli(&fixture("temporal-bootstrap-dynamic-taskqueue-qualified"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["validation"]["source_compatibility_preflight"]["status"], "passed");
+    assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
+    assert!(report["worker_packages"][0]["task_queue"].is_null());
 }
 
 #[test]
@@ -224,7 +314,8 @@ fn temporal_patching_api_slice_qualifies_and_packages() {
 #[test]
 fn temporal_worker_versioning_annotations_qualify_and_package() {
     let output_dir = temp_output_dir("worker-versioning-qualified");
-    let (status, report) = run_cli(&fixture("temporal-worker-versioning-qualified"), &output_dir, &[]);
+    let (status, report) =
+        run_cli(&fixture("temporal-worker-versioning-qualified"), &output_dir, &[]);
     assert!(status.success(), "report: {report:?}");
     assert_eq!(report["status"], "compatible_ready_not_deployed");
     assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
@@ -282,6 +373,22 @@ fn workspace_and_tsconfig_path_activity_modules_package_cleanly() {
     assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
     assert_eq!(report["worker_packages"][0]["task_queue"], "workspace-qualified");
     assert!(report["worker_packages"][0]["resolved_activity_module_path"].is_string());
+}
+
+#[test]
+fn relative_project_root_uses_relaxed_transpile_fallback_for_worker_packaging() {
+    let output_dir = temp_output_dir("relative-relaxed-transpile");
+    let (status, report) =
+        run_cli_relative(&fixture("temporal-relaxed-transpile-qualified"), &output_dir, &[]);
+    assert!(status.success(), "report: {report:?}");
+    assert_eq!(report["status"], "compatible_ready_not_deployed");
+    assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
+    assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
+    let worker_packages = report["worker_packages"].as_array().expect("worker packages");
+    assert_eq!(worker_packages.len(), 1);
+    assert_eq!(worker_packages[0]["worker_file"], "src/worker.ts");
+    assert_eq!(worker_packages[0]["package_status"], "packaged");
+    assert!(worker_packages[0]["resolved_activity_module_path"].is_string());
 }
 
 #[test]

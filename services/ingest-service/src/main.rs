@@ -1,37 +1,91 @@
-use anyhow::Result;
+use std::{collections::HashMap, env};
+
+use anyhow::{Context, Result};
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::StatusCode,
     routing::post,
 };
+use chrono::{DateTime, Utc};
 use fabrik_broker::{
-    BrokerConfig, WorkflowHistoryFilter, WorkflowPublisher, read_workflow_history,
+    BrokerConfig, JsonTopicConfig, WorkflowHistoryFilter, WorkflowPublisher,
+    build_json_consumer_from_offsets, decode_json_record, read_workflow_history,
 };
 use fabrik_config::{HttpServiceConfig, PostgresConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
-use fabrik_store::{WorkflowRunFilters, WorkflowStore};
+use fabrik_store::{
+    TopicAdapterRecord, TopicAdapterResolvedDispatch, WorkflowRunFilters, WorkflowStore,
+    resolve_topic_adapter_dispatch,
+};
 use fabrik_workflow::{
     CompiledWorkflowArtifact, ReplayDivergence, WorkflowDefinition, WorkflowStatus, artifact_hash,
     validate_compiled_artifact_history_compatibility,
 };
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
-use tokio::time::{Duration, Instant};
-use tracing::info;
+use tokio::{
+    task::JoinHandle,
+    time::{Duration, Instant},
+};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const DEFAULT_ARTIFACT_VALIDATION_RUN_LIMIT: usize = 10;
 const HISTORY_IDLE_TIMEOUT_MS: u64 = 1_000;
 const HISTORY_MAX_SCAN_MS: u64 = 10_000;
+const TOPIC_ADAPTER_RECONCILE_INTERVAL_MS: u64 = 5_000;
+const TOPIC_ADAPTER_RESTART_DELAY_MS: u64 = 1_000;
+const TOPIC_ADAPTER_OWNERSHIP_LEASE_TTL_MS: u64 = 5_000;
+const TOPIC_ADAPTER_OWNERSHIP_RENEW_INTERVAL_MS: u64 = 1_000;
+const TOPIC_ADAPTER_OWNERSHIP_RETRY_DELAY_MS: u64 = 1_000;
 
 #[derive(Clone)]
 struct AppState {
     broker: BrokerConfig,
     publisher: WorkflowPublisher,
     store: WorkflowStore,
+    runtime_id: String,
 }
+
+#[derive(Clone)]
+struct TopicAdapterTaskSpec {
+    tenant_id: String,
+    adapter_id: String,
+    updated_at: DateTime<Utc>,
+    is_paused: bool,
+}
+
+#[derive(Debug)]
+struct TopicAdapterOwnershipLost {
+    tenant_id: String,
+    adapter_id: String,
+    owner_epoch: u64,
+}
+
+impl TopicAdapterOwnershipLost {
+    fn new(tenant_id: &str, adapter_id: &str, owner_epoch: u64) -> Self {
+        Self {
+            tenant_id: tenant_id.to_owned(),
+            adapter_id: adapter_id.to_owned(),
+            owner_epoch,
+        }
+    }
+}
+
+impl std::fmt::Display for TopicAdapterOwnershipLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "topic adapter ownership lost for {}/{} at owner epoch {}",
+            self.tenant_id, self.adapter_id, self.owner_epoch
+        )
+    }
+}
+
+impl std::error::Error for TopicAdapterOwnershipLost {}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct TriggerWorkflowRequest {
@@ -224,6 +278,15 @@ async fn main() -> Result<()> {
     );
     let store = WorkflowStore::connect(&postgres.url).await?;
     store.init().await?;
+    let state = AppState {
+        broker: broker.clone(),
+        publisher: WorkflowPublisher::new(&broker, "ingest-service").await?,
+        store,
+        runtime_id: env::var("INGEST_RUNTIME_ID")
+            .ok()
+            .filter(|value: &String| !value.is_empty())
+            .unwrap_or_else(|| format!("ingest-service-{}", Uuid::now_v7())),
+    };
     let app = default_router::<AppState>(ServiceInfo::new(
         config.name,
         "ingest",
@@ -253,13 +316,437 @@ async fn main() -> Result<()> {
         "/tenants/{tenant_id}/workflows/{workflow_instance_id}/activities/{activity_id}/cancel",
         post(cancel_activity),
     )
-    .with_state(AppState {
-        broker: broker.clone(),
-        publisher: WorkflowPublisher::new(&broker, "ingest-service").await?,
-        store,
-    });
+    .with_state(state.clone());
 
+    tokio::spawn(run_topic_adapter_manager(state));
     serve(app, config.port).await
+}
+
+async fn run_topic_adapter_manager(state: AppState) {
+    let mut tasks: HashMap<String, (TopicAdapterTaskSpec, JoinHandle<()>)> = HashMap::new();
+    loop {
+        match state.store.list_topic_adapters().await {
+            Ok(adapters) => {
+                let mut desired = HashMap::new();
+                for adapter in adapters {
+                    let key = topic_adapter_key(&adapter.tenant_id, &adapter.adapter_id);
+                    desired.insert(
+                        key,
+                        TopicAdapterTaskSpec {
+                            tenant_id: adapter.tenant_id.clone(),
+                            adapter_id: adapter.adapter_id.clone(),
+                            updated_at: adapter.updated_at,
+                            is_paused: adapter.is_paused,
+                        },
+                    );
+
+                    if adapter.is_paused {
+                        if let Some((_, handle)) = tasks
+                            .remove(&topic_adapter_key(&adapter.tenant_id, &adapter.adapter_id))
+                        {
+                            handle.abort();
+                        }
+                        continue;
+                    }
+
+                    let key = topic_adapter_key(&adapter.tenant_id, &adapter.adapter_id);
+                    let should_restart = tasks
+                        .get(&key)
+                        .map(|(spec, handle)| {
+                            spec.updated_at != adapter.updated_at
+                                || spec.is_paused
+                                || handle.is_finished()
+                        })
+                        .unwrap_or(true);
+                    if !should_restart {
+                        continue;
+                    }
+                    if let Some((_, handle)) = tasks.remove(&key) {
+                        handle.abort();
+                    }
+                    info!(
+                        tenant_id = %adapter.tenant_id,
+                        adapter_id = %adapter.adapter_id,
+                        topic = %adapter.topic_name,
+                        action = %adapter.action.as_str(),
+                        "starting topic adapter worker"
+                    );
+                    let spec = TopicAdapterTaskSpec {
+                        tenant_id: adapter.tenant_id.clone(),
+                        adapter_id: adapter.adapter_id.clone(),
+                        updated_at: adapter.updated_at,
+                        is_paused: false,
+                    };
+                    let handle = tokio::spawn(run_topic_adapter_worker(state.clone(), adapter));
+                    tasks.insert(key, (spec, handle));
+                }
+
+                let stale = tasks
+                    .keys()
+                    .filter(|key| !desired.contains_key(*key))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for key in stale {
+                    if let Some((spec, handle)) = tasks.remove(&key) {
+                        info!(
+                            tenant_id = %spec.tenant_id,
+                            adapter_id = %spec.adapter_id,
+                            "stopping topic adapter worker"
+                        );
+                        handle.abort();
+                    }
+                }
+            }
+            Err(error) => error!(error = %error, "failed to reconcile topic adapters"),
+        }
+
+        tokio::time::sleep(Duration::from_millis(TOPIC_ADAPTER_RECONCILE_INTERVAL_MS)).await;
+    }
+}
+
+async fn run_topic_adapter_worker(state: AppState, adapter: TopicAdapterRecord) {
+    let lease_ttl = Duration::from_millis(TOPIC_ADAPTER_OWNERSHIP_LEASE_TTL_MS);
+    loop {
+        let ownership = match state
+            .store
+            .claim_topic_adapter_ownership(
+                &adapter.tenant_id,
+                &adapter.adapter_id,
+                &state.runtime_id,
+                lease_ttl,
+            )
+            .await
+        {
+            Ok(Some(ownership)) => ownership,
+            Ok(None) => {
+                tokio::time::sleep(Duration::from_millis(TOPIC_ADAPTER_OWNERSHIP_RETRY_DELAY_MS))
+                    .await;
+                continue;
+            }
+            Err(error) => {
+                warn!(
+                    tenant_id = %adapter.tenant_id,
+                    adapter_id = %adapter.adapter_id,
+                    error = %error,
+                    "topic adapter worker failed to claim ownership"
+                );
+                tokio::time::sleep(Duration::from_millis(TOPIC_ADAPTER_RESTART_DELAY_MS)).await;
+                continue;
+            }
+        };
+
+        info!(
+            tenant_id = %adapter.tenant_id,
+            adapter_id = %adapter.adapter_id,
+            owner_id = %ownership.owner_id,
+            owner_epoch = ownership.owner_epoch,
+            lease_expires_at = %ownership.lease_expires_at,
+            "topic adapter worker claimed ownership"
+        );
+
+        if let Err(error) = run_topic_adapter_consumer_pass(&state, &adapter, ownership.owner_epoch).await {
+            if error
+                .downcast_ref::<TopicAdapterOwnershipLost>()
+                .is_some()
+            {
+                info!(
+                    tenant_id = %adapter.tenant_id,
+                    adapter_id = %adapter.adapter_id,
+                    owner_id = %state.runtime_id,
+                    owner_epoch = ownership.owner_epoch,
+                    "topic adapter worker lost ownership"
+                );
+                tokio::time::sleep(Duration::from_millis(TOPIC_ADAPTER_OWNERSHIP_RETRY_DELAY_MS))
+                    .await;
+                continue;
+            }
+            warn!(
+                tenant_id = %adapter.tenant_id,
+                adapter_id = %adapter.adapter_id,
+                error = %error,
+                "topic adapter worker restarting after error"
+            );
+            if let Err(store_error) = state
+                .store
+                .mark_topic_adapter_runtime_error(
+                    &adapter.tenant_id,
+                    &adapter.adapter_id,
+                    &error.to_string(),
+                    Utc::now(),
+                )
+                .await
+            {
+                error!(
+                    tenant_id = %adapter.tenant_id,
+                    adapter_id = %adapter.adapter_id,
+                    error = %store_error,
+                    "failed to persist topic adapter runtime error"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(TOPIC_ADAPTER_RESTART_DELAY_MS)).await;
+        }
+    }
+}
+
+async fn run_topic_adapter_consumer_pass(
+    state: &AppState,
+    adapter: &TopicAdapterRecord,
+    owner_epoch: u64,
+) -> Result<()> {
+    let config = JsonTopicConfig::new(
+        adapter.brokers.clone(),
+        adapter.topic_name.clone(),
+        adapter.topic_partitions,
+    );
+    let partitions = config.all_partition_ids();
+    let offsets = state
+        .store
+        .load_topic_adapter_offsets(&adapter.tenant_id, &adapter.adapter_id)
+        .await
+        .context("failed to load topic adapter offsets")?;
+    let start_offsets = offsets
+        .into_iter()
+        .map(|offset| (offset.partition_id, offset.log_offset.saturating_add(1)))
+        .collect::<HashMap<_, _>>();
+    let mut consumer = build_json_consumer_from_offsets(
+        &config,
+        &format!(
+            "topic-adapter-{}-{}-{}",
+            adapter.tenant_id, adapter.adapter_id, state.runtime_id
+        ),
+        &start_offsets,
+        &partitions,
+    )
+    .await
+    .context("failed to build topic adapter consumer")?;
+    let mut renew_interval =
+        tokio::time::interval(Duration::from_millis(TOPIC_ADAPTER_OWNERSHIP_RENEW_INTERVAL_MS));
+    renew_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        let record_result = tokio::select! {
+            _ = renew_interval.tick() => {
+                let renewed = state
+                    .store
+                    .renew_topic_adapter_ownership(
+                        &adapter.tenant_id,
+                        &adapter.adapter_id,
+                        &state.runtime_id,
+                        owner_epoch,
+                        Duration::from_millis(TOPIC_ADAPTER_OWNERSHIP_LEASE_TTL_MS),
+                    )
+                    .await
+                    .context("failed to renew topic adapter ownership")?;
+                if renewed.is_none() {
+                    return Err(TopicAdapterOwnershipLost::new(
+                        &adapter.tenant_id,
+                        &adapter.adapter_id,
+                        owner_epoch,
+                    )
+                    .into());
+                }
+                continue;
+            }
+            record_result = consumer.next() => record_result,
+        };
+
+        let Some(record_result) = record_result else {
+            return Ok(());
+        };
+        let consumed = record_result.context("failed to read topic adapter record")?;
+        let key = consumed
+            .record
+            .record
+            .key
+            .as_deref()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
+        let payload = match decode_json_record::<Value>(&consumed.record) {
+            Ok(payload) => payload,
+            Err(error) => {
+                let committed = state
+                    .store
+                    .record_topic_adapter_dead_letter_if_owned(
+                        &adapter.tenant_id,
+                        &adapter.adapter_id,
+                        consumed.partition_id,
+                        consumed.record.offset,
+                        key.as_deref(),
+                        &Value::Null,
+                        &format!("invalid_json: {error}"),
+                        Utc::now(),
+                        &state.runtime_id,
+                        owner_epoch,
+                    )
+                    .await
+                    .context("failed to store invalid json topic adapter record")?;
+                if !committed {
+                    if !state
+                        .store
+                        .validate_topic_adapter_ownership(
+                            &adapter.tenant_id,
+                            &adapter.adapter_id,
+                            &state.runtime_id,
+                            owner_epoch,
+                        )
+                        .await
+                        .context("failed to validate topic adapter ownership after invalid json commit rejection")?
+                    {
+                        return Err(TopicAdapterOwnershipLost::new(
+                            &adapter.tenant_id,
+                            &adapter.adapter_id,
+                            owner_epoch,
+                        )
+                        .into());
+                    }
+                }
+                continue;
+            }
+        };
+
+        match dispatch_topic_adapter_record(
+            state,
+            adapter,
+            &payload,
+            consumed.partition_id,
+            consumed.record.offset,
+        )
+        .await
+        {
+            Ok(()) => {
+                let committed = state
+                    .store
+                    .record_topic_adapter_success_if_owned(
+                        &adapter.tenant_id,
+                        &adapter.adapter_id,
+                        consumed.partition_id,
+                        consumed.record.offset,
+                        Utc::now(),
+                        &state.runtime_id,
+                        owner_epoch,
+                    )
+                    .await
+                    .context("failed to commit topic adapter success")?;
+                if !committed {
+                    if !state
+                        .store
+                        .validate_topic_adapter_ownership(
+                            &adapter.tenant_id,
+                            &adapter.adapter_id,
+                            &state.runtime_id,
+                            owner_epoch,
+                        )
+                        .await
+                        .context("failed to validate topic adapter ownership after success commit rejection")?
+                    {
+                        return Err(TopicAdapterOwnershipLost::new(
+                            &adapter.tenant_id,
+                            &adapter.adapter_id,
+                            owner_epoch,
+                        )
+                        .into());
+                    }
+                }
+            }
+            Err((status, message)) if status.is_client_error() => {
+                let committed = state
+                    .store
+                    .record_topic_adapter_dead_letter_if_owned(
+                        &adapter.tenant_id,
+                        &adapter.adapter_id,
+                        consumed.partition_id,
+                        consumed.record.offset,
+                        key.as_deref(),
+                        &payload,
+                        &format!("{}: {}", status.as_u16(), message),
+                        Utc::now(),
+                        &state.runtime_id,
+                        owner_epoch,
+                    )
+                    .await
+                    .context("failed to store topic adapter dead letter")?;
+                if !committed {
+                    if !state
+                        .store
+                        .validate_topic_adapter_ownership(
+                            &adapter.tenant_id,
+                            &adapter.adapter_id,
+                            &state.runtime_id,
+                            owner_epoch,
+                        )
+                        .await
+                        .context("failed to validate topic adapter ownership after dead letter commit rejection")?
+                    {
+                        return Err(TopicAdapterOwnershipLost::new(
+                            &adapter.tenant_id,
+                            &adapter.adapter_id,
+                            owner_epoch,
+                        )
+                        .into());
+                    }
+                }
+            }
+            Err((status, message)) => {
+                anyhow::bail!(
+                    "topic adapter dispatch failed with status {} for {}:{}:{}: {}",
+                    status.as_u16(),
+                    adapter.tenant_id,
+                    adapter.adapter_id,
+                    consumed.record.offset,
+                    message
+                );
+            }
+        }
+    }
+
+}
+
+async fn dispatch_topic_adapter_record(
+    state: &AppState,
+    adapter: &TopicAdapterRecord,
+    payload: &Value,
+    partition_id: i32,
+    log_offset: i64,
+) -> Result<(), (StatusCode, String)> {
+    let preview = resolve_topic_adapter_dispatch(adapter, payload, partition_id, log_offset)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    match preview.dispatch {
+        TopicAdapterResolvedDispatch::StartWorkflow(request) => {
+            handle_trigger_workflow(
+                state,
+                &request.definition_id,
+                TriggerWorkflowRequest {
+                    tenant_id: adapter.tenant_id.clone(),
+                    instance_id: request.instance_id,
+                    workflow_task_queue: request.workflow_task_queue,
+                    input: request.input,
+                    memo: request.memo,
+                    search_attributes: request.search_attributes,
+                    request_id: Some(request.request_id),
+                },
+            )
+            .await
+            .map(|_| ())
+        }
+        TopicAdapterResolvedDispatch::SignalWorkflow(request) => {
+            handle_signal_workflow(
+                state,
+                &adapter.tenant_id,
+                &request.instance_id,
+                &request.signal_type,
+                SignalWorkflowRequest {
+                    payload: request.payload,
+                    dedupe_key: request.dedupe_key,
+                    request_id: Some(request.request_id),
+                },
+            )
+            .await
+            .map(|_| ())
+        }
+    }
+}
+
+fn topic_adapter_key(tenant_id: &str, adapter_id: &str) -> String {
+    format!("{tenant_id}:{adapter_id}")
 }
 
 async fn publish_workflow_artifact(
@@ -466,6 +953,25 @@ async fn trigger_workflow(
     State(state): State<AppState>,
     Json(request): Json<TriggerWorkflowRequest>,
 ) -> Result<(StatusCode, Json<TriggerWorkflowResponse>), (StatusCode, String)> {
+    let response = handle_trigger_workflow(&state, &definition_id, request).await?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+async fn signal_workflow(
+    Path((tenant_id, instance_id, signal_type)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<SignalWorkflowRequest>,
+) -> Result<(StatusCode, Json<SignalWorkflowResponse>), (StatusCode, String)> {
+    let response =
+        handle_signal_workflow(&state, &tenant_id, &instance_id, &signal_type, request).await?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+async fn handle_trigger_workflow(
+    state: &AppState,
+    definition_id: &str,
+    request: TriggerWorkflowRequest,
+) -> Result<TriggerWorkflowResponse, (StatusCode, String)> {
     if let Some(request_id) = request.request_id.as_deref() {
         if let Some(response) = load_dedup_response::<TriggerWorkflowResponse, _>(
             &state.store,
@@ -477,7 +983,7 @@ async fn trigger_workflow(
         )
         .await?
         {
-            return Ok((StatusCode::ACCEPTED, Json(response)));
+            return Ok(response);
         }
     }
     let task_queue_hint = request.workflow_task_queue.as_deref();
@@ -596,31 +1102,33 @@ async fn trigger_workflow(
         )
         .await?;
     }
-    Ok((StatusCode::ACCEPTED, Json(response)))
+    Ok(response)
 }
 
-async fn signal_workflow(
-    Path((tenant_id, instance_id, signal_type)): Path<(String, String, String)>,
-    State(state): State<AppState>,
-    Json(request): Json<SignalWorkflowRequest>,
-) -> Result<(StatusCode, Json<SignalWorkflowResponse>), (StatusCode, String)> {
+async fn handle_signal_workflow(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    signal_type: &str,
+    request: SignalWorkflowRequest,
+) -> Result<SignalWorkflowResponse, (StatusCode, String)> {
     if let Some(request_id) = request.request_id.as_deref() {
         if let Some(response) = load_dedup_response::<SignalWorkflowResponse, _>(
             &state.store,
-            &tenant_id,
-            Some(&instance_id),
+            tenant_id,
+            Some(instance_id),
             &format!("signal:{signal_type}"),
             request_id,
             &request,
         )
         .await?
         {
-            return Ok((StatusCode::ACCEPTED, Json(response)));
+            return Ok(response);
         }
     }
     let instance = state
         .store
-        .get_instance(&tenant_id, &instance_id)
+        .get_instance(tenant_id, instance_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| {
@@ -663,13 +1171,13 @@ async fn signal_workflow(
     let signal_id = format!("sig-{}", Uuid::now_v7());
     let payload = WorkflowEvent::SignalQueued {
         signal_id: signal_id.clone(),
-        signal_type: signal_type.clone(),
+        signal_type: signal_type.to_owned(),
         payload: request.payload.clone(),
     };
     let envelope = EventEnvelope::new(
         payload.event_type(),
         WorkflowIdentity::new(
-            tenant_id,
+            tenant_id.to_owned(),
             instance.definition_id.clone(),
             definition_version,
             artifact_hash,
@@ -696,14 +1204,14 @@ async fn signal_workflow(
         .map_err(internal_error)?;
     if !queued {
         let response = SignalWorkflowResponse {
-            instance_id,
+            instance_id: instance_id.to_owned(),
             run_id: instance.run_id,
             signal_id,
-            signal_type,
+            signal_type: signal_type.to_owned(),
             event_id: envelope.event_id,
             status: "duplicate".to_owned(),
         };
-        return Ok((StatusCode::ACCEPTED, Json(response)));
+        return Ok(response);
     }
 
     if let Err(error) = state.publisher.publish(&envelope, &envelope.partition_key).await {
@@ -714,10 +1222,10 @@ async fn signal_workflow(
         return Err(internal_error(error));
     }
     let response = SignalWorkflowResponse {
-        instance_id,
+        instance_id: instance_id.to_owned(),
         run_id: instance.run_id,
         signal_id,
-        signal_type,
+        signal_type: signal_type.to_owned(),
         event_id: envelope.event_id,
         status: "accepted".to_owned(),
     };
@@ -733,7 +1241,7 @@ async fn signal_workflow(
         )
         .await?;
     }
-    Ok((StatusCode::ACCEPTED, Json(response)))
+    Ok(response)
 }
 
 async fn continue_as_new(
@@ -1291,5 +1799,920 @@ fn update_status_label(status: &fabrik_store::WorkflowUpdateStatus) -> &'static 
         fabrik_store::WorkflowUpdateStatus::Accepted => "accepted",
         fabrik_store::WorkflowUpdateStatus::Completed => "completed",
         fabrik_store::WorkflowUpdateStatus::Rejected => "rejected",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+    use fabrik_broker::{JsonTopicPublisher, WorkflowHistoryFilter, read_workflow_history};
+    use fabrik_workflow::{StateNode, WorkflowInstanceState, WorkflowStatus};
+    use serde_json::json;
+    use std::{
+        collections::BTreeMap,
+        process::Command,
+        time::{Duration as StdDuration, Instant},
+    };
+    use tokio::time::sleep;
+
+    struct TestPostgres {
+        container_name: String,
+        database_url: String,
+    }
+
+    impl TestPostgres {
+        fn start() -> Result<Option<Self>> {
+            if !docker_available() {
+                eprintln!(
+                    "skipping ingest-service integration tests because docker is unavailable"
+                );
+                return Ok(None);
+            }
+
+            let container_name = format!("fabrik-ingest-test-pg-{}", Uuid::now_v7());
+            let image = std::env::var("FABRIK_TEST_POSTGRES_IMAGE")
+                .unwrap_or_else(|_| "postgres:16-alpine".to_owned());
+            let output = Command::new("docker")
+                .args([
+                    "run",
+                    "--detach",
+                    "--rm",
+                    "--name",
+                    &container_name,
+                    "--env",
+                    "POSTGRES_USER=fabrik",
+                    "--env",
+                    "POSTGRES_PASSWORD=fabrik",
+                    "--env",
+                    "POSTGRES_DB=fabrik_test",
+                    "--publish-all",
+                    &image,
+                ])
+                .output()
+                .with_context(|| format!("failed to start docker container {container_name}"))?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "docker failed to start postgres test container: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+
+            let host_port = wait_for_host_port(&container_name, "5432/tcp")?;
+            let database_url = format!(
+                "postgres://fabrik:fabrik@127.0.0.1:{host_port}/fabrik_test?sslmode=disable"
+            );
+            Ok(Some(Self { container_name, database_url }))
+        }
+
+        async fn connect_store(&self) -> Result<WorkflowStore> {
+            let deadline = Instant::now() + StdDuration::from_secs(30);
+            loop {
+                match WorkflowStore::connect(&self.database_url).await {
+                    Ok(store) => {
+                        store.init().await?;
+                        return Ok(store);
+                    }
+                    Err(error) if Instant::now() < deadline => {
+                        let _ = error;
+                        sleep(StdDuration::from_millis(250)).await;
+                    }
+                    Err(error) => {
+                        let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        return Err(error).with_context(|| {
+                            format!(
+                                "postgres test container {} did not become ready; logs:\n{}",
+                                self.container_name, logs
+                            )
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for TestPostgres {
+        fn drop(&mut self) {
+            let _ = cleanup_container(&self.container_name);
+        }
+    }
+
+    struct TestRedpanda {
+        container_name: String,
+        broker: BrokerConfig,
+    }
+
+    impl TestRedpanda {
+        fn start() -> Result<Option<Self>> {
+            if !docker_available() {
+                eprintln!(
+                    "skipping ingest-service integration tests because docker is unavailable"
+                );
+                return Ok(None);
+            }
+
+            let kafka_port = choose_free_port().context("failed to allocate kafka host port")?;
+            let container_name = format!("fabrik-ingest-test-rp-{}", Uuid::now_v7());
+            let image = std::env::var("FABRIK_TEST_REDPANDA_IMAGE")
+                .unwrap_or_else(|_| "docker.redpanda.com/redpandadata/redpanda:v25.1.2".to_owned());
+            let workflow_topic = format!("workflow-events-test-{}", Uuid::now_v7());
+            let output = Command::new("docker")
+                .args([
+                    "run",
+                    "--detach",
+                    "--rm",
+                    "--name",
+                    &container_name,
+                    "--publish",
+                    &format!("{kafka_port}:{kafka_port}"),
+                    &image,
+                    "redpanda",
+                    "start",
+                    "--overprovisioned",
+                    "--smp",
+                    "1",
+                    "--memory",
+                    "1G",
+                    "--reserve-memory",
+                    "0M",
+                    "--node-id",
+                    "0",
+                    "--check=false",
+                    "--kafka-addr",
+                    &format!("PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:{kafka_port}"),
+                    "--advertise-kafka-addr",
+                    &format!("PLAINTEXT://127.0.0.1:9092,OUTSIDE://127.0.0.1:{kafka_port}"),
+                    "--rpc-addr",
+                    "0.0.0.0:33145",
+                    "--advertise-rpc-addr",
+                    "127.0.0.1:33145",
+                ])
+                .output()
+                .with_context(|| format!("failed to start docker container {container_name}"))?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "docker failed to start redpanda test container: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+
+            Ok(Some(Self {
+                container_name,
+                broker: BrokerConfig::new(format!("127.0.0.1:{kafka_port}"), workflow_topic, 1),
+            }))
+        }
+
+        async fn connect_workflow_publisher(&self) -> Result<WorkflowPublisher> {
+            let deadline = Instant::now() + StdDuration::from_secs(45);
+            loop {
+                match WorkflowPublisher::new(&self.broker, "ingest-service-test").await {
+                    Ok(publisher) => return Ok(publisher),
+                    Err(error) if Instant::now() < deadline => {
+                        let _ = error;
+                        sleep(StdDuration::from_millis(500)).await;
+                    }
+                    Err(error) => {
+                        let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        return Err(error).with_context(|| {
+                            format!(
+                                "redpanda test container {} did not become ready; logs:\n{}",
+                                self.container_name, logs
+                            )
+                        });
+                    }
+                }
+            }
+        }
+
+        async fn connect_json_publisher(
+            &self,
+            topic_name: &str,
+            partitions: i32,
+        ) -> Result<JsonTopicPublisher<Value>> {
+            let config = JsonTopicConfig::new(
+                self.broker.brokers.clone(),
+                topic_name.to_owned(),
+                partitions,
+            );
+            let deadline = Instant::now() + StdDuration::from_secs(45);
+            loop {
+                match JsonTopicPublisher::<Value>::new(&config, "ingest-service-test").await {
+                    Ok(publisher) => return Ok(publisher),
+                    Err(error) if Instant::now() < deadline => {
+                        let _ = error;
+                        sleep(StdDuration::from_millis(500)).await;
+                    }
+                    Err(error) => {
+                        let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        return Err(error).with_context(|| {
+                            format!(
+                                "redpanda test container {} did not become ready for json topic {}; logs:\n{}",
+                                self.container_name, topic_name, logs
+                            )
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for TestRedpanda {
+        fn drop(&mut self) {
+            let _ = cleanup_container(&self.container_name);
+        }
+    }
+
+    fn docker_available() -> bool {
+        Command::new("docker")
+            .args(["info", "--format", "{{.ServerVersion}}"])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    fn choose_free_port() -> Result<u16> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .context("failed to bind ephemeral tcp listener")?;
+        let port =
+            listener.local_addr().context("failed to inspect ephemeral tcp listener")?.port();
+        drop(listener);
+        Ok(port)
+    }
+
+    fn wait_for_host_port(container_name: &str, container_port: &str) -> Result<u16> {
+        let deadline = Instant::now() + StdDuration::from_secs(15);
+        loop {
+            let output = Command::new("docker")
+                .args([
+                    "inspect",
+                    "--format",
+                    &format!(
+                        "{{{{(index (index .NetworkSettings.Ports \"{container_port}\") 0).HostPort}}}}"
+                    ),
+                    container_name,
+                ])
+                .output()
+                .with_context(|| format!("failed to inspect docker container {container_name}"))?;
+            if output.status.success() {
+                let host_port = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                if !host_port.is_empty() {
+                    return host_port
+                        .parse::<u16>()
+                        .with_context(|| format!("invalid mapped port {host_port}"));
+                }
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("timed out waiting for port {container_port} on {container_name}");
+            }
+            std::thread::sleep(StdDuration::from_millis(100));
+        }
+    }
+
+    fn docker_logs(container_name: &str) -> Result<String> {
+        let output = Command::new("docker")
+            .args(["logs", container_name])
+            .output()
+            .with_context(|| format!("failed to read docker logs for {container_name}"))?;
+        Ok(format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+
+    fn cleanup_container(container_name: &str) -> Result<()> {
+        let output = Command::new("docker")
+            .args(["rm", "--force", container_name])
+            .output()
+            .with_context(|| format!("failed to remove docker container {container_name}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "docker failed to remove container {container_name}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        }
+    }
+
+    async fn test_state(store: WorkflowStore, redpanda: &TestRedpanda) -> Result<AppState> {
+        test_state_with_runtime_id(store, redpanda, &format!("ingest-test-{}", Uuid::now_v7()))
+            .await
+    }
+
+    async fn test_state_with_runtime_id(
+        store: WorkflowStore,
+        redpanda: &TestRedpanda,
+        runtime_id: &str,
+    ) -> Result<AppState> {
+        Ok(AppState {
+            broker: redpanda.broker.clone(),
+            publisher: redpanda.connect_workflow_publisher().await?,
+            store,
+            runtime_id: runtime_id.to_owned(),
+        })
+    }
+
+    async fn claim_adapter_for_state(
+        store: &WorkflowStore,
+        state: &AppState,
+        tenant_id: &str,
+        adapter_id: &str,
+    ) -> Result<u64> {
+        let ownership = store
+            .claim_topic_adapter_ownership(
+                tenant_id,
+                adapter_id,
+                &state.runtime_id,
+                StdDuration::from_millis(TOPIC_ADAPTER_OWNERSHIP_LEASE_TTL_MS),
+            )
+            .await?
+            .context("expected topic adapter ownership claim")?;
+        Ok(ownership.owner_epoch)
+    }
+
+    fn simple_definition(definition_id: &str) -> WorkflowDefinition {
+        WorkflowDefinition {
+            id: definition_id.to_owned(),
+            version: 1,
+            initial_state: "done".to_owned(),
+            states: BTreeMap::from([("done".to_owned(), StateNode::Succeed)]),
+        }
+    }
+
+    async fn wait_for_adapter_counts(
+        store: &WorkflowStore,
+        tenant_id: &str,
+        adapter_id: &str,
+        processed: u64,
+        failed: u64,
+    ) -> Result<fabrik_store::TopicAdapterRecord> {
+        let deadline = Instant::now() + StdDuration::from_secs(15);
+        loop {
+            if let Some(adapter) = store.get_topic_adapter(tenant_id, adapter_id).await? {
+                if adapter.processed_count == processed && adapter.failed_count == failed {
+                    return Ok(adapter);
+                }
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for topic adapter {tenant_id}/{adapter_id} to reach processed={processed} failed={failed}"
+                );
+            }
+            sleep(StdDuration::from_millis(100)).await;
+        }
+    }
+
+    async fn wait_for_adapter_owner(
+        store: &WorkflowStore,
+        tenant_id: &str,
+        adapter_id: &str,
+        owner_id: &str,
+    ) -> Result<fabrik_store::TopicAdapterOwnershipRecord> {
+        let deadline = Instant::now() + StdDuration::from_secs(20);
+        loop {
+            if let Some(ownership) = store.get_topic_adapter_ownership(tenant_id, adapter_id).await? {
+                if ownership.owner_id == owner_id {
+                    return Ok(ownership);
+                }
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for topic adapter {tenant_id}/{adapter_id} owner {owner_id}"
+                );
+            }
+            sleep(StdDuration::from_millis(100)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn topic_adapter_starts_workflow_and_commits_offset_once() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state = test_state(store.clone(), &redpanda).await?;
+
+        let definition = simple_definition("order-workflow");
+        store.put_definition("tenant-a", &definition).await?;
+
+        let adapter = store
+            .upsert_topic_adapter(&fabrik_store::TopicAdapterUpsert {
+                tenant_id: "tenant-a".to_owned(),
+                adapter_id: "orders".to_owned(),
+                adapter_kind: fabrik_store::TopicAdapterKind::Redpanda,
+                brokers: redpanda.broker.brokers.clone(),
+                topic_name: "orders.events".to_owned(),
+                topic_partitions: 1,
+                action: fabrik_store::TopicAdapterAction::StartWorkflow,
+                definition_id: Some("order-workflow".to_owned()),
+                signal_type: None,
+                workflow_task_queue: Some("orders".to_owned()),
+                workflow_instance_id_json_pointer: Some("/instance_id".to_owned()),
+                payload_json_pointer: Some("/payload".to_owned()),
+                payload_template_json: None,
+                memo_json_pointer: Some("/memo".to_owned()),
+                memo_template_json: None,
+                search_attributes_json_pointer: Some("/search".to_owned()),
+                search_attributes_template_json: None,
+                request_id_json_pointer: Some("/request_id".to_owned()),
+                dedupe_key_json_pointer: None,
+                dead_letter_policy: fabrik_store::TopicAdapterDeadLetterPolicy::Store,
+                is_paused: false,
+            })
+            .await?;
+
+        let worker_state = state.clone();
+        let worker_adapter = adapter.clone();
+        let owner_epoch = claim_adapter_for_state(&store, &worker_state, "tenant-a", "orders").await?;
+        let worker = tokio::spawn(async move {
+            let _ = run_topic_adapter_consumer_pass(&worker_state, &worker_adapter, owner_epoch).await;
+        });
+
+        let publisher = redpanda.connect_json_publisher("orders.events", 1).await?;
+        publisher
+            .publish(
+                &json!({
+                    "instance_id": "order-1",
+                    "request_id": "adapter-start-1",
+                    "payload": { "order_id": "o-1", "amount": 42 },
+                    "memo": { "source": "topic-adapter" },
+                    "search": { "order_id": "o-1" }
+                }),
+                "order-1",
+            )
+            .await?;
+
+        let adapter_state = wait_for_adapter_counts(&store, "tenant-a", "orders", 1, 0).await?;
+        assert_eq!(adapter_state.last_error, None);
+
+        let runs = store
+            .list_runs_page_with_filters(
+                "tenant-a",
+                &WorkflowRunFilters {
+                    instance_id: Some("order-1".to_owned()),
+                    ..WorkflowRunFilters::default()
+                },
+                10,
+                0,
+            )
+            .await?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].workflow_task_queue, "orders");
+
+        let history = read_workflow_history(
+            &redpanda.broker,
+            "ingest-service-test-history",
+            &WorkflowHistoryFilter::new("tenant-a", "order-1", &runs[0].run_id),
+            Duration::from_millis(250),
+            Duration::from_millis(3_000),
+        )
+        .await?;
+        assert!(history.iter().any(|event| event.event_type == "WorkflowTriggered"));
+
+        worker.abort();
+        let worker_state = state.clone();
+        let worker_adapter = adapter.clone();
+        let owner_epoch = claim_adapter_for_state(&store, &worker_state, "tenant-a", "orders").await?;
+        let replay_worker = tokio::spawn(async move {
+            let _ = run_topic_adapter_consumer_pass(&worker_state, &worker_adapter, owner_epoch).await;
+        });
+        sleep(StdDuration::from_millis(750)).await;
+        replay_worker.abort();
+
+        let adapter_state = store
+            .get_topic_adapter("tenant-a", "orders")
+            .await?
+            .context("adapter missing after replay worker")?;
+        assert_eq!(adapter_state.processed_count, 1);
+        assert_eq!(store.load_topic_adapter_offsets("tenant-a", "orders").await?[0].log_offset, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn topic_adapter_queues_signal_and_publishes_signal_event() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state = test_state(store.clone(), &redpanda).await?;
+
+        let definition = simple_definition("approval-workflow");
+        let artifact_hash = artifact_hash(&definition);
+        let now = Utc::now();
+        store
+            .put_run_start(
+                "tenant-a",
+                "approval-1",
+                "run-1",
+                "approval-workflow",
+                Some(1),
+                Some(&artifact_hash),
+                "approvals",
+                None,
+                None,
+                Uuid::now_v7(),
+                now,
+                None,
+                None,
+            )
+            .await?;
+        store
+            .upsert_instance(&WorkflowInstanceState {
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "approval-1".to_owned(),
+                run_id: "run-1".to_owned(),
+                definition_id: "approval-workflow".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some(artifact_hash.clone()),
+                workflow_task_queue: "approvals".to_owned(),
+                sticky_workflow_build_id: None,
+                sticky_workflow_poller_id: None,
+                current_state: Some("awaiting_approval".to_owned()),
+                context: Some(json!({"status": "waiting"})),
+                artifact_execution: None,
+                status: WorkflowStatus::Running,
+                input: Some(json!({"order_id": "o-2"})),
+                persisted_input_handle: None,
+                memo: None,
+                search_attributes: None,
+                output: None,
+                event_count: 1,
+                last_event_id: Uuid::now_v7(),
+                last_event_type: "WorkflowStarted".to_owned(),
+                updated_at: now,
+            })
+            .await?;
+
+        let adapter = store
+            .upsert_topic_adapter(&fabrik_store::TopicAdapterUpsert {
+                tenant_id: "tenant-a".to_owned(),
+                adapter_id: "approvals".to_owned(),
+                adapter_kind: fabrik_store::TopicAdapterKind::Redpanda,
+                brokers: redpanda.broker.brokers.clone(),
+                topic_name: "approvals.events".to_owned(),
+                topic_partitions: 1,
+                action: fabrik_store::TopicAdapterAction::SignalWorkflow,
+                definition_id: None,
+                signal_type: Some("external.approved".to_owned()),
+                workflow_task_queue: None,
+                workflow_instance_id_json_pointer: Some("/instance_id".to_owned()),
+                payload_json_pointer: Some("/payload".to_owned()),
+                payload_template_json: None,
+                memo_json_pointer: None,
+                memo_template_json: None,
+                search_attributes_json_pointer: None,
+                search_attributes_template_json: None,
+                request_id_json_pointer: Some("/request_id".to_owned()),
+                dedupe_key_json_pointer: Some("/dedupe_key".to_owned()),
+                dead_letter_policy: fabrik_store::TopicAdapterDeadLetterPolicy::Store,
+                is_paused: false,
+            })
+            .await?;
+
+        let worker_state = state.clone();
+        let worker_adapter = adapter.clone();
+        let owner_epoch =
+            claim_adapter_for_state(&store, &worker_state, "tenant-a", "approvals").await?;
+        let worker = tokio::spawn(async move {
+            let _ = run_topic_adapter_consumer_pass(&worker_state, &worker_adapter, owner_epoch).await;
+        });
+
+        let publisher = redpanda.connect_json_publisher("approvals.events", 1).await?;
+        publisher
+            .publish(
+                &json!({
+                    "instance_id": "approval-1",
+                    "request_id": "adapter-signal-1",
+                    "dedupe_key": "approval-1-approved",
+                    "payload": { "approved_by": "ops" }
+                }),
+                "approval-1",
+            )
+            .await?;
+
+        wait_for_adapter_counts(&store, "tenant-a", "approvals", 1, 0).await?;
+        let signals = store.list_signals_for_run("tenant-a", "approval-1", "run-1").await?;
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].signal_type, "external.approved");
+
+        let history = read_workflow_history(
+            &redpanda.broker,
+            "ingest-service-test-history-signal",
+            &WorkflowHistoryFilter::new("tenant-a", "approval-1", "run-1"),
+            Duration::from_millis(250),
+            Duration::from_millis(3_000),
+        )
+        .await?;
+        assert!(history.iter().any(|event| event.event_type == "SignalQueued"));
+
+        worker.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn topic_adapter_dead_letters_invalid_record_and_advances_offset() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state = test_state(store.clone(), &redpanda).await?;
+
+        let definition = simple_definition("order-workflow");
+        store.put_definition("tenant-a", &definition).await?;
+
+        let adapter = store
+            .upsert_topic_adapter(&fabrik_store::TopicAdapterUpsert {
+                tenant_id: "tenant-a".to_owned(),
+                adapter_id: "orders-invalid".to_owned(),
+                adapter_kind: fabrik_store::TopicAdapterKind::Redpanda,
+                brokers: redpanda.broker.brokers.clone(),
+                topic_name: "orders.invalid".to_owned(),
+                topic_partitions: 1,
+                action: fabrik_store::TopicAdapterAction::StartWorkflow,
+                definition_id: Some("order-workflow".to_owned()),
+                signal_type: None,
+                workflow_task_queue: Some("orders".to_owned()),
+                workflow_instance_id_json_pointer: Some("/instance_id".to_owned()),
+                payload_json_pointer: Some("/payload".to_owned()),
+                payload_template_json: None,
+                memo_json_pointer: None,
+                memo_template_json: None,
+                search_attributes_json_pointer: None,
+                search_attributes_template_json: None,
+                request_id_json_pointer: Some("/request_id".to_owned()),
+                dedupe_key_json_pointer: None,
+                dead_letter_policy: fabrik_store::TopicAdapterDeadLetterPolicy::Store,
+                is_paused: false,
+            })
+            .await?;
+
+        let worker_state = state.clone();
+        let worker_adapter = adapter.clone();
+        let owner_epoch =
+            claim_adapter_for_state(&store, &worker_state, "tenant-a", "orders-invalid").await?;
+        let worker = tokio::spawn(async move {
+            let _ = run_topic_adapter_consumer_pass(&worker_state, &worker_adapter, owner_epoch).await;
+        });
+
+        let publisher = redpanda.connect_json_publisher("orders.invalid", 1).await?;
+        publisher
+            .publish(
+                &json!({
+                    "instance_id": "order-bad-1",
+                    "request_id": "adapter-invalid-1"
+                }),
+                "order-bad-1",
+            )
+            .await?;
+
+        let adapter_state =
+            wait_for_adapter_counts(&store, "tenant-a", "orders-invalid", 0, 1).await?;
+        assert_eq!(
+            adapter_state.last_error.as_deref(),
+            Some("400: missing required field input at json pointer /payload")
+        );
+        let dead_letters =
+            store.list_topic_adapter_dead_letters("tenant-a", "orders-invalid", 10, 0).await?;
+        assert_eq!(dead_letters.len(), 1);
+        assert_eq!(dead_letters[0].log_offset, 0);
+        assert_eq!(
+            store.load_topic_adapter_offsets("tenant-a", "orders-invalid").await?[0].log_offset,
+            0
+        );
+
+        worker.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn topic_adapter_multi_replica_workers_are_fenced_by_adapter_ownership() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_a = test_state_with_runtime_id(store.clone(), &redpanda, "ingest-a").await?;
+        let state_b = test_state_with_runtime_id(store.clone(), &redpanda, "ingest-b").await?;
+
+        let definition = simple_definition("order-workflow");
+        store.put_definition("tenant-a", &definition).await?;
+
+        let adapter = store
+            .upsert_topic_adapter(&fabrik_store::TopicAdapterUpsert {
+                tenant_id: "tenant-a".to_owned(),
+                adapter_id: "orders-fenced".to_owned(),
+                adapter_kind: fabrik_store::TopicAdapterKind::Redpanda,
+                brokers: redpanda.broker.brokers.clone(),
+                topic_name: "orders.fenced".to_owned(),
+                topic_partitions: 1,
+                action: fabrik_store::TopicAdapterAction::StartWorkflow,
+                definition_id: Some("order-workflow".to_owned()),
+                signal_type: None,
+                workflow_task_queue: Some("orders".to_owned()),
+                workflow_instance_id_json_pointer: Some("/instance_id".to_owned()),
+                payload_json_pointer: Some("/payload".to_owned()),
+                payload_template_json: None,
+                memo_json_pointer: None,
+                memo_template_json: None,
+                search_attributes_json_pointer: None,
+                search_attributes_template_json: None,
+                request_id_json_pointer: Some("/request_id".to_owned()),
+                dedupe_key_json_pointer: None,
+                dead_letter_policy: fabrik_store::TopicAdapterDeadLetterPolicy::Store,
+                is_paused: false,
+            })
+            .await?;
+
+        let worker_a = tokio::spawn(run_topic_adapter_worker(state_a.clone(), adapter.clone()));
+        let worker_b = tokio::spawn(run_topic_adapter_worker(state_b.clone(), adapter.clone()));
+
+        let publisher = redpanda.connect_json_publisher("orders.fenced", 1).await?;
+        publisher
+            .publish(
+                &json!({
+                    "instance_id": "order-fenced-1",
+                    "request_id": "adapter-fenced-1",
+                    "payload": { "order_id": "o-fenced-1" }
+                }),
+                "order-fenced-1",
+            )
+            .await?;
+
+        let adapter_state = wait_for_adapter_counts(&store, "tenant-a", "orders-fenced", 1, 0).await?;
+        assert_eq!(adapter_state.processed_count, 1);
+
+        sleep(StdDuration::from_millis(500)).await;
+        let ownership = store
+            .get_topic_adapter_ownership("tenant-a", "orders-fenced")
+            .await?
+            .context("adapter ownership missing after worker start")?;
+        assert!(matches!(ownership.owner_id.as_str(), "ingest-a" | "ingest-b"));
+        assert!(store
+            .validate_topic_adapter_ownership(
+                "tenant-a",
+                "orders-fenced",
+                &ownership.owner_id,
+                ownership.owner_epoch,
+            )
+            .await?);
+
+        let runs = store
+            .list_runs_page_with_filters(
+                "tenant-a",
+                &WorkflowRunFilters {
+                    instance_id: Some("order-fenced-1".to_owned()),
+                    ..WorkflowRunFilters::default()
+                },
+                10,
+                0,
+            )
+            .await?;
+        assert_eq!(runs.len(), 1);
+        let offsets = store.load_topic_adapter_offsets("tenant-a", "orders-fenced").await?;
+        assert_eq!(offsets.len(), 1);
+        assert_eq!(offsets[0].log_offset, 0);
+
+        worker_a.abort();
+        worker_b.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn topic_adapter_failover_handoffs_after_owner_crash_without_duplicate_processing()
+    -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_a = test_state_with_runtime_id(store.clone(), &redpanda, "ingest-a").await?;
+        let state_b = test_state_with_runtime_id(store.clone(), &redpanda, "ingest-b").await?;
+
+        let definition = simple_definition("order-workflow");
+        store.put_definition("tenant-a", &definition).await?;
+
+        let adapter = store
+            .upsert_topic_adapter(&fabrik_store::TopicAdapterUpsert {
+                tenant_id: "tenant-a".to_owned(),
+                adapter_id: "orders-failover".to_owned(),
+                adapter_kind: fabrik_store::TopicAdapterKind::Redpanda,
+                brokers: redpanda.broker.brokers.clone(),
+                topic_name: "orders.failover".to_owned(),
+                topic_partitions: 1,
+                action: fabrik_store::TopicAdapterAction::StartWorkflow,
+                definition_id: Some("order-workflow".to_owned()),
+                signal_type: None,
+                workflow_task_queue: Some("orders".to_owned()),
+                workflow_instance_id_json_pointer: Some("/instance_id".to_owned()),
+                payload_json_pointer: Some("/payload".to_owned()),
+                payload_template_json: None,
+                memo_json_pointer: None,
+                memo_template_json: None,
+                search_attributes_json_pointer: None,
+                search_attributes_template_json: None,
+                request_id_json_pointer: Some("/request_id".to_owned()),
+                dedupe_key_json_pointer: None,
+                dead_letter_policy: fabrik_store::TopicAdapterDeadLetterPolicy::Store,
+                is_paused: false,
+            })
+            .await?;
+
+        let worker_a = tokio::spawn(run_topic_adapter_worker(state_a.clone(), adapter.clone()));
+        let worker_b = tokio::spawn(run_topic_adapter_worker(state_b.clone(), adapter.clone()));
+
+        let publisher = redpanda.connect_json_publisher("orders.failover", 1).await?;
+        publisher
+            .publish(
+                &json!({
+                    "instance_id": "order-failover-1",
+                    "request_id": "adapter-failover-1",
+                    "payload": { "order_id": "o-failover-1" }
+                }),
+                "order-failover-1",
+            )
+            .await?;
+
+        wait_for_adapter_counts(&store, "tenant-a", "orders-failover", 1, 0).await?;
+        let initial_ownership = store
+            .get_topic_adapter_ownership("tenant-a", "orders-failover")
+            .await?
+            .context("adapter ownership missing after first record")?;
+        let crashed_owner = initial_ownership.owner_id.clone();
+        let standby_owner = if crashed_owner == "ingest-a" { "ingest-b" } else { "ingest-a" };
+        let expected_epoch = initial_ownership.owner_epoch + 1;
+
+        if crashed_owner == "ingest-a" {
+            worker_a.abort();
+        } else {
+            worker_b.abort();
+        }
+
+        let takeover_start = Instant::now();
+        let takeover = wait_for_adapter_owner(&store, "tenant-a", "orders-failover", standby_owner).await?;
+        let takeover_duration = takeover_start.elapsed();
+        assert_eq!(takeover.owner_epoch, expected_epoch);
+        assert!(
+            takeover_duration < StdDuration::from_secs(15),
+            "takeover took too long: {:?}",
+            takeover_duration
+        );
+
+        publisher
+            .publish(
+                &json!({
+                    "instance_id": "order-failover-2",
+                    "request_id": "adapter-failover-2",
+                    "payload": { "order_id": "o-failover-2" }
+                }),
+                "order-failover-2",
+            )
+            .await?;
+
+        let adapter_state = wait_for_adapter_counts(&store, "tenant-a", "orders-failover", 2, 0).await?;
+        assert_eq!(adapter_state.failed_count, 0);
+
+        let runs = store
+            .list_runs_page_with_filters(
+                "tenant-a",
+                &WorkflowRunFilters {
+                    definition_id: Some("order-workflow".to_owned()),
+                    ..WorkflowRunFilters::default()
+                },
+                10,
+                0,
+            )
+            .await?;
+        let failover_runs = runs
+            .into_iter()
+            .filter(|run| run.instance_id == "order-failover-1" || run.instance_id == "order-failover-2")
+            .collect::<Vec<_>>();
+        assert_eq!(failover_runs.len(), 2);
+
+        let offsets = store.load_topic_adapter_offsets("tenant-a", "orders-failover").await?;
+        assert_eq!(offsets.len(), 1);
+        assert_eq!(offsets[0].log_offset, 1);
+
+        if standby_owner == "ingest-a" {
+            worker_a.abort();
+        } else {
+            worker_b.abort();
+        }
+
+        Ok(())
     }
 }

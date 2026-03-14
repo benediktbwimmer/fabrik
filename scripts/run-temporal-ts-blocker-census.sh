@@ -238,6 +238,7 @@ run_sample_migration() {
   local sample="$1"
   local output_dir="$2"
   local project_root="${REPO_ROOT}/${sample}"
+  local report_path="${output_dir}/migration-report.json"
   local stdout_log="${output_dir}/migrate.stdout.log"
   local stderr_log="${output_dir}/migrate.stderr.log"
   local status
@@ -247,6 +248,10 @@ run_sample_migration() {
     >"$stdout_log" 2>"$stderr_log"
   status=$?
   set -e
+
+  if [[ -f "$report_path" ]]; then
+    return 0
+  fi
 
   if [[ "$status" == "0" || "$status" == "2" ]]; then
     return 0
@@ -259,6 +264,9 @@ run_sample_migration() {
       >"$stdout_log" 2>"$stderr_log"
     status=$?
     set -e
+    if [[ -f "$report_path" ]]; then
+      return 0
+    fi
     if [[ "$status" == "0" || "$status" == "2" ]]; then
       return 0
     fi
@@ -274,6 +282,7 @@ fi
 for sample in "${SAMPLES[@]}"; do
   project_root="${REPO_ROOT}/${sample}"
   output_dir="${OUTPUT_ROOT}/${sample}"
+  rm -rf "$output_dir"
   mkdir -p "$output_dir"
   run_sample_migration "$sample" "$output_dir"
 done

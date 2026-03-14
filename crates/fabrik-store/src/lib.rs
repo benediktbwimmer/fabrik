@@ -10,7 +10,7 @@ use fabrik_throughput::{
 };
 use fabrik_workflow::{CompiledWorkflowArtifact, WorkflowDefinition, WorkflowInstanceState};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sqlx::{
     PgPool, QueryBuilder, Row,
     postgres::{PgPoolOptions, Postgres},
@@ -914,6 +914,567 @@ pub struct TaskQueueRuntimeControlRecord {
     pub reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TopicAdapterKind {
+    Kafka,
+    Redpanda,
+}
+
+impl TopicAdapterKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Kafka => "kafka",
+            Self::Redpanda => "redpanda",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "kafka" => Ok(Self::Kafka),
+            "redpanda" => Ok(Self::Redpanda),
+            other => anyhow::bail!("unknown topic adapter kind {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TopicAdapterAction {
+    StartWorkflow,
+    SignalWorkflow,
+}
+
+impl TopicAdapterAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::StartWorkflow => "start_workflow",
+            Self::SignalWorkflow => "signal_workflow",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "start_workflow" => Ok(Self::StartWorkflow),
+            "signal_workflow" => Ok(Self::SignalWorkflow),
+            other => anyhow::bail!("unknown topic adapter action {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TopicAdapterDeadLetterPolicy {
+    Store,
+}
+
+impl TopicAdapterDeadLetterPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Store => "store",
+        }
+    }
+
+    fn from_db(value: &str) -> Result<Self> {
+        match value {
+            "store" => Ok(Self::Store),
+            other => anyhow::bail!("unknown topic adapter dead letter policy {other}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TopicAdapterUpsert {
+    pub tenant_id: String,
+    pub adapter_id: String,
+    pub adapter_kind: TopicAdapterKind,
+    pub brokers: String,
+    pub topic_name: String,
+    pub topic_partitions: i32,
+    pub action: TopicAdapterAction,
+    pub definition_id: Option<String>,
+    pub signal_type: Option<String>,
+    pub workflow_task_queue: Option<String>,
+    pub workflow_instance_id_json_pointer: Option<String>,
+    pub payload_json_pointer: Option<String>,
+    pub payload_template_json: Option<Value>,
+    pub memo_json_pointer: Option<String>,
+    pub memo_template_json: Option<Value>,
+    pub search_attributes_json_pointer: Option<String>,
+    pub search_attributes_template_json: Option<Value>,
+    pub request_id_json_pointer: Option<String>,
+    pub dedupe_key_json_pointer: Option<String>,
+    pub dead_letter_policy: TopicAdapterDeadLetterPolicy,
+    pub is_paused: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TopicAdapterRecord {
+    pub tenant_id: String,
+    pub adapter_id: String,
+    pub adapter_kind: TopicAdapterKind,
+    pub brokers: String,
+    pub topic_name: String,
+    pub topic_partitions: i32,
+    pub action: TopicAdapterAction,
+    pub definition_id: Option<String>,
+    pub signal_type: Option<String>,
+    pub workflow_task_queue: Option<String>,
+    pub workflow_instance_id_json_pointer: Option<String>,
+    pub payload_json_pointer: Option<String>,
+    pub payload_template_json: Option<Value>,
+    pub memo_json_pointer: Option<String>,
+    pub memo_template_json: Option<Value>,
+    pub search_attributes_json_pointer: Option<String>,
+    pub search_attributes_template_json: Option<Value>,
+    pub request_id_json_pointer: Option<String>,
+    pub dedupe_key_json_pointer: Option<String>,
+    pub dead_letter_policy: TopicAdapterDeadLetterPolicy,
+    pub is_paused: bool,
+    pub processed_count: u64,
+    pub failed_count: u64,
+    pub ownership_handoff_count: u64,
+    pub last_processed_at: Option<DateTime<Utc>>,
+    pub last_handoff_at: Option<DateTime<Utc>>,
+    pub last_takeover_latency_ms: Option<u64>,
+    pub last_error: Option<String>,
+    pub last_error_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TopicAdapterMappingDiagnostic {
+    pub field: String,
+    pub mode: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TopicAdapterResolvedStartRequest {
+    pub definition_id: String,
+    pub instance_id: Option<String>,
+    pub workflow_task_queue: Option<String>,
+    pub input: Value,
+    pub memo: Option<Value>,
+    pub search_attributes: Option<Value>,
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TopicAdapterResolvedSignalRequest {
+    pub signal_type: String,
+    pub instance_id: String,
+    pub payload: Value,
+    pub dedupe_key: Option<String>,
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum TopicAdapterResolvedDispatch {
+    StartWorkflow(TopicAdapterResolvedStartRequest),
+    SignalWorkflow(TopicAdapterResolvedSignalRequest),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TopicAdapterDispatchPreview {
+    pub dispatch: TopicAdapterResolvedDispatch,
+    pub diagnostics: Vec<TopicAdapterMappingDiagnostic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TopicAdapterMappingError {
+    pub field: String,
+    pub detail: String,
+}
+
+impl std::fmt::Display for TopicAdapterMappingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "mapping {}: {}", self.field, self.detail)
+    }
+}
+
+impl std::error::Error for TopicAdapterMappingError {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TopicAdapterOffsetRecord {
+    pub tenant_id: String,
+    pub adapter_id: String,
+    pub partition_id: i32,
+    pub log_offset: i64,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TopicAdapterDeadLetterRecord {
+    pub tenant_id: String,
+    pub adapter_id: String,
+    pub partition_id: i32,
+    pub log_offset: i64,
+    pub record_key: Option<String>,
+    pub payload: Value,
+    pub error: String,
+    pub occurred_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+enum TemplateResolve {
+    Present(Value),
+    Omitted,
+}
+
+pub fn resolve_topic_adapter_dispatch(
+    adapter: &TopicAdapterRecord,
+    payload: &Value,
+    partition_id: i32,
+    log_offset: i64,
+) -> std::result::Result<TopicAdapterDispatchPreview, TopicAdapterMappingError> {
+    let default_request_id = format!(
+        "adapter:{}:{}:{partition_id}:{log_offset}",
+        adapter.adapter_id, adapter.topic_name
+    );
+    let mut diagnostics = Vec::new();
+    match adapter.action {
+        TopicAdapterAction::StartWorkflow => {
+            let definition_id = adapter.definition_id.clone().ok_or_else(|| TopicAdapterMappingError {
+                field: "definition_id".to_owned(),
+                detail: format!("topic adapter {} missing definition_id", adapter.adapter_id),
+            })?;
+            let instance_id = resolve_optional_string(
+                payload,
+                adapter.workflow_instance_id_json_pointer.as_deref(),
+                "workflow_instance_id",
+                &mut diagnostics,
+            )?;
+            let input = resolve_required_value(
+                payload,
+                adapter.payload_json_pointer.as_deref(),
+                adapter.payload_template_json.as_ref(),
+                "input",
+                &mut diagnostics,
+                true,
+            )?;
+            let memo = resolve_optional_value(
+                payload,
+                adapter.memo_json_pointer.as_deref(),
+                adapter.memo_template_json.as_ref(),
+                "memo",
+                &mut diagnostics,
+            )?;
+            let search_attributes = resolve_optional_value(
+                payload,
+                adapter.search_attributes_json_pointer.as_deref(),
+                adapter.search_attributes_template_json.as_ref(),
+                "search_attributes",
+                &mut diagnostics,
+            )?;
+            let request_id = resolve_optional_string(
+                payload,
+                adapter.request_id_json_pointer.as_deref(),
+                "request_id",
+                &mut diagnostics,
+            )?
+            .unwrap_or_else(|| {
+                diagnostics.push(TopicAdapterMappingDiagnostic {
+                    field: "request_id".to_owned(),
+                    mode: "derived".to_owned(),
+                    detail: "derived from topic partition and offset".to_owned(),
+                });
+                default_request_id.clone()
+            });
+            Ok(TopicAdapterDispatchPreview {
+                dispatch: TopicAdapterResolvedDispatch::StartWorkflow(
+                    TopicAdapterResolvedStartRequest {
+                        definition_id,
+                        instance_id,
+                        workflow_task_queue: adapter.workflow_task_queue.clone(),
+                        input,
+                        memo,
+                        search_attributes,
+                        request_id,
+                    },
+                ),
+                diagnostics,
+            })
+        }
+        TopicAdapterAction::SignalWorkflow => {
+            let signal_type = adapter.signal_type.clone().ok_or_else(|| TopicAdapterMappingError {
+                field: "signal_type".to_owned(),
+                detail: format!("topic adapter {} missing signal_type", adapter.adapter_id),
+            })?;
+            let instance_id = resolve_required_string(
+                payload,
+                adapter.workflow_instance_id_json_pointer.as_deref(),
+                "workflow_instance_id",
+                &mut diagnostics,
+            )?;
+            let request_id = resolve_optional_string(
+                payload,
+                adapter.request_id_json_pointer.as_deref(),
+                "request_id",
+                &mut diagnostics,
+            )?
+            .unwrap_or_else(|| {
+                diagnostics.push(TopicAdapterMappingDiagnostic {
+                    field: "request_id".to_owned(),
+                    mode: "derived".to_owned(),
+                    detail: "derived from topic partition and offset".to_owned(),
+                });
+                default_request_id.clone()
+            });
+            let dedupe_key = resolve_optional_string(
+                payload,
+                adapter.dedupe_key_json_pointer.as_deref(),
+                "dedupe_key",
+                &mut diagnostics,
+            )?
+            .or_else(|| {
+                diagnostics.push(TopicAdapterMappingDiagnostic {
+                    field: "dedupe_key".to_owned(),
+                    mode: "derived".to_owned(),
+                    detail: "defaulted to request_id".to_owned(),
+                });
+                Some(request_id.clone())
+            });
+            let signal_payload = resolve_required_value(
+                payload,
+                adapter.payload_json_pointer.as_deref(),
+                adapter.payload_template_json.as_ref(),
+                "payload",
+                &mut diagnostics,
+                true,
+            )?;
+            Ok(TopicAdapterDispatchPreview {
+                dispatch: TopicAdapterResolvedDispatch::SignalWorkflow(
+                    TopicAdapterResolvedSignalRequest {
+                        signal_type,
+                        instance_id,
+                        payload: signal_payload,
+                        dedupe_key,
+                        request_id,
+                    },
+                ),
+                diagnostics,
+            })
+        }
+    }
+}
+
+fn resolve_required_value(
+    payload: &Value,
+    pointer: Option<&str>,
+    template: Option<&Value>,
+    field: &str,
+    diagnostics: &mut Vec<TopicAdapterMappingDiagnostic>,
+    default_to_whole_payload: bool,
+) -> std::result::Result<Value, TopicAdapterMappingError> {
+    if let Some(template) = template {
+        diagnostics.push(TopicAdapterMappingDiagnostic {
+            field: field.to_owned(),
+            mode: "template".to_owned(),
+            detail: format!("resolved via {}_template_json", field),
+        });
+        return match resolve_template_value(template, payload, field, &format!("{field}_template_json"))? {
+            TemplateResolve::Present(value) => Ok(value),
+            TemplateResolve::Omitted => Err(TopicAdapterMappingError {
+                field: field.to_owned(),
+                detail: format!("template for {field} resolved to no value"),
+            }),
+        };
+    }
+    if let Some(pointer) = pointer {
+        diagnostics.push(TopicAdapterMappingDiagnostic {
+            field: field.to_owned(),
+            mode: "pointer".to_owned(),
+            detail: pointer.to_owned(),
+        });
+        return payload.pointer(pointer).cloned().ok_or_else(|| TopicAdapterMappingError {
+            field: field.to_owned(),
+            detail: format!("missing required field {field} at json pointer {pointer}"),
+        });
+    }
+    if default_to_whole_payload {
+        diagnostics.push(TopicAdapterMappingDiagnostic {
+            field: field.to_owned(),
+            mode: "whole_payload".to_owned(),
+            detail: "using the full topic payload".to_owned(),
+        });
+        return Ok(payload.clone());
+    }
+    Err(TopicAdapterMappingError {
+        field: field.to_owned(),
+        detail: format!("no mapping configured for required field {field}"),
+    })
+}
+
+fn resolve_optional_value(
+    payload: &Value,
+    pointer: Option<&str>,
+    template: Option<&Value>,
+    field: &str,
+    diagnostics: &mut Vec<TopicAdapterMappingDiagnostic>,
+) -> std::result::Result<Option<Value>, TopicAdapterMappingError> {
+    if let Some(template) = template {
+        diagnostics.push(TopicAdapterMappingDiagnostic {
+            field: field.to_owned(),
+            mode: "template".to_owned(),
+            detail: format!("resolved via {}_template_json", field),
+        });
+        return match resolve_template_value(template, payload, field, &format!("{field}_template_json"))? {
+            TemplateResolve::Present(value) => Ok(Some(value)),
+            TemplateResolve::Omitted => Ok(None),
+        };
+    }
+    if let Some(pointer) = pointer {
+        diagnostics.push(TopicAdapterMappingDiagnostic {
+            field: field.to_owned(),
+            mode: "pointer".to_owned(),
+            detail: pointer.to_owned(),
+        });
+        return Ok(payload.pointer(pointer).cloned());
+    }
+    diagnostics.push(TopicAdapterMappingDiagnostic {
+        field: field.to_owned(),
+        mode: "none".to_owned(),
+        detail: "no mapping configured".to_owned(),
+    });
+    Ok(None)
+}
+
+fn resolve_required_string(
+    payload: &Value,
+    pointer: Option<&str>,
+    field: &str,
+    diagnostics: &mut Vec<TopicAdapterMappingDiagnostic>,
+) -> std::result::Result<String, TopicAdapterMappingError> {
+    resolve_optional_string(payload, pointer, field, diagnostics)?.ok_or_else(|| TopicAdapterMappingError {
+        field: field.to_owned(),
+        detail: format!("missing required string field {field}"),
+    })
+}
+
+fn resolve_optional_string(
+    payload: &Value,
+    pointer: Option<&str>,
+    field: &str,
+    diagnostics: &mut Vec<TopicAdapterMappingDiagnostic>,
+) -> std::result::Result<Option<String>, TopicAdapterMappingError> {
+    let Some(pointer) = pointer else {
+        diagnostics.push(TopicAdapterMappingDiagnostic {
+            field: field.to_owned(),
+            mode: "none".to_owned(),
+            detail: "no mapping configured".to_owned(),
+        });
+        return Ok(None);
+    };
+    diagnostics.push(TopicAdapterMappingDiagnostic {
+        field: field.to_owned(),
+        mode: "pointer".to_owned(),
+        detail: pointer.to_owned(),
+    });
+    match payload.pointer(pointer) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(TopicAdapterMappingError {
+            field: field.to_owned(),
+            detail: format!("json pointer {pointer} must point to a string"),
+        }),
+    }
+}
+
+fn resolve_template_value(
+    template: &Value,
+    payload: &Value,
+    field: &str,
+    template_name: &str,
+) -> std::result::Result<TemplateResolve, TopicAdapterMappingError> {
+    match template {
+        Value::Object(map) if map.contains_key("$from") => resolve_template_from(map, payload, field, template_name),
+        Value::Object(map) => {
+            let mut output = Map::new();
+            for (key, value) in map {
+                match resolve_template_value(value, payload, field, template_name)? {
+                    TemplateResolve::Present(resolved) => {
+                        output.insert(key.clone(), resolved);
+                    }
+                    TemplateResolve::Omitted => {}
+                }
+            }
+            Ok(TemplateResolve::Present(Value::Object(output)))
+        }
+        Value::Array(items) => {
+            let mut output = Vec::with_capacity(items.len());
+            for value in items {
+                match resolve_template_value(value, payload, field, template_name)? {
+                    TemplateResolve::Present(resolved) => output.push(resolved),
+                    TemplateResolve::Omitted => output.push(Value::Null),
+                }
+            }
+            Ok(TemplateResolve::Present(Value::Array(output)))
+        }
+        other => Ok(TemplateResolve::Present(other.clone())),
+    }
+}
+
+fn resolve_template_from(
+    map: &Map<String, Value>,
+    payload: &Value,
+    field: &str,
+    template_name: &str,
+) -> std::result::Result<TemplateResolve, TopicAdapterMappingError> {
+    let pointer = map
+        .get("$from")
+        .and_then(Value::as_str)
+        .ok_or_else(|| TopicAdapterMappingError {
+            field: field.to_owned(),
+            detail: format!("{template_name} $from must be a string json pointer"),
+        })?;
+    let optional = map.get("$optional").and_then(Value::as_bool).unwrap_or(false);
+    let invalid_keys = map
+        .keys()
+        .filter(|key| key.as_str() != "$from" && key.as_str() != "$optional")
+        .cloned()
+        .collect::<Vec<_>>();
+    if !invalid_keys.is_empty() {
+        return Err(TopicAdapterMappingError {
+            field: field.to_owned(),
+            detail: format!(
+                "{template_name} $from directives only support $from and $optional; found {}",
+                invalid_keys.join(", ")
+            ),
+        });
+    }
+    match payload.pointer(pointer).cloned() {
+        Some(value) => Ok(TemplateResolve::Present(value)),
+        None if optional => Ok(TemplateResolve::Omitted),
+        None => Err(TopicAdapterMappingError {
+            field: field.to_owned(),
+            detail: format!(
+                "{template_name} missing source value at json pointer {pointer}"
+            ),
+        }),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TopicAdapterOwnershipRecord {
+    pub tenant_id: String,
+    pub adapter_id: String,
+    pub owner_id: String,
+    pub owner_epoch: u64,
+    pub lease_expires_at: DateTime<Utc>,
+    pub acquired_at: DateTime<Utc>,
+    pub last_transition_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl TopicAdapterOwnershipRecord {
+    pub fn is_active_at(&self, now: DateTime<Utc>) -> bool {
+        self.lease_expires_at > now
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2119,6 +2680,154 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize workflow_bulk_batch_runtime_controls table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS topic_adapters (
+                tenant_id TEXT NOT NULL,
+                adapter_id TEXT NOT NULL,
+                adapter_kind TEXT NOT NULL,
+                brokers TEXT NOT NULL,
+                topic_name TEXT NOT NULL,
+                topic_partitions INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                definition_id TEXT,
+                signal_type TEXT,
+                workflow_task_queue TEXT,
+                workflow_instance_id_json_pointer TEXT,
+                payload_json_pointer TEXT,
+                payload_template_json JSONB,
+                memo_json_pointer TEXT,
+                memo_template_json JSONB,
+                search_attributes_json_pointer TEXT,
+                search_attributes_template_json JSONB,
+                request_id_json_pointer TEXT,
+                dedupe_key_json_pointer TEXT,
+                dead_letter_policy TEXT NOT NULL,
+                is_paused BOOLEAN NOT NULL DEFAULT FALSE,
+                processed_count BIGINT NOT NULL DEFAULT 0,
+                failed_count BIGINT NOT NULL DEFAULT 0,
+                ownership_handoff_count BIGINT NOT NULL DEFAULT 0,
+                last_processed_at TIMESTAMPTZ,
+                last_handoff_at TIMESTAMPTZ,
+                last_takeover_latency_ms BIGINT,
+                last_error TEXT,
+                last_error_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, adapter_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize topic_adapters table")?;
+
+        sqlx::query(
+            "ALTER TABLE topic_adapters ADD COLUMN IF NOT EXISTS payload_template_json JSONB",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize topic_adapters payload_template_json column")?;
+
+        sqlx::query(
+            "ALTER TABLE topic_adapters ADD COLUMN IF NOT EXISTS memo_template_json JSONB",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize topic_adapters memo_template_json column")?;
+
+        sqlx::query(
+            "ALTER TABLE topic_adapters ADD COLUMN IF NOT EXISTS search_attributes_template_json JSONB",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize topic_adapters search_attributes_template_json column")?;
+
+        sqlx::query(
+            "ALTER TABLE topic_adapters ADD COLUMN IF NOT EXISTS ownership_handoff_count BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize topic_adapters ownership_handoff_count column")?;
+
+        sqlx::query(
+            "ALTER TABLE topic_adapters ADD COLUMN IF NOT EXISTS last_handoff_at TIMESTAMPTZ",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize topic_adapters last_handoff_at column")?;
+
+        sqlx::query(
+            "ALTER TABLE topic_adapters ADD COLUMN IF NOT EXISTS last_takeover_latency_ms BIGINT",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize topic_adapters last_takeover_latency_ms column")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS topic_adapter_offsets (
+                tenant_id TEXT NOT NULL,
+                adapter_id TEXT NOT NULL,
+                partition_id INTEGER NOT NULL,
+                log_offset BIGINT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, adapter_id, partition_id),
+                FOREIGN KEY (tenant_id, adapter_id)
+                    REFERENCES topic_adapters(tenant_id, adapter_id)
+                    ON DELETE CASCADE
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize topic_adapter_offsets table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS topic_adapter_dead_letters (
+                tenant_id TEXT NOT NULL,
+                adapter_id TEXT NOT NULL,
+                partition_id INTEGER NOT NULL,
+                log_offset BIGINT NOT NULL,
+                record_key TEXT,
+                payload JSONB NOT NULL DEFAULT 'null'::jsonb,
+                error TEXT NOT NULL,
+                occurred_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, adapter_id, partition_id, log_offset),
+                FOREIGN KEY (tenant_id, adapter_id)
+                    REFERENCES topic_adapters(tenant_id, adapter_id)
+                    ON DELETE CASCADE
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize topic_adapter_dead_letters table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS topic_adapter_ownership (
+                tenant_id TEXT NOT NULL,
+                adapter_id TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                owner_epoch BIGINT NOT NULL,
+                lease_expires_at TIMESTAMPTZ NOT NULL,
+                acquired_at TIMESTAMPTZ NOT NULL,
+                last_transition_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, adapter_id),
+                FOREIGN KEY (tenant_id, adapter_id)
+                    REFERENCES topic_adapters(tenant_id, adapter_id)
+                    ON DELETE CASCADE
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize topic_adapter_ownership table")?;
 
         sqlx::query(
             r#"
@@ -5478,6 +6187,1024 @@ impl WorkflowStore {
         .context("failed to load workflow bulk batch runtime control")?;
 
         row.map(Self::decode_bulk_batch_runtime_control_row).transpose()
+    }
+
+    pub async fn upsert_topic_adapter(
+        &self,
+        adapter: &TopicAdapterUpsert,
+    ) -> Result<TopicAdapterRecord> {
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO topic_adapters (
+                tenant_id,
+                adapter_id,
+                adapter_kind,
+                brokers,
+                topic_name,
+                topic_partitions,
+                action,
+                definition_id,
+                signal_type,
+                workflow_task_queue,
+                workflow_instance_id_json_pointer,
+                payload_json_pointer,
+                payload_template_json,
+                memo_json_pointer,
+                memo_template_json,
+                search_attributes_json_pointer,
+                search_attributes_template_json,
+                request_id_json_pointer,
+                dedupe_key_json_pointer,
+                dead_letter_policy,
+                is_paused,
+                created_at,
+                updated_at
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23
+            )
+            ON CONFLICT (tenant_id, adapter_id)
+            DO UPDATE SET
+                adapter_kind = EXCLUDED.adapter_kind,
+                brokers = EXCLUDED.brokers,
+                topic_name = EXCLUDED.topic_name,
+                topic_partitions = EXCLUDED.topic_partitions,
+                action = EXCLUDED.action,
+                definition_id = EXCLUDED.definition_id,
+                signal_type = EXCLUDED.signal_type,
+                workflow_task_queue = EXCLUDED.workflow_task_queue,
+                workflow_instance_id_json_pointer = EXCLUDED.workflow_instance_id_json_pointer,
+                payload_json_pointer = EXCLUDED.payload_json_pointer,
+                payload_template_json = EXCLUDED.payload_template_json,
+                memo_json_pointer = EXCLUDED.memo_json_pointer,
+                memo_template_json = EXCLUDED.memo_template_json,
+                search_attributes_json_pointer = EXCLUDED.search_attributes_json_pointer,
+                search_attributes_template_json = EXCLUDED.search_attributes_template_json,
+                request_id_json_pointer = EXCLUDED.request_id_json_pointer,
+                dedupe_key_json_pointer = EXCLUDED.dedupe_key_json_pointer,
+                dead_letter_policy = EXCLUDED.dead_letter_policy,
+                is_paused = EXCLUDED.is_paused,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(&adapter.tenant_id)
+        .bind(&adapter.adapter_id)
+        .bind(adapter.adapter_kind.as_str())
+        .bind(&adapter.brokers)
+        .bind(&adapter.topic_name)
+        .bind(adapter.topic_partitions)
+        .bind(adapter.action.as_str())
+        .bind(adapter.definition_id.as_deref())
+        .bind(adapter.signal_type.as_deref())
+        .bind(adapter.workflow_task_queue.as_deref())
+        .bind(adapter.workflow_instance_id_json_pointer.as_deref())
+        .bind(adapter.payload_json_pointer.as_deref())
+        .bind(adapter.payload_template_json.as_ref().map(Json))
+        .bind(adapter.memo_json_pointer.as_deref())
+        .bind(adapter.memo_template_json.as_ref().map(Json))
+        .bind(adapter.search_attributes_json_pointer.as_deref())
+        .bind(adapter.search_attributes_template_json.as_ref().map(Json))
+        .bind(adapter.request_id_json_pointer.as_deref())
+        .bind(adapter.dedupe_key_json_pointer.as_deref())
+        .bind(adapter.dead_letter_policy.as_str())
+        .bind(adapter.is_paused)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert topic adapter")?;
+
+        self.get_topic_adapter(&adapter.tenant_id, &adapter.adapter_id)
+            .await?
+            .context("topic adapter missing after upsert")
+    }
+
+    pub async fn get_topic_adapter(
+        &self,
+        tenant_id: &str,
+        adapter_id: &str,
+    ) -> Result<Option<TopicAdapterRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                tenant_id,
+                adapter_id,
+                adapter_kind,
+                brokers,
+                topic_name,
+                topic_partitions,
+                action,
+                definition_id,
+                signal_type,
+                workflow_task_queue,
+                workflow_instance_id_json_pointer,
+                payload_json_pointer,
+                payload_template_json,
+                memo_json_pointer,
+                memo_template_json,
+                search_attributes_json_pointer,
+                search_attributes_template_json,
+                request_id_json_pointer,
+                dedupe_key_json_pointer,
+                dead_letter_policy,
+                is_paused,
+                processed_count,
+                failed_count,
+                ownership_handoff_count,
+                last_processed_at,
+                last_handoff_at,
+                last_takeover_latency_ms,
+                last_error,
+                last_error_at,
+                created_at,
+                updated_at
+            FROM topic_adapters
+            WHERE tenant_id = $1 AND adapter_id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load topic adapter")?;
+
+        row.map(Self::decode_topic_adapter_row).transpose()
+    }
+
+    pub async fn list_topic_adapters_for_tenant(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Vec<TopicAdapterRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                tenant_id,
+                adapter_id,
+                adapter_kind,
+                brokers,
+                topic_name,
+                topic_partitions,
+                action,
+                definition_id,
+                signal_type,
+                workflow_task_queue,
+                workflow_instance_id_json_pointer,
+                payload_json_pointer,
+                payload_template_json,
+                memo_json_pointer,
+                memo_template_json,
+                search_attributes_json_pointer,
+                search_attributes_template_json,
+                request_id_json_pointer,
+                dedupe_key_json_pointer,
+                dead_letter_policy,
+                is_paused,
+                processed_count,
+                failed_count,
+                ownership_handoff_count,
+                last_processed_at,
+                last_handoff_at,
+                last_takeover_latency_ms,
+                last_error,
+                last_error_at,
+                created_at,
+                updated_at
+            FROM topic_adapters
+            WHERE tenant_id = $1
+            ORDER BY adapter_id ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list topic adapters")?;
+
+        rows.into_iter().map(Self::decode_topic_adapter_row).collect()
+    }
+
+    pub async fn list_topic_adapters(&self) -> Result<Vec<TopicAdapterRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                tenant_id,
+                adapter_id,
+                adapter_kind,
+                brokers,
+                topic_name,
+                topic_partitions,
+                action,
+                definition_id,
+                signal_type,
+                workflow_task_queue,
+                workflow_instance_id_json_pointer,
+                payload_json_pointer,
+                payload_template_json,
+                memo_json_pointer,
+                memo_template_json,
+                search_attributes_json_pointer,
+                search_attributes_template_json,
+                request_id_json_pointer,
+                dedupe_key_json_pointer,
+                dead_letter_policy,
+                is_paused,
+                processed_count,
+                failed_count,
+                ownership_handoff_count,
+                last_processed_at,
+                last_handoff_at,
+                last_takeover_latency_ms,
+                last_error,
+                last_error_at,
+                created_at,
+                updated_at
+            FROM topic_adapters
+            ORDER BY tenant_id ASC, adapter_id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list topic adapters")?;
+
+        rows.into_iter().map(Self::decode_topic_adapter_row).collect()
+    }
+
+    pub async fn set_topic_adapter_paused(
+        &self,
+        tenant_id: &str,
+        adapter_id: &str,
+        is_paused: bool,
+    ) -> Result<Option<TopicAdapterRecord>> {
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            UPDATE topic_adapters
+            SET is_paused = $3,
+                updated_at = $4
+            WHERE tenant_id = $1 AND adapter_id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .bind(is_paused)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("failed to update topic adapter pause state")?;
+
+        self.get_topic_adapter(tenant_id, adapter_id).await
+    }
+
+    pub async fn claim_topic_adapter_ownership(
+        &self,
+        tenant_id: &str,
+        adapter_id: &str,
+        owner_id: &str,
+        lease_ttl: std::time::Duration,
+    ) -> Result<Option<TopicAdapterOwnershipRecord>> {
+        let mut tx =
+            self.pool.begin().await.context("failed to begin topic adapter ownership transaction")?;
+        let now = Utc::now();
+        let lease_expires_at = now
+            + chrono::Duration::from_std(lease_ttl)
+                .context("topic adapter ownership lease ttl overflow")?;
+        let row = sqlx::query(
+            r#"
+            SELECT
+                tenant_id,
+                adapter_id,
+                owner_id,
+                owner_epoch,
+                lease_expires_at,
+                acquired_at,
+                last_transition_at,
+                updated_at
+            FROM topic_adapter_ownership
+            WHERE tenant_id = $1 AND adapter_id = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("failed to load topic adapter ownership for claim")?;
+
+        let ownership = match row {
+            Some(row) => {
+                let current = Self::decode_topic_adapter_ownership_row(row)?;
+                if current.owner_id == owner_id {
+                    sqlx::query(
+                        r#"
+                        UPDATE topic_adapter_ownership
+                        SET lease_expires_at = $4,
+                            updated_at = $5
+                        WHERE tenant_id = $1 AND adapter_id = $2 AND owner_id = $3
+                        "#,
+                    )
+                    .bind(tenant_id)
+                    .bind(adapter_id)
+                    .bind(owner_id)
+                    .bind(lease_expires_at)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await
+                    .context("failed to renew existing topic adapter ownership claim")?;
+                    TopicAdapterOwnershipRecord { lease_expires_at, updated_at: now, ..current }
+                } else if current.lease_expires_at <= now {
+                    let next_epoch = current.owner_epoch + 1;
+                    let takeover_latency_ms =
+                        now.signed_duration_since(current.lease_expires_at).num_milliseconds().max(0);
+                    sqlx::query(
+                        r#"
+                        UPDATE topic_adapter_ownership
+                        SET owner_id = $3,
+                            owner_epoch = $4,
+                            lease_expires_at = $5,
+                            acquired_at = $6,
+                            last_transition_at = $6,
+                            updated_at = $6
+                        WHERE tenant_id = $1 AND adapter_id = $2
+                        "#,
+                    )
+                    .bind(tenant_id)
+                    .bind(adapter_id)
+                    .bind(owner_id)
+                    .bind(i64::try_from(next_epoch).context("topic adapter ownership epoch exceeds i64")?)
+                    .bind(lease_expires_at)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await
+                    .context("failed to transfer expired topic adapter ownership")?;
+                    sqlx::query(
+                        r#"
+                        UPDATE topic_adapters
+                        SET ownership_handoff_count = ownership_handoff_count + 1,
+                            last_handoff_at = $3,
+                            last_takeover_latency_ms = $4,
+                            updated_at = $3
+                        WHERE tenant_id = $1 AND adapter_id = $2
+                        "#,
+                    )
+                    .bind(tenant_id)
+                    .bind(adapter_id)
+                    .bind(now)
+                    .bind(takeover_latency_ms)
+                    .execute(&mut *tx)
+                    .await
+                    .context("failed to update topic adapter handoff metrics")?;
+                    TopicAdapterOwnershipRecord {
+                        tenant_id: tenant_id.to_owned(),
+                        adapter_id: adapter_id.to_owned(),
+                        owner_id: owner_id.to_owned(),
+                        owner_epoch: next_epoch,
+                        lease_expires_at,
+                        acquired_at: now,
+                        last_transition_at: now,
+                        updated_at: now,
+                    }
+                } else {
+                    tx.commit()
+                        .await
+                        .context("failed to commit busy topic adapter ownership transaction")?;
+                    return Ok(None);
+                }
+            }
+            None => {
+                sqlx::query(
+                    r#"
+                    INSERT INTO topic_adapter_ownership (
+                        tenant_id,
+                        adapter_id,
+                        owner_id,
+                        owner_epoch,
+                        lease_expires_at,
+                        acquired_at,
+                        last_transition_at,
+                        updated_at
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $6, $6)
+                    "#,
+                )
+                .bind(tenant_id)
+                .bind(adapter_id)
+                .bind(owner_id)
+                .bind(1_i64)
+                .bind(lease_expires_at)
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .context("failed to insert topic adapter ownership record")?;
+                TopicAdapterOwnershipRecord {
+                    tenant_id: tenant_id.to_owned(),
+                    adapter_id: adapter_id.to_owned(),
+                    owner_id: owner_id.to_owned(),
+                    owner_epoch: 1,
+                    lease_expires_at,
+                    acquired_at: now,
+                    last_transition_at: now,
+                    updated_at: now,
+                }
+            }
+        };
+
+        tx.commit().await.context("failed to commit topic adapter ownership claim transaction")?;
+        Ok(Some(ownership))
+    }
+
+    pub async fn renew_topic_adapter_ownership(
+        &self,
+        tenant_id: &str,
+        adapter_id: &str,
+        owner_id: &str,
+        owner_epoch: u64,
+        lease_ttl: std::time::Duration,
+    ) -> Result<Option<TopicAdapterOwnershipRecord>> {
+        let now = Utc::now();
+        let lease_expires_at = now
+            + chrono::Duration::from_std(lease_ttl)
+                .context("topic adapter ownership lease ttl overflow")?;
+        let result = sqlx::query(
+            r#"
+            UPDATE topic_adapter_ownership
+            SET lease_expires_at = $5,
+                updated_at = $6
+            WHERE tenant_id = $1
+              AND adapter_id = $2
+              AND owner_id = $3
+              AND owner_epoch = $4
+              AND lease_expires_at > $6
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .bind(owner_id)
+        .bind(i64::try_from(owner_epoch).context("topic adapter ownership epoch exceeds i64")?)
+        .bind(lease_expires_at)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("failed to renew topic adapter ownership")?;
+
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        self.get_topic_adapter_ownership(tenant_id, adapter_id).await
+    }
+
+    pub async fn get_topic_adapter_ownership(
+        &self,
+        tenant_id: &str,
+        adapter_id: &str,
+    ) -> Result<Option<TopicAdapterOwnershipRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                tenant_id,
+                adapter_id,
+                owner_id,
+                owner_epoch,
+                lease_expires_at,
+                acquired_at,
+                last_transition_at,
+                updated_at
+            FROM topic_adapter_ownership
+            WHERE tenant_id = $1 AND adapter_id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load topic adapter ownership")?;
+
+        row.map(Self::decode_topic_adapter_ownership_row).transpose()
+    }
+
+    pub async fn validate_topic_adapter_ownership(
+        &self,
+        tenant_id: &str,
+        adapter_id: &str,
+        owner_id: &str,
+        owner_epoch: u64,
+    ) -> Result<bool> {
+        let now = Utc::now();
+        let row = sqlx::query(
+            r#"
+            SELECT 1
+            FROM topic_adapter_ownership
+            WHERE tenant_id = $1
+              AND adapter_id = $2
+              AND owner_id = $3
+              AND owner_epoch = $4
+              AND lease_expires_at > $5
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .bind(owner_id)
+        .bind(i64::try_from(owner_epoch).context("topic adapter ownership epoch exceeds i64")?)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to validate topic adapter ownership")?;
+
+        Ok(row.is_some())
+    }
+
+    pub async fn release_topic_adapter_ownership(
+        &self,
+        tenant_id: &str,
+        adapter_id: &str,
+        owner_id: &str,
+        owner_epoch: u64,
+    ) -> Result<bool> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            r#"
+            UPDATE topic_adapter_ownership
+            SET lease_expires_at = $5,
+                updated_at = $5
+            WHERE tenant_id = $1
+              AND adapter_id = $2
+              AND owner_id = $3
+              AND owner_epoch = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .bind(owner_id)
+        .bind(i64::try_from(owner_epoch).context("topic adapter ownership epoch exceeds i64")?)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .context("failed to release topic adapter ownership")?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn load_topic_adapter_offsets(
+        &self,
+        tenant_id: &str,
+        adapter_id: &str,
+    ) -> Result<Vec<TopicAdapterOffsetRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT tenant_id, adapter_id, partition_id, log_offset, updated_at
+            FROM topic_adapter_offsets
+            WHERE tenant_id = $1 AND adapter_id = $2
+            ORDER BY partition_id ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load topic adapter offsets")?;
+
+        rows.into_iter().map(Self::decode_topic_adapter_offset_row).collect()
+    }
+
+    pub async fn list_topic_adapter_dead_letters(
+        &self,
+        tenant_id: &str,
+        adapter_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<TopicAdapterDeadLetterRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                tenant_id,
+                adapter_id,
+                partition_id,
+                log_offset,
+                record_key,
+                payload,
+                error,
+                occurred_at,
+                updated_at
+            FROM topic_adapter_dead_letters
+            WHERE tenant_id = $1 AND adapter_id = $2
+            ORDER BY occurred_at DESC, partition_id ASC, log_offset ASC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list topic adapter dead letters")?;
+
+        rows.into_iter().map(Self::decode_topic_adapter_dead_letter_row).collect()
+    }
+
+    pub async fn record_topic_adapter_success(
+        &self,
+        tenant_id: &str,
+        adapter_id: &str,
+        partition_id: i32,
+        log_offset: i64,
+        processed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let mut tx =
+            self.pool.begin().await.context("failed to begin topic adapter success transaction")?;
+        if self
+            .prepare_topic_adapter_offset_commit(
+                &mut tx,
+                tenant_id,
+                adapter_id,
+                partition_id,
+                log_offset,
+                None,
+            )
+            .await?
+        {
+            self.apply_topic_adapter_success_commit(
+                &mut tx,
+                tenant_id,
+                adapter_id,
+                partition_id,
+                log_offset,
+                processed_at,
+            )
+            .await?;
+        }
+        tx.commit().await.context("failed to commit topic adapter success transaction")?;
+        Ok(())
+    }
+
+    pub async fn record_topic_adapter_success_if_owned(
+        &self,
+        tenant_id: &str,
+        adapter_id: &str,
+        partition_id: i32,
+        log_offset: i64,
+        processed_at: DateTime<Utc>,
+        owner_id: &str,
+        owner_epoch: u64,
+    ) -> Result<bool> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin owned topic adapter success transaction")?;
+        if !self
+            .prepare_topic_adapter_offset_commit(
+                &mut tx,
+                tenant_id,
+                adapter_id,
+                partition_id,
+                log_offset,
+                Some((owner_id, owner_epoch)),
+            )
+            .await?
+        {
+            tx.commit()
+                .await
+                .context("failed to commit rejected topic adapter success transaction")?;
+            return Ok(false);
+        }
+        self.apply_topic_adapter_success_commit(
+            &mut tx,
+            tenant_id,
+            adapter_id,
+            partition_id,
+            log_offset,
+            processed_at,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .context("failed to commit owned topic adapter success transaction")?;
+        Ok(true)
+    }
+
+    pub async fn record_topic_adapter_dead_letter(
+        &self,
+        tenant_id: &str,
+        adapter_id: &str,
+        partition_id: i32,
+        log_offset: i64,
+        record_key: Option<&str>,
+        payload: &Value,
+        error: &str,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin topic adapter dead letter transaction")?;
+        if self
+            .prepare_topic_adapter_offset_commit(
+                &mut tx,
+                tenant_id,
+                adapter_id,
+                partition_id,
+                log_offset,
+                None,
+            )
+            .await?
+        {
+            self.apply_topic_adapter_dead_letter_commit(
+                &mut tx,
+                tenant_id,
+                adapter_id,
+                partition_id,
+                log_offset,
+                record_key,
+                payload,
+                error,
+                occurred_at,
+            )
+            .await?;
+        }
+        tx.commit().await.context("failed to commit topic adapter dead letter transaction")?;
+        Ok(())
+    }
+
+    pub async fn record_topic_adapter_dead_letter_if_owned(
+        &self,
+        tenant_id: &str,
+        adapter_id: &str,
+        partition_id: i32,
+        log_offset: i64,
+        record_key: Option<&str>,
+        payload: &Value,
+        error: &str,
+        occurred_at: DateTime<Utc>,
+        owner_id: &str,
+        owner_epoch: u64,
+    ) -> Result<bool> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin owned topic adapter dead letter transaction")?;
+        if !self
+            .prepare_topic_adapter_offset_commit(
+                &mut tx,
+                tenant_id,
+                adapter_id,
+                partition_id,
+                log_offset,
+                Some((owner_id, owner_epoch)),
+            )
+            .await?
+        {
+            tx.commit()
+                .await
+                .context("failed to commit rejected topic adapter dead letter transaction")?;
+            return Ok(false);
+        }
+        self.apply_topic_adapter_dead_letter_commit(
+            &mut tx,
+            tenant_id,
+            adapter_id,
+            partition_id,
+            log_offset,
+            record_key,
+            payload,
+            error,
+            occurred_at,
+        )
+        .await?;
+        tx.commit()
+            .await
+            .context("failed to commit owned topic adapter dead letter transaction")?;
+        Ok(true)
+    }
+
+    pub async fn mark_topic_adapter_runtime_error(
+        &self,
+        tenant_id: &str,
+        adapter_id: &str,
+        error: &str,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE topic_adapters
+            SET last_error = $3,
+                last_error_at = $4,
+                updated_at = $4
+            WHERE tenant_id = $1 AND adapter_id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .bind(error)
+        .bind(occurred_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to record topic adapter runtime error")?;
+        Ok(())
+    }
+
+    async fn prepare_topic_adapter_offset_commit(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        tenant_id: &str,
+        adapter_id: &str,
+        partition_id: i32,
+        log_offset: i64,
+        ownership: Option<(&str, u64)>,
+    ) -> Result<bool> {
+        if let Some((owner_id, owner_epoch)) = ownership {
+            let now = Utc::now();
+            let owner_row = sqlx::query(
+                r#"
+                SELECT 1
+                FROM topic_adapter_ownership
+                WHERE tenant_id = $1
+                  AND adapter_id = $2
+                  AND owner_id = $3
+                  AND owner_epoch = $4
+                  AND lease_expires_at > $5
+                FOR UPDATE
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(adapter_id)
+            .bind(owner_id)
+            .bind(i64::try_from(owner_epoch).context("topic adapter ownership epoch exceeds i64")?)
+            .bind(now)
+            .fetch_optional(&mut **tx)
+            .await
+            .context("failed to validate topic adapter ownership for offset commit")?;
+            if owner_row.is_none() {
+                return Ok(false);
+            }
+        }
+
+        let current_offset = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT log_offset
+            FROM topic_adapter_offsets
+            WHERE tenant_id = $1 AND adapter_id = $2 AND partition_id = $3
+            FOR UPDATE
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .bind(partition_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .context("failed to load topic adapter offset for commit")?;
+
+        Ok(current_offset.is_none_or(|existing| existing < log_offset))
+    }
+
+    async fn apply_topic_adapter_success_commit(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        tenant_id: &str,
+        adapter_id: &str,
+        partition_id: i32,
+        log_offset: i64,
+        processed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO topic_adapter_offsets (
+                tenant_id,
+                adapter_id,
+                partition_id,
+                log_offset,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (tenant_id, adapter_id, partition_id)
+            DO UPDATE SET
+                log_offset = EXCLUDED.log_offset,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .bind(partition_id)
+        .bind(log_offset)
+        .bind(processed_at)
+        .execute(&mut **tx)
+        .await
+        .context("failed to commit topic adapter offset")?;
+
+        sqlx::query(
+            r#"
+            UPDATE topic_adapters
+            SET processed_count = processed_count + 1,
+                last_processed_at = $3,
+                last_error = NULL,
+                last_error_at = NULL,
+                updated_at = $3
+            WHERE tenant_id = $1 AND adapter_id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .bind(processed_at)
+        .execute(&mut **tx)
+        .await
+        .context("failed to update topic adapter success metrics")?;
+
+        Ok(())
+    }
+
+    async fn apply_topic_adapter_dead_letter_commit(
+        &self,
+        tx: &mut sqlx::Transaction<'_, Postgres>,
+        tenant_id: &str,
+        adapter_id: &str,
+        partition_id: i32,
+        log_offset: i64,
+        record_key: Option<&str>,
+        payload: &Value,
+        error: &str,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO topic_adapter_dead_letters (
+                tenant_id,
+                adapter_id,
+                partition_id,
+                log_offset,
+                record_key,
+                payload,
+                error,
+                occurred_at,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+            ON CONFLICT (tenant_id, adapter_id, partition_id, log_offset)
+            DO UPDATE SET
+                record_key = EXCLUDED.record_key,
+                payload = EXCLUDED.payload,
+                error = EXCLUDED.error,
+                occurred_at = EXCLUDED.occurred_at,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .bind(partition_id)
+        .bind(log_offset)
+        .bind(record_key)
+        .bind(Json(payload))
+        .bind(error)
+        .bind(occurred_at)
+        .execute(&mut **tx)
+        .await
+        .context("failed to upsert topic adapter dead letter")?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO topic_adapter_offsets (
+                tenant_id,
+                adapter_id,
+                partition_id,
+                log_offset,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (tenant_id, adapter_id, partition_id)
+            DO UPDATE SET
+                log_offset = EXCLUDED.log_offset,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .bind(partition_id)
+        .bind(log_offset)
+        .bind(occurred_at)
+        .execute(&mut **tx)
+        .await
+        .context("failed to commit topic adapter dead letter offset")?;
+
+        sqlx::query(
+            r#"
+            UPDATE topic_adapters
+            SET failed_count = failed_count + 1,
+                last_error = $3,
+                last_error_at = $4,
+                updated_at = $4
+            WHERE tenant_id = $1 AND adapter_id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .bind(error)
+        .bind(occurred_at)
+        .execute(&mut **tx)
+        .await
+        .context("failed to update topic adapter dead letter metrics")?;
+
+        Ok(())
     }
 
     pub async fn set_bulk_batch_admission_metadata(
@@ -11050,7 +12777,10 @@ impl WorkflowStore {
         Ok(())
     }
 
-    pub async fn upsert_throughput_run_input(&self, input: &ThroughputRunInputRecord) -> Result<()> {
+    pub async fn upsert_throughput_run_input(
+        &self,
+        input: &ThroughputRunInputRecord,
+    ) -> Result<()> {
         sqlx::query(
             r#"
             INSERT INTO throughput_run_inputs (
@@ -11322,7 +13052,11 @@ impl WorkflowStore {
             );
         }
 
-        let mut tx = self.pool.begin().await.context("failed to begin throughput terminal handoff transaction")?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin throughput terminal handoff transaction")?;
         let inserted = sqlx::query(
             r#"
             INSERT INTO throughput_terminals (
@@ -11389,8 +13123,12 @@ impl WorkflowStore {
             );
         }
 
-        self.enqueue_workflow_event_outbox(tx.as_mut(), &terminal.terminal_event, terminal.terminal_at)
-            .await?;
+        self.enqueue_workflow_event_outbox(
+            tx.as_mut(),
+            &terminal.terminal_event,
+            terminal.terminal_at,
+        )
+        .await?;
 
         let updated = sqlx::query(
             r#"
@@ -11523,6 +13261,46 @@ impl WorkflowStore {
             .await
             .context("failed to list throughput report log")?
         };
+        rows.into_iter()
+            .map(|row| {
+                Ok(ThroughputReportLogEntry {
+                    report: row
+                        .try_get::<Json<ThroughputChunkReport>, _>("report")
+                        .map(|json| json.0)
+                        .context("throughput report log row missing report payload")?,
+                    captured_at: row
+                        .try_get("captured_at")
+                        .context("throughput report log row missing captured_at")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn list_throughput_report_log_for_batch(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        batch_id: &str,
+    ) -> Result<Vec<ThroughputReportLogEntry>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT report, captured_at
+            FROM throughput_report_log
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND batch_id = $4
+            ORDER BY captured_at ASC, report_id ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(batch_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list throughput report log for batch")?;
         rows.into_iter()
             .map(|row| {
                 Ok(ThroughputReportLogEntry {
@@ -14057,6 +15835,180 @@ impl WorkflowStore {
         })
     }
 
+    fn decode_topic_adapter_row(row: sqlx::postgres::PgRow) -> Result<TopicAdapterRecord> {
+        Ok(TopicAdapterRecord {
+            tenant_id: row.try_get("tenant_id").context("topic adapter tenant_id missing")?,
+            adapter_id: row.try_get("adapter_id").context("topic adapter adapter_id missing")?,
+            adapter_kind: TopicAdapterKind::from_db(
+                &row.try_get::<String, _>("adapter_kind")
+                    .context("topic adapter adapter_kind missing")?,
+            )?,
+            brokers: row.try_get("brokers").context("topic adapter brokers missing")?,
+            topic_name: row.try_get("topic_name").context("topic adapter topic_name missing")?,
+            topic_partitions: row
+                .try_get("topic_partitions")
+                .context("topic adapter topic_partitions missing")?,
+            action: TopicAdapterAction::from_db(
+                &row.try_get::<String, _>("action").context("topic adapter action missing")?,
+            )?,
+            definition_id: row
+                .try_get("definition_id")
+                .context("topic adapter definition_id missing")?,
+            signal_type: row.try_get("signal_type").context("topic adapter signal_type missing")?,
+            workflow_task_queue: row
+                .try_get("workflow_task_queue")
+                .context("topic adapter workflow_task_queue missing")?,
+            workflow_instance_id_json_pointer: row
+                .try_get("workflow_instance_id_json_pointer")
+                .context("topic adapter workflow_instance_id_json_pointer missing")?,
+            payload_json_pointer: row
+                .try_get("payload_json_pointer")
+                .context("topic adapter payload_json_pointer missing")?,
+            payload_template_json: row
+                .try_get::<Option<Json<Value>>, _>("payload_template_json")
+                .context("topic adapter payload_template_json missing")?
+                .map(|value| value.0),
+            memo_json_pointer: row
+                .try_get("memo_json_pointer")
+                .context("topic adapter memo_json_pointer missing")?,
+            memo_template_json: row
+                .try_get::<Option<Json<Value>>, _>("memo_template_json")
+                .context("topic adapter memo_template_json missing")?
+                .map(|value| value.0),
+            search_attributes_json_pointer: row
+                .try_get("search_attributes_json_pointer")
+                .context("topic adapter search_attributes_json_pointer missing")?,
+            search_attributes_template_json: row
+                .try_get::<Option<Json<Value>>, _>("search_attributes_template_json")
+                .context("topic adapter search_attributes_template_json missing")?
+                .map(|value| value.0),
+            request_id_json_pointer: row
+                .try_get("request_id_json_pointer")
+                .context("topic adapter request_id_json_pointer missing")?,
+            dedupe_key_json_pointer: row
+                .try_get("dedupe_key_json_pointer")
+                .context("topic adapter dedupe_key_json_pointer missing")?,
+            dead_letter_policy: TopicAdapterDeadLetterPolicy::from_db(
+                &row.try_get::<String, _>("dead_letter_policy")
+                    .context("topic adapter dead_letter_policy missing")?,
+            )?,
+            is_paused: row.try_get("is_paused").context("topic adapter is_paused missing")?,
+            processed_count: row
+                .try_get::<i64, _>("processed_count")
+                .context("topic adapter processed_count missing")?
+                as u64,
+            failed_count: row
+                .try_get::<i64, _>("failed_count")
+                .context("topic adapter failed_count missing")? as u64,
+            ownership_handoff_count: row
+                .try_get::<i64, _>("ownership_handoff_count")
+                .context("topic adapter ownership_handoff_count missing")?
+                as u64,
+            last_processed_at: row
+                .try_get("last_processed_at")
+                .context("topic adapter last_processed_at missing")?,
+            last_handoff_at: row
+                .try_get("last_handoff_at")
+                .context("topic adapter last_handoff_at missing")?,
+            last_takeover_latency_ms: row
+                .try_get::<Option<i64>, _>("last_takeover_latency_ms")
+                .context("topic adapter last_takeover_latency_ms missing")?
+                .map(|value| value as u64),
+            last_error: row.try_get("last_error").context("topic adapter last_error missing")?,
+            last_error_at: row
+                .try_get("last_error_at")
+                .context("topic adapter last_error_at missing")?,
+            created_at: row.try_get("created_at").context("topic adapter created_at missing")?,
+            updated_at: row.try_get("updated_at").context("topic adapter updated_at missing")?,
+        })
+    }
+
+    fn decode_topic_adapter_offset_row(
+        row: sqlx::postgres::PgRow,
+    ) -> Result<TopicAdapterOffsetRecord> {
+        Ok(TopicAdapterOffsetRecord {
+            tenant_id: row
+                .try_get("tenant_id")
+                .context("topic adapter offset tenant_id missing")?,
+            adapter_id: row
+                .try_get("adapter_id")
+                .context("topic adapter offset adapter_id missing")?,
+            partition_id: row
+                .try_get("partition_id")
+                .context("topic adapter offset partition_id missing")?,
+            log_offset: row
+                .try_get("log_offset")
+                .context("topic adapter offset log_offset missing")?,
+            updated_at: row
+                .try_get("updated_at")
+                .context("topic adapter offset updated_at missing")?,
+        })
+    }
+
+    fn decode_topic_adapter_ownership_row(
+        row: sqlx::postgres::PgRow,
+    ) -> Result<TopicAdapterOwnershipRecord> {
+        Ok(TopicAdapterOwnershipRecord {
+            tenant_id: row
+                .try_get("tenant_id")
+                .context("topic adapter ownership tenant_id missing")?,
+            adapter_id: row
+                .try_get("adapter_id")
+                .context("topic adapter ownership adapter_id missing")?,
+            owner_id: row
+                .try_get("owner_id")
+                .context("topic adapter ownership owner_id missing")?,
+            owner_epoch: row
+                .try_get::<i64, _>("owner_epoch")
+                .context("topic adapter ownership owner_epoch missing")? as u64,
+            lease_expires_at: row
+                .try_get("lease_expires_at")
+                .context("topic adapter ownership lease_expires_at missing")?,
+            acquired_at: row
+                .try_get("acquired_at")
+                .context("topic adapter ownership acquired_at missing")?,
+            last_transition_at: row
+                .try_get("last_transition_at")
+                .context("topic adapter ownership last_transition_at missing")?,
+            updated_at: row
+                .try_get("updated_at")
+                .context("topic adapter ownership updated_at missing")?,
+        })
+    }
+
+    fn decode_topic_adapter_dead_letter_row(
+        row: sqlx::postgres::PgRow,
+    ) -> Result<TopicAdapterDeadLetterRecord> {
+        Ok(TopicAdapterDeadLetterRecord {
+            tenant_id: row
+                .try_get("tenant_id")
+                .context("topic adapter dead letter tenant_id missing")?,
+            adapter_id: row
+                .try_get("adapter_id")
+                .context("topic adapter dead letter adapter_id missing")?,
+            partition_id: row
+                .try_get("partition_id")
+                .context("topic adapter dead letter partition_id missing")?,
+            log_offset: row
+                .try_get("log_offset")
+                .context("topic adapter dead letter log_offset missing")?,
+            record_key: row
+                .try_get("record_key")
+                .context("topic adapter dead letter record_key missing")?,
+            payload: row
+                .try_get::<Json<Value>, _>("payload")
+                .context("topic adapter dead letter payload missing")?
+                .0,
+            error: row.try_get("error").context("topic adapter dead letter error missing")?,
+            occurred_at: row
+                .try_get("occurred_at")
+                .context("topic adapter dead letter occurred_at missing")?,
+            updated_at: row
+                .try_get("updated_at")
+                .context("topic adapter dead letter updated_at missing")?,
+        })
+    }
+
     fn decode_workflow_task_row(row: sqlx::postgres::PgRow) -> Result<WorkflowTaskRecord> {
         Ok(WorkflowTaskRecord {
             task_id: row.try_get("task_id").context("workflow task task_id missing")?,
@@ -14555,7 +16507,8 @@ impl WorkflowStore {
         if values.is_empty() {
             return Ok(bulk_reducer_default_summary_value(reducer));
         }
-        bulk_reducer_reduce_values(reducer, &values).context("failed to reduce workflow bulk batch outputs")
+        bulk_reducer_reduce_values(reducer, &values)
+            .context("failed to reduce workflow bulk batch outputs")
     }
 
     fn decode_bulk_batch_row(row: sqlx::postgres::PgRow) -> Result<WorkflowBulkBatchRecord> {
@@ -14714,18 +16667,12 @@ impl WorkflowStore {
             command_published_at: row
                 .try_get("command_published_at")
                 .context("throughput run command_published_at missing")?,
-            started_at: row
-                .try_get("started_at")
-                .context("throughput run started_at missing")?,
+            started_at: row.try_get("started_at").context("throughput run started_at missing")?,
             terminal_at: row
                 .try_get("terminal_at")
                 .context("throughput run terminal_at missing")?,
-            created_at: row
-                .try_get("created_at")
-                .context("throughput run created_at missing")?,
-            updated_at: row
-                .try_get("updated_at")
-                .context("throughput run updated_at missing")?,
+            created_at: row.try_get("created_at").context("throughput run created_at missing")?,
+            updated_at: row.try_get("updated_at").context("throughput run updated_at missing")?,
         })
     }
 
@@ -14758,21 +16705,13 @@ impl WorkflowStore {
         row: sqlx::postgres::PgRow,
     ) -> Result<ThroughputTerminalRecord> {
         Ok(ThroughputTerminalRecord {
-            tenant_id: row
-                .try_get("tenant_id")
-                .context("throughput terminal tenant_id missing")?,
+            tenant_id: row.try_get("tenant_id").context("throughput terminal tenant_id missing")?,
             instance_id: row
                 .try_get("workflow_instance_id")
                 .context("throughput terminal workflow_instance_id missing")?,
-            run_id: row
-                .try_get("run_id")
-                .context("throughput terminal run_id missing")?,
-            batch_id: row
-                .try_get("batch_id")
-                .context("throughput terminal batch_id missing")?,
-            status: row
-                .try_get("status")
-                .context("throughput terminal status missing")?,
+            run_id: row.try_get("run_id").context("throughput terminal run_id missing")?,
+            batch_id: row.try_get("batch_id").context("throughput terminal batch_id missing")?,
+            status: row.try_get("status").context("throughput terminal status missing")?,
             terminal_at: row
                 .try_get("terminal_at")
                 .context("throughput terminal terminal_at missing")?,
@@ -16538,9 +18477,7 @@ mod tests {
                 worker_id: "worker-a".to_owned(),
                 worker_build_id: "build-a".to_owned(),
                 occurred_at: Utc::now(),
-                payload: BulkChunkTerminalPayload::Failed {
-                    error: "boom".to_owned(),
-                },
+                payload: BulkChunkTerminalPayload::Failed { error: "boom".to_owned() },
             })
             .await?;
 
@@ -17531,9 +19468,8 @@ mod tests {
             .await?
             .context("throughput run input should exist")?;
         assert_eq!(stored_input.items.len(), 2);
-        let unpublished = store
-            .list_unpublished_scheduled_throughput_runs_for_backend("stream-v2", 10)
-            .await?;
+        let unpublished =
+            store.list_unpublished_scheduled_throughput_runs_for_backend("stream-v2", 10).await?;
         assert_eq!(unpublished.len(), 1);
         assert_eq!(unpublished[0].batch_id, "batch-a");
         assert!(
@@ -17581,10 +19517,7 @@ mod tests {
         assert!(stored.started_at.is_some());
         assert!(stored.terminal_at.is_some());
         assert!(
-            store
-                .list_nonterminal_throughput_runs_for_backend("stream-v2", 10)
-                .await?
-                .is_empty()
+            store.list_nonterminal_throughput_runs_for_backend("stream-v2", 10).await?.is_empty()
         );
 
         Ok(())
@@ -17618,17 +19551,18 @@ mod tests {
                 output: Some(vec![json!({"value": 1})]),
             },
         };
-        store
-            .append_throughput_report_log_entries(std::slice::from_ref(&report), now)
-            .await?;
-        store
-            .append_throughput_report_log_entries(std::slice::from_ref(&report), now)
-            .await?;
+        store.append_throughput_report_log_entries(std::slice::from_ref(&report), now).await?;
+        store.append_throughput_report_log_entries(std::slice::from_ref(&report), now).await?;
 
         let entries = store.list_throughput_report_log_since(None, 10).await?;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].report, report);
         assert_eq!(entries[0].captured_at, now);
+        let batch_entries = store
+            .list_throughput_report_log_for_batch("tenant-a", "instance-a", "run-a", "batch-a")
+            .await?;
+        assert_eq!(batch_entries.len(), 1);
+        assert_eq!(batch_entries[0].report, report);
 
         assert_eq!(
             store
@@ -17636,10 +19570,7 @@ mod tests {
                 .await?,
             0
         );
-        assert_eq!(
-            store.delete_throughput_report_log_through(now).await?,
-            1
-        );
+        assert_eq!(store.delete_throughput_report_log_through(now).await?, 1);
         assert!(store.list_throughput_report_log_since(None, 10).await?.is_empty());
 
         Ok(())
@@ -17659,34 +19590,34 @@ mod tests {
             partition_key: "batch-a:0".to_owned(),
             payload: fabrik_throughput::ThroughputCommand::StartThroughputRun(
                 fabrik_throughput::StartThroughputRunCommand {
-                dedupe_key: "throughput-start:test-terminal".to_owned(),
-                tenant_id: "tenant-a".to_owned(),
-                definition_id: "demo".to_owned(),
-                definition_version: Some(1),
-                artifact_hash: Some("artifact-a".to_owned()),
-                instance_id: "instance-a".to_owned(),
-                run_id: "run-a".to_owned(),
-                batch_id: "batch-a".to_owned(),
-                activity_type: "benchmark.echo".to_owned(),
-                task_queue: "bulk".to_owned(),
-                state: Some("join".to_owned()),
-                chunk_size: 2,
-                max_attempts: 1,
-                retry_delay_ms: 0,
-                total_items: 2,
-                aggregation_group_count: 1,
-                execution_policy: Some("parallel".to_owned()),
-                reducer: Some("count".to_owned()),
-                throughput_backend: "stream-v2".to_owned(),
-                throughput_backend_version: "2.0.0".to_owned(),
-                routing_reason: "stream_v2_selected".to_owned(),
-                admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
-                input_handle: fabrik_throughput::PayloadHandle::Inline {
-                    key: "bulk-input:batch-a".to_owned(),
-                },
-                result_handle: fabrik_throughput::PayloadHandle::Inline {
-                    key: "bulk-result:batch-a".to_owned(),
-                },
+                    dedupe_key: "throughput-start:test-terminal".to_owned(),
+                    tenant_id: "tenant-a".to_owned(),
+                    definition_id: "demo".to_owned(),
+                    definition_version: Some(1),
+                    artifact_hash: Some("artifact-a".to_owned()),
+                    instance_id: "instance-a".to_owned(),
+                    run_id: "run-a".to_owned(),
+                    batch_id: "batch-a".to_owned(),
+                    activity_type: "benchmark.echo".to_owned(),
+                    task_queue: "bulk".to_owned(),
+                    state: Some("join".to_owned()),
+                    chunk_size: 2,
+                    max_attempts: 1,
+                    retry_delay_ms: 0,
+                    total_items: 2,
+                    aggregation_group_count: 1,
+                    execution_policy: Some("parallel".to_owned()),
+                    reducer: Some("count".to_owned()),
+                    throughput_backend: "stream-v2".to_owned(),
+                    throughput_backend_version: "2.0.0".to_owned(),
+                    routing_reason: "stream_v2_selected".to_owned(),
+                    admission_policy_version: ADMISSION_POLICY_VERSION.to_owned(),
+                    input_handle: fabrik_throughput::PayloadHandle::Inline {
+                        key: "bulk-input:batch-a".to_owned(),
+                    },
+                    result_handle: fabrik_throughput::PayloadHandle::Inline {
+                        key: "bulk-result:batch-a".to_owned(),
+                    },
                 },
             ),
         };
@@ -17755,7 +19686,8 @@ mod tests {
         let mut duplicate_envelope = terminal.terminal_event.clone();
         duplicate_envelope.event_id = Uuid::now_v7();
         duplicate_envelope.occurred_at += chrono::Duration::milliseconds(250);
-        duplicate_envelope.dedupe_key = Some("terminal:tenant-a:instance-a:run-a:batch-a:duplicate".to_owned());
+        duplicate_envelope.dedupe_key =
+            Some("terminal:tenant-a:instance-a:run-a:batch-a:duplicate".to_owned());
         let duplicate_terminal = ThroughputTerminalRecord {
             terminal_at: duplicate_envelope.occurred_at,
             terminal_event_id: duplicate_envelope.event_id,
@@ -17987,6 +19919,308 @@ mod tests {
             }
             .event_type()
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn topic_adapter_offsets_and_dead_letters_are_queryable() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+
+        let adapter = store
+            .upsert_topic_adapter(&TopicAdapterUpsert {
+                tenant_id: "tenant-a".to_owned(),
+                adapter_id: "orders".to_owned(),
+                adapter_kind: TopicAdapterKind::Redpanda,
+                brokers: "127.0.0.1:9092".to_owned(),
+                topic_name: "orders.events".to_owned(),
+                topic_partitions: 3,
+                action: TopicAdapterAction::StartWorkflow,
+                definition_id: Some("order-workflow".to_owned()),
+                signal_type: None,
+                workflow_task_queue: Some("orders".to_owned()),
+                workflow_instance_id_json_pointer: None,
+                payload_json_pointer: Some("/payload".to_owned()),
+                payload_template_json: Some(json!({
+                    "order": {"$from": "/payload"},
+                    "request": {"$from": "/request_id"}
+                })),
+                memo_json_pointer: Some("/memo".to_owned()),
+                memo_template_json: Some(json!({
+                    "sample": {"$from": "/memo", "$optional": true}
+                })),
+                search_attributes_json_pointer: Some("/search".to_owned()),
+                search_attributes_template_json: Some(json!({
+                    "customer_id": {"$from": "/search/customer_id", "$optional": true}
+                })),
+                request_id_json_pointer: Some("/request_id".to_owned()),
+                dedupe_key_json_pointer: None,
+                dead_letter_policy: TopicAdapterDeadLetterPolicy::Store,
+                is_paused: false,
+            })
+            .await?;
+        assert_eq!(adapter.action, TopicAdapterAction::StartWorkflow);
+
+        store.record_topic_adapter_success("tenant-a", "orders", 0, 41, Utc::now()).await?;
+        store
+            .record_topic_adapter_dead_letter(
+                "tenant-a",
+                "orders",
+                1,
+                9,
+                Some("order-9"),
+                &json!({"bad": true}),
+                "workflow definition missing",
+                Utc::now(),
+            )
+            .await?;
+
+        let loaded =
+            store.get_topic_adapter("tenant-a", "orders").await?.context("adapter missing")?;
+        assert_eq!(loaded.processed_count, 1);
+        assert_eq!(loaded.failed_count, 1);
+        assert_eq!(loaded.last_error.as_deref(), Some("workflow definition missing"));
+        assert_eq!(
+            loaded.payload_template_json,
+            Some(json!({
+                "order": {"$from": "/payload"},
+                "request": {"$from": "/request_id"}
+            }))
+        );
+        assert_eq!(
+            loaded.memo_template_json,
+            Some(json!({"sample": {"$from": "/memo", "$optional": true}}))
+        );
+        assert_eq!(
+            loaded.search_attributes_template_json,
+            Some(json!({"customer_id": {"$from": "/search/customer_id", "$optional": true}}))
+        );
+
+        let offsets = store.load_topic_adapter_offsets("tenant-a", "orders").await?;
+        assert_eq!(offsets.len(), 2);
+        assert_eq!(offsets[0].partition_id, 0);
+        assert_eq!(offsets[0].log_offset, 41);
+        assert_eq!(offsets[1].partition_id, 1);
+        assert_eq!(offsets[1].log_offset, 9);
+
+        let dead_letters =
+            store.list_topic_adapter_dead_letters("tenant-a", "orders", 10, 0).await?;
+        assert_eq!(dead_letters.len(), 1);
+        assert_eq!(dead_letters[0].record_key.as_deref(), Some("order-9"));
+        assert_eq!(dead_letters[0].payload, json!({"bad": true}));
+
+        let paused = store
+            .set_topic_adapter_paused("tenant-a", "orders", true)
+            .await?
+            .context("adapter missing after pause")?;
+        assert!(paused.is_paused);
+
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_topic_adapter_dispatch_applies_templates_and_diagnostics() -> Result<()> {
+        let adapter = TopicAdapterRecord {
+            tenant_id: "tenant-a".to_owned(),
+            adapter_id: "orders".to_owned(),
+            adapter_kind: TopicAdapterKind::Redpanda,
+            brokers: "127.0.0.1:9092".to_owned(),
+            topic_name: "orders.events".to_owned(),
+            topic_partitions: 1,
+            action: TopicAdapterAction::StartWorkflow,
+            definition_id: Some("order-workflow".to_owned()),
+            signal_type: None,
+            workflow_task_queue: Some("orders".to_owned()),
+            workflow_instance_id_json_pointer: Some("/instance_id".to_owned()),
+            payload_json_pointer: None,
+            payload_template_json: Some(json!({
+                "order_id": {"$from": "/payload/id"},
+                "amount": {"$from": "/payload/amount"},
+                "note": {"$from": "/note", "$optional": true}
+            })),
+            memo_json_pointer: None,
+            memo_template_json: Some(json!({
+                "source": "topic",
+                "raw_key": {"$from": "/instance_id"}
+            })),
+            search_attributes_json_pointer: None,
+            search_attributes_template_json: Some(json!({
+                "customer": {"$from": "/search/customer"}
+            })),
+            request_id_json_pointer: Some("/request_id".to_owned()),
+            dedupe_key_json_pointer: None,
+            dead_letter_policy: TopicAdapterDeadLetterPolicy::Store,
+            is_paused: false,
+            processed_count: 0,
+            failed_count: 0,
+            ownership_handoff_count: 0,
+            last_processed_at: None,
+            last_handoff_at: None,
+            last_takeover_latency_ms: None,
+            last_error: None,
+            last_error_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let preview = resolve_topic_adapter_dispatch(
+            &adapter,
+            &json!({
+                "instance_id": "order-42",
+                "payload": {"id": "order-42", "amount": 125},
+                "search": {"customer": "cust-9"},
+                "request_id": "req-42"
+            }),
+            0,
+            12,
+        )?;
+        match preview.dispatch {
+            TopicAdapterResolvedDispatch::StartWorkflow(request) => {
+                assert_eq!(request.definition_id, "order-workflow");
+                assert_eq!(request.instance_id.as_deref(), Some("order-42"));
+                assert_eq!(
+                    request.input,
+                    json!({"order_id": "order-42", "amount": 125})
+                );
+                assert_eq!(
+                    request.memo,
+                    Some(json!({"source": "topic", "raw_key": "order-42"}))
+                );
+                assert_eq!(
+                    request.search_attributes,
+                    Some(json!({"customer": "cust-9"}))
+                );
+                assert_eq!(request.request_id, "req-42");
+            }
+            other => panic!("unexpected dispatch {other:?}"),
+        }
+        assert!(preview.diagnostics.iter().any(|entry| entry.field == "input" && entry.mode == "template"));
+        assert!(preview
+            .diagnostics
+            .iter()
+            .any(|entry| entry.field == "request_id" && entry.mode == "pointer"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn topic_adapter_ownership_handoffs_after_lease_expiry_and_fences_stale_commit()
+    -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+
+        store
+            .upsert_topic_adapter(&TopicAdapterUpsert {
+                tenant_id: "tenant-a".to_owned(),
+                adapter_id: "orders".to_owned(),
+                adapter_kind: TopicAdapterKind::Redpanda,
+                brokers: "127.0.0.1:9092".to_owned(),
+                topic_name: "orders.events".to_owned(),
+                topic_partitions: 1,
+                action: TopicAdapterAction::StartWorkflow,
+                definition_id: Some("order-workflow".to_owned()),
+                signal_type: None,
+                workflow_task_queue: Some("orders".to_owned()),
+                workflow_instance_id_json_pointer: None,
+                payload_json_pointer: Some("/payload".to_owned()),
+                payload_template_json: None,
+                memo_json_pointer: None,
+                memo_template_json: None,
+                search_attributes_json_pointer: None,
+                search_attributes_template_json: None,
+                request_id_json_pointer: None,
+                dedupe_key_json_pointer: None,
+                dead_letter_policy: TopicAdapterDeadLetterPolicy::Store,
+                is_paused: false,
+            })
+            .await?;
+
+        let initial = store
+            .claim_topic_adapter_ownership("tenant-a", "orders", "ingest-a", StdDuration::from_millis(150))
+            .await?
+            .context("initial adapter owner should claim adapter")?;
+        assert_eq!(initial.owner_epoch, 1);
+        assert!(store.validate_topic_adapter_ownership("tenant-a", "orders", "ingest-a", 1).await?);
+
+        assert!(
+            store
+                .claim_topic_adapter_ownership(
+                    "tenant-a",
+                    "orders",
+                    "ingest-b",
+                    StdDuration::from_secs(1),
+                )
+                .await?
+                .is_none()
+        );
+
+        sleep(StdDuration::from_millis(250)).await;
+
+        let handoff = store
+            .claim_topic_adapter_ownership("tenant-a", "orders", "ingest-b", StdDuration::from_secs(1))
+            .await?
+            .context("new owner should claim expired adapter lease")?;
+        assert_eq!(handoff.owner_epoch, 2);
+        assert!(!store.validate_topic_adapter_ownership("tenant-a", "orders", "ingest-a", 1).await?);
+        assert!(store.validate_topic_adapter_ownership("tenant-a", "orders", "ingest-b", 2).await?);
+
+        assert!(
+            !store
+                .record_topic_adapter_success_if_owned(
+                    "tenant-a",
+                    "orders",
+                    0,
+                    7,
+                    Utc::now(),
+                    "ingest-a",
+                    1,
+                )
+                .await?
+        );
+        let adapter = store
+            .get_topic_adapter("tenant-a", "orders")
+            .await?
+            .context("adapter missing after stale commit")?;
+        assert_eq!(adapter.processed_count, 0);
+
+        assert!(
+            store
+                .record_topic_adapter_success_if_owned(
+                    "tenant-a",
+                    "orders",
+                    0,
+                    7,
+                    Utc::now(),
+                    "ingest-b",
+                    2,
+                )
+                .await?
+        );
+        assert!(
+            !store
+                .record_topic_adapter_success_if_owned(
+                    "tenant-a",
+                    "orders",
+                    0,
+                    7,
+                    Utc::now(),
+                    "ingest-b",
+                    2,
+                )
+                .await?
+        );
+        let updated = store
+            .get_topic_adapter("tenant-a", "orders")
+            .await?
+            .context("adapter missing after owned commit")?;
+        assert_eq!(updated.processed_count, 1);
+        assert_eq!(updated.ownership_handoff_count, 1);
+        assert!(updated.last_handoff_at.is_some());
+        assert!(updated.last_takeover_latency_ms.is_some());
+        assert_eq!(store.load_topic_adapter_offsets("tenant-a", "orders").await?[0].log_offset, 7);
 
         Ok(())
     }

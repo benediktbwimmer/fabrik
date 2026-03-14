@@ -721,6 +721,133 @@ function maybeImportedModulePath(sourceFile, localName) {
   return null;
 }
 
+function isTestSupportFile(relativeFile) {
+  const normalized = relativeFile.replaceAll("\\", "/");
+  if (normalized.includes("/test/") || normalized.includes("/tests/") || normalized.includes("/__tests__/")) {
+    return true;
+  }
+  const fileName = normalized.split("/").at(-1) ?? normalized;
+  return fileName.includes(".test.") || fileName.includes(".spec.");
+}
+
+function transpileExpressionToJavaScript(expressionText) {
+  const result = ts
+    .transpileModule(`export default (${expressionText});`, {
+      compilerOptions: {
+        module: ts.ModuleKind.ES2020,
+        target: ts.ScriptTarget.ES2020,
+      },
+    })
+    .outputText.trim();
+  const prefix = "export default ";
+  if (!result.startsWith(prefix)) {
+    return null;
+  }
+  return result.slice(prefix.length).replace(/;\s*$/, "");
+}
+
+function staticBootstrapArgExpression(node, currentBindings, checker) {
+  if (!node) {
+    return null;
+  }
+  const resolved = resolveStaticExpression(node, currentBindings, checker) ?? node;
+  if (
+    ts.isStringLiteralLike(resolved) ||
+    ts.isNumericLiteral(resolved) ||
+    resolved.kind === ts.SyntaxKind.TrueKeyword ||
+    resolved.kind === ts.SyntaxKind.FalseKeyword ||
+    resolved.kind === ts.SyntaxKind.NullKeyword ||
+    ts.isArrayLiteralExpression(resolved) ||
+    ts.isObjectLiteralExpression(resolved)
+  ) {
+    return transpileExpressionToJavaScript(resolved.getText(resolved.getSourceFile()));
+  }
+  if (ts.isIdentifier(resolved)) {
+    const binding = currentBindings.get(resolved.text);
+    if (binding?.initializer) {
+      return staticBootstrapArgExpression(binding.initializer, currentBindings, checker);
+    }
+  }
+  return null;
+}
+
+function analyzeActivitiesRegistration(sourceFile, activitiesProperty, currentBindings, checker) {
+  if (
+    ts.isPropertyAssignment(activitiesProperty) &&
+    ts.isIdentifier(activitiesProperty.initializer)
+  ) {
+    const activitiesReference = activitiesProperty.initializer.text;
+    return {
+      supported: true,
+      activities_reference: activitiesReference,
+      activity_module: maybeImportedModulePath(sourceFile, activitiesReference),
+      activity_factory_export: null,
+      activity_factory_args_js: [],
+    };
+  }
+  if (ts.isShorthandPropertyAssignment(activitiesProperty)) {
+    const activitiesReference = activitiesProperty.name.text;
+    return {
+      supported: true,
+      activities_reference: activitiesReference,
+      activity_module: maybeImportedModulePath(sourceFile, activitiesReference),
+      activity_factory_export: null,
+      activity_factory_args_js: [],
+    };
+  }
+  if (
+    ts.isPropertyAssignment(activitiesProperty) &&
+    ts.isObjectLiteralExpression(activitiesProperty.initializer)
+  ) {
+    return {
+      supported: true,
+      activities_reference: "inline-object",
+      activity_module: null,
+      activity_factory_export: null,
+      activity_factory_args_js: [],
+    };
+  }
+  if (
+    ts.isPropertyAssignment(activitiesProperty) &&
+    ts.isCallExpression(activitiesProperty.initializer)
+  ) {
+    const call = activitiesProperty.initializer;
+    let modulePath = null;
+    let factoryExport = null;
+    if (ts.isIdentifier(call.expression)) {
+      modulePath = maybeImportedModulePath(sourceFile, call.expression.text);
+      factoryExport = call.expression.text;
+    } else if (
+      ts.isPropertyAccessExpression(call.expression) &&
+      ts.isIdentifier(call.expression.expression)
+    ) {
+      modulePath = maybeImportedModulePath(sourceFile, call.expression.expression.text);
+      factoryExport = call.expression.name.text;
+    }
+    if (modulePath && factoryExport) {
+      const argsJs = [];
+      let requiresRuntimeHelper = false;
+      for (const argument of call.arguments) {
+        const rendered = staticBootstrapArgExpression(argument, currentBindings, checker);
+        if (rendered == null) {
+          requiresRuntimeHelper = true;
+          break;
+        }
+        argsJs.push(rendered);
+      }
+      return {
+        supported: true,
+        activities_reference: factoryExport,
+        activity_module: modulePath,
+        activity_factory_export: factoryExport,
+        activity_factory_args_js: argsJs,
+        activity_runtime_helper: requiresRuntimeHelper,
+      };
+    }
+  }
+  return { supported: false };
+}
+
 function resolveProjectModulePath(projectRoot, fromFileName, specifier) {
   const compilerOptions = parseCompilerOptionsForFile(projectRoot, fromFileName);
   const resolved = ts.resolveModuleName(specifier, fromFileName, compilerOptions, ts.sys).resolvedModule;
@@ -1240,21 +1367,6 @@ async function main() {
               : taskQueueProperty && ts.isShorthandPropertyAssignment(taskQueueProperty)
                 ? findStaticString(taskQueueProperty.name, currentBindings, checker)
                 : null;
-          if (taskQueueProperty && taskQueue == null) {
-            findings.push(
-              createFinding(
-                projectRoot,
-                "hard_block",
-                "dynamic_task_queue",
-                "worker_bootstrap_patterns",
-                taskQueueProperty,
-                "Worker taskQueue must be a static string literal",
-                "use a static taskQueue string in Worker.create",
-                "taskQueue",
-              ),
-            );
-          }
-
           const workflowsPath =
             workflowsPathProperty && ts.isPropertyAssignment(workflowsPathProperty)
               ? findStaticString(workflowsPathProperty.initializer, currentBindings, checker)
@@ -1338,21 +1450,22 @@ async function main() {
 
           let activitiesReference = null;
           let activityModule = null;
+          let activityFactoryExport = null;
+          let activityFactoryArgsJs = [];
+          let activityRuntimeHelper = false;
           if (activitiesProperty) {
-            if (
-              ts.isPropertyAssignment(activitiesProperty) &&
-              ts.isIdentifier(activitiesProperty.initializer)
-            ) {
-              activitiesReference = activitiesProperty.initializer.text;
-              activityModule = maybeImportedModulePath(sourceFile, activitiesReference);
-            } else if (ts.isShorthandPropertyAssignment(activitiesProperty)) {
-              activitiesReference = activitiesProperty.name.text;
-              activityModule = maybeImportedModulePath(sourceFile, activitiesReference);
-            } else if (
-              ts.isPropertyAssignment(activitiesProperty) &&
-              ts.isObjectLiteralExpression(activitiesProperty.initializer)
-            ) {
-              activitiesReference = "inline-object";
+            const activityRegistration = analyzeActivitiesRegistration(
+              sourceFile,
+              activitiesProperty,
+              currentBindings,
+              checker,
+            );
+            if (activityRegistration.supported) {
+              activitiesReference = activityRegistration.activities_reference;
+              activityModule = activityRegistration.activity_module;
+              activityFactoryExport = activityRegistration.activity_factory_export;
+              activityFactoryArgsJs = activityRegistration.activity_factory_args_js;
+              activityRuntimeHelper = activityRegistration.activity_runtime_helper ?? false;
             } else {
               findings.push(
                 createFinding(
@@ -1379,9 +1492,13 @@ async function main() {
             workflows_path: workflowsPath,
             activities_reference: activitiesReference,
             activity_module: activityModule,
+            activity_factory_export: activityFactoryExport,
+            activity_factory_args_js: activityFactoryArgsJs,
+            activity_runtime_helper: activityRuntimeHelper,
             data_converter_mode: dataConverterMode,
             payload_converter_module: payloadConverterModule,
             bootstrap_pattern: "worker_create_static",
+            worker_index: workers.filter((worker) => worker.file === relativeFile).length + 1,
             uses: [...fileUses].sort(),
           });
         }
@@ -1463,6 +1580,23 @@ async function main() {
   }
 
   findings = dedupeFindings(findings);
+  const hasNonTestWorker = workers.some((worker) => !isTestSupportFile(worker.file));
+  if (hasNonTestWorker) {
+    findings = findings.map((finding) => {
+      if (
+        finding.severity === "hard_block" &&
+        finding.feature === "worker_bootstrap_patterns" &&
+        isTestSupportFile(finding.file)
+      ) {
+        return {
+          ...finding,
+          severity: "warning",
+          remediation: "ignore test-only worker bootstrap findings while migrating the production worker entrypoint",
+        };
+      }
+      return finding;
+    });
+  }
   const hardBlockCount = findings.filter((finding) => finding.severity === "hard_block").length;
   const warningCount = findings.filter((finding) => finding.severity === "warning").length;
   const infoCount = findings.filter((finding) => finding.severity === "info").length;
