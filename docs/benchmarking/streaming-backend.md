@@ -2,6 +2,8 @@
 
 Use `benchmark-runner` to compare the durable engine, `pg-v1`, and `stream-v2` under the same workload.
 
+For the current benchmark-backed product envelope and workload-shape guidance, see [streaming-performance-envelope.md](streaming-performance-envelope.md).
+
 ## Turnkey isolated run
 
 Use the isolated harness when you want trustworthy numbers without reusing your normal local service processes:
@@ -103,32 +105,16 @@ cargo run -p benchmark-runner -- \
 
 For `stream-v2`, nonzero `grouped_batch_rows` and `max_aggregation_group_count > 1` show that hierarchical aggregation was enabled during the run.
 
-## Experimental fast lane status
+## Current Status
 
-The current `stream-v2` fast lane should still be treated as experimental.
+The streaming path is now broader than the original fast-lane experiment:
 
-What changed in the benchmark harness:
+- mergeable reducers now include `sum`, `min`, `max`, `avg`, and `histogram`
+- topic adapters provide a durable ingress path into streaming workloads
+- failover now has dedicated benchmark suites for both `stream-v2` and topic-adapter ownership handoff
+- the console exposes a unified streaming operations view
 
-- owner-first benchmark runs now skip the throughput changelog restore/consumer path inside `throughput-runtime`
-- the isolated harness now waits for Redpanda topics to report the requested partition counts before services start
-- `/debug/throughput` now exposes tree-specific counters so runs can distinguish leaf, parent, and root group terminalization
+The benchmark story should therefore be read in two layers:
 
-What the latest controlled runs showed:
-
-- on a forced 2-level grouped workload (`25` workflows, `4096` activities/workflow, `chunk_size=8`), `count` improved throughput by about `2.8%`
-- on a forced 3-level grouped workload (`10` workflows, `4096` activities/workflow, `chunk_size=4`), `count` improved throughput by about `1.3%`
-- the fast lane now emits visible hierarchy counters in debug output:
-  - 2-level case: leaf groups plus root groups
-  - 3-level case: leaf groups, parent groups, and root groups
-
-Why this is still experimental:
-
-- the measured gain is real but small
-- it is still far below the original success gate for the milestone
-- some ownership-renewal warning noise remains during long runs, so small deltas should still be treated cautiously
-
-Recommended use:
-
-- keep the fast lane behind an experiment flag or branch
-- use the isolated benchmark harness for evaluation
-- rely on `batch_tree_depth_counts`, `group_level_counts`, and the runtime terminal counters when judging whether a run actually exercised the intended tree shape
+- this document explains how to run the benchmark harness
+- [streaming-performance-envelope.md](streaming-performance-envelope.md) captures the current benchmark-backed product guidance

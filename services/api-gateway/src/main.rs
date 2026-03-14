@@ -469,6 +469,10 @@ fn build_app(state: AppState, service_name: String) -> Router {
         get(list_topic_adapter_dead_letters),
     )
     .route(
+        "/admin/tenants/{tenant_id}/topic-adapters/{adapter_id}/dead-letters/{partition_id}/{log_offset}/replay",
+        post(replay_topic_adapter_dead_letter),
+    )
+    .route(
         "/admin/tenants/{tenant_id}/topic-adapters/{adapter_id}/preview",
         post(preview_topic_adapter),
     )
@@ -1671,18 +1675,10 @@ async fn delete_topic_adapter(
     let lag = topic_adapter_lag_snapshot(&adapter, &offsets).await;
     let now = Utc::now();
     let force = query.force.unwrap_or(false);
-    let ownership_active = ownership
-        .as_ref()
-        .is_some_and(|record| record.lease_expires_at > now);
-    let lag_total = lag
-        .get("total_lag_records")
-        .and_then(Value::as_i64)
-        .unwrap_or_default();
-    let lag_blocked = lag
-        .get("available")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        && lag_total > 0;
+    let ownership_active = ownership.as_ref().is_some_and(|record| record.lease_expires_at > now);
+    let lag_total = lag.get("total_lag_records").and_then(Value::as_i64).unwrap_or_default();
+    let lag_blocked =
+        lag.get("available").and_then(Value::as_bool).unwrap_or(false) && lag_total > 0;
     if !force && (ownership_active || lag_blocked) {
         let mut blockers = Vec::new();
         if ownership_active {
@@ -1705,11 +1701,8 @@ async fn delete_topic_adapter(
             ),
         ));
     }
-    let deleted = state
-        .store
-        .delete_topic_adapter(&tenant_id, &adapter_id)
-        .await
-        .map_err(internal_error)?;
+    let deleted =
+        state.store.delete_topic_adapter(&tenant_id, &adapter_id).await.map_err(internal_error)?;
     Ok(Json(json!({
         "tenant_id": tenant_id,
         "adapter_id": adapter_id,
@@ -1757,6 +1750,13 @@ async fn list_topic_adapter_dead_letters(
     })))
 }
 
+async fn replay_topic_adapter_dead_letter(
+    State(state): State<AppState>,
+    uri: OriginalUri,
+) -> Result<(StatusCode, Bytes), (StatusCode, String)> {
+    proxy_post_path(state.client.clone(), state.ingest_base.clone(), uri.0.path()).await
+}
+
 async fn preview_topic_adapter(
     Path((tenant_id, adapter_id)): Path<(String, String)>,
     State(state): State<AppState>,
@@ -1774,7 +1774,10 @@ async fn preview_topic_adapter(
             )
         })?;
     let response = match resolve_topic_adapter_dispatch_detailed(
-        &adapter, &request.payload, request.partition_id, request.log_offset,
+        &adapter,
+        &request.payload,
+        request.partition_id,
+        request.log_offset,
     ) {
         Ok(preview) => json!({
             "ok": true,
@@ -1818,11 +1821,8 @@ async fn preview_topic_adapter_draft(
             "error": error,
         })));
     }
-    let adapter_id = request
-        .adapter_id
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .unwrap_or("draft");
+    let adapter_id =
+        request.adapter_id.as_deref().filter(|value| !value.is_empty()).unwrap_or("draft");
     let adapter = topic_adapter_request_to_record(&tenant_id, adapter_id, request.adapter);
     let response = match resolve_topic_adapter_dispatch_detailed(
         &adapter,
@@ -1860,23 +1860,24 @@ async fn watch_topic_adapter(
         loop {
             let adapter = state.store.get_topic_adapter(&tenant_id, &adapter_id).await;
             if let Ok(Some(adapter)) = adapter {
-                let offsets = match state.store.load_topic_adapter_offsets(&tenant_id, &adapter_id).await {
-                    Ok(offsets) => offsets,
-                    Err(error) => {
-                        let _ = send_watch_event(
-                            &tx,
-                            "adapter_runtime_error",
-                            "eventual",
-                            "projection",
-                            None,
-                            Utc::now().to_rfc3339(),
-                            json!({ "error": error.to_string() }),
-                        )
-                        .await;
-                        interval.tick().await;
-                        continue;
-                    }
-                };
+                let offsets =
+                    match state.store.load_topic_adapter_offsets(&tenant_id, &adapter_id).await {
+                        Ok(offsets) => offsets,
+                        Err(error) => {
+                            let _ = send_watch_event(
+                                &tx,
+                                "adapter_runtime_error",
+                                "eventual",
+                                "projection",
+                                None,
+                                Utc::now().to_rfc3339(),
+                                json!({ "error": error.to_string() }),
+                            )
+                            .await;
+                            interval.tick().await;
+                            continue;
+                        }
+                    };
                 let dead_letters = match state
                     .store
                     .list_topic_adapter_dead_letters(&tenant_id, &adapter_id, 1, 0)
@@ -1898,23 +1899,24 @@ async fn watch_topic_adapter(
                         continue;
                     }
                 };
-                let ownership = match state.store.get_topic_adapter_ownership(&tenant_id, &adapter_id).await {
-                    Ok(ownership) => ownership,
-                    Err(error) => {
-                        let _ = send_watch_event(
-                            &tx,
-                            "adapter_runtime_error",
-                            "eventual",
-                            "projection",
-                            None,
-                            Utc::now().to_rfc3339(),
-                            json!({ "error": error.to_string() }),
-                        )
-                        .await;
-                        interval.tick().await;
-                        continue;
-                    }
-                };
+                let ownership =
+                    match state.store.get_topic_adapter_ownership(&tenant_id, &adapter_id).await {
+                        Ok(ownership) => ownership,
+                        Err(error) => {
+                            let _ = send_watch_event(
+                                &tx,
+                                "adapter_runtime_error",
+                                "eventual",
+                                "projection",
+                                None,
+                                Utc::now().to_rfc3339(),
+                                json!({ "error": error.to_string() }),
+                            )
+                            .await;
+                            interval.tick().await;
+                            continue;
+                        }
+                    };
                 let lag = topic_adapter_lag_snapshot(&adapter, &offsets).await;
 
                 let cursor = Utc::now().to_rfc3339();
@@ -2068,6 +2070,25 @@ async fn proxy_get_path(
     let url = format!("{base_url}{path}");
     let response = client
         .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("failed to proxy request to {url}"))
+        .map_err(internal_error)?;
+    let status = StatusCode::from_u16(response.status().as_u16())
+        .map_err(|error| internal_error(anyhow::anyhow!(error.to_string())))?;
+    let bytes =
+        response.bytes().await.map_err(|error| internal_error(anyhow::Error::from(error)))?;
+    Ok((status, bytes))
+}
+
+async fn proxy_post_path(
+    client: Client,
+    base_url: String,
+    path: &str,
+) -> Result<(StatusCode, Bytes), (StatusCode, String)> {
+    let url = format!("{base_url}{path}");
+    let response = client
+        .post(&url)
         .send()
         .await
         .with_context(|| format!("failed to proxy request to {url}"))
@@ -2731,10 +2752,40 @@ mod tests {
             return Ok(());
         };
         let store = postgres.connect_store().await?;
+        let ingest = TestHttpServer::start(Router::new().route(
+            "/admin/tenants/tenant-a/topic-adapters/orders/dead-letters/1/7/replay",
+            post(|| async {
+                Json(json!({
+                    "tenant_id": "tenant-a",
+                    "adapter_id": "orders",
+                    "partition_id": 1,
+                    "log_offset": 7,
+                    "replayed": true,
+                    "status": "replayed",
+                    "dead_letter": {
+                        "tenant_id": "tenant-a",
+                        "adapter_id": "orders",
+                        "partition_id": 1,
+                        "log_offset": 7,
+                        "record_key": "order-7",
+                        "payload": {"bad": true},
+                        "error": "400: missing required field input",
+                        "replay_count": 1,
+                        "last_replay_at": "2026-03-14T00:00:00Z",
+                        "last_replay_error": null,
+                        "resolved_at": "2026-03-14T00:00:00Z",
+                        "occurred_at": "2026-03-14T00:00:00Z",
+                        "updated_at": "2026-03-14T00:00:00Z"
+                    }
+                }))
+                .into_response()
+            }),
+        ))
+        .await?;
         let app = build_app(
             AppState {
                 client: Client::new(),
-                ingest_base: "http://127.0.0.1:1".to_owned(),
+                ingest_base: ingest.base_url.clone(),
                 query_base: "http://127.0.0.1:1".to_owned(),
                 matching_base: "http://127.0.0.1:1".to_owned(),
                 store: store.clone(),
@@ -2837,9 +2888,9 @@ mod tests {
         assert_eq!(preview_json["dispatch"]["action"], "start_workflow");
         assert_eq!(preview_json["dispatch"]["input"]["order"]["amount"], 125);
         assert_eq!(preview_json["dispatch"]["request_id"], "req-42");
-        assert!(preview_json["diagnostics"].as_array().is_some_and(|diagnostics| diagnostics
-            .iter()
-            .any(|entry| entry["field"] == "input" && entry["mode"] == "template")));
+        assert!(preview_json["diagnostics"].as_array().is_some_and(|diagnostics| {
+            diagnostics.iter().any(|entry| entry["field"] == "input" && entry["mode"] == "template")
+        }));
 
         let failing_preview_response = app
             .clone()
@@ -2857,15 +2908,10 @@ mod tests {
             to_bytes(failing_preview_response.into_body(), usize::MAX).await?;
         let failing_preview_json: Value = serde_json::from_slice(&failing_preview_body)?;
         assert_eq!(failing_preview_json["ok"], false);
-        assert_eq!(
-            failing_preview_json["error"]["field"],
-            "payload_template_json.order"
-        );
-        assert!(failing_preview_json["diagnostics"]
-            .as_array()
-            .is_some_and(|diagnostics| diagnostics
-                .iter()
-                .any(|entry| entry["field"] == "input" && entry["mode"] == "template")));
+        assert_eq!(failing_preview_json["error"]["field"], "payload_template_json.order");
+        assert!(failing_preview_json["diagnostics"].as_array().is_some_and(|diagnostics| {
+            diagnostics.iter().any(|entry| entry["field"] == "input" && entry["mode"] == "template")
+        }));
 
         let invalid_upsert_response = app
             .clone()
@@ -2879,8 +2925,7 @@ mod tests {
             )
             .await?;
         assert_eq!(invalid_upsert_response.status(), StatusCode::BAD_REQUEST);
-        let invalid_upsert_body =
-            to_bytes(invalid_upsert_response.into_body(), usize::MAX).await?;
+        let invalid_upsert_body = to_bytes(invalid_upsert_response.into_body(), usize::MAX).await?;
         let invalid_upsert_text = String::from_utf8(invalid_upsert_body.to_vec())?;
         assert!(invalid_upsert_text.contains("mapping"));
 
@@ -2906,9 +2951,31 @@ mod tests {
         let dead_letters_body = to_bytes(dead_letters_response.into_body(), usize::MAX).await?;
         let dead_letters_json: Value = serde_json::from_slice(&dead_letters_body)?;
         assert_eq!(dead_letters_json["items"][0]["record_key"], "order-7");
+        assert_eq!(dead_letters_json["items"][0]["replay_count"], 0);
+
+        let replay_response = app
+            .clone()
+            .oneshot(
+                Request::post(
+                    "/admin/tenants/tenant-a/topic-adapters/orders/dead-letters/1/7/replay",
+                )
+                .body(Body::empty())
+                .expect("topic adapter dead letter replay request"),
+            )
+            .await?;
+        assert_eq!(replay_response.status(), StatusCode::OK);
+        let replay_body = to_bytes(replay_response.into_body(), usize::MAX).await?;
+        let replay_json: Value = serde_json::from_slice(&replay_body)?;
+        assert_eq!(replay_json["replayed"], true);
+        assert_eq!(replay_json["dead_letter"]["resolved_at"], "2026-03-14T00:00:00Z");
 
         store
-            .claim_topic_adapter_ownership("tenant-a", "orders", "ingest-a", StdDuration::from_secs(30))
+            .claim_topic_adapter_ownership(
+                "tenant-a",
+                "orders",
+                "ingest-a",
+                StdDuration::from_secs(30),
+            )
             .await?;
 
         let blocked_delete_response = app
@@ -2940,10 +3007,10 @@ mod tests {
         assert!(store.get_topic_adapter("tenant-a", "orders").await?.is_none());
         assert!(store.get_topic_adapter_ownership("tenant-a", "orders").await?.is_none());
         assert!(store.load_topic_adapter_offsets("tenant-a", "orders").await?.is_empty());
-        assert!(store
-            .list_topic_adapter_dead_letters("tenant-a", "orders", 10, 0)
-            .await?
-            .is_empty());
+        assert!(
+            store.list_topic_adapter_dead_letters("tenant-a", "orders", 10, 0).await?.is_empty()
+        );
+        ingest.stop().await;
 
         Ok(())
     }

@@ -58,12 +58,16 @@ Use these surfaces:
 - workflow routing
 - replay endpoint
 - task queue inspection
+- topic adapters
+- streaming ops
 
 The operator surfaces should answer three questions directly:
 
 - which definition version and artifact hash the current run is pinned to
 - why the run routed to its current sticky/default build state
 - whether replay used the same pinned artifact/version path after restart or handoff
+
+For the streaming-specific operator workflow, including adapter lag, DLQ replay, queue pressure, and active reducer progress, use [streaming-product-guide.md](streaming-product-guide.md).
 
 ## Replay and Recovery
 

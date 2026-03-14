@@ -91,6 +91,21 @@ This writes:
 - `target/external-repo-qualification/summary.json`
 - `target/external-repo-qualification/summary.md`
 
+Run the internal pressure-repo set with:
+
+```bash
+scripts/run-pressure-repo-qualification.sh
+```
+
+This writes:
+
+- `target/pressure-repo-qualification/summary.json`
+- `target/pressure-repo-qualification/summary.md`
+
+The pressure repos are tracked in:
+
+- [`docs/pressure-repos.md`](/Users/bene/code/fabrik/docs/pressure-repos.md)
+
 Current app-style repo batch:
 
 - `target/external-repo-qualification/app-batch/worker-versioning-replay-demo/migration-report.json`

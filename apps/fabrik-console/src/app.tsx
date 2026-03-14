@@ -6,6 +6,7 @@ import { ConformancePage } from "./pages/conformance-page";
 import { OverviewPage } from "./pages/overview-page";
 import { ReplayPage } from "./pages/replay-page";
 import { RunsPage } from "./pages/runs-page";
+import { StreamingOpsPage } from "./pages/streaming-ops-page";
 import { TaskQueuesPage } from "./pages/task-queues-page";
 import { TopicAdaptersPage } from "./pages/topic-adapters-page";
 import { WorkflowDefinitionDetailPage } from "./pages/workflow-definition-detail-page";
@@ -25,6 +26,7 @@ export function App() {
         <Route path="replay" element={<ReplayPage />} />
         <Route path="builds" element={<BuildsPage />} />
         <Route path="conformance" element={<ConformancePage />} />
+        <Route path="streaming" element={<StreamingOpsPage />} />
         <Route path="task-queues" element={<TaskQueuesPage />} />
         <Route path="topic-adapters" element={<TopicAdaptersPage />} />
       </Route>

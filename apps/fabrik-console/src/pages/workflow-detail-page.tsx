@@ -89,6 +89,15 @@ function metadataPreview(value: unknown) {
     .join(" · ");
 }
 
+function labelFromSnakeCase(value: string | null | undefined) {
+  if (!value) return "-";
+  return value
+    .split("_")
+    .filter(Boolean)
+    .map((segment) => segment[0]?.toUpperCase() + segment.slice(1))
+    .join(" ");
+}
+
 function reducerOutputPreview(value: unknown) {
   if (value == null) return "-";
   if (typeof value === "number" || typeof value === "boolean" || typeof value === "string") {
@@ -579,6 +588,8 @@ export function WorkflowDetailPage() {
                     <div>Definition version {formatInlineValue(routing?.definition_version ?? selectedRun?.definition_version)}</div>
                     <div>Artifact hash {routing?.artifact_hash ?? selectedRun?.artifact_hash ?? "-"}</div>
                     <div>Routing status {routing?.routing_status ?? "-"}</div>
+                    <div>Execution path {labelFromSnakeCase(selectedRun?.execution_path)}</div>
+                    <div>Fast-path fallback {labelFromSnakeCase(selectedRun?.fast_path_rejection_reason)}</div>
                     <div>Default set {routing?.default_compatibility_set_id ?? "-"}</div>
                     <div>Sticky build {routing?.sticky_workflow_build_id ?? selectedRun?.sticky_workflow_build_id ?? "-"}</div>
                     <div>Sticky poller {routing?.sticky_workflow_poller_id ?? selectedRun?.sticky_workflow_poller_id ?? "-"}</div>
@@ -682,10 +693,10 @@ export function WorkflowDetailPage() {
                     source={bulkBatchesQuery.data?.authoritative_source ?? bulkBatchDetailQuery.data?.authoritative_source}
                   />
                 </div>
-                {bulkBatchesQuery.data && bulkBatchesQuery.data.batches.length > 0 ? (
+                {(bulkBatchesQuery.data?.batches?.length ?? 0) > 0 ? (
                   <div className="split">
                     <div className="stack">
-                      {bulkBatchesQuery.data.batches.map((batch) => (
+                      {(bulkBatchesQuery.data?.batches ?? []).map((batch) => (
                         <button
                           key={batch.batch_id}
                           className={`subtle-block ${batch.batch_id === selectedBatchId ? "current" : ""}`}

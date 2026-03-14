@@ -6,6 +6,15 @@ import { api } from "../lib/api";
 import { formatDate, formatNumber } from "../lib/format";
 import { useTenant } from "../lib/tenant-context";
 
+function labelFromSnakeCase(value: string | null | undefined) {
+  if (!value) return "-";
+  return value
+    .split("_")
+    .filter(Boolean)
+    .map((segment) => segment[0]?.toUpperCase() + segment.slice(1))
+    .join(" ");
+}
+
 const evidenceSurfaces = [
   {
     title: "Workflow definitions",
@@ -31,6 +40,11 @@ const evidenceSurfaces = [
     title: "Task queues",
     href: "/task-queues",
     summary: "Queue health, pollers, and compatibility-set visibility."
+  },
+  {
+    title: "Streaming ops",
+    href: "/streaming",
+    summary: "Unified ingress lag, queue pressure, routing mix, and live reducer progress."
   }
 ];
 
@@ -118,6 +132,10 @@ export function OverviewPage() {
                 <td>{item.status}</td>
                 <td>
                   <Badge value={item.routing_status} />
+                  <div className="muted">engine {labelFromSnakeCase(item.execution_path)}</div>
+                  {item.fast_path_rejection_reason ? (
+                    <div className="muted">fallback {labelFromSnakeCase(item.fast_path_rejection_reason)}</div>
+                  ) : null}
                 </td>
                 <td>{item.workflow_task_queue}</td>
                   <td>{formatDate(item.updated_at)}</td>

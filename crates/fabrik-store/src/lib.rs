@@ -1263,6 +1263,10 @@ pub struct TopicAdapterDeadLetterRecord {
     pub record_key: Option<String>,
     pub payload: Value,
     pub error: String,
+    pub replay_count: u64,
+    pub last_replay_at: Option<DateTime<Utc>>,
+    pub last_replay_error: Option<String>,
+    pub resolved_at: Option<DateTime<Utc>>,
     pub occurred_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1296,10 +1300,7 @@ pub fn validate_topic_adapter_config(
 
     validate_template(payload_template_json, "payload_template_json")?;
     validate_template(memo_template_json, "memo_template_json")?;
-    validate_template(
-        search_attributes_template_json,
-        "search_attributes_template_json",
-    )?;
+    validate_template(search_attributes_template_json, "search_attributes_template_json")?;
 
     validate_exclusive_mapping(
         "payload",
@@ -1368,9 +1369,8 @@ pub fn validate_topic_adapter_config(
             if workflow_instance_id_json_pointer.is_none() {
                 return Err(TopicAdapterMappingError {
                     field: "workflow_instance_id_json_pointer".to_owned(),
-                    detail:
-                        "signal_workflow adapters require workflow_instance_id_json_pointer"
-                            .to_owned(),
+                    detail: "signal_workflow adapters require workflow_instance_id_json_pointer"
+                        .to_owned(),
                 });
             }
             if memo_json_pointer.is_some() || memo_template_json.is_some() {
@@ -1383,9 +1383,8 @@ pub fn validate_topic_adapter_config(
             {
                 return Err(TopicAdapterMappingError {
                     field: "search_attributes".to_owned(),
-                    detail:
-                        "signal_workflow adapters cannot configure search_attributes mapping"
-                            .to_owned(),
+                    detail: "signal_workflow adapters cannot configure search_attributes mapping"
+                        .to_owned(),
                 });
             }
         }
@@ -1418,141 +1417,138 @@ pub fn resolve_topic_adapter_dispatch_detailed(
     let dispatch =
         (|| -> std::result::Result<TopicAdapterResolvedDispatch, TopicAdapterMappingError> {
             match adapter.action {
-            TopicAdapterAction::StartWorkflow => {
-                let definition_id =
-                    adapter.definition_id.clone().ok_or_else(|| TopicAdapterMappingError {
-                        field: "definition_id".to_owned(),
-                        detail: format!(
-                            "topic adapter {} missing definition_id",
-                            adapter.adapter_id
-                        ),
-                    })?;
-                let instance_id = resolve_optional_string(
-                    payload,
-                    adapter.workflow_instance_id_json_pointer.as_deref(),
-                    "workflow_instance_id",
-                    &mut diagnostics,
-                )?;
-                let input = resolve_required_value(
-                    payload,
-                    adapter.payload_json_pointer.as_deref(),
-                    adapter.payload_template_json.as_ref(),
-                    "input",
-                    "payload_template_json",
-                    &mut diagnostics,
-                    true,
-                )?;
-                let memo = resolve_optional_value(
-                    payload,
-                    adapter.memo_json_pointer.as_deref(),
-                    adapter.memo_template_json.as_ref(),
-                    "memo",
-                    "memo_template_json",
-                    &mut diagnostics,
-                )?;
-                let search_attributes = resolve_optional_value(
-                    payload,
-                    adapter.search_attributes_json_pointer.as_deref(),
-                    adapter.search_attributes_template_json.as_ref(),
-                    "search_attributes",
-                    "search_attributes_template_json",
-                    &mut diagnostics,
-                )?;
-                let request_id = resolve_optional_string(
-                    payload,
-                    adapter.request_id_json_pointer.as_deref(),
-                    "request_id",
-                    &mut diagnostics,
-                )?
-                .unwrap_or_else(|| {
-                    diagnostics.push(TopicAdapterMappingDiagnostic {
-                        field: "request_id".to_owned(),
-                        mode: "derived".to_owned(),
-                        detail: "derived from topic partition and offset".to_owned(),
+                TopicAdapterAction::StartWorkflow => {
+                    let definition_id =
+                        adapter.definition_id.clone().ok_or_else(|| TopicAdapterMappingError {
+                            field: "definition_id".to_owned(),
+                            detail: format!(
+                                "topic adapter {} missing definition_id",
+                                adapter.adapter_id
+                            ),
+                        })?;
+                    let instance_id = resolve_optional_string(
+                        payload,
+                        adapter.workflow_instance_id_json_pointer.as_deref(),
+                        "workflow_instance_id",
+                        &mut diagnostics,
+                    )?;
+                    let input = resolve_required_value(
+                        payload,
+                        adapter.payload_json_pointer.as_deref(),
+                        adapter.payload_template_json.as_ref(),
+                        "input",
+                        "payload_template_json",
+                        &mut diagnostics,
+                        true,
+                    )?;
+                    let memo = resolve_optional_value(
+                        payload,
+                        adapter.memo_json_pointer.as_deref(),
+                        adapter.memo_template_json.as_ref(),
+                        "memo",
+                        "memo_template_json",
+                        &mut diagnostics,
+                    )?;
+                    let search_attributes = resolve_optional_value(
+                        payload,
+                        adapter.search_attributes_json_pointer.as_deref(),
+                        adapter.search_attributes_template_json.as_ref(),
+                        "search_attributes",
+                        "search_attributes_template_json",
+                        &mut diagnostics,
+                    )?;
+                    let request_id = resolve_optional_string(
+                        payload,
+                        adapter.request_id_json_pointer.as_deref(),
+                        "request_id",
+                        &mut diagnostics,
+                    )?
+                    .unwrap_or_else(|| {
+                        diagnostics.push(TopicAdapterMappingDiagnostic {
+                            field: "request_id".to_owned(),
+                            mode: "derived".to_owned(),
+                            detail: "derived from topic partition and offset".to_owned(),
+                        });
+                        default_request_id.clone()
                     });
-                    default_request_id.clone()
-                });
-                Ok(TopicAdapterResolvedDispatch::StartWorkflow(
-                    TopicAdapterResolvedStartRequest {
-                        definition_id,
-                        instance_id,
-                        workflow_task_queue: adapter.workflow_task_queue.clone(),
-                        input,
-                        memo,
-                        search_attributes,
-                        request_id,
-                    },
-                ))
+                    Ok(TopicAdapterResolvedDispatch::StartWorkflow(
+                        TopicAdapterResolvedStartRequest {
+                            definition_id,
+                            instance_id,
+                            workflow_task_queue: adapter.workflow_task_queue.clone(),
+                            input,
+                            memo,
+                            search_attributes,
+                            request_id,
+                        },
+                    ))
+                }
+                TopicAdapterAction::SignalWorkflow => {
+                    let signal_type =
+                        adapter.signal_type.clone().ok_or_else(|| TopicAdapterMappingError {
+                            field: "signal_type".to_owned(),
+                            detail: format!(
+                                "topic adapter {} missing signal_type",
+                                adapter.adapter_id
+                            ),
+                        })?;
+                    let instance_id = resolve_required_string(
+                        payload,
+                        adapter.workflow_instance_id_json_pointer.as_deref(),
+                        "workflow_instance_id",
+                        &mut diagnostics,
+                    )?;
+                    let request_id = resolve_optional_string(
+                        payload,
+                        adapter.request_id_json_pointer.as_deref(),
+                        "request_id",
+                        &mut diagnostics,
+                    )?
+                    .unwrap_or_else(|| {
+                        diagnostics.push(TopicAdapterMappingDiagnostic {
+                            field: "request_id".to_owned(),
+                            mode: "derived".to_owned(),
+                            detail: "derived from topic partition and offset".to_owned(),
+                        });
+                        default_request_id.clone()
+                    });
+                    let dedupe_key = resolve_optional_string(
+                        payload,
+                        adapter.dedupe_key_json_pointer.as_deref(),
+                        "dedupe_key",
+                        &mut diagnostics,
+                    )?
+                    .or_else(|| {
+                        diagnostics.push(TopicAdapterMappingDiagnostic {
+                            field: "dedupe_key".to_owned(),
+                            mode: "derived".to_owned(),
+                            detail: "defaulted to request_id".to_owned(),
+                        });
+                        Some(request_id.clone())
+                    });
+                    let signal_payload = resolve_required_value(
+                        payload,
+                        adapter.payload_json_pointer.as_deref(),
+                        adapter.payload_template_json.as_ref(),
+                        "payload",
+                        "payload_template_json",
+                        &mut diagnostics,
+                        true,
+                    )?;
+                    Ok(TopicAdapterResolvedDispatch::SignalWorkflow(
+                        TopicAdapterResolvedSignalRequest {
+                            signal_type,
+                            instance_id,
+                            payload: signal_payload,
+                            dedupe_key,
+                            request_id,
+                        },
+                    ))
+                }
             }
-            TopicAdapterAction::SignalWorkflow => {
-                let signal_type =
-                    adapter.signal_type.clone().ok_or_else(|| TopicAdapterMappingError {
-                        field: "signal_type".to_owned(),
-                        detail: format!(
-                            "topic adapter {} missing signal_type",
-                            adapter.adapter_id
-                        ),
-                    })?;
-                let instance_id = resolve_required_string(
-                    payload,
-                    adapter.workflow_instance_id_json_pointer.as_deref(),
-                    "workflow_instance_id",
-                    &mut diagnostics,
-                )?;
-                let request_id = resolve_optional_string(
-                    payload,
-                    adapter.request_id_json_pointer.as_deref(),
-                    "request_id",
-                    &mut diagnostics,
-                )?
-                .unwrap_or_else(|| {
-                    diagnostics.push(TopicAdapterMappingDiagnostic {
-                        field: "request_id".to_owned(),
-                        mode: "derived".to_owned(),
-                        detail: "derived from topic partition and offset".to_owned(),
-                    });
-                    default_request_id.clone()
-                });
-                let dedupe_key = resolve_optional_string(
-                    payload,
-                    adapter.dedupe_key_json_pointer.as_deref(),
-                    "dedupe_key",
-                    &mut diagnostics,
-                )?
-                .or_else(|| {
-                    diagnostics.push(TopicAdapterMappingDiagnostic {
-                        field: "dedupe_key".to_owned(),
-                        mode: "derived".to_owned(),
-                        detail: "defaulted to request_id".to_owned(),
-                    });
-                    Some(request_id.clone())
-                });
-                let signal_payload = resolve_required_value(
-                    payload,
-                    adapter.payload_json_pointer.as_deref(),
-                    adapter.payload_template_json.as_ref(),
-                    "payload",
-                    "payload_template_json",
-                    &mut diagnostics,
-                    true,
-                )?;
-                Ok(TopicAdapterResolvedDispatch::SignalWorkflow(
-                    TopicAdapterResolvedSignalRequest {
-                        signal_type,
-                        instance_id,
-                        payload: signal_payload,
-                        dedupe_key,
-                        request_id,
-                    },
-                ))
-            }
-        }
         })();
     match dispatch {
-        Ok(dispatch) => Ok(TopicAdapterDispatchPreview {
-            dispatch,
-            diagnostics,
-        }),
+        Ok(dispatch) => Ok(TopicAdapterDispatchPreview { dispatch, diagnostics }),
         Err(error) => Err(TopicAdapterDispatchFailure { error, diagnostics }),
     }
 }
@@ -1646,9 +1642,11 @@ fn resolve_required_string(
     field: &str,
     diagnostics: &mut Vec<TopicAdapterMappingDiagnostic>,
 ) -> std::result::Result<String, TopicAdapterMappingError> {
-    resolve_optional_string(payload, pointer, field, diagnostics)?.ok_or_else(|| TopicAdapterMappingError {
-        field: field.to_owned(),
-        detail: format!("missing required string field {field}"),
+    resolve_optional_string(payload, pointer, field, diagnostics)?.ok_or_else(|| {
+        TopicAdapterMappingError {
+            field: field.to_owned(),
+            detail: format!("missing required string field {field}"),
+        }
     })
 }
 
@@ -1688,7 +1686,9 @@ fn resolve_template_value(
     template_path: &str,
 ) -> std::result::Result<TemplateResolve, TopicAdapterMappingError> {
     match template {
-        Value::Object(map) if map.contains_key("$from") => resolve_template_from(map, payload, template_path),
+        Value::Object(map) if map.contains_key("$from") => {
+            resolve_template_from(map, payload, template_path)
+        }
         Value::Object(map) => {
             let mut output = Map::new();
             for (key, value) in map {
@@ -1722,10 +1722,8 @@ fn resolve_template_from(
     payload: &Value,
     template_path: &str,
 ) -> std::result::Result<TemplateResolve, TopicAdapterMappingError> {
-    let pointer = map
-        .get("$from")
-        .and_then(Value::as_str)
-        .ok_or_else(|| TopicAdapterMappingError {
+    let pointer =
+        map.get("$from").and_then(Value::as_str).ok_or_else(|| TopicAdapterMappingError {
             field: template_path.to_owned(),
             detail: format!("{template_path}.$from must be a string json pointer"),
         })?;
@@ -1764,9 +1762,7 @@ fn validate_exclusive_mapping(
     if pointer.is_some() && template.is_some() {
         return Err(TopicAdapterMappingError {
             field: field.to_owned(),
-            detail: format!(
-                "configure either {pointer_field} or {template_field}, not both"
-            ),
+            detail: format!("configure either {pointer_field} or {template_field}, not both"),
         });
     }
     Ok(())
@@ -1797,13 +1793,12 @@ fn validate_template(
     };
     match template {
         Value::Object(map) if map.contains_key("$from") => {
-            let pointer = map
-                .get("$from")
-                .and_then(Value::as_str)
-                .ok_or_else(|| TopicAdapterMappingError {
+            let pointer = map.get("$from").and_then(Value::as_str).ok_or_else(|| {
+                TopicAdapterMappingError {
                     field: template_path.to_owned(),
                     detail: format!("{template_path}.$from must be a string json pointer"),
-                })?;
+                }
+            })?;
             validate_json_pointer(Some(pointer), &format!("{template_path}.$from"))?;
             if let Some(optional) = map.get("$optional") {
                 if !optional.is_boolean() {
@@ -3311,6 +3306,10 @@ impl WorkflowStore {
                 record_key TEXT,
                 payload JSONB NOT NULL DEFAULT 'null'::jsonb,
                 error TEXT NOT NULL,
+                replay_count BIGINT NOT NULL DEFAULT 0,
+                last_replay_at TIMESTAMPTZ,
+                last_replay_error TEXT,
+                resolved_at TIMESTAMPTZ,
                 occurred_at TIMESTAMPTZ NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY (tenant_id, adapter_id, partition_id, log_offset),
@@ -3323,6 +3322,30 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize topic_adapter_dead_letters table")?;
+        sqlx::query(
+            "ALTER TABLE topic_adapter_dead_letters ADD COLUMN IF NOT EXISTS replay_count BIGINT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add topic_adapter_dead_letters.replay_count")?;
+        sqlx::query(
+            "ALTER TABLE topic_adapter_dead_letters ADD COLUMN IF NOT EXISTS last_replay_at TIMESTAMPTZ",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add topic_adapter_dead_letters.last_replay_at")?;
+        sqlx::query(
+            "ALTER TABLE topic_adapter_dead_letters ADD COLUMN IF NOT EXISTS last_replay_error TEXT",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add topic_adapter_dead_letters.last_replay_error")?;
+        sqlx::query(
+            "ALTER TABLE topic_adapter_dead_letters ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add topic_adapter_dead_letters.resolved_at")?;
 
         sqlx::query(
             r#"
@@ -5508,9 +5531,7 @@ impl WorkflowStore {
                     .push_bind(record.artifact_hash.as_deref())
                     .push_bind(&record.workflow_task_queue)
                     .push_bind(record.memo.as_ref().map(|value| Json(value.clone())))
-                    .push_bind(
-                        record.search_attributes.as_ref().map(|value| Json(value.clone())),
-                    )
+                    .push_bind(record.search_attributes.as_ref().map(|value| Json(value.clone())))
                     .push("NULL")
                     .push("NULL")
                     .push("NULL")
@@ -5683,9 +5704,7 @@ impl WorkflowStore {
                     .push_bind(record.status.as_str())
                     .push_bind(Json(&record.input))
                     .push_bind(record.memo.as_ref().map(|value| Json(value.clone())))
-                    .push_bind(
-                        record.search_attributes.as_ref().map(|value| Json(value.clone())),
-                    )
+                    .push_bind(record.search_attributes.as_ref().map(|value| Json(value.clone())))
                     .push_bind(record.trigger_event_id)
                     .push_bind(record.terminal_event_id)
                     .push_bind(record.terminal_event_type.as_deref())
@@ -5796,7 +5815,8 @@ impl WorkflowStore {
     ) -> Result<()> {
         let mut persisted_instance = instance.clone();
         persisted_instance.compact_for_persistence();
-        let mut tx = self.pool.begin().await.context("failed to begin tiny workflow transaction")?;
+        let mut tx =
+            self.pool.begin().await.context("failed to begin tiny workflow transaction")?;
 
         sqlx::query(
             r#"
@@ -7689,9 +7709,7 @@ impl WorkflowStore {
         .await
         .context("failed to delete topic adapter")?;
 
-        tx.commit()
-            .await
-            .context("failed to commit topic adapter delete transaction")?;
+        tx.commit().await.context("failed to commit topic adapter delete transaction")?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -7702,8 +7720,11 @@ impl WorkflowStore {
         owner_id: &str,
         lease_ttl: std::time::Duration,
     ) -> Result<Option<TopicAdapterOwnershipRecord>> {
-        let mut tx =
-            self.pool.begin().await.context("failed to begin topic adapter ownership transaction")?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin topic adapter ownership transaction")?;
         let now = Utc::now();
         let lease_expires_at = now
             + chrono::Duration::from_std(lease_ttl)
@@ -7753,8 +7774,10 @@ impl WorkflowStore {
                     TopicAdapterOwnershipRecord { lease_expires_at, updated_at: now, ..current }
                 } else if current.lease_expires_at <= now {
                     let next_epoch = current.owner_epoch + 1;
-                    let takeover_latency_ms =
-                        now.signed_duration_since(current.lease_expires_at).num_milliseconds().max(0);
+                    let takeover_latency_ms = now
+                        .signed_duration_since(current.lease_expires_at)
+                        .num_milliseconds()
+                        .max(0);
                     sqlx::query(
                         r#"
                         UPDATE topic_adapter_ownership
@@ -7770,7 +7793,10 @@ impl WorkflowStore {
                     .bind(tenant_id)
                     .bind(adapter_id)
                     .bind(owner_id)
-                    .bind(i64::try_from(next_epoch).context("topic adapter ownership epoch exceeds i64")?)
+                    .bind(
+                        i64::try_from(next_epoch)
+                            .context("topic adapter ownership epoch exceeds i64")?,
+                    )
                     .bind(lease_expires_at)
                     .bind(now)
                     .execute(&mut *tx)
@@ -8022,6 +8048,10 @@ impl WorkflowStore {
                 record_key,
                 payload,
                 error,
+                replay_count,
+                last_replay_at,
+                last_replay_error,
+                resolved_at,
                 occurred_at,
                 updated_at
             FROM topic_adapter_dead_letters
@@ -8039,6 +8069,47 @@ impl WorkflowStore {
         .context("failed to list topic adapter dead letters")?;
 
         rows.into_iter().map(Self::decode_topic_adapter_dead_letter_row).collect()
+    }
+
+    pub async fn get_topic_adapter_dead_letter(
+        &self,
+        tenant_id: &str,
+        adapter_id: &str,
+        partition_id: i32,
+        log_offset: i64,
+    ) -> Result<Option<TopicAdapterDeadLetterRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                tenant_id,
+                adapter_id,
+                partition_id,
+                log_offset,
+                record_key,
+                payload,
+                error,
+                replay_count,
+                last_replay_at,
+                last_replay_error,
+                resolved_at,
+                occurred_at,
+                updated_at
+            FROM topic_adapter_dead_letters
+            WHERE tenant_id = $1
+              AND adapter_id = $2
+              AND partition_id = $3
+              AND log_offset = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .bind(partition_id)
+        .bind(log_offset)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load topic adapter dead letter")?;
+
+        row.map(Self::decode_topic_adapter_dead_letter_row).transpose()
     }
 
     pub async fn record_topic_adapter_success(
@@ -8116,9 +8187,7 @@ impl WorkflowStore {
             processed_at,
         )
         .await?;
-        tx.commit()
-            .await
-            .context("failed to commit owned topic adapter success transaction")?;
+        tx.commit().await.context("failed to commit owned topic adapter success transaction")?;
         Ok(true)
     }
 
@@ -8375,15 +8444,23 @@ impl WorkflowStore {
                 record_key,
                 payload,
                 error,
+                replay_count,
+                last_replay_at,
+                last_replay_error,
+                resolved_at,
                 occurred_at,
                 updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 0, NULL, NULL, NULL, $8, $8)
             ON CONFLICT (tenant_id, adapter_id, partition_id, log_offset)
             DO UPDATE SET
                 record_key = EXCLUDED.record_key,
                 payload = EXCLUDED.payload,
                 error = EXCLUDED.error,
+                replay_count = 0,
+                last_replay_at = NULL,
+                last_replay_error = NULL,
+                resolved_at = NULL,
                 occurred_at = EXCLUDED.occurred_at,
                 updated_at = EXCLUDED.updated_at
             "#,
@@ -8444,6 +8521,58 @@ impl WorkflowStore {
         .context("failed to update topic adapter dead letter metrics")?;
 
         Ok(())
+    }
+
+    pub async fn record_topic_adapter_dead_letter_replay_result(
+        &self,
+        tenant_id: &str,
+        adapter_id: &str,
+        partition_id: i32,
+        log_offset: i64,
+        replayed_at: DateTime<Utc>,
+        replay_error: Option<&str>,
+        resolved: bool,
+    ) -> Result<Option<TopicAdapterDeadLetterRecord>> {
+        let row = sqlx::query(
+            r#"
+            UPDATE topic_adapter_dead_letters
+            SET replay_count = replay_count + 1,
+                last_replay_at = $5,
+                last_replay_error = $6,
+                resolved_at = CASE WHEN $7 THEN $5 ELSE NULL END,
+                updated_at = $5
+            WHERE tenant_id = $1
+              AND adapter_id = $2
+              AND partition_id = $3
+              AND log_offset = $4
+            RETURNING
+                tenant_id,
+                adapter_id,
+                partition_id,
+                log_offset,
+                record_key,
+                payload,
+                error,
+                replay_count,
+                last_replay_at,
+                last_replay_error,
+                resolved_at,
+                occurred_at,
+                updated_at
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(adapter_id)
+        .bind(partition_id)
+        .bind(log_offset)
+        .bind(replayed_at)
+        .bind(replay_error)
+        .bind(resolved)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to record topic adapter dead letter replay result")?;
+
+        row.map(Self::decode_topic_adapter_dead_letter_row).transpose()
     }
 
     pub async fn set_bulk_batch_admission_metadata(
@@ -9907,13 +10036,15 @@ impl WorkflowStore {
                 .context("avg schedule-to-start latency missing")?,
             max_schedule_to_start_latency_ms: row
                 .try_get::<f64, _>("max_schedule_to_start_latency_ms")
-                .context("max schedule-to-start latency missing")? as u64,
+                .context("max schedule-to-start latency missing")?
+                as u64,
             avg_start_to_close_latency_ms: row
                 .try_get::<f64, _>("avg_start_to_close_latency_ms")
                 .context("avg start-to-close latency missing")?,
             max_start_to_close_latency_ms: row
                 .try_get::<f64, _>("max_start_to_close_latency_ms")
-                .context("max start-to-close latency missing")? as u64,
+                .context("max start-to-close latency missing")?
+                as u64,
         }))
     }
 
@@ -16992,9 +17123,7 @@ impl WorkflowStore {
             triggered_by_run_id: row
                 .try_get("triggered_by_run_id")
                 .context("run triggered_by_run_id missing")?,
-            execution_path: row
-                .try_get("execution_path")
-                .context("run execution_path missing")?,
+            execution_path: row.try_get("execution_path").context("run execution_path missing")?,
             fast_path_rejection_reason: row
                 .try_get("fast_path_rejection_reason")
                 .context("run fast_path_rejection_reason missing")?,
@@ -17014,7 +17143,9 @@ impl WorkflowStore {
                 .context("workflow_fast_starts.workflow_instance_id")?,
             run_id: row.try_get("run_id").context("workflow_fast_starts.run_id")?,
             request_id: row.try_get("request_id").context("workflow_fast_starts.request_id")?,
-            definition_id: row.try_get("workflow_id").context("workflow_fast_starts.workflow_id")?,
+            definition_id: row
+                .try_get("workflow_id")
+                .context("workflow_fast_starts.workflow_id")?,
             definition_version: row
                 .try_get::<i32, _>("definition_version")
                 .context("workflow_fast_starts.definition_version")?
@@ -17034,11 +17165,11 @@ impl WorkflowStore {
             status: WorkflowFastStartStatus::from_db(
                 &row.try_get::<String, _>("status").context("workflow_fast_starts.status")?,
             )?,
-            input: row
-                .try_get::<Json<Value>, _>("input")
-                .context("workflow_fast_starts.input")?
-                .0,
-            memo: row.try_get::<Option<Json<Value>>, _>("memo").context("workflow_fast_starts.memo")?.map(|v| v.0),
+            input: row.try_get::<Json<Value>, _>("input").context("workflow_fast_starts.input")?.0,
+            memo: row
+                .try_get::<Option<Json<Value>>, _>("memo")
+                .context("workflow_fast_starts.memo")?
+                .map(|v| v.0),
             search_attributes: row
                 .try_get::<Option<Json<Value>>, _>("search_attributes")
                 .context("workflow_fast_starts.search_attributes")?
@@ -17056,15 +17187,11 @@ impl WorkflowStore {
                 .try_get::<Option<Json<Value>>, _>("terminal_payload")
                 .context("workflow_fast_starts.terminal_payload")?
                 .map(|v| v.0),
-            accepted_at: row
-                .try_get("accepted_at")
-                .context("workflow_fast_starts.accepted_at")?,
+            accepted_at: row.try_get("accepted_at").context("workflow_fast_starts.accepted_at")?,
             completed_at: row
                 .try_get("completed_at")
                 .context("workflow_fast_starts.completed_at")?,
-            updated_at: row
-                .try_get("updated_at")
-                .context("workflow_fast_starts.updated_at")?,
+            updated_at: row.try_get("updated_at").context("workflow_fast_starts.updated_at")?,
             fast_path_rejection_reason: row
                 .try_get("fast_path_rejection_reason")
                 .context("workflow_fast_starts.fast_path_rejection_reason")?,
@@ -17419,7 +17546,8 @@ impl WorkflowStore {
                 .context("topic adapter ownership owner_id missing")?,
             owner_epoch: row
                 .try_get::<i64, _>("owner_epoch")
-                .context("topic adapter ownership owner_epoch missing")? as u64,
+                .context("topic adapter ownership owner_epoch missing")?
+                as u64,
             lease_expires_at: row
                 .try_get("lease_expires_at")
                 .context("topic adapter ownership lease_expires_at missing")?,
@@ -17459,6 +17587,19 @@ impl WorkflowStore {
                 .context("topic adapter dead letter payload missing")?
                 .0,
             error: row.try_get("error").context("topic adapter dead letter error missing")?,
+            replay_count: row
+                .try_get::<i64, _>("replay_count")
+                .context("topic adapter dead letter replay_count missing")?
+                as u64,
+            last_replay_at: row
+                .try_get("last_replay_at")
+                .context("topic adapter dead letter last_replay_at missing")?,
+            last_replay_error: row
+                .try_get("last_replay_error")
+                .context("topic adapter dead letter last_replay_error missing")?,
+            resolved_at: row
+                .try_get("resolved_at")
+                .context("topic adapter dead letter resolved_at missing")?,
             occurred_at: row
                 .try_get("occurred_at")
                 .context("topic adapter dead letter occurred_at missing")?,
@@ -21541,6 +21682,42 @@ mod tests {
         assert_eq!(dead_letters.len(), 1);
         assert_eq!(dead_letters[0].record_key.as_deref(), Some("order-9"));
         assert_eq!(dead_letters[0].payload, json!({"bad": true}));
+        assert_eq!(dead_letters[0].replay_count, 0);
+        assert!(dead_letters[0].last_replay_at.is_none());
+        assert!(dead_letters[0].last_replay_error.is_none());
+        assert!(dead_letters[0].resolved_at.is_none());
+
+        let replay_failed = store
+            .record_topic_adapter_dead_letter_replay_result(
+                "tenant-a",
+                "orders",
+                1,
+                9,
+                Utc::now(),
+                Some("workflow instance missing"),
+                false,
+            )
+            .await?
+            .context("dead letter missing after failed replay update")?;
+        assert_eq!(replay_failed.replay_count, 1);
+        assert_eq!(replay_failed.last_replay_error.as_deref(), Some("workflow instance missing"));
+        assert!(replay_failed.resolved_at.is_none());
+
+        let replay_succeeded = store
+            .record_topic_adapter_dead_letter_replay_result(
+                "tenant-a",
+                "orders",
+                1,
+                9,
+                Utc::now(),
+                None,
+                true,
+            )
+            .await?
+            .context("dead letter missing after successful replay update")?;
+        assert_eq!(replay_succeeded.replay_count, 2);
+        assert!(replay_succeeded.last_replay_error.is_none());
+        assert!(replay_succeeded.resolved_at.is_some());
 
         let paused = store
             .set_topic_adapter_paused("tenant-a", "orders", true)
@@ -21610,27 +21787,25 @@ mod tests {
             TopicAdapterResolvedDispatch::StartWorkflow(request) => {
                 assert_eq!(request.definition_id, "order-workflow");
                 assert_eq!(request.instance_id.as_deref(), Some("order-42"));
-                assert_eq!(
-                    request.input,
-                    json!({"order_id": "order-42", "amount": 125})
-                );
-                assert_eq!(
-                    request.memo,
-                    Some(json!({"source": "topic", "raw_key": "order-42"}))
-                );
-                assert_eq!(
-                    request.search_attributes,
-                    Some(json!({"customer": "cust-9"}))
-                );
+                assert_eq!(request.input, json!({"order_id": "order-42", "amount": 125}));
+                assert_eq!(request.memo, Some(json!({"source": "topic", "raw_key": "order-42"})));
+                assert_eq!(request.search_attributes, Some(json!({"customer": "cust-9"})));
                 assert_eq!(request.request_id, "req-42");
             }
             other => panic!("unexpected dispatch {other:?}"),
         }
-        assert!(preview.diagnostics.iter().any(|entry| entry.field == "input" && entry.mode == "template"));
-        assert!(preview
-            .diagnostics
-            .iter()
-            .any(|entry| entry.field == "request_id" && entry.mode == "pointer"));
+        assert!(
+            preview
+                .diagnostics
+                .iter()
+                .any(|entry| entry.field == "input" && entry.mode == "template")
+        );
+        assert!(
+            preview
+                .diagnostics
+                .iter()
+                .any(|entry| entry.field == "request_id" && entry.mode == "pointer")
+        );
         Ok(())
     }
 
@@ -21671,9 +21846,7 @@ mod tests {
         )
         .expect_err("invalid template pointer should fail");
         assert_eq!(invalid_template.field, "payload_template_json.amount.$from");
-        assert!(invalid_template
-            .detail
-            .contains("must be an RFC 6901 json pointer"));
+        assert!(invalid_template.detail.contains("must be an RFC 6901 json pointer"));
     }
 
     #[test]
@@ -21725,10 +21898,12 @@ mod tests {
         .expect_err("missing template source should fail");
 
         assert_eq!(failure.error.field, "payload_template_json.order_id");
-        assert!(failure
-            .diagnostics
-            .iter()
-            .any(|entry| entry.field == "input" && entry.mode == "template"));
+        assert!(
+            failure
+                .diagnostics
+                .iter()
+                .any(|entry| entry.field == "input" && entry.mode == "template")
+        );
     }
 
     #[tokio::test]
@@ -21766,7 +21941,12 @@ mod tests {
             .await?;
 
         let initial = store
-            .claim_topic_adapter_ownership("tenant-a", "orders", "ingest-a", StdDuration::from_millis(150))
+            .claim_topic_adapter_ownership(
+                "tenant-a",
+                "orders",
+                "ingest-a",
+                StdDuration::from_millis(150),
+            )
             .await?
             .context("initial adapter owner should claim adapter")?;
         assert_eq!(initial.owner_epoch, 1);
@@ -21787,11 +21967,18 @@ mod tests {
         sleep(StdDuration::from_millis(250)).await;
 
         let handoff = store
-            .claim_topic_adapter_ownership("tenant-a", "orders", "ingest-b", StdDuration::from_secs(1))
+            .claim_topic_adapter_ownership(
+                "tenant-a",
+                "orders",
+                "ingest-b",
+                StdDuration::from_secs(1),
+            )
             .await?
             .context("new owner should claim expired adapter lease")?;
         assert_eq!(handoff.owner_epoch, 2);
-        assert!(!store.validate_topic_adapter_ownership("tenant-a", "orders", "ingest-a", 1).await?);
+        assert!(
+            !store.validate_topic_adapter_ownership("tenant-a", "orders", "ingest-a", 1).await?
+        );
         assert!(store.validate_topic_adapter_ownership("tenant-a", "orders", "ingest-b", 2).await?);
 
         assert!(
@@ -21886,7 +22073,12 @@ mod tests {
             .await?;
 
         store
-            .claim_topic_adapter_ownership("tenant-a", "orders", "ingest-a", StdDuration::from_secs(30))
+            .claim_topic_adapter_ownership(
+                "tenant-a",
+                "orders",
+                "ingest-a",
+                StdDuration::from_secs(30),
+            )
             .await?;
         store.record_topic_adapter_success("tenant-a", "orders", 0, 5, Utc::now()).await?;
         store
@@ -21906,10 +22098,9 @@ mod tests {
         assert!(store.get_topic_adapter("tenant-a", "orders").await?.is_none());
         assert!(store.get_topic_adapter_ownership("tenant-a", "orders").await?.is_none());
         assert!(store.load_topic_adapter_offsets("tenant-a", "orders").await?.is_empty());
-        assert!(store
-            .list_topic_adapter_dead_letters("tenant-a", "orders", 10, 0)
-            .await?
-            .is_empty());
+        assert!(
+            store.list_topic_adapter_dead_letters("tenant-a", "orders", 10, 0).await?.is_empty()
+        );
 
         Ok(())
     }

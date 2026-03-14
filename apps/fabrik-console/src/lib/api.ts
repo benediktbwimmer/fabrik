@@ -20,6 +20,8 @@ export type WorkflowListItem = {
   sticky_workflow_build_id: string | null;
   sticky_workflow_poller_id: string | null;
   routing_status: string;
+  execution_path: string | null;
+  fast_path_rejection_reason: string | null;
   current_state: string | null;
   status: string;
   event_count: number;
@@ -246,6 +248,8 @@ export type WorkflowRun = {
   search_attributes: unknown;
   sticky_workflow_build_id: string | null;
   sticky_workflow_poller_id: string | null;
+  execution_path: string;
+  fast_path_rejection_reason: string | null;
   started_at: string;
   closed_at: string | null;
 };
@@ -272,6 +276,8 @@ export type RunListItem = {
   sticky_workflow_build_id: string | null;
   sticky_workflow_poller_id: string | null;
   routing_status: string;
+  execution_path: string;
+  fast_path_rejection_reason: string | null;
   sticky_updated_at: string | null;
   previous_run_id: string | null;
   next_run_id: string | null;
@@ -488,6 +494,10 @@ export type TopicAdapterDeadLetter = {
   record_key: string | null;
   payload: unknown;
   error: string;
+  replay_count: number;
+  last_replay_at: string | null;
+  last_replay_error: string | null;
+  resolved_at: string | null;
   occurred_at: string;
   updated_at: string;
 };
@@ -543,6 +553,16 @@ export type TopicAdapterPreviewResponse = {
     field: string;
     detail: string;
   } | null;
+};
+
+export type TopicAdapterDeadLetterReplayResponse = {
+  tenant_id: string;
+  adapter_id: string;
+  partition_id: number;
+  log_offset: number;
+  replayed: boolean;
+  status: string;
+  dead_letter: TopicAdapterDeadLetter;
 };
 
 export type TopicAdapterUpsertRequest = {
@@ -1012,6 +1032,13 @@ export const api = {
   listTopicAdapterDeadLetters: (tenantId: string, adapterId: string, limit = 100, offset = 0) =>
     request<{ tenant_id: string; adapter_id: string; items: TopicAdapterDeadLetter[]; limit: number; offset: number }>(
       `/admin/tenants/${tenantId}/topic-adapters/${adapterId}/dead-letters?limit=${limit}&offset=${offset}`
+    ),
+  replayTopicAdapterDeadLetter: (tenantId: string, adapterId: string, partitionId: number, logOffset: number) =>
+    request<TopicAdapterDeadLetterReplayResponse>(
+      `/admin/tenants/${tenantId}/topic-adapters/${adapterId}/dead-letters/${partitionId}/${logOffset}/replay`,
+      {
+        method: "POST"
+      }
     ),
   previewTopicAdapter: (
     tenantId: string,

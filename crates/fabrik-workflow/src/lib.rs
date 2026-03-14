@@ -1464,125 +1464,124 @@ pub fn replay_compiled_history_trace(
                     Err(error) => return Err(error.into()),
                 }
             }
-                WorkflowEvent::BulkActivityBatchCompleted {
-                    batch_id,
-                    total_items,
-                    succeeded_items,
-                    failed_items,
-                    cancelled_items,
-                    chunk_count,
-                    reducer_output,
-                } => {
-                    let mut payload = serde_json::json!({
-                        "batchId": batch_id,
-                        "status": "completed",
-                        "totalItems": total_items,
-                        "succeededItems": succeeded_items,
-                        "failedItems": failed_items,
-                        "cancelledItems": cancelled_items,
-                        "chunkCount": chunk_count,
-                        "resultHandle": { "batchId": batch_id },
-                    });
-                    if let Some(value) = reducer_output {
-                        payload["reducerOutput"] = value.clone();
-                    }
-                    execution = artifact.execute_after_bulk_completion_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        batch_id,
-                        &payload,
-                        execution_state_for_event(&replayed, Some(event)),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    advanced = true;
+            WorkflowEvent::BulkActivityBatchCompleted {
+                batch_id,
+                total_items,
+                succeeded_items,
+                failed_items,
+                cancelled_items,
+                chunk_count,
+                reducer_output,
+            } => {
+                let mut payload = serde_json::json!({
+                    "batchId": batch_id,
+                    "status": "completed",
+                    "totalItems": total_items,
+                    "succeededItems": succeeded_items,
+                    "failedItems": failed_items,
+                    "cancelledItems": cancelled_items,
+                    "chunkCount": chunk_count,
+                    "resultHandle": { "batchId": batch_id },
+                });
+                if let Some(value) = reducer_output {
+                    payload["reducerOutput"] = value.clone();
                 }
-                WorkflowEvent::BulkActivityBatchFailed {
+                execution = artifact.execute_after_bulk_completion_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
                     batch_id,
-                    total_items,
-                    succeeded_items,
-                    failed_items,
-                    cancelled_items,
-                    chunk_count,
-                    message,
-                    ..
+                    &payload,
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                advanced = true;
+            }
+            WorkflowEvent::BulkActivityBatchFailed {
+                batch_id,
+                total_items,
+                succeeded_items,
+                failed_items,
+                cancelled_items,
+                chunk_count,
+                message,
+                ..
+            }
+            | WorkflowEvent::BulkActivityBatchCancelled {
+                batch_id,
+                total_items,
+                succeeded_items,
+                failed_items,
+                cancelled_items,
+                chunk_count,
+                message,
+                ..
+            } => {
+                let mut payload = serde_json::json!({
+                    "batchId": batch_id,
+                    "status": if matches!(&event.payload, WorkflowEvent::BulkActivityBatchFailed { .. }) {
+                        "failed"
+                    } else {
+                        "cancelled"
+                    },
+                    "message": message,
+                    "totalItems": total_items,
+                    "succeededItems": succeeded_items,
+                    "failedItems": failed_items,
+                    "cancelledItems": cancelled_items,
+                    "chunkCount": chunk_count,
+                });
+                if let WorkflowEvent::BulkActivityBatchFailed {
+                    reducer_output: Some(value), ..
                 }
                 | WorkflowEvent::BulkActivityBatchCancelled {
-                    batch_id,
-                    total_items,
-                    succeeded_items,
-                    failed_items,
-                    cancelled_items,
-                    chunk_count,
-                    message,
+                    reducer_output: Some(value),
                     ..
-                } => {
-                    let mut payload = serde_json::json!({
-                        "batchId": batch_id,
-                        "status": if matches!(&event.payload, WorkflowEvent::BulkActivityBatchFailed { .. }) {
-                            "failed"
-                        } else {
-                            "cancelled"
-                        },
-                        "message": message,
-                        "totalItems": total_items,
-                        "succeededItems": succeeded_items,
-                        "failedItems": failed_items,
-                        "cancelledItems": cancelled_items,
-                        "chunkCount": chunk_count,
-                    });
-                    if let WorkflowEvent::BulkActivityBatchFailed {
-                        reducer_output: Some(value),
-                        ..
-                    }
-                    | WorkflowEvent::BulkActivityBatchCancelled {
-                        reducer_output: Some(value),
-                        ..
-                    } = &event.payload
-                    {
-                        payload["reducerOutput"] = value.clone();
-                    }
-                    execution = artifact.execute_after_bulk_failure_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        batch_id,
-                        &payload,
-                        execution_state_for_event(&replayed, Some(event)),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    advanced = true;
+                } = &event.payload
+                {
+                    payload["reducerOutput"] = value.clone();
                 }
-                WorkflowEvent::ChildWorkflowCompleted { child_id, output, .. } => {
-                    execution = artifact.execute_after_child_completion_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        child_id,
-                        output,
-                        execution_state_for_event(&replayed, Some(event)),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    advanced = true;
-                }
-                WorkflowEvent::ChildWorkflowFailed { child_id, error, .. }
-                | WorkflowEvent::ChildWorkflowCancelled { child_id, reason: error, .. }
-                | WorkflowEvent::ChildWorkflowTerminated { child_id, reason: error, .. } => {
-                    execution = artifact.execute_after_child_failure_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        child_id,
-                        error,
-                        execution_state_for_event(&replayed, Some(event)),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    advanced = true;
-                }
+                execution = artifact.execute_after_bulk_failure_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    batch_id,
+                    &payload,
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                advanced = true;
+            }
+            WorkflowEvent::ChildWorkflowCompleted { child_id, output, .. } => {
+                execution = artifact.execute_after_child_completion_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    child_id,
+                    output,
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                advanced = true;
+            }
+            WorkflowEvent::ChildWorkflowFailed { child_id, error, .. }
+            | WorkflowEvent::ChildWorkflowCancelled { child_id, reason: error, .. }
+            | WorkflowEvent::ChildWorkflowTerminated { child_id, reason: error, .. } => {
+                execution = artifact.execute_after_child_failure_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    child_id,
+                    error,
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                advanced = true;
+            }
             _ => {}
         }
         if advanced {
@@ -1629,108 +1628,83 @@ pub fn replay_compiled_history_trace_from_snapshot(
             continue;
         }
         match &event.payload {
-                WorkflowEvent::WorkflowCancellationRequested { reason } => {
-                    let execution = artifact.execute_after_workflow_cancellation_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        reason,
-                        execution_state_for_event(&replayed, Some(event)),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    apply_compiled_execution(&mut replayed, &execution);
-                }
-                WorkflowEvent::SignalReceived { signal_id, signal_type, payload } => {
-                    let current_state = replayed.current_state.as_deref().unwrap_or_default();
-                    let turn_context = ExecutionTurnContext {
+            WorkflowEvent::WorkflowCancellationRequested { reason } => {
+                let execution = artifact.execute_after_workflow_cancellation_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    reason,
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
                         event_id: event.event_id,
                         occurred_at: event.occurred_at,
-                    };
-                    let execution_state = execution_state_for_event(&replayed, Some(event));
-                    let execution = if artifact
-                        .expected_signal_type(current_state)?
-                        .is_some_and(|expected| expected == signal_type)
-                    {
-                        artifact.execute_after_signal_with_turn(
-                            current_state,
-                            signal_type,
-                            payload,
-                            execution_state,
-                            turn_context,
-                        )?
-                    } else if artifact.has_signal_handler(signal_type) {
-                        artifact.execute_signal_handler_with_turn(
-                            current_state,
-                            signal_id,
-                            signal_type,
-                            payload,
-                            execution_state,
-                            turn_context,
-                        )?
-                    } else if artifact.has_dynamic_signal_handler(&execution_state, signal_type) {
-                        artifact.execute_dynamic_signal_handler_with_turn(
-                            current_state,
-                            signal_type,
-                            payload,
-                            execution_state,
-                            turn_context,
-                        )?
-                    } else {
-                        artifact.execute_after_signal_with_turn(
-                            current_state,
-                            signal_type,
-                            payload,
-                            execution_state,
-                            turn_context,
-                        )?
-                    };
-                    apply_compiled_execution(&mut replayed, &execution);
-                }
-                WorkflowEvent::WorkflowUpdateAccepted { update_id, update_name, payload } => {
-                    let execution = artifact.execute_update_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        update_id,
-                        update_name,
+                    },
+                )?;
+                apply_compiled_execution(&mut replayed, &execution);
+            }
+            WorkflowEvent::SignalReceived { signal_id, signal_type, payload } => {
+                let current_state = replayed.current_state.as_deref().unwrap_or_default();
+                let turn_context = ExecutionTurnContext {
+                    event_id: event.event_id,
+                    occurred_at: event.occurred_at,
+                };
+                let execution_state = execution_state_for_event(&replayed, Some(event));
+                let execution = if artifact
+                    .expected_signal_type(current_state)?
+                    .is_some_and(|expected| expected == signal_type)
+                {
+                    artifact.execute_after_signal_with_turn(
+                        current_state,
+                        signal_type,
                         payload,
-                        execution_state_for_event(&replayed, Some(event)),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    apply_compiled_execution(&mut replayed, &execution);
-                }
-                WorkflowEvent::TimerFired { timer_id } => {
-                    if !is_internal_control_timer(timer_id) {
-                        match artifact.execute_after_timer_with_turn(
-                            replayed.current_state.as_deref().unwrap_or_default(),
-                            timer_id,
-                            execution_state_for_event(&replayed, Some(event)),
-                            ExecutionTurnContext {
-                                event_id: event.event_id,
-                                occurred_at: event.occurred_at,
-                            },
-                        ) {
-                            Ok(execution) => {
-                                remember_replay_dedupe_key(event, &mut seen_dedupe_keys);
-                                apply_compiled_execution(&mut replayed, &execution);
-                            }
-                            Err(error)
-                                if is_ignorable_duplicate_replay_error(
-                                    event,
-                                    &error,
-                                    &seen_dedupe_keys,
-                                ) => {}
-                            Err(error) => return Err(error.into()),
-                        }
-                    }
-                }
-                WorkflowEvent::ActivityTaskCompleted { activity_id, output, .. } => {
-                    match artifact.execute_after_step_completion_with_turn(
+                        execution_state,
+                        turn_context,
+                    )?
+                } else if artifact.has_signal_handler(signal_type) {
+                    artifact.execute_signal_handler_with_turn(
+                        current_state,
+                        signal_id,
+                        signal_type,
+                        payload,
+                        execution_state,
+                        turn_context,
+                    )?
+                } else if artifact.has_dynamic_signal_handler(&execution_state, signal_type) {
+                    artifact.execute_dynamic_signal_handler_with_turn(
+                        current_state,
+                        signal_type,
+                        payload,
+                        execution_state,
+                        turn_context,
+                    )?
+                } else {
+                    artifact.execute_after_signal_with_turn(
+                        current_state,
+                        signal_type,
+                        payload,
+                        execution_state,
+                        turn_context,
+                    )?
+                };
+                apply_compiled_execution(&mut replayed, &execution);
+            }
+            WorkflowEvent::WorkflowUpdateAccepted { update_id, update_name, payload } => {
+                let execution = artifact.execute_update_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    update_id,
+                    update_name,
+                    payload,
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                apply_compiled_execution(&mut replayed, &execution);
+            }
+            WorkflowEvent::TimerFired { timer_id } => {
+                if !is_internal_control_timer(timer_id) {
+                    match artifact.execute_after_timer_with_turn(
                         replayed.current_state.as_deref().unwrap_or_default(),
-                        activity_id,
-                        output,
+                        timer_id,
                         execution_state_for_event(&replayed, Some(event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,
@@ -1750,197 +1724,221 @@ pub fn replay_compiled_history_trace_from_snapshot(
                         Err(error) => return Err(error.into()),
                     }
                 }
-                WorkflowEvent::ActivityTaskFailed { activity_id, error, .. } => {
-                    match artifact.execute_after_step_failure_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        activity_id,
-                        error,
-                        execution_state_for_event(&replayed, Some(event)),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    ) {
-                        Ok(execution) => {
-                            remember_replay_dedupe_key(event, &mut seen_dedupe_keys);
-                            apply_compiled_execution(&mut replayed, &execution);
-                        }
-                        Err(error)
-                            if is_ignorable_duplicate_replay_error(
-                                event,
-                                &error,
-                                &seen_dedupe_keys,
-                            ) => {}
-                        Err(error) => return Err(error.into()),
+            }
+            WorkflowEvent::ActivityTaskCompleted { activity_id, output, .. } => {
+                match artifact.execute_after_step_completion_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    activity_id,
+                    output,
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                ) {
+                    Ok(execution) => {
+                        remember_replay_dedupe_key(event, &mut seen_dedupe_keys);
+                        apply_compiled_execution(&mut replayed, &execution);
                     }
+                    Err(error)
+                        if is_ignorable_duplicate_replay_error(
+                            event,
+                            &error,
+                            &seen_dedupe_keys,
+                        ) => {}
+                    Err(error) => return Err(error.into()),
                 }
-                WorkflowEvent::ActivityTaskTimedOut { activity_id, .. } => {
-                    match artifact.execute_after_step_failure_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        activity_id,
-                        "activity timed out",
-                        execution_state_for_event(&replayed, Some(event)),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    ) {
-                        Ok(execution) => {
-                            remember_replay_dedupe_key(event, &mut seen_dedupe_keys);
-                            apply_compiled_execution(&mut replayed, &execution);
-                        }
-                        Err(error)
-                            if is_ignorable_duplicate_replay_error(
-                                event,
-                                &error,
-                                &seen_dedupe_keys,
-                            ) => {}
-                        Err(error) => return Err(error.into()),
+            }
+            WorkflowEvent::ActivityTaskFailed { activity_id, error, .. } => {
+                match artifact.execute_after_step_failure_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    activity_id,
+                    error,
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                ) {
+                    Ok(execution) => {
+                        remember_replay_dedupe_key(event, &mut seen_dedupe_keys);
+                        apply_compiled_execution(&mut replayed, &execution);
                     }
+                    Err(error)
+                        if is_ignorable_duplicate_replay_error(
+                            event,
+                            &error,
+                            &seen_dedupe_keys,
+                        ) => {}
+                    Err(error) => return Err(error.into()),
                 }
-                WorkflowEvent::ActivityTaskCancelled { activity_id, reason, .. } => {
-                    match artifact.execute_after_step_cancellation_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        activity_id,
-                        reason,
-                        execution_state_for_event(&replayed, Some(event)),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    ) {
-                        Ok(execution) => {
-                            remember_replay_dedupe_key(event, &mut seen_dedupe_keys);
-                            apply_compiled_execution(&mut replayed, &execution);
-                        }
-                        Err(error)
-                            if is_ignorable_duplicate_replay_error(
-                                event,
-                                &error,
-                                &seen_dedupe_keys,
-                            ) => {}
-                        Err(error) => return Err(error.into()),
+            }
+            WorkflowEvent::ActivityTaskTimedOut { activity_id, .. } => {
+                match artifact.execute_after_step_failure_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    activity_id,
+                    "activity timed out",
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                ) {
+                    Ok(execution) => {
+                        remember_replay_dedupe_key(event, &mut seen_dedupe_keys);
+                        apply_compiled_execution(&mut replayed, &execution);
                     }
+                    Err(error)
+                        if is_ignorable_duplicate_replay_error(
+                            event,
+                            &error,
+                            &seen_dedupe_keys,
+                        ) => {}
+                    Err(error) => return Err(error.into()),
                 }
-                WorkflowEvent::BulkActivityBatchCompleted {
+            }
+            WorkflowEvent::ActivityTaskCancelled { activity_id, reason, .. } => {
+                match artifact.execute_after_step_cancellation_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    activity_id,
+                    reason,
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                ) {
+                    Ok(execution) => {
+                        remember_replay_dedupe_key(event, &mut seen_dedupe_keys);
+                        apply_compiled_execution(&mut replayed, &execution);
+                    }
+                    Err(error)
+                        if is_ignorable_duplicate_replay_error(
+                            event,
+                            &error,
+                            &seen_dedupe_keys,
+                        ) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            WorkflowEvent::BulkActivityBatchCompleted {
+                batch_id,
+                total_items,
+                succeeded_items,
+                failed_items,
+                cancelled_items,
+                chunk_count,
+                reducer_output,
+            } => {
+                let mut payload = serde_json::json!({
+                    "batchId": batch_id,
+                    "status": "completed",
+                    "totalItems": total_items,
+                    "succeededItems": succeeded_items,
+                    "failedItems": failed_items,
+                    "cancelledItems": cancelled_items,
+                    "chunkCount": chunk_count,
+                    "resultHandle": { "batchId": batch_id },
+                });
+                if let Some(value) = reducer_output {
+                    payload["reducerOutput"] = value.clone();
+                }
+                let execution = artifact.execute_after_bulk_completion_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
                     batch_id,
-                    total_items,
-                    succeeded_items,
-                    failed_items,
-                    cancelled_items,
-                    chunk_count,
-                    reducer_output,
-                } => {
-                    let mut payload = serde_json::json!({
-                        "batchId": batch_id,
-                        "status": "completed",
-                        "totalItems": total_items,
-                        "succeededItems": succeeded_items,
-                        "failedItems": failed_items,
-                        "cancelledItems": cancelled_items,
-                        "chunkCount": chunk_count,
-                        "resultHandle": { "batchId": batch_id },
-                    });
-                    if let Some(value) = reducer_output {
-                        payload["reducerOutput"] = value.clone();
-                    }
-                    let execution = artifact.execute_after_bulk_completion_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        batch_id,
-                        &payload,
-                        execution_state_for_event(&replayed, Some(event)),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    apply_compiled_execution(&mut replayed, &execution);
-                }
-                WorkflowEvent::BulkActivityBatchFailed {
-                    batch_id,
-                    total_items,
-                    succeeded_items,
-                    failed_items,
-                    cancelled_items,
-                    chunk_count,
-                    message,
-                    ..
+                    &payload,
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                apply_compiled_execution(&mut replayed, &execution);
+            }
+            WorkflowEvent::BulkActivityBatchFailed {
+                batch_id,
+                total_items,
+                succeeded_items,
+                failed_items,
+                cancelled_items,
+                chunk_count,
+                message,
+                ..
+            }
+            | WorkflowEvent::BulkActivityBatchCancelled {
+                batch_id,
+                total_items,
+                succeeded_items,
+                failed_items,
+                cancelled_items,
+                chunk_count,
+                message,
+                ..
+            } => {
+                let mut payload = serde_json::json!({
+                    "batchId": batch_id,
+                    "status": if matches!(&event.payload, WorkflowEvent::BulkActivityBatchFailed { .. }) {
+                        "failed"
+                    } else {
+                        "cancelled"
+                    },
+                    "message": message,
+                    "totalItems": total_items,
+                    "succeededItems": succeeded_items,
+                    "failedItems": failed_items,
+                    "cancelledItems": cancelled_items,
+                    "chunkCount": chunk_count,
+                });
+                if let WorkflowEvent::BulkActivityBatchFailed {
+                    reducer_output: Some(value), ..
                 }
                 | WorkflowEvent::BulkActivityBatchCancelled {
-                    batch_id,
-                    total_items,
-                    succeeded_items,
-                    failed_items,
-                    cancelled_items,
-                    chunk_count,
-                    message,
+                    reducer_output: Some(value),
                     ..
-                } => {
-                    let mut payload = serde_json::json!({
-                        "batchId": batch_id,
-                        "status": if matches!(&event.payload, WorkflowEvent::BulkActivityBatchFailed { .. }) {
-                            "failed"
-                        } else {
-                            "cancelled"
-                        },
-                        "message": message,
-                        "totalItems": total_items,
-                        "succeededItems": succeeded_items,
-                        "failedItems": failed_items,
-                        "cancelledItems": cancelled_items,
-                        "chunkCount": chunk_count,
-                    });
-                    if let WorkflowEvent::BulkActivityBatchFailed {
-                        reducer_output: Some(value),
-                        ..
-                    }
-                    | WorkflowEvent::BulkActivityBatchCancelled {
-                        reducer_output: Some(value),
-                        ..
-                    } = &event.payload
-                    {
-                        payload["reducerOutput"] = value.clone();
-                    }
-                    let execution = artifact.execute_after_bulk_failure_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        batch_id,
-                        &payload,
-                        execution_state_for_event(&replayed, Some(event)),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    apply_compiled_execution(&mut replayed, &execution);
+                } = &event.payload
+                {
+                    payload["reducerOutput"] = value.clone();
                 }
-                WorkflowEvent::ChildWorkflowCompleted { child_id, output, .. } => {
-                    let execution = artifact.execute_after_child_completion_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        child_id,
-                        output,
-                        execution_state_for_event(&replayed, Some(event)),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    apply_compiled_execution(&mut replayed, &execution);
-                }
-                WorkflowEvent::ChildWorkflowFailed { child_id, error, .. }
-                | WorkflowEvent::ChildWorkflowCancelled { child_id, reason: error, .. }
-                | WorkflowEvent::ChildWorkflowTerminated { child_id, reason: error, .. } => {
-                    let execution = artifact.execute_after_child_failure_with_turn(
-                        replayed.current_state.as_deref().unwrap_or_default(),
-                        child_id,
-                        error,
-                        execution_state_for_event(&replayed, Some(event)),
-                        ExecutionTurnContext {
-                            event_id: event.event_id,
-                            occurred_at: event.occurred_at,
-                        },
-                    )?;
-                    apply_compiled_execution(&mut replayed, &execution);
-                }
+                let execution = artifact.execute_after_bulk_failure_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    batch_id,
+                    &payload,
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                apply_compiled_execution(&mut replayed, &execution);
+            }
+            WorkflowEvent::ChildWorkflowCompleted { child_id, output, .. } => {
+                let execution = artifact.execute_after_child_completion_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    child_id,
+                    output,
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                apply_compiled_execution(&mut replayed, &execution);
+            }
+            WorkflowEvent::ChildWorkflowFailed { child_id, error, .. }
+            | WorkflowEvent::ChildWorkflowCancelled { child_id, reason: error, .. }
+            | WorkflowEvent::ChildWorkflowTerminated { child_id, reason: error, .. } => {
+                let execution = artifact.execute_after_child_failure_with_turn(
+                    replayed.current_state.as_deref().unwrap_or_default(),
+                    child_id,
+                    error,
+                    execution_state_for_event(&replayed, Some(event)),
+                    ExecutionTurnContext {
+                        event_id: event.event_id,
+                        occurred_at: event.occurred_at,
+                    },
+                )?;
+                apply_compiled_execution(&mut replayed, &execution);
+            }
             _ => {}
         }
         transitions.push(ReplayTransitionTraceEntry {

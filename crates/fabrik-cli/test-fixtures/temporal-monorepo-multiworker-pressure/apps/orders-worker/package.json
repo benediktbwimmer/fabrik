@@ -1,0 +1,10 @@
+{
+  "name": "@pressure/orders-worker",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@pressure/orders-activities": "*",
+    "@pressure/shared": "*",
+    "@temporalio/worker": "^1.15.0"
+  }
+}

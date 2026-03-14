@@ -1224,11 +1224,7 @@ fn build_worker_packages(
                 None
             };
         let resolved_activity_runtime_helper_path = if worker.activity_runtime_helper {
-            Some(generate_activity_runtime_helper(
-                project_root,
-                &dist_dir,
-                worker,
-            )?)
+            Some(generate_activity_runtime_helper(project_root, &dist_dir, worker)?)
         } else {
             None
         };
@@ -1293,31 +1289,28 @@ fn build_worker_packages(
 
 fn preferred_packaged_workers(workers: &[DiscoveredWorker]) -> Vec<&DiscoveredWorker> {
     let has_non_test = workers.iter().any(|worker| !is_test_worker_source(&worker.file));
-    workers
-        .iter()
-        .filter(|worker| !has_non_test || !is_test_worker_source(&worker.file))
-        .collect()
+    workers.iter().filter(|worker| !has_non_test || !is_test_worker_source(&worker.file)).collect()
 }
 
 fn is_test_worker_source(file: &str) -> bool {
     let path = Path::new(file);
     if path.components().any(|component| {
-        matches!(
-            component.as_os_str().to_str(),
-            Some("test") | Some("tests") | Some("__tests__")
-        )
+        matches!(component.as_os_str().to_str(), Some("test") | Some("tests") | Some("__tests__"))
     }) {
         return true;
     }
-    path.file_name().and_then(|value| value.to_str()).is_some_and(|name| {
-        name.contains(".test.") || name.contains(".spec.")
-    })
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| name.contains(".test.") || name.contains(".spec."))
 }
 
 fn transpile_project_into(project_root: &Path, dist_dir: &Path) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to read current directory")?;
-    let project_root_abs =
-        if project_root.is_absolute() { project_root.to_path_buf() } else { cwd.join(project_root) };
+    let project_root_abs = if project_root.is_absolute() {
+        project_root.to_path_buf()
+    } else {
+        cwd.join(project_root)
+    };
     let dist_dir_abs =
         if dist_dir.is_absolute() { dist_dir.to_path_buf() } else { cwd.join(dist_dir) };
     if dist_dir.exists() && dist_dir.read_dir()?.next().is_some() {
@@ -1404,13 +1397,11 @@ fn generate_activity_runtime_helper(
     if !generator.exists() {
         bail!("missing worker runtime helper generator at {}", generator.display());
     }
-    let worker_js = transpiled_output_path(project_root, dist_dir, &project_root.join(&worker.file))?;
+    let worker_js =
+        transpiled_output_path(project_root, dist_dir, &project_root.join(&worker.file))?;
     let helper_path = worker_js.with_file_name(format!(
         "{}.fabrik-runtime-helper.mjs",
-        worker_js
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or("worker")
+        worker_js.file_stem().and_then(|value| value.to_str()).unwrap_or("worker")
     ));
     let output = Command::new("node")
         .arg(&generator)

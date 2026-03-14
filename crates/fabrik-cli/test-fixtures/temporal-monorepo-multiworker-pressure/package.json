@@ -1,0 +1,8 @@
+{
+  "name": "temporal-monorepo-multiworker-pressure",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ]
+}

@@ -52,6 +52,10 @@ The latest compiler, runtime, and packaging passes materially shifted the remain
   - `worker-versioning-replay-demo` qualifies in `target/external-repo-qualification/app-batch/worker-versioning-replay-demo/migration-report.json`
   - `worker-versioning-replay-demo` now also has a passing replay/restart/rollback drill in `target/alpha-drills/worker-versioning-replay-demo/worker-versioning-replay-demo-drill-report.json`
   - `temporal-worker-versioning-typescript` is blocked only by top-level side effects in `src/commit-b/workflows.ts`
+- an internal pressure-repo set now exists for continued engineering coverage when external repos are limited:
+  - definition doc: `docs/pressure-repos.md`
+  - batch summary: `target/pressure-repo-qualification/summary.json`
+  - current status: `5/5` qualified with caveats
 - The remaining explicit unsupported-import census is now dominated by:
   - `WorkflowInterceptors`: `1`
   - `Sinks`: `1`

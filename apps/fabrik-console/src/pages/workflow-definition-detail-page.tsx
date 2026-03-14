@@ -12,6 +12,15 @@ import { useTenant } from "../lib/tenant-context";
 const TABS = ["overview", "graph"] as const;
 type Tab = (typeof TABS)[number];
 
+function labelFromSnakeCase(value: string | null | undefined) {
+  if (!value) return "-";
+  return value
+    .split("_")
+    .filter(Boolean)
+    .map((segment) => segment[0]?.toUpperCase() + segment.slice(1))
+    .join(" ");
+}
+
 export function WorkflowDefinitionDetailPage() {
   const { definitionId = "" } = useParams();
   const { tenantId } = useTenant();
@@ -180,6 +189,10 @@ export function WorkflowDefinitionDetailPage() {
                   </div>
                   <div className="muted">
                     {run.run_id} · {formatDate(run.last_transition_at)}
+                  </div>
+                  <div className="muted">
+                    {labelFromSnakeCase(run.execution_path)} · {run.routing_status}
+                    {run.fast_path_rejection_reason ? ` · fallback ${labelFromSnakeCase(run.fast_path_rejection_reason)}` : ""}
                   </div>
                 </Link>
               ))}

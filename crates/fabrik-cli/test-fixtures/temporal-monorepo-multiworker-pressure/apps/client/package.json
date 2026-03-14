@@ -1,0 +1,9 @@
+{
+  "name": "@pressure/client",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@pressure/shared": "*",
+    "@temporalio/client": "^1.15.0"
+  }
+}

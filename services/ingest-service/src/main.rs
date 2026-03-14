@@ -22,19 +22,17 @@ use fabrik_store::{
 };
 use fabrik_throughput::{
     ADMISSION_POLICY_VERSION, BENCHMARK_ECHO_ACTIVITY, BENCHMARK_FAST_COUNT_ACTIVITY,
-    FastPathRejectionReason, PayloadHandle, ThroughputBackend, WorkflowExecutionPath,
-    execute_benchmark_echo,
-    TinyWorkflowExecutionMode, TinyWorkflowStartBatchCommand, TinyWorkflowStartCommand,
-    TinyWorkflowStartItem, ThroughputCommand, ThroughputCommandEnvelope,
-    can_inline_durable_tiny_fanout, can_inline_stream_v2_microbatch,
-    tiny_workflow_routing_decision,
+    FastPathRejectionReason, PayloadHandle, ThroughputBackend, ThroughputCommand,
+    ThroughputCommandEnvelope, TinyWorkflowExecutionMode, TinyWorkflowStartBatchCommand,
+    TinyWorkflowStartCommand, TinyWorkflowStartItem, WorkflowExecutionPath,
+    can_inline_durable_tiny_fanout, can_inline_stream_v2_microbatch, execute_benchmark_echo,
     parse_benchmark_compact_input_spec, parse_benchmark_compact_total_items_from_handle,
+    tiny_workflow_routing_decision,
 };
 use fabrik_workflow::{
     CompiledExecutionPlan, CompiledWorkflowArtifact, ExecutionTurnContext, ReplayDivergence,
     WorkflowDefinition, WorkflowInstanceState, WorkflowStatus, artifact_hash,
-    execution_state_for_event,
-    validate_compiled_artifact_history_compatibility,
+    execution_state_for_event, validate_compiled_artifact_history_compatibility,
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -105,11 +103,7 @@ struct TopicAdapterOwnershipLost {
 
 impl TopicAdapterOwnershipLost {
     fn new(tenant_id: &str, adapter_id: &str, owner_epoch: u64) -> Self {
-        Self {
-            tenant_id: tenant_id.to_owned(),
-            adapter_id: adapter_id.to_owned(),
-            owner_epoch,
-        }
+        Self { tenant_id: tenant_id.to_owned(), adapter_id: adapter_id.to_owned(), owner_epoch }
     }
 }
 
@@ -243,6 +237,17 @@ struct SignalWorkflowResponse {
     signal_type: String,
     event_id: Uuid,
     status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TopicAdapterDeadLetterReplayResponse {
+    tenant_id: String,
+    adapter_id: String,
+    partition_id: i32,
+    log_offset: i64,
+    replayed: bool,
+    status: String,
+    dead_letter: fabrik_store::TopicAdapterDeadLetterRecord,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -408,6 +413,10 @@ async fn main() -> Result<()> {
         "/tenants/{tenant_id}/workflows/{workflow_instance_id}/activities/{activity_id}/cancel",
         post(cancel_activity),
     )
+    .route(
+        "/admin/tenants/{tenant_id}/topic-adapters/{adapter_id}/dead-letters/{partition_id}/{log_offset}/replay",
+        post(replay_topic_adapter_dead_letter),
+    )
     .with_state(state.clone());
 
     tokio::spawn(run_topic_adapter_manager(state.clone()));
@@ -503,8 +512,8 @@ async fn run_tiny_workflow_start_batcher(
 ) {
     while let Some(first) = receiver.recv().await {
         let mut pending = vec![first];
-        let deadline =
-            tokio::time::Instant::now() + Duration::from_millis(TINY_WORKFLOW_SINGLE_START_BATCH_DELAY_MS);
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(TINY_WORKFLOW_SINGLE_START_BATCH_DELAY_MS);
         while pending.len() < TINY_WORKFLOW_SINGLE_START_BATCH_SIZE {
             match tokio::time::timeout_at(deadline, receiver.recv()).await {
                 Ok(Some(item)) => pending.push(item),
@@ -696,11 +705,10 @@ async fn run_topic_adapter_worker(state: AppState, adapter: TopicAdapterRecord) 
             "topic adapter worker claimed ownership"
         );
 
-        if let Err(error) = run_topic_adapter_consumer_pass(&state, &adapter, ownership.owner_epoch).await {
-            if error
-                .downcast_ref::<TopicAdapterOwnershipLost>()
-                .is_some()
-            {
+        if let Err(error) =
+            run_topic_adapter_consumer_pass(&state, &adapter, ownership.owner_epoch).await
+        {
+            if error.downcast_ref::<TopicAdapterOwnershipLost>().is_some() {
                 info!(
                     tenant_id = %adapter.tenant_id,
                     adapter_id = %adapter.adapter_id,
@@ -762,10 +770,7 @@ async fn run_topic_adapter_consumer_pass(
         .collect::<HashMap<_, _>>();
     let mut consumer = build_json_consumer_from_offsets(
         &config,
-        &format!(
-            "topic-adapter-{}-{}-{}",
-            adapter.tenant_id, adapter.adapter_id, state.runtime_id
-        ),
+        &format!("topic-adapter-{}-{}-{}", adapter.tenant_id, adapter.adapter_id, state.runtime_id),
         &start_offsets,
         &partitions,
     )
@@ -949,7 +954,6 @@ async fn run_topic_adapter_consumer_pass(
             }
         }
     }
-
 }
 
 async fn dispatch_topic_adapter_record(
@@ -962,37 +966,137 @@ async fn dispatch_topic_adapter_record(
     let preview = resolve_topic_adapter_dispatch(adapter, payload, partition_id, log_offset)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     match preview.dispatch {
-        TopicAdapterResolvedDispatch::StartWorkflow(request) => {
-            handle_trigger_workflow(
-                state,
-                &request.definition_id,
-                TriggerWorkflowRequest {
-                    tenant_id: adapter.tenant_id.clone(),
-                    instance_id: request.instance_id,
-                    workflow_task_queue: request.workflow_task_queue,
-                    input: request.input,
-                    memo: request.memo,
-                    search_attributes: request.search_attributes,
-                    request_id: Some(request.request_id),
-                },
+        TopicAdapterResolvedDispatch::StartWorkflow(request) => handle_trigger_workflow(
+            state,
+            &request.definition_id,
+            TriggerWorkflowRequest {
+                tenant_id: adapter.tenant_id.clone(),
+                instance_id: request.instance_id,
+                workflow_task_queue: request.workflow_task_queue,
+                input: request.input,
+                memo: request.memo,
+                search_attributes: request.search_attributes,
+                request_id: Some(request.request_id),
+            },
+        )
+        .await
+        .map(|_| ()),
+        TopicAdapterResolvedDispatch::SignalWorkflow(request) => handle_signal_workflow(
+            state,
+            &adapter.tenant_id,
+            &request.instance_id,
+            &request.signal_type,
+            SignalWorkflowRequest {
+                payload: request.payload,
+                dedupe_key: request.dedupe_key,
+                request_id: Some(request.request_id),
+            },
+        )
+        .await
+        .map(|_| ()),
+    }
+}
+
+async fn replay_topic_adapter_dead_letter(
+    Path((tenant_id, adapter_id, partition_id, log_offset)): Path<(String, String, i32, i64)>,
+    State(state): State<AppState>,
+) -> Result<Json<TopicAdapterDeadLetterReplayResponse>, (StatusCode, String)> {
+    let adapter = state
+        .store
+        .get_topic_adapter(&tenant_id, &adapter_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("topic adapter {adapter_id} not found for tenant {tenant_id}"),
             )
-            .await
-            .map(|_| ())
+        })?;
+    let dead_letter = state
+        .store
+        .get_topic_adapter_dead_letter(&tenant_id, &adapter_id, partition_id, log_offset)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "topic adapter dead letter {tenant_id}/{adapter_id}/{partition_id}/{log_offset} not found"
+                ),
+            )
+        })?;
+
+    match dispatch_topic_adapter_record(
+        &state,
+        &adapter,
+        &dead_letter.payload,
+        partition_id,
+        log_offset,
+    )
+    .await
+    {
+        Ok(()) => {
+            let updated = state
+                .store
+                .record_topic_adapter_dead_letter_replay_result(
+                    &tenant_id,
+                    &adapter_id,
+                    partition_id,
+                    log_offset,
+                    Utc::now(),
+                    None,
+                    true,
+                )
+                .await
+                .map_err(internal_error)?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        format!(
+                            "topic adapter dead letter {tenant_id}/{adapter_id}/{partition_id}/{log_offset} disappeared during replay"
+                        ),
+                    )
+                })?;
+            Ok(Json(TopicAdapterDeadLetterReplayResponse {
+                tenant_id,
+                adapter_id,
+                partition_id,
+                log_offset,
+                replayed: true,
+                status: "replayed".to_owned(),
+                dead_letter: updated,
+            }))
         }
-        TopicAdapterResolvedDispatch::SignalWorkflow(request) => {
-            handle_signal_workflow(
-                state,
-                &adapter.tenant_id,
-                &request.instance_id,
-                &request.signal_type,
-                SignalWorkflowRequest {
-                    payload: request.payload,
-                    dedupe_key: request.dedupe_key,
-                    request_id: Some(request.request_id),
+        Err((status, message)) => {
+            let replay_error = format!("{}: {}", status.as_u16(), message);
+            let updated = state
+                .store
+                .record_topic_adapter_dead_letter_replay_result(
+                    &tenant_id,
+                    &adapter_id,
+                    partition_id,
+                    log_offset,
+                    Utc::now(),
+                    Some(&replay_error),
+                    false,
+                )
+                .await
+                .map_err(internal_error)?;
+            Err((
+                status,
+                if let Some(dead_letter) = updated {
+                    format!(
+                        "{message}\nreplay_count={}; resolved_at={}",
+                        dead_letter.replay_count,
+                        dead_letter
+                            .resolved_at
+                            .map(|value| value.to_rfc3339())
+                            .unwrap_or_else(|| "null".to_owned())
+                    )
+                } else {
+                    message
                 },
-            )
-            .await
-            .map(|_| ())
+            ))
         }
     }
 }
@@ -1247,9 +1351,13 @@ async fn handle_trigger_workflow(
             return Ok(response);
         }
     }
-    let resolved =
-        resolve_trigger_target(state, &request.tenant_id, definition_id, request.workflow_task_queue.as_deref())
-            .await?;
+    let resolved = resolve_trigger_target(
+        state,
+        &request.tenant_id,
+        definition_id,
+        request.workflow_task_queue.as_deref(),
+    )
+    .await?;
 
     let instance_id =
         request.instance_id.clone().unwrap_or_else(|| format!("wf-{}", Uuid::now_v7()));
@@ -1270,16 +1378,12 @@ async fn handle_trigger_workflow(
             memo: request.memo.clone(),
             search_attributes: request.search_attributes.clone(),
         };
-        let completed_inline = submit_tiny_workflow_start_inline(state, &resolved, mode, item.clone())
-            .await
-            .map_err(internal_error)?;
+        let completed_inline =
+            submit_tiny_workflow_start_inline(state, &resolved, mode, item.clone())
+                .await
+                .map_err(internal_error)?;
         if !completed_inline {
-            publish_tiny_workflow_start(
-                state,
-                &resolved,
-                mode,
-                item.clone(),
-                )
+            publish_tiny_workflow_start(state, &resolved, mode, item.clone())
                 .await
                 .map_err(internal_error)?;
             state
@@ -1357,9 +1461,7 @@ async fn handle_trigger_workflow(
         WorkflowExecutionPath::LegacyWorkflow.as_str().to_owned(),
     );
     if let Some(reason) = fast_path_rejection_reason.as_deref() {
-        envelope
-            .metadata
-            .insert("fast_path_rejection_reason".to_owned(), reason.to_owned());
+        envelope.metadata.insert("fast_path_rejection_reason".to_owned(), reason.to_owned());
     }
 
     state.publisher.publish(&envelope, &envelope.partition_key).await.map_err(internal_error)?;
@@ -1424,11 +1526,18 @@ async fn handle_trigger_workflow_batch(
     request: TriggerWorkflowBatchRequest,
 ) -> Result<TriggerWorkflowBatchResponse, (StatusCode, String)> {
     if request.items.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "trigger batch requires at least one item".to_owned()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "trigger batch requires at least one item".to_owned(),
+        ));
     }
-    let resolved =
-        resolve_trigger_target(state, &request.tenant_id, definition_id, request.workflow_task_queue.as_deref())
-            .await?;
+    let resolved = resolve_trigger_target(
+        state,
+        &request.tenant_id,
+        definition_id,
+        request.workflow_task_queue.as_deref(),
+    )
+    .await?;
     let mut items = Vec::with_capacity(request.items.len());
     for item in &request.items {
         let routing = analyze_tiny_workflow_eligibility(&resolved.artifact, &item.input)?;
@@ -1450,7 +1559,10 @@ async fn handle_trigger_workflow_batch(
                 .expect("first batch item remains eligible")
                 .mode
         {
-            return Err((StatusCode::BAD_REQUEST, "trigger batch items must share one tiny-workflow execution mode".to_owned()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "trigger batch items must share one tiny-workflow execution mode".to_owned(),
+            ));
         }
         items.push(TinyWorkflowStartItem {
             instance_id: item.instance_id.clone(),
@@ -1583,11 +1695,12 @@ async fn resolve_trigger_target(
 fn analyze_tiny_workflow_eligibility(
     artifact: &CompiledWorkflowArtifact,
     input: &Value,
-) -> Result<std::result::Result<TinyWorkflowRoutingOutcome, FastPathRejectionReason>, (StatusCode, String)> {
-    let turn_context = fabrik_workflow::ExecutionTurnContext {
-        event_id: Uuid::now_v7(),
-        occurred_at: Utc::now(),
-    };
+) -> Result<
+    std::result::Result<TinyWorkflowRoutingOutcome, FastPathRejectionReason>,
+    (StatusCode, String),
+> {
+    let turn_context =
+        fabrik_workflow::ExecutionTurnContext { event_id: Uuid::now_v7(), occurred_at: Utc::now() };
     let plan = artifact
         .execute_trigger_with_turn(input, turn_context)
         .map_err(|error| internal_error(error.into()))?;
@@ -1603,11 +1716,9 @@ fn analyze_tiny_workflow_eligibility(
 fn tiny_workflow_throughput_mode(
     plan: &CompiledExecutionPlan,
 ) -> Option<std::result::Result<TinyWorkflowRoutingOutcome, FastPathRejectionReason>> {
-    let Some(emission) = plan
-        .emissions
-        .iter()
-        .find(|emission| matches!(emission.event, WorkflowEvent::BulkActivityBatchScheduled { .. }))
-    else {
+    let Some(emission) = plan.emissions.iter().find(|emission| {
+        matches!(emission.event, WorkflowEvent::BulkActivityBatchScheduled { .. })
+    }) else {
         return None;
     };
     let WorkflowEvent::BulkActivityBatchScheduled {
@@ -1629,15 +1740,14 @@ fn tiny_workflow_throughput_mode(
         };
         parse_benchmark_compact_total_items_from_handle(&handle)
             .map(|count| count as usize)
-            .unwrap_or_else(|| parse_benchmark_compact_input_spec(input_handle).unwrap_or_default() as usize)
+            .unwrap_or_else(|| {
+                parse_benchmark_compact_input_spec(input_handle).unwrap_or_default() as usize
+            })
     } else {
         items.len()
     };
-    let chunk_count = if *chunk_size == 0 {
-        0
-    } else {
-        total_items.div_ceil(*chunk_size as usize) as u32
-    };
+    let chunk_count =
+        if *chunk_size == 0 { 0 } else { total_items.div_ceil(*chunk_size as usize) as u32 };
     Some(
         tiny_workflow_routing_decision(
             activity_type,
@@ -1662,16 +1772,14 @@ fn tiny_workflow_durable_mode(
     if plan.emissions.is_empty() {
         return None;
     }
-    let Some((activity_type, reducer)) = artifact.workflow.states.values().find_map(|state| {
-        match state {
-            fabrik_workflow::CompiledStateNode::FanOut { activity_type, reducer, retry, .. }
-                if retry.is_none() =>
-            {
-                Some((activity_type.clone(), reducer.clone()))
-            }
+    let Some((activity_type, reducer)) =
+        artifact.workflow.states.values().find_map(|state| match state {
+            fabrik_workflow::CompiledStateNode::FanOut {
+                activity_type, reducer, retry, ..
+            } if retry.is_none() => Some((activity_type.clone(), reducer.clone())),
             _ => None,
-        }
-    }) else {
+        })
+    else {
         return None;
     };
     let mut items = Vec::with_capacity(plan.emissions.len());
@@ -1768,7 +1876,8 @@ async fn try_execute_tiny_workflow_start_inline(
         &resolved.artifact_hash,
         mode,
         item.clone(),
-    )? else {
+    )?
+    else {
         return Ok(false);
     };
     state
@@ -1853,16 +1962,21 @@ fn prepare_tiny_workflow_completion(
     };
     apply_compiled_plan(&mut instance, &plan);
     let completed = match mode {
-        TinyWorkflowExecutionMode::Throughput => try_inline_stream_v2_microbatch_trigger_completion(
+        TinyWorkflowExecutionMode::Throughput => {
+            try_inline_stream_v2_microbatch_trigger_completion(
+                artifact,
+                &mut instance,
+                &plan,
+                item.trigger_event_id,
+                item.accepted_at,
+            )?
+        }
+        TinyWorkflowExecutionMode::Durable => try_inline_durable_tiny_workflow_completion(
             artifact,
             &mut instance,
             &plan,
-            item.trigger_event_id,
             item.accepted_at,
         )?,
-        TinyWorkflowExecutionMode::Durable => {
-            try_inline_durable_tiny_workflow_completion(artifact, &mut instance, &plan, item.accepted_at)?
-        }
     };
     if !completed || !instance.status.is_terminal() {
         return Ok(None);
@@ -1909,9 +2023,7 @@ fn tiny_workflow_trigger_event(
     );
     event.event_id = item.trigger_event_id;
     event.occurred_at = item.accepted_at;
-    event
-        .metadata
-        .insert("workflow_task_queue".to_owned(), workflow_task_queue.to_owned());
+    event.metadata.insert("workflow_task_queue".to_owned(), workflow_task_queue.to_owned());
     if let Some(memo) = item.memo.as_ref() {
         event.metadata.insert(
             "memo_json".to_owned(),
@@ -1951,28 +2063,21 @@ fn try_inline_durable_tiny_workflow_completion(
     plan: &CompiledExecutionPlan,
     occurred_at: DateTime<Utc>,
 ) -> Result<bool> {
-    let Some((activity_type, reducer)) = artifact.workflow.states.values().find_map(|state| {
-        match state {
-            fabrik_workflow::CompiledStateNode::FanOut { activity_type, reducer, retry, .. }
-                if retry.is_none() =>
-            {
-                Some((activity_type.clone(), reducer.clone()))
-            }
+    let Some((activity_type, reducer)) =
+        artifact.workflow.states.values().find_map(|state| match state {
+            fabrik_workflow::CompiledStateNode::FanOut {
+                activity_type, reducer, retry, ..
+            } if retry.is_none() => Some((activity_type.clone(), reducer.clone())),
             _ => None,
-        }
-    }) else {
+        })
+    else {
         return Ok(false);
     };
     let mut scheduled = Vec::new();
     for emission in &plan.emissions {
         match &emission.event {
             WorkflowEvent::WorkflowStarted => continue,
-            WorkflowEvent::ActivityTaskScheduled {
-                activity_id,
-                input,
-                attempt,
-                ..
-            } => {
+            WorkflowEvent::ActivityTaskScheduled { activity_id, input, attempt, .. } => {
                 if *attempt != 1 {
                     return Ok(false);
                 }
@@ -1991,8 +2096,10 @@ fn try_inline_durable_tiny_workflow_completion(
         } else {
             execute_benchmark_echo(1, &input)?
         };
-        let current_state =
-            instance.current_state.clone().unwrap_or_else(|| artifact.workflow.initial_state.clone());
+        let current_state = instance
+            .current_state
+            .clone()
+            .unwrap_or_else(|| artifact.workflow.initial_state.clone());
         let completion = artifact.execute_after_step_completion_with_turn(
             &current_state,
             &activity_id,
@@ -2077,11 +2184,8 @@ fn try_inline_stream_v2_microbatch_trigger_completion(
     } else {
         items.len()
     };
-    let chunk_count = if *chunk_size == 0 {
-        0
-    } else {
-        total_items.div_ceil(*chunk_size as usize) as u32
-    };
+    let chunk_count =
+        if *chunk_size == 0 { 0 } else { total_items.div_ceil(*chunk_size as usize) as u32 };
     if !can_inline_stream_v2_microbatch(
         activity_type,
         reducer.as_deref(),
@@ -2164,9 +2268,7 @@ fn tiny_inline_bulk_terminal_event(
     envelope
         .metadata
         .insert("throughput_backend".to_owned(), ThroughputBackend::StreamV2.as_str().to_owned());
-    envelope
-        .metadata
-        .insert("routing_reason".to_owned(), "inline_microbatch".to_owned());
+    envelope.metadata.insert("routing_reason".to_owned(), "inline_microbatch".to_owned());
     envelope
         .metadata
         .insert("admission_policy_version".to_owned(), ADMISSION_POLICY_VERSION.to_owned());
@@ -2261,10 +2363,7 @@ async fn publish_tiny_workflow_start(
         fast_path_rejection_reason: None,
     };
     state.store.upsert_workflow_fast_starts(&[record]).await?;
-    state
-        .throughput_command_publisher
-        .publish(&command, &command.partition_key)
-        .await
+    state.throughput_command_publisher.publish(&command, &command.partition_key).await
 }
 
 async fn publish_tiny_workflow_batch(
@@ -2274,8 +2373,7 @@ async fn publish_tiny_workflow_batch(
     items: Vec<TinyWorkflowStartItem>,
 ) -> Result<()> {
     let occurred_at = Utc::now();
-    let dedupe_key =
-        format!("tiny-workflow-batch:{}:{}", resolved.definition_id, Uuid::now_v7());
+    let dedupe_key = format!("tiny-workflow-batch:{}:{}", resolved.definition_id, Uuid::now_v7());
     let command = ThroughputCommandEnvelope {
         command_id: Uuid::now_v7(),
         occurred_at,
@@ -2323,10 +2421,7 @@ async fn publish_tiny_workflow_batch(
         })
         .collect::<Vec<_>>();
     state.store.upsert_workflow_fast_starts(&records).await?;
-    state
-        .throughput_command_publisher
-        .publish(&command, &command.partition_key)
-        .await
+    state.throughput_command_publisher.publish(&command, &command.partition_key).await
 }
 
 async fn handle_signal_workflow(
@@ -3395,7 +3490,9 @@ mod tests {
     ) -> Result<fabrik_store::TopicAdapterOwnershipRecord> {
         let deadline = Instant::now() + StdDuration::from_secs(20);
         loop {
-            if let Some(ownership) = store.get_topic_adapter_ownership(tenant_id, adapter_id).await? {
+            if let Some(ownership) =
+                store.get_topic_adapter_ownership(tenant_id, adapter_id).await?
+            {
                 if ownership.owner_id == owner_id {
                     return Ok(ownership);
                 }
@@ -3451,9 +3548,11 @@ mod tests {
 
         let worker_state = state.clone();
         let worker_adapter = adapter.clone();
-        let owner_epoch = claim_adapter_for_state(&store, &worker_state, "tenant-a", "orders").await?;
+        let owner_epoch =
+            claim_adapter_for_state(&store, &worker_state, "tenant-a", "orders").await?;
         let worker = tokio::spawn(async move {
-            let _ = run_topic_adapter_consumer_pass(&worker_state, &worker_adapter, owner_epoch).await;
+            let _ =
+                run_topic_adapter_consumer_pass(&worker_state, &worker_adapter, owner_epoch).await;
         });
 
         let publisher = redpanda.connect_json_publisher("orders.events", 1).await?;
@@ -3500,9 +3599,11 @@ mod tests {
         worker.abort();
         let worker_state = state.clone();
         let worker_adapter = adapter.clone();
-        let owner_epoch = claim_adapter_for_state(&store, &worker_state, "tenant-a", "orders").await?;
+        let owner_epoch =
+            claim_adapter_for_state(&store, &worker_state, "tenant-a", "orders").await?;
         let replay_worker = tokio::spawn(async move {
-            let _ = run_topic_adapter_consumer_pass(&worker_state, &worker_adapter, owner_epoch).await;
+            let _ =
+                run_topic_adapter_consumer_pass(&worker_state, &worker_adapter, owner_epoch).await;
         });
         sleep(StdDuration::from_millis(750)).await;
         replay_worker.abort();
@@ -3606,7 +3707,8 @@ mod tests {
         let owner_epoch =
             claim_adapter_for_state(&store, &worker_state, "tenant-a", "approvals").await?;
         let worker = tokio::spawn(async move {
-            let _ = run_topic_adapter_consumer_pass(&worker_state, &worker_adapter, owner_epoch).await;
+            let _ =
+                run_topic_adapter_consumer_pass(&worker_state, &worker_adapter, owner_epoch).await;
         });
 
         let publisher = redpanda.connect_json_publisher("approvals.events", 1).await?;
@@ -3686,7 +3788,8 @@ mod tests {
         let owner_epoch =
             claim_adapter_for_state(&store, &worker_state, "tenant-a", "orders-invalid").await?;
         let worker = tokio::spawn(async move {
-            let _ = run_topic_adapter_consumer_pass(&worker_state, &worker_adapter, owner_epoch).await;
+            let _ =
+                run_topic_adapter_consumer_pass(&worker_state, &worker_adapter, owner_epoch).await;
         });
 
         let publisher = redpanda.connect_json_publisher("orders.invalid", 1).await?;
@@ -3775,7 +3878,8 @@ mod tests {
             )
             .await?;
 
-        let adapter_state = wait_for_adapter_counts(&store, "tenant-a", "orders-fenced", 1, 0).await?;
+        let adapter_state =
+            wait_for_adapter_counts(&store, "tenant-a", "orders-fenced", 1, 0).await?;
         assert_eq!(adapter_state.processed_count, 1);
 
         sleep(StdDuration::from_millis(500)).await;
@@ -3784,14 +3888,16 @@ mod tests {
             .await?
             .context("adapter ownership missing after worker start")?;
         assert!(matches!(ownership.owner_id.as_str(), "ingest-a" | "ingest-b"));
-        assert!(store
-            .validate_topic_adapter_ownership(
-                "tenant-a",
-                "orders-fenced",
-                &ownership.owner_id,
-                ownership.owner_epoch,
-            )
-            .await?);
+        assert!(
+            store
+                .validate_topic_adapter_ownership(
+                    "tenant-a",
+                    "orders-fenced",
+                    &ownership.owner_id,
+                    ownership.owner_epoch,
+                )
+                .await?
+        );
 
         let runs = store
             .list_runs_page_with_filters(
@@ -3887,7 +3993,8 @@ mod tests {
         }
 
         let takeover_start = Instant::now();
-        let takeover = wait_for_adapter_owner(&store, "tenant-a", "orders-failover", standby_owner).await?;
+        let takeover =
+            wait_for_adapter_owner(&store, "tenant-a", "orders-failover", standby_owner).await?;
         let takeover_duration = takeover_start.elapsed();
         assert_eq!(takeover.owner_epoch, expected_epoch);
         assert!(
@@ -3907,7 +4014,8 @@ mod tests {
             )
             .await?;
 
-        let adapter_state = wait_for_adapter_counts(&store, "tenant-a", "orders-failover", 2, 0).await?;
+        let adapter_state =
+            wait_for_adapter_counts(&store, "tenant-a", "orders-failover", 2, 0).await?;
         assert_eq!(adapter_state.failed_count, 0);
 
         let runs = store
@@ -3923,7 +4031,9 @@ mod tests {
             .await?;
         let failover_runs = runs
             .into_iter()
-            .filter(|run| run.instance_id == "order-failover-1" || run.instance_id == "order-failover-2")
+            .filter(|run| {
+                run.instance_id == "order-failover-1" || run.instance_id == "order-failover-2"
+            })
             .collect::<Vec<_>>();
         assert_eq!(failover_runs.len(), 2);
 

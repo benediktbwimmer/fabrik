@@ -604,10 +604,8 @@ pub async fn load_json_topic_latest_offsets(
                     config.topic_name
                 )
             })?;
-        let latest_offset = partition_client
-            .get_offset(OffsetAt::Latest)
-            .await
-            .with_context(|| {
+        let latest_offset =
+            partition_client.get_offset(OffsetAt::Latest).await.with_context(|| {
                 format!(
                     "failed to load latest offset for topic {} partition {partition_id}",
                     config.topic_name

@@ -985,8 +985,9 @@ async fn run_topic_adapter_benchmark(
     let executor_debug_delta_metrics =
         executor_debug_delta_metrics(executor_debug_delta.as_ref(), &activity_metrics);
     let failover_injection = load_failover_injection_metrics()?;
-    let adapter_metrics =
-        Some(load_topic_adapter_metrics(store, &adapter, &topic_config, max_adapter_lag_records).await?);
+    let adapter_metrics = Some(
+        load_topic_adapter_metrics(store, &adapter, &topic_config, max_adapter_lag_records).await?,
+    );
 
     Ok(BenchmarkReport {
         scenario: scenario_name,
@@ -1097,7 +1098,9 @@ async fn upsert_benchmark_topic_adapter(
     let action = match args.ingress_driver {
         BenchmarkIngressDriver::TopicAdapterStart => TopicAdapterAction::StartWorkflow,
         BenchmarkIngressDriver::TopicAdapterSignal => TopicAdapterAction::SignalWorkflow,
-        BenchmarkIngressDriver::HttpTrigger => bail!("http trigger benchmark cannot upsert topic adapter"),
+        BenchmarkIngressDriver::HttpTrigger => {
+            bail!("http trigger benchmark cannot upsert topic adapter")
+        }
     };
     store
         .upsert_topic_adapter(&TopicAdapterUpsert {
@@ -1182,12 +1185,13 @@ async fn publish_topic_adapter_inputs(
                 "payload": { "approved": true },
                 "published_at": started_at,
             }),
-            BenchmarkIngressDriver::HttpTrigger => bail!("http trigger benchmark cannot publish topic adapter input"),
+            BenchmarkIngressDriver::HttpTrigger => {
+                bail!("http trigger benchmark cannot publish topic adapter input")
+            }
         };
-        publisher
-            .publish(&payload, &instance_id)
-            .await
-            .with_context(|| format!("failed to publish benchmark adapter input for {instance_id}"))?;
+        publisher.publish(&payload, &instance_id).await.with_context(|| {
+            format!("failed to publish benchmark adapter input for {instance_id}")
+        })?;
     }
     Ok(())
 }
@@ -1214,8 +1218,10 @@ fn topic_adapter_total_lag_records(
     offsets: &[TopicAdapterOffsetRecord],
     latest_offsets: &[fabrik_broker::TopicPartitionOffset],
 ) -> i64 {
-    let committed_by_partition =
-        offsets.iter().map(|offset| (offset.partition_id, offset.log_offset)).collect::<BTreeMap<_, _>>();
+    let committed_by_partition = offsets
+        .iter()
+        .map(|offset| (offset.partition_id, offset.log_offset))
+        .collect::<BTreeMap<_, _>>();
     latest_offsets
         .iter()
         .map(|offset| match committed_by_partition.get(&offset.partition_id).copied() {
@@ -1278,29 +1284,22 @@ fn write_failover_arm_file_if_configured(owner_id: &str) -> Result<()> {
     };
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create benchmark failover arm directory {}",
-                parent.display()
-            )
+            format!("failed to create benchmark failover arm directory {}", parent.display())
         })?;
     }
     let payload = json!({
         "owner_id": owner_id,
     });
-    fs::write(&path, serde_json::to_vec(&payload).context("failed to encode benchmark failover arm payload")?)
-        .with_context(|| {
-        format!(
-            "failed to write benchmark failover arm file {}",
-            path.display()
-        )
-    })?;
+    fs::write(
+        &path,
+        serde_json::to_vec(&payload).context("failed to encode benchmark failover arm payload")?,
+    )
+    .with_context(|| format!("failed to write benchmark failover arm file {}", path.display()))?;
     Ok(())
 }
 
 fn topic_adapter_failover_expected(args: &Args) -> bool {
-    args.scenario_tag
-        .as_deref()
-        .is_some_and(|tag| tag.contains("owner-crash"))
+    args.scenario_tag.as_deref().is_some_and(|tag| tag.contains("owner-crash"))
         && env::var("BENCHMARK_FAILOVER_INJECTION_PATH")
             .map(|value| !value.is_empty())
             .unwrap_or(false)
@@ -1321,16 +1320,13 @@ async fn wait_for_topic_adapter_failover_observed(
             .await
             .context("failed to load topic adapter while waiting for failover observation")?
             .context("topic adapter missing while waiting for failover observation")?;
-        let ownership = store
-            .get_topic_adapter_ownership(tenant_id, adapter_id)
-            .await
-            .context("failed to load topic adapter ownership while waiting for failover observation")?;
+        let ownership = store.get_topic_adapter_ownership(tenant_id, adapter_id).await.context(
+            "failed to load topic adapter ownership while waiting for failover observation",
+        )?;
         if adapter.ownership_handoff_count > 0
-            || ownership
-                .as_ref()
-                .is_some_and(|record| {
-                    record.owner_epoch > initial_owner_epoch || record.owner_id != initial_owner_id
-                })
+            || ownership.as_ref().is_some_and(|record| {
+                record.owner_epoch > initial_owner_epoch || record.owner_id != initial_owner_id
+            })
         {
             return Ok(());
         }
@@ -2469,7 +2465,7 @@ async fn trigger_workflow(
     instance_id: &str,
     task_queue: &str,
     input: Value,
- ) -> Result<f64> {
+) -> Result<f64> {
     let started = Instant::now();
     client
         .post(format!("{ingest_base}/workflows/{definition_id}/trigger"))
@@ -2495,7 +2491,7 @@ async fn trigger_workflow_batch(
     tenant_id: &str,
     task_queue: &str,
     items: Vec<Value>,
- ) -> Result<f64> {
+) -> Result<f64> {
     let started = Instant::now();
     let response = client
         .post(format!("{ingest_base}/workflows/{definition_id}/trigger-batch"))
@@ -2816,7 +2812,8 @@ async fn wait_for_stream_projection_convergence(
             return Ok(());
         }
         if stream_projection_uses_inline_microbatch_path(&row) {
-            let outcomes = workflow_outcomes(pool, tenant_id, instance_prefix, workload_kind).await?;
+            let outcomes =
+                workflow_outcomes(pool, tenant_id, instance_prefix, workload_kind).await?;
             if outcomes.running == 0
                 && outcomes.completed + outcomes.failed + outcomes.cancelled >= expected_batches
             {
@@ -3091,10 +3088,7 @@ async fn batch_routing_metrics(
     .context("failed to query workflow execution path metrics")?;
     for (execution_path, rejection_reason, count) in workflow_path_rows {
         let count = count as u64;
-        *metrics
-            .workflow_execution_path_counts
-            .entry(execution_path)
-            .or_default() += count;
+        *metrics.workflow_execution_path_counts.entry(execution_path).or_default() += count;
         if let Some(rejection_reason) = rejection_reason {
             *metrics
                 .workflow_fast_path_rejection_reason_counts
@@ -3122,10 +3116,8 @@ async fn batch_routing_metrics(
     .await
     .context("failed to query throughput execution path metrics")?;
     for (execution_path, count) in throughput_path_rows {
-        *metrics
-            .throughput_execution_path_counts
-            .entry(execution_path)
-            .or_default() += count as u64;
+        *metrics.throughput_execution_path_counts.entry(execution_path).or_default() +=
+            count as u64;
     }
     Ok(metrics)
 }
@@ -3457,11 +3449,8 @@ fn summary_text(report: &BenchmarkReport) -> String {
         format_counts(&report.batch_routing_metrics.admission_policy_version_counts);
     let workflow_execution_path_counts =
         format_counts(&report.batch_routing_metrics.workflow_execution_path_counts);
-    let workflow_fast_path_rejection_reason_counts = format_counts(
-        &report
-            .batch_routing_metrics
-            .workflow_fast_path_rejection_reason_counts,
-    );
+    let workflow_fast_path_rejection_reason_counts =
+        format_counts(&report.batch_routing_metrics.workflow_fast_path_rejection_reason_counts);
     let throughput_execution_path_counts =
         format_counts(&report.batch_routing_metrics.throughput_execution_path_counts);
     let failover = report.failover_injection.as_ref().map(|metrics| {
@@ -3851,10 +3840,7 @@ mod tests {
         assert_eq!(scenarios[0].scenario_tag.as_deref(), Some("owner-crash"));
         assert!(scenarios[0].profile.workflow_count >= 12);
         assert!(scenarios[0].profile.activities_per_workflow >= 4_096);
-        assert_eq!(
-            scenarios[1].scenario_tag.as_deref(),
-            Some("lag-under-load-owner-crash")
-        );
+        assert_eq!(scenarios[1].scenario_tag.as_deref(), Some("lag-under-load-owner-crash"));
         assert!(scenarios[1].profile.workflow_count >= 256);
         assert!(scenarios[1].profile.activities_per_workflow >= 512);
     }

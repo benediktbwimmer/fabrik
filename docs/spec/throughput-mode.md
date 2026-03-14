@@ -6,6 +6,8 @@ Throughput mode is an explicit workflow primitive for high-cardinality fan-out /
 
 Eager execution is an execution policy inside throughput mode, not a separate workflow model and not a change to the default workflow runtime.
 
+For the product-level streaming narrative and operator workflow around this primitive, see [../streaming-product-guide.md](../streaming-product-guide.md). For benchmark-backed workload-shape guidance, see [../benchmarking/streaming-performance-envelope.md](../benchmarking/streaming-performance-envelope.md).
+
 ## Summary
 
 The product contract for throughput mode is:
@@ -84,8 +86,14 @@ Initial reducers are built-in and deterministic:
 - `all_settled`
 - `count`
 - `collect_results`
+- `sum`
+- `min`
+- `max`
+- `avg`
+- `histogram`
+- `sample_errors`
 
-`all_succeeded`, `all_settled`, and `count` are the mergeable reducers used by the `stream-v2` fast lane. `collect_results` remains supported, but stays on the legacy result-materialization path rather than the optimized mergeable reduction path.
+`all_succeeded`, `all_settled`, `count`, `sum`, `min`, `max`, `avg`, and `histogram` are mergeable reducers used by the optimized `stream-v2` path. `sample_errors` is also supported, but retry-heavy cases are more sensitive to workload shape and benchmark design. `collect_results` remains supported, but stays on the legacy result-materialization path rather than the optimized mergeable reduction path.
 
 User-defined reducers are out of scope until they can be compiled, version-pinned, and replay-safe.
 

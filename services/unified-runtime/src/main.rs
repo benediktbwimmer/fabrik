@@ -18,9 +18,7 @@ use chrono::{DateTime, Utc};
 use fabrik_broker::{
     BrokerConfig, JsonTopicConfig, JsonTopicPublisher, WorkflowHistoryFilter, WorkflowPublisher,
     build_json_consumer, build_workflow_consumer, decode_consumed_workflow_event,
-    decode_json_record,
-    partition_for_instance,
-    read_workflow_history,
+    decode_json_record, partition_for_instance, read_workflow_history,
 };
 use fabrik_config::{
     ExecutorRuntimeConfig, GrpcServiceConfig, HttpServiceConfig, PostgresConfig, RedpandaConfig,
@@ -37,14 +35,13 @@ use fabrik_store::{
 };
 use fabrik_throughput::{
     ADMISSION_POLICY_VERSION, BENCHMARK_ECHO_ACTIVITY, BENCHMARK_FAST_COUNT_ACTIVITY,
-    PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
-    StartThroughputRunCommand, ThroughputBackend, ThroughputCommand, ThroughputCommandEnvelope,
-    TinyWorkflowExecutionMode, TinyWorkflowStartItem, WorkflowExecutionPath,
-    bulk_reducer_class, bulk_reducer_is_mergeable, bulk_reducer_materializes_results,
-    can_inline_durable_tiny_fanout,
-    can_use_payloadless_benchmark_transport, decode_cbor, encode_cbor, execute_benchmark_echo,
-    parse_benchmark_compact_input_meta_from_handle, parse_benchmark_compact_total_items_from_handle,
-    planned_reduction_tree_depth,
+    PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind, StartThroughputRunCommand,
+    ThroughputBackend, ThroughputCommand, ThroughputCommandEnvelope, TinyWorkflowExecutionMode,
+    TinyWorkflowStartItem, WorkflowExecutionPath, bulk_reducer_class, bulk_reducer_is_mergeable,
+    bulk_reducer_materializes_results, can_inline_durable_tiny_fanout,
+    can_use_payloadless_bulk_transport, decode_cbor, encode_cbor, execute_benchmark_echo,
+    parse_benchmark_compact_input_meta_from_handle,
+    parse_benchmark_compact_total_items_from_handle, planned_reduction_tree_depth,
     stream_v2_fast_lane_enabled, throughput_partition_key,
 };
 use fabrik_worker_protocol::activity_worker::{
@@ -60,9 +57,9 @@ use fabrik_worker_protocol::activity_worker::{
 use fabrik_workflow::{
     ArtifactExecutionState, CompiledExecutionPlan, CompiledStateNode, CompiledWorkflowArtifact,
     CompiledWorkflowError, ExecutionTurnContext, RetryPolicy, WorkflowInstanceState,
-    WorkflowStatus, execution_state_for_event, parse_timer_ref,
-    replay_compiled_history_trace, replay_compiled_history_trace_from_snapshot,
-    replay_history_trace_from_snapshot, retry_policy_allows_failure_retry,
+    WorkflowStatus, execution_state_for_event, parse_timer_ref, replay_compiled_history_trace,
+    replay_compiled_history_trace_from_snapshot, replay_history_trace_from_snapshot,
+    retry_policy_allows_failure_retry,
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -1593,14 +1590,12 @@ async fn handle_tiny_workflow_batch_command(
         return Ok(());
     }
     let instances = prepared.iter().map(|entry| entry.instance.clone()).collect::<Vec<_>>();
-    let terminals =
-        prepared.iter().map(|entry| entry.terminal_update.clone()).collect::<Vec<_>>();
+    let terminals = prepared.iter().map(|entry| entry.terminal_update.clone()).collect::<Vec<_>>();
     state.store.upsert_instances_batch(&instances).await?;
     state.store.mark_workflow_fast_starts_terminal(&terminals).await?;
     let mut debug = state.debug.lock().expect("unified debug lock poisoned");
-    debug.workflow_triggers_applied = debug
-        .workflow_triggers_applied
-        .saturating_add(instances.len() as u64);
+    debug.workflow_triggers_applied =
+        debug.workflow_triggers_applied.saturating_add(instances.len() as u64);
     Ok(())
 }
 
@@ -1651,13 +1646,15 @@ fn prepare_tiny_workflow_completion(
     };
     apply_compiled_plan(&mut instance, &plan);
     let completed = match mode {
-        TinyWorkflowExecutionMode::Throughput => try_inline_stream_v2_microbatch_trigger_completion(
-            artifact,
-            &mut instance,
-            &plan,
-            item.trigger_event_id,
-            item.accepted_at,
-        )?,
+        TinyWorkflowExecutionMode::Throughput => {
+            try_inline_stream_v2_microbatch_trigger_completion(
+                artifact,
+                &mut instance,
+                &plan,
+                item.trigger_event_id,
+                item.accepted_at,
+            )?
+        }
         TinyWorkflowExecutionMode::Durable => try_inline_durable_tiny_workflow_completion(
             artifact,
             &mut instance,
@@ -1710,9 +1707,7 @@ fn tiny_workflow_trigger_event(
     );
     event.event_id = item.trigger_event_id;
     event.occurred_at = item.accepted_at;
-    event
-        .metadata
-        .insert("workflow_task_queue".to_owned(), workflow_task_queue.to_owned());
+    event.metadata.insert("workflow_task_queue".to_owned(), workflow_task_queue.to_owned());
     if let Some(memo) = item.memo.as_ref() {
         event.metadata.insert(
             "memo_json".to_owned(),
@@ -1720,13 +1715,11 @@ fn tiny_workflow_trigger_event(
         );
     }
     if let Some(search_attributes) = item.search_attributes.as_ref() {
-        event
-            .metadata
-            .insert(
-                "search_attributes_json".to_owned(),
-                serde_json::to_string(search_attributes)
-                    .expect("tiny workflow search attributes serialize"),
-            );
+        event.metadata.insert(
+            "search_attributes_json".to_owned(),
+            serde_json::to_string(search_attributes)
+                .expect("tiny workflow search attributes serialize"),
+        );
     }
     event
 }
@@ -1754,26 +1747,21 @@ fn try_inline_durable_tiny_workflow_completion(
     plan: &CompiledExecutionPlan,
     occurred_at: DateTime<Utc>,
 ) -> Result<bool> {
-    let Some((activity_type, reducer)) = artifact.workflow.states.values().find_map(|state| {
-        match state {
+    let Some((activity_type, reducer)) =
+        artifact.workflow.states.values().find_map(|state| match state {
             CompiledStateNode::FanOut { activity_type, reducer, retry, .. } if retry.is_none() => {
                 Some((activity_type.clone(), reducer.clone()))
             }
             _ => None,
-        }
-    }) else {
+        })
+    else {
         return Ok(false);
     };
     let mut scheduled = Vec::new();
     for emission in &plan.emissions {
         match &emission.event {
             WorkflowEvent::WorkflowStarted => continue,
-            WorkflowEvent::ActivityTaskScheduled {
-                activity_id,
-                input,
-                attempt,
-                ..
-            } => {
+            WorkflowEvent::ActivityTaskScheduled { activity_id, input, attempt, .. } => {
                 if *attempt != 1 {
                     return Ok(false);
                 }
@@ -1792,8 +1780,10 @@ fn try_inline_durable_tiny_workflow_completion(
         } else {
             execute_benchmark_echo(1, &input)?
         };
-        let current_state =
-            instance.current_state.clone().unwrap_or_else(|| artifact.workflow.initial_state.clone());
+        let current_state = instance
+            .current_state
+            .clone()
+            .unwrap_or_else(|| artifact.workflow.initial_state.clone());
         let completion = artifact.execute_after_step_completion_with_turn(
             &current_state,
             &activity_id,
@@ -2051,14 +2041,12 @@ async fn handle_trigger_event_batch(
         let mut debug = state.debug.lock().expect("unified debug lock poisoned");
         for prepared in &prepared_inline {
             debug.workflow_triggers_applied = debug.workflow_triggers_applied.saturating_add(1);
-            debug.trigger_artifact_load_micros = debug
-                .trigger_artifact_load_micros
-                .saturating_add(prepared.artifact_load_micros);
+            debug.trigger_artifact_load_micros =
+                debug.trigger_artifact_load_micros.saturating_add(prepared.artifact_load_micros);
             debug.trigger_plan_micros =
                 debug.trigger_plan_micros.saturating_add(prepared.plan_micros);
-            debug.trigger_state_apply_micros = debug
-                .trigger_state_apply_micros
-                .saturating_add(prepared.state_apply_micros);
+            debug.trigger_state_apply_micros =
+                debug.trigger_state_apply_micros.saturating_add(prepared.state_apply_micros);
             debug.trigger_total_micros = debug
                 .trigger_total_micros
                 .saturating_add(prepared.total_micros_without_db + db_apply_micros);
@@ -2086,13 +2074,7 @@ async fn prepare_inline_trigger_completion(
         instance_id: event.instance_id.clone(),
         run_id: event.run_id.clone(),
     };
-    if state
-        .inner
-        .lock()
-        .expect("unified runtime lock poisoned")
-        .instances
-        .contains_key(&run_key)
-    {
+    if state.inner.lock().expect("unified runtime lock poisoned").instances.contains_key(&run_key) {
         return Ok(None);
     }
 
@@ -5173,11 +5155,8 @@ async fn materialize_bulk_batches_from_plan(
         let publish_started_at = Instant::now();
         let native_stream_v2 = selected_backend == ThroughputBackend::StreamV2.as_str()
             && native_stream_v2_engine_enabled(state);
-        let chunk_count = if *chunk_size == 0 {
-            0
-        } else {
-            total_items.div_ceil(*chunk_size as usize) as u32
-        };
+        let chunk_count =
+            if *chunk_size == 0 { 0 } else { total_items.div_ceil(*chunk_size as usize) as u32 };
         let scheduled_event = WorkflowEvent::BulkActivityBatchScheduled {
             batch_id: batch_id.clone(),
             activity_type: activity_type.clone(),
@@ -5228,11 +5207,10 @@ async fn materialize_bulk_batches_from_plan(
                     debug.trigger_bulk_events_published.saturating_add(1);
                 continue;
             }
-            let compact_benchmark_input = parse_benchmark_compact_input_meta_from_handle(
-                &scheduled_input_handle,
-            )
-            .is_some_and(|meta| meta.payload_size.is_some());
-            let native_input_handle = if can_use_payloadless_benchmark_transport(
+            let compact_benchmark_input =
+                parse_benchmark_compact_input_meta_from_handle(&scheduled_input_handle)
+                    .is_some_and(|meta| meta.payload_size.is_some());
+            let native_input_handle = if can_use_payloadless_bulk_transport(
                 activity_type,
                 reducer.as_deref(),
                 *max_attempts,
@@ -5357,7 +5335,7 @@ fn can_inline_stream_v2_microbatch(
         && total_items > 0
         && total_items <= STREAM_V2_INLINE_MICROBATCH_MAX_ITEMS
         && matches!(reducer.unwrap_or("collect_results"), "all_settled" | "count")
-        && can_use_payloadless_benchmark_transport(activity_type, reducer, max_attempts, items)
+        && can_use_payloadless_bulk_transport(activity_type, reducer, max_attempts, items)
 }
 
 fn unified_inline_bulk_terminal_event(
@@ -6881,10 +6859,7 @@ async fn apply_db_actions(
         state.store.upsert_instances_batch(&instance_updates).await?;
     }
     if !persisted_instance_updates.is_empty() {
-        state
-            .store
-            .upsert_persisted_instances_batch(&persisted_instance_updates)
-            .await?;
+        state.store.upsert_persisted_instances_batch(&persisted_instance_updates).await?;
     }
     for action in other_general {
         match action {
@@ -8315,11 +8290,8 @@ fn try_inline_stream_v2_microbatch_trigger_completion(
     } else {
         items.len()
     };
-    let chunk_count = if *chunk_size == 0 {
-        0
-    } else {
-        total_items.div_ceil(*chunk_size as usize) as u32
-    };
+    let chunk_count =
+        if *chunk_size == 0 { 0 } else { total_items.div_ceil(*chunk_size as usize) as u32 };
     if !can_inline_stream_v2_microbatch(
         activity_type,
         reducer.as_deref(),
@@ -10444,9 +10416,7 @@ mod tests {
             "run-inline-microbatch",
             "unified-runtime-test",
         );
-        let items = (0..10)
-            .map(|index| json!({"value": format!("v-{index}")}))
-            .collect::<Vec<_>>();
+        let items = (0..10).map(|index| json!({"value": format!("v-{index}")})).collect::<Vec<_>>();
         let trigger = test_event(
             &identity,
             WorkflowEvent::WorkflowTriggered { input: json!({ "items": items }) },
@@ -10461,7 +10431,10 @@ mod tests {
             .context("stored inline microbatch instance should exist")?;
         assert_eq!(stored.status, WorkflowStatus::Completed);
         assert_eq!(stored.current_state.as_deref(), Some("done"));
-        assert_eq!(stored.output.as_ref().and_then(|value| value.get("status")), Some(&json!("settled")));
+        assert_eq!(
+            stored.output.as_ref().and_then(|value| value.get("status")),
+            Some(&json!("settled"))
+        );
         assert_eq!(
             stored.output.as_ref().and_then(|value| value.get("totalItems")),
             Some(&json!(10))

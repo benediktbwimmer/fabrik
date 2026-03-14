@@ -49,6 +49,15 @@ The generated summaries live at:
 - `target/external-repo-qualification/summary.json`
 - `target/external-repo-qualification/summary.md`
 
+When external repos are scarce, use the internal pressure-repo set for engineering coverage:
+
+- definition doc: `docs/pressure-repos.md`
+- runner: `scripts/run-pressure-repo-qualification.sh`
+- current batch summary:
+  - `target/pressure-repo-qualification/summary.json`
+  - `target/pressure-repo-qualification/summary.md`
+- current pressure-batch status: `5/5` qualified with caveats
+
 Current app-style batch signal:
 
 - `worker-versioning-replay-demo` qualifies as `qualified_with_caveats` in:

@@ -40,9 +40,8 @@ fn run_cli_relative(
     extra_args: &[&str],
 ) -> (std::process::ExitStatus, Value) {
     let cwd = Path::new("/Users/bene/code/fabrik");
-    let relative_root = project_root
-        .strip_prefix(cwd)
-        .expect("fixture path should be under repo root");
+    let relative_root =
+        project_root.strip_prefix(cwd).expect("fixture path should be under repo root");
     let mut command = Command::new(env!("CARGO_BIN_EXE_fabrik"));
     command.args(["migrate", "temporal"]);
     command.arg(relative_root);
@@ -150,10 +149,7 @@ fn activity_factory_registration_with_static_bootstrap_args_is_packaged() {
     assert_eq!(report["compiled_workflows"][0]["status"], "compiled");
     assert_eq!(report["worker_packages"][0]["package_status"], "packaged");
     assert_eq!(report["worker_packages"][0]["task_queue"], "activity-factory-qualified");
-    assert_eq!(
-        report["discovered"]["workers"][0]["activity_factory_export"],
-        "createActivities"
-    );
+    assert_eq!(report["discovered"]["workers"][0]["activity_factory_export"], "createActivities");
     let factory_arg = report["discovered"]["workers"][0]["activity_factory_args_js"][0]
         .as_str()
         .expect("factory arg");
@@ -164,8 +160,7 @@ fn activity_factory_registration_with_static_bootstrap_args_is_packaged() {
 #[test]
 fn test_only_worker_bootstrap_findings_do_not_block_production_worker() {
     let output_dir = temp_output_dir("test-worker-qualified");
-    let (status, report) =
-        run_cli(&fixture("temporal-test-worker-qualified"), &output_dir, &[]);
+    let (status, report) = run_cli(&fixture("temporal-test-worker-qualified"), &output_dir, &[]);
     assert!(status.success(), "report: {report:?}");
     assert_eq!(report["status"], "compatible_ready_not_deployed");
     assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");
@@ -177,7 +172,8 @@ fn test_only_worker_bootstrap_findings_do_not_block_production_worker() {
             .as_array()
             .expect("findings")
             .iter()
-            .all(|finding| !(finding["file"] == "src/workflows.test.ts" && finding["severity"] == "hard_block"))
+            .all(|finding| !(finding["file"] == "src/workflows.test.ts"
+                && finding["severity"] == "hard_block"))
     );
 }
 
@@ -224,11 +220,8 @@ fn mixed_build_payload_converter_path_upgrade_fixture_is_qualified_for_alpha() {
 #[test]
 fn static_data_converter_factory_usage_is_qualified_for_alpha() {
     let output_dir = temp_output_dir("data-converter-factory");
-    let (status, report) = run_cli(
-        &fixture("temporal-data-converter-factory-qualified"),
-        &output_dir,
-        &[],
-    );
+    let (status, report) =
+        run_cli(&fixture("temporal-data-converter-factory-qualified"), &output_dir, &[]);
     assert!(status.success(), "report: {report:?}");
     assert_eq!(report["status"], "compatible_ready_not_deployed");
     assert_eq!(report["alpha_qualification"]["verdict"], "qualified_with_caveats");

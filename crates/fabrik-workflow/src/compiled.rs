@@ -6,9 +6,9 @@ use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_throughput::{
     DEFAULT_AGGREGATION_GROUP_COUNT, PayloadHandle, ThroughputBackend,
     benchmark_compact_input_handle_with_meta, bulk_reducer_default_summary_value,
-    bulk_reducer_reduce_values,
-    bulk_reducer_requires_success_outputs, bulk_reducer_settles as throughput_bulk_reducer_settles,
-    bulk_reducer_summary_field_name, parse_benchmark_compact_input_meta,
+    bulk_reducer_reduce_values, bulk_reducer_requires_success_outputs,
+    bulk_reducer_settles as throughput_bulk_reducer_settles, bulk_reducer_summary_field_name,
+    parse_benchmark_compact_input_meta,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, json};
@@ -882,9 +882,8 @@ impl CompiledWorkflowArtifact {
         step_id: &str,
         execution_state: &mut ArtifactExecutionState,
     ) -> Result<(), CompiledWorkflowError> {
-        let Some(CompiledStateNode::StartStepHandle {
-            completion_actions, ..
-        }) = self.state_by_id(step_id)
+        let Some(CompiledStateNode::StartStepHandle { completion_actions, .. }) =
+            self.state_by_id(step_id)
         else {
             return Ok(());
         };
@@ -1138,11 +1137,10 @@ impl CompiledWorkflowArtifact {
         turn_context: ExecutionTurnContext,
     ) -> Result<CompiledExecutionPlan, CompiledWorkflowError> {
         execution_state.turn_context = Some(turn_context);
-        let handler = execution_state
-            .dynamic_signal_handlers
-            .get(signal_name)
-            .cloned()
-            .ok_or_else(|| CompiledWorkflowError::UnknownSignalHandler(signal_name.to_owned()))?;
+        let handler =
+            execution_state.dynamic_signal_handlers.get(signal_name).cloned().ok_or_else(|| {
+                CompiledWorkflowError::UnknownSignalHandler(signal_name.to_owned())
+            })?;
         if let Some(arg_name) = &handler.arg_name {
             execution_state.bindings.insert(arg_name.clone(), payload.clone());
         } else {
@@ -2389,11 +2387,10 @@ impl CompiledWorkflowArtifact {
                     output_var,
                     on_error,
                 } => {
-                    let helper = self
-                        .workflow
-                        .async_helpers
-                        .get(helper_name)
-                        .ok_or_else(|| CompiledWorkflowError::UnknownState(helper_name.clone()))?;
+                    let helper =
+                        self.workflow.async_helpers.get(helper_name).ok_or_else(|| {
+                            CompiledWorkflowError::UnknownState(helper_name.clone())
+                        })?;
                     let mut saved = BTreeMap::new();
                     let mut missing = Vec::new();
                     for binding in &helper.scoped_bindings {
@@ -2435,11 +2432,14 @@ impl CompiledWorkflowArtifact {
                         })
                         .transpose()?
                         .unwrap_or(Value::Null);
-                    let frame = execution_state
-                        .async_frames
-                        .pop()
-                        .ok_or_else(|| CompiledWorkflowError::UnknownState(current_state.clone()))?;
-                    restore_async_helper_bindings(&mut execution_state, frame.scoped_bindings, frame.missing_bindings);
+                    let frame = execution_state.async_frames.pop().ok_or_else(|| {
+                        CompiledWorkflowError::UnknownState(current_state.clone())
+                    })?;
+                    restore_async_helper_bindings(
+                        &mut execution_state,
+                        frame.scoped_bindings,
+                        frame.missing_bindings,
+                    );
                     if let Some(output_var) = frame.output_var {
                         execution_state.bindings.insert(output_var, value);
                     }
@@ -2455,17 +2455,18 @@ impl CompiledWorkflowArtifact {
                         .transpose()?
                         .and_then(|value| stringify_value(&value))
                         .unwrap_or_else(|| format!("async helper failed in state {current_state}"));
-                    let frame = execution_state
-                        .async_frames
-                        .pop()
-                        .ok_or_else(|| CompiledWorkflowError::UnknownState(current_state.clone()))?;
-                    restore_async_helper_bindings(&mut execution_state, frame.scoped_bindings, frame.missing_bindings);
+                    let frame = execution_state.async_frames.pop().ok_or_else(|| {
+                        CompiledWorkflowError::UnknownState(current_state.clone())
+                    })?;
+                    restore_async_helper_bindings(
+                        &mut execution_state,
+                        frame.scoped_bindings,
+                        frame.missing_bindings,
+                    );
                     emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
                     if let Some(on_error) = frame.on_error {
                         if let Some(error_var) = on_error.error_var {
-                            execution_state
-                                .bindings
-                                .insert(error_var, Value::String(reason));
+                            execution_state.bindings.insert(error_var, Value::String(reason));
                         }
                         current_state = on_error.next;
                     } else {
@@ -2486,22 +2487,16 @@ impl CompiledWorkflowArtifact {
                         });
                     }
                 }
-                CompiledStateNode::StartStepHandle {
-                    descriptor,
-                    handle_var,
-                    next,
-                    ..
-                } => {
+                CompiledStateNode::StartStepHandle { descriptor, handle_var, next, .. } => {
                     let descriptor =
                         evaluate_expression(descriptor, &mut execution_state, &self.helpers)?;
                     let descriptor = parse_dynamic_activity_descriptor(&current_state, descriptor)?;
                     context = Some(descriptor.input.clone());
                     emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
                     let task_queue = descriptor.task_queue.unwrap_or_else(|| "default".to_owned());
-                    execution_state.bindings.insert(
-                        handle_var.clone(),
-                        encode_step_handle_binding(&current_state),
-                    );
+                    execution_state
+                        .bindings
+                        .insert(handle_var.clone(), encode_step_handle_binding(&current_state));
                     emissions.push(ExecutionEmission {
                         event: WorkflowEvent::ActivityTaskScheduled {
                             activity_id: current_state.clone(),
@@ -3150,12 +3145,7 @@ impl CompiledWorkflowArtifact {
                         output,
                     });
                 }
-                CompiledStateNode::StartTimerHandle {
-                    timer_ref,
-                    timer_expr,
-                    handle_var,
-                    next,
-                } => {
+                CompiledStateNode::StartTimerHandle { timer_ref, timer_expr, handle_var, next } => {
                     emit_pending_markers(&mut emissions, &mut execution_state, &current_state);
                     let timer_delay = evaluate_timer_delay(
                         timer_ref,
@@ -3177,10 +3167,7 @@ impl CompiledWorkflowArtifact {
                         .bindings
                         .insert(handle_var.clone(), encode_timer_handle_binding(&timer_id));
                     emissions.push(ExecutionEmission {
-                        event: WorkflowEvent::TimerScheduled {
-                            timer_id,
-                            fire_at,
-                        },
+                        event: WorkflowEvent::TimerScheduled { timer_id, fire_at },
                         state: Some(current_state.clone()),
                     });
                     current_state = next.clone();
@@ -3451,7 +3438,10 @@ fn encode_step_handle_binding(step_id: &str) -> Value {
     })
 }
 
-fn complete_timer_handle_binding(execution_state: &mut ArtifactExecutionState, timer_id: &str) -> bool {
+fn complete_timer_handle_binding(
+    execution_state: &mut ArtifactExecutionState,
+    timer_id: &str,
+) -> bool {
     for value in execution_state.bindings.values_mut() {
         let Some(object) = value.as_object_mut() else {
             continue;
@@ -5133,11 +5123,8 @@ fn assign_member_path_value(current: Value, path: &[String], value: Value) -> Va
     };
     let key = path[0].clone();
     let next = map.remove(&key).unwrap_or(Value::Null);
-    let updated = if path.len() == 1 {
-        value
-    } else {
-        assign_member_path_value(next, &path[1..], value)
-    };
+    let updated =
+        if path.len() == 1 { value } else { assign_member_path_value(next, &path[1..], value) };
     map.insert(key, updated);
     Value::Object(map)
 }

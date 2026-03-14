@@ -722,11 +722,9 @@ impl LocalThroughputState {
             run_id: chunk.run_id.clone(),
             batch_id: chunk.batch_id.clone(),
         };
-        let strip_collect_results_output = self
-            .load_batch_state(&identity)?
-            .and_then(|batch| batch.reducer)
-            .as_deref()
-            == Some("collect_results");
+        let strip_collect_results_output =
+            self.load_batch_state(&identity)?.and_then(|batch| batch.reducer).as_deref()
+                == Some("collect_results");
         let existing = self.load_chunk_state(&identity, &chunk.chunk_id)?;
         let state = LocalChunkState {
             identity,
@@ -1273,10 +1271,7 @@ impl LocalThroughputState {
                 lease_expires_at: leased_chunk.lease_expires_at,
                 updated_at: leased_chunk.updated_at,
             };
-            if predicate
-                .as_mut()
-                .is_some_and(|predicate| !(predicate)(&snapshot))
-            {
+            if predicate.as_mut().is_some_and(|predicate| !(predicate)(&snapshot)) {
                 continue;
             }
             self.write_chunk_state(&mut write_batch, Some(&existing_chunk), &leased_chunk)?;
@@ -2770,8 +2765,8 @@ impl LocalThroughputState {
                 retry_delay_ms,
                 lease_epoch,
                 owner_epoch,
-                    available_at,
-                } => {
+                available_at,
+            } => {
                 let existing_chunk = self.load_chunk_state(identity, chunk_id)?;
                 let task_queue = existing_chunk
                     .as_ref()

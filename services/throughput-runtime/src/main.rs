@@ -33,19 +33,20 @@ use fabrik_store::{
 };
 use fabrik_throughput::{
     ADMISSION_POLICY_VERSION, BENCHMARK_ECHO_ACTIVITY, BENCHMARK_FAST_COUNT_ACTIVITY,
-    CollectResultsBatchManifest, CollectResultsChunkSegmentRef, PayloadHandle, PayloadStore,
-    PayloadStoreConfig, PayloadStoreKind, StartThroughputRunCommand, ThroughputBackend,
-    ThroughputBatchIdentity, ThroughputChangelogEntry, ThroughputChangelogPayload,
-    ThroughputChunkReport, ThroughputChunkReportPayload, ThroughputCommand,
-    ThroughputCommandEnvelope, bulk_reducer_class, bulk_reducer_name, bulk_reducer_settles,
-    bulk_reducer_summary_field_name, benchmark_echo_item_requires_output,
-    can_complete_payloadless_benchmark_chunk, can_use_payloadless_benchmark_transport,
-    decode_cbor, effective_aggregation_group_count, encode_cbor, execute_benchmark_echo,
-    group_id_for_chunk_index,
-    parse_benchmark_compact_input_meta_from_handle, parse_benchmark_compact_total_items_from_handle,
-    planned_reduction_tree_depth, synthesize_benchmark_echo_items,
-    stream_v2_fast_lane_enabled, throughput_execution_mode, throughput_partition_key,
-    throughput_reducer_execution_path, throughput_reducer_version, throughput_routing_reason,
+    CORE_ACCEPT_ACTIVITY, CORE_ECHO_ACTIVITY, CORE_NOOP_ACTIVITY, CollectResultsBatchManifest,
+    CollectResultsChunkSegmentRef, PayloadHandle, PayloadStore, PayloadStoreConfig,
+    PayloadStoreKind, StartThroughputRunCommand, ThroughputBackend, ThroughputBatchIdentity,
+    ThroughputChangelogEntry, ThroughputChangelogPayload, ThroughputChunkReport,
+    ThroughputChunkReportPayload, ThroughputCommand, ThroughputCommandEnvelope,
+    benchmark_echo_item_requires_output, bulk_reducer_class, bulk_reducer_name,
+    bulk_reducer_settles, bulk_reducer_summary_field_name, can_complete_payloadless_bulk_chunk,
+    can_use_payloadless_bulk_transport, decode_cbor, effective_aggregation_group_count,
+    encode_cbor, execute_benchmark_echo, group_id_for_chunk_index,
+    parse_benchmark_compact_input_meta_from_handle,
+    parse_benchmark_compact_total_items_from_handle, planned_reduction_tree_depth,
+    stream_v2_fast_lane_enabled, synthesize_benchmark_echo_items, throughput_execution_mode,
+    throughput_partition_key, throughput_reducer_execution_path, throughput_reducer_version,
+    throughput_routing_reason,
 };
 use fabrik_worker_protocol::activity_worker::{
     Ack, BulkActivityTask, BulkActivityTaskResult, PollBulkActivityTaskRequest,
@@ -1682,13 +1683,11 @@ async fn run_local_benchmark_fastlane_once(
         let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
         debug.local_fastlane_batches_applied =
             debug.local_fastlane_batches_applied.saturating_add(1);
-        debug.local_fastlane_chunks_completed = debug
-            .local_fastlane_chunks_completed
-            .saturating_add(reports.len() as u64);
+        debug.local_fastlane_chunks_completed =
+            debug.local_fastlane_chunks_completed.saturating_add(reports.len() as u64);
         debug.report_batches_applied = debug.report_batches_applied.saturating_add(1);
-        debug.report_batch_items_total = debug
-            .report_batch_items_total
-            .saturating_add(reports.len() as u64);
+        debug.report_batch_items_total =
+            debug.report_batch_items_total.saturating_add(reports.len() as u64);
         debug.reports_received = debug.reports_received.saturating_add(reports.len() as u64);
         debug.last_report_at = Some(Utc::now());
     }
@@ -1697,17 +1696,28 @@ async fn run_local_benchmark_fastlane_once(
 }
 
 fn is_local_benchmark_fastlane_chunk(chunk: &LeasedChunkSnapshot) -> bool {
-    matches!(
-        chunk.activity_type.as_str(),
-        BENCHMARK_FAST_COUNT_ACTIVITY | BENCHMARK_ECHO_ACTIVITY
-    )
+    can_complete_payloadless_bulk_chunk(
+        &chunk.activity_type,
+        chunk.omit_success_output,
+        chunk.item_count,
+        !chunk.items.is_empty(),
+        !chunk.input_handle.is_null(),
+        chunk.cancellation_requested,
+    ) || chunk.activity_type == BENCHMARK_ECHO_ACTIVITY
 }
 
 async fn execute_local_benchmark_chunk(
     state: &AppState,
     chunk: LeasedChunkSnapshot,
 ) -> Result<ThroughputChunkReport> {
-    if chunk.activity_type == BENCHMARK_FAST_COUNT_ACTIVITY {
+    if can_complete_payloadless_bulk_chunk(
+        &chunk.activity_type,
+        chunk.omit_success_output,
+        chunk.item_count,
+        !chunk.items.is_empty(),
+        !chunk.input_handle.is_null(),
+        chunk.cancellation_requested,
+    ) {
         return Ok(local_benchmark_completed_report(chunk, Value::Null, None));
     }
     let items = resolve_local_benchmark_chunk_items(state, &chunk).await?;
@@ -1755,11 +1765,9 @@ async fn resolve_local_benchmark_chunk_items(
             }
         }
     }
-    state
-        .payload_store
-        .read_items(&handle)
-        .await
-        .with_context(|| format!("failed to read local benchmark chunk input for {}", chunk.chunk_id))
+    state.payload_store.read_items(&handle).await.with_context(|| {
+        format!("failed to read local benchmark chunk input for {}", chunk.chunk_id)
+    })
 }
 
 fn local_benchmark_completed_report(
@@ -1783,10 +1791,7 @@ fn local_benchmark_completed_report(
         worker_build_id: LOCAL_BENCHMARK_FASTLANE_WORKER_BUILD_ID.to_owned(),
         lease_token: chunk.lease_token.unwrap_or_default(),
         occurred_at: Utc::now(),
-        payload: ThroughputChunkReportPayload::ChunkCompleted {
-            result_handle,
-            output,
-        },
+        payload: ThroughputChunkReportPayload::ChunkCompleted { result_handle, output },
     }
 }
 
@@ -1834,10 +1839,7 @@ fn local_benchmark_cancelled_report(
         worker_build_id: LOCAL_BENCHMARK_FASTLANE_WORKER_BUILD_ID.to_owned(),
         lease_token: chunk.lease_token.unwrap_or_default(),
         occurred_at: Utc::now(),
-        payload: ThroughputChunkReportPayload::ChunkCancelled {
-            reason,
-            metadata: None,
-        },
+        payload: ThroughputChunkReportPayload::ChunkCancelled { reason, metadata: None },
     }
 }
 
@@ -2322,10 +2324,8 @@ async fn apply_throughput_report_batch(
         state.store.upsert_throughput_result_segments(&result_segments).await?;
     }
     if capture_report_log && state.runtime.owner_first_apply {
-        let captured = accepted_reports
-            .iter()
-            .map(|accepted| accepted.report.clone())
-            .collect::<Vec<_>>();
+        let captured =
+            accepted_reports.iter().map(|accepted| accepted.report.clone()).collect::<Vec<_>>();
         state.store.append_throughput_report_log_entries(&captured, Utc::now()).await?;
     }
     let mut projection_records = Vec::with_capacity(report_batch.len() * 2);
@@ -2549,11 +2549,10 @@ async fn build_stream_projection_records_from_parts(
     )
     .await?;
     let payloadless_chunk_transport =
-        can_use_payloadless_benchmark_transport(activity_type, reducer, max_attempts, &items);
-    let uses_compact_chunk_input_handle =
-        !materialize_inline_chunk_items
-            && !payloadless_chunk_transport
-            && parse_benchmark_compact_total_items_from_handle(&batch_input_handle).is_some();
+        can_use_payloadless_bulk_transport(activity_type, reducer, max_attempts, &items);
+    let uses_compact_chunk_input_handle = !materialize_inline_chunk_items
+        && !payloadless_chunk_transport
+        && parse_benchmark_compact_total_items_from_handle(&batch_input_handle).is_some();
     let compact_chunk_input_handle = if uses_compact_chunk_input_handle {
         Some(
             serde_json::to_value(&batch_input_handle)
@@ -2783,7 +2782,9 @@ async fn load_native_stream_run_items(
     command: &StartThroughputRunCommand,
 ) -> Result<Vec<Value>> {
     match &command.input_handle {
-        handle if parse_benchmark_compact_total_items_from_handle(handle).is_some() => Ok(Vec::new()),
+        handle if parse_benchmark_compact_total_items_from_handle(handle).is_some() => {
+            Ok(Vec::new())
+        }
         PayloadHandle::Manifest { .. } | PayloadHandle::ManifestSlice { .. } => {
             state.payload_store.read_items(&command.input_handle).await.with_context(|| {
                 format!(
@@ -3285,7 +3286,8 @@ async fn materialize_collect_results_segment(
     if reducer != Some("collect_results") {
         return Ok((report.clone(), None));
     }
-    let ThroughputChunkReportPayload::ChunkCompleted { result_handle, output } = &report.payload else {
+    let ThroughputChunkReportPayload::ChunkCompleted { result_handle, output } = &report.payload
+    else {
         return Ok((report.clone(), None));
     };
     let resolved_handle = if result_handle.is_null() {
@@ -4155,8 +4157,9 @@ async fn sync_projection_batch_result_manifest(
                             chunk_id: segment.chunk_id,
                             chunk_index: segment.chunk_index,
                             item_count: segment.item_count,
-                            result_handle: serde_json::from_value(segment.result_handle)
-                                .context("failed to decode collect_results segment result handle")?,
+                            result_handle: serde_json::from_value(segment.result_handle).context(
+                                "failed to decode collect_results segment result handle",
+                            )?,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?,
@@ -4255,10 +4258,8 @@ async fn publish_projection_batch_terminal_handoff(
     {
         return Ok(false);
     }
-    let Some(batch) = state
-        .store
-        .get_bulk_batch_query_view(tenant_id, instance_id, run_id, batch_id)
-        .await?
+    let Some(batch) =
+        state.store.get_bulk_batch_query_view(tenant_id, instance_id, run_id, batch_id).await?
     else {
         return Ok(false);
     };
@@ -4393,7 +4394,7 @@ fn bulk_chunk_to_proto(
     supports_cbor: bool,
     inline_chunk_input_threshold_bytes: usize,
 ) -> BulkActivityTask {
-    let payloadless_chunk_transport = can_complete_payloadless_benchmark_chunk(
+    let payloadless_chunk_transport = can_complete_payloadless_bulk_chunk(
         &record.activity_type,
         record.omit_success_output,
         record.item_count,

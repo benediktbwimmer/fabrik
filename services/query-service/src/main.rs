@@ -22,8 +22,8 @@ use fabrik_store::{
     WorkflowStateSnapshot, WorkflowStore, WorkflowUpdateRecord, WorkflowUpdateStatus,
 };
 use fabrik_throughput::{
-    CollectResultsBatchManifest, PayloadHandle, PayloadStore, PayloadStoreConfig,
-    PayloadStoreKind, ThroughputBackend, throughput_partition_key,
+    CollectResultsBatchManifest, PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
+    ThroughputBackend, throughput_partition_key,
 };
 use fabrik_workflow::{
     CompiledStateNode, CompiledWorkflowArtifact, ReplayDivergence, ReplayDivergenceKind,
@@ -1704,9 +1704,8 @@ async fn get_workflow_run_graph(
     })?;
     let current_instance =
         state.store.get_instance(&tenant_id, &instance_id).await.map_err(internal_error)?;
-    let history = read_history(&state, &tenant_id, &instance_id, &run_id)
-        .await
-        .map_err(internal_error)?;
+    let history =
+        read_history(&state, &tenant_id, &instance_id, &run_id).await.map_err(internal_error)?;
     let activities = state
         .store
         .list_activities_for_run(&tenant_id, &instance_id, &run_id)
@@ -3378,9 +3377,8 @@ async fn workflow_list_item_from_state(
     store: &WorkflowStore,
     state: WorkflowInstanceState,
 ) -> Result<WorkflowListItem> {
-    let run_metadata = store
-        .get_run_record(&state.tenant_id, &state.instance_id, &state.run_id)
-        .await?;
+    let run_metadata =
+        store.get_run_record(&state.tenant_id, &state.instance_id, &state.run_id).await?;
     let routing_status = compute_routing_status(
         store,
         &state.tenant_id,
@@ -4363,13 +4361,9 @@ async fn replay_workflow_run(
     current_instance: &WorkflowInstanceState,
     run_id: &str,
 ) -> Result<WorkflowReplayResponse> {
-    let history = read_history(
-        state,
-        &current_instance.tenant_id,
-        &current_instance.instance_id,
-        run_id,
-    )
-    .await?;
+    let history =
+        read_history(state, &current_instance.tenant_id, &current_instance.instance_id, run_id)
+            .await?;
     if history.is_empty() {
         anyhow::bail!(
             "no workflow history found for tenant={}, instance_id={}, run_id={run_id}",
@@ -4530,10 +4524,8 @@ async fn replay_workflow_run(
         state.compact_terminal_for_persistence();
         state
     };
-    let mut projection_matches_store =
-        (current_instance.run_id == comparison_state.run_id).then(|| {
-            same_projection(current_instance, &comparison_state)
-        });
+    let mut projection_matches_store = (current_instance.run_id == comparison_state.run_id)
+        .then(|| same_projection(current_instance, &comparison_state));
     if matches!(projection_matches_store, Some(false)) {
         divergences.push(ReplayDivergence {
             kind: ReplayDivergenceKind::ProjectionMismatch,
@@ -4601,7 +4593,8 @@ async fn read_history(
     if !history.is_empty() {
         return Ok(history);
     }
-    if let Some(fast_start) = state.store.get_workflow_fast_start(tenant_id, instance_id, run_id).await?
+    if let Some(fast_start) =
+        state.store.get_workflow_fast_start(tenant_id, instance_id, run_id).await?
     {
         return build_fast_start_history(&fast_start);
     }
@@ -4663,7 +4656,8 @@ fn build_fast_start_history(
             },
             other => anyhow::bail!("unsupported fast-start terminal event type {other}"),
         };
-        let mut terminal = EventEnvelope::new(terminal_payload.event_type(), identity, terminal_payload);
+        let mut terminal =
+            EventEnvelope::new(terminal_payload.event_type(), identity, terminal_payload);
         terminal.event_id = event_id;
         terminal.occurred_at = completed_at;
         history.push(terminal);
@@ -4842,10 +4836,7 @@ mod tests {
             slice_collect_results_chunk_output(&items, 1, 2, 2).unwrap(),
             vec![json!(3), json!(4)]
         );
-        assert_eq!(
-            slice_collect_results_chunk_output(&items, 2, 2, 1).unwrap(),
-            vec![json!(5)]
-        );
+        assert_eq!(slice_collect_results_chunk_output(&items, 2, 2, 1).unwrap(), vec![json!(5)]);
     }
 
     struct TestPostgres {

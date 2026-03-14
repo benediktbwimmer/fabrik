@@ -249,6 +249,7 @@ Throughput mode supports two interchangeable backends:
 Backend selection is server-controlled per batch and pinned for the lifetime of that batch. Workflow code does not select `pg-v1` vs `stream-v2`. Both backends implement the same internal interface and produce the same workflow-visible batch lifecycle events.
 
 See [throughput-mode.md](spec/throughput-mode.md) for the full specification.
+See [streaming-product-guide.md](streaming-product-guide.md) for the product-level operator story and [benchmarking/streaming-performance-envelope.md](benchmarking/streaming-performance-envelope.md) for the current benchmark-backed workload guidance.
 
 ### Sticky Execution
 

@@ -18,6 +18,9 @@ use uuid::Uuid;
 
 pub const PG_V1_BACKEND: &str = "pg-v1";
 pub const STREAM_V2_BACKEND: &str = "stream-v2";
+pub const CORE_ECHO_ACTIVITY: &str = "core.echo";
+pub const CORE_NOOP_ACTIVITY: &str = "core.noop";
+pub const CORE_ACCEPT_ACTIVITY: &str = "core.accept";
 pub const BENCHMARK_ECHO_ACTIVITY: &str = "benchmark.echo";
 pub const BENCHMARK_FAST_COUNT_ACTIVITY: &str = "benchmark.fast_count";
 pub const BENCHMARK_COMPACT_INPUT_KIND: &str = "benchmark_compact";
@@ -203,7 +206,14 @@ pub fn bulk_reducer_requires_error_outputs(reducer: Option<&str>) -> bool {
     matches!(bulk_reducer_name(reducer), BULK_REDUCER_SAMPLE_ERRORS)
 }
 
-pub fn can_use_payloadless_benchmark_transport(
+pub fn activity_can_short_circuit_omitted_success_output(activity_type: &str) -> bool {
+    matches!(
+        activity_type,
+        BENCHMARK_ECHO_ACTIVITY | CORE_ECHO_ACTIVITY | CORE_NOOP_ACTIVITY | CORE_ACCEPT_ACTIVITY
+    )
+}
+
+pub fn can_use_payloadless_bulk_transport(
     activity_type: &str,
     reducer: Option<&str>,
     max_attempts: u32,
@@ -235,7 +245,7 @@ pub fn can_use_payloadless_benchmark_transport(
     })
 }
 
-pub fn can_complete_payloadless_benchmark_chunk(
+pub fn can_complete_payloadless_bulk_chunk(
     activity_type: &str,
     omit_success_output: bool,
     item_count: u32,
@@ -257,6 +267,33 @@ pub fn can_complete_payloadless_benchmark_chunk(
         && !has_input_handle
 }
 
+pub fn can_use_payloadless_benchmark_transport(
+    activity_type: &str,
+    reducer: Option<&str>,
+    max_attempts: u32,
+    items: &[Value],
+) -> bool {
+    can_use_payloadless_bulk_transport(activity_type, reducer, max_attempts, items)
+}
+
+pub fn can_complete_payloadless_benchmark_chunk(
+    activity_type: &str,
+    omit_success_output: bool,
+    item_count: u32,
+    has_inline_items: bool,
+    has_input_handle: bool,
+    cancellation_requested: bool,
+) -> bool {
+    can_complete_payloadless_bulk_chunk(
+        activity_type,
+        omit_success_output,
+        item_count,
+        has_inline_items,
+        has_input_handle,
+        cancellation_requested,
+    )
+}
+
 pub fn can_inline_stream_v2_microbatch(
     activity_type: &str,
     reducer: Option<&str>,
@@ -268,8 +305,11 @@ pub fn can_inline_stream_v2_microbatch(
     chunk_count == 1
         && total_items > 0
         && total_items <= TINY_WORKFLOW_MAX_ITEMS
-        && matches!(reducer.unwrap_or(BULK_REDUCER_COLLECT_RESULTS), BULK_REDUCER_ALL_SETTLED | BULK_REDUCER_COUNT)
-        && can_use_payloadless_benchmark_transport(activity_type, reducer, max_attempts, items)
+        && matches!(
+            reducer.unwrap_or(BULK_REDUCER_COLLECT_RESULTS),
+            BULK_REDUCER_ALL_SETTLED | BULK_REDUCER_COUNT
+        )
+        && can_use_payloadless_bulk_transport(activity_type, reducer, max_attempts, items)
 }
 
 pub fn can_inline_durable_tiny_fanout(
@@ -280,8 +320,11 @@ pub fn can_inline_durable_tiny_fanout(
 ) -> bool {
     !items.is_empty()
         && items.len() <= TINY_WORKFLOW_MAX_ITEMS
-        && matches!(reducer.unwrap_or(BULK_REDUCER_COLLECT_RESULTS), BULK_REDUCER_ALL_SETTLED | BULK_REDUCER_COUNT)
-        && can_use_payloadless_benchmark_transport(activity_type, reducer, max_attempts, items)
+        && matches!(
+            reducer.unwrap_or(BULK_REDUCER_COLLECT_RESULTS),
+            BULK_REDUCER_ALL_SETTLED | BULK_REDUCER_COUNT
+        )
+        && can_use_payloadless_bulk_transport(activity_type, reducer, max_attempts, items)
 }
 
 pub fn vectorized_bulk_activity_capability(
@@ -289,7 +332,10 @@ pub fn vectorized_bulk_activity_capability(
 ) -> VectorizedBulkActivityCapability {
     match activity_type {
         BENCHMARK_FAST_COUNT_ACTIVITY => VectorizedBulkActivityCapability::TinyInlineCompletion,
-        BENCHMARK_ECHO_ACTIVITY => VectorizedBulkActivityCapability::PayloadlessTransport,
+        BENCHMARK_ECHO_ACTIVITY
+        | CORE_ECHO_ACTIVITY
+        | CORE_NOOP_ACTIVITY
+        | CORE_ACCEPT_ACTIVITY => VectorizedBulkActivityCapability::PayloadlessTransport,
         _ => VectorizedBulkActivityCapability::None,
     }
 }
@@ -309,7 +355,8 @@ pub fn tiny_workflow_routing_decision(
     if !matches!(bulk_reducer_name(reducer), BULK_REDUCER_ALL_SETTLED | BULK_REDUCER_COUNT) {
         return Err(FastPathRejectionReason::UnsupportedReducer);
     }
-    if vectorized_bulk_activity_capability(activity_type) == VectorizedBulkActivityCapability::None {
+    if vectorized_bulk_activity_capability(activity_type) == VectorizedBulkActivityCapability::None
+    {
         return Err(FastPathRejectionReason::UnsupportedActivity);
     }
     if total_items == 0 || total_items > TINY_WORKFLOW_MAX_ITEMS {
@@ -320,7 +367,7 @@ pub fn tiny_workflow_routing_decision(
             return Err(FastPathRejectionReason::UnsupportedBackend);
         }
         if chunk_count != 1
-            || !can_use_payloadless_benchmark_transport(activity_type, reducer, max_attempts, items)
+            || !can_use_payloadless_bulk_transport(activity_type, reducer, max_attempts, items)
         {
             return Err(FastPathRejectionReason::NotTinyWorkflow);
         }
@@ -329,7 +376,7 @@ pub fn tiny_workflow_routing_decision(
             execution_mode: TinyWorkflowExecutionMode::Throughput,
         });
     }
-    if !can_use_payloadless_benchmark_transport(activity_type, reducer, max_attempts, items) {
+    if !can_use_payloadless_bulk_transport(activity_type, reducer, max_attempts, items) {
         return Err(FastPathRejectionReason::NotTinyWorkflow);
     }
     Ok(TinyWorkflowRoutingDecision {
@@ -421,9 +468,7 @@ pub fn benchmark_compact_input_handle_with_meta(
     if let Some(chunk_size) = chunk_size {
         key.push_str(&format!(":c{chunk_size}"));
     }
-    PayloadHandle::Inline {
-        key,
-    }
+    PayloadHandle::Inline { key }
 }
 
 pub fn parse_benchmark_compact_input_meta_from_handle(
@@ -458,9 +503,11 @@ pub fn synthesize_benchmark_echo_items(
     item_count: u32,
 ) -> Vec<Value> {
     let chunk_size = meta.chunk_size.unwrap_or(item_count.max(1));
-    let start = usize::try_from(chunk_index).unwrap_or_default()
+    let start = usize::try_from(chunk_index)
+        .unwrap_or_default()
         .saturating_mul(usize::try_from(chunk_size).unwrap_or_default().max(1));
-    let payload = "x".repeat(usize::try_from(meta.payload_size.unwrap_or_default()).unwrap_or_default());
+    let payload =
+        "x".repeat(usize::try_from(meta.payload_size.unwrap_or_default()).unwrap_or_default());
     (0..usize::try_from(item_count).unwrap_or_default())
         .map(|offset| {
             serde_json::json!({
@@ -1745,6 +1792,54 @@ mod tests {
         assert!(bulk_reducer_supports_stream_v2(Some(BULK_REDUCER_HISTOGRAM)));
         assert!(bulk_reducer_supports_stream_v2(Some(BULK_REDUCER_SAMPLE_ERRORS)));
         assert!(bulk_reducer_settles(Some(BULK_REDUCER_SAMPLE_ERRORS)));
+    }
+
+    #[test]
+    fn core_activities_are_fast_lane_eligible_when_outputs_can_be_omitted() {
+        let items = vec![serde_json::json!({"value": 1}), serde_json::json!({"value": 2})];
+
+        assert!(activity_can_short_circuit_omitted_success_output(CORE_ECHO_ACTIVITY));
+        assert!(activity_can_short_circuit_omitted_success_output(CORE_NOOP_ACTIVITY));
+        assert!(activity_can_short_circuit_omitted_success_output(CORE_ACCEPT_ACTIVITY));
+        assert!(can_use_payloadless_bulk_transport(
+            CORE_ECHO_ACTIVITY,
+            Some(BULK_REDUCER_COUNT),
+            1,
+            &items,
+        ));
+        assert!(can_inline_durable_tiny_fanout(
+            CORE_ACCEPT_ACTIVITY,
+            Some(BULK_REDUCER_ALL_SETTLED),
+            1,
+            &items,
+        ));
+        assert_eq!(
+            tiny_workflow_routing_decision(
+                CORE_NOOP_ACTIVITY,
+                Some(BULK_REDUCER_COUNT),
+                None,
+                1,
+                &items,
+                items.len(),
+                1,
+            )
+            .expect("core.noop should route through tiny workflow fast lane")
+            .execution_path,
+            WorkflowExecutionPath::TinyWorkflowEngine
+        );
+    }
+
+    #[test]
+    fn fast_count_remains_bulk_only_for_single_activity_short_circuiting() {
+        assert!(!activity_can_short_circuit_omitted_success_output(BENCHMARK_FAST_COUNT_ACTIVITY));
+        assert!(can_complete_payloadless_bulk_chunk(
+            BENCHMARK_FAST_COUNT_ACTIVITY,
+            true,
+            128,
+            true,
+            false,
+            false,
+        ));
     }
 
     #[test]

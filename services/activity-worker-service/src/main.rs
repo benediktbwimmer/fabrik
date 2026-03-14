@@ -10,10 +10,11 @@ use std::{
 use anyhow::{Context, Result};
 use fabrik_config::{GrpcServiceConfig, ThroughputPayloadStoreConfig, ThroughputPayloadStoreKind};
 use fabrik_throughput::{
-    BENCHMARK_ECHO_ACTIVITY, PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
-    benchmark_echo_item_requires_output, can_complete_payloadless_benchmark_chunk, decode_cbor,
-    encode_cbor, execute_benchmark_echo, parse_benchmark_compact_input_meta_from_handle,
-    synthesize_benchmark_echo_items,
+    BENCHMARK_ECHO_ACTIVITY, CORE_ACCEPT_ACTIVITY, CORE_ECHO_ACTIVITY, CORE_NOOP_ACTIVITY,
+    PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind,
+    activity_can_short_circuit_omitted_success_output, benchmark_echo_item_requires_output,
+    can_complete_payloadless_bulk_chunk, decode_cbor, encode_cbor, execute_benchmark_echo,
+    parse_benchmark_compact_input_meta_from_handle, synthesize_benchmark_echo_items,
 };
 use fabrik_worker_protocol::activity_worker::{
     ActivityTaskCancelledResult, ActivityTaskCompletedResult, ActivityTaskFailedResult,
@@ -726,8 +727,10 @@ async fn execute_activity_task(
     worker_id: String,
     worker_build_id: String,
 ) -> Result<ActivityTaskResult> {
-    let result = if task.activity_type == "benchmark.echo" && task.omit_success_output {
-        execute_benchmark_echo_task_without_output(&task).map(|()| Value::Null)
+    let result = if task.omit_success_output
+        && activity_can_short_circuit_omitted_success_output(&task.activity_type)
+    {
+        execute_activity_task_without_output(&task).map(|()| Value::Null)
     } else {
         execute_activity(
             client,
@@ -800,24 +803,33 @@ struct BenchmarkEchoTaskInput {
     fail_until_attempt: u32,
 }
 
-fn execute_benchmark_echo_task_without_output(
+fn execute_activity_task_without_output(
     task: &fabrik_worker_protocol::activity_worker::ActivityTask,
 ) -> Result<()> {
-    let input = match parse_benchmark_echo_task_input(task) {
-        Ok(input) => input,
-        Err(_) => {
-            let input = parse_activity_task_input(task)?;
-            execute_benchmark_echo(task.attempt, &input)?;
-            return Ok(());
+    if task.activity_type == BENCHMARK_ECHO_ACTIVITY {
+        let input = match parse_benchmark_echo_task_input(task) {
+            Ok(input) => input,
+            Err(_) => {
+                let input = parse_activity_task_input(task)?;
+                execute_benchmark_echo(task.attempt, &input)?;
+                return Ok(());
+            }
+        };
+        if input.cancel {
+            anyhow::bail!("activity cancelled");
         }
-    };
-    if input.cancel {
-        anyhow::bail!("activity cancelled");
+        if task.attempt <= input.fail_until_attempt {
+            anyhow::bail!("benchmark configured failure on attempt {}", task.attempt);
+        }
+        return Ok(());
     }
-    if task.attempt <= input.fail_until_attempt {
-        anyhow::bail!("benchmark configured failure on attempt {}", task.attempt);
+    if matches!(
+        task.activity_type.as_str(),
+        CORE_ECHO_ACTIVITY | CORE_NOOP_ACTIVITY | CORE_ACCEPT_ACTIVITY
+    ) {
+        return Ok(());
     }
-    Ok(())
+    anyhow::bail!("activity {} cannot short-circuit omitted success output", task.activity_type)
 }
 
 fn parse_benchmark_echo_task_input(
@@ -879,7 +891,7 @@ async fn execute_bulk_activity_task(
     worker_build_id: String,
     managed_node: Option<&ManagedNodeActivityConfig>,
 ) -> Result<BulkActivityTaskResult> {
-    if can_complete_payloadless_benchmark_chunk(
+    if can_complete_payloadless_bulk_chunk(
         &task.activity_type,
         task.omit_success_output,
         task.item_count,
@@ -887,7 +899,7 @@ async fn execute_bulk_activity_task(
         !task.input_handle_json.is_empty() || !task.input_handle_cbor.is_empty(),
         task.cancellation_requested,
     ) {
-        return execute_benchmark_fast_count_bulk_task(task, worker_id, worker_build_id);
+        return execute_payloadless_bulk_task(task, worker_id, worker_build_id);
     }
     let input_handle = task_input_handle(&task)?;
     let items = resolve_bulk_task_items(payload_store, &task, input_handle.as_ref()).await?;
@@ -983,13 +995,13 @@ async fn execute_bulk_activity_task(
     })
 }
 
-fn execute_benchmark_fast_count_bulk_task(
+fn execute_payloadless_bulk_task(
     task: fabrik_worker_protocol::activity_worker::BulkActivityTask,
     worker_id: String,
     worker_build_id: String,
 ) -> Result<BulkActivityTaskResult> {
     if !task.omit_success_output {
-        anyhow::bail!("benchmark.fast_count requires omit_success_output");
+        anyhow::bail!("payloadless bulk fast lane requires omit_success_output");
     }
     let completed = encode_bulk_completed_result(None)?;
     Ok(BulkActivityTaskResult {
@@ -1434,7 +1446,9 @@ async fn response_body(response: Response) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fabrik_throughput::BENCHMARK_FAST_COUNT_ACTIVITY;
+    use fabrik_throughput::{
+        BENCHMARK_FAST_COUNT_ACTIVITY, CORE_ACCEPT_ACTIVITY, CORE_ECHO_ACTIVITY,
+    };
     use fabrik_worker_protocol::activity_worker::{ActivityTask, BulkActivityTask};
     use serde_json::json;
     use std::{
@@ -1501,6 +1515,7 @@ mod tests {
     #[test]
     fn benchmark_echo_fast_path_reads_only_control_fields_from_cbor() {
         let task = ActivityTask {
+            activity_type: BENCHMARK_ECHO_ACTIVITY.to_owned(),
             attempt: 2,
             input_cbor: encode_cbor(
                 &serde_json::json!({
@@ -1514,20 +1529,44 @@ mod tests {
             ..ActivityTask::default()
         };
 
-        execute_benchmark_echo_task_without_output(&task).expect("benchmark echo succeeds");
+        execute_activity_task_without_output(&task).expect("benchmark echo succeeds");
     }
 
     #[test]
     fn benchmark_echo_fast_path_preserves_retry_failures() {
         let task = ActivityTask {
+            activity_type: BENCHMARK_ECHO_ACTIVITY.to_owned(),
             attempt: 1,
             input_json: "{\"fail_until_attempt\":1,\"payload\":\"ignored\"}".to_owned(),
             ..ActivityTask::default()
         };
 
-        let error =
-            execute_benchmark_echo_task_without_output(&task).expect_err("task should fail");
+        let error = execute_activity_task_without_output(&task).expect_err("task should fail");
         assert_eq!(error.to_string(), "benchmark configured failure on attempt 1");
+    }
+
+    #[test]
+    fn core_activity_fast_path_accepts_omitted_output() {
+        let task = ActivityTask {
+            activity_type: CORE_ACCEPT_ACTIVITY.to_owned(),
+            input_json: "{\"ignored\":true}".to_owned(),
+            ..ActivityTask::default()
+        };
+
+        execute_activity_task_without_output(&task)
+            .expect("core.accept should short-circuit without materializing output");
+    }
+
+    #[test]
+    fn unsupported_activity_cannot_short_circuit_omitted_output() {
+        let task =
+            ActivityTask { activity_type: "http.request".to_owned(), ..ActivityTask::default() };
+
+        let error = execute_activity_task_without_output(&task).expect_err("task should fail");
+        assert_eq!(
+            error.to_string(),
+            "activity http.request cannot short-circuit omitted success output"
+        );
     }
 
     #[test]
@@ -1596,7 +1635,7 @@ mod tests {
     }
 
     #[test]
-    fn bulk_benchmark_fast_count_skips_item_deserialization() {
+    fn bulk_payloadless_fast_lane_skips_item_deserialization() {
         let task = BulkActivityTask {
             tenant_id: "tenant".to_owned(),
             instance_id: "instance".to_owned(),
@@ -1611,9 +1650,60 @@ mod tests {
             ..BulkActivityTask::default()
         };
 
-        let result =
-            execute_benchmark_fast_count_bulk_task(task, "worker".to_owned(), "build".to_owned())
-                .expect("bulk fast count succeeds");
+        let result = execute_payloadless_bulk_task(task, "worker".to_owned(), "build".to_owned())
+            .expect("bulk fast count succeeds");
+
+        let completed = match result.result.expect("result present") {
+            fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(
+                completed,
+            ) => completed,
+            other => panic!("expected completed result, got {other:?}"),
+        };
+
+        assert!(completed.output_json.is_empty());
+        assert!(completed.output_cbor.is_empty());
+    }
+
+    #[tokio::test]
+    async fn core_echo_payloadless_chunk_uses_fast_completion() {
+        let temp_root = std::env::temp_dir()
+            .join(format!("fabrik-activity-worker-payload-test-{}", Uuid::now_v7()));
+        let payload_store = PayloadStore::from_config(PayloadStoreConfig {
+            default_store: PayloadStoreKind::LocalFilesystem,
+            local_dir: temp_root.to_string_lossy().into_owned(),
+            s3_bucket: None,
+            s3_region: "us-east-1".to_owned(),
+            s3_endpoint: None,
+            s3_access_key_id: None,
+            s3_secret_access_key: None,
+            s3_force_path_style: true,
+            s3_key_prefix: String::new(),
+        })
+        .await
+        .expect("payload store");
+        let task = BulkActivityTask {
+            tenant_id: "tenant".to_owned(),
+            instance_id: "instance".to_owned(),
+            run_id: "run".to_owned(),
+            batch_id: "batch".to_owned(),
+            chunk_id: "batch::0".to_owned(),
+            activity_type: CORE_ECHO_ACTIVITY.to_owned(),
+            attempt: 1,
+            omit_success_output: true,
+            item_count: 32,
+            ..BulkActivityTask::default()
+        };
+
+        let result = execute_bulk_activity_task(
+            &Client::new(),
+            &payload_store,
+            task,
+            "worker".to_owned(),
+            "build".to_owned(),
+            None,
+        )
+        .await
+        .expect("bulk core echo succeeds");
 
         let completed = match result.result.expect("result present") {
             fabrik_worker_protocol::activity_worker::bulk_activity_task_result::Result::Completed(

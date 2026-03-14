@@ -25,6 +25,15 @@ function metadataPreview(value: unknown) {
     .join(" · ");
 }
 
+function labelFromSnakeCase(value: string | null | undefined) {
+  if (!value) return "-";
+  return value
+    .split("_")
+    .filter(Boolean)
+    .map((segment) => segment[0]?.toUpperCase() + segment.slice(1))
+    .join(" ");
+}
+
 function buildParams(searchParams: URLSearchParams) {
   const params = new URLSearchParams();
   for (const key of [
@@ -285,6 +294,10 @@ export function RunsPage() {
                 </td>
                 <td>
                   <Badge value={item.routing_status} />
+                  <div className="muted">engine {labelFromSnakeCase(item.execution_path)}</div>
+                  {item.fast_path_rejection_reason ? (
+                    <div className="muted">fallback {labelFromSnakeCase(item.fast_path_rejection_reason)}</div>
+                  ) : null}
                 </td>
                 <td>
                   {item.current_state ?? "-"}

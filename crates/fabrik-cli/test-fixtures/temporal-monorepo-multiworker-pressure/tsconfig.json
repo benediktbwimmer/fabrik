@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "baseUrl": ".",
+    "paths": {
+      "@pressure/shared": ["packages/shared/src/index.ts"],
+      "@pressure/orders-activities": ["packages/orders-activities/src/index.ts"],
+      "@pressure/reports-activities": ["packages/reports-activities/src/index.ts"]
+    },
+    "strict": true
+  },
+  "include": ["apps/**/*", "packages/**/*"]
+}

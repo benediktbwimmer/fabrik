@@ -2293,7 +2293,13 @@ function compileArrayUnshiftAction(statement, callExpression) {
 }
 
 function resolveArrayShiftCall(callExpression) {
+  if (!callExpression) {
+    return null;
+  }
   callExpression = unwrapExpressionWrappers(callExpression);
+  if (!ts.isCallExpression(callExpression)) {
+    return null;
+  }
   if (
     !ts.isPropertyAccessExpression(callExpression.expression) ||
     callExpression.expression.name.text !== "shift" ||

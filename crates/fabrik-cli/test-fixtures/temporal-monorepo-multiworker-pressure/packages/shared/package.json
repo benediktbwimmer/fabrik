@@ -1,0 +1,5 @@
+{
+  "name": "@pressure/shared",
+  "private": true,
+  "type": "module"
+}

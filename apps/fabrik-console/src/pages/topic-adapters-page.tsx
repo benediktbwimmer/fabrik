@@ -65,6 +65,7 @@ export function TopicAdaptersPage() {
   const watchedAdapterId = selectedAdapterId !== "" && !isCreating ? selectedAdapterId : "";
   const [controlPending, setControlPending] = useState(false);
   const [deletePending, setDeletePending] = useState(false);
+  const [replayPendingKey, setReplayPendingKey] = useState<string | null>(null);
   const [savePending, setSavePending] = useState(false);
   const [previewPending, setPreviewPending] = useState(false);
   const [latestOwnershipTransition, setLatestOwnershipTransition] = useState<OwnershipTransition | null>(null);
@@ -308,6 +309,35 @@ export function TopicAdaptersPage() {
       toast.error(message);
     } finally {
       setDeletePending(false);
+    }
+  }
+
+  async function replayDeadLetter(partitionId: number, logOffset: number) {
+    if (tenantId === "" || watchedAdapterId === "") return;
+    const replayKey = `${partitionId}:${logOffset}`;
+    setReplayPendingKey(replayKey);
+    try {
+      const result = await api.replayTopicAdapterDeadLetter(tenantId, watchedAdapterId, partitionId, logOffset);
+      client.setQueryData<TopicAdapterDetailResponse | undefined>(
+        ["topic-adapter", tenantId, watchedAdapterId],
+        (current) =>
+          current
+            ? {
+                ...current,
+                recent_dead_letters: current.recent_dead_letters.map((entry) =>
+                  entry.partition_id === partitionId && entry.log_offset === logOffset ? result.dead_letter : entry
+                )
+              }
+            : current
+      );
+      await client.invalidateQueries({ queryKey: ["topic-adapters", tenantId] });
+      await client.invalidateQueries({ queryKey: ["topic-adapter", tenantId, watchedAdapterId] });
+      toast.success(`Replayed dead letter ${partitionId}:${logOffset}`);
+    } catch (error) {
+      toast.error(extractErrorMessage(error));
+      await client.invalidateQueries({ queryKey: ["topic-adapter", tenantId, watchedAdapterId] });
+    } finally {
+      setReplayPendingKey(null);
     }
   }
 
@@ -820,7 +850,9 @@ export function TopicAdaptersPage() {
                       <tr>
                         <th>Partition</th>
                         <th>Offset</th>
+                        <th>Status</th>
                         <th>Error</th>
+                        <th>Replay</th>
                         <th>When</th>
                       </tr>
                     </thead>
@@ -829,13 +861,43 @@ export function TopicAdaptersPage() {
                         <tr key={`${entry.partition_id}:${entry.log_offset}`}>
                           <td>{entry.partition_id}</td>
                           <td>{formatNumber(entry.log_offset)}</td>
+                          <td>
+                            {entry.resolved_at ? (
+                              <Badge value="completed" />
+                            ) : entry.last_replay_error ? (
+                              <Badge value="failed" />
+                            ) : (
+                              <Badge value="queued" />
+                            )}
+                          </td>
                           <td>{entry.error}</td>
-                          <td>{formatDate(entry.occurred_at)}</td>
+                          <td>
+                            <div className="stack">
+                              <button
+                                className="button ghost"
+                                onClick={() => void replayDeadLetter(entry.partition_id, entry.log_offset)}
+                                disabled={replayPendingKey === `${entry.partition_id}:${entry.log_offset}`}
+                              >
+                                {replayPendingKey === `${entry.partition_id}:${entry.log_offset}` ? "Replaying..." : "Replay"}
+                              </button>
+                              <div className="muted">
+                                attempts {formatNumber(entry.replay_count)}
+                                {entry.last_replay_at ? `, last ${formatDate(entry.last_replay_at)}` : ""}
+                              </div>
+                              {entry.last_replay_error ? <div className="muted">{entry.last_replay_error}</div> : null}
+                            </div>
+                          </td>
+                          <td>
+                            <div className="stack">
+                              <div>{formatDate(entry.occurred_at)}</div>
+                              {entry.resolved_at ? <div className="muted">resolved {formatDate(entry.resolved_at)}</div> : null}
+                            </div>
+                          </td>
                         </tr>
                       ))}
                       {detailQuery.data.recent_dead_letters.length === 0 ? (
                         <tr>
-                          <td colSpan={4} className="muted">
+                          <td colSpan={6} className="muted">
                             No dead letters
                           </td>
                         </tr>

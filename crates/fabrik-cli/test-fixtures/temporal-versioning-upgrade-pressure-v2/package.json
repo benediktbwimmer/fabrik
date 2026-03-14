@@ -1,0 +1,10 @@
+{
+  "name": "temporal-versioning-upgrade-pressure-v2",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@temporalio/client": "^1.15.0",
+    "@temporalio/workflow": "^1.15.0",
+    "@temporalio/worker": "^1.15.0"
+  }
+}
