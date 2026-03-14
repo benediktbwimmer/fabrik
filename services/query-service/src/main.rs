@@ -28,10 +28,10 @@ use fabrik_throughput::{
 use fabrik_workflow::{
     CompiledStateNode, CompiledWorkflowArtifact, ReplayDivergence, ReplayDivergenceKind,
     ReplayFieldMismatch, ReplaySource, ReplayTransitionTraceEntry, SourceLocation,
-    WorkflowDefinition, WorkflowInstanceState, artifact_hash, first_transition_divergence,
-    projection_mismatches, replay_compiled_history, replay_compiled_history_trace,
-    replay_compiled_history_trace_from_snapshot, replay_history_trace,
-    replay_history_trace_from_snapshot, same_projection,
+    WorkflowDefinition, WorkflowInstanceState, artifact_hash, execution_state_for_event,
+    first_transition_divergence, projection_mismatches, replay_compiled_history,
+    replay_compiled_history_trace, replay_compiled_history_trace_from_snapshot,
+    replay_history_trace, replay_history_trace_from_snapshot, same_projection,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -1294,7 +1294,7 @@ async fn execute_strong_query(
         .evaluate_query(
             &query_name,
             &request.args,
-            query_state.artifact_execution.clone().unwrap_or_default(),
+            execution_state_for_event(&query_state, None),
         )
         .map_err(|error| {
             (StatusCode::BAD_REQUEST, Json(ErrorResponse { message: error.to_string() }))

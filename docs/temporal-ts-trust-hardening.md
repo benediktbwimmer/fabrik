@@ -10,12 +10,10 @@ Current compatibility snapshot:
 ## Priority Order
 
 1. `dsl-interpreter` helper-join semantics
-- Current migration support uses persisted async-helper call frames plus a sequential helper-join lowering for recursive `Promise.all(map(asyncHelper(...)))`.
-- This is sufficient for migration/package qualification.
-- It is not yet trust-backed helper-level parallel equivalence.
-- Next trust task:
-  - add semantic fixtures that compare helper-join outputs against the expected DSL branch semantics
-  - decide whether sequential helper-join is an accepted caveat or whether helper-parallel equivalence is required
+- Current support is now trust-backed for the accepted semantics: persisted async-helper call frames plus deterministic depth-first sequential helper joins for recursive `Promise.all(map(asyncHelper(...)))`.
+- Layer B now includes both compiler-shape coverage and a runtime semantic test for recursive helper joins.
+- Remaining non-goal:
+  - helper-level parallel equivalence is still not claimed; the accepted model is deterministic sequential traversal
 
 2. Interceptor bridge semantics
 - Current support allows static `interceptors.workflowModules` packaging and restart/replay-safe workflow execution when the workflow-visible state stays in the compiled workflow.
@@ -32,9 +30,8 @@ Current compatibility snapshot:
   - keep sink trust scoped to workflow-visible semantics, not side-effect delivery guarantees
 
 4. Payload/data-converter adapter semantics
-- Current support is broad enough for the official samples, and the adapter slice now has a restart/replay drill around static factory-based converter packaging plus normalized activity output.
-- Next trust task:
-  - tighten the remaining converter-query caveat around pre-activity copied object state if that becomes product-relevant
+- Current support is broad enough for the official samples, and the adapter slice now has a restart/replay drill around static factory-based converter packaging, pre-normalize query state, restart preservation, and normalized activity output.
+- Remaining non-goal:
   - keep full transport parity out of scope unless a real repo forces it
 
 ## Real Repo Qualification
@@ -74,7 +71,7 @@ When external repos are scarce, use the internal pressure-repo set for engineeri
   - `target/alpha-drills/temporal-converter-trust-pressure/converter-pressure-drill-report.json`
   - current drill status: `passed`
   - replay divergence counts: post-restart `0`, post-complete `0`
-  - current caveat: pre-normalize query state is validated only at the phase level, not full copied input fields
+  - pre-normalize query state now preserves copied `id/tags` fields before and after restart
 - `temporal-monorepo-multiworker-pressure` now has a passing internal replay/restart drill for the multi-worker monorepo packaging and restore path in:
   - `target/alpha-drills/temporal-monorepo-multiworker-pressure/monorepo-multiworker-pressure-drill-report.json`
   - current drill status: `passed`

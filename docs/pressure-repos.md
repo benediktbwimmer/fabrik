@@ -15,7 +15,7 @@ They exist to exercise the remaining trust and packaging surfaces once the offic
 - `crates/fabrik-cli/test-fixtures/temporal-converter-trust-pressure`
   - purpose: static `dataConverter` factory plus static `payloadConverterPath` packaging and replay pressure
   - passing drill bundle: `target/alpha-drills/temporal-converter-trust-pressure/converter-pressure-drill-report.json`
-  - caveat: pre-normalize query assertions currently validate only workflow phase, not copied input-field reflection
+  - current trust coverage includes full pre-normalize query reflection for `id/tags` before and after restart
 - `crates/fabrik-cli/test-fixtures/temporal-monorepo-multiworker-pressure`
   - purpose: multi-worker monorepo packaging, workspace resolution, and tsconfig-path handling
   - passing drill bundle: `target/alpha-drills/temporal-monorepo-multiworker-pressure/monorepo-multiworker-pressure-drill-report.json`

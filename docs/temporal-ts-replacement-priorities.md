@@ -47,7 +47,7 @@ The latest compiler, runtime, and packaging passes materially shifted the remain
 - `sinks` now qualifies after `proxySinks()` declarations and fire-and-forget sink calls moved onto a caveated no-op migration bridge and worker `sinks` configuration stopped hard-blocking packaging
 - `encryption` now qualifies after static zero-argument `dataConverter` factory helpers moved into the supported packaging adapter slice
 - `query-subscriptions` now qualifies after static workflow-module interceptor bootstraps moved onto the caveated packaging path and helper-side interceptor scaffolding (`setHandler`, `enablePatches`, `Object.defineProperty`) stopped hard-blocking compilation
-- `dsl-interpreter` now qualifies after adding persisted async-helper call frames plus a sequential helper-join lowering for recursive `Promise.all(map(asyncHelper(...)))` patterns; this is explicitly a caveated adapter path, not trust-backed helper-level parallel semantics
+- `dsl-interpreter` now qualifies with explicit Layer B semantic evidence for the accepted deterministic depth-first sequential helper-join model used by recursive `Promise.all(map(asyncHelper(...)))`
 - the first app-style external repo batch produced one strong non-sample candidate:
   - `worker-versioning-replay-demo` qualifies in `target/external-repo-qualification/app-batch/worker-versioning-replay-demo/migration-report.json`
   - `worker-versioning-replay-demo` now also has a passing replay/restart/rollback drill in `target/alpha-drills/worker-versioning-replay-demo/worker-versioning-replay-demo-drill-report.json`
@@ -69,7 +69,7 @@ The latest compiler, runtime, and packaging passes materially shifted the remain
 This means broad import coverage is no longer the main hard-blocker class. The next replacement bottlenecks are:
 - external non-Temporal async SDK execution inside workflow code
 - trust-bounded caveat cleanup around the adapter-backed converter/interceptor/sink slice
-- deciding whether the remaining `dsl-interpreter` caveat is acceptable or worth upgrading into full trust-backed helper-parallel semantics
+- keeping the accepted sequential helper-join model explicit while avoiding accidental claims of helper-level parallel equivalence
 - scaling the now-proven trust drill from one non-sample repo to a larger real-repo set
 
 ## Priority Order
@@ -83,12 +83,12 @@ This means broad import coverage is no longer the main hard-blocker class. The n
   - broader external-library async orchestration in `ai-sdk`
 - Recommendation: treat `ai-sdk` as a separate product decision because it embeds non-Temporal AI SDK execution directly in workflow code.
 
-2. Recursive async helper trust upgrade
+2. Accepted async helper semantics
 - Hard-block findings: `0`
 - Affected samples: `0`
-- Qualified sample with caveat: `dsl-interpreter`
-- Current support uses persisted async-helper call frames and a sequential helper-join lowering for recursive `Promise.all(map(asyncHelper(...)))` patterns. That is enough for migration/package qualification, but it is not yet trust-backed helper-parallel equivalence.
-- Recommendation: only upgrade this further if a real repo needs trusted helper-level parallel semantics.
+- Qualified sample with explicit trust model: `dsl-interpreter`
+- Current support uses persisted async-helper call frames and a deterministic depth-first sequential helper-join lowering for recursive `Promise.all(map(asyncHelper(...)))` patterns.
+- Recommendation: only revisit this if a real repo needs helper-level parallel equivalence rather than the current accepted sequential semantics.
 
 3. External SDK execution inside workflows
 - Hard-block findings: `1`
@@ -111,8 +111,8 @@ This means broad import coverage is no longer the main hard-blocker class. The n
   - or start a separate project for arbitrary external async library execution in workflows
 - Success criterion: stop treating `ai-sdk` as if it were just one more compiler-sugar gap.
 
-2. Decide whether to leave `dsl-interpreter` caveated or invest in a trust upgrade.
-- Success criterion: be explicit about whether sequential helper-join semantics are acceptable for the replacement claim.
+2. Keep the accepted sequential helper-join model explicit.
+- Success criterion: do not accidentally over-claim helper-level parallel equivalence.
 
 3. Re-run the blocker census after every parity slice.
 - Use `/Users/bene/code/fabrik/scripts/run-temporal-ts-blocker-census.sh`

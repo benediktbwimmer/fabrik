@@ -3,7 +3,7 @@
   "milestone_scope": "temporal_ts_subset_trust",
   "title": "Temporal TS subset trust",
   "goal": "Freeze and validate the Temporal TypeScript subset Fabrik can trust under replay, failover, and upgrade conditions.",
-  "generated_at": "2026-03-14T03:41:23.398Z",
+  "generated_at": "2026-03-14T13:41:56.176Z",
   "status": "passing",
   "trusted_confidence_floor": "supported_failover_validated",
   "upgrade_confidence_floor": "supported_upgrade_validated",
@@ -23,8 +23,8 @@
       "layer_id": "layer_b_semantic",
       "title": "Layer B: semantic parity fixtures",
       "purpose": "Compiled semantic artifact cases for the supported Temporal TS subset.",
-      "case_count": 10,
-      "passed_count": 10,
+      "case_count": 11,
+      "passed_count": 11,
       "failed_count": 0,
       "report_path": "target/conformance-reports/layer-b-semantic.json",
       "public_report_path": "/conformance-reports/layer-b-semantic.json",
@@ -45,16 +45,18 @@
   "confidence_bands": [
     {
       "confidence_class": "supported_failover_validated",
-      "count": 8,
+      "count": 10,
       "features": [
         "Activity options and retries",
         "Cancellation scopes",
         "Child workflows",
         "Conditions and timer waits",
         "Continue-as-new",
+        "Interceptors and middleware",
         "Proxy activities",
         "Search attributes and memo",
-        "Signals, queries, and updates"
+        "Signals, queries, and updates",
+        "Sinks"
       ]
     },
     {
@@ -76,9 +78,8 @@
     },
     {
       "confidence_class": "supported",
-      "count": 2,
+      "count": 1,
       "features": [
-        "Interceptors and middleware",
         "Worker bootstrap packaging"
       ]
     },
@@ -96,10 +97,12 @@
     "Child workflows",
     "Conditions and timer waits",
     "Continue-as-new",
+    "Interceptors and middleware",
     "Payload and data converter usage",
     "Proxy activities",
     "Search attributes and memo",
     "Signals, queries, and updates",
+    "Sinks",
     "Version markers and workflow evolution",
     "Worker builds and routing"
   ],
@@ -115,7 +118,22 @@
     "migration report classification exists",
     "operator evidence surfaces can explain the feature and its failure modes"
   ],
-  "confidence_deltas": [],
+  "confidence_deltas": [
+    {
+      "feature": "interceptors_middleware",
+      "label": "Interceptors and middleware",
+      "declared_confidence_class": "supported_replay_validated",
+      "derived_confidence_class": "supported_failover_validated",
+      "confidence_status": "evidence_promoted"
+    },
+    {
+      "feature": "sinks_bridge",
+      "label": "Sinks",
+      "declared_confidence_class": "supported_replay_validated",
+      "derived_confidence_class": "supported_failover_validated",
+      "confidence_status": "evidence_promoted"
+    }
+  ],
   "features": [
     {
       "feature": "proxy_activities",
@@ -466,23 +484,48 @@
       }
     },
     {
+      "feature": "sinks_bridge",
+      "label": "Sinks",
+      "milestone_status": "supported",
+      "support_level": "adapter",
+      "confidence_class": "supported_failover_validated",
+      "replay_validation": true,
+      "deploy_validation": true,
+      "support_fixtures": true,
+      "semantic_fixtures": false,
+      "trust_fixtures": true,
+      "upgrade_fixtures": false,
+      "semantic_caveats": [
+        "static proxySinks declarations and fire-and-forget sink calls are replay/restart validated when sink effects are workflow-invisible; side-effect delivery guarantees remain out of scope"
+      ],
+      "blocking_severity": "warning",
+      "declared_confidence_class": "supported_replay_validated",
+      "confidence_status": "evidence_promoted",
+      "evidence": {
+        "support_layer_status": "passing",
+        "semantic_layer_status": "passing",
+        "trust_layer_status": "passing",
+        "upgrade_layer_status": "passing"
+      }
+    },
+    {
       "feature": "interceptors_middleware",
       "label": "Interceptors and middleware",
       "milestone_status": "supported",
       "support_level": "adapter",
-      "confidence_class": "supported",
-      "replay_validation": false,
-      "deploy_validation": false,
+      "confidence_class": "supported_failover_validated",
+      "replay_validation": true,
+      "deploy_validation": true,
       "support_fixtures": true,
       "semantic_fixtures": false,
-      "trust_fixtures": false,
+      "trust_fixtures": true,
       "upgrade_fixtures": false,
       "semantic_caveats": [
-        "only static workflowModules interceptor bootstraps and workflow-side interceptor scaffolding are accepted today; interceptor behavior is treated as a caveated migration bridge, not trust-backed parity"
+        "only static workflowModules interceptor bootstraps are supported, and workflow-visible state/query semantics must stay owned by the compiled workflow; broader Temporal interceptor runtime behavior remains out of scope"
       ],
       "blocking_severity": "warning",
-      "declared_confidence_class": "supported",
-      "confidence_status": "declared_confirmed",
+      "declared_confidence_class": "supported_replay_validated",
+      "confidence_status": "evidence_promoted",
       "evidence": {
         "support_layer_status": "passing",
         "semantic_layer_status": "passing",

@@ -38,11 +38,14 @@ The alpha claim is:
 - static `payloadConverterPath` modules on `Worker.create({ ... })` that export a named `payloadConverter`
 - mixed-build deploy, restart, replay, and rollback evidence for the supported payload/data-converter adapter slice
 - workflow task queue preservation through replay, snapshot restore, and owner handoff for the supported alpha slice
+- static `interceptors.workflowModules` bridge when workflow-visible state remains owned by the compiled workflow
+- static `proxySinks()` declarations plus fire-and-forget sink calls when sink effects are workflow-invisible
 
 ## Blocked in Alpha
 
 - codec servers and broader payload/data converter transport semantics beyond the static `dataConverter` / `payloadConverterPath` packaging slice
 - dynamic or non-static interceptor bootstraps outside the narrow `interceptors.workflowModules` bridge
+- sink delivery guarantees and broader sink-side side-effect semantics
 - dynamic worker bootstrap shapes
 - arbitrary external async SDK execution inside workflow code
 - arbitrary workflow inspection APIs outside the supported subset

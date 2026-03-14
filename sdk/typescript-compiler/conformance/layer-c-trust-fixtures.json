@@ -217,6 +217,26 @@
       "expect": {
         "output_matches": ["\\[mixed-build-drill\\] completed", "alpha-mixed-build-drill-report\\.md"]
       }
+    },
+    {
+      "id": "interceptor-pressure-drill",
+      "title": "Interceptor bridge survives deploy, restart, and replay",
+      "kind": "command",
+      "command": "bash",
+      "args": ["scripts/run-interceptor-pressure-drill.sh"],
+      "expect": {
+        "output_matches": ["\\[interceptor-pressure-drill\\] completed", "interceptor-pressure-drill-report\\.md"]
+      }
+    },
+    {
+      "id": "sinks-pressure-drill",
+      "title": "Sink bridge survives deploy, restart, and replay",
+      "kind": "command",
+      "command": "bash",
+      "args": ["scripts/run-sinks-pressure-drill.sh"],
+      "expect": {
+        "output_matches": ["\\[sinks-pressure-drill\\] completed", "sinks-pressure-drill-report\\.md"]
+      }
     }
   ]
 }

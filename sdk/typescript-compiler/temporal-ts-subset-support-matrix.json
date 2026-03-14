@@ -225,18 +225,33 @@
       "blocking_severity": "warning"
     },
     {
+      "feature": "sinks_bridge",
+      "label": "Sinks",
+      "milestone_status": "supported",
+      "support_level": "adapter",
+      "confidence_class": "supported_replay_validated",
+      "replay_validation": true,
+      "deploy_validation": true,
+      "support_fixtures": true,
+      "semantic_fixtures": false,
+      "trust_fixtures": true,
+      "upgrade_fixtures": false,
+      "semantic_caveats": ["static proxySinks declarations and fire-and-forget sink calls are replay/restart validated when sink effects are workflow-invisible; side-effect delivery guarantees remain out of scope"],
+      "blocking_severity": "warning"
+    },
+    {
       "feature": "interceptors_middleware",
       "label": "Interceptors and middleware",
       "milestone_status": "supported",
       "support_level": "adapter",
-      "confidence_class": "supported",
-      "replay_validation": false,
-      "deploy_validation": false,
+      "confidence_class": "supported_replay_validated",
+      "replay_validation": true,
+      "deploy_validation": true,
       "support_fixtures": true,
       "semantic_fixtures": false,
-      "trust_fixtures": false,
+      "trust_fixtures": true,
       "upgrade_fixtures": false,
-      "semantic_caveats": ["only static workflowModules interceptor bootstraps and workflow-side interceptor scaffolding are accepted today; interceptor behavior is treated as a caveated migration bridge, not trust-backed parity"],
+      "semantic_caveats": ["only static workflowModules interceptor bootstraps are supported, and workflow-visible state/query semantics must stay owned by the compiled workflow; broader Temporal interceptor runtime behavior remains out of scope"],
       "blocking_severity": "warning"
     },
     {

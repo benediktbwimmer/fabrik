@@ -1011,8 +1011,6 @@ impl CompiledWorkflowArtifact {
         for param in &self.workflow.params {
             let value = if param.name == "ctx" {
                 Value::Null
-            } else if param.name == "input" {
-                input.clone()
             } else if param.rest {
                 let value = Value::Array(args.iter().skip(next_arg_index).cloned().collect());
                 next_arg_index = args.len();
@@ -6456,9 +6454,9 @@ mod tests {
     }
 
     #[test]
-    fn execute_trigger_preserves_input_binding_for_reserved_params() {
+    fn execute_trigger_binds_identifier_param_named_input_to_first_argument() {
         let artifact = CompiledWorkflowArtifact::new(
-            "workflow-reserved-params",
+            "workflow-input-param",
             1,
             "test",
             ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
@@ -6490,7 +6488,7 @@ mod tests {
             },
         );
 
-        let plan = artifact.execute_trigger(&json!({"items": ["a", "b"]})).unwrap();
+        let plan = artifact.execute_trigger(&json!([{"items": ["a", "b"]}])).unwrap();
 
         assert!(matches!(
             plan.emissions.last(),
@@ -6505,9 +6503,9 @@ mod tests {
     }
 
     #[test]
-    fn execute_trigger_skips_reserved_params_when_binding_rest_args() {
+    fn execute_trigger_binds_rest_args_after_identifier_param_named_input() {
         let artifact = CompiledWorkflowArtifact::new(
-            "workflow-reserved-rest-params",
+            "workflow-input-rest-params",
             1,
             "test",
             ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
@@ -6540,7 +6538,7 @@ mod tests {
             },
         );
 
-        let plan = artifact.execute_trigger(&json!(["root", "a", "b"])).unwrap();
+        let plan = artifact.execute_trigger(&json!([{"items": ["a"]}, "b", "c"])).unwrap();
 
         assert!(matches!(
             plan.emissions.last(),
@@ -6548,8 +6546,8 @@ mod tests {
                 event: WorkflowEvent::WorkflowCompleted { output },
                 ..
             }) if output == &json!({
-                "input": ["root", "a", "b"],
-                "suffix": ["root", "a", "b"],
+                "input": {"items": ["a"]},
+                "suffix": ["b", "c"],
             })
         ));
     }
@@ -9010,7 +9008,7 @@ mod tests {
                         "join_choice".to_owned(),
                         CompiledStateNode::Choice {
                             condition: Expression::Binary {
-                                op: "less_than".to_owned(),
+                                op: BinaryOp::LessThan,
                                 left: Box::new(Expression::Identifier { name: "join_index".to_owned() }),
                                 right: Box::new(Expression::Member {
                                     object: Box::new(Expression::Member {
@@ -9056,7 +9054,7 @@ mod tests {
                             actions: vec![Assignment {
                                 target: "join_index".to_owned(),
                                 expr: Expression::Binary {
-                                    op: "add".to_owned(),
+                                    op: BinaryOp::Add,
                                     left: Box::new(Expression::Identifier { name: "join_index".to_owned() }),
                                     right: Box::new(Expression::Literal { value: json!(1) }),
                                 },
@@ -9069,7 +9067,7 @@ mod tests {
                         CompiledStateNode::Step {
                             handler: "greet".to_owned(),
                             input: Expression::Logical {
-                                op: "coalesce".to_owned(),
+                                op: LogicalOp::Coalesce,
                                 left: Box::new(Expression::Member {
                                     object: Box::new(Expression::Identifier { name: "node".to_owned() }),
                                     property: "value".to_owned(),

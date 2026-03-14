@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "milestone_scope": "temporal_ts_subset_trust",
-  "generated_at": "2026-03-14T03:41:23.398Z",
+  "generated_at": "2026-03-14T13:41:56.175Z",
   "reports": [
     {
       "layer_id": "layer_a_support",
@@ -12,7 +12,7 @@
     {
       "layer_id": "layer_b_semantic",
       "status": "passing",
-      "case_count": 10,
+      "case_count": 11,
       "failed_count": 0
     },
     {
@@ -372,23 +372,48 @@
       }
     },
     {
+      "feature": "sinks_bridge",
+      "label": "Sinks",
+      "milestone_status": "supported",
+      "support_level": "adapter",
+      "confidence_class": "supported_failover_validated",
+      "replay_validation": true,
+      "deploy_validation": true,
+      "support_fixtures": true,
+      "semantic_fixtures": false,
+      "trust_fixtures": true,
+      "upgrade_fixtures": false,
+      "semantic_caveats": [
+        "static proxySinks declarations and fire-and-forget sink calls are replay/restart validated when sink effects are workflow-invisible; side-effect delivery guarantees remain out of scope"
+      ],
+      "blocking_severity": "warning",
+      "declared_confidence_class": "supported_replay_validated",
+      "confidence_status": "evidence_promoted",
+      "evidence": {
+        "support_layer_status": "passing",
+        "semantic_layer_status": "passing",
+        "trust_layer_status": "passing",
+        "upgrade_layer_status": "passing"
+      }
+    },
+    {
       "feature": "interceptors_middleware",
       "label": "Interceptors and middleware",
       "milestone_status": "supported",
       "support_level": "adapter",
-      "confidence_class": "supported",
-      "replay_validation": false,
-      "deploy_validation": false,
+      "confidence_class": "supported_failover_validated",
+      "replay_validation": true,
+      "deploy_validation": true,
       "support_fixtures": true,
       "semantic_fixtures": false,
-      "trust_fixtures": false,
+      "trust_fixtures": true,
       "upgrade_fixtures": false,
       "semantic_caveats": [
-        "only static workflowModules interceptor bootstraps and workflow-side interceptor scaffolding are accepted today; interceptor behavior is treated as a caveated migration bridge, not trust-backed parity"
+        "only static workflowModules interceptor bootstraps are supported, and workflow-visible state/query semantics must stay owned by the compiled workflow; broader Temporal interceptor runtime behavior remains out of scope"
       ],
       "blocking_severity": "warning",
-      "declared_confidence_class": "supported",
-      "confidence_status": "declared_confirmed",
+      "declared_confidence_class": "supported_replay_validated",
+      "confidence_status": "evidence_promoted",
       "evidence": {
         "support_layer_status": "passing",
         "semantic_layer_status": "passing",
@@ -422,5 +447,20 @@
       }
     }
   ],
-  "confidence_deltas": []
+  "confidence_deltas": [
+    {
+      "feature": "interceptors_middleware",
+      "label": "Interceptors and middleware",
+      "declared_confidence_class": "supported_replay_validated",
+      "derived_confidence_class": "supported_failover_validated",
+      "confidence_status": "evidence_promoted"
+    },
+    {
+      "feature": "sinks_bridge",
+      "label": "Sinks",
+      "declared_confidence_class": "supported_replay_validated",
+      "derived_confidence_class": "supported_failover_validated",
+      "confidence_status": "evidence_promoted"
+    }
+  ]
 }
