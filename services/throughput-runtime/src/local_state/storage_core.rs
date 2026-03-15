@@ -2,6 +2,86 @@ use super::*;
 use std::collections::BTreeMap;
 
 impl LocalThroughputState {
+    pub(crate) fn load_stream_job_accepted_progress_cursor(
+        &self,
+        handle_id: &str,
+    ) -> Result<Option<LocalStreamJobAcceptedProgressCursorState>> {
+        self.db
+            .get_cf(self.cf(STREAM_JOBS_CF), &stream_job_accepted_progress_cursor_key(handle_id))
+            .context("failed to load stream job accepted progress cursor")?
+            .map(|value| decode_rocksdb_value(&value, "stream job accepted progress cursor"))
+            .transpose()
+    }
+
+    pub(crate) fn load_all_stream_job_accepted_progress_cursors(
+        &self,
+    ) -> Result<Vec<LocalStreamJobAcceptedProgressCursorState>> {
+        let mut states = Vec::new();
+        for (_key, value) in self.load_prefixed_entries_bytes(
+            STREAM_JOBS_CF,
+            STREAM_JOB_ACCEPTED_PROGRESS_CURSOR_BINARY_PREFIX,
+            "stream job accepted progress cursors",
+        )? {
+            let state: LocalStreamJobAcceptedProgressCursorState =
+                decode_rocksdb_value(&value, "stream job accepted progress cursor")?;
+            states.push(state);
+        }
+        states.sort_by(|left, right| left.handle_id.cmp(&right.handle_id));
+        Ok(states)
+    }
+
+    pub(crate) fn load_stream_job_accepted_progress_tail(
+        &self,
+        handle_id: &str,
+        limit: usize,
+    ) -> Result<Vec<LocalStreamJobAcceptedProgressState>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut states = self
+            .load_prefixed_entries_bytes(
+                STREAM_JOBS_CF,
+                &stream_job_accepted_progress_prefix(handle_id),
+                "stream job accepted progress records",
+            )?
+            .into_iter()
+            .map(|(_key, value)| {
+                decode_rocksdb_value::<LocalStreamJobAcceptedProgressState>(
+                    &value,
+                    "stream job accepted progress state",
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        states.sort_by(|left, right| {
+            left.accepted_progress_position.cmp(&right.accepted_progress_position)
+        });
+        if states.len() > limit {
+            states.drain(..states.len() - limit);
+        }
+        Ok(states)
+    }
+
+    pub(crate) fn load_all_stream_job_accepted_progress(
+        &self,
+    ) -> Result<Vec<LocalStreamJobAcceptedProgressState>> {
+        let mut states = Vec::new();
+        for (_key, value) in self.load_prefixed_entries_bytes(
+            STREAM_JOBS_CF,
+            STREAM_JOB_ACCEPTED_PROGRESS_BINARY_PREFIX,
+            "stream job accepted progress records",
+        )? {
+            let state: LocalStreamJobAcceptedProgressState =
+                decode_rocksdb_value(&value, "stream job accepted progress state")?;
+            states.push(state);
+        }
+        states.sort_by(|left, right| {
+            left.handle_id.cmp(&right.handle_id).then_with(|| {
+                left.accepted_progress_position.cmp(&right.accepted_progress_position)
+            })
+        });
+        Ok(states)
+    }
+
     pub(crate) fn load_stream_job_applied_dispatch_batch_ids(
         &self,
         handle_id: &str,
@@ -201,6 +281,28 @@ impl LocalThroughputState {
                 .or_insert(state);
         }
         Ok(checkpoints.into_values().collect())
+    }
+
+    pub(crate) fn load_all_stream_job_sealed_checkpoints(
+        &self,
+    ) -> Result<Vec<LocalStreamJobSealedCheckpointState>> {
+        let mut states = Vec::new();
+        for (_key, value) in self.load_prefixed_entries_bytes(
+            STREAM_JOBS_CF,
+            STREAM_JOB_SEALED_CHECKPOINT_BINARY_PREFIX,
+            "stream job sealed checkpoints",
+        )? {
+            let state: LocalStreamJobSealedCheckpointState =
+                decode_rocksdb_value(&value, "stream job sealed checkpoint state")?;
+            states.push(state);
+        }
+        states.sort_by(|left, right| {
+            left.handle_id
+                .cmp(&right.handle_id)
+                .then_with(|| left.checkpoint_name.cmp(&right.checkpoint_name))
+                .then_with(|| left.stream_partition_id.cmp(&right.stream_partition_id))
+        });
+        Ok(states)
     }
 
     pub(crate) fn load_stream_job_workflow_signal_state(

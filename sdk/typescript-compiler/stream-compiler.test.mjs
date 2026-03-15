@@ -30,7 +30,7 @@ test("stream compiler emits keyed-rollup standalone artifacts", async () => {
 
   assert.equal(artifact.definition_id, "payments-rollup");
   assert.equal(artifact.definition_version, 3);
-  assert.equal(artifact.runtime_contract, "streams_kernel_v1");
+  assert.equal(artifact.runtime_contract, "streams_dataflow_v1");
   assert.equal(artifact.job.name, "keyed-rollup");
   assert.equal(artifact.job.runtime, "keyed_rollup");
   assert.equal(artifact.job.source.kind, "bounded_input");
@@ -62,7 +62,7 @@ test("stream compiler emits keyed-rollup workflow signal artifacts", async () =>
   ]);
   const artifact = JSON.parse(stdout);
 
-  assert.equal(artifact.runtime_contract, "streams_kernel_v1");
+  assert.equal(artifact.runtime_contract, "streams_dataflow_v1");
   assert.equal(artifact.job.runtime, "keyed_rollup");
   assert.equal(artifact.job.operators[2].kind, "signal_workflow");
   assert.equal(artifact.job.operators[2].config.view, "accountTotals");
@@ -104,7 +104,7 @@ test("stream compiler emits aggregate-v2 artifacts with widened schema", async (
   ]);
   const artifact = JSON.parse(stdout);
 
-  assert.equal(artifact.runtime_contract, "streams_kernel_v2");
+  assert.equal(artifact.runtime_contract, "streams_dataflow_v1");
   assert.equal(artifact.job.runtime, "aggregate_v2");
   assert.equal(artifact.job.source.kind, "topic");
   assert.equal(artifact.job.source.name, "payments");
@@ -138,7 +138,7 @@ test("stream compiler emits aggregate-v2 map artifacts", async () => {
   ]);
   const artifact = JSON.parse(stdout);
 
-  assert.equal(artifact.runtime_contract, "streams_kernel_v2");
+  assert.equal(artifact.runtime_contract, "streams_dataflow_v1");
   assert.equal(artifact.job.runtime, "aggregate_v2");
   assert.equal(artifact.job.operators[0].kind, "map");
   assert.equal(artifact.job.operators[0].config.inputField, "riskPoints");
@@ -164,7 +164,7 @@ test("stream compiler accepts aggregate-v2 filter then map ordering", async () =
   ]);
   const artifact = JSON.parse(stdout);
 
-  assert.equal(artifact.runtime_contract, "streams_kernel_v2");
+  assert.equal(artifact.runtime_contract, "streams_dataflow_v1");
   assert.equal(artifact.job.runtime, "aggregate_v2");
   assert.equal(artifact.job.operators[0].kind, "filter");
   assert.equal(artifact.job.operators[1].kind, "map");
@@ -188,7 +188,7 @@ test("stream compiler emits aggregate-v2 route artifacts", async () => {
   ]);
   const artifact = JSON.parse(stdout);
 
-  assert.equal(artifact.runtime_contract, "streams_kernel_v2");
+  assert.equal(artifact.runtime_contract, "streams_dataflow_v1");
   assert.equal(artifact.job.runtime, "aggregate_v2");
   assert.equal(artifact.job.operators[0].kind, "route");
   assert.equal(artifact.job.operators[0].config.outputField, "riskBucket");
@@ -213,7 +213,7 @@ test("stream compiler emits aggregate-v2 hopping window artifacts", async () => 
   ]);
   const artifact = JSON.parse(stdout);
 
-  assert.equal(artifact.runtime_contract, "streams_kernel_v2");
+  assert.equal(artifact.runtime_contract, "streams_dataflow_v1");
   assert.equal(artifact.job.runtime, "aggregate_v2");
   assert.equal(artifact.job.operators[0].kind, "window");
   assert.equal(artifact.job.operators[0].config.mode, "hopping");
@@ -239,7 +239,7 @@ test("stream compiler emits threshold aggregate-v2 artifacts", async () => {
   ]);
   const artifact = JSON.parse(stdout);
 
-  assert.equal(artifact.runtime_contract, "streams_kernel_v2");
+  assert.equal(artifact.runtime_contract, "streams_dataflow_v1");
   assert.equal(artifact.job.runtime, "aggregate_v2");
   assert.equal(artifact.job.source.kind, "bounded_input");
   assert.equal(artifact.job.operators[0].config.reducer, "threshold");
@@ -265,7 +265,7 @@ test("stream compiler emits aggregate-v2 workflow signal artifacts", async () =>
   ]);
   const artifact = JSON.parse(stdout);
 
-  assert.equal(artifact.runtime_contract, "streams_kernel_v2");
+  assert.equal(artifact.runtime_contract, "streams_dataflow_v1");
   assert.equal(artifact.job.runtime, "aggregate_v2");
   assert.equal(artifact.job.operators[2].kind, "signal_workflow");
   assert.equal(artifact.job.operators[2].config.view, "riskThresholds");

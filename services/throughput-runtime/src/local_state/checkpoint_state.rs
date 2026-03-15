@@ -409,6 +409,10 @@ impl LocalThroughputState {
                 .load_all_stream_job_applied_dispatch_batches()?,
             stream_job_checkpoints: self.load_all_stream_job_checkpoints()?,
             stream_job_workflow_signals: self.load_all_stream_job_workflow_signals()?,
+            stream_job_accepted_progress_cursors: self
+                .load_all_stream_job_accepted_progress_cursors()?,
+            stream_job_accepted_progress: self.load_all_stream_job_accepted_progress()?,
+            stream_job_sealed_checkpoints: self.load_all_stream_job_sealed_checkpoints()?,
         })
     }
 
@@ -484,6 +488,23 @@ impl LocalThroughputState {
                 throughput_partition_id(&state.logical_key, 0, partition_count) == partition_id
             })
             .collect::<Vec<_>>();
+        let stream_job_accepted_progress_cursors = self
+            .load_all_stream_job_accepted_progress_cursors()?
+            .into_iter()
+            .filter(|state| {
+                stream_job_runtime_states.iter().any(|runtime| runtime.handle_id == state.handle_id)
+            })
+            .collect::<Vec<_>>();
+        let stream_job_accepted_progress = self
+            .load_all_stream_job_accepted_progress()?
+            .into_iter()
+            .filter(|state| state.stream_partition_id == partition_id)
+            .collect::<Vec<_>>();
+        let stream_job_sealed_checkpoints = self
+            .load_all_stream_job_sealed_checkpoints()?
+            .into_iter()
+            .filter(|state| state.stream_partition_id == partition_id)
+            .collect::<Vec<_>>();
         Ok(CheckpointFile {
             created_at,
             offsets: self
@@ -506,6 +527,9 @@ impl LocalThroughputState {
             stream_job_applied_dispatch_batches,
             stream_job_checkpoints,
             stream_job_workflow_signals,
+            stream_job_accepted_progress_cursors,
+            stream_job_accepted_progress,
+            stream_job_sealed_checkpoints,
         })
     }
 
@@ -630,6 +654,37 @@ impl LocalThroughputState {
                 STREAM_JOBS_CF,
                 &stream_job_signal_key(&state.handle_id, &state.operator_id, &state.logical_key),
                 encode_rocksdb_value(state, "stream job workflow signal state")?,
+            );
+        }
+        for state in &checkpoint.stream_job_accepted_progress_cursors {
+            self.write_batch_put_cf_bytes(
+                &mut batch,
+                STREAM_JOBS_CF,
+                &stream_job_accepted_progress_cursor_key(&state.handle_id),
+                encode_rocksdb_value(state, "stream job accepted progress cursor")?,
+            );
+        }
+        for state in &checkpoint.stream_job_accepted_progress {
+            self.write_batch_put_cf_bytes(
+                &mut batch,
+                STREAM_JOBS_CF,
+                &stream_job_accepted_progress_key(
+                    &state.handle_id,
+                    state.accepted_progress_position,
+                ),
+                encode_rocksdb_value(state, "stream job accepted progress state")?,
+            );
+        }
+        for state in &checkpoint.stream_job_sealed_checkpoints {
+            self.write_batch_put_cf_bytes(
+                &mut batch,
+                STREAM_JOBS_CF,
+                &stream_job_checkpoint_seal_key(
+                    &state.handle_id,
+                    &state.checkpoint_name,
+                    state.stream_partition_id,
+                ),
+                encode_rocksdb_value(state, "stream job sealed checkpoint state")?,
             );
         }
         self.db.write(batch).context("failed to restore throughput checkpoint into state db")?;

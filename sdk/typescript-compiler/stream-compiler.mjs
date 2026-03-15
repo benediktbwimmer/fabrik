@@ -696,8 +696,8 @@ function validateJob(job) {
 }
 
 function runtimeContractForJob(job) {
-  if (job.runtime === "aggregate_v2") {
-    return "streams_kernel_v2";
+  if (job.runtime === "keyed_rollup" || job.runtime === "aggregate_v2") {
+    return "streams_dataflow_v1";
   }
   return "streams_kernel_v1";
 }

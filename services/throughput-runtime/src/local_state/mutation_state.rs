@@ -681,6 +681,21 @@ impl LocalThroughputState {
                         &stream_job_runtime_key(handle_id),
                         encode_rocksdb_value(&runtime_state, "stream job runtime state")?,
                     );
+                    let sealed_checkpoint = self.sealed_checkpoint_state_from_runtime(
+                        handle_id,
+                        job_id,
+                        checkpoint_name,
+                        *checkpoint_sequence,
+                        *stream_partition_id,
+                        *owner_epoch,
+                        *reached_at,
+                        None,
+                        &runtime_state,
+                    )?;
+                    self.write_stream_job_sealed_checkpoint_to_batch(
+                        write_batch,
+                        &sealed_checkpoint,
+                    )?;
                 }
             }
             ThroughputChangelogPayload::StreamJobWorkflowSignaled {
@@ -1719,6 +1734,21 @@ impl LocalThroughputState {
                         &stream_job_runtime_key(handle_id),
                         encode_rocksdb_value(&runtime_state, "stream job runtime state")?,
                     );
+                    let sealed_checkpoint = self.sealed_checkpoint_state_from_runtime(
+                        handle_id,
+                        job_id,
+                        checkpoint_name,
+                        *checkpoint_sequence,
+                        *stream_partition_id,
+                        *owner_epoch,
+                        *reached_at,
+                        None,
+                        &runtime_state,
+                    )?;
+                    self.write_stream_job_sealed_checkpoint_to_batch(
+                        write_batch,
+                        &sealed_checkpoint,
+                    )?;
                 }
             }
             StreamsChangelogPayload::StreamJobWorkflowSignaled {

@@ -22,6 +22,7 @@ Read in this order:
 16. [Streams Kernel v2](/Users/bene/code/fabrik/docs/spec/streams-kernel-v2.md)
 17. [Streams First Vertical Slice](/Users/bene/code/fabrik/docs/spec/streams-first-vertical-slice.md)
 18. [Stream Jobs](/Users/bene/code/fabrik/docs/spec/stream-jobs.md)
+19. [Streams Dataflow v1 Plan](/Users/bene/code/fabrik/docs/spec/streams-dataflow-v1.md)
 19. [Snapshots](/Users/bene/code/fabrik/docs/spec/snapshots.md)
 20. [Signals, Queries, and Updates](/Users/bene/code/fabrik/docs/spec/signals.md)
 21. [Failure, Retry, and Compensation](/Users/bene/code/fabrik/docs/spec/failure-retry-compensation.md)

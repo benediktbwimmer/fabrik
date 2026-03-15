@@ -10,6 +10,8 @@ use fabrik_store::{
     StreamJobViewProjectionSummaryRecord, StreamJobViewRecord, WorkflowSignalStatus, WorkflowStore,
 };
 use fabrik_throughput::{
+    AcceptedProgressRecord, DataflowBatchSummary, DataflowOffsetRange, DataflowSourceFrontier,
+    OwnerApplyAck, STREAMS_DATAFLOW_V1_CONTRACT, StrongReadCheckpointRef, StrongReadMetadata,
     CompiledAggregateV2Kernel, CompiledAggregateV2PreKeyOperator, CompiledStreamJob,
     CompiledStreamOperator, CompiledStreamQuery, CompiledStreamSource, CompiledStreamState,
     CompiledStreamView, STREAM_CONSISTENCY_STRONG, STREAM_JOB_KEYED_ROLLUP,
@@ -33,7 +35,8 @@ use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 use crate::local_state::{
-    LocalStreamJobDispatchBatch, LocalStreamJobDispatchItem, LocalStreamJobHotKeyRuntimeStatsState,
+    LocalStreamJobAcceptedProgressState, LocalStreamJobDispatchBatch,
+    LocalStreamJobDispatchItem, LocalStreamJobHotKeyRuntimeStatsState,
     LocalStreamJobOwnerPartitionRuntimeStatsState, LocalStreamJobPreKeyRuntimeStatsState,
     LocalStreamJobRouteBranchRuntimeStatsState, LocalStreamJobRuntimeState,
     LocalStreamJobSourceCursorState, LocalStreamJobSourceLeaseState, LocalStreamJobViewState,
@@ -1293,6 +1296,12 @@ pub(crate) async fn resolve_stream_job_definition(
         }
     }
 
+    resolve_stream_job_definition_without_store(handle)
+}
+
+fn resolve_stream_job_definition_without_store(
+    handle: &StreamJobBridgeHandleRecord,
+) -> Result<Option<CompiledStreamJob>> {
     if let Some(job) = parse_compiled_job_from_config_ref(handle)? {
         job.validate_supported_contract()?;
         return Ok(Some(job));
@@ -1305,6 +1314,74 @@ pub(crate) async fn resolve_stream_job_definition(
     }
 
     Ok(None)
+}
+
+fn dataflow_plan_id_for_handle(handle: &StreamJobBridgeHandleRecord) -> String {
+    format!("stream-job:{}", handle.handle_id)
+}
+
+fn dataflow_plan_summary_value_for_job(
+    handle: &StreamJobBridgeHandleRecord,
+    job: &CompiledStreamJob,
+) -> Result<Value> {
+    Ok(job.dataflow_plan(dataflow_plan_id_for_handle(handle))?.summary_value())
+}
+
+fn accepted_progress_source_id(
+    runtime_state: Option<&LocalStreamJobRuntimeState>,
+    work: &StreamJobPartitionWork,
+) -> String {
+    runtime_state
+        .and_then(|state| state.source_name.clone())
+        .or_else(|| runtime_state.and_then(|state| state.source_kind.clone()))
+        .unwrap_or_else(|| {
+            if work.source_lease_token.is_some() {
+                STREAM_SOURCE_TOPIC.to_owned()
+            } else {
+                STREAM_SOURCE_BOUNDED_INPUT.to_owned()
+            }
+        })
+}
+
+fn accepted_progress_state_for_work(
+    handle: &StreamJobBridgeHandleRecord,
+    work: &StreamJobPartitionWork,
+    runtime_state: Option<&LocalStreamJobRuntimeState>,
+) -> LocalStreamJobAcceptedProgressState {
+    let record = AcceptedProgressRecord {
+        plan_id: dataflow_plan_id_for_handle(handle),
+        run_id: Some(handle.run_id.clone()),
+        job_id: Some(handle.job_id.clone()),
+        source_id: accepted_progress_source_id(runtime_state, work),
+        source_partition_id: work.checkpoint_partition_id.unwrap_or(work.stream_partition_id),
+        source_epoch: work.checkpoint_sequence.max(0) as u64,
+        offset_range: None::<DataflowOffsetRange>,
+        edge_id: format!("exchange:key_by:{}", work.key_field),
+        dest_partition_id: work.stream_partition_id,
+        batch_id: work.batch_id.clone(),
+        owner_epoch: work.owner_epoch,
+        lease_epoch: None,
+        summary: DataflowBatchSummary {
+            record_count: work.items.len() as u64,
+            payload_checksum: None,
+        },
+    };
+    LocalStreamJobAcceptedProgressState {
+        handle_id: handle.handle_id.clone(),
+        stream_partition_id: work.stream_partition_id,
+        accepted_progress_position: 0,
+        batch_id: work.batch_id.clone(),
+        ack: OwnerApplyAck {
+            plan_id: record.plan_id.clone(),
+            batch_id: record.batch_id.clone(),
+            dest_partition_id: record.dest_partition_id,
+            owner_epoch: record.owner_epoch,
+            durable: false,
+            accepted_progress_position: 0,
+        },
+        record,
+        accepted_at: work.occurred_at,
+    }
 }
 
 fn for_each_bounded_input_item<F>(input_ref: &str, mut on_item: F) -> Result<usize>
@@ -2821,6 +2898,196 @@ fn optional_duration_seconds(value: Option<chrono::Duration>) -> Value {
     value.map(|duration| Value::from(duration.num_seconds())).unwrap_or(Value::Null)
 }
 
+fn strong_read_metadata_from_runtime_state(
+    local_state: &LocalThroughputState,
+    runtime_state: &LocalStreamJobRuntimeState,
+    handle_id: &str,
+) -> StrongReadMetadata {
+    let last_durable_position = local_state
+        .load_stream_job_accepted_progress_cursor(handle_id)
+        .ok()
+        .flatten()
+        .map(|cursor| cursor.last_durable_positions)
+        .filter(|positions| !positions.is_empty())
+        .unwrap_or_else(|| {
+            runtime_state
+                .source_cursors
+                .iter()
+                .map(|cursor| {
+                    (
+                        cursor.source_partition_id,
+                        cursor
+                            .last_applied_offset
+                            .unwrap_or_else(|| cursor.next_offset.saturating_sub(1)),
+                    )
+                })
+                .collect()
+        });
+    let last_source_frontier = runtime_state
+        .source_cursors
+        .iter()
+        .map(|cursor| DataflowSourceFrontier {
+            source_partition_id: cursor.source_partition_id,
+            last_applied_offset: cursor.last_applied_offset,
+            next_offset: Some(cursor.next_offset),
+            high_watermark: cursor.last_high_watermark,
+        })
+        .collect();
+    let last_sealed_checkpoint = sealed_checkpoint_states_for_runtime(local_state, runtime_state)
+        .ok()
+        .and_then(|states| {
+            if states.len() == runtime_state.active_partitions.len() && !states.is_empty() {
+                Some(StrongReadCheckpointRef {
+                    checkpoint_name: runtime_state.checkpoint_name.clone(),
+                    checkpoint_sequence: runtime_state.checkpoint_sequence,
+                    sealed_at: states.into_iter().map(|state| state.sealed_at).max(),
+                })
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            (!runtime_state.checkpoint_name.is_empty() && runtime_state.checkpoint_sequence > 0)
+                .then(|| StrongReadCheckpointRef {
+                    checkpoint_name: runtime_state.checkpoint_name.clone(),
+                    checkpoint_sequence: runtime_state.checkpoint_sequence,
+                    sealed_at: runtime_state.latest_checkpoint_at,
+                })
+        });
+    StrongReadMetadata {
+        consistency: STREAM_CONSISTENCY_STRONG.to_owned(),
+        owner_epoch: runtime_state.stream_owner_epoch,
+        last_durable_position,
+        last_source_frontier,
+        last_sealed_checkpoint,
+    }
+}
+
+fn strong_read_metadata_value(
+    local_state: &LocalThroughputState,
+    runtime_state: &LocalStreamJobRuntimeState,
+    handle_id: &str,
+) -> Result<Value> {
+    let metadata = strong_read_metadata_from_runtime_state(local_state, runtime_state, handle_id);
+    Ok(json!({
+        "consistency": metadata.consistency,
+        "ownerEpoch": metadata.owner_epoch,
+        "lastDurablePosition": metadata.last_durable_position,
+        "lastSourceFrontier": metadata.last_source_frontier.into_iter().map(|frontier| {
+            json!({
+                "sourcePartitionId": frontier.source_partition_id,
+                "lastAppliedOffset": frontier.last_applied_offset,
+                "nextOffset": frontier.next_offset,
+                "highWatermark": frontier.high_watermark,
+            })
+        }).collect::<Vec<_>>(),
+        "lastSealedCheckpoint": metadata.last_sealed_checkpoint.map(|checkpoint| {
+            json!({
+                "checkpointName": checkpoint.checkpoint_name,
+                "checkpointSequence": checkpoint.checkpoint_sequence,
+                "sealedAt": optional_datetime_value(checkpoint.sealed_at),
+            })
+        }).unwrap_or(Value::Null),
+    }))
+}
+
+fn accepted_progress_runtime_value(
+    local_state: &LocalThroughputState,
+    handle_id: &str,
+) -> Result<Value> {
+    let cursor = local_state.load_stream_job_accepted_progress_cursor(handle_id)?;
+    let tail = local_state.load_stream_job_accepted_progress_tail(handle_id, 4)?;
+    let partition_positions = cursor
+        .as_ref()
+        .map(|state| serde_json::to_value(&state.last_durable_positions))
+        .transpose()
+        .context("failed to serialize accepted progress partition positions")?
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    Ok(json!({
+        "latestPosition": cursor.as_ref().map(|state| state.latest_position),
+        "partitionPositions": partition_positions,
+        "recent": tail.into_iter().map(|state| {
+            json!({
+                "position": state.accepted_progress_position,
+                "batchId": state.batch_id,
+                "streamPartitionId": state.stream_partition_id,
+                "sourcePartitionId": state.record.source_partition_id,
+                "sourceEpoch": state.record.source_epoch,
+                "ownerEpoch": state.record.owner_epoch,
+                "recordCount": state.record.summary.record_count,
+                "acceptedAt": state.accepted_at.to_rfc3339(),
+            })
+        }).collect::<Vec<_>>(),
+    }))
+}
+
+fn sealed_checkpoint_states_for_runtime(
+    local_state: &LocalThroughputState,
+    runtime_state: &LocalStreamJobRuntimeState,
+) -> Result<Vec<crate::local_state::LocalStreamJobSealedCheckpointState>> {
+    if runtime_state.checkpoint_name.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(local_state
+        .load_all_stream_job_sealed_checkpoints()?
+        .into_iter()
+        .filter(|state| {
+            state.handle_id == runtime_state.handle_id
+                && state.checkpoint_name == runtime_state.checkpoint_name
+                && state.checkpoint_sequence == runtime_state.checkpoint_sequence
+                && runtime_state.active_partitions.contains(&state.stream_partition_id)
+        })
+        .collect())
+}
+
+fn sealed_checkpoint_runtime_value(
+    local_state: &LocalThroughputState,
+    runtime_state: &LocalStreamJobRuntimeState,
+) -> Result<Value> {
+    let sealed = sealed_checkpoint_states_for_runtime(local_state, runtime_state)?;
+    if sealed.is_empty() {
+        let fallback = runtime_state
+            .checkpoint_partitions
+            .iter()
+            .filter(|state| {
+                state.checkpoint_name == runtime_state.checkpoint_name
+                    && state.checkpoint_sequence == runtime_state.checkpoint_sequence
+                    && runtime_state.active_partitions.contains(&state.stream_partition_id)
+            })
+            .map(|state| {
+                json!({
+                    "streamPartitionId": state.stream_partition_id,
+                    "checkpointName": state.checkpoint_name,
+                    "checkpointSequence": state.checkpoint_sequence,
+                    "acceptedProgressPosition": Value::Null,
+                    "sealedAt": state.reached_at.to_rfc3339(),
+                    "stateImage": Value::Null,
+                })
+            })
+            .collect::<Vec<_>>();
+        return Ok(json!({
+            "count": fallback.len(),
+            "partitions": fallback,
+        }));
+    }
+    Ok(json!({
+        "count": sealed.len(),
+        "partitions": sealed.into_iter().map(|state| {
+            json!({
+                "streamPartitionId": state.stream_partition_id,
+                "checkpointName": state.checkpoint_name,
+                "checkpointSequence": state.checkpoint_sequence,
+                "acceptedProgressPosition": state.record.accepted_progress_position,
+                "sealedAt": state.sealed_at.to_rfc3339(),
+                "stateImage": {
+                    "manifestKey": state.record.state_image.manifest_key,
+                    "checksum": state.record.state_image.checksum,
+                },
+            })
+        }).collect::<Vec<_>>(),
+    }))
+}
+
 fn build_stream_job_runtime_stats_output_from_runtime_state(
     local_state: &LocalThroughputState,
     runtime_state: &LocalStreamJobRuntimeState,
@@ -2861,8 +3128,16 @@ fn build_stream_job_runtime_stats_output_from_runtime_state(
     output.insert("jobId".to_owned(), Value::String(runtime_state.job_id.clone()));
     output.insert("jobName".to_owned(), Value::String(runtime_state.job_name.clone()));
     output.insert("queryName".to_owned(), Value::String(query.query_name.clone()));
-    if let Some(job) = parse_compiled_job_from_config_ref(handle)? {
+    if let Some(job) = resolve_stream_job_definition_without_store(handle)? {
         output.insert("jobRuntime".to_owned(), Value::String(job.runtime.clone()));
+        output.insert(
+            "runtimeContract".to_owned(),
+            Value::String(STREAMS_DATAFLOW_V1_CONTRACT.to_owned()),
+        );
+        output.insert(
+            "dataflowPlan".to_owned(),
+            dataflow_plan_summary_value_for_job(handle, &job)?,
+        );
         output.insert(
             "jobClassification".to_owned(),
             job.classification.clone().map(Value::String).unwrap_or(Value::Null),
@@ -2921,6 +3196,14 @@ fn build_stream_job_runtime_stats_output_from_runtime_state(
         Value::Array(source_leases.into_iter().map(source_lease_runtime_stats).collect()),
     );
     output.insert("sourcePartitionStats".to_owned(), source_partition_stats);
+    output.insert(
+        "sealedCheckpoint".to_owned(),
+        sealed_checkpoint_runtime_value(local_state, runtime_state)?,
+    );
+    output.insert(
+        "acceptedProgress".to_owned(),
+        accepted_progress_runtime_value(local_state, &handle.handle_id)?,
+    );
     output.insert("consistency".to_owned(), Value::String(STREAM_CONSISTENCY_STRONG.to_owned()));
     output.insert(
         "consistencySource".to_owned(),
@@ -2961,7 +3244,7 @@ fn build_stream_job_view_runtime_stats_output_on_local_state(
     let Some(view_name) = query_view_name(query)? else {
         anyhow::bail!("{STREAM_JOB_VIEW_RUNTIME_STATS_QUERY_NAME} requires viewName");
     };
-    let Some(job) = parse_compiled_job_from_config_ref(handle)? else {
+    let Some(job) = resolve_stream_job_definition_without_store(handle)? else {
         return Ok(None);
     };
     let Some(view) = job.views.iter().find(|view| view.name == view_name) else {
@@ -3027,6 +3310,8 @@ fn build_stream_job_view_runtime_stats_output_on_local_state(
         "handleId": runtime_state.handle_id,
         "jobId": runtime_state.job_id,
         "jobName": runtime_state.job_name,
+        "runtimeContract": STREAMS_DATAFLOW_V1_CONTRACT,
+        "dataflowPlan": dataflow_plan_summary_value_for_job(handle, &job)?,
         "viewName": view_name,
         "policy": policy,
         "preKeyStats": pre_key_runtime_stats_value(&runtime_state),
@@ -3040,6 +3325,8 @@ fn build_stream_job_view_runtime_stats_output_on_local_state(
             &runtime_state.source_cursors.iter().collect::<Vec<_>>(),
             &runtime_state.source_partition_leases.iter().collect::<Vec<_>>(),
         ),
+        "sealedCheckpoint": sealed_checkpoint_runtime_value(local_state, &runtime_state)?,
+        "acceptedProgress": accepted_progress_runtime_value(local_state, &handle.handle_id)?,
         "storedKeyCount": stored_entries.len(),
         "activeKeyCount": active_entries,
         "latestCheckpointSequence": latest_checkpoint_sequence,
@@ -3997,6 +4284,7 @@ struct PreparedStreamJobPartitionApply {
     activation_result: StreamJobActivationResult,
     owner_view_updates: Vec<LocalStreamJobViewState>,
     mirrored_stream_entries: Vec<StreamsChangelogEntry>,
+    accepted_progress_state: LocalStreamJobAcceptedProgressState,
     stream_partition_id: i32,
     state_key_delta: u64,
     batch_id: String,
@@ -6315,6 +6603,7 @@ pub(crate) async fn plan_stream_job_activation(
     let Some(job) = resolve_stream_job_definition(store, handle).await? else {
         return Ok(None);
     };
+    let _canonical_dataflow_plan = job.dataflow_plan(dataflow_plan_id_for_handle(handle))?;
     let owner_epoch = owner_epoch.unwrap_or(1);
     let bounded_plan = bounded_stream_plan_for_job(&job)?;
     let Some(plan) = bounded_plan else {
@@ -6632,6 +6921,7 @@ pub(crate) fn apply_stream_job_partition_work_on_local_state_with_metrics(
             prepared.completes_dispatch,
             prepared.occurred_at,
             prepared.owner_view_updates,
+            vec![prepared.accepted_progress_state],
             &prepared.mirrored_stream_entries,
         )?;
         if let Some(metrics) = metrics.as_deref_mut()
@@ -6691,20 +6981,20 @@ fn prepare_stream_job_partition_work_apply(
     if local_state.has_stream_job_applied_dispatch_batch(&handle.handle_id, &work.batch_id)? {
         return Ok(None);
     }
+    let mut loaded_runtime_state = None;
     if let (Some(source_partition_id), Some(source_lease_token)) =
         (work.checkpoint_partition_id, work.source_lease_token.as_ref())
     {
         if let Some(metrics) = metrics.as_deref_mut() {
             metrics.runtime_state_loads += 1;
         }
-        let loaded_runtime_state;
         let runtime_state = if let Some(runtime_state_override) = runtime_state_override {
             runtime_state_override
         } else if let Some(runtime_state) =
             local_state.load_stream_job_runtime_state(&handle.handle_id)?
         {
-            loaded_runtime_state = runtime_state;
-            &loaded_runtime_state
+            loaded_runtime_state = Some(runtime_state);
+            loaded_runtime_state.as_ref().expect("loaded runtime state should exist")
         } else {
             return Ok(None);
         };
@@ -6838,6 +7128,9 @@ fn prepare_stream_job_partition_work_apply(
     changelog_records.extend(signal_records);
     let owner_view_updates = materialized.owner_view_updates;
     let state_key_delta = prior_outputs.values().filter(|output| output.is_none()).count() as u64;
+    let runtime_state_for_progress = runtime_state_override.or(loaded_runtime_state.as_ref());
+    let accepted_progress_state =
+        accepted_progress_state_for_work(handle, work, runtime_state_for_progress);
     if work.is_final_partition_batch && !work.checkpoint_name.is_empty() {
         changelog_records.push(checkpoint_reached_changelog_record(
             handle,
@@ -6888,6 +7181,7 @@ fn prepare_stream_job_partition_work_apply(
         activation_result: StreamJobActivationResult { projection_records, changelog_records },
         owner_view_updates,
         mirrored_stream_entries,
+        accepted_progress_state,
         stream_partition_id: work.stream_partition_id,
         state_key_delta,
         batch_id: work.batch_id.clone(),
@@ -6947,6 +7241,7 @@ pub(crate) async fn activate_stream_job_on_local_state(
     }
     let mut batched_owner_view_updates = Vec::new();
     let mut batched_stream_entries = Vec::new();
+    let mut batched_accepted_progress = Vec::new();
     let mut batched_dispatch_batch_ids = Vec::new();
     let mut batched_partition_state_key_deltas = BTreeMap::<i32, u64>::new();
     let mut batched_completes_dispatch = false;
@@ -6975,6 +7270,7 @@ pub(crate) async fn activate_stream_job_on_local_state(
             changelog_records.extend(prepared.activation_result.changelog_records);
             batched_owner_view_updates.extend(prepared.owner_view_updates);
             batched_stream_entries.extend(prepared.mirrored_stream_entries);
+            batched_accepted_progress.push(prepared.accepted_progress_state);
             batched_dispatch_batch_ids.push(prepared.batch_id);
             if prepared.state_key_delta > 0 {
                 let entry = batched_partition_state_key_deltas
@@ -7003,6 +7299,7 @@ pub(crate) async fn activate_stream_job_on_local_state(
             batched_completes_dispatch,
             batched_updated_at,
             batched_owner_view_updates,
+            batched_accepted_progress,
             &batched_stream_entries,
         )?;
         if !batched_partition_state_key_deltas.is_empty() {
@@ -7052,6 +7349,7 @@ pub(crate) fn materialization_outcome_from_local_state(
     let Some(runtime_state) = local_state.load_stream_job_runtime_state(&handle.handle_id)? else {
         return Ok(None);
     };
+    let sealed_checkpoint_states = sealed_checkpoint_states_for_runtime(local_state, &runtime_state)?;
     let checkpoint_states = if runtime_state.checkpoint_name.is_empty() {
         Vec::new()
     } else {
@@ -7082,6 +7380,73 @@ pub(crate) fn materialization_outcome_from_local_state(
     };
     let checkpoint = if runtime_state.checkpoint_name.is_empty() {
         None
+    } else if sealed_checkpoint_states.len() == runtime_state.active_partitions.len()
+        && !sealed_checkpoint_states.is_empty()
+    {
+        let reached_at = sealed_checkpoint_states
+            .iter()
+            .map(|state| state.sealed_at)
+            .max()
+            .unwrap_or(runtime_state.updated_at);
+        let owner_epoch = sealed_checkpoint_states
+            .iter()
+            .map(|state| state.record.owner_epoch)
+            .max()
+            .unwrap_or(runtime_state.stream_owner_epoch);
+        let sealed_output = sealed_checkpoint_states
+            .iter()
+            .map(|state| {
+                json!({
+                    "streamPartitionId": state.stream_partition_id,
+                    "acceptedProgressPosition": state.record.accepted_progress_position,
+                    "sealedAt": state.sealed_at.to_rfc3339(),
+                })
+            })
+            .collect::<Vec<_>>();
+        Some(StreamJobCheckpointRecord {
+            workflow_event_id: Uuid::new_v5(
+                &Uuid::NAMESPACE_URL,
+                format!(
+                    "stream-job-checkpoint:{}:{}:{}",
+                    handle.handle_id,
+                    runtime_state.checkpoint_name,
+                    runtime_state.checkpoint_sequence
+                )
+                .as_bytes(),
+            ),
+            protocol_version: fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: fabrik_throughput::ThroughputBridgeOperationKind::StreamJob
+                .as_str()
+                .to_owned(),
+            tenant_id: handle.tenant_id.clone(),
+            instance_id: handle.instance_id.clone(),
+            run_id: handle.run_id.clone(),
+            job_id: handle.job_id.clone(),
+            handle_id: handle.handle_id.clone(),
+            bridge_request_id: handle.bridge_request_id.clone(),
+            await_request_id: format!(
+                "stream-job-reached:{}:{}:{}",
+                handle.handle_id, runtime_state.checkpoint_name, runtime_state.checkpoint_sequence
+            ),
+            checkpoint_name: runtime_state.checkpoint_name.clone(),
+            checkpoint_sequence: Some(runtime_state.checkpoint_sequence),
+            status: fabrik_throughput::StreamJobCheckpointStatus::Reached.as_str().to_owned(),
+            workflow_owner_epoch: handle.workflow_owner_epoch,
+            stream_owner_epoch: Some(owner_epoch),
+            reached_at: Some(reached_at),
+            output: Some(json!({
+                "jobId": handle.job_id,
+                "checkpoint": runtime_state.checkpoint_name,
+                "checkpointSequence": runtime_state.checkpoint_sequence,
+                "viewName": runtime_state.view_name,
+                "activePartitions": runtime_state.active_partitions,
+                "sealed": sealed_output,
+            })),
+            accepted_at: None,
+            cancelled_at: None,
+            created_at: runtime_state.planned_at,
+            updated_at: reached_at,
+        })
     } else if checkpoint_states.len() == runtime_state.active_partitions.len() {
         let reached_at = checkpoint_states
             .iter()
@@ -7282,6 +7647,7 @@ fn stream_scan_output(
     items: Vec<Value>,
     runtime_stats: Option<Value>,
     projection_stats: Option<Value>,
+    strong_read_metadata: Option<Value>,
 ) -> Value {
     let mut output = Map::new();
     output.insert("queryName".to_owned(), Value::String(query.query_name.clone()));
@@ -7297,6 +7663,9 @@ fn stream_scan_output(
     }
     if let Some(projection_stats) = projection_stats {
         output.insert("projectionStats".to_owned(), projection_stats);
+    }
+    if let Some(strong_read_metadata) = strong_read_metadata {
+        output.insert("strongReadMetadata".to_owned(), strong_read_metadata);
     }
     Value::Object(output)
 }
@@ -7743,6 +8112,7 @@ pub(crate) async fn build_stream_job_query_output(
                 items,
                 None,
                 projection_stats,
+                None,
             )));
         }
         let Some(mut output) = build_stream_job_query_output_on_local_state(
@@ -7871,17 +8241,28 @@ pub(crate) fn build_stream_job_query_output_on_local_state(
             }
             total = total.saturating_add(1);
         }
-        let runtime_stats = local_state
-            .load_stream_job_runtime_state(&handle.handle_id)?
+        let runtime_state = local_state.load_stream_job_runtime_state(&handle.handle_id)?;
+        let runtime_stats = runtime_state
+            .as_ref()
             .map(|runtime_state| {
                 build_stream_job_runtime_stats_output_from_runtime_state(
                     local_state,
-                    &runtime_state,
+                    runtime_state,
                     handle,
                     query,
                 )
             })
             .transpose()?;
+        let strong_read_metadata = if resolved_query_consistency(query) == STREAM_CONSISTENCY_STRONG {
+            runtime_state
+                .as_ref()
+                .map(|runtime_state| {
+                    strong_read_metadata_value(local_state, runtime_state, &handle.handle_id)
+                })
+                .transpose()?
+        } else {
+            None
+        };
         return Ok(Some(stream_scan_output(
             query,
             &prefix,
@@ -7893,6 +8274,7 @@ pub(crate) fn build_stream_job_query_output_on_local_state(
             items,
             runtime_stats,
             None,
+            strong_read_metadata,
         )));
     }
     if view.query_mode != STREAM_QUERY_MODE_BY_KEY {
@@ -7913,6 +8295,11 @@ pub(crate) fn build_stream_job_query_output_on_local_state(
     }
 
     let mut output = sanitize_stream_view_output(view_state.output);
+    let runtime_state = if resolved_query_consistency(query) == STREAM_CONSISTENCY_STRONG {
+        local_state.load_stream_job_runtime_state(&handle.handle_id)?
+    } else {
+        None
+    };
     if let Some(object) = output.as_object_mut() {
         window_query_annotations(job.as_ref(), &view, object)?;
         object.insert("consistency".to_owned(), Value::String(query.consistency.clone()));
@@ -7925,6 +8312,12 @@ pub(crate) fn build_stream_job_query_output_on_local_state(
             object.insert("streamOwnerEpoch".to_owned(), Value::from(owner_epoch));
         }
         object.insert("consistency".to_owned(), Value::String(resolved_query_consistency(query)));
+        if let Some(runtime_state) = runtime_state.as_ref() {
+            object.insert(
+                "strongReadMetadata".to_owned(),
+                strong_read_metadata_value(local_state, runtime_state, &handle.handle_id)?,
+            );
+        }
     }
     Ok(Some(output))
 }
@@ -9746,6 +10139,102 @@ mod tests {
 
         std::fs::remove_dir_all(db_path).ok();
         std::fs::remove_dir_all(checkpoint_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keyed_rollup_apply_persists_accepted_progress_and_restores_checkpoint() -> Result<()> {
+        let partition_count = 8;
+        let handle = keyed_rollup_handle(
+            &json!({
+                "kind": "bounded_items",
+                "items": [
+                    { "accountId": "acct_1", "amount": 4.0 },
+                    { "accountId": "acct_1", "amount": 5.0 }
+                ]
+            })
+            .to_string(),
+        );
+        let db_path = temp_path("stream-jobs-keyed-rollup-accepted-progress-db");
+        let checkpoint_dir = temp_path("stream-jobs-keyed-rollup-accepted-progress-checkpoints");
+        let local_state = LocalThroughputState::open(&db_path, &checkpoint_dir, 3)?;
+        let occurred_at = Utc::now();
+
+        let plan = plan_stream_job_activation(
+            &local_state,
+            None,
+            None,
+            &handle,
+            partition_count,
+            Some(9),
+            occurred_at,
+        )
+        .await?
+        .expect("activation plan should exist");
+        let execution_entry = streams_entry_from_record(
+            plan.execution_planned.as_ref().expect("execution plan should exist"),
+        );
+        local_state.mirror_streams_changelog_entry(&execution_entry)?;
+        local_state.replace_stream_job_dispatch_manifest(
+            &handle.handle_id,
+            plan.partition_work.iter().map(local_dispatch_batch_from_work).collect(),
+            occurred_at,
+        )?;
+
+        let work = plan.partition_work.first().expect("partition work should exist");
+        let _applied =
+            apply_stream_job_partition_work_on_local_state(&local_state, &handle, work, true)?;
+
+        let cursor = local_state
+            .load_stream_job_accepted_progress_cursor(&handle.handle_id)?
+            .expect("accepted progress cursor should exist");
+        assert_eq!(cursor.latest_position, 1);
+        assert_eq!(cursor.last_durable_positions.get(&work.stream_partition_id), Some(&1));
+
+        let tail = local_state.load_stream_job_accepted_progress_tail(&handle.handle_id, 8)?;
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].batch_id, work.batch_id);
+        assert_eq!(tail[0].record.batch_id, work.batch_id);
+        assert_eq!(tail[0].ack.accepted_progress_position, 1);
+        assert!(tail[0].ack.durable);
+        let sealed = local_state
+            .load_all_stream_job_sealed_checkpoints()?
+            .into_iter()
+            .filter(|state| state.handle_id == handle.handle_id)
+            .collect::<Vec<_>>();
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(sealed[0].checkpoint_name, KEYED_ROLLUP_CHECKPOINT_NAME);
+        assert_eq!(sealed[0].record.accepted_progress_position, 1);
+
+        let checkpoint_value = local_state.snapshot_checkpoint_value()?;
+        let restored_db_path =
+            temp_path("stream-jobs-keyed-rollup-accepted-progress-restored-db");
+        let restored_checkpoint_dir =
+            temp_path("stream-jobs-keyed-rollup-accepted-progress-restored-checkpoints");
+        let restored_state =
+            LocalThroughputState::open(&restored_db_path, &restored_checkpoint_dir, 3)?;
+        assert!(restored_state.restore_from_checkpoint_value_if_empty(checkpoint_value)?);
+
+        let restored_cursor = restored_state
+            .load_stream_job_accepted_progress_cursor(&handle.handle_id)?
+            .expect("restored accepted progress cursor should exist");
+        assert_eq!(restored_cursor.latest_position, 1);
+        let restored_tail =
+            restored_state.load_stream_job_accepted_progress_tail(&handle.handle_id, 8)?;
+        assert_eq!(restored_tail.len(), 1);
+        assert_eq!(restored_tail[0].record.batch_id, work.batch_id);
+        let restored_sealed = restored_state
+            .load_all_stream_job_sealed_checkpoints()?
+            .into_iter()
+            .filter(|state| state.handle_id == handle.handle_id)
+            .collect::<Vec<_>>();
+        assert_eq!(restored_sealed.len(), 1);
+        assert_eq!(restored_sealed[0].record.accepted_progress_position, 1);
+
+        std::fs::remove_dir_all(db_path).ok();
+        std::fs::remove_dir_all(checkpoint_dir).ok();
+        std::fs::remove_dir_all(restored_db_path).ok();
+        std::fs::remove_dir_all(restored_checkpoint_dir).ok();
         Ok(())
     }
 
@@ -11674,11 +12163,12 @@ mod tests {
             )?;
         }
 
-        let output = build_stream_job_query_output_on_local_state(
-            &local_state,
-            &handle,
-            &strong_scan_query(&handle, "acct_1"),
-        )?
+        let mut query = strong_scan_query(&handle, "acct_1");
+        let requested_at = occurred_at - chrono::Duration::seconds(150);
+        query.requested_at = requested_at;
+        query.created_at = requested_at;
+        query.updated_at = requested_at;
+        let output = build_stream_job_query_output_on_local_state(&local_state, &handle, &query)?
         .expect("scan output should exist");
         assert_eq!(output["prefix"], "acct_1");
         assert_eq!(output["total"], 2);
@@ -11692,6 +12182,13 @@ mod tests {
         assert_eq!(output["items"][0]["avgRisk"], 0.6);
         assert_eq!(output["items"][0]["windowRetentionSeconds"], 120);
         assert_eq!(output["runtimeStats"]["streamOwnerEpoch"], 7);
+        assert_eq!(output["strongReadMetadata"]["ownerEpoch"], 7);
+        assert_eq!(output["strongReadMetadata"]["lastDurablePosition"]["0"], 9);
+        assert_eq!(output["strongReadMetadata"]["lastSealedCheckpoint"]["checkpointName"], "minute-checkpoint");
+        assert_eq!(
+            output["strongReadMetadata"]["lastSourceFrontier"][0]["nextOffset"],
+            10
+        );
 
         std::fs::remove_dir_all(db_path).ok();
         std::fs::remove_dir_all(checkpoint_dir).ok();
@@ -12190,7 +12687,10 @@ mod tests {
             .expect("runtime stats output should build")
             .expect("runtime stats output should exist");
         assert_eq!(output["queryName"], STREAM_JOB_RUNTIME_STATS_QUERY_NAME);
+        assert_eq!(output["runtimeContract"], STREAMS_DATAFLOW_V1_CONTRACT);
         assert_eq!(output["jobRuntime"], STREAM_RUNTIME_AGGREGATE_V2);
+        assert_eq!(output["dataflowPlan"]["streamRuntime"], STREAM_RUNTIME_AGGREGATE_V2);
+        assert_eq!(output["dataflowPlan"]["exchangeEdgeCount"], 1);
         assert_eq!(output["sourceKind"], STREAM_SOURCE_TOPIC);
         assert_eq!(output["sourceName"], "payments");
         assert_eq!(output["streamOwnerEpoch"], 7);
@@ -12258,6 +12758,8 @@ mod tests {
         );
         assert_eq!(output["sourceLeases"][0]["leaseToken"], "lease-0");
         assert_eq!(output["sourcePartitionStats"]["summary"]["partitionCount"], 1);
+        assert_eq!(output["sealedCheckpoint"]["count"], 1);
+        assert_eq!(output["sealedCheckpoint"]["partitions"][0]["checkpointName"], "initial-risk-ready");
         assert_eq!(output["sourcePartitionStats"]["summary"]["caughtUpPartitionCount"], 1);
         assert_eq!(output["sourcePartitionStats"]["summary"]["totalOffsetLag"], 0);
         assert_eq!(output["sourcePartitionStats"]["summary"]["totalCheckpointLag"], 0);

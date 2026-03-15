@@ -5,6 +5,7 @@ use std::{
 };
 
 mod bridge;
+mod dataflow;
 
 use anyhow::{Context, Result};
 use aws_config::BehaviorVersion;
@@ -20,6 +21,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub use bridge::*;
+pub use dataflow::*;
 
 pub const STREAM_V2_BACKEND: &str = "stream-v2";
 pub const CORE_ECHO_ACTIVITY: &str = "core.echo";
@@ -1193,9 +1195,10 @@ impl CompiledStreamJobArtifact {
         }
         if self.runtime_contract != STREAMS_KERNEL_V1_CONTRACT
             && self.runtime_contract != STREAMS_KERNEL_V2_CONTRACT
+            && self.runtime_contract != STREAMS_DATAFLOW_V1_CONTRACT
         {
             anyhow::bail!(
-                "stream artifact runtime_contract must be {STREAMS_KERNEL_V1_CONTRACT} or {STREAMS_KERNEL_V2_CONTRACT}"
+                "stream artifact runtime_contract must be {STREAMS_KERNEL_V1_CONTRACT}, {STREAMS_KERNEL_V2_CONTRACT}, or {STREAMS_DATAFLOW_V1_CONTRACT}"
             );
         }
         if self.entrypoint.module.trim().is_empty() || self.entrypoint.export.trim().is_empty() {
@@ -1219,10 +1222,7 @@ impl CompiledStreamJobArtifact {
 
     pub fn validate(&self) -> Result<()> {
         self.validate_persistable()?;
-        if self.runtime_contract != STREAMS_KERNEL_V1_CONTRACT {
-            anyhow::bail!("stream artifact runtime_contract must be {STREAMS_KERNEL_V1_CONTRACT}");
-        }
-        self.job.validate_supported_contract()?;
+        self.job.validate_for_runtime_contract(&self.runtime_contract)?;
         Ok(())
     }
 }
@@ -3922,7 +3922,7 @@ mod tests {
     }
 
     #[test]
-    fn compiled_stream_artifact_allows_persistable_kernel_v2_shape() -> Result<()> {
+    fn compiled_stream_artifact_validates_kernel_v2_shape() -> Result<()> {
         let mut artifact = CompiledStreamJobArtifact {
             definition_id: "fraud-detector".to_owned(),
             definition_version: 1,
@@ -4067,10 +4067,10 @@ mod tests {
         artifact.artifact_hash = artifact.hash();
 
         artifact.validate_persistable()?;
-        let error = artifact
-            .validate()
-            .expect_err("kernel v2 artifact should not validate as runnable yet");
-        assert!(error.to_string().contains(STREAMS_KERNEL_V1_CONTRACT));
+        artifact.validate()?;
+        let plan = artifact.dataflow_plan()?;
+        assert_eq!(plan.runtime_contract, STREAMS_DATAFLOW_V1_CONTRACT);
+        assert_eq!(plan.stream_runtime, STREAM_RUNTIME_AGGREGATE_V2);
         Ok(())
     }
 

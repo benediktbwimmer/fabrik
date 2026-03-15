@@ -1308,6 +1308,8 @@ struct StreamJobViewScanQuery {
 #[derive(Debug, Clone, Serialize)]
 struct StrongBatchResponse {
     batch: WorkflowBulkBatchRecord,
+    #[serde(rename = "dataflowPlan", skip_serializing_if = "Option::is_none")]
+    dataflow_plan: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2007,7 +2009,16 @@ async fn get_strong_batch_snapshot(
         .await
         .map_err(internal_http_error)?
         .ok_or_else(|| (StatusCode::NOT_FOUND, format!("bulk batch {batch_id} not found")))?;
-    Ok(Json(StrongBatchResponse { batch }))
+    let dataflow_plan = state
+        .store
+        .get_throughput_run(&tenant_id, &instance_id, &run_id, &batch_id)
+        .await
+        .map_err(internal_http_error)?
+        .and_then(|run| match &run.command.payload {
+            ThroughputCommand::StartThroughputRun(start) => Some(start.dataflow_plan().summary_value()),
+            _ => None,
+        });
+    Ok(Json(StrongBatchResponse { batch, dataflow_plan }))
 }
 
 async fn get_strong_stream_job_view(

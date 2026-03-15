@@ -15,14 +15,19 @@ use self::derivation::{
     derive_batch_state_from_chunk_states, infer_ungrouped_batch_terminal_from_chunk_apply,
 };
 use self::keyspace::{
+    STREAM_JOB_ACCEPTED_PROGRESS_BINARY_PREFIX, STREAM_JOB_ACCEPTED_PROGRESS_CURSOR_BINARY_PREFIX,
     STREAM_JOB_CHECKPOINT_BINARY_PREFIX, STREAM_JOB_RUNTIME_BINARY_PREFIX,
-    STREAM_JOB_SIGNAL_BINARY_PREFIX, STREAM_JOB_VIEW_BINARY_PREFIX, batch_chunk_index_key,
+    STREAM_JOB_SEALED_CHECKPOINT_BINARY_PREFIX, STREAM_JOB_SIGNAL_BINARY_PREFIX,
+    STREAM_JOB_VIEW_BINARY_PREFIX, batch_chunk_index_key,
     batch_chunk_index_prefix, batch_key, chunk_key, group_key, legacy_cf_for_key,
     legacy_stream_job_checkpoint_key, legacy_stream_job_runtime_key, legacy_stream_job_signal_key,
     legacy_stream_job_view_key, legacy_stream_job_view_prefix, mirrored_entry_key, offset_key,
-    parse_stream_job_view_key, stream_job_checkpoint_key, stream_job_dispatch_applied_key,
-    stream_job_dispatch_applied_prefix, stream_job_runtime_key, stream_job_signal_key,
-    stream_job_view_key, stream_job_view_prefix, throughput_partition_id, timestamp_sort_key,
+    parse_stream_job_view_key, stream_job_accepted_progress_cursor_key,
+    stream_job_accepted_progress_key, stream_job_accepted_progress_prefix,
+    stream_job_checkpoint_seal_key,
+    stream_job_checkpoint_key, stream_job_dispatch_applied_key, stream_job_dispatch_applied_prefix,
+    stream_job_runtime_key, stream_job_signal_key, stream_job_view_key, stream_job_view_prefix,
+    throughput_partition_id, timestamp_sort_key,
 };
 #[cfg(test)]
 use self::scheduling_state::{lease_expiry_index_key, ready_index_key, started_index_key};
@@ -45,8 +50,10 @@ use fabrik_throughput::{
     throughput_reducer_execution_path, throughput_reducer_version, throughput_routing_reason,
 };
 use fabrik_throughput::{
-    ActivityExecutionCapabilities, StreamsChangelogEntry, StreamsChangelogPayload,
-    ThroughputBatchIdentity, ThroughputChangelogEntry, ThroughputChangelogPayload,
+    AcceptedProgressRecord, ActivityExecutionCapabilities, DataflowSourceFrontier,
+    DataflowStateImageManifest, DataflowWatermarkState, OwnerApplyAck, SealedCheckpointRecord,
+    StreamsChangelogEntry, StreamsChangelogPayload, ThroughputBatchIdentity,
+    ThroughputChangelogEntry, ThroughputChangelogPayload,
     ThroughputChunkReport, ThroughputChunkReportPayload, bulk_reducer_default_summary_value,
     bulk_reducer_reduce_errors, bulk_reducer_reduce_values, bulk_reducer_requires_error_outputs,
     bulk_reducer_requires_success_outputs, bulk_reducer_settles, bulk_reducer_summary_field_name,
@@ -413,6 +420,12 @@ struct CheckpointFile {
     stream_job_checkpoints: Vec<LocalStreamJobCheckpointState>,
     #[serde(default)]
     stream_job_workflow_signals: Vec<LocalStreamJobWorkflowSignalState>,
+    #[serde(default)]
+    stream_job_accepted_progress_cursors: Vec<LocalStreamJobAcceptedProgressCursorState>,
+    #[serde(default)]
+    stream_job_accepted_progress: Vec<LocalStreamJobAcceptedProgressState>,
+    #[serde(default)]
+    stream_job_sealed_checkpoints: Vec<LocalStreamJobSealedCheckpointState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -663,6 +676,39 @@ pub(crate) struct LocalStreamJobRuntimeState {
     pub(crate) terminal_error: Option<String>,
     pub(crate) terminal_at: Option<DateTime<Utc>>,
     pub(crate) updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalStreamJobAcceptedProgressCursorState {
+    pub(crate) handle_id: String,
+    #[serde(default)]
+    pub(crate) latest_position: u64,
+    #[serde(default)]
+    pub(crate) last_durable_positions: BTreeMap<i32, i64>,
+    pub(crate) updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalStreamJobAcceptedProgressState {
+    pub(crate) handle_id: String,
+    pub(crate) stream_partition_id: i32,
+    #[serde(default)]
+    pub(crate) accepted_progress_position: u64,
+    pub(crate) batch_id: String,
+    pub(crate) record: AcceptedProgressRecord,
+    pub(crate) ack: OwnerApplyAck,
+    pub(crate) accepted_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalStreamJobSealedCheckpointState {
+    pub(crate) handle_id: String,
+    pub(crate) job_id: String,
+    pub(crate) checkpoint_name: String,
+    pub(crate) checkpoint_sequence: i64,
+    pub(crate) stream_partition_id: i32,
+    pub(crate) record: SealedCheckpointRecord,
+    pub(crate) sealed_at: DateTime<Utc>,
 }
 
 impl LocalStreamJobRuntimeState {
