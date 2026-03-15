@@ -4,6 +4,8 @@ use rocksdb::WriteOptions;
 pub(crate) struct StreamJobDispatchBatchAppliedOutcome {
     pub(crate) inserted: bool,
     pub(crate) runtime_state_updated: bool,
+    pub(crate) accepted_progress: Vec<LocalStreamJobAcceptedProgressState>,
+    pub(crate) sealed_checkpoints: Vec<LocalStreamJobSealedCheckpointState>,
 }
 
 impl LocalThroughputState {
@@ -153,9 +155,8 @@ impl LocalThroughputState {
         if accepted_progress_states.is_empty() {
             return Ok(None);
         }
-        let mut cursor = self
-            .load_stream_job_accepted_progress_cursor(handle_id)?
-            .unwrap_or(LocalStreamJobAcceptedProgressCursorState {
+        let mut cursor = self.load_stream_job_accepted_progress_cursor(handle_id)?.unwrap_or(
+            LocalStreamJobAcceptedProgressCursorState {
                 handle_id: handle_id.to_owned(),
                 latest_position: 0,
                 last_durable_positions: BTreeMap::new(),
@@ -164,7 +165,8 @@ impl LocalThroughputState {
                     .map(|state| state.accepted_at)
                     .min()
                     .unwrap_or_else(Utc::now),
-            });
+            },
+        );
         for state in accepted_progress_states.iter_mut() {
             cursor.latest_position = cursor.latest_position.saturating_add(1);
             cursor.updated_at = cursor.updated_at.max(state.accepted_at);
@@ -198,7 +200,7 @@ impl LocalThroughputState {
         updated_at: DateTime<Utc>,
         accepted_progress_states: &mut [LocalStreamJobAcceptedProgressState],
         mirrored_stream_entries: &[StreamsChangelogEntry],
-    ) -> Result<bool> {
+    ) -> Result<(bool, Vec<LocalStreamJobSealedCheckpointState>)> {
         let requires_runtime_state = completes_dispatch
             || !accepted_progress_states.is_empty()
             || mirrored_stream_entries.iter().any(|entry| {
@@ -214,15 +216,19 @@ impl LocalThroughputState {
         }
 
         let mut runtime_state_updated = false;
+        let mut sealed_checkpoints = Vec::new();
         if completes_dispatch {
             let state = runtime_state.as_mut().expect("checked runtime state existence");
             state.dispatch_completed_at = Some(updated_at);
             state.updated_at = updated_at;
             runtime_state_updated = true;
         }
-        let latest_assigned_cursor = if let Some(cursor) =
-            self.assign_and_write_stream_job_accepted_progress(write_batch, handle_id, accepted_progress_states)?
-        {
+        let latest_assigned_cursor = if let Some(cursor) = self
+            .assign_and_write_stream_job_accepted_progress(
+                write_batch,
+                handle_id,
+                accepted_progress_states,
+            )? {
             let state = runtime_state.as_mut().expect("checked runtime state existence");
             state.updated_at = state.updated_at.max(cursor.updated_at);
             runtime_state_updated = true;
@@ -313,6 +319,7 @@ impl LocalThroughputState {
                         write_batch,
                         &sealed_checkpoint,
                     )?;
+                    sealed_checkpoints.push(sealed_checkpoint);
                     runtime_state_updated = true;
                 }
                 StreamsChangelogPayload::StreamJobWorkflowSignaled {
@@ -371,7 +378,7 @@ impl LocalThroughputState {
             self.write_stream_job_runtime_state_to_batch(write_batch, state)?;
         }
 
-        Ok(runtime_state_updated)
+        Ok((runtime_state_updated, sealed_checkpoints))
     }
 
     fn stream_job_view_overlay_key(
@@ -514,9 +521,10 @@ impl LocalThroughputState {
         let Some(mut runtime_state) = self.load_stream_job_runtime_state(handle_id)? else {
             anyhow::bail!("stream job runtime state missing for handle {handle_id}");
         };
-        runtime_state.dispatch_batches = dispatch_batches;
+        runtime_state.set_dispatch_manifest_batches(dispatch_batches);
         runtime_state.dispatch_completed_at = runtime_state.dispatch_completed_at.filter(|_| {
-            runtime_state.applied_dispatch_batch_ids.len() == runtime_state.dispatch_batches.len()
+            runtime_state.applied_dispatch_batch_ids.len()
+                == runtime_state.dispatch_manifest_batches().len()
         });
         runtime_state.updated_at = updated_at;
         self.upsert_stream_job_runtime_state(&runtime_state)
@@ -547,6 +555,8 @@ impl LocalThroughputState {
             return Ok(StreamJobDispatchBatchAppliedOutcome {
                 inserted: false,
                 runtime_state_updated: false,
+                accepted_progress: Vec::new(),
+                sealed_checkpoints: Vec::new(),
             });
         }
         let mut write_batch = WriteBatch::default();
@@ -581,7 +591,12 @@ impl LocalThroughputState {
             write_batch,
             "failed to store stream job applied dispatch batch in column family stream_jobs",
         )?;
-        Ok(StreamJobDispatchBatchAppliedOutcome { inserted: true, runtime_state_updated })
+        Ok(StreamJobDispatchBatchAppliedOutcome {
+            inserted: true,
+            runtime_state_updated,
+            accepted_progress: Vec::new(),
+            sealed_checkpoints: Vec::new(),
+        })
     }
 
     pub(crate) fn mark_stream_job_dispatch_batch_applied(
@@ -616,6 +631,8 @@ impl LocalThroughputState {
             return Ok(StreamJobDispatchBatchAppliedOutcome {
                 inserted: false,
                 runtime_state_updated: false,
+                accepted_progress: Vec::new(),
+                sealed_checkpoints: Vec::new(),
             });
         }
 
@@ -626,60 +643,61 @@ impl LocalThroughputState {
             &stream_job_dispatch_applied_key(handle_id, batch_id),
             Vec::new(),
         );
-        let runtime_state_updated =
-            if mirrored_stream_entries.iter().all(Self::optimized_stream_job_mirror_supported) {
-                self.write_optimized_stream_job_mirrors(
-                    &mut write_batch,
-                    handle_id,
-                    compact_checkpoint_mirrors,
-                    true,
-                    completes_dispatch,
-                    updated_at,
-                    &mut accepted_progress_states,
-                    mirrored_stream_entries,
-                )?
+        let (runtime_state_updated, sealed_checkpoints) = if mirrored_stream_entries
+            .iter()
+            .all(Self::optimized_stream_job_mirror_supported)
+        {
+            self.write_optimized_stream_job_mirrors(
+                &mut write_batch,
+                handle_id,
+                compact_checkpoint_mirrors,
+                true,
+                completes_dispatch,
+                updated_at,
+                &mut accepted_progress_states,
+                mirrored_stream_entries,
+            )?
+        } else {
+            let mut runtime_state = if completes_dispatch || !accepted_progress_states.is_empty() {
+                let Some(mut runtime_state) = self.load_stream_job_runtime_state(handle_id)? else {
+                    anyhow::bail!("stream job runtime state missing for handle {handle_id}");
+                };
+                if completes_dispatch {
+                    runtime_state.dispatch_completed_at = Some(updated_at);
+                }
+                runtime_state.updated_at = updated_at;
+                Some(runtime_state)
             } else {
-                let mut runtime_state = if completes_dispatch || !accepted_progress_states.is_empty() {
-                    let Some(mut runtime_state) = self.load_stream_job_runtime_state(handle_id)?
-                    else {
-                        anyhow::bail!("stream job runtime state missing for handle {handle_id}");
-                    };
-                    if completes_dispatch {
-                        runtime_state.dispatch_completed_at = Some(updated_at);
-                    }
-                    runtime_state.updated_at = updated_at;
-                    Some(runtime_state)
-                } else {
-                    None
-                };
-                if let Some(cursor) = self.assign_and_write_stream_job_accepted_progress(
-                    &mut write_batch,
-                    handle_id,
-                    &mut accepted_progress_states,
-                )? {
-                    let state = runtime_state
-                        .as_mut()
-                        .context("stream job runtime state missing for accepted progress")?;
-                    state.updated_at = state.updated_at.max(cursor.updated_at);
-                }
-                let runtime_state_updated = if let Some(runtime_state) = runtime_state {
-                    self.write_stream_job_runtime_state_to_batch(&mut write_batch, &runtime_state)?;
-                    true
-                } else {
-                    false
-                };
-
-                for entry in mirrored_stream_entries {
-                    self.write_streams_entry_payload(&mut write_batch, entry)?;
-                    self.write_batch_put_cf(
-                        &mut write_batch,
-                        META_CF,
-                        &mirrored_entry_key(LocalChangelogPlane::Streams, entry.entry_id),
-                        b"1".to_vec(),
-                    );
-                }
-                runtime_state_updated
+                None
             };
+            if let Some(cursor) = self.assign_and_write_stream_job_accepted_progress(
+                &mut write_batch,
+                handle_id,
+                &mut accepted_progress_states,
+            )? {
+                let state = runtime_state
+                    .as_mut()
+                    .context("stream job runtime state missing for accepted progress")?;
+                state.updated_at = state.updated_at.max(cursor.updated_at);
+            }
+            let runtime_state_updated = if let Some(runtime_state) = runtime_state {
+                self.write_stream_job_runtime_state_to_batch(&mut write_batch, &runtime_state)?;
+                true
+            } else {
+                false
+            };
+
+            for entry in mirrored_stream_entries {
+                self.write_streams_entry_payload(&mut write_batch, entry)?;
+                self.write_batch_put_cf(
+                    &mut write_batch,
+                    META_CF,
+                    &mirrored_entry_key(LocalChangelogPlane::Streams, entry.entry_id),
+                    b"1".to_vec(),
+                );
+            }
+            (runtime_state_updated, Vec::new())
+        };
 
         self.write_stream_job_state_batch(
             write_batch,
@@ -696,7 +714,12 @@ impl LocalThroughputState {
             );
             overlay.insert(key, StreamJobViewOverlayEntry::Present(state));
         }
-        Ok(StreamJobDispatchBatchAppliedOutcome { inserted: true, runtime_state_updated })
+        Ok(StreamJobDispatchBatchAppliedOutcome {
+            inserted: true,
+            runtime_state_updated,
+            accepted_progress: accepted_progress_states,
+            sealed_checkpoints,
+        })
     }
 
     pub(crate) fn persist_stream_job_activation_apply(
@@ -720,6 +743,8 @@ impl LocalThroughputState {
             return Ok(StreamJobDispatchBatchAppliedOutcome {
                 inserted: false,
                 runtime_state_updated: false,
+                accepted_progress: Vec::new(),
+                sealed_checkpoints: Vec::new(),
             });
         }
 
@@ -733,50 +758,51 @@ impl LocalThroughputState {
             );
         }
 
-        let runtime_state_updated =
-            if mirrored_stream_entries.iter().all(Self::optimized_stream_job_mirror_supported) {
-                self.write_optimized_stream_job_mirrors(
-                    &mut write_batch,
-                    handle_id,
-                    compact_checkpoint_mirrors,
-                    false,
-                    completes_dispatch,
-                    updated_at,
-                    &mut accepted_progress_states,
-                    mirrored_stream_entries,
-                )?
-            } else {
-                let mut runtime_state = if completes_dispatch || !accepted_progress_states.is_empty() {
-                    let Some(mut runtime_state) = self.load_stream_job_runtime_state(handle_id)?
-                    else {
-                        anyhow::bail!("stream job runtime state missing for handle {handle_id}");
-                    };
-                    if completes_dispatch {
-                        runtime_state.dispatch_completed_at = Some(updated_at);
-                    }
-                    runtime_state.updated_at = updated_at;
-                    Some(runtime_state)
-                } else {
-                    None
+        let (runtime_state_updated, sealed_checkpoints) = if mirrored_stream_entries
+            .iter()
+            .all(Self::optimized_stream_job_mirror_supported)
+        {
+            self.write_optimized_stream_job_mirrors(
+                &mut write_batch,
+                handle_id,
+                compact_checkpoint_mirrors,
+                false,
+                completes_dispatch,
+                updated_at,
+                &mut accepted_progress_states,
+                mirrored_stream_entries,
+            )?
+        } else {
+            let mut runtime_state = if completes_dispatch || !accepted_progress_states.is_empty() {
+                let Some(mut runtime_state) = self.load_stream_job_runtime_state(handle_id)? else {
+                    anyhow::bail!("stream job runtime state missing for handle {handle_id}");
                 };
-                if let Some(cursor) = self.assign_and_write_stream_job_accepted_progress(
-                    &mut write_batch,
-                    handle_id,
-                    &mut accepted_progress_states,
-                )? {
-                    let state = runtime_state
-                        .as_mut()
-                        .context("stream job runtime state missing for accepted progress")?;
-                    state.updated_at = state.updated_at.max(cursor.updated_at);
+                if completes_dispatch {
+                    runtime_state.dispatch_completed_at = Some(updated_at);
                 }
-                let runtime_state_updated = if let Some(runtime_state) = runtime_state {
-                    self.write_stream_job_runtime_state_to_batch(&mut write_batch, &runtime_state)?;
-                    true
-                } else {
-                    false
-                };
-                runtime_state_updated
+                runtime_state.updated_at = updated_at;
+                Some(runtime_state)
+            } else {
+                None
             };
+            if let Some(cursor) = self.assign_and_write_stream_job_accepted_progress(
+                &mut write_batch,
+                handle_id,
+                &mut accepted_progress_states,
+            )? {
+                let state = runtime_state
+                    .as_mut()
+                    .context("stream job runtime state missing for accepted progress")?;
+                state.updated_at = state.updated_at.max(cursor.updated_at);
+            }
+            let runtime_state_updated = if let Some(runtime_state) = runtime_state {
+                self.write_stream_job_runtime_state_to_batch(&mut write_batch, &runtime_state)?;
+                true
+            } else {
+                false
+            };
+            (runtime_state_updated, Vec::new())
+        };
 
         self.write_stream_job_state_batch(
             write_batch,
@@ -793,7 +819,12 @@ impl LocalThroughputState {
             );
             overlay.insert(key, StreamJobViewOverlayEntry::Present(state));
         }
-        Ok(StreamJobDispatchBatchAppliedOutcome { inserted: true, runtime_state_updated })
+        Ok(StreamJobDispatchBatchAppliedOutcome {
+            inserted: true,
+            runtime_state_updated,
+            accepted_progress: accepted_progress_states,
+            sealed_checkpoints,
+        })
     }
 
     pub(crate) fn mark_stream_job_dispatch_cancelled(
@@ -943,6 +974,23 @@ impl LocalThroughputState {
         self.write_stream_job_state_batch(
             write_batch,
             "failed to mark stream job workflow signal published in column family stream_jobs",
+        )
+    }
+
+    pub(crate) fn upsert_stream_job_bridge_callback(
+        &self,
+        state: &LocalStreamJobBridgeCallbackState,
+    ) -> Result<()> {
+        let mut write_batch = WriteBatch::default();
+        self.write_batch_put_cf_bytes(
+            &mut write_batch,
+            STREAM_JOBS_CF,
+            &stream_job_bridge_callback_key(&state.handle_id, &state.callback_id),
+            encode_rocksdb_value(state, "stream job bridge callback state")?,
+        );
+        self.write_stream_job_state_batch(
+            write_batch,
+            "failed to upsert stream job bridge callback state in column family stream_jobs",
         )
     }
 }

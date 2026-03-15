@@ -17,8 +17,8 @@ members = [
     "services/replay-tool",
     "services/timer-service",
     "services/unified-runtime",
-    "services/throughput-projector",
-    "services/throughput-runtime",
+    "services/streams-projector",
+    "services/streams-runtime",
 ]
 resolver = "3"
 

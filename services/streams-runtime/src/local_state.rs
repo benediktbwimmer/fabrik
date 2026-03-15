@@ -16,18 +16,18 @@ use self::derivation::{
 };
 use self::keyspace::{
     STREAM_JOB_ACCEPTED_PROGRESS_BINARY_PREFIX, STREAM_JOB_ACCEPTED_PROGRESS_CURSOR_BINARY_PREFIX,
-    STREAM_JOB_CHECKPOINT_BINARY_PREFIX, STREAM_JOB_RUNTIME_BINARY_PREFIX,
-    STREAM_JOB_SEALED_CHECKPOINT_BINARY_PREFIX, STREAM_JOB_SIGNAL_BINARY_PREFIX,
-    STREAM_JOB_VIEW_BINARY_PREFIX, batch_chunk_index_key,
+    STREAM_JOB_BRIDGE_CALLBACK_BINARY_PREFIX, STREAM_JOB_CHECKPOINT_BINARY_PREFIX,
+    STREAM_JOB_RUNTIME_BINARY_PREFIX, STREAM_JOB_SEALED_CHECKPOINT_BINARY_PREFIX,
+    STREAM_JOB_SIGNAL_BINARY_PREFIX, STREAM_JOB_VIEW_BINARY_PREFIX, batch_chunk_index_key,
     batch_chunk_index_prefix, batch_key, chunk_key, group_key, legacy_cf_for_key,
     legacy_stream_job_checkpoint_key, legacy_stream_job_runtime_key, legacy_stream_job_signal_key,
     legacy_stream_job_view_key, legacy_stream_job_view_prefix, mirrored_entry_key, offset_key,
     parse_stream_job_view_key, stream_job_accepted_progress_cursor_key,
     stream_job_accepted_progress_key, stream_job_accepted_progress_prefix,
-    stream_job_checkpoint_seal_key,
-    stream_job_checkpoint_key, stream_job_dispatch_applied_key, stream_job_dispatch_applied_prefix,
-    stream_job_runtime_key, stream_job_signal_key, stream_job_view_key, stream_job_view_prefix,
-    throughput_partition_id, timestamp_sort_key,
+    stream_job_bridge_callback_key, stream_job_bridge_callback_prefix, stream_job_checkpoint_key,
+    stream_job_checkpoint_seal_key, stream_job_dispatch_applied_key,
+    stream_job_dispatch_applied_prefix, stream_job_runtime_key, stream_job_signal_key,
+    stream_job_view_key, stream_job_view_prefix, throughput_partition_id, timestamp_sort_key,
 };
 #[cfg(test)]
 use self::scheduling_state::{lease_expiry_index_key, ready_index_key, started_index_key};
@@ -50,12 +50,13 @@ use fabrik_throughput::{
     throughput_reducer_execution_path, throughput_reducer_version, throughput_routing_reason,
 };
 use fabrik_throughput::{
-    AcceptedProgressRecord, ActivityExecutionCapabilities, DataflowSourceFrontier,
+    AcceptedProgressRecord, ActivityExecutionCapabilities, DataflowBatchSummary,
+    DataflowBridgeCallbackRecord, DataflowOffsetRange, DataflowSourceFrontier,
     DataflowStateImageManifest, DataflowWatermarkState, OwnerApplyAck, SealedCheckpointRecord,
     StreamsChangelogEntry, StreamsChangelogPayload, ThroughputBatchIdentity,
-    ThroughputChangelogEntry, ThroughputChangelogPayload,
-    ThroughputChunkReport, ThroughputChunkReportPayload, bulk_reducer_default_summary_value,
-    bulk_reducer_reduce_errors, bulk_reducer_reduce_values, bulk_reducer_requires_error_outputs,
+    ThroughputChangelogEntry, ThroughputChangelogPayload, ThroughputChunkReport,
+    ThroughputChunkReportPayload, bulk_reducer_default_summary_value, bulk_reducer_reduce_errors,
+    bulk_reducer_reduce_values, bulk_reducer_requires_error_outputs,
     bulk_reducer_requires_success_outputs, bulk_reducer_settles, bulk_reducer_summary_field_name,
     decode_cbor, encode_cbor, reduction_tree_child_group_ids, reduction_tree_level_counts,
     reduction_tree_node_id, reduction_tree_node_level, reduction_tree_parent_group_id,
@@ -426,6 +427,8 @@ struct CheckpointFile {
     stream_job_accepted_progress: Vec<LocalStreamJobAcceptedProgressState>,
     #[serde(default)]
     stream_job_sealed_checkpoints: Vec<LocalStreamJobSealedCheckpointState>,
+    #[serde(default)]
+    stream_job_bridge_callbacks: Vec<LocalStreamJobBridgeCallbackState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -645,7 +648,7 @@ pub(crate) struct LocalStreamJobRuntimeState {
     #[serde(default)]
     pub(crate) source_partition_leases: Vec<LocalStreamJobSourceLeaseState>,
     #[serde(default)]
-    pub(crate) dispatch_batches: Vec<LocalStreamJobDispatchBatch>,
+    pub(crate) dispatch_dataflow_batches: Vec<LocalStreamJobDispatchBatch>,
     #[serde(default)]
     pub(crate) applied_dispatch_batch_ids: Vec<String>,
     #[serde(default)]
@@ -711,7 +714,26 @@ pub(crate) struct LocalStreamJobSealedCheckpointState {
     pub(crate) sealed_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalStreamJobBridgeCallbackState {
+    pub(crate) handle_id: String,
+    pub(crate) callback_id: String,
+    pub(crate) record: DataflowBridgeCallbackRecord,
+    pub(crate) created_at: DateTime<Utc>,
+}
+
 impl LocalStreamJobRuntimeState {
+    pub(crate) fn dispatch_manifest_batches(&self) -> &[LocalStreamJobDispatchBatch] {
+        &self.dispatch_dataflow_batches
+    }
+
+    pub(crate) fn set_dispatch_manifest_batches(
+        &mut self,
+        dispatch_batches: Vec<LocalStreamJobDispatchBatch>,
+    ) {
+        self.dispatch_dataflow_batches = dispatch_batches;
+    }
+
     pub(crate) fn view_runtime_stats(
         &self,
         view_name: &str,
@@ -939,6 +961,22 @@ pub(crate) struct LocalStreamJobAppliedDispatchBatchState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct LocalStreamJobDispatchBatch {
     pub(crate) batch_id: String,
+    #[serde(default)]
+    pub(crate) plan_id: Option<String>,
+    #[serde(default)]
+    pub(crate) source_id: Option<String>,
+    #[serde(default)]
+    pub(crate) source_partition_id: Option<i32>,
+    #[serde(default)]
+    pub(crate) source_epoch: Option<u64>,
+    #[serde(default)]
+    pub(crate) offset_range: Option<DataflowOffsetRange>,
+    #[serde(default)]
+    pub(crate) edge_id: Option<String>,
+    #[serde(default)]
+    pub(crate) lease_epoch: Option<u64>,
+    #[serde(default)]
+    pub(crate) summary: Option<DataflowBatchSummary>,
     pub(crate) stream_partition_id: i32,
     #[serde(default)]
     pub(crate) checkpoint_partition_id: Option<i32>,
@@ -964,6 +1002,8 @@ pub(crate) struct LocalStreamJobDispatchBatch {
     pub(crate) occurred_at: DateTime<Utc>,
     pub(crate) items: Vec<LocalStreamJobDispatchItem>,
     pub(crate) is_final_partition_batch: bool,
+    #[serde(default)]
+    pub(crate) completes_dispatch: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

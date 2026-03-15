@@ -26,7 +26,8 @@ use crate::{
     stream_jobs::{
         activate_stream_job_on_local_state, build_stream_job_query_output,
         materialization_outcome_from_local_state, resolve_stream_job_definition,
-        should_defer_terminal_callback_until_query_boundary, terminal_result_after_query,
+        should_defer_terminal_callback_until_query_boundary,
+        sync_stream_job_bridge_callback_records_on_local_state, terminal_result_after_query,
     },
     throughput_partition_for_stream_key, workflow_event_from_throughput_command,
 };
@@ -1367,6 +1368,7 @@ async fn sync_stream_job_materialization_outcome(
     occurred_at: DateTime<Utc>,
     sync_running_status: bool,
 ) -> Result<()> {
+    sync_stream_job_bridge_callback_records_on_local_state(&state.local_state, handle)?;
     let Some(materialized) = materialization_outcome_from_local_state(&state.local_state, &handle)?
     else {
         return Ok(());
@@ -1625,12 +1627,15 @@ pub(crate) async fn reconcile_active_topic_stream_jobs(
     page_size: i64,
 ) -> Result<()> {
     reconcile_stream_deployments(state, page_size).await?;
-    {
-        let mut workers =
-            state.active_topic_job_workers.lock().expect("active topic worker lock poisoned");
-        workers.retain(|_, task| !task.is_finished());
-    }
-    let mut reconciled_handle_ids = HashSet::new();
+    tick_active_topic_stream_job_workers(state, page_size).await?;
+    reconcile_stream_job_callback_repairs(state, page_size).await
+}
+
+pub(crate) async fn tick_active_topic_stream_job_workers(
+    state: &AppState,
+    page_size: i64,
+) -> Result<()> {
+    retain_finished_active_topic_stream_job_workers(state);
     let mut offset = 0;
     loop {
         let handles =
@@ -1639,18 +1644,11 @@ pub(crate) async fn reconcile_active_topic_stream_jobs(
             break;
         }
         for handle in &handles {
-            reconciled_handle_ids.insert(handle.handle_id.clone());
             let is_topic_backed = resolve_stream_job_definition(Some(&state.store), handle)
                 .await?
                 .is_some_and(|job| job.source.kind == STREAM_SOURCE_TOPIC);
             if is_topic_backed {
-                let spawned =
-                    ensure_active_topic_stream_job_worker(state.clone(), handle.handle_id.clone());
-                if spawned {
-                    materialize_stream_job_from_handle(state, handle.clone(), Utc::now()).await?;
-                }
-            } else {
-                materialize_stream_job_from_handle(state, handle.clone(), Utc::now()).await?;
+                ensure_active_topic_stream_job_worker(state.clone(), handle.handle_id.clone());
             }
         }
         if handles.len() < usize::try_from(page_size).unwrap_or(usize::MAX) {
@@ -1658,6 +1656,14 @@ pub(crate) async fn reconcile_active_topic_stream_jobs(
         }
         offset += page_size;
     }
+    Ok(())
+}
+
+pub(crate) async fn reconcile_stream_job_callback_repairs(
+    state: &AppState,
+    page_size: i64,
+) -> Result<()> {
+    let mut reconciled_handle_ids = HashSet::new();
     let repair_limit = page_size.max(1);
     loop {
         let pending_repairs =
@@ -1703,6 +1709,12 @@ pub(crate) async fn reconcile_active_topic_stream_jobs(
         .await?;
     }
     Ok(())
+}
+
+fn retain_finished_active_topic_stream_job_workers(state: &AppState) {
+    let mut workers =
+        state.active_topic_job_workers.lock().expect("active topic worker lock poisoned");
+    workers.retain(|_, task| !task.is_finished());
 }
 
 fn ensure_active_topic_stream_job_worker(state: AppState, handle_id: String) -> bool {

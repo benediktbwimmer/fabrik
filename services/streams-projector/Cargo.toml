@@ -5,7 +5,7 @@ license.workspace = true
 version.workspace = true
 
 [[bin]]
-name = "throughput-projector"
+name = "streams-projector"
 path = "src/bin/throughput-projector.rs"
 
 [dependencies]

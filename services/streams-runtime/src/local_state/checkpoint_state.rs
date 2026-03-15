@@ -413,6 +413,7 @@ impl LocalThroughputState {
                 .load_all_stream_job_accepted_progress_cursors()?,
             stream_job_accepted_progress: self.load_all_stream_job_accepted_progress()?,
             stream_job_sealed_checkpoints: self.load_all_stream_job_sealed_checkpoints()?,
+            stream_job_bridge_callbacks: self.load_all_stream_job_bridge_callbacks()?,
         })
     }
 
@@ -464,7 +465,7 @@ impl LocalThroughputState {
             .filter(|state| {
                 state.active_partitions.contains(&partition_id)
                     || state
-                        .dispatch_batches
+                        .dispatch_manifest_batches()
                         .iter()
                         .any(|batch| batch.stream_partition_id == partition_id)
             })
@@ -505,6 +506,13 @@ impl LocalThroughputState {
             .into_iter()
             .filter(|state| state.stream_partition_id == partition_id)
             .collect::<Vec<_>>();
+        let stream_job_bridge_callbacks = self
+            .load_all_stream_job_bridge_callbacks()?
+            .into_iter()
+            .filter(|state| {
+                stream_job_runtime_states.iter().any(|runtime| runtime.handle_id == state.handle_id)
+            })
+            .collect::<Vec<_>>();
         Ok(CheckpointFile {
             created_at,
             offsets: self
@@ -530,6 +538,7 @@ impl LocalThroughputState {
             stream_job_accepted_progress_cursors,
             stream_job_accepted_progress,
             stream_job_sealed_checkpoints,
+            stream_job_bridge_callbacks,
         })
     }
 
@@ -685,6 +694,14 @@ impl LocalThroughputState {
                     state.stream_partition_id,
                 ),
                 encode_rocksdb_value(state, "stream job sealed checkpoint state")?,
+            );
+        }
+        for state in &checkpoint.stream_job_bridge_callbacks {
+            self.write_batch_put_cf_bytes(
+                &mut batch,
+                STREAM_JOBS_CF,
+                &stream_job_bridge_callback_key(&state.handle_id, &state.callback_id),
+                encode_rocksdb_value(state, "stream job bridge callback state")?,
             );
         }
         self.db.write(batch).context("failed to restore throughput checkpoint into state db")?;

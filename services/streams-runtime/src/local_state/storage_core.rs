@@ -159,8 +159,9 @@ impl LocalThroughputState {
                 if !applied.is_empty() {
                     state.applied_dispatch_batch_ids = applied;
                     if state.dispatch_completed_at.is_none()
-                        && !state.dispatch_batches.is_empty()
-                        && state.applied_dispatch_batch_ids.len() == state.dispatch_batches.len()
+                        && !state.dispatch_manifest_batches().is_empty()
+                        && state.applied_dispatch_batch_ids.len()
+                            == state.dispatch_manifest_batches().len()
                     {
                         state.dispatch_completed_at = Some(state.updated_at);
                     }
@@ -197,8 +198,9 @@ impl LocalThroughputState {
             if !applied.is_empty() {
                 state.applied_dispatch_batch_ids = applied;
                 if state.dispatch_completed_at.is_none()
-                    && !state.dispatch_batches.is_empty()
-                    && state.applied_dispatch_batch_ids.len() == state.dispatch_batches.len()
+                    && !state.dispatch_manifest_batches().is_empty()
+                    && state.applied_dispatch_batch_ids.len()
+                        == state.dispatch_manifest_batches().len()
                 {
                     state.dispatch_completed_at = Some(state.updated_at);
                 }
@@ -301,6 +303,50 @@ impl LocalThroughputState {
                 .cmp(&right.handle_id)
                 .then_with(|| left.checkpoint_name.cmp(&right.checkpoint_name))
                 .then_with(|| left.stream_partition_id.cmp(&right.stream_partition_id))
+        });
+        Ok(states)
+    }
+
+    pub(crate) fn load_stream_job_bridge_callbacks(
+        &self,
+        handle_id: &str,
+    ) -> Result<Vec<LocalStreamJobBridgeCallbackState>> {
+        let mut states = Vec::new();
+        for (_key, value) in self.load_prefixed_entries_bytes(
+            STREAM_JOBS_CF,
+            &stream_job_bridge_callback_prefix(handle_id),
+            "stream job bridge callbacks",
+        )? {
+            let state: LocalStreamJobBridgeCallbackState =
+                decode_rocksdb_value(&value, "stream job bridge callback state")?;
+            states.push(state);
+        }
+        states.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.callback_id.cmp(&right.callback_id))
+        });
+        Ok(states)
+    }
+
+    pub(crate) fn load_all_stream_job_bridge_callbacks(
+        &self,
+    ) -> Result<Vec<LocalStreamJobBridgeCallbackState>> {
+        let mut states = Vec::new();
+        for (_key, value) in self.load_prefixed_entries_bytes(
+            STREAM_JOBS_CF,
+            STREAM_JOB_BRIDGE_CALLBACK_BINARY_PREFIX,
+            "stream job bridge callbacks",
+        )? {
+            let state: LocalStreamJobBridgeCallbackState =
+                decode_rocksdb_value(&value, "stream job bridge callback state")?;
+            states.push(state);
+        }
+        states.sort_by(|left, right| {
+            left.handle_id
+                .cmp(&right.handle_id)
+                .then_with(|| left.created_at.cmp(&right.created_at))
+                .then_with(|| left.callback_id.cmp(&right.callback_id))
         });
         Ok(states)
     }

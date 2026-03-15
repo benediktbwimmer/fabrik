@@ -10,18 +10,18 @@ use fabrik_store::{
     StreamJobViewProjectionSummaryRecord, StreamJobViewRecord, WorkflowSignalStatus, WorkflowStore,
 };
 use fabrik_throughput::{
-    AcceptedProgressRecord, DataflowBatchSummary, DataflowOffsetRange, DataflowSourceFrontier,
-    OwnerApplyAck, STREAMS_DATAFLOW_V1_CONTRACT, StrongReadCheckpointRef, StrongReadMetadata,
     CompiledAggregateV2Kernel, CompiledAggregateV2PreKeyOperator, CompiledStreamJob,
     CompiledStreamOperator, CompiledStreamQuery, CompiledStreamSource, CompiledStreamState,
-    CompiledStreamView, STREAM_CONSISTENCY_STRONG, STREAM_JOB_KEYED_ROLLUP,
-    STREAM_QUERY_MODE_BY_KEY, STREAM_QUERY_MODE_PREFIX_SCAN, STREAM_REDUCER_AVG,
-    STREAM_REDUCER_COUNT, STREAM_REDUCER_HISTOGRAM, STREAM_REDUCER_MAX, STREAM_REDUCER_MIN,
-    STREAM_REDUCER_SUM, STREAM_REDUCER_THRESHOLD, STREAM_RUNTIME_AGGREGATE_V2,
+    CompiledStreamView, DataflowBatchEnvelope, DataflowBatchSummary, DataflowBridgeCallbackRecord,
+    DataflowOffsetRange, DataflowSourceFrontier, OwnerApplyAck, STREAM_CONSISTENCY_STRONG,
+    STREAM_JOB_KEYED_ROLLUP, STREAM_QUERY_MODE_BY_KEY, STREAM_QUERY_MODE_PREFIX_SCAN,
+    STREAM_REDUCER_AVG, STREAM_REDUCER_COUNT, STREAM_REDUCER_HISTOGRAM, STREAM_REDUCER_MAX,
+    STREAM_REDUCER_MIN, STREAM_REDUCER_SUM, STREAM_REDUCER_THRESHOLD, STREAM_RUNTIME_AGGREGATE_V2,
     STREAM_RUNTIME_KEYED_ROLLUP, STREAM_SOURCE_BOUNDED_INPUT, STREAM_SOURCE_TOPIC,
-    StreamJobBridgeHandleStatus, StreamJobBridgeRepairKind, StreamJobOriginKind,
-    StreamJobQueryConsistency, StreamJobViewBatchUpdate, StreamsChangelogEntry,
-    StreamsChangelogPayload, StreamsProjectionEvent, StreamsViewDeleteRecord, StreamsViewRecord,
+    STREAMS_DATAFLOW_V1_CONTRACT, SealedCheckpointRecord, StreamJobBridgeHandleStatus,
+    StreamJobBridgeRepairKind, StreamJobOriginKind, StreamJobQueryConsistency,
+    StreamJobViewBatchUpdate, StreamsChangelogEntry, StreamsChangelogPayload,
+    StreamsProjectionEvent, StreamsViewDeleteRecord, StrongReadCheckpointRef, StrongReadMetadata,
     stream_job_callback_event_id, stream_job_signal_callback_dedupe_key,
 };
 use futures_util::StreamExt;
@@ -35,12 +35,11 @@ use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
 use crate::local_state::{
-    LocalStreamJobAcceptedProgressState, LocalStreamJobDispatchBatch,
-    LocalStreamJobDispatchItem, LocalStreamJobHotKeyRuntimeStatsState,
-    LocalStreamJobOwnerPartitionRuntimeStatsState, LocalStreamJobPreKeyRuntimeStatsState,
-    LocalStreamJobRouteBranchRuntimeStatsState, LocalStreamJobRuntimeState,
-    LocalStreamJobSourceCursorState, LocalStreamJobSourceLeaseState, LocalStreamJobViewState,
-    LocalStreamJobWorkflowSignalState,
+    LocalStreamJobBridgeCallbackState, LocalStreamJobDispatchBatch, LocalStreamJobDispatchItem,
+    LocalStreamJobHotKeyRuntimeStatsState, LocalStreamJobOwnerPartitionRuntimeStatsState,
+    LocalStreamJobPreKeyRuntimeStatsState, LocalStreamJobRouteBranchRuntimeStatsState,
+    LocalStreamJobRuntimeState, LocalStreamJobSourceCursorState, LocalStreamJobSourceLeaseState,
+    LocalStreamJobViewState, LocalStreamJobWorkflowSignalState,
 };
 use crate::{
     AppState, LocalThroughputState, StreamChangelogRecord, StreamJobActivationResult,
@@ -65,6 +64,8 @@ const STREAM_JOB_TOPIC_POLL_MAX_RECORDS: usize = 4_096;
 const STREAM_JOB_TOPIC_IDLE_WAIT_MS: u64 = 5;
 const STREAM_JOB_TOPIC_FRONTIER_REFRESH_INTERVAL_MS: i64 = 250;
 const STREAM_JOB_TOPIC_POLL_MAX_BATCH_BYTES: i32 = 50 * 1024 * 1024;
+const STREAM_JOB_CALLBACK_KIND_CHECKPOINT: &str = "checkpoint";
+const STREAM_JOB_CALLBACK_KIND_TERMINAL: &str = "terminal";
 
 #[derive(Debug, Clone)]
 pub(crate) struct StreamJobMaterializationOutcome {
@@ -144,7 +145,7 @@ struct StreamJobSignalTarget {
 pub(crate) struct StreamJobActivationPlan {
     pub execution_planned: Option<StreamChangelogRecord>,
     pub runtime_state_update: Option<LocalStreamJobRuntimeState>,
-    pub partition_work: Vec<StreamJobPartitionWork>,
+    pub dataflow_batches: Vec<StreamJobDataflowBatch>,
     pub post_apply_projection_records: Vec<StreamProjectionRecord>,
     pub post_apply_changelog_records: Vec<StreamChangelogRecord>,
     pub source_cursor_updates: Option<Vec<LocalStreamJobSourceCursorState>>,
@@ -168,30 +169,6 @@ pub(crate) struct StreamJobApplyMetrics {
     pub accumulate_elapsed: std::time::Duration,
     pub materialize_elapsed: std::time::Duration,
     pub persist_elapsed: std::time::Duration,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct StreamJobPartitionWork {
-    pub batch_id: String,
-    pub stream_partition_id: i32,
-    pub checkpoint_partition_id: Option<i32>,
-    pub source_owner_partition_id: Option<i32>,
-    pub source_lease_token: Option<String>,
-    pub routing_key: String,
-    pub key_field: String,
-    pub reducer_kind: String,
-    pub output_field: String,
-    pub view_name: String,
-    pub additional_view_names: Vec<String>,
-    pub eventual_projection_view_names: Vec<String>,
-    pub workflow_signals: Vec<StreamJobWorkflowSignalPlan>,
-    pub checkpoint_name: String,
-    pub checkpoint_sequence: i64,
-    pub owner_epoch: u64,
-    pub occurred_at: DateTime<Utc>,
-    pub items: Vec<StreamJobPartitionItem>,
-    pub is_final_partition_batch: bool,
-    pub completes_dispatch: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,7 +229,7 @@ pub(crate) struct TopicStreamJobPollResult {
     pub runtime_state_update: Option<LocalStreamJobRuntimeState>,
     pub runtime_delta: Option<TopicStreamJobPollRuntimeDelta>,
     pub projection_records: Vec<StreamProjectionRecord>,
-    pub owner_input_batches: Vec<StreamJobOwnerInputBatch>,
+    pub owner_input_batches: Vec<StreamJobDataflowBatch>,
     pub changelog_records: Vec<StreamChangelogRecord>,
 }
 
@@ -296,13 +273,44 @@ pub(crate) struct TopicSourceBatch {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct StreamJobOwnerInputBatch {
-    pub source_partition_id: i32,
-    pub owner_partition_id: i32,
-    pub offset_start: i64,
-    pub offset_end: i64,
-    pub record_count: usize,
-    pub work: StreamJobPartitionWork,
+pub(crate) struct StreamJobDataflowBatch {
+    pub envelope: DataflowBatchEnvelope,
+    pub program: crate::dataflow_engine::BoundedDataflowBatchProgram,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedBoundedDataflowBatch {
+    batch_id: String,
+    source_id: String,
+    source_partition_id: i32,
+    source_epoch: u64,
+    offset_range: Option<DataflowOffsetRange>,
+    program: crate::dataflow_engine::BoundedDataflowBatchProgram,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StreamJobDataflowBatchApplyResult {
+    pub batch: StreamJobDataflowBatch,
+    pub activation_result: StreamJobActivationResult,
+    pub owner_apply_ack: Option<OwnerApplyAck>,
+    pub sealed_checkpoint: Option<SealedCheckpointRecord>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StreamJobDataflowApplyResult {
+    pub batch_results: Vec<StreamJobDataflowBatchApplyResult>,
+}
+
+impl StreamJobDataflowApplyResult {
+    pub(crate) fn into_activation_result(self) -> StreamJobActivationResult {
+        let mut projection_records = Vec::new();
+        let mut changelog_records = Vec::new();
+        for batch_result in self.batch_results {
+            projection_records.extend(batch_result.activation_result.projection_records);
+            changelog_records.extend(batch_result.activation_result.changelog_records);
+        }
+        StreamJobActivationResult { projection_records, changelog_records }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -352,50 +360,32 @@ enum StreamFilterValue {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TopicStreamJobOwnerPollPlan {
+pub(crate) struct TopicStreamJobRuntimeInstallPlan {
     pub execution_planned: Option<StreamChangelogRecord>,
     pub runtime_state_update: Option<LocalStreamJobRuntimeState>,
     pub post_apply_projection_records: Vec<StreamProjectionRecord>,
     pub post_apply_changelog_records: Vec<StreamChangelogRecord>,
-    pub poll_requests: Vec<TopicStreamJobPollRequest>,
     pub terminalized: Option<StreamChangelogRecord>,
 }
 
-pub(crate) fn plan_topic_stream_job_owner_polls_from_runtime_state(
+pub(crate) fn topic_poll_requests_from_runtime_state(
     handle: &StreamJobBridgeHandleRecord,
     resolved_job: &CompiledStreamJob,
-    _throughput_partitions: i32,
     runtime_state: &LocalStreamJobRuntimeState,
-    occurred_at: DateTime<Utc>,
-) -> Result<Option<TopicStreamJobOwnerPollPlan>> {
+) -> Result<Vec<TopicStreamJobPollRequest>> {
     if resolved_job.source.kind != STREAM_SOURCE_TOPIC {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let Some(plan) = bounded_stream_plan_for_job(resolved_job)? else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     ensure_signal_workflows_supported(handle, &plan)?;
-    if runtime_state
-        .source_kind
-        .as_deref()
-        .is_some_and(|kind| kind != STREAM_SOURCE_TOPIC)
+    if runtime_state.source_kind.as_deref().is_some_and(|kind| kind != STREAM_SOURCE_TOPIC)
+        || runtime_state.terminal_status.is_some()
     {
-        return Ok(None);
-    }
-    if runtime_state.terminal_status.is_some() {
-        return Ok(Some(TopicStreamJobOwnerPollPlan {
-            execution_planned: None,
-            runtime_state_update: None,
-            post_apply_projection_records: Vec::new(),
-            post_apply_changelog_records: Vec::new(),
-            poll_requests: Vec::new(),
-            terminalized: None,
-        }));
+        return Ok(Vec::new());
     }
 
-    let mut runtime_state = runtime_state.clone();
-    runtime_state.checkpoint_sequence = runtime_state.checkpoint_sequence.max(plan.checkpoint_sequence);
-    let checkpoint_sequence = runtime_state.checkpoint_sequence;
     let lease_by_partition = runtime_state
         .source_partition_leases
         .iter()
@@ -404,7 +394,7 @@ pub(crate) fn plan_topic_stream_job_owner_polls_from_runtime_state(
     let mut poll_requests = Vec::new();
     for cursor in &runtime_state.source_cursors {
         let Some(lease) = lease_by_partition.get(&cursor.source_partition_id) else {
-            return Ok(None);
+            continue;
         };
         let latest_target = cursor.initial_checkpoint_target_offset;
         if cursor.next_offset < latest_target {
@@ -412,7 +402,7 @@ pub(crate) fn plan_topic_stream_job_owner_polls_from_runtime_state(
                 source_partition_id: cursor.source_partition_id,
                 source_owner_partition_id: lease.owner_partition_id,
                 lease_token: lease.lease_token.clone(),
-                checkpoint_sequence,
+                checkpoint_sequence: runtime_state.checkpoint_sequence,
                 start_offset: cursor.next_offset,
                 checkpoint_target_offset: latest_target,
                 idle_window_timer: false,
@@ -422,23 +412,14 @@ pub(crate) fn plan_topic_stream_job_owner_polls_from_runtime_state(
                 source_partition_id: cursor.source_partition_id,
                 source_owner_partition_id: lease.owner_partition_id,
                 lease_token: lease.lease_token.clone(),
-                checkpoint_sequence,
+                checkpoint_sequence: runtime_state.checkpoint_sequence,
                 start_offset: cursor.next_offset,
                 checkpoint_target_offset: latest_target,
                 idle_window_timer: true,
             });
         }
     }
-
-    runtime_state.updated_at = occurred_at;
-    Ok(Some(TopicStreamJobOwnerPollPlan {
-        execution_planned: None,
-        runtime_state_update: Some(runtime_state),
-        post_apply_projection_records: Vec::new(),
-        post_apply_changelog_records: Vec::new(),
-        poll_requests,
-        terminalized: None,
-    }))
+    Ok(poll_requests)
 }
 
 #[derive(Debug, Clone)]
@@ -657,16 +638,17 @@ fn hot_key_runtime_stats_from_counts(
     entries
 }
 
-fn owner_partition_runtime_stats_from_work(
-    partition_work: &[StreamJobPartitionWork],
+fn owner_partition_runtime_stats_from_batches(
+    batches: &[StreamJobDataflowBatch],
     occurred_at: DateTime<Utc>,
 ) -> Vec<LocalStreamJobOwnerPartitionRuntimeStatsState> {
     let mut by_partition = BTreeMap::<i32, LocalStreamJobOwnerPartitionRuntimeStatsState>::new();
-    for work in partition_work {
-        let batch_item_count = work.items.len() as u64;
-        let stats = by_partition.entry(work.stream_partition_id).or_insert_with(|| {
+    for batch in batches {
+        let program = &batch.program;
+        let batch_item_count = program.items.len() as u64;
+        let stats = by_partition.entry(program.stream_partition_id).or_insert_with(|| {
             LocalStreamJobOwnerPartitionRuntimeStatsState {
-                stream_partition_id: work.stream_partition_id,
+                stream_partition_id: program.stream_partition_id,
                 observed_batch_count: 0,
                 observed_item_count: 0,
                 last_batch_item_count: 0,
@@ -680,7 +662,7 @@ fn owner_partition_runtime_stats_from_work(
         stats.observed_item_count = stats.observed_item_count.saturating_add(batch_item_count);
         stats.last_batch_item_count = batch_item_count;
         stats.max_batch_item_count = stats.max_batch_item_count.max(batch_item_count);
-        if let Some(source_partition_id) = work.checkpoint_partition_id
+        if let Some(source_partition_id) = program.checkpoint_partition_id
             && !stats.source_partition_ids.contains(&source_partition_id)
         {
             stats.source_partition_ids.push(source_partition_id);
@@ -696,7 +678,8 @@ pub(crate) fn apply_topic_stream_job_poll_runtime_delta(
     runtime_state: &mut LocalStreamJobRuntimeState,
     delta: &TopicStreamJobPollRuntimeDelta,
 ) {
-    runtime_state.checkpoint_sequence = runtime_state.checkpoint_sequence.max(delta.checkpoint_sequence);
+    runtime_state.checkpoint_sequence =
+        runtime_state.checkpoint_sequence.max(delta.checkpoint_sequence);
     if let Some(cursor) = runtime_state
         .source_cursors
         .iter_mut()
@@ -715,9 +698,7 @@ pub(crate) fn apply_topic_stream_job_poll_runtime_delta(
         *lease = delta.source_lease_update.clone();
     } else {
         runtime_state.source_partition_leases.push(delta.source_lease_update.clone());
-        runtime_state
-            .source_partition_leases
-            .sort_by_key(|lease| lease.source_partition_id);
+        runtime_state.source_partition_leases.sort_by_key(|lease| lease.source_partition_id);
     }
     runtime_state.merge_pre_key_runtime_stats(&delta.pre_key_runtime_stats);
     runtime_state.merge_hot_key_runtime_stats(
@@ -1327,15 +1308,50 @@ fn dataflow_plan_summary_value_for_job(
     Ok(job.dataflow_plan(dataflow_plan_id_for_handle(handle))?.summary_value())
 }
 
-fn accepted_progress_source_id(
+fn dataflow_batch_for_program(
+    handle: &StreamJobBridgeHandleRecord,
+    planned_batch: PlannedBoundedDataflowBatch,
+) -> StreamJobDataflowBatch {
+    let record_count = planned_batch
+        .program
+        .items
+        .iter()
+        .fold(0u64, |count, item| count.saturating_add(item.count));
+    let envelope = DataflowBatchEnvelope {
+        plan_id: dataflow_plan_id_for_handle(handle),
+        batch_id: planned_batch.batch_id,
+        source_id: planned_batch.source_id,
+        source_partition_id: planned_batch.source_partition_id,
+        source_epoch: planned_batch.source_epoch,
+        offset_range: planned_batch.offset_range,
+        edge_id: format!("exchange:key_by:{}", planned_batch.program.key_field),
+        dest_partition_id: planned_batch.program.stream_partition_id,
+        owner_epoch: planned_batch.program.owner_epoch,
+        lease_epoch: None,
+        summary: DataflowBatchSummary { record_count, payload_checksum: None },
+    };
+    StreamJobDataflowBatch { envelope, program: planned_batch.program }
+}
+
+fn dataflow_batches_for_planned_programs(
+    handle: &StreamJobBridgeHandleRecord,
+    planned_batches: Vec<PlannedBoundedDataflowBatch>,
+) -> Vec<StreamJobDataflowBatch> {
+    planned_batches
+        .into_iter()
+        .map(|planned_batch| dataflow_batch_for_program(handle, planned_batch))
+        .collect()
+}
+
+fn default_source_id_for_program(
     runtime_state: Option<&LocalStreamJobRuntimeState>,
-    work: &StreamJobPartitionWork,
+    program: &crate::dataflow_engine::BoundedDataflowBatchProgram,
 ) -> String {
     runtime_state
         .and_then(|state| state.source_name.clone())
         .or_else(|| runtime_state.and_then(|state| state.source_kind.clone()))
         .unwrap_or_else(|| {
-            if work.source_lease_token.is_some() {
+            if program.source_lease_token.is_some() {
                 STREAM_SOURCE_TOPIC.to_owned()
             } else {
                 STREAM_SOURCE_BOUNDED_INPUT.to_owned()
@@ -1343,45 +1359,25 @@ fn accepted_progress_source_id(
         })
 }
 
-fn accepted_progress_state_for_work(
+fn direct_dataflow_batch_for_program(
     handle: &StreamJobBridgeHandleRecord,
-    work: &StreamJobPartitionWork,
+    batch_id: String,
+    program: crate::dataflow_engine::BoundedDataflowBatchProgram,
     runtime_state: Option<&LocalStreamJobRuntimeState>,
-) -> LocalStreamJobAcceptedProgressState {
-    let record = AcceptedProgressRecord {
-        plan_id: dataflow_plan_id_for_handle(handle),
-        run_id: Some(handle.run_id.clone()),
-        job_id: Some(handle.job_id.clone()),
-        source_id: accepted_progress_source_id(runtime_state, work),
-        source_partition_id: work.checkpoint_partition_id.unwrap_or(work.stream_partition_id),
-        source_epoch: work.checkpoint_sequence.max(0) as u64,
-        offset_range: None::<DataflowOffsetRange>,
-        edge_id: format!("exchange:key_by:{}", work.key_field),
-        dest_partition_id: work.stream_partition_id,
-        batch_id: work.batch_id.clone(),
-        owner_epoch: work.owner_epoch,
-        lease_epoch: None,
-        summary: DataflowBatchSummary {
-            record_count: work.items.len() as u64,
-            payload_checksum: None,
+) -> StreamJobDataflowBatch {
+    dataflow_batch_for_program(
+        handle,
+        PlannedBoundedDataflowBatch {
+            batch_id,
+            source_id: default_source_id_for_program(runtime_state, &program),
+            source_partition_id: program
+                .checkpoint_partition_id
+                .unwrap_or(program.stream_partition_id),
+            source_epoch: program.checkpoint_sequence.max(0) as u64,
+            offset_range: None,
+            program,
         },
-    };
-    LocalStreamJobAcceptedProgressState {
-        handle_id: handle.handle_id.clone(),
-        stream_partition_id: work.stream_partition_id,
-        accepted_progress_position: 0,
-        batch_id: work.batch_id.clone(),
-        ack: OwnerApplyAck {
-            plan_id: record.plan_id.clone(),
-            batch_id: record.batch_id.clone(),
-            dest_partition_id: record.dest_partition_id,
-            owner_epoch: record.owner_epoch,
-            durable: false,
-            accepted_progress_position: 0,
-        },
-        record,
-        accepted_at: work.occurred_at,
-    }
+    )
 }
 
 fn for_each_bounded_input_item<F>(input_ref: &str, mut on_item: F) -> Result<usize>
@@ -1715,23 +1711,26 @@ fn event_window_bounds(
 }
 
 fn owner_input_batches_from_source_batch(
+    handle: &StreamJobBridgeHandleRecord,
     source_batch: &TopicSourceBatch,
     plan: &BoundedStreamAggregationPlan,
     throughput_partitions: i32,
     source_owner_epoch: u64,
     occurred_at: DateTime<Utc>,
-) -> Result<Vec<StreamJobOwnerInputBatch>> {
-    let mut by_owner_partition = BTreeMap::<i32, BTreeMap<String, StreamJobPartitionItem>>::new();
+) -> Result<Vec<StreamJobDataflowBatch>> {
+    let mut planned_batches = Vec::new();
+    let mut by_owner_partition =
+        BTreeMap::<i32, BTreeMap<String, crate::dataflow_engine::BoundedDataflowItem>>::new();
     for record in &source_batch.records {
         let owner_partition_id =
             throughput_partition_for_stream_key(&record.display_key, throughput_partitions);
         let partition_items = by_owner_partition.entry(owner_partition_id).or_default();
         if let Some(aggregate) = partition_items.get_mut(&record.logical_key) {
-            merge_partition_item(&plan.reducer_kind, aggregate, record.value)?;
+            merge_dataflow_item(&plan.reducer_kind, aggregate, record.value)?;
         } else {
             partition_items.insert(
                 record.logical_key.clone(),
-                StreamJobPartitionItem {
+                crate::dataflow_engine::BoundedDataflowItem {
                     logical_key: record.logical_key.clone(),
                     value: record.value,
                     display_key: Some(record.display_key.clone()),
@@ -1750,21 +1749,23 @@ fn owner_input_batches_from_source_batch(
             .first()
             .map(|item| item.logical_key.clone())
             .unwrap_or_else(|| source_batch.job_id.clone());
-        owner_input_batches.push(StreamJobOwnerInputBatch {
+        planned_batches.push(PlannedBoundedDataflowBatch {
+            batch_id: format!(
+                "{}:topic:{}:{}:{}:{}",
+                source_batch.handle_id,
+                source_batch.source_partition_id,
+                source_batch.offset_start,
+                source_batch.offset_end,
+                owner_partition_id,
+            ),
+            source_id: format!("topic:{}", source_batch.handle_id),
             source_partition_id: source_batch.source_partition_id,
-            owner_partition_id,
-            offset_start: source_batch.offset_start,
-            offset_end: source_batch.offset_end,
-            record_count: source_batch.records.len(),
-            work: StreamJobPartitionWork {
-                batch_id: format!(
-                    "{}:topic:{}:{}:{}:{}",
-                    source_batch.handle_id,
-                    source_batch.source_partition_id,
-                    source_batch.offset_start,
-                    source_batch.offset_end,
-                    owner_partition_id,
-                ),
+            source_epoch: source_batch.checkpoint_sequence.max(0) as u64,
+            offset_range: Some(DataflowOffsetRange {
+                start: source_batch.offset_start,
+                end: source_batch.offset_end,
+            }),
+            program: crate::dataflow_engine::BoundedDataflowBatchProgram {
                 stream_partition_id: owner_partition_id,
                 checkpoint_partition_id: Some(source_batch.source_partition_id),
                 source_owner_partition_id: Some(source_batch.source_owner_partition_id),
@@ -1787,6 +1788,7 @@ fn owner_input_batches_from_source_batch(
             },
         });
     }
+    owner_input_batches.extend(dataflow_batches_for_planned_programs(handle, planned_batches));
     Ok(owner_input_batches)
 }
 
@@ -2499,7 +2501,7 @@ fn owner_partition_runtime_stats_value(
     let checkpoint_reached_at_by_partition =
         stream_job_checkpoint_reached_at_by_partition(runtime_state);
     let mut pending_batches_by_partition = BTreeMap::<i32, (u64, u64)>::new();
-    for batch in &runtime_state.dispatch_batches {
+    for batch in runtime_state.dispatch_manifest_batches() {
         let entry = pending_batches_by_partition.entry(batch.stream_partition_id).or_default();
         entry.0 = entry.0.saturating_add(1);
         entry.1 = entry.1.saturating_add(u64::try_from(batch.items.len()).unwrap_or(u64::MAX));
@@ -3134,10 +3136,8 @@ fn build_stream_job_runtime_stats_output_from_runtime_state(
             "runtimeContract".to_owned(),
             Value::String(STREAMS_DATAFLOW_V1_CONTRACT.to_owned()),
         );
-        output.insert(
-            "dataflowPlan".to_owned(),
-            dataflow_plan_summary_value_for_job(handle, &job)?,
-        );
+        output
+            .insert("dataflowPlan".to_owned(), dataflow_plan_summary_value_for_job(handle, &job)?);
         output.insert(
             "jobClassification".to_owned(),
             job.classification.clone().map(Value::String).unwrap_or(Value::Null),
@@ -3984,270 +3984,52 @@ fn merge_partition_item(
     Ok(())
 }
 
-fn hidden_avg_count(output: &Map<String, Value>) -> u64 {
-    output
-        .get(STREAM_INTERNAL_AVG_COUNT_FIELD)
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            output
-                .get(STREAM_INTERNAL_AVG_COUNT_FIELD)
-                .and_then(Value::as_f64)
-                .filter(|value| value.is_finite() && *value >= 0.0)
-                .map(|value| value as u64)
-        })
-        .unwrap_or(0)
-}
-
-fn numeric_output_field(output: &Map<String, Value>, field: &str) -> Option<f64> {
-    output
-        .get(field)
-        .and_then(Value::as_f64)
-        .or_else(|| output.get(field).and_then(Value::as_u64).map(|value| value as f64))
-}
-
-fn boolean_output_field(output: &Map<String, Value>, field: &str) -> Option<bool> {
-    output
-        .get(field)
-        .and_then(Value::as_bool)
-        .or_else(|| numeric_output_field(output, field).map(|value| value > 0.0))
-}
-
-fn truthy_output_field(output: &Map<String, Value>, field: &str) -> bool {
-    output.get(field).is_some_and(|value| match value {
-        Value::Bool(value) => *value,
-        Value::Number(value) => value.as_f64().is_some_and(|value| value > 0.0),
-        Value::String(value) => !value.is_empty(),
-        Value::Null => false,
-        Value::Array(values) => !values.is_empty(),
-        Value::Object(values) => !values.is_empty(),
-    })
-}
-
-fn signal_output_matches(output: &Value, when_output_field: Option<&str>) -> bool {
-    match when_output_field {
-        Some(field) => output.as_object().is_some_and(|output| truthy_output_field(output, field)),
-        None => true,
-    }
-}
-
-fn sanitize_stream_view_output(mut output: Value) -> Value {
-    if let Some(object) = output.as_object_mut() {
-        object.remove(STREAM_INTERNAL_AVG_SUM_FIELD);
-        object.remove(STREAM_INTERNAL_AVG_COUNT_FIELD);
-    }
-    output
-}
-
-fn normalize_stream_average_output(value: f64) -> f64 {
-    if !value.is_finite() {
-        return value;
-    }
-    const SCALE: f64 = 1_000_000_000_000.0;
-    (value * SCALE).round() / SCALE
-}
-
-#[derive(Debug, Clone)]
-enum StreamReducerAccumulator {
-    Count { total: u64 },
-    Sum { total: f64 },
-    Min { value: Option<f64> },
-    Max { value: Option<f64> },
-    Avg { sum: f64, count: u64 },
-    Threshold { crossed: bool },
-}
-
-impl StreamReducerAccumulator {
-    fn new(reducer_kind: &str) -> Result<Self> {
-        match reducer_kind {
-            STREAM_REDUCER_COUNT => Ok(Self::Count { total: 0 }),
-            STREAM_REDUCER_SUM => Ok(Self::Sum { total: 0.0 }),
-            STREAM_REDUCER_MIN => Ok(Self::Min { value: None }),
-            STREAM_REDUCER_MAX => Ok(Self::Max { value: None }),
-            STREAM_REDUCER_AVG => Ok(Self::Avg { sum: 0.0, count: 0 }),
-            STREAM_REDUCER_THRESHOLD => Ok(Self::Threshold { crossed: false }),
-            other => anyhow::bail!("stream reducer {other} is not implemented in local activation"),
+fn merge_dataflow_item(
+    reducer_kind: &str,
+    aggregate: &mut crate::dataflow_engine::BoundedDataflowItem,
+    input_value: f64,
+) -> Result<()> {
+    match reducer_kind {
+        STREAM_REDUCER_COUNT => {
+            aggregate.value += 1.0;
+            aggregate.count = aggregate.count.saturating_add(1);
         }
-    }
-
-    fn from_output(
-        output: &Map<String, Value>,
-        reducer_kind: &str,
-        output_field: &str,
-    ) -> Result<Self> {
-        match reducer_kind {
-            STREAM_REDUCER_COUNT => Ok(Self::Count {
-                total: numeric_output_field(output, output_field)
-                    .filter(|value| value.is_finite() && *value >= 0.0)
-                    .map(|value| value as u64)
-                    .unwrap_or(0),
-            }),
-            STREAM_REDUCER_SUM => {
-                Ok(Self::Sum { total: numeric_output_field(output, output_field).unwrap_or(0.0) })
-            }
-            STREAM_REDUCER_MIN => {
-                Ok(Self::Min { value: numeric_output_field(output, output_field) })
-            }
-            STREAM_REDUCER_MAX => {
-                Ok(Self::Max { value: numeric_output_field(output, output_field) })
-            }
-            STREAM_REDUCER_AVG => {
-                let sum = output
-                    .get(STREAM_INTERNAL_AVG_SUM_FIELD)
-                    .and_then(Value::as_f64)
-                    .or_else(|| numeric_output_field(output, output_field))
-                    .unwrap_or(0.0);
-                let count =
-                    hidden_avg_count(output).max(u64::from(output.contains_key(output_field)));
-                Ok(Self::Avg { sum, count })
-            }
-            STREAM_REDUCER_THRESHOLD => Ok(Self::Threshold {
-                crossed: boolean_output_field(output, output_field).unwrap_or(false),
-            }),
-            other => anyhow::bail!("stream reducer {other} is not implemented in local activation"),
+        STREAM_REDUCER_SUM => {
+            aggregate.value += input_value;
+            aggregate.count = aggregate.count.saturating_add(1);
         }
-    }
-
-    fn apply(&mut self, input_value: f64, input_count: u64) {
-        match self {
-            Self::Count { total } => *total = total.saturating_add(input_count),
-            Self::Sum { total } => *total += input_value,
-            Self::Min { value } => {
-                *value = Some(value.map_or(input_value, |baseline| baseline.min(input_value)));
-            }
-            Self::Max { value } => {
-                *value = Some(value.map_or(input_value, |baseline| baseline.max(input_value)));
-            }
-            Self::Avg { sum, count } => {
-                *sum += input_value;
-                *count = count.saturating_add(input_count);
-            }
-            Self::Threshold { crossed } => *crossed |= input_value > 0.0,
+        STREAM_REDUCER_MIN => {
+            aggregate.value = aggregate.value.min(input_value);
+            aggregate.count = 1;
         }
-    }
-
-    fn write_output(
-        &self,
-        output: &mut Map<String, Value>,
-        output_field: &str,
-        include_internal_fields: bool,
-    ) {
-        match self {
-            Self::Count { total } => {
-                output.insert(output_field.to_owned(), json!(*total as f64));
-            }
-            Self::Sum { total } => {
-                output.insert(output_field.to_owned(), json!(*total));
-            }
-            Self::Min { value } | Self::Max { value } => {
-                if let Some(value) = value {
-                    output.insert(output_field.to_owned(), json!(*value));
-                }
-            }
-            Self::Avg { sum, count } => {
-                let average = if *count == 0 { 0.0 } else { *sum / *count as f64 };
-                output.insert(
-                    output_field.to_owned(),
-                    json!(normalize_stream_average_output(average)),
-                );
-                if include_internal_fields {
-                    output.insert(STREAM_INTERNAL_AVG_SUM_FIELD.to_owned(), json!(*sum));
-                    output.insert(STREAM_INTERNAL_AVG_COUNT_FIELD.to_owned(), json!(*count));
-                }
-            }
-            Self::Threshold { crossed } => {
-                output.insert(output_field.to_owned(), json!(*crossed));
-            }
+        STREAM_REDUCER_MAX => {
+            aggregate.value = aggregate.value.max(input_value);
+            aggregate.count = 1;
         }
+        STREAM_REDUCER_AVG => {
+            aggregate.value += input_value;
+            aggregate.count = aggregate.count.saturating_add(1);
+        }
+        STREAM_REDUCER_THRESHOLD => {
+            aggregate.value = aggregate.value.max(input_value);
+            aggregate.count = 1;
+        }
+        other => anyhow::bail!("stream reducer {other} is not implemented in local activation"),
     }
+    Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct StreamJobViewAccumulator {
-    display_key: String,
-    window_start: Option<String>,
-    window_end: Option<String>,
-    reducer: StreamReducerAccumulator,
+pub(crate) fn signal_output_matches(output: &Value, when_output_field: Option<&str>) -> bool {
+    crate::dataflow_engine::signal_output_matches(output, when_output_field)
 }
 
-impl StreamJobViewAccumulator {
-    fn from_output(
-        output: &Map<String, Value>,
-        reducer_kind: &str,
-        output_field: &str,
-        key_field: &str,
-        logical_key: &str,
-    ) -> Result<Self> {
-        Ok(Self {
-            display_key: output
-                .get(key_field)
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| logical_key.to_owned()),
-            window_start: output.get("windowStart").and_then(Value::as_str).map(str::to_owned),
-            window_end: output.get("windowEnd").and_then(Value::as_str).map(str::to_owned),
-            reducer: StreamReducerAccumulator::from_output(output, reducer_kind, output_field)?,
-        })
-    }
-
-    fn from_item(item: &StreamJobPartitionItem, reducer_kind: &str) -> Result<Self> {
-        Ok(Self {
-            display_key: item.display_key.clone().unwrap_or_else(|| item.logical_key.clone()),
-            window_start: item.window_start.clone(),
-            window_end: item.window_end.clone(),
-            reducer: StreamReducerAccumulator::new(reducer_kind)?,
-        })
-    }
-
-    fn apply_item(&mut self, item: &StreamJobPartitionItem) {
-        self.reducer.apply(item.value, item.count);
-        if let Some(display_key) = &item.display_key {
-            self.display_key = display_key.clone();
-        }
-        if self.window_start.is_none() {
-            self.window_start = item.window_start.clone();
-        }
-        if self.window_end.is_none() {
-            self.window_end = item.window_end.clone();
-        }
-    }
-
-    fn append_common_fields(&self, output: &mut Map<String, Value>, key_field: &str) {
-        output.insert(key_field.to_owned(), Value::String(self.display_key.clone()));
-        if let Some(window_start) = &self.window_start {
-            output.insert("windowStart".to_owned(), Value::String(window_start.clone()));
-        }
-        if let Some(window_end) = &self.window_end {
-            output.insert("windowEnd".to_owned(), Value::String(window_end.clone()));
-        }
-    }
-
-    fn into_output_value(
-        &self,
-        key_field: &str,
-        output_field: &str,
-        checkpoint_sequence: i64,
-        include_internal_fields: bool,
-    ) -> Value {
-        let mut output = Map::with_capacity(6);
-        self.append_common_fields(&mut output, key_field);
-        self.reducer.write_output(&mut output, output_field, include_internal_fields);
-        output.insert("asOfCheckpoint".to_owned(), json!(checkpoint_sequence));
-        Value::Object(output)
-    }
-
-    fn into_output_values(
-        &self,
-        key_field: &str,
-        output_field: &str,
-        checkpoint_sequence: i64,
-    ) -> (Value, Value) {
-        let internal = self.into_output_value(key_field, output_field, checkpoint_sequence, true);
-        let public = self.into_output_value(key_field, output_field, checkpoint_sequence, false);
-        (internal, public)
-    }
+pub(crate) fn sanitize_stream_view_output(output: Value) -> Value {
+    crate::dataflow_engine::sanitize_stream_view_output(output)
 }
 
-fn load_stream_job_view_accumulator(
+pub(crate) type StreamJobViewAccumulator = crate::dataflow_engine::StreamJobViewAccumulator;
+
+pub(crate) fn load_stream_job_view_accumulator(
     local_state: &LocalThroughputState,
     handle_id: &str,
     view_name: &str,
@@ -4256,207 +4038,38 @@ fn load_stream_job_view_accumulator(
     key_field: &str,
     logical_key: &str,
 ) -> Result<Option<(Map<String, Value>, StreamJobViewAccumulator)>> {
-    local_state
-        .load_stream_job_view_state(handle_id, view_name, logical_key)?
-        .and_then(|view_state| view_state.output.as_object().cloned())
-        .map(|output| {
-            let accumulator = StreamJobViewAccumulator::from_output(
-                &output,
-                reducer_kind,
-                output_field,
-                key_field,
-                logical_key,
-            )?;
-            Ok((output, accumulator))
-        })
-        .transpose()
+    crate::dataflow_engine::load_stream_job_view_accumulator(
+        local_state,
+        handle_id,
+        view_name,
+        reducer_kind,
+        output_field,
+        key_field,
+        logical_key,
+    )
 }
 
-#[derive(Debug)]
-struct StreamJobMaterializedBatch {
-    projection_records: Vec<StreamProjectionRecord>,
-    changelog_records: Vec<StreamChangelogRecord>,
-    owner_view_updates: Vec<LocalStreamJobViewState>,
-}
+pub(crate) type StreamJobMaterializedBatch = crate::dataflow_engine::StreamJobMaterializedBatch;
 
-#[derive(Debug)]
-struct PreparedStreamJobPartitionApply {
-    activation_result: StreamJobActivationResult,
-    owner_view_updates: Vec<LocalStreamJobViewState>,
-    mirrored_stream_entries: Vec<StreamsChangelogEntry>,
-    accepted_progress_state: LocalStreamJobAcceptedProgressState,
-    stream_partition_id: i32,
-    state_key_delta: u64,
-    batch_id: String,
-    compact_checkpoint_mirrors: bool,
-    completes_dispatch: bool,
-    occurred_at: DateTime<Utc>,
-}
-
-fn materialize_stream_job_batch_updates(
+pub(crate) fn materialize_stream_job_batch_updates(
     handle: &StreamJobBridgeHandleRecord,
-    work: &StreamJobPartitionWork,
+    program: &crate::dataflow_engine::BoundedDataflowBatchProgram,
     updated_outputs: Vec<(String, StreamJobViewAccumulator)>,
     mirror_owner_state: bool,
 ) -> StreamJobMaterializedBatch {
-    let view_count = 1 + work.additional_view_names.len();
-    let use_batched_materialization = true;
-    let mut projection_records =
-        Vec::with_capacity(updated_outputs.len() * work.eventual_projection_view_names.len());
-    let mut changelog_records = Vec::with_capacity(updated_outputs.len() * view_count);
-    let mut changelog_updates = Vec::with_capacity(updated_outputs.len() * view_count);
-    let mut owner_view_updates = if mirror_owner_state {
-        Vec::with_capacity(updated_outputs.len() * view_count)
-    } else {
-        Vec::new()
-    };
-    let should_project_view = |view_name: &str| {
-        work.source_lease_token.is_some()
-            || !use_batched_materialization
-            || work.eventual_projection_view_names.iter().any(|candidate| candidate == view_name)
-    };
-    for (logical_key, output) in updated_outputs {
-        let (internal_output, public_output) = output.into_output_values(
-            &work.key_field,
-            &work.output_field,
-            work.checkpoint_sequence,
-        );
-        let partition_key = throughput_partition_key(&logical_key, 0);
-
-        if work.additional_view_names.is_empty() {
-            if mirror_owner_state {
-                owner_view_updates.push(LocalStreamJobViewState {
-                    handle_id: handle.handle_id.clone(),
-                    job_id: handle.job_id.clone(),
-                    view_name: work.view_name.clone(),
-                    logical_key: logical_key.clone(),
-                    output: internal_output.clone(),
-                    checkpoint_sequence: work.checkpoint_sequence,
-                    updated_at: work.occurred_at,
-                });
-            }
-            if should_project_view(&work.view_name) {
-                projection_records.push(StreamProjectionRecord::streams(
-                    partition_key,
-                    StreamsProjectionEvent::UpsertStreamJobView {
-                        view: StreamsViewRecord {
-                            tenant_id: handle.tenant_id.clone(),
-                            instance_id: handle.instance_id.clone(),
-                            run_id: handle.run_id.clone(),
-                            job_id: handle.job_id.clone(),
-                            handle_id: handle.handle_id.clone(),
-                            view_name: work.view_name.clone(),
-                            logical_key: logical_key.clone(),
-                            output: public_output.clone(),
-                            checkpoint_sequence: work.checkpoint_sequence,
-                            updated_at: work.occurred_at,
-                        },
-                    },
-                ));
-            }
-            if use_batched_materialization {
-                changelog_updates.push(StreamJobViewBatchUpdate {
-                    view_name: work.view_name.clone(),
-                    logical_key,
-                    output: internal_output,
-                });
-            } else {
-                changelog_records.push(view_update_changelog_record(
-                    handle,
-                    &work.view_name,
-                    &logical_key,
-                    &logical_key,
-                    internal_output,
-                    work.checkpoint_sequence,
-                    work.occurred_at,
-                ));
-            }
-            continue;
-        }
-
-        for view_name in std::iter::once(&work.view_name).chain(work.additional_view_names.iter()) {
-            if mirror_owner_state {
-                owner_view_updates.push(LocalStreamJobViewState {
-                    handle_id: handle.handle_id.clone(),
-                    job_id: handle.job_id.clone(),
-                    view_name: view_name.clone(),
-                    logical_key: logical_key.clone(),
-                    output: internal_output.clone(),
-                    checkpoint_sequence: work.checkpoint_sequence,
-                    updated_at: work.occurred_at,
-                });
-            }
-            if should_project_view(view_name) {
-                projection_records.push(StreamProjectionRecord::streams(
-                    partition_key.clone(),
-                    StreamsProjectionEvent::UpsertStreamJobView {
-                        view: StreamsViewRecord {
-                            tenant_id: handle.tenant_id.clone(),
-                            instance_id: handle.instance_id.clone(),
-                            run_id: handle.run_id.clone(),
-                            job_id: handle.job_id.clone(),
-                            handle_id: handle.handle_id.clone(),
-                            view_name: view_name.clone(),
-                            logical_key: logical_key.clone(),
-                            output: public_output.clone(),
-                            checkpoint_sequence: work.checkpoint_sequence,
-                            updated_at: work.occurred_at,
-                        },
-                    },
-                ));
-            }
-            if use_batched_materialization {
-                changelog_updates.push(StreamJobViewBatchUpdate {
-                    view_name: view_name.clone(),
-                    logical_key: logical_key.clone(),
-                    output: internal_output.clone(),
-                });
-            } else {
-                changelog_records.push(view_update_changelog_record(
-                    handle,
-                    view_name,
-                    &logical_key,
-                    &logical_key,
-                    internal_output.clone(),
-                    work.checkpoint_sequence,
-                    work.occurred_at,
-                ));
-            }
-        }
-    }
-    if use_batched_materialization && !changelog_updates.is_empty() {
-        changelog_records.push(view_batch_update_changelog_record(
-            handle,
-            &work.routing_key,
-            changelog_updates,
-            work.checkpoint_sequence,
-            work.occurred_at,
-        ));
-    }
-    StreamJobMaterializedBatch { projection_records, changelog_records, owner_view_updates }
+    crate::dataflow_engine::materialize_stream_job_batch_updates(
+        handle,
+        program,
+        updated_outputs,
+        mirror_owner_state,
+    )
 }
 
-fn apply_stream_job_partition_work_in_memory(
+fn apply_stream_job_batch_program_in_memory(
     accumulators: &mut HashMap<String, StreamJobViewAccumulator>,
-    work: &StreamJobPartitionWork,
+    program: &crate::dataflow_engine::BoundedDataflowBatchProgram,
 ) -> Result<Vec<(String, StreamJobViewAccumulator)>> {
-    let mut updated_outputs = Vec::with_capacity(work.items.len());
-    for item in &work.items {
-        let output = if let Some(existing) = accumulators.get_mut(&item.logical_key) {
-            existing
-        } else {
-            accumulators.insert(
-                item.logical_key.clone(),
-                StreamJobViewAccumulator::from_item(item, &work.reducer_kind)?,
-            );
-            accumulators
-                .get_mut(&item.logical_key)
-                .expect("stream job accumulator should exist after insert")
-        };
-        output.apply_item(item);
-        updated_outputs.push((item.logical_key.clone(), output.clone()));
-    }
-    Ok(updated_outputs)
+    crate::dataflow_engine::apply_stream_job_batch_program_in_memory(accumulators, program)
 }
 
 fn bounded_aggregate_v2_kernel_subset(
@@ -4815,20 +4428,13 @@ fn view_batch_update_changelog_record(
     checkpoint_sequence: i64,
     updated_at: DateTime<Utc>,
 ) -> StreamChangelogRecord {
-    let key = throughput_partition_key(routing_key, 0);
-    let entry = StreamsChangelogEntry {
-        entry_id: Uuid::now_v7(),
-        occurred_at: updated_at,
-        partition_key: key.clone(),
-        payload: StreamsChangelogPayload::StreamJobViewBatchUpdated {
-            handle_id: handle.handle_id.clone(),
-            job_id: handle.job_id.clone(),
-            updates,
-            checkpoint_sequence,
-            updated_at,
-        },
-    };
-    StreamChangelogRecord::streams(key, entry)
+    crate::dataflow_engine::view_batch_update_changelog_record(
+        handle,
+        routing_key,
+        updates,
+        checkpoint_sequence,
+        updated_at,
+    )
 }
 
 fn view_update_changelog_record(
@@ -4840,37 +4446,27 @@ fn view_update_changelog_record(
     checkpoint_sequence: i64,
     updated_at: DateTime<Utc>,
 ) -> StreamChangelogRecord {
-    view_batch_update_changelog_record(
+    crate::dataflow_engine::view_update_changelog_record(
         handle,
+        view_name,
         routing_key,
-        vec![StreamJobViewBatchUpdate {
-            view_name: view_name.to_owned(),
-            logical_key: logical_key.to_owned(),
-            output,
-        }],
+        logical_key,
+        output,
         checkpoint_sequence,
         updated_at,
     )
 }
 
-fn workflow_signal_payload(
+pub(crate) fn workflow_signal_payload(
     handle: &StreamJobBridgeHandleRecord,
     signal: &StreamJobWorkflowSignalPlan,
     logical_key: &str,
     output: Value,
 ) -> Value {
-    json!({
-        "jobId": handle.job_id,
-        "handleId": handle.handle_id,
-        "jobName": handle.job_name,
-        "operatorId": signal.operator_id,
-        "viewName": signal.view_name,
-        "logicalKey": logical_key,
-        "output": output,
-    })
+    crate::dataflow_engine::workflow_signal_payload(handle, signal, logical_key, output)
 }
 
-fn workflow_signaled_changelog_record(
+pub(crate) fn workflow_signaled_changelog_record(
     handle: &StreamJobBridgeHandleRecord,
     signal: &StreamJobWorkflowSignalPlan,
     logical_key: &str,
@@ -4878,36 +4474,17 @@ fn workflow_signaled_changelog_record(
     owner_epoch: u64,
     signaled_at: DateTime<Utc>,
 ) -> StreamChangelogRecord {
-    let key = throughput_partition_key(logical_key, 0);
-    let signal_id = stream_job_signal_callback_dedupe_key(
-        &handle.tenant_id,
-        &handle.instance_id,
-        &handle.run_id,
-        &handle.job_id,
-        &signal.operator_id,
+    crate::dataflow_engine::workflow_signaled_changelog_record(
+        handle,
+        signal,
         logical_key,
-    );
-    let entry = StreamsChangelogEntry {
-        entry_id: Uuid::now_v7(),
-        occurred_at: signaled_at,
-        partition_key: key.clone(),
-        payload: StreamsChangelogPayload::StreamJobWorkflowSignaled {
-            handle_id: handle.handle_id.clone(),
-            job_id: handle.job_id.clone(),
-            operator_id: signal.operator_id.clone(),
-            view_name: signal.view_name.clone(),
-            logical_key: logical_key.to_owned(),
-            signal_id,
-            signal_type: signal.signal_type.clone(),
-            payload,
-            owner_epoch,
-            signaled_at,
-        },
-    };
-    StreamChangelogRecord::streams(key, entry)
+        payload,
+        owner_epoch,
+        signaled_at,
+    )
 }
 
-fn checkpoint_reached_changelog_record(
+pub(crate) fn checkpoint_reached_changelog_record(
     handle: &StreamJobBridgeHandleRecord,
     routing_key: &str,
     checkpoint_name: &str,
@@ -4916,22 +4493,15 @@ fn checkpoint_reached_changelog_record(
     owner_epoch: u64,
     reached_at: DateTime<Utc>,
 ) -> StreamChangelogRecord {
-    let key = throughput_partition_key(routing_key, 0);
-    let entry = StreamsChangelogEntry {
-        entry_id: Uuid::now_v7(),
-        occurred_at: reached_at,
-        partition_key: key.clone(),
-        payload: StreamsChangelogPayload::StreamJobCheckpointReached {
-            handle_id: handle.handle_id.clone(),
-            job_id: handle.job_id.clone(),
-            checkpoint_name: checkpoint_name.to_owned(),
-            checkpoint_sequence,
-            stream_partition_id,
-            owner_epoch,
-            reached_at,
-        },
-    };
-    StreamChangelogRecord::streams(key, entry)
+    crate::dataflow_engine::checkpoint_reached_changelog_record(
+        handle,
+        routing_key,
+        checkpoint_name,
+        checkpoint_sequence,
+        stream_partition_id,
+        owner_epoch,
+        reached_at,
+    )
 }
 
 fn source_lease_assigned_changelog_record(
@@ -5126,28 +4696,37 @@ fn dispatch_batch_id(
     format!("{}:{stream_partition_id}:{batch_index}", handle.handle_id)
 }
 
-pub(crate) fn local_dispatch_batch_from_work(
-    work: &StreamJobPartitionWork,
+pub(crate) fn local_dispatch_batch_from_dataflow_batch(
+    batch: &StreamJobDataflowBatch,
 ) -> LocalStreamJobDispatchBatch {
     LocalStreamJobDispatchBatch {
-        batch_id: work.batch_id.clone(),
-        stream_partition_id: work.stream_partition_id,
-        checkpoint_partition_id: work.checkpoint_partition_id,
-        source_owner_partition_id: work.source_owner_partition_id,
-        source_lease_token: work.source_lease_token.clone(),
-        routing_key: work.routing_key.clone(),
-        key_field: work.key_field.clone(),
-        reducer_kind: work.reducer_kind.clone(),
-        output_field: work.output_field.clone(),
-        view_name: work.view_name.clone(),
-        additional_view_names: work.additional_view_names.clone(),
-        eventual_projection_view_names: work.eventual_projection_view_names.clone(),
-        workflow_signals: work.workflow_signals.clone(),
-        checkpoint_name: work.checkpoint_name.clone(),
-        checkpoint_sequence: work.checkpoint_sequence,
-        owner_epoch: work.owner_epoch,
-        occurred_at: work.occurred_at,
-        items: work
+        batch_id: batch.envelope.batch_id.clone(),
+        plan_id: Some(batch.envelope.plan_id.clone()),
+        source_id: Some(batch.envelope.source_id.clone()),
+        source_partition_id: Some(batch.envelope.source_partition_id),
+        source_epoch: Some(batch.envelope.source_epoch),
+        offset_range: batch.envelope.offset_range.clone(),
+        edge_id: Some(batch.envelope.edge_id.clone()),
+        lease_epoch: batch.envelope.lease_epoch,
+        summary: Some(batch.envelope.summary.clone()),
+        stream_partition_id: batch.program.stream_partition_id,
+        checkpoint_partition_id: batch.program.checkpoint_partition_id,
+        source_owner_partition_id: batch.program.source_owner_partition_id,
+        source_lease_token: batch.program.source_lease_token.clone(),
+        routing_key: batch.program.routing_key.clone(),
+        key_field: batch.program.key_field.clone(),
+        reducer_kind: batch.program.reducer_kind.clone(),
+        output_field: batch.program.output_field.clone(),
+        view_name: batch.program.view_name.clone(),
+        additional_view_names: batch.program.additional_view_names.clone(),
+        workflow_signals: batch.program.workflow_signals.clone(),
+        eventual_projection_view_names: batch.program.eventual_projection_view_names.clone(),
+        checkpoint_name: batch.program.checkpoint_name.clone(),
+        checkpoint_sequence: batch.program.checkpoint_sequence,
+        owner_epoch: batch.program.owner_epoch,
+        occurred_at: batch.program.occurred_at,
+        items: batch
+            .program
             .items
             .iter()
             .map(|item| LocalStreamJobDispatchItem {
@@ -5159,13 +4738,15 @@ pub(crate) fn local_dispatch_batch_from_work(
                 count: item.count,
             })
             .collect(),
-        is_final_partition_batch: work.is_final_partition_batch,
+        is_final_partition_batch: batch.program.is_final_partition_batch,
+        completes_dispatch: batch.program.completes_dispatch,
     }
 }
 
-fn work_from_local_dispatch_batch(batch: &LocalStreamJobDispatchBatch) -> StreamJobPartitionWork {
-    StreamJobPartitionWork {
-        batch_id: batch.batch_id.clone(),
+fn program_from_local_dispatch_batch(
+    batch: &LocalStreamJobDispatchBatch,
+) -> crate::dataflow_engine::BoundedDataflowBatchProgram {
+    crate::dataflow_engine::BoundedDataflowBatchProgram {
         stream_partition_id: batch.stream_partition_id,
         checkpoint_partition_id: batch.checkpoint_partition_id,
         source_owner_partition_id: batch.source_owner_partition_id,
@@ -5185,7 +4766,7 @@ fn work_from_local_dispatch_batch(batch: &LocalStreamJobDispatchBatch) -> Stream
         items: batch
             .items
             .iter()
-            .map(|item| StreamJobPartitionItem {
+            .map(|item| crate::dataflow_engine::BoundedDataflowItem {
                 logical_key: item.logical_key.clone(),
                 value: item.value,
                 display_key: item.display_key.clone(),
@@ -5195,8 +4776,43 @@ fn work_from_local_dispatch_batch(batch: &LocalStreamJobDispatchBatch) -> Stream
             })
             .collect(),
         is_final_partition_batch: batch.is_final_partition_batch,
-        completes_dispatch: false,
+        completes_dispatch: batch.completes_dispatch,
     }
+}
+
+fn dataflow_batch_from_local_dispatch_batch(
+    handle: &StreamJobBridgeHandleRecord,
+    batch: &LocalStreamJobDispatchBatch,
+    runtime_state: Option<&LocalStreamJobRuntimeState>,
+) -> StreamJobDataflowBatch {
+    let program = program_from_local_dispatch_batch(batch);
+    let mut restored =
+        direct_dataflow_batch_for_program(handle, batch.batch_id.clone(), program, runtime_state);
+    if let Some(plan_id) = &batch.plan_id {
+        restored.envelope.plan_id = plan_id.clone();
+    }
+    if let Some(source_id) = &batch.source_id {
+        restored.envelope.source_id = source_id.clone();
+    }
+    if let Some(source_partition_id) = batch.source_partition_id {
+        restored.envelope.source_partition_id = source_partition_id;
+    }
+    if let Some(source_epoch) = batch.source_epoch {
+        restored.envelope.source_epoch = source_epoch;
+    }
+    if let Some(offset_range) = &batch.offset_range {
+        restored.envelope.offset_range = Some(offset_range.clone());
+    }
+    if let Some(edge_id) = &batch.edge_id {
+        restored.envelope.edge_id = edge_id.clone();
+    }
+    if let Some(lease_epoch) = batch.lease_epoch {
+        restored.envelope.lease_epoch = Some(lease_epoch);
+    }
+    if let Some(summary) = &batch.summary {
+        restored.envelope.summary = summary.clone();
+    }
+    restored
 }
 
 async fn plan_topic_stream_job_activation(
@@ -5220,7 +4836,7 @@ async fn plan_topic_stream_job_activation(
         return Ok(StreamJobActivationPlan {
             execution_planned: None,
             runtime_state_update: None,
-            partition_work: Vec::new(),
+            dataflow_batches: Vec::new(),
             post_apply_projection_records: Vec::new(),
             post_apply_changelog_records: Vec::new(),
             source_cursor_updates: None,
@@ -5302,7 +4918,7 @@ async fn plan_topic_stream_job_activation(
                 source_name: Some(topic.topic_name.clone()),
                 source_cursors: Vec::new(),
                 source_partition_leases: Vec::new(),
-                dispatch_batches: Vec::new(),
+                dispatch_dataflow_batches: Vec::new(),
                 applied_dispatch_batch_ids: Vec::new(),
                 dispatch_completed_at: None,
                 dispatch_cancelled_at: None,
@@ -5446,7 +5062,7 @@ async fn plan_topic_stream_job_activation(
         return Ok(StreamJobActivationPlan {
             execution_planned,
             runtime_state_update,
-            partition_work: Vec::new(),
+            dataflow_batches: Vec::new(),
             post_apply_projection_records: Vec::new(),
             post_apply_changelog_records,
             source_cursor_updates: None,
@@ -5565,7 +5181,7 @@ async fn plan_topic_stream_job_activation(
         ),
     );
 
-    let mut partition_work = Vec::new();
+    let mut planned_batches = Vec::new();
     for (source_partition_id, records) in &consumed {
         let cursor = source_cursors
             .iter()
@@ -5576,7 +5192,7 @@ async fn plan_topic_stream_job_activation(
             continue;
         }
         let mut by_owner_partition =
-            BTreeMap::<i32, HashMap<String, StreamJobPartitionItem>>::new();
+            BTreeMap::<i32, HashMap<String, crate::dataflow_engine::BoundedDataflowItem>>::new();
         let mut routing_keys = HashMap::<i32, String>::new();
         let (source_owner_partition_id, source_lease_token) =
             source_leases.get(source_partition_id).cloned().context(
@@ -5585,16 +5201,14 @@ async fn plan_topic_stream_job_activation(
         for record in &admitted.accepted_records {
             let owner_partition_id =
                 throughput_partition_for_stream_key(&record.display_key, throughput_partitions);
-            routing_keys
-                .entry(owner_partition_id)
-                .or_insert_with(|| record.logical_key.clone());
+            routing_keys.entry(owner_partition_id).or_insert_with(|| record.logical_key.clone());
             let partition_items = by_owner_partition.entry(owner_partition_id).or_default();
             if let Some(aggregate) = partition_items.get_mut(&record.logical_key) {
-                merge_partition_item(&plan.reducer_kind, aggregate, record.value)?;
+                merge_dataflow_item(&plan.reducer_kind, aggregate, record.value)?;
             } else {
                 partition_items.insert(
                     record.logical_key.clone(),
-                    StreamJobPartitionItem {
+                    crate::dataflow_engine::BoundedDataflowItem {
                         logical_key: record.logical_key.clone(),
                         value: record.value,
                         display_key: Some(record.display_key.clone()),
@@ -5611,30 +5225,36 @@ async fn plan_topic_stream_job_activation(
             let items = items_by_key.into_values().collect::<Vec<_>>();
             let routing_key =
                 routing_keys.remove(&owner_partition_id).unwrap_or_else(|| handle.job_id.clone());
-            partition_work.push(StreamJobPartitionWork {
+            planned_batches.push(PlannedBoundedDataflowBatch {
                 batch_id: format!(
                     "{}:topic:{source_partition_id}:{start_offset}:{end_offset}:{owner_partition_id}",
                     handle.handle_id
                 ),
-                stream_partition_id: owner_partition_id,
-                checkpoint_partition_id: Some(*source_partition_id),
-                source_owner_partition_id: Some(source_owner_partition_id),
-                source_lease_token: Some(source_lease_token.clone()),
-                routing_key,
-                key_field: plan.key_field.clone(),
-                reducer_kind: plan.reducer_kind.clone(),
-                output_field: plan.output_field.clone(),
-                view_name: plan.view_name.clone(),
-                additional_view_names: plan.additional_view_names.clone(),
-                eventual_projection_view_names: plan.eventual_projection_view_names.clone(),
-                workflow_signals: plan.workflow_signals.clone(),
-                checkpoint_name: plan.checkpoint_name.clone(),
-                checkpoint_sequence: plan.checkpoint_sequence,
-                owner_epoch,
-                occurred_at,
-                items,
-                is_final_partition_batch: false,
-                completes_dispatch: false,
+                source_id: format!("topic:{}", handle.handle_id),
+                source_partition_id: *source_partition_id,
+                source_epoch: plan.checkpoint_sequence.max(0) as u64,
+                offset_range: Some(DataflowOffsetRange { start: start_offset, end: end_offset }),
+                program: crate::dataflow_engine::BoundedDataflowBatchProgram {
+                    stream_partition_id: owner_partition_id,
+                    checkpoint_partition_id: Some(*source_partition_id),
+                    source_owner_partition_id: Some(source_owner_partition_id),
+                    source_lease_token: Some(source_lease_token.clone()),
+                    routing_key,
+                    key_field: plan.key_field.clone(),
+                    reducer_kind: plan.reducer_kind.clone(),
+                    output_field: plan.output_field.clone(),
+                    view_name: plan.view_name.clone(),
+                    additional_view_names: plan.additional_view_names.clone(),
+                    eventual_projection_view_names: plan.eventual_projection_view_names.clone(),
+                    workflow_signals: plan.workflow_signals.clone(),
+                    checkpoint_name: plan.checkpoint_name.clone(),
+                    checkpoint_sequence: plan.checkpoint_sequence,
+                    owner_epoch,
+                    occurred_at,
+                    items,
+                    is_final_partition_batch: false,
+                    completes_dispatch: false,
+                },
             });
         }
     }
@@ -5783,10 +5403,11 @@ async fn plan_topic_stream_job_activation(
     post_apply_projection_records.extend(retention_sweep.projection_records);
     post_apply_changelog_records.extend(retention_sweep.changelog_records);
 
+    let dataflow_batches = dataflow_batches_for_planned_programs(handle, planned_batches);
     Ok(StreamJobActivationPlan {
         execution_planned,
         runtime_state_update,
-        partition_work,
+        dataflow_batches,
         post_apply_projection_records,
         post_apply_changelog_records,
         source_cursor_updates: None,
@@ -5794,7 +5415,7 @@ async fn plan_topic_stream_job_activation(
     })
 }
 
-pub(crate) async fn plan_topic_stream_job_owner_polls(
+pub(crate) async fn prepare_topic_stream_job_runtime_install(
     local_state: &LocalThroughputState,
     store: Option<&WorkflowStore>,
     app_state: &AppState,
@@ -5804,7 +5425,7 @@ pub(crate) async fn plan_topic_stream_job_owner_polls(
     owner_epoch: u64,
     runtime_state_override: Option<&LocalStreamJobRuntimeState>,
     occurred_at: DateTime<Utc>,
-) -> Result<Option<TopicStreamJobOwnerPollPlan>> {
+) -> Result<Option<TopicStreamJobRuntimeInstallPlan>> {
     let Some(job) =
         resolved_job_override.cloned().or(resolve_stream_job_definition(store, handle).await?)
     else {
@@ -5853,12 +5474,11 @@ pub(crate) async fn plan_topic_stream_job_owner_polls(
     };
     if existing_runtime_state.as_ref().and_then(|state| state.terminal_status.as_deref()).is_some()
     {
-        return Ok(Some(TopicStreamJobOwnerPollPlan {
+        return Ok(Some(TopicStreamJobRuntimeInstallPlan {
             execution_planned: None,
             runtime_state_update: None,
             post_apply_projection_records: Vec::new(),
             post_apply_changelog_records: Vec::new(),
-            poll_requests: Vec::new(),
             terminalized: None,
         }));
     }
@@ -5941,7 +5561,7 @@ pub(crate) async fn plan_topic_stream_job_owner_polls(
                 source_name: Some(topic.topic_name.clone()),
                 source_cursors: source_cursors.clone(),
                 source_partition_leases: source_leases.clone(),
-                dispatch_batches: Vec::new(),
+                dispatch_dataflow_batches: Vec::new(),
                 applied_dispatch_batch_ids: Vec::new(),
                 dispatch_completed_at: None,
                 dispatch_cancelled_at: None,
@@ -6053,12 +5673,11 @@ pub(crate) async fn plan_topic_stream_job_owner_polls(
     runtime_state.source_cursors = source_cursors.clone();
 
     if handle.cancellation_requested_at.is_some() {
-        return Ok(Some(TopicStreamJobOwnerPollPlan {
+        return Ok(Some(TopicStreamJobRuntimeInstallPlan {
             execution_planned,
             runtime_state_update: Some(runtime_state),
             post_apply_projection_records: Vec::new(),
             post_apply_changelog_records,
-            poll_requests: Vec::new(),
             terminalized: Some(terminalized_status_changelog_record(
                 handle,
                 owner_epoch,
@@ -6074,8 +5693,6 @@ pub(crate) async fn plan_topic_stream_job_owner_polls(
             )),
         }));
     }
-
-    let mut poll_requests = Vec::new();
     for cursor in &source_cursors {
         let latest_target = latest_offsets_by_partition
             .get(&cursor.source_partition_id)
@@ -6085,56 +5702,6 @@ pub(crate) async fn plan_topic_stream_job_owner_polls(
             .iter()
             .find(|lease| lease.source_partition_id == cursor.source_partition_id)
             .context("topic stream job source lease should exist")?;
-        if cursor.next_offset < latest_target {
-            poll_requests.push(TopicStreamJobPollRequest {
-                source_partition_id: cursor.source_partition_id,
-                source_owner_partition_id: lease.owner_partition_id,
-                lease_token: lease.lease_token.clone(),
-                checkpoint_sequence: current_checkpoint_sequence,
-                start_offset: cursor.next_offset,
-                checkpoint_target_offset: latest_target,
-                idle_window_timer: false,
-            });
-            continue;
-        }
-        if should_request_idle_window_timer(cursor, &plan, latest_target) {
-            poll_requests.push(TopicStreamJobPollRequest {
-                source_partition_id: cursor.source_partition_id,
-                source_owner_partition_id: lease.owner_partition_id,
-                lease_token: lease.lease_token.clone(),
-                checkpoint_sequence: current_checkpoint_sequence,
-                start_offset: cursor.next_offset,
-                checkpoint_target_offset: latest_target,
-                idle_window_timer: true,
-            });
-            if frontier_advanced {
-                post_apply_changelog_records.push(source_progressed_changelog_record(
-                    handle,
-                    cursor.source_partition_id,
-                    cursor.next_offset,
-                    current_checkpoint_sequence,
-                    latest_target,
-                    cursor.last_applied_offset,
-                    cursor.last_high_watermark,
-                    cursor.last_event_time_watermark,
-                    cursor.last_closed_window_end,
-                    cursor.pending_window_ends.clone(),
-                    cursor.dropped_late_event_count,
-                    cursor.last_dropped_late_offset,
-                    cursor.last_dropped_late_event_at,
-                    cursor.last_dropped_late_window_end,
-                    cursor.dropped_evicted_window_event_count,
-                    cursor.last_dropped_evicted_window_offset,
-                    cursor.last_dropped_evicted_window_event_at,
-                    cursor.last_dropped_evicted_window_end,
-                    lease.owner_partition_id,
-                    &lease.lease_token,
-                    lease.owner_epoch,
-                    occurred_at,
-                ));
-            }
-            continue;
-        }
         if frontier_advanced {
             post_apply_changelog_records.push(source_progressed_changelog_record(
                 handle,
@@ -6184,12 +5751,11 @@ pub(crate) async fn plan_topic_stream_job_owner_polls(
     }
     let post_apply_projection_records = retention_sweep.projection_records;
     post_apply_changelog_records.extend(retention_sweep.changelog_records);
-    Ok(Some(TopicStreamJobOwnerPollPlan {
+    Ok(Some(TopicStreamJobRuntimeInstallPlan {
         execution_planned,
         runtime_state_update: Some(runtime_state),
         post_apply_projection_records,
         post_apply_changelog_records,
-        poll_requests,
         terminalized: None,
     }))
 }
@@ -6463,19 +6029,15 @@ pub(crate) async fn poll_topic_stream_job_source_partition_on_local_state(
         records: admitted.accepted_records.clone(),
     };
     let owner_input_batches = owner_input_batches_from_source_batch(
+        handle,
         &source_batch,
         &plan,
         throughput_partitions,
         source_owner_epoch,
         occurred_at,
     )?;
-    let owner_partition_runtime_stats = owner_partition_runtime_stats_from_work(
-        &owner_input_batches
-            .iter()
-            .map(|batch| batch.work.clone())
-            .collect::<Vec<_>>(),
-        occurred_at,
-    );
+    let owner_partition_runtime_stats =
+        owner_partition_runtime_stats_from_batches(&owner_input_batches, occurred_at);
 
     let last_offset = consumed.last().map(|record| record.offset);
     let last_high_watermark = consumed.iter().map(|record| record.high_watermark).max();
@@ -6636,16 +6198,16 @@ pub(crate) async fn plan_stream_job_activation(
             return Ok(Some(StreamJobActivationPlan {
                 execution_planned: None,
                 runtime_state_update: None,
-                partition_work: Vec::new(),
+                dataflow_batches: Vec::new(),
                 post_apply_projection_records: Vec::new(),
                 post_apply_changelog_records: Vec::new(),
                 source_cursor_updates: None,
                 terminalized: None,
             }));
         }
-        if !runtime_state.dispatch_batches.is_empty() {
-            let mut pending = runtime_state
-                .dispatch_batches
+        if !runtime_state.dispatch_manifest_batches().is_empty() {
+            let pending_dispatch_batches = runtime_state
+                .dispatch_manifest_batches()
                 .iter()
                 .filter(|batch| {
                     !runtime_state
@@ -6653,12 +6215,8 @@ pub(crate) async fn plan_stream_job_activation(
                         .iter()
                         .any(|applied| applied == &batch.batch_id)
                 })
-                .map(work_from_local_dispatch_batch)
                 .collect::<Vec<_>>();
-            if let Some(last) = pending.last_mut() {
-                last.completes_dispatch = true;
-            }
-            let terminalized = if pending.is_empty()
+            let terminalized = if pending_dispatch_batches.is_empty()
                 && runtime_state.dispatch_completed_at.is_some()
                 && runtime_state.terminal_status.is_none()
             {
@@ -6670,10 +6228,19 @@ pub(crate) async fn plan_stream_job_activation(
             } else {
                 None
             };
+            let mut dataflow_batches = pending_dispatch_batches
+                .iter()
+                .map(|batch| {
+                    dataflow_batch_from_local_dispatch_batch(handle, batch, Some(&runtime_state))
+                })
+                .collect::<Vec<_>>();
+            if let Some(last) = dataflow_batches.last_mut() {
+                last.program.completes_dispatch = true;
+            }
             return Ok(Some(StreamJobActivationPlan {
                 execution_planned: None,
                 runtime_state_update: None,
-                partition_work: pending,
+                dataflow_batches,
                 post_apply_projection_records: Vec::new(),
                 post_apply_changelog_records: Vec::new(),
                 source_cursor_updates: None,
@@ -6776,7 +6343,7 @@ pub(crate) async fn plan_stream_job_activation(
         source_name: None,
         source_cursors: Vec::new(),
         source_partition_leases: Vec::new(),
-        dispatch_batches: Vec::new(),
+        dispatch_dataflow_batches: Vec::new(),
         applied_dispatch_batch_ids: Vec::new(),
         dispatch_completed_at: None,
         dispatch_cancelled_at: None,
@@ -6797,7 +6364,7 @@ pub(crate) async fn plan_stream_job_activation(
         terminal_at: None,
         updated_at: occurred_at,
     };
-    let mut partition_work = Vec::new();
+    let mut planned_batches = Vec::new();
     for (stream_partition_id, partition_items_by_key) in items_by_partition {
         let routing_key =
             routing_keys.remove(&stream_partition_id).unwrap_or_else(|| handle.job_id.clone());
@@ -6816,39 +6383,56 @@ pub(crate) async fn plan_stream_job_activation(
                 STREAM_JOB_OWNER_BATCH_MAX_ITEMS.min(remaining_items)
             };
             let items = partition_items.by_ref().take(batch_len).collect::<Vec<_>>();
-            partition_work.push(StreamJobPartitionWork {
+            planned_batches.push(PlannedBoundedDataflowBatch {
                 batch_id: dispatch_batch_id(handle, stream_partition_id, batch_index),
-                stream_partition_id,
-                checkpoint_partition_id: None,
-                source_owner_partition_id: None,
-                source_lease_token: None,
-                routing_key: routing_key.clone(),
-                key_field: plan.key_field.clone(),
-                reducer_kind: plan.reducer_kind.clone(),
-                output_field: plan.output_field.clone(),
-                view_name: plan.view_name.clone(),
-                additional_view_names: plan.additional_view_names.clone(),
-                eventual_projection_view_names: plan.eventual_projection_view_names.clone(),
-                workflow_signals: plan.workflow_signals.clone(),
-                checkpoint_name: plan.checkpoint_name.clone(),
-                checkpoint_sequence: plan.checkpoint_sequence,
-                owner_epoch,
-                occurred_at,
-                items,
-                is_final_partition_batch: batch_index + 1 == batch_count,
-                completes_dispatch: false,
+                source_id: format!("bounded:{}", handle.handle_id),
+                source_partition_id: stream_partition_id,
+                source_epoch: plan.checkpoint_sequence.max(0) as u64,
+                offset_range: None,
+                program: crate::dataflow_engine::BoundedDataflowBatchProgram {
+                    stream_partition_id,
+                    checkpoint_partition_id: None,
+                    source_owner_partition_id: None,
+                    source_lease_token: None,
+                    routing_key: routing_key.clone(),
+                    key_field: plan.key_field.clone(),
+                    reducer_kind: plan.reducer_kind.clone(),
+                    output_field: plan.output_field.clone(),
+                    view_name: plan.view_name.clone(),
+                    additional_view_names: plan.additional_view_names.clone(),
+                    eventual_projection_view_names: plan.eventual_projection_view_names.clone(),
+                    workflow_signals: plan.workflow_signals.clone(),
+                    checkpoint_name: plan.checkpoint_name.clone(),
+                    checkpoint_sequence: plan.checkpoint_sequence,
+                    owner_epoch,
+                    occurred_at,
+                    items: items
+                        .into_iter()
+                        .map(|item| crate::dataflow_engine::BoundedDataflowItem {
+                            logical_key: item.logical_key,
+                            value: item.value,
+                            display_key: item.display_key,
+                            window_start: item.window_start,
+                            window_end: item.window_end,
+                            count: item.count,
+                        })
+                        .collect(),
+                    is_final_partition_batch: batch_index + 1 == batch_count,
+                    completes_dispatch: false,
+                },
             });
         }
     }
-    if let Some(last) = partition_work.last_mut() {
-        last.completes_dispatch = true;
+    if let Some(last) = planned_batches.last_mut() {
+        last.program.completes_dispatch = true;
     }
+    let dataflow_batches = dataflow_batches_for_planned_programs(handle, planned_batches);
     runtime_state.owner_partition_runtime_stats =
-        owner_partition_runtime_stats_from_work(&partition_work, occurred_at);
+        owner_partition_runtime_stats_from_batches(&dataflow_batches, occurred_at);
     Ok(Some(StreamJobActivationPlan {
         execution_planned: Some(execution_planned),
         runtime_state_update: Some(runtime_state),
-        partition_work,
+        dataflow_batches,
         post_apply_projection_records: Vec::new(),
         post_apply_changelog_records: Vec::new(),
         source_cursor_updates: None,
@@ -6856,54 +6440,82 @@ pub(crate) async fn plan_stream_job_activation(
     }))
 }
 
-pub(crate) fn apply_stream_job_partition_work_on_local_state(
+pub(crate) fn apply_stream_job_dataflow_batch_on_local_state(
     local_state: &LocalThroughputState,
     handle: &StreamJobBridgeHandleRecord,
-    work: &StreamJobPartitionWork,
+    batch: &StreamJobDataflowBatch,
     mirror_owner_state: bool,
-) -> Result<StreamJobActivationResult> {
-    apply_stream_job_partition_work_on_local_state_with_runtime_override(
+) -> Result<StreamJobDataflowBatchApplyResult> {
+    apply_stream_job_dataflow_batch_on_local_state_with_runtime_override(
         local_state,
         handle,
-        work,
+        batch,
         mirror_owner_state,
         None,
     )
 }
 
-pub(crate) fn apply_stream_job_partition_work_on_local_state_with_runtime_override(
+pub(crate) fn apply_stream_job_dataflow_batch_list_on_local_state(
     local_state: &LocalThroughputState,
     handle: &StreamJobBridgeHandleRecord,
-    work: &StreamJobPartitionWork,
+    batch_list: &[StreamJobDataflowBatch],
+    mirror_owner_state: bool,
+) -> Result<StreamJobDataflowApplyResult> {
+    apply_stream_job_dataflow_batch_list_on_local_state_with_runtime_override(
+        local_state,
+        handle,
+        batch_list,
+        mirror_owner_state,
+        None,
+    )
+}
+
+pub(crate) fn apply_stream_job_dataflow_batch_list_on_local_state_with_runtime_override(
+    local_state: &LocalThroughputState,
+    handle: &StreamJobBridgeHandleRecord,
+    batch_list: &[StreamJobDataflowBatch],
     mirror_owner_state: bool,
     runtime_state_override: Option<&LocalStreamJobRuntimeState>,
-) -> Result<StreamJobActivationResult> {
-    apply_stream_job_partition_work_on_local_state_with_metrics(
-        local_state,
+) -> Result<StreamJobDataflowApplyResult> {
+    crate::dataflow_engine::LocalDataflowEngine::new(local_state).apply_stream_job_batch_list(
         handle,
-        work,
-        mirror_owner_state,
         runtime_state_override,
-        None,
+        batch_list,
+        mirror_owner_state,
     )
 }
 
-pub(crate) fn apply_stream_job_partition_work_on_local_state_with_metrics(
+pub(crate) fn apply_stream_job_dataflow_batch_on_local_state_with_runtime_override(
     local_state: &LocalThroughputState,
     handle: &StreamJobBridgeHandleRecord,
-    work: &StreamJobPartitionWork,
+    batch: &StreamJobDataflowBatch,
+    mirror_owner_state: bool,
+    runtime_state_override: Option<&LocalStreamJobRuntimeState>,
+) -> Result<StreamJobDataflowBatchApplyResult> {
+    crate::dataflow_engine::LocalDataflowEngine::new(local_state).apply_stream_job_batch(
+        handle,
+        runtime_state_override,
+        batch,
+        mirror_owner_state,
+    )
+}
+
+pub(crate) fn apply_stream_job_dataflow_batch_on_local_state_with_metrics(
+    local_state: &LocalThroughputState,
+    handle: &StreamJobBridgeHandleRecord,
+    batch: &StreamJobDataflowBatch,
     mirror_owner_state: bool,
     runtime_state_override: Option<&LocalStreamJobRuntimeState>,
     mut metrics: Option<&mut StreamJobApplyMetrics>,
 ) -> Result<StreamJobActivationResult> {
-    let Some(prepared) = prepare_stream_job_partition_work_apply(
-        local_state,
-        handle,
-        work,
-        mirror_owner_state,
-        runtime_state_override,
-        metrics.as_deref_mut(),
-    )?
+    let Some(prepared) = crate::dataflow_engine::LocalDataflowEngine::new(local_state)
+        .prepare_stream_job_batch_apply(
+            handle,
+            batch,
+            mirror_owner_state,
+            runtime_state_override,
+            metrics.as_deref_mut(),
+        )?
     else {
         return Ok(StreamJobActivationResult {
             projection_records: Vec::new(),
@@ -6970,227 +6582,6 @@ pub(crate) fn apply_stream_job_partition_work_on_local_state_with_metrics(
     Ok(activation_result)
 }
 
-fn prepare_stream_job_partition_work_apply(
-    local_state: &LocalThroughputState,
-    handle: &StreamJobBridgeHandleRecord,
-    work: &StreamJobPartitionWork,
-    mirror_owner_state: bool,
-    runtime_state_override: Option<&LocalStreamJobRuntimeState>,
-    mut metrics: Option<&mut StreamJobApplyMetrics>,
-) -> Result<Option<PreparedStreamJobPartitionApply>> {
-    if local_state.has_stream_job_applied_dispatch_batch(&handle.handle_id, &work.batch_id)? {
-        return Ok(None);
-    }
-    let mut loaded_runtime_state = None;
-    if let (Some(source_partition_id), Some(source_lease_token)) =
-        (work.checkpoint_partition_id, work.source_lease_token.as_ref())
-    {
-        if let Some(metrics) = metrics.as_deref_mut() {
-            metrics.runtime_state_loads += 1;
-        }
-        let runtime_state = if let Some(runtime_state_override) = runtime_state_override {
-            runtime_state_override
-        } else if let Some(runtime_state) =
-            local_state.load_stream_job_runtime_state(&handle.handle_id)?
-        {
-            loaded_runtime_state = Some(runtime_state);
-            loaded_runtime_state.as_ref().expect("loaded runtime state should exist")
-        } else {
-            return Ok(None);
-        };
-        let Some(lease) = runtime_state
-            .source_partition_leases
-            .iter()
-            .find(|lease| lease.source_partition_id == source_partition_id)
-        else {
-            return Ok(None);
-        };
-        if lease.lease_token != *source_lease_token
-            || work
-                .source_owner_partition_id
-                .is_some_and(|owner_partition_id| lease.owner_partition_id != owner_partition_id)
-        {
-            return Ok(None);
-        }
-    }
-
-    let accumulate_started = std::time::Instant::now();
-    let mut updated_outputs =
-        HashMap::<String, StreamJobViewAccumulator>::with_capacity(work.items.len());
-    let mut prior_outputs =
-        HashMap::<String, Option<Map<String, Value>>>::with_capacity(work.items.len());
-    for item in &work.items {
-        if let Some(output) = updated_outputs.get_mut(&item.logical_key) {
-            output.apply_item(item);
-            continue;
-        }
-
-        let load_started = std::time::Instant::now();
-        let output = load_stream_job_view_accumulator(
-            local_state,
-            &handle.handle_id,
-            &work.view_name,
-            &work.reducer_kind,
-            &work.output_field,
-            &work.key_field,
-            &item.logical_key,
-        )?;
-        if let Some(metrics) = metrics.as_deref_mut() {
-            metrics.view_state_loads += 1;
-            metrics.load_existing_state_elapsed += load_started.elapsed();
-            if output.is_some() {
-                metrics.view_state_hits += 1;
-            } else {
-                metrics.view_state_misses += 1;
-            }
-        }
-        let (previous_output, mut output) = match output {
-            Some((previous_output, accumulator)) => (Some(previous_output), accumulator),
-            None => (None, StreamJobViewAccumulator::from_item(item, &work.reducer_kind)?),
-        };
-        output.apply_item(item);
-        prior_outputs.insert(item.logical_key.clone(), previous_output);
-        updated_outputs.insert(item.logical_key.clone(), output);
-    }
-    if let Some(metrics) = metrics.as_deref_mut() {
-        metrics.accumulate_elapsed += accumulate_started.elapsed();
-    }
-
-    let materialize_started = std::time::Instant::now();
-    let signal_records = updated_outputs
-        .iter()
-        .flat_map(|(logical_key, output)| {
-            let previous_output = prior_outputs.get(logical_key).and_then(|value| value.as_ref());
-            let public_output = sanitize_stream_view_output(output.into_output_value(
-                &work.key_field,
-                &work.output_field,
-                work.checkpoint_sequence,
-                true,
-            ));
-            work.workflow_signals.iter().filter_map(move |signal| {
-                if signal.view_name != work.view_name
-                    && !work
-                        .additional_view_names
-                        .iter()
-                        .any(|view_name| view_name == &signal.view_name)
-                {
-                    return None;
-                }
-                if local_state
-                    .load_stream_job_workflow_signal_state(
-                        &handle.handle_id,
-                        &signal.operator_id,
-                        logical_key,
-                    )
-                    .ok()
-                    .flatten()
-                    .is_some()
-                {
-                    return None;
-                }
-                if !signal_output_matches(&public_output, signal.when_output_field.as_deref()) {
-                    return None;
-                }
-                if previous_output.is_some_and(|output| {
-                    signal_output_matches(
-                        &Value::Object(output.clone()),
-                        signal.when_output_field.as_deref(),
-                    )
-                }) {
-                    return None;
-                }
-                Some(workflow_signaled_changelog_record(
-                    handle,
-                    signal,
-                    logical_key,
-                    workflow_signal_payload(handle, signal, logical_key, public_output.clone()),
-                    work.owner_epoch,
-                    work.occurred_at,
-                ))
-            })
-        })
-        .collect::<Vec<_>>();
-    let materialized = materialize_stream_job_batch_updates(
-        handle,
-        work,
-        updated_outputs.into_iter().collect(),
-        mirror_owner_state,
-    );
-    if let Some(metrics) = metrics.as_deref_mut() {
-        metrics.materialize_elapsed += materialize_started.elapsed();
-        metrics.projection_record_count += materialized.projection_records.len();
-        metrics.changelog_record_count +=
-            materialized.changelog_records.len() + signal_records.len();
-        metrics.owner_view_update_count += materialized.owner_view_updates.len();
-    }
-    let projection_records = materialized.projection_records;
-    let mut changelog_records = materialized.changelog_records;
-    changelog_records.extend(signal_records);
-    let owner_view_updates = materialized.owner_view_updates;
-    let state_key_delta = prior_outputs.values().filter(|output| output.is_none()).count() as u64;
-    let runtime_state_for_progress = runtime_state_override.or(loaded_runtime_state.as_ref());
-    let accepted_progress_state =
-        accepted_progress_state_for_work(handle, work, runtime_state_for_progress);
-    if work.is_final_partition_batch && !work.checkpoint_name.is_empty() {
-        changelog_records.push(checkpoint_reached_changelog_record(
-            handle,
-            &work.routing_key,
-            &work.checkpoint_name,
-            work.checkpoint_sequence,
-            work.checkpoint_partition_id.unwrap_or(work.stream_partition_id),
-            work.owner_epoch,
-            work.occurred_at,
-        ));
-        if let Some(metrics) = metrics.as_deref_mut() {
-            metrics.changelog_record_count += 1;
-        }
-    }
-    let mirrored_stream_entries = changelog_records
-        .iter()
-        .filter_map(|record| match &record.entry {
-            crate::ChangelogRecordEntry::Streams(entry)
-                if !matches!(
-                    entry.payload,
-                    StreamsChangelogPayload::StreamJobViewUpdated { .. }
-                        | StreamsChangelogPayload::StreamJobViewBatchUpdated { .. }
-                ) =>
-            {
-                Some(entry.clone())
-            }
-            crate::ChangelogRecordEntry::Throughput(_) => None,
-            crate::ChangelogRecordEntry::Streams(_) => None,
-        })
-        .collect::<Vec<_>>();
-    if mirror_owner_state {
-        for record in &mut changelog_records {
-            if matches!(
-                &record.entry,
-                crate::ChangelogRecordEntry::Streams(entry)
-                    if !matches!(
-                        entry.payload,
-                        StreamsChangelogPayload::StreamJobViewUpdated { .. }
-                            | StreamsChangelogPayload::StreamJobViewBatchUpdated { .. }
-                    )
-            ) {
-                record.local_mirror_applied = true;
-                record.partition_mirror_applied = true;
-            }
-        }
-    }
-    Ok(Some(PreparedStreamJobPartitionApply {
-        activation_result: StreamJobActivationResult { projection_records, changelog_records },
-        owner_view_updates,
-        mirrored_stream_entries,
-        accepted_progress_state,
-        stream_partition_id: work.stream_partition_id,
-        state_key_delta,
-        batch_id: work.batch_id.clone(),
-        compact_checkpoint_mirrors: work.source_lease_token.is_none(),
-        completes_dispatch: work.completes_dispatch,
-        occurred_at: work.occurred_at,
-    }))
-}
-
 pub(crate) async fn activate_stream_job_on_local_state(
     store: Option<&WorkflowStore>,
     app_state: Option<&AppState>,
@@ -7213,133 +6604,13 @@ pub(crate) async fn activate_stream_job_on_local_state(
     else {
         return Ok(None);
     };
-
-    let mut projection_records = Vec::new();
-    let mut changelog_records = Vec::with_capacity(
-        plan.partition_work.len().saturating_add(plan.post_apply_changelog_records.len() + 2),
-    );
-    let bounded_batch_persist = !plan.partition_work.is_empty()
-        && plan.partition_work.iter().all(|work| work.source_lease_token.is_none());
-    if let Some(execution_planned) = plan.execution_planned.clone() {
-        let crate::ChangelogRecordEntry::Streams(streams_entry) = &execution_planned.entry else {
-            anyhow::bail!("stream job execution plan must use a streams changelog entry");
-        };
-        local_state.mirror_streams_changelog_entry(&streams_entry)?;
-        if let Some(runtime_state) = &plan.runtime_state_update {
-            local_state.upsert_stream_job_runtime_state(runtime_state)?;
-        }
-        if !plan.partition_work.is_empty() {
-            local_state.replace_stream_job_dispatch_manifest(
-                &handle.handle_id,
-                plan.partition_work.iter().map(local_dispatch_batch_from_work).collect(),
-                streams_entry.occurred_at,
-            )?;
-        }
-        changelog_records.push(execution_planned);
-    } else if let Some(runtime_state) = &plan.runtime_state_update {
-        local_state.upsert_stream_job_runtime_state(runtime_state)?;
-    }
-    let mut batched_owner_view_updates = Vec::new();
-    let mut batched_stream_entries = Vec::new();
-    let mut batched_accepted_progress = Vec::new();
-    let mut batched_dispatch_batch_ids = Vec::new();
-    let mut batched_partition_state_key_deltas = BTreeMap::<i32, u64>::new();
-    let mut batched_completes_dispatch = false;
-    let mut batched_updated_at = occurred_at;
-    for partition_work in &plan.partition_work {
-        if handle.cancellation_requested_at.is_some() {
-            local_state.mark_stream_job_dispatch_cancelled(
-                &handle.handle_id,
-                handle.cancellation_requested_at.unwrap_or(occurred_at),
-            )?;
-            break;
-        }
-        if bounded_batch_persist {
-            let Some(prepared) = prepare_stream_job_partition_work_apply(
-                local_state,
-                handle,
-                partition_work,
-                true,
-                None,
-                None,
-            )?
-            else {
-                continue;
-            };
-            projection_records.extend(prepared.activation_result.projection_records);
-            changelog_records.extend(prepared.activation_result.changelog_records);
-            batched_owner_view_updates.extend(prepared.owner_view_updates);
-            batched_stream_entries.extend(prepared.mirrored_stream_entries);
-            batched_accepted_progress.push(prepared.accepted_progress_state);
-            batched_dispatch_batch_ids.push(prepared.batch_id);
-            if prepared.state_key_delta > 0 {
-                let entry = batched_partition_state_key_deltas
-                    .entry(prepared.stream_partition_id)
-                    .or_default();
-                *entry = entry.saturating_add(prepared.state_key_delta);
-            }
-            batched_completes_dispatch |= prepared.completes_dispatch;
-            batched_updated_at = batched_updated_at.max(prepared.occurred_at);
-            continue;
-        }
-        let applied = apply_stream_job_partition_work_on_local_state(
-            local_state,
+    Ok(Some(
+        crate::dataflow_engine::LocalDataflowEngine::new(local_state).execute_stream_job_plan(
             handle,
-            partition_work,
-            true,
-        )?;
-        projection_records.extend(applied.projection_records);
-        changelog_records.extend(applied.changelog_records);
-    }
-    if bounded_batch_persist && !batched_dispatch_batch_ids.is_empty() {
-        local_state.persist_stream_job_activation_apply(
-            &handle.handle_id,
-            &batched_dispatch_batch_ids,
-            true,
-            batched_completes_dispatch,
-            batched_updated_at,
-            batched_owner_view_updates,
-            batched_accepted_progress,
-            &batched_stream_entries,
-        )?;
-        if !batched_partition_state_key_deltas.is_empty() {
-            let Some(mut runtime_state) =
-                local_state.load_stream_job_runtime_state(&handle.handle_id)?
-            else {
-                anyhow::bail!("stream job runtime state missing for handle {}", handle.handle_id);
-            };
-            for (stream_partition_id, state_key_delta) in batched_partition_state_key_deltas {
-                runtime_state.record_owner_partition_state_key_delta(
-                    stream_partition_id,
-                    state_key_delta,
-                    batched_updated_at,
-                );
-            }
-            runtime_state.updated_at = batched_updated_at;
-            local_state.upsert_stream_job_runtime_state(&runtime_state)?;
-        }
-    }
-    if let Some(source_cursors) = plan.source_cursor_updates {
-        local_state.replace_stream_job_source_cursors(
-            &handle.handle_id,
-            source_cursors,
+            plan,
             occurred_at,
-        )?;
-    }
-    projection_records.extend(plan.post_apply_projection_records);
-    changelog_records.extend(plan.post_apply_changelog_records);
-    if let Some(terminalized) = plan.terminalized {
-        if local_state.load_stream_job_runtime_state(&handle.handle_id)?.is_some_and(|state| {
-            let bounded_completed =
-                state.dispatch_completed_at.is_some() && state.dispatch_cancelled_at.is_none();
-            let topic_cancelled =
-                state.source_kind.as_deref().is_some_and(|kind| kind == STREAM_SOURCE_TOPIC);
-            bounded_completed || topic_cancelled
-        }) {
-            changelog_records.push(terminalized);
-        }
-    }
-    Ok(Some(StreamJobActivationResult { projection_records, changelog_records }))
+        )?,
+    ))
 }
 
 pub(crate) fn materialization_outcome_from_local_state(
@@ -7349,7 +6620,8 @@ pub(crate) fn materialization_outcome_from_local_state(
     let Some(runtime_state) = local_state.load_stream_job_runtime_state(&handle.handle_id)? else {
         return Ok(None);
     };
-    let sealed_checkpoint_states = sealed_checkpoint_states_for_runtime(local_state, &runtime_state)?;
+    let sealed_checkpoint_states =
+        sealed_checkpoint_states_for_runtime(local_state, &runtime_state)?;
     let checkpoint_states = if runtime_state.checkpoint_name.is_empty() {
         Vec::new()
     } else {
@@ -7378,9 +6650,68 @@ pub(crate) fn materialization_outcome_from_local_state(
             persisted_states
         }
     };
-    let checkpoint = if runtime_state.checkpoint_name.is_empty() {
-        None
-    } else if sealed_checkpoint_states.len() == runtime_state.active_partitions.len()
+    let bridge_callbacks = local_state.load_stream_job_bridge_callbacks(&handle.handle_id)?;
+    let checkpoint = checkpoint_materialization_record(
+        handle,
+        &runtime_state,
+        &sealed_checkpoint_states,
+        &checkpoint_states,
+        &bridge_callbacks,
+    );
+    let terminal_ready = runtime_state.checkpoint_name.is_empty() || checkpoint.is_some();
+    let terminal =
+        terminal_materialization_result(&runtime_state, &bridge_callbacks, terminal_ready)?;
+    let mut workflow_signals = local_state
+        .load_all_stream_job_workflow_signals()?
+        .into_iter()
+        .filter(|state| state.handle_id == handle.handle_id && state.published_at.is_none())
+        .collect::<Vec<_>>();
+    workflow_signals.sort_by(|left, right| {
+        left.signaled_at.cmp(&right.signaled_at).then_with(|| left.signal_id.cmp(&right.signal_id))
+    });
+
+    Ok(Some(StreamJobMaterializationOutcome { checkpoint, terminal, workflow_signals }))
+}
+
+fn stream_job_checkpoint_callback_id(
+    handle_id: &str,
+    checkpoint_name: &str,
+    checkpoint_sequence: i64,
+) -> String {
+    format!("stream-job-callback:{handle_id}:checkpoint:{checkpoint_name}:{checkpoint_sequence}")
+}
+
+fn stream_job_terminal_callback_id(handle_id: &str, status: &str) -> String {
+    format!("stream-job-callback:{handle_id}:terminal:{status}")
+}
+
+fn checkpoint_materialization_record(
+    handle: &StreamJobBridgeHandleRecord,
+    runtime_state: &LocalStreamJobRuntimeState,
+    sealed_checkpoint_states: &[crate::local_state::LocalStreamJobSealedCheckpointState],
+    checkpoint_states: &[crate::local_state::LocalStreamJobCheckpointState],
+    bridge_callbacks: &[LocalStreamJobBridgeCallbackState],
+) -> Option<StreamJobCheckpointRecord> {
+    if runtime_state.checkpoint_name.is_empty() {
+        return None;
+    }
+    let checkpoint_callback = bridge_callbacks.iter().find(|state| {
+        state.record.callback_kind == STREAM_JOB_CALLBACK_KIND_CHECKPOINT
+            && state.record.checkpoint.as_ref().is_some_and(|checkpoint| {
+                checkpoint.checkpoint_name == runtime_state.checkpoint_name
+                    && checkpoint.checkpoint_sequence == runtime_state.checkpoint_sequence
+            })
+    });
+    if let Some(callback_state) = checkpoint_callback {
+        return Some(build_stream_job_checkpoint_record(
+            handle,
+            runtime_state,
+            callback_state.created_at,
+            callback_state.record.owner_epoch,
+            sealed_checkpoint_output(sealed_checkpoint_states),
+        ));
+    }
+    if sealed_checkpoint_states.len() == runtime_state.active_partitions.len()
         && !sealed_checkpoint_states.is_empty()
     {
         let reached_at = sealed_checkpoint_states
@@ -7393,61 +6724,15 @@ pub(crate) fn materialization_outcome_from_local_state(
             .map(|state| state.record.owner_epoch)
             .max()
             .unwrap_or(runtime_state.stream_owner_epoch);
-        let sealed_output = sealed_checkpoint_states
-            .iter()
-            .map(|state| {
-                json!({
-                    "streamPartitionId": state.stream_partition_id,
-                    "acceptedProgressPosition": state.record.accepted_progress_position,
-                    "sealedAt": state.sealed_at.to_rfc3339(),
-                })
-            })
-            .collect::<Vec<_>>();
-        Some(StreamJobCheckpointRecord {
-            workflow_event_id: Uuid::new_v5(
-                &Uuid::NAMESPACE_URL,
-                format!(
-                    "stream-job-checkpoint:{}:{}:{}",
-                    handle.handle_id,
-                    runtime_state.checkpoint_name,
-                    runtime_state.checkpoint_sequence
-                )
-                .as_bytes(),
-            ),
-            protocol_version: fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
-            operation_kind: fabrik_throughput::ThroughputBridgeOperationKind::StreamJob
-                .as_str()
-                .to_owned(),
-            tenant_id: handle.tenant_id.clone(),
-            instance_id: handle.instance_id.clone(),
-            run_id: handle.run_id.clone(),
-            job_id: handle.job_id.clone(),
-            handle_id: handle.handle_id.clone(),
-            bridge_request_id: handle.bridge_request_id.clone(),
-            await_request_id: format!(
-                "stream-job-reached:{}:{}:{}",
-                handle.handle_id, runtime_state.checkpoint_name, runtime_state.checkpoint_sequence
-            ),
-            checkpoint_name: runtime_state.checkpoint_name.clone(),
-            checkpoint_sequence: Some(runtime_state.checkpoint_sequence),
-            status: fabrik_throughput::StreamJobCheckpointStatus::Reached.as_str().to_owned(),
-            workflow_owner_epoch: handle.workflow_owner_epoch,
-            stream_owner_epoch: Some(owner_epoch),
-            reached_at: Some(reached_at),
-            output: Some(json!({
-                "jobId": handle.job_id,
-                "checkpoint": runtime_state.checkpoint_name,
-                "checkpointSequence": runtime_state.checkpoint_sequence,
-                "viewName": runtime_state.view_name,
-                "activePartitions": runtime_state.active_partitions,
-                "sealed": sealed_output,
-            })),
-            accepted_at: None,
-            cancelled_at: None,
-            created_at: runtime_state.planned_at,
-            updated_at: reached_at,
-        })
-    } else if checkpoint_states.len() == runtime_state.active_partitions.len() {
+        return Some(build_stream_job_checkpoint_record(
+            handle,
+            runtime_state,
+            reached_at,
+            owner_epoch,
+            sealed_checkpoint_output(sealed_checkpoint_states),
+        ));
+    }
+    if checkpoint_states.len() == runtime_state.active_partitions.len() {
         let reached_at = checkpoint_states
             .iter()
             .map(|state| state.reached_at)
@@ -7458,94 +6743,258 @@ pub(crate) fn materialization_outcome_from_local_state(
             .map(|state| state.stream_owner_epoch)
             .max()
             .unwrap_or(runtime_state.stream_owner_epoch);
-        Some(StreamJobCheckpointRecord {
-            workflow_event_id: Uuid::new_v5(
-                &Uuid::NAMESPACE_URL,
-                format!(
-                    "stream-job-checkpoint:{}:{}:{}",
-                    handle.handle_id,
-                    runtime_state.checkpoint_name,
-                    runtime_state.checkpoint_sequence
-                )
-                .as_bytes(),
-            ),
-            protocol_version: fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
-            operation_kind: fabrik_throughput::ThroughputBridgeOperationKind::StreamJob
-                .as_str()
-                .to_owned(),
-            tenant_id: handle.tenant_id.clone(),
-            instance_id: handle.instance_id.clone(),
-            run_id: handle.run_id.clone(),
-            job_id: handle.job_id.clone(),
-            handle_id: handle.handle_id.clone(),
-            bridge_request_id: handle.bridge_request_id.clone(),
-            await_request_id: format!(
-                "stream-job-reached:{}:{}:{}",
-                handle.handle_id, runtime_state.checkpoint_name, runtime_state.checkpoint_sequence
-            ),
-            checkpoint_name: runtime_state.checkpoint_name.clone(),
-            checkpoint_sequence: Some(runtime_state.checkpoint_sequence),
-            status: fabrik_throughput::StreamJobCheckpointStatus::Reached.as_str().to_owned(),
-            workflow_owner_epoch: handle.workflow_owner_epoch,
-            stream_owner_epoch: Some(owner_epoch),
-            reached_at: Some(reached_at),
-            output: Some(json!({
-                "jobId": handle.job_id,
-                "checkpoint": runtime_state.checkpoint_name,
-                "checkpointSequence": runtime_state.checkpoint_sequence,
-                "viewName": runtime_state.view_name,
-                "activePartitions": runtime_state.active_partitions,
-            })),
-            accepted_at: None,
-            cancelled_at: None,
-            created_at: runtime_state.planned_at,
-            updated_at: reached_at,
-        })
-    } else {
-        None
-    };
-    let terminal_ready = runtime_state.checkpoint_name.is_empty() || checkpoint.is_some();
-    let terminal = if !terminal_ready {
-        None
-    } else {
-        match runtime_state.terminal_status.as_deref() {
-            Some(status) if status == StreamJobBridgeHandleStatus::Completed.as_str() => {
-                Some(StreamJobTerminalResult {
-                    status: StreamJobBridgeHandleStatus::Completed,
-                    output: runtime_state.terminal_output.clone(),
-                    error: runtime_state.terminal_error.clone(),
-                })
-            }
-            Some(status) if status == StreamJobBridgeHandleStatus::Failed.as_str() => {
-                Some(StreamJobTerminalResult {
-                    status: StreamJobBridgeHandleStatus::Failed,
-                    output: runtime_state.terminal_output.clone(),
-                    error: runtime_state.terminal_error.clone(),
-                })
-            }
-            Some(status) if status == StreamJobBridgeHandleStatus::Cancelled.as_str() => {
-                Some(StreamJobTerminalResult {
-                    status: StreamJobBridgeHandleStatus::Cancelled,
-                    output: runtime_state.terminal_output.clone(),
-                    error: runtime_state.terminal_error.clone(),
-                })
-            }
-            Some(other) => {
-                anyhow::bail!("unexpected materialized stream job terminal status {other}")
-            }
-            None => None,
-        }
-    };
-    let mut workflow_signals = local_state
-        .load_all_stream_job_workflow_signals()?
-        .into_iter()
-        .filter(|state| state.handle_id == handle.handle_id && state.published_at.is_none())
-        .collect::<Vec<_>>();
-    workflow_signals.sort_by(|left, right| {
-        left.signaled_at.cmp(&right.signaled_at).then_with(|| left.signal_id.cmp(&right.signal_id))
-    });
+        return Some(build_stream_job_checkpoint_record(
+            handle,
+            runtime_state,
+            reached_at,
+            owner_epoch,
+            None,
+        ));
+    }
+    None
+}
 
-    Ok(Some(StreamJobMaterializationOutcome { checkpoint, terminal, workflow_signals }))
+fn build_stream_job_checkpoint_record(
+    handle: &StreamJobBridgeHandleRecord,
+    runtime_state: &LocalStreamJobRuntimeState,
+    reached_at: DateTime<Utc>,
+    owner_epoch: u64,
+    sealed_output: Option<Vec<Value>>,
+) -> StreamJobCheckpointRecord {
+    let mut output = Map::new();
+    output.insert("jobId".to_owned(), json!(handle.job_id));
+    output.insert("checkpoint".to_owned(), json!(runtime_state.checkpoint_name));
+    output.insert("checkpointSequence".to_owned(), json!(runtime_state.checkpoint_sequence));
+    output.insert("viewName".to_owned(), json!(runtime_state.view_name));
+    output.insert("activePartitions".to_owned(), json!(runtime_state.active_partitions));
+    if let Some(sealed_output) = sealed_output.filter(|states| !states.is_empty()) {
+        output.insert("sealed".to_owned(), Value::Array(sealed_output));
+    }
+    StreamJobCheckpointRecord {
+        workflow_event_id: Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!(
+                "stream-job-checkpoint:{}:{}:{}",
+                handle.handle_id, runtime_state.checkpoint_name, runtime_state.checkpoint_sequence
+            )
+            .as_bytes(),
+        ),
+        protocol_version: fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+        operation_kind: fabrik_throughput::ThroughputBridgeOperationKind::StreamJob
+            .as_str()
+            .to_owned(),
+        tenant_id: handle.tenant_id.clone(),
+        instance_id: handle.instance_id.clone(),
+        run_id: handle.run_id.clone(),
+        job_id: handle.job_id.clone(),
+        handle_id: handle.handle_id.clone(),
+        bridge_request_id: handle.bridge_request_id.clone(),
+        await_request_id: format!(
+            "stream-job-reached:{}:{}:{}",
+            handle.handle_id, runtime_state.checkpoint_name, runtime_state.checkpoint_sequence
+        ),
+        checkpoint_name: runtime_state.checkpoint_name.clone(),
+        checkpoint_sequence: Some(runtime_state.checkpoint_sequence),
+        status: fabrik_throughput::StreamJobCheckpointStatus::Reached.as_str().to_owned(),
+        workflow_owner_epoch: handle.workflow_owner_epoch,
+        stream_owner_epoch: Some(owner_epoch),
+        reached_at: Some(reached_at),
+        output: Some(Value::Object(output)),
+        accepted_at: None,
+        cancelled_at: None,
+        created_at: runtime_state.planned_at,
+        updated_at: reached_at,
+    }
+}
+
+fn sealed_checkpoint_output(
+    sealed_checkpoint_states: &[crate::local_state::LocalStreamJobSealedCheckpointState],
+) -> Option<Vec<Value>> {
+    if sealed_checkpoint_states.is_empty() {
+        return None;
+    }
+    Some(
+        sealed_checkpoint_states
+            .iter()
+            .map(|state| {
+                json!({
+                    "streamPartitionId": state.stream_partition_id,
+                    "acceptedProgressPosition": state.record.accepted_progress_position,
+                    "sealedAt": state.sealed_at.to_rfc3339(),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn terminal_materialization_result(
+    runtime_state: &LocalStreamJobRuntimeState,
+    bridge_callbacks: &[LocalStreamJobBridgeCallbackState],
+    terminal_ready: bool,
+) -> Result<Option<StreamJobTerminalResult>> {
+    if !terminal_ready {
+        return Ok(None);
+    }
+    if let Some(callback_state) = bridge_callbacks.iter().find(|state| {
+        state.record.callback_kind == STREAM_JOB_CALLBACK_KIND_TERMINAL
+            && state
+                .record
+                .terminal_status
+                .as_deref()
+                .zip(runtime_state.terminal_status.as_deref())
+                .is_some_and(|(callback_status, runtime_status)| callback_status == runtime_status)
+    }) {
+        return terminal_result_from_status(
+            callback_state
+                .record
+                .terminal_status
+                .as_deref()
+                .expect("terminal callback record should carry terminal status"),
+            runtime_state,
+        )
+        .map(Some);
+    }
+    runtime_state
+        .terminal_status
+        .as_deref()
+        .map(|status| terminal_result_from_status(status, runtime_state))
+        .transpose()
+}
+
+fn terminal_result_from_status(
+    status: &str,
+    runtime_state: &LocalStreamJobRuntimeState,
+) -> Result<StreamJobTerminalResult> {
+    match status {
+        status if status == StreamJobBridgeHandleStatus::Completed.as_str() => {
+            Ok(StreamJobTerminalResult {
+                status: StreamJobBridgeHandleStatus::Completed,
+                output: runtime_state.terminal_output.clone(),
+                error: runtime_state.terminal_error.clone(),
+            })
+        }
+        status if status == StreamJobBridgeHandleStatus::Failed.as_str() => {
+            Ok(StreamJobTerminalResult {
+                status: StreamJobBridgeHandleStatus::Failed,
+                output: runtime_state.terminal_output.clone(),
+                error: runtime_state.terminal_error.clone(),
+            })
+        }
+        status if status == StreamJobBridgeHandleStatus::Cancelled.as_str() => {
+            Ok(StreamJobTerminalResult {
+                status: StreamJobBridgeHandleStatus::Cancelled,
+                output: runtime_state.terminal_output.clone(),
+                error: runtime_state.terminal_error.clone(),
+            })
+        }
+        other => anyhow::bail!("unexpected materialized stream job terminal status {other}"),
+    }
+}
+
+fn latest_accepted_progress_position(
+    local_state: &LocalThroughputState,
+    handle_id: &str,
+    sealed_checkpoint_states: &[crate::local_state::LocalStreamJobSealedCheckpointState],
+) -> Result<Option<u64>> {
+    let cursor_position = local_state
+        .load_stream_job_accepted_progress_cursor(handle_id)?
+        .map(|cursor| cursor.latest_position);
+    let sealed_position =
+        sealed_checkpoint_states.iter().map(|state| state.record.accepted_progress_position).max();
+    Ok(match (cursor_position, sealed_position) {
+        (Some(cursor), Some(sealed)) => Some(cursor.max(sealed)),
+        (Some(cursor), None) => Some(cursor),
+        (None, Some(sealed)) => Some(sealed),
+        (None, None) => None,
+    })
+}
+
+pub(crate) fn sync_stream_job_bridge_callback_records_on_local_state(
+    local_state: &LocalThroughputState,
+    handle: &StreamJobBridgeHandleRecord,
+) -> Result<()> {
+    let Some(runtime_state) = local_state.load_stream_job_runtime_state(&handle.handle_id)? else {
+        return Ok(());
+    };
+    let sealed_checkpoint_states =
+        sealed_checkpoint_states_for_runtime(local_state, &runtime_state)?;
+    let checkpoint_ready = !runtime_state.checkpoint_name.is_empty()
+        && !sealed_checkpoint_states.is_empty()
+        && sealed_checkpoint_states.len() == runtime_state.active_partitions.len();
+    if checkpoint_ready {
+        let owner_epoch = sealed_checkpoint_states
+            .iter()
+            .map(|state| state.record.owner_epoch)
+            .max()
+            .unwrap_or(runtime_state.stream_owner_epoch);
+        let accepted_progress_position = sealed_checkpoint_states
+            .iter()
+            .map(|state| state.record.accepted_progress_position)
+            .max()
+            .unwrap_or_default();
+        let created_at = sealed_checkpoint_states
+            .iter()
+            .map(|state| state.sealed_at)
+            .max()
+            .unwrap_or(runtime_state.updated_at);
+        let callback_id = stream_job_checkpoint_callback_id(
+            &handle.handle_id,
+            &runtime_state.checkpoint_name,
+            runtime_state.checkpoint_sequence,
+        );
+        local_state.upsert_stream_job_bridge_callback(&LocalStreamJobBridgeCallbackState {
+            handle_id: handle.handle_id.clone(),
+            callback_id: callback_id.clone(),
+            record: DataflowBridgeCallbackRecord {
+                callback_id,
+                plan_id: format!("stream-job:{}", handle.handle_id),
+                run_id: Some(handle.run_id.clone()),
+                job_id: Some(handle.job_id.clone()),
+                owner_epoch,
+                callback_kind: STREAM_JOB_CALLBACK_KIND_CHECKPOINT.to_owned(),
+                checkpoint: Some(StrongReadCheckpointRef {
+                    checkpoint_name: runtime_state.checkpoint_name.clone(),
+                    checkpoint_sequence: runtime_state.checkpoint_sequence,
+                    sealed_at: Some(created_at),
+                }),
+                terminal_status: None,
+                accepted_progress_position: Some(accepted_progress_position),
+            },
+            created_at,
+        })?;
+    }
+
+    let terminal_ready = runtime_state.checkpoint_name.is_empty() || checkpoint_ready;
+    if terminal_ready && let Some(status) = runtime_state.terminal_status.as_deref() {
+        let created_at = runtime_state.terminal_at.unwrap_or(runtime_state.updated_at);
+        let owner_epoch = sealed_checkpoint_states
+            .iter()
+            .map(|state| state.record.owner_epoch)
+            .max()
+            .unwrap_or(runtime_state.stream_owner_epoch);
+        let callback_id = stream_job_terminal_callback_id(&handle.handle_id, status);
+        local_state.upsert_stream_job_bridge_callback(&LocalStreamJobBridgeCallbackState {
+            handle_id: handle.handle_id.clone(),
+            callback_id: callback_id.clone(),
+            record: DataflowBridgeCallbackRecord {
+                callback_id,
+                plan_id: format!("stream-job:{}", handle.handle_id),
+                run_id: Some(handle.run_id.clone()),
+                job_id: Some(handle.job_id.clone()),
+                owner_epoch,
+                callback_kind: STREAM_JOB_CALLBACK_KIND_TERMINAL.to_owned(),
+                checkpoint: None,
+                terminal_status: Some(status.to_owned()),
+                accepted_progress_position: latest_accepted_progress_position(
+                    local_state,
+                    &handle.handle_id,
+                    &sealed_checkpoint_states,
+                )?,
+            },
+            created_at,
+        })?;
+    }
+    Ok(())
 }
 
 fn resolve_query_view(
@@ -8253,7 +7702,8 @@ pub(crate) fn build_stream_job_query_output_on_local_state(
                 )
             })
             .transpose()?;
-        let strong_read_metadata = if resolved_query_consistency(query) == STREAM_CONSISTENCY_STRONG {
+        let strong_read_metadata = if resolved_query_consistency(query) == STREAM_CONSISTENCY_STRONG
+        {
             runtime_state
                 .as_ref()
                 .map(|runtime_state| {
@@ -9188,10 +8638,13 @@ mod tests {
                 local_state.upsert_stream_job_runtime_state(runtime_state)?;
                 metrics.runtime_state_writes += 1;
             }
-            if !plan.partition_work.is_empty() {
+            if !plan.dataflow_batches.is_empty() {
                 local_state.replace_stream_job_dispatch_manifest(
                     &handle.handle_id,
-                    plan.partition_work.iter().map(local_dispatch_batch_from_work).collect(),
+                    plan.dataflow_batches
+                        .iter()
+                        .map(local_dispatch_batch_from_dataflow_batch)
+                        .collect(),
                     execution_planned.occurred_at(),
                 )?;
                 metrics.dispatch_manifest_writes += 1;
@@ -9585,7 +9038,7 @@ mod tests {
             1,
             planned_at,
         );
-        local_state.upsert_stream_job_runtime_state(&LocalStreamJobRuntimeState {
+        let runtime_state = LocalStreamJobRuntimeState {
             handle_id: handle.handle_id.clone(),
             job_id: handle.job_id.clone(),
             job_name: handle.job_name.clone(),
@@ -9619,7 +9072,7 @@ mod tests {
                 updated_at: planned_at,
             }],
             source_partition_leases: Vec::new(),
-            dispatch_batches: Vec::new(),
+            dispatch_dataflow_batches: Vec::new(),
             applied_dispatch_batch_ids: Vec::new(),
             dispatch_completed_at: None,
             dispatch_cancelled_at: None,
@@ -9639,7 +9092,8 @@ mod tests {
             terminal_error: None,
             terminal_at: None,
             updated_at: planned_at,
-        })?;
+        };
+        local_state.upsert_stream_job_runtime_state(&runtime_state)?;
         let initial_view = view_update_changelog_record(
             &handle,
             "accountTotals",
@@ -9801,7 +9255,7 @@ mod tests {
         let local_state = LocalThroughputState::open(&db_path, &checkpoint_dir, 3)?;
         let handle = topic_keyed_rollup_handle("payments");
         let occurred_at = Utc::now();
-        local_state.upsert_stream_job_runtime_state(&LocalStreamJobRuntimeState {
+        let runtime_state = LocalStreamJobRuntimeState {
             handle_id: handle.handle_id.clone(),
             job_id: handle.job_id.clone(),
             job_name: handle.job_name.clone(),
@@ -9841,7 +9295,7 @@ mod tests {
                 lease_token: "lease-current".to_owned(),
                 updated_at: occurred_at,
             }],
-            dispatch_batches: Vec::new(),
+            dispatch_dataflow_batches: Vec::new(),
             applied_dispatch_batch_ids: Vec::new(),
             dispatch_completed_at: None,
             dispatch_cancelled_at: None,
@@ -9861,13 +9315,13 @@ mod tests {
             terminal_error: None,
             terminal_at: None,
             updated_at: occurred_at,
-        })?;
+        };
+        local_state.upsert_stream_job_runtime_state(&runtime_state)?;
 
-        let stale = apply_stream_job_partition_work_on_local_state(
-            &local_state,
+        let stale_batch = direct_dataflow_batch_for_program(
             &handle,
-            &StreamJobPartitionWork {
-                batch_id: "batch-stale".to_owned(),
+            "batch-stale".to_owned(),
+            crate::dataflow_engine::BoundedDataflowBatchProgram {
                 stream_partition_id: 0,
                 checkpoint_partition_id: Some(0),
                 source_owner_partition_id: Some(0),
@@ -9884,7 +9338,7 @@ mod tests {
                 checkpoint_sequence: KEYED_ROLLUP_CHECKPOINT_SEQUENCE + 1,
                 owner_epoch: 3,
                 occurred_at,
-                items: vec![StreamJobPartitionItem {
+                items: vec![crate::dataflow_engine::BoundedDataflowItem {
                     logical_key: "acct_1".to_owned(),
                     value: 9.0,
                     display_key: Some("acct_1".to_owned()),
@@ -9895,7 +9349,15 @@ mod tests {
                 is_final_partition_batch: false,
                 completes_dispatch: false,
             },
+            Some(&runtime_state),
+        );
+        let stale = apply_stream_job_dataflow_batch_on_local_state_with_metrics(
+            &local_state,
+            &handle,
+            &stale_batch,
             true,
+            Some(&runtime_state),
+            None,
         )?;
         assert!(stale.projection_records.is_empty());
         assert!(stale.changelog_records.is_empty());
@@ -9955,22 +9417,22 @@ mod tests {
         .await?
         .expect("keyed-rollup activation plan should exist");
         let second_partition = throughput_partition_for_stream_key(&second_key, partition_count);
-        let mut first_partition_work = plan
-            .partition_work
+        let mut first_partition_batches = plan
+            .dataflow_batches
             .iter()
-            .filter(|work| work.stream_partition_id == first_partition)
+            .filter(|batch| batch.program.stream_partition_id == first_partition)
             .cloned()
             .collect::<Vec<_>>();
-        let second_partition_work = plan
-            .partition_work
+        let second_partition_batch = plan
+            .dataflow_batches
             .iter()
-            .find(|work| work.stream_partition_id == second_partition)
+            .find(|batch| batch.program.stream_partition_id == second_partition)
             .cloned()
-            .expect("second partition work should exist");
-        assert_eq!(first_partition_work.len(), 2);
-        first_partition_work.sort_by_key(|work| work.is_final_partition_batch);
-        assert!(!first_partition_work[0].is_final_partition_batch);
-        assert!(first_partition_work[1].is_final_partition_batch);
+            .expect("second partition batch should exist");
+        assert_eq!(first_partition_batches.len(), 2);
+        first_partition_batches.sort_by_key(|batch| batch.program.is_final_partition_batch);
+        assert!(!first_partition_batches[0].program.is_final_partition_batch);
+        assert!(first_partition_batches[1].program.is_final_partition_batch);
         let owner_db_path = temp_path("stream-jobs-keyed-rollup-midflight-owner-db");
         let owner_checkpoint_dir =
             temp_path("stream-jobs-keyed-rollup-midflight-owner-checkpoints");
@@ -9983,17 +9445,17 @@ mod tests {
         owner_state.mirror_streams_changelog_entry(&execution_entry)?;
         owner_state.replace_stream_job_dispatch_manifest(
             &handle.handle_id,
-            plan.partition_work.iter().map(local_dispatch_batch_from_work).collect(),
+            plan.dataflow_batches.iter().map(local_dispatch_batch_from_dataflow_batch).collect(),
             occurred_at,
         )?;
 
-        let first_batch = apply_stream_job_partition_work_on_local_state(
+        let first_batch = apply_stream_job_dataflow_batch_on_local_state(
             &owner_state,
             &handle,
-            &first_partition_work[0],
+            &first_partition_batches[0],
             true,
         )?;
-        assert!(first_batch.projection_records.is_empty());
+        assert!(first_batch.activation_result.projection_records.is_empty());
         let partial_view = owner_state
             .load_stream_job_view_state(&handle.handle_id, "accountTotals", &first_key)?
             .expect("partial owner state should materialize the first key");
@@ -10019,22 +9481,22 @@ mod tests {
             .expect("restored owner should preserve partial key state");
         assert_eq!(restored_partial.output["totalAmount"], json!(1.0));
 
-        let first_final_batch = apply_stream_job_partition_work_on_local_state(
+        let first_final_batch = apply_stream_job_dataflow_batch_on_local_state(
             &restored_owner,
             &handle,
-            &first_partition_work[1],
+            &first_partition_batches[1],
             true,
         )?;
-        let second_batch = apply_stream_job_partition_work_on_local_state(
+        let second_batch = apply_stream_job_dataflow_batch_on_local_state(
             &owner_state,
             &handle,
-            &second_partition_work,
+            &second_partition_batch,
             true,
         )?;
         let mut replay_records = Vec::new();
-        replay_records.extend(first_batch.changelog_records);
-        replay_records.extend(first_final_batch.changelog_records);
-        replay_records.extend(second_batch.changelog_records);
+        replay_records.extend(first_batch.activation_result.changelog_records);
+        replay_records.extend(first_final_batch.activation_result.changelog_records);
+        replay_records.extend(second_batch.activation_result.changelog_records);
         replay_records.push(plan.terminalized.expect("terminal record should exist"));
         for (offset, record) in replay_records.iter().enumerate() {
             let entry = streams_entry_from_record(record);
@@ -10107,14 +9569,18 @@ mod tests {
         state.mirror_streams_changelog_entry(&execution_entry)?;
         state.replace_stream_job_dispatch_manifest(
             &handle.handle_id,
-            first_plan.partition_work.iter().map(local_dispatch_batch_from_work).collect(),
+            first_plan
+                .dataflow_batches
+                .iter()
+                .map(local_dispatch_batch_from_dataflow_batch)
+                .collect(),
             occurred_at,
         )?;
-        let applied_batch_id = first_plan.partition_work[0].batch_id.clone();
+        let applied_batch_id = first_plan.dataflow_batches[0].envelope.batch_id.clone();
         assert!(state.mark_stream_job_dispatch_batch_applied(
             &handle.handle_id,
             &applied_batch_id,
-            first_plan.partition_work[0].completes_dispatch,
+            first_plan.dataflow_batches[0].program.completes_dispatch,
             occurred_at,
         )?);
 
@@ -10132,10 +9598,38 @@ mod tests {
         assert!(resumed_plan.execution_planned.is_none());
         assert!(resumed_plan.terminalized.is_none());
         assert_eq!(
-            resumed_plan.partition_work.len(),
-            first_plan.partition_work.len().saturating_sub(1)
+            resumed_plan.dataflow_batches.len(),
+            first_plan.dataflow_batches.len().saturating_sub(1)
         );
-        assert!(resumed_plan.partition_work.iter().all(|work| work.batch_id != applied_batch_id));
+        assert!(
+            resumed_plan
+                .dataflow_batches
+                .iter()
+                .all(|batch| batch.envelope.batch_id != applied_batch_id)
+        );
+        let expected_pending_batches = first_plan
+            .dataflow_batches
+            .iter()
+            .filter(|batch| batch.envelope.batch_id != applied_batch_id)
+            .map(|batch| (batch.envelope.batch_id.clone(), batch))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(resumed_plan.dataflow_batches.len(), expected_pending_batches.len());
+        for resumed in &resumed_plan.dataflow_batches {
+            let expected = expected_pending_batches
+                .get(&resumed.envelope.batch_id)
+                .expect("resumed batch should exist in persisted manifest");
+            assert_eq!(resumed.envelope.plan_id, expected.envelope.plan_id);
+            assert_eq!(resumed.envelope.batch_id, expected.envelope.batch_id);
+            assert_eq!(resumed.envelope.source_id, expected.envelope.source_id);
+            assert_eq!(resumed.envelope.source_partition_id, expected.envelope.source_partition_id);
+            assert_eq!(resumed.envelope.source_epoch, expected.envelope.source_epoch);
+            assert_eq!(resumed.envelope.offset_range, expected.envelope.offset_range);
+            assert_eq!(resumed.envelope.edge_id, expected.envelope.edge_id);
+            assert_eq!(resumed.envelope.dest_partition_id, expected.envelope.dest_partition_id);
+            assert_eq!(resumed.envelope.owner_epoch, expected.envelope.owner_epoch);
+            assert_eq!(resumed.envelope.lease_epoch, expected.envelope.lease_epoch);
+            assert_eq!(resumed.envelope.summary, expected.envelope.summary);
+        }
 
         std::fs::remove_dir_all(db_path).ok();
         std::fs::remove_dir_all(checkpoint_dir).ok();
@@ -10177,24 +9671,49 @@ mod tests {
         local_state.mirror_streams_changelog_entry(&execution_entry)?;
         local_state.replace_stream_job_dispatch_manifest(
             &handle.handle_id,
-            plan.partition_work.iter().map(local_dispatch_batch_from_work).collect(),
+            plan.dataflow_batches.iter().map(local_dispatch_batch_from_dataflow_batch).collect(),
             occurred_at,
         )?;
 
-        let work = plan.partition_work.first().expect("partition work should exist");
-        let _applied =
-            apply_stream_job_partition_work_on_local_state(&local_state, &handle, work, true)?;
+        let batch = plan.dataflow_batches.first().cloned().expect("dataflow batch should exist");
+        let applied =
+            apply_stream_job_dataflow_batch_on_local_state(&local_state, &handle, &batch, true)?;
+        let owner_apply_ack = applied
+            .owner_apply_ack
+            .as_ref()
+            .expect("dataflow batch apply should return owner apply ack");
+        assert_eq!(owner_apply_ack.plan_id, batch.envelope.plan_id);
+        assert_eq!(owner_apply_ack.batch_id, batch.envelope.batch_id);
+        assert_eq!(owner_apply_ack.dest_partition_id, batch.envelope.dest_partition_id);
+        assert_eq!(owner_apply_ack.owner_epoch, batch.envelope.owner_epoch);
+        assert!(owner_apply_ack.durable);
+        assert_eq!(owner_apply_ack.accepted_progress_position, 1);
+        let sealed_checkpoint = applied
+            .sealed_checkpoint
+            .as_ref()
+            .expect("checkpoint-reaching batch should return sealed checkpoint");
+        assert_eq!(sealed_checkpoint.plan_id, batch.envelope.plan_id);
+        assert_eq!(sealed_checkpoint.partition_id, batch.envelope.dest_partition_id);
+        assert_eq!(sealed_checkpoint.accepted_progress_position, 1);
 
         let cursor = local_state
             .load_stream_job_accepted_progress_cursor(&handle.handle_id)?
             .expect("accepted progress cursor should exist");
         assert_eq!(cursor.latest_position, 1);
-        assert_eq!(cursor.last_durable_positions.get(&work.stream_partition_id), Some(&1));
+        assert_eq!(cursor.last_durable_positions.get(&batch.program.stream_partition_id), Some(&1));
 
         let tail = local_state.load_stream_job_accepted_progress_tail(&handle.handle_id, 8)?;
         assert_eq!(tail.len(), 1);
-        assert_eq!(tail[0].batch_id, work.batch_id);
-        assert_eq!(tail[0].record.batch_id, work.batch_id);
+        assert_eq!(tail[0].batch_id, batch.envelope.batch_id);
+        assert_eq!(tail[0].record.batch_id, batch.envelope.batch_id);
+        assert_eq!(tail[0].record.plan_id, batch.envelope.plan_id);
+        assert_eq!(tail[0].record.source_id, batch.envelope.source_id);
+        assert_eq!(tail[0].record.source_partition_id, batch.envelope.source_partition_id);
+        assert_eq!(tail[0].record.source_epoch, batch.envelope.source_epoch);
+        assert_eq!(tail[0].record.offset_range, batch.envelope.offset_range);
+        assert_eq!(tail[0].record.edge_id, batch.envelope.edge_id);
+        assert_eq!(tail[0].record.dest_partition_id, batch.envelope.dest_partition_id);
+        assert_eq!(tail[0].record.owner_epoch, batch.envelope.owner_epoch);
         assert_eq!(tail[0].ack.accepted_progress_position, 1);
         assert!(tail[0].ack.durable);
         let sealed = local_state
@@ -10207,8 +9726,7 @@ mod tests {
         assert_eq!(sealed[0].record.accepted_progress_position, 1);
 
         let checkpoint_value = local_state.snapshot_checkpoint_value()?;
-        let restored_db_path =
-            temp_path("stream-jobs-keyed-rollup-accepted-progress-restored-db");
+        let restored_db_path = temp_path("stream-jobs-keyed-rollup-accepted-progress-restored-db");
         let restored_checkpoint_dir =
             temp_path("stream-jobs-keyed-rollup-accepted-progress-restored-checkpoints");
         let restored_state =
@@ -10222,7 +9740,7 @@ mod tests {
         let restored_tail =
             restored_state.load_stream_job_accepted_progress_tail(&handle.handle_id, 8)?;
         assert_eq!(restored_tail.len(), 1);
-        assert_eq!(restored_tail[0].record.batch_id, work.batch_id);
+        assert_eq!(restored_tail[0].record.batch_id, batch.envelope.batch_id);
         let restored_sealed = restored_state
             .load_all_stream_job_sealed_checkpoints()?
             .into_iter()
@@ -10235,6 +9753,112 @@ mod tests {
         std::fs::remove_dir_all(checkpoint_dir).ok();
         std::fs::remove_dir_all(restored_db_path).ok();
         std::fs::remove_dir_all(restored_checkpoint_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keyed_rollup_dataflow_batch_list_returns_ordered_owner_apply_acks() -> Result<()> {
+        let partition_count = 8;
+        let seed_key = "acct_batch_root".to_owned();
+        let first_partition = throughput_partition_for_stream_key(&seed_key, partition_count);
+        let mut batch_partition_keys = vec![seed_key];
+        let mut candidate_index = 0usize;
+        while batch_partition_keys.len() < 65 {
+            let candidate = format!("acct_batch_extra_{candidate_index}");
+            candidate_index = candidate_index.saturating_add(1);
+            if throughput_partition_for_stream_key(&candidate, partition_count) == first_partition {
+                batch_partition_keys.push(candidate);
+            }
+        }
+        let handle = keyed_rollup_handle(
+            &json!({
+                "kind": "bounded_items",
+                "items": batch_partition_keys
+                    .iter()
+                    .map(|account_id| json!({ "accountId": account_id, "amount": 1.0 }))
+                    .collect::<Vec<_>>()
+            })
+            .to_string(),
+        );
+        let db_path = temp_path("stream-jobs-keyed-rollup-dataflow-batch-list-db");
+        let checkpoint_dir = temp_path("stream-jobs-keyed-rollup-dataflow-batch-list-checkpoints");
+        let local_state = LocalThroughputState::open(&db_path, &checkpoint_dir, 3)?;
+        let occurred_at = Utc::now();
+
+        let plan = plan_stream_job_activation(
+            &local_state,
+            None,
+            None,
+            &handle,
+            partition_count,
+            Some(9),
+            occurred_at,
+        )
+        .await?
+        .expect("activation plan should exist");
+        assert!(plan.dataflow_batches.len() >= 2);
+        let execution_entry = streams_entry_from_record(
+            plan.execution_planned.as_ref().expect("execution plan should exist"),
+        );
+        local_state.mirror_streams_changelog_entry(&execution_entry)?;
+        local_state.replace_stream_job_dispatch_manifest(
+            &handle.handle_id,
+            plan.dataflow_batches.iter().map(local_dispatch_batch_from_dataflow_batch).collect(),
+            occurred_at,
+        )?;
+
+        let batches = plan.dataflow_batches.clone();
+        let applied = apply_stream_job_dataflow_batch_list_on_local_state(
+            &local_state,
+            &handle,
+            &batches,
+            true,
+        )?;
+        assert_eq!(applied.batch_results.len(), batches.len());
+
+        let durable_positions = applied
+            .batch_results
+            .iter()
+            .map(|result| {
+                result
+                    .owner_apply_ack
+                    .as_ref()
+                    .expect("every bounded batch should return an owner ack")
+                    .accepted_progress_position
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(durable_positions, vec![1, 2]);
+        assert_eq!(
+            applied
+                .batch_results
+                .iter()
+                .filter_map(|result| result.sealed_checkpoint.as_ref())
+                .count(),
+            1
+        );
+        let final_batch = applied
+            .batch_results
+            .iter()
+            .find(|result| result.batch.program.is_final_partition_batch)
+            .expect("final partition batch should exist");
+        assert_eq!(
+            final_batch
+                .sealed_checkpoint
+                .as_ref()
+                .expect("final batch should seal a checkpoint")
+                .accepted_progress_position,
+            2
+        );
+
+        let tail = local_state.load_stream_job_accepted_progress_tail(&handle.handle_id, 8)?;
+        assert_eq!(tail.len(), 2);
+        assert_eq!(
+            tail.iter().map(|state| state.ack.accepted_progress_position).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        std::fs::remove_dir_all(db_path).ok();
+        std::fs::remove_dir_all(checkpoint_dir).ok();
         Ok(())
     }
 
@@ -10274,7 +9898,11 @@ mod tests {
         state.mirror_streams_changelog_entry(&execution_entry)?;
         state.replace_stream_job_dispatch_manifest(
             &handle.handle_id,
-            first_plan.partition_work.iter().map(local_dispatch_batch_from_work).collect(),
+            first_plan
+                .dataflow_batches
+                .iter()
+                .map(local_dispatch_batch_from_dataflow_batch)
+                .collect(),
             occurred_at,
         )?;
         state.mark_stream_job_dispatch_cancelled(
@@ -10294,7 +9922,7 @@ mod tests {
         .await?
         .expect("resumed activation plan should exist");
         assert!(resumed_plan.execution_planned.is_none());
-        assert!(resumed_plan.partition_work.is_empty());
+        assert!(resumed_plan.dataflow_batches.is_empty());
         assert!(resumed_plan.terminalized.is_none());
 
         std::fs::remove_dir_all(db_path).ok();
@@ -12057,7 +11685,7 @@ mod tests {
                 lease_token: "lease-0".to_owned(),
                 updated_at: occurred_at,
             }],
-            dispatch_batches: Vec::new(),
+            dispatch_dataflow_batches: Vec::new(),
             applied_dispatch_batch_ids: Vec::new(),
             dispatch_completed_at: None,
             dispatch_cancelled_at: None,
@@ -12169,7 +11797,7 @@ mod tests {
         query.created_at = requested_at;
         query.updated_at = requested_at;
         let output = build_stream_job_query_output_on_local_state(&local_state, &handle, &query)?
-        .expect("scan output should exist");
+            .expect("scan output should exist");
         assert_eq!(output["prefix"], "acct_1");
         assert_eq!(output["total"], 2);
         assert_eq!(output["offset"], 1);
@@ -12184,11 +11812,11 @@ mod tests {
         assert_eq!(output["runtimeStats"]["streamOwnerEpoch"], 7);
         assert_eq!(output["strongReadMetadata"]["ownerEpoch"], 7);
         assert_eq!(output["strongReadMetadata"]["lastDurablePosition"]["0"], 9);
-        assert_eq!(output["strongReadMetadata"]["lastSealedCheckpoint"]["checkpointName"], "minute-checkpoint");
         assert_eq!(
-            output["strongReadMetadata"]["lastSourceFrontier"][0]["nextOffset"],
-            10
+            output["strongReadMetadata"]["lastSealedCheckpoint"]["checkpointName"],
+            "minute-checkpoint"
         );
+        assert_eq!(output["strongReadMetadata"]["lastSourceFrontier"][0]["nextOffset"], 10);
 
         std::fs::remove_dir_all(db_path).ok();
         std::fs::remove_dir_all(checkpoint_dir).ok();
@@ -12252,7 +11880,7 @@ mod tests {
                 lease_token: "lease-0".to_owned(),
                 updated_at: occurred_at,
             }],
-            dispatch_batches: Vec::new(),
+            dispatch_dataflow_batches: Vec::new(),
             applied_dispatch_batch_ids: Vec::new(),
             dispatch_completed_at: None,
             dispatch_cancelled_at: None,
@@ -12583,7 +12211,7 @@ mod tests {
                     lease_token: "lease-0".to_owned(),
                     updated_at: occurred_at,
                 }],
-                dispatch_batches: Vec::new(),
+                dispatch_dataflow_batches: Vec::new(),
                 applied_dispatch_batch_ids: Vec::new(),
                 dispatch_completed_at: None,
                 dispatch_cancelled_at: None,
@@ -12759,7 +12387,10 @@ mod tests {
         assert_eq!(output["sourceLeases"][0]["leaseToken"], "lease-0");
         assert_eq!(output["sourcePartitionStats"]["summary"]["partitionCount"], 1);
         assert_eq!(output["sealedCheckpoint"]["count"], 1);
-        assert_eq!(output["sealedCheckpoint"]["partitions"][0]["checkpointName"], "initial-risk-ready");
+        assert_eq!(
+            output["sealedCheckpoint"]["partitions"][0]["checkpointName"],
+            "initial-risk-ready"
+        );
         assert_eq!(output["sourcePartitionStats"]["summary"]["caughtUpPartitionCount"], 1);
         assert_eq!(output["sourcePartitionStats"]["summary"]["totalOffsetLag"], 0);
         assert_eq!(output["sourcePartitionStats"]["summary"]["totalCheckpointLag"], 0);
@@ -12864,7 +12495,7 @@ mod tests {
                     lease_token: "lease-0".to_owned(),
                     updated_at: occurred_at,
                 }],
-                dispatch_batches: Vec::new(),
+                dispatch_dataflow_batches: Vec::new(),
                 applied_dispatch_batch_ids: Vec::new(),
                 dispatch_completed_at: None,
                 dispatch_cancelled_at: None,
@@ -12913,6 +12544,71 @@ mod tests {
 
         std::fs::remove_dir_all(db_path).ok();
         std::fs::remove_dir_all(checkpoint_dir).ok();
+    }
+
+    #[test]
+    fn topic_owner_input_batches_include_dataflow_envelopes() -> Result<()> {
+        let handle = topic_keyed_rollup_handle("payments");
+        let plan = bounded_stream_plan_for_job(&default_keyed_rollup_compiled_job(&handle))?
+            .expect("bounded plan should exist");
+        let source_batch = TopicSourceBatch {
+            handle_id: handle.handle_id.clone(),
+            job_id: handle.job_id.clone(),
+            source_partition_id: 2,
+            source_owner_partition_id: 1,
+            source_lease_token: "lease-2".to_owned(),
+            checkpoint_sequence: 9,
+            checkpoint_target_offset: 11,
+            idle_window_timer: false,
+            offset_start: 7,
+            offset_end: 9,
+            records: vec![
+                TopicSourceBatchRecord {
+                    logical_key: "acct_1".to_owned(),
+                    display_key: "acct_1".to_owned(),
+                    window_start: None,
+                    window_end: None,
+                    event_time: None,
+                    window_end_at: None,
+                    value: 4.0,
+                    offset: 7,
+                    high_watermark: 9,
+                },
+                TopicSourceBatchRecord {
+                    logical_key: "acct_2".to_owned(),
+                    display_key: "acct_2".to_owned(),
+                    window_start: None,
+                    window_end: None,
+                    event_time: None,
+                    window_end_at: None,
+                    value: 5.0,
+                    offset: 8,
+                    high_watermark: 9,
+                },
+            ],
+        };
+
+        let batches = owner_input_batches_from_source_batch(
+            &handle,
+            &source_batch,
+            &plan,
+            8,
+            12,
+            Utc::now(),
+        )?;
+        assert!(!batches.is_empty());
+        for batch in batches {
+            assert_eq!(batch.envelope.plan_id, format!("stream-job:{}", handle.handle_id));
+            assert_eq!(batch.envelope.source_partition_id, 2);
+            assert_eq!(batch.envelope.source_epoch, 9);
+            assert_eq!(
+                batch.envelope.offset_range.as_ref().map(|range| (range.start, range.end)),
+                Some((7, 9))
+            );
+            assert_eq!(batch.envelope.dest_partition_id, batch.program.stream_partition_id);
+            assert!(batch.envelope.edge_id.starts_with("exchange:key_by:"));
+        }
+        Ok(())
     }
 
     #[test]
@@ -12978,7 +12674,7 @@ mod tests {
                 lease_token: "lease-0".to_owned(),
                 updated_at: occurred_at,
             }],
-            dispatch_batches: Vec::new(),
+            dispatch_dataflow_batches: Vec::new(),
             applied_dispatch_batch_ids: Vec::new(),
             dispatch_completed_at: None,
             dispatch_cancelled_at: None,
@@ -13094,7 +12790,7 @@ mod tests {
                     updated_at: occurred_at,
                 }],
                 source_partition_leases: Vec::new(),
-                dispatch_batches: Vec::new(),
+                dispatch_dataflow_batches: Vec::new(),
                 applied_dispatch_batch_ids: Vec::new(),
                 dispatch_completed_at: None,
                 dispatch_cancelled_at: None,
@@ -13332,10 +13028,14 @@ mod tests {
 
         let mut view_offset = 1i64;
         let mut checkpoint_entries = Vec::new();
-        for work in &plan.partition_work {
-            let applied =
-                apply_stream_job_partition_work_on_local_state(&local_state, &handle, work, false)?;
-            for record in applied.changelog_records {
+        for batch in &plan.dataflow_batches {
+            let applied = apply_stream_job_dataflow_batch_on_local_state(
+                &local_state,
+                &handle,
+                batch,
+                false,
+            )?;
+            for record in applied.activation_result.changelog_records {
                 match &record.entry {
                     crate::ChangelogRecordEntry::Streams(StreamsChangelogEntry {
                         payload: StreamsChangelogPayload::StreamJobViewBatchUpdated { updates, .. },
@@ -13373,6 +13073,8 @@ mod tests {
             view_offset,
             &checkpoint_entries[0]
         )?);
+        sync_stream_job_bridge_callback_records_on_local_state(&local_state, &handle)?;
+        assert!(local_state.load_stream_job_bridge_callbacks(&handle.handle_id)?.is_empty());
         let incomplete = materialization_outcome_from_local_state(&local_state, &handle)?
             .expect("runtime state should be present after first checkpoint");
         assert!(incomplete.checkpoint.is_none());
@@ -13393,6 +13095,43 @@ mod tests {
             view_offset + checkpoint_entries.len() as i64,
             &terminal_entry,
         )?);
+        sync_stream_job_bridge_callback_records_on_local_state(&local_state, &handle)?;
+
+        let callback_states = local_state.load_stream_job_bridge_callbacks(&handle.handle_id)?;
+        assert_eq!(callback_states.len(), 2);
+        let checkpoint_callback = callback_states
+            .iter()
+            .find(|state| state.record.callback_kind == STREAM_JOB_CALLBACK_KIND_CHECKPOINT)
+            .expect("checkpoint callback should be present after barrier completion");
+        assert_eq!(
+            checkpoint_callback
+                .record
+                .checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.checkpoint_name.as_str()),
+            Some(KEYED_ROLLUP_CHECKPOINT_NAME)
+        );
+        assert_eq!(
+            checkpoint_callback
+                .record
+                .checkpoint
+                .as_ref()
+                .map(|checkpoint| checkpoint.checkpoint_sequence),
+            Some(KEYED_ROLLUP_CHECKPOINT_SEQUENCE)
+        );
+        assert!(checkpoint_callback.record.accepted_progress_position.is_some());
+        let terminal_callback = callback_states
+            .iter()
+            .find(|state| state.record.callback_kind == STREAM_JOB_CALLBACK_KIND_TERMINAL)
+            .expect("terminal callback should be present after terminal replay");
+        assert_eq!(
+            terminal_callback.record.terminal_status.as_deref(),
+            Some(StreamJobBridgeHandleStatus::Completed.as_str())
+        );
+        assert!(
+            terminal_callback.record.accepted_progress_position.is_some_and(|position| position
+                >= checkpoint_callback.record.accepted_progress_position.unwrap_or_default())
+        );
 
         let complete = materialization_outcome_from_local_state(&local_state, &handle)?
             .expect("materialization should exist after barrier completion");
@@ -13405,8 +13144,44 @@ mod tests {
             Some(StreamJobBridgeHandleStatus::Completed)
         );
 
+        let checkpoint_value = local_state.snapshot_checkpoint_value()?;
+        let restored_db_path = temp_path("stream-jobs-keyed-rollup-barrier-restored-db");
+        let restored_checkpoint_dir =
+            temp_path("stream-jobs-keyed-rollup-barrier-restored-checkpoints");
+        let restored = LocalThroughputState::open(&restored_db_path, &restored_checkpoint_dir, 3)?;
+        assert!(restored.restore_from_checkpoint_value_if_empty(checkpoint_value)?);
+        let restored_callbacks = restored.load_stream_job_bridge_callbacks(&handle.handle_id)?;
+        assert_eq!(restored_callbacks.len(), 2);
+        assert!(restored_callbacks.iter().any(|state| {
+            state.record.callback_kind == STREAM_JOB_CALLBACK_KIND_CHECKPOINT
+                && state.record.checkpoint.as_ref().is_some_and(|checkpoint| {
+                    checkpoint.checkpoint_name == KEYED_ROLLUP_CHECKPOINT_NAME
+                        && checkpoint.checkpoint_sequence == KEYED_ROLLUP_CHECKPOINT_SEQUENCE
+                })
+        }));
+        assert!(restored_callbacks.iter().any(|state| {
+            state.record.callback_kind == STREAM_JOB_CALLBACK_KIND_TERMINAL
+                && state.record.terminal_status.as_deref()
+                    == Some(StreamJobBridgeHandleStatus::Completed.as_str())
+        }));
+        let restored_complete = materialization_outcome_from_local_state(&restored, &handle)?
+            .expect("restored materialization should still exist after callback restore");
+        assert_eq!(
+            restored_complete
+                .checkpoint
+                .as_ref()
+                .and_then(|checkpoint| checkpoint.checkpoint_sequence),
+            Some(KEYED_ROLLUP_CHECKPOINT_SEQUENCE)
+        );
+        assert_eq!(
+            restored_complete.terminal.as_ref().map(|terminal| terminal.status),
+            Some(StreamJobBridgeHandleStatus::Completed)
+        );
+
         std::fs::remove_dir_all(db_path).ok();
         std::fs::remove_dir_all(checkpoint_dir).ok();
+        std::fs::remove_dir_all(restored_db_path).ok();
+        std::fs::remove_dir_all(restored_checkpoint_dir).ok();
         Ok(())
     }
 
@@ -13464,10 +13239,12 @@ mod tests {
             let compute_started = Instant::now();
             let mut compute_accumulators = HashMap::with_capacity(distinct_keys);
             let mut compute_updates = 0usize;
-            for work in &plan.partition_work {
-                compute_updates +=
-                    apply_stream_job_partition_work_in_memory(&mut compute_accumulators, work)?
-                        .len();
+            for batch in &plan.dataflow_batches {
+                compute_updates += apply_stream_job_batch_program_in_memory(
+                    &mut compute_accumulators,
+                    &batch.program,
+                )?
+                .len();
             }
             let compute_elapsed = compute_started.elapsed();
 
@@ -13475,15 +13252,22 @@ mod tests {
             let mut record_accumulators = HashMap::with_capacity(distinct_keys);
             let mut record_projection_count = 0usize;
             let mut record_changelog_count = 0usize;
-            for work in &plan.partition_work {
-                let updated_outputs =
-                    apply_stream_job_partition_work_in_memory(&mut record_accumulators, work)?;
-                let materialized =
-                    materialize_stream_job_batch_updates(&handle, work, updated_outputs, false);
+            for batch in &plan.dataflow_batches {
+                let updated_outputs = apply_stream_job_batch_program_in_memory(
+                    &mut record_accumulators,
+                    &batch.program,
+                )?;
+                let materialized = materialize_stream_job_batch_updates(
+                    &handle,
+                    &batch.program,
+                    updated_outputs,
+                    false,
+                );
                 record_projection_count += materialized.projection_records.len();
                 record_changelog_count += materialized.changelog_records.len()
                     + usize::from(
-                        work.is_final_partition_batch && !work.checkpoint_name.is_empty(),
+                        batch.program.is_final_partition_batch
+                            && !batch.program.checkpoint_name.is_empty(),
                     );
                 black_box(materialized.projection_records.len());
                 black_box(materialized.changelog_records.len());
@@ -13498,11 +13282,11 @@ mod tests {
             let mut apply_metrics = StreamJobApplyMetrics::default();
             let mut apply_projection_count = 0usize;
             let mut apply_changelog_count = 0usize;
-            for work in &plan.partition_work {
-                let applied = apply_stream_job_partition_work_on_local_state_with_metrics(
+            for batch in &plan.dataflow_batches {
+                let applied = apply_stream_job_dataflow_batch_on_local_state_with_metrics(
                     &apply_state,
                     &handle,
-                    work,
+                    batch,
                     false,
                     None,
                     Some(&mut apply_metrics),
@@ -13523,11 +13307,11 @@ mod tests {
             let mut persist_metrics = StreamJobApplyMetrics::default();
             let mut persist_projection_count = 0usize;
             let mut persist_changelog_count = 0usize;
-            for work in &plan.partition_work {
-                let applied = apply_stream_job_partition_work_on_local_state_with_metrics(
+            for batch in &plan.dataflow_batches {
+                let applied = apply_stream_job_dataflow_batch_on_local_state_with_metrics(
                     &persist_state,
                     &handle,
-                    work,
+                    batch,
                     true,
                     None,
                     Some(&mut persist_metrics),
@@ -13561,10 +13345,10 @@ mod tests {
                 "bench=owner_activation_plan_only scenario={label} items={total_items} distinct_keys={distinct_keys} elapsed_ms={:.2} items_per_sec={:.0} batches={} planned_partitions={}",
                 plan_elapsed.as_secs_f64() * 1_000.0,
                 total_items as f64 / plan_elapsed.as_secs_f64().max(f64::EPSILON),
-                plan.partition_work.len(),
-                plan.partition_work
+                plan.dataflow_batches.len(),
+                plan.dataflow_batches
                     .iter()
-                    .map(|work| work.stream_partition_id)
+                    .map(|batch| batch.program.stream_partition_id)
                     .collect::<std::collections::BTreeSet<_>>()
                     .len(),
             );

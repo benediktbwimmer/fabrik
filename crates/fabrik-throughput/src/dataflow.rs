@@ -7,14 +7,14 @@ use serde_json::{Value, json};
 
 use crate::{
     CompiledAggregateV2Checkpoint, CompiledAggregateV2Kernel, CompiledAggregateV2MaterializedView,
-    CompiledAggregateV2PreKeyOperator, CompiledAggregateV2WorkflowSignal, CompiledKeyedRollupKernel,
-    CompiledStreamJob, CompiledStreamJobArtifact, CompiledStreamQuery, CompiledStreamView,
-    StartThroughputRunCommand, STREAM_CONSISTENCY_STRONG, STREAM_OPERATOR_AGGREGATE,
+    CompiledAggregateV2PreKeyOperator, CompiledAggregateV2WorkflowSignal,
+    CompiledKeyedRollupKernel, CompiledStreamJob, CompiledStreamJobArtifact, CompiledStreamQuery,
+    CompiledStreamView, STREAM_CONSISTENCY_STRONG, STREAM_OPERATOR_AGGREGATE,
     STREAM_OPERATOR_EMIT_CHECKPOINT, STREAM_OPERATOR_FILTER, STREAM_OPERATOR_MAP,
     STREAM_OPERATOR_MATERIALIZE, STREAM_OPERATOR_REDUCE, STREAM_OPERATOR_ROUTE,
-    STREAM_OPERATOR_SIGNAL_WORKFLOW, STREAM_OPERATOR_WINDOW, STREAMS_KERNEL_V1_CONTRACT,
-    STREAMS_KERNEL_V2_CONTRACT,
-    STREAM_RUNTIME_AGGREGATE_V2, STREAM_RUNTIME_KEYED_ROLLUP,
+    STREAM_OPERATOR_SIGNAL_WORKFLOW, STREAM_OPERATOR_WINDOW, STREAM_RUNTIME_AGGREGATE_V2,
+    STREAM_RUNTIME_KEYED_ROLLUP, STREAMS_KERNEL_V1_CONTRACT, STREAMS_KERNEL_V2_CONTRACT,
+    StartThroughputRunCommand,
 };
 
 pub const STREAMS_DATAFLOW_V1_CONTRACT: &str = "streams_dataflow_v1";
@@ -29,8 +29,7 @@ pub const DATAFLOW_DURABILITY_ACCEPTED_PROGRESS_LOG: &str = "accepted_progress_l
 pub const DATAFLOW_STRONG_READ_METADATA_OWNER_EPOCH: &str = "owner_epoch";
 pub const DATAFLOW_STRONG_READ_METADATA_LAST_DURABLE_POSITION: &str = "last_durable_position";
 pub const DATAFLOW_STRONG_READ_METADATA_LAST_SOURCE_FRONTIER: &str = "last_source_frontier";
-pub const DATAFLOW_STRONG_READ_METADATA_LAST_SEALED_CHECKPOINT: &str =
-    "last_sealed_checkpoint";
+pub const DATAFLOW_STRONG_READ_METADATA_LAST_SEALED_CHECKPOINT: &str = "last_sealed_checkpoint";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -637,11 +636,8 @@ fn lower_aggregate_v2_plan(
         kind: "source".to_owned(),
         config: None,
     }];
-    let pre_key_ops = kernel
-        .pre_key_operators
-        .iter()
-        .map(pre_key_operator_plan)
-        .collect::<Result<Vec<_>>>()?;
+    let pre_key_ops =
+        kernel.pre_key_operators.iter().map(pre_key_operator_plan).collect::<Result<Vec<_>>>()?;
     if !pre_key_ops.is_empty() {
         source_ops.extend(pre_key_ops);
     }
@@ -657,14 +653,11 @@ fn lower_aggregate_v2_plan(
     stateful_ops.extend(kernel.aggregates.iter().map(|aggregate| DataflowOperatorPlan {
         operator_id: aggregate.operator_id.clone(),
         kind: STREAM_OPERATOR_AGGREGATE.to_owned(),
-        config: Some(serde_json::to_value(aggregate).expect("aggregate_v2 aggregate should serialize")),
+        config: Some(
+            serde_json::to_value(aggregate).expect("aggregate_v2 aggregate should serialize"),
+        ),
     }));
-    stateful_ops.extend(
-        kernel
-            .materialized_views
-            .iter()
-            .map(materialized_view_operator_plan),
-    );
+    stateful_ops.extend(kernel.materialized_views.iter().map(materialized_view_operator_plan));
     stateful_ops.extend(kernel.checkpoints.iter().map(checkpoint_operator_plan));
     stateful_ops.extend(kernel.workflow_signals.iter().map(signal_operator));
 
@@ -674,10 +667,7 @@ fn lower_aggregate_v2_plan(
         stream_runtime: job.runtime.clone(),
         job_name: job.name.clone(),
         source: DataflowSourcePlan {
-            source_id: kernel
-                .source_name
-                .clone()
-                .unwrap_or_else(|| "source".to_owned()),
+            source_id: kernel.source_name.clone().unwrap_or_else(|| "source".to_owned()),
             kind: kernel.source_kind.clone(),
             name: job.source.name.clone(),
             binding: job.source.binding.clone(),
@@ -723,24 +713,20 @@ fn lower_aggregate_v2_plan(
         }],
         materialized_views: job.views.iter().map(materialized_view_plan).collect(),
         queries: job.queries.iter().map(query_plan).collect(),
-        checkpoints: kernel
-            .checkpoints
-            .iter()
-            .map(checkpoint_plan)
-            .collect(),
+        checkpoints: kernel.checkpoints.iter().map(checkpoint_plan).collect(),
         workflow_signals: kernel.workflow_signals.iter().map(workflow_signal_plan).collect(),
         strong_reads: default_strong_read_contract(),
         external_work: None,
     })
 }
 
-fn pre_key_operator_plan(operator: &CompiledAggregateV2PreKeyOperator) -> Result<DataflowOperatorPlan> {
+fn pre_key_operator_plan(
+    operator: &CompiledAggregateV2PreKeyOperator,
+) -> Result<DataflowOperatorPlan> {
     let (operator_id, kind, config) = match operator {
-        CompiledAggregateV2PreKeyOperator::Map(map) => (
-            map.operator_id.clone(),
-            STREAM_OPERATOR_MAP.to_owned(),
-            serde_json::to_value(map)?,
-        ),
+        CompiledAggregateV2PreKeyOperator::Map(map) => {
+            (map.operator_id.clone(), STREAM_OPERATOR_MAP.to_owned(), serde_json::to_value(map)?)
+        }
         CompiledAggregateV2PreKeyOperator::Filter(filter) => (
             filter.operator_id.clone(),
             STREAM_OPERATOR_FILTER.to_owned(),
@@ -752,11 +738,7 @@ fn pre_key_operator_plan(operator: &CompiledAggregateV2PreKeyOperator) -> Result
             serde_json::to_value(route)?,
         ),
     };
-    Ok(DataflowOperatorPlan {
-        operator_id,
-        kind,
-        config: Some(config),
-    })
+    Ok(DataflowOperatorPlan { operator_id, kind, config: Some(config) })
 }
 
 fn materialized_view_operator_plan(
@@ -851,8 +833,8 @@ mod tests {
         PayloadHandle, STREAM_CHECKPOINT_DELIVERY_WORKFLOW_AWAITABLE,
         STREAM_CHECKPOINT_POLICY_NAMED, STREAM_CONSISTENCY_EVENTUAL, STREAM_OPERATOR_FILTER,
         STREAM_OPERATOR_MATERIALIZE, STREAM_OPERATOR_REDUCE, STREAM_OPERATOR_WINDOW,
-        STREAM_QUERY_MODE_BY_KEY,
-        STREAM_QUERY_MODE_PREFIX_SCAN, STREAM_REDUCER_AVG, STREAM_REDUCER_SUM,
+        STREAM_QUERY_MODE_BY_KEY, STREAM_QUERY_MODE_PREFIX_SCAN, STREAM_REDUCER_AVG,
+        STREAM_REDUCER_SUM,
     };
 
     fn keyed_rollup_job() -> CompiledStreamJob {
@@ -1042,10 +1024,12 @@ mod tests {
         assert_eq!(plan.runtime_contract, STREAMS_DATAFLOW_V1_CONTRACT);
         assert_eq!(plan.regions.len(), 2);
         assert_eq!(plan.regions[0].stage, DATAFLOW_REGION_PRE_KEY);
-        assert!(plan.regions[1]
-            .operators
-            .iter()
-            .any(|operator| operator.kind == STREAM_OPERATOR_WINDOW));
+        assert!(
+            plan.regions[1]
+                .operators
+                .iter()
+                .any(|operator| operator.kind == STREAM_OPERATOR_WINDOW)
+        );
         Ok(())
     }
 
@@ -1078,12 +1062,8 @@ mod tests {
             throughput_backend_version: "2.0.0".to_owned(),
             routing_reason: "stream_v2_selected".to_owned(),
             admission_policy_version: "2026-03-13.1".to_owned(),
-            input_handle: PayloadHandle::Inline {
-                key: "input".to_owned(),
-            },
-            result_handle: PayloadHandle::Inline {
-                key: "result".to_owned(),
-            },
+            input_handle: PayloadHandle::Inline { key: "input".to_owned() },
+            result_handle: PayloadHandle::Inline { key: "result".to_owned() },
         };
         let plan = command.dataflow_plan();
         assert_eq!(plan.runtime_contract, STREAMS_DATAFLOW_V1_CONTRACT);

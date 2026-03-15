@@ -8,6 +8,7 @@ pub(super) const STREAM_JOB_DISPATCH_APPLIED_BINARY_PREFIX: &[u8] = b"sjd1\0";
 pub(super) const STREAM_JOB_ACCEPTED_PROGRESS_BINARY_PREFIX: &[u8] = b"sjp1\0";
 pub(super) const STREAM_JOB_ACCEPTED_PROGRESS_CURSOR_BINARY_PREFIX: &[u8] = b"sjpc1\0";
 pub(super) const STREAM_JOB_SEALED_CHECKPOINT_BINARY_PREFIX: &[u8] = b"sjsc1\0";
+pub(super) const STREAM_JOB_BRIDGE_CALLBACK_BINARY_PREFIX: &[u8] = b"sjcb1\0";
 
 fn append_binary_key_component(buffer: &mut Vec<u8>, component: &str) {
     let bytes = component.as_bytes();
@@ -212,9 +213,8 @@ pub(super) fn stream_job_accepted_progress_cursor_key(handle_id: &str) -> Vec<u8
 }
 
 pub(super) fn stream_job_accepted_progress_prefix(handle_id: &str) -> Vec<u8> {
-    let mut key = Vec::with_capacity(
-        STREAM_JOB_ACCEPTED_PROGRESS_BINARY_PREFIX.len() + handle_id.len() + 3,
-    );
+    let mut key =
+        Vec::with_capacity(STREAM_JOB_ACCEPTED_PROGRESS_BINARY_PREFIX.len() + handle_id.len() + 3);
     key.extend_from_slice(STREAM_JOB_ACCEPTED_PROGRESS_BINARY_PREFIX);
     append_binary_key_component(&mut key, handle_id);
     key.push(0);
@@ -248,12 +248,30 @@ pub(super) fn stream_job_checkpoint_seal_key(
     stream_partition_id: i32,
 ) -> Vec<u8> {
     let mut key = Vec::with_capacity(
-        STREAM_JOB_SEALED_CHECKPOINT_BINARY_PREFIX.len() + handle_id.len() + checkpoint_name.len() + 8,
+        STREAM_JOB_SEALED_CHECKPOINT_BINARY_PREFIX.len()
+            + handle_id.len()
+            + checkpoint_name.len()
+            + 8,
     );
     key.extend_from_slice(STREAM_JOB_SEALED_CHECKPOINT_BINARY_PREFIX);
     append_binary_key_component(&mut key, handle_id);
     append_binary_key_component(&mut key, checkpoint_name);
     key.extend_from_slice(&stream_partition_id.to_be_bytes());
+    key
+}
+
+pub(super) fn stream_job_bridge_callback_prefix(handle_id: &str) -> Vec<u8> {
+    let mut key =
+        Vec::with_capacity(STREAM_JOB_BRIDGE_CALLBACK_BINARY_PREFIX.len() + handle_id.len() + 3);
+    key.extend_from_slice(STREAM_JOB_BRIDGE_CALLBACK_BINARY_PREFIX);
+    append_binary_key_component(&mut key, handle_id);
+    key.push(0);
+    key
+}
+
+pub(super) fn stream_job_bridge_callback_key(handle_id: &str, callback_id: &str) -> Vec<u8> {
+    let mut key = stream_job_bridge_callback_prefix(handle_id);
+    key.extend_from_slice(callback_id.as_bytes());
     key
 }
 

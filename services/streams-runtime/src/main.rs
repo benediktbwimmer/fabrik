@@ -1,5 +1,6 @@
 mod aggregation;
 mod bridge;
+mod dataflow_engine;
 mod local_state;
 mod stream_jobs;
 
@@ -265,24 +266,21 @@ struct ShardWorkerPool {
 }
 
 enum ShardWorkerCommand {
-    ApplyStreamJobPartitionWork {
-        handle: StreamJobBridgeHandleRecord,
-        work: stream_jobs::StreamJobPartitionWork,
-        respond_to: oneshot::Sender<Result<StreamJobActivationResult>>,
+    InstallStreamJobRuntimeState {
+        runtime_state: local_state::LocalStreamJobRuntimeState,
+        respond_to: oneshot::Sender<Result<()>>,
     },
-    ApplyStreamJobPartitionWorkBatch {
+    DrainInstalledTopicStreamJobSources {
         handle: StreamJobBridgeHandleRecord,
-        runtime_state_override: Option<local_state::LocalStreamJobRuntimeState>,
-        work_batch: Vec<stream_jobs::StreamJobPartitionWork>,
-        respond_to: oneshot::Sender<Result<StreamJobActivationResult>>,
-    },
-    PollTopicStreamJobSourcePartition {
-        handle: StreamJobBridgeHandleRecord,
-        compiled_job: Option<CompiledStreamJob>,
-        runtime_state_override: Option<local_state::LocalStreamJobRuntimeState>,
-        request: stream_jobs::TopicStreamJobPollRequest,
+        compiled_job: CompiledStreamJob,
         throughput_partitions: i32,
-        respond_to: oneshot::Sender<Result<stream_jobs::TopicStreamJobPollResult>>,
+        respond_to: oneshot::Sender<Result<InstalledTopicSourceDrainResult>>,
+    },
+    ApplyStreamJobDataflowBatchBatch {
+        handle: StreamJobBridgeHandleRecord,
+        runtime_state_override: Option<local_state::LocalStreamJobRuntimeState>,
+        batch_list: Vec<stream_jobs::StreamJobDataflowBatch>,
+        respond_to: oneshot::Sender<Result<stream_jobs::StreamJobDataflowApplyResult>>,
     },
     PollBulkActivityTasks {
         request: PollBulkActivityTaskRequest,
@@ -319,12 +317,88 @@ struct TopicSourceSession {
     next_offset: Option<i64>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct InstalledTopicSourceDrainResult {
+    runtime_state: Option<local_state::LocalStreamJobRuntimeState>,
+    projection_records: Vec<StreamProjectionRecord>,
+    owner_input_batches: Vec<stream_jobs::StreamJobDataflowBatch>,
+    changelog_records: Vec<StreamChangelogRecord>,
+}
+
+#[derive(Debug, Clone)]
+struct PartitionExecutorQueuedBatch {
+    handle: StreamJobBridgeHandleRecord,
+    batch: stream_jobs::StreamJobDataflowBatch,
+}
+
+#[derive(Default)]
+struct PartitionExecutorState {
+    pending_batches: VecDeque<PartitionExecutorQueuedBatch>,
+    runtime_state_by_handle: HashMap<String, local_state::LocalStreamJobRuntimeState>,
+}
+
+impl PartitionExecutorState {
+    fn install_runtime_state(&mut self, runtime_state: &local_state::LocalStreamJobRuntimeState) {
+        self.runtime_state_by_handle.insert(runtime_state.handle_id.clone(), runtime_state.clone());
+    }
+
+    fn enqueue_batches(
+        &mut self,
+        handle: &StreamJobBridgeHandleRecord,
+        batch_list: &[stream_jobs::StreamJobDataflowBatch],
+    ) {
+        self.pending_batches.reserve(batch_list.len());
+        for batch in batch_list {
+            self.pending_batches.push_back(PartitionExecutorQueuedBatch {
+                handle: handle.clone(),
+                batch: batch.clone(),
+            });
+        }
+    }
+
+    fn refresh_runtime_state(
+        &mut self,
+        local_state: &LocalThroughputState,
+        handle_id: &str,
+    ) -> Result<Option<local_state::LocalStreamJobRuntimeState>> {
+        let runtime_state = local_state.load_stream_job_runtime_state(handle_id)?;
+        if let Some(runtime_state) = &runtime_state {
+            self.runtime_state_by_handle.insert(handle_id.to_owned(), runtime_state.clone());
+        } else {
+            self.runtime_state_by_handle.remove(handle_id);
+        }
+        Ok(runtime_state)
+    }
+
+    fn runtime_state_override(
+        &mut self,
+        local_state: &LocalThroughputState,
+        handle_id: &str,
+    ) -> Result<Option<local_state::LocalStreamJobRuntimeState>> {
+        if let Some(runtime_state) = self.runtime_state_by_handle.get(handle_id) {
+            return Ok(Some(runtime_state.clone()));
+        }
+        self.refresh_runtime_state(local_state, handle_id)
+    }
+}
+
 pub(crate) struct TopicStreamJobDirectActivationResult {
     pub(crate) activation: Option<StreamJobActivationResult>,
     pub(crate) runtime_state: Option<local_state::LocalStreamJobRuntimeState>,
 }
 
 impl ShardWorker {
+    fn install_stream_job_runtime_state(
+        &self,
+        partition_executors: &mut HashMap<i32, PartitionExecutorState>,
+        runtime_state: &local_state::LocalStreamJobRuntimeState,
+    ) -> Result<()> {
+        for executor in partition_executors.values_mut() {
+            executor.install_runtime_state(runtime_state);
+        }
+        Ok(())
+    }
+
     fn new(
         state: AppState,
         scheduling_state: LocalThroughputState,
@@ -355,36 +429,138 @@ impl ShardWorker {
         self.scheduling_state.mirror_changelog_records(entries)
     }
 
-    fn apply_stream_job_partition_work(
+    fn apply_stream_job_dataflow_batch_batch(
         &self,
+        partition_executors: &mut HashMap<i32, PartitionExecutorState>,
         handle: &StreamJobBridgeHandleRecord,
-        work: &stream_jobs::StreamJobPartitionWork,
         runtime_state_override: Option<&local_state::LocalStreamJobRuntimeState>,
-    ) -> Result<StreamJobActivationResult> {
-        stream_jobs::apply_stream_job_partition_work_on_local_state_with_runtime_override(
-            &self.scheduling_state,
-            handle,
-            work,
-            self.state.runtime.owner_first_apply,
-            runtime_state_override,
-        )
+        batch_list: &[stream_jobs::StreamJobDataflowBatch],
+    ) -> Result<stream_jobs::StreamJobDataflowApplyResult> {
+        if batch_list.is_empty() {
+            return Ok(stream_jobs::StreamJobDataflowApplyResult::default());
+        }
+        let partition_id = batch_list[0].program.stream_partition_id;
+        let executor = partition_executors.entry(partition_id).or_default();
+        if let Some(runtime_state) = runtime_state_override {
+            executor.install_runtime_state(runtime_state);
+        }
+        executor.enqueue_batches(handle, batch_list);
+        let mut apply_result = stream_jobs::StreamJobDataflowApplyResult::default();
+        while let Some(queued) = executor.pending_batches.pop_front() {
+            let runtime_override = executor
+                .runtime_state_override(&self.scheduling_state, &queued.handle.handle_id)?;
+            let applied = dataflow_engine::LocalDataflowEngine::new(&self.scheduling_state)
+                .apply_stream_job_batch(
+                    &queued.handle,
+                    runtime_override.as_ref(),
+                    &queued.batch,
+                    self.state.runtime.owner_first_apply,
+                )?;
+            apply_result.batch_results.push(applied);
+            let _ =
+                executor.refresh_runtime_state(&self.scheduling_state, &queued.handle.handle_id)?;
+        }
+        Ok(apply_result)
     }
 
-    fn apply_stream_job_partition_work_batch(
+    async fn drain_installed_topic_stream_job_sources(
         &self,
+        partition_executors: &mut HashMap<i32, PartitionExecutorState>,
+        topic_source_sessions: &mut HashMap<TopicSourceSessionKey, TopicSourceSession>,
         handle: &StreamJobBridgeHandleRecord,
-        runtime_state_override: Option<&local_state::LocalStreamJobRuntimeState>,
-        work_batch: &[stream_jobs::StreamJobPartitionWork],
-    ) -> Result<StreamJobActivationResult> {
-        let mut projection_records = Vec::new();
-        let mut changelog_records = Vec::new();
-        for work in work_batch {
-            let applied =
-                self.apply_stream_job_partition_work(handle, work, runtime_state_override)?;
-            projection_records.extend(applied.projection_records);
-            changelog_records.extend(applied.changelog_records);
+        compiled_job: &CompiledStreamJob,
+        throughput_partitions: i32,
+    ) -> Result<InstalledTopicSourceDrainResult> {
+        let Some(runtime_state) = partition_executors
+            .values()
+            .find_map(|executor| executor.runtime_state_by_handle.get(&handle.handle_id).cloned())
+            .or(self.scheduling_state.load_stream_job_runtime_state(&handle.handle_id)?)
+        else {
+            return Ok(InstalledTopicSourceDrainResult::default());
+        };
+        let poll_requests = stream_jobs::topic_poll_requests_from_runtime_state(
+            handle,
+            compiled_job,
+            &runtime_state,
+        )?;
+        if poll_requests.is_empty() {
+            return Ok(InstalledTopicSourceDrainResult {
+                runtime_state: Some(runtime_state),
+                ..InstalledTopicSourceDrainResult::default()
+            });
         }
-        Ok(StreamJobActivationResult { projection_records, changelog_records })
+        let mut current_runtime_state = runtime_state;
+        let mut result = InstalledTopicSourceDrainResult::default();
+        for request in poll_requests {
+            if !self.shard_partitions.contains(&request.source_owner_partition_id) {
+                continue;
+            }
+            let session_key = TopicSourceSessionKey {
+                handle_id: handle.handle_id.clone(),
+                source_partition_id: request.source_partition_id,
+            };
+            let polled = {
+                let session = topic_source_sessions.entry(session_key.clone()).or_default();
+                if session.next_offset != Some(request.start_offset) {
+                    session.buffered_records.clear();
+                    session.next_offset = Some(request.start_offset);
+                }
+                self.poll_topic_stream_job_source_partition(
+                    handle,
+                    Some(compiled_job),
+                    Some(&current_runtime_state),
+                    Some(&mut session.fetcher),
+                    Some(&mut session.buffered_records),
+                    &request,
+                    throughput_partitions,
+                )
+                .await
+            };
+            let mut evict_session = false;
+            match polled {
+                Ok(polled) => {
+                    if let Some(runtime_delta) = &polled.runtime_delta {
+                        stream_jobs::apply_topic_stream_job_poll_runtime_delta(
+                            &mut current_runtime_state,
+                            runtime_delta,
+                        );
+                        if let Some(session) = topic_source_sessions.get_mut(&session_key) {
+                            session.next_offset =
+                                Some(runtime_delta.source_cursor_update.next_offset);
+                        }
+                    } else if let Some(runtime_state) = &polled.runtime_state_update {
+                        current_runtime_state = runtime_state.clone();
+                        if let Some(next_offset) = current_runtime_state
+                            .source_cursors
+                            .iter()
+                            .find(|cursor| {
+                                cursor.source_partition_id == request.source_partition_id
+                            })
+                            .map(|cursor| cursor.next_offset)
+                            && let Some(session) = topic_source_sessions.get_mut(&session_key)
+                        {
+                            session.next_offset = Some(next_offset);
+                        }
+                        evict_session = current_runtime_state.terminal_status.is_some();
+                    }
+                    result.projection_records.extend(polled.projection_records);
+                    result.owner_input_batches.extend(polled.owner_input_batches);
+                    result.changelog_records.extend(polled.changelog_records);
+                }
+                Err(error) => {
+                    topic_source_sessions.remove(&session_key);
+                    return Err(error);
+                }
+            }
+            if evict_session {
+                topic_source_sessions.remove(&session_key);
+            }
+        }
+        for executor in partition_executors.values_mut() {
+            executor.install_runtime_state(&current_runtime_state);
+        }
+        result.runtime_state = Some(current_runtime_state);
+        Ok(result)
     }
 
     async fn poll_topic_stream_job_source_partition(
@@ -442,31 +618,30 @@ impl ShardWorkerHandle {
         response_rx.await.map_err(|_| Status::unavailable("shard worker stopped"))?
     }
 
-    async fn apply_stream_job_partition_work(
+    async fn install_stream_job_runtime_state(
         &self,
-        handle: StreamJobBridgeHandleRecord,
-        work: stream_jobs::StreamJobPartitionWork,
-    ) -> Result<StreamJobActivationResult> {
+        runtime_state: local_state::LocalStreamJobRuntimeState,
+    ) -> Result<()> {
         let (respond_to, response_rx) = oneshot::channel();
         self.command_tx
-            .send(ShardWorkerCommand::ApplyStreamJobPartitionWork { handle, work, respond_to })
+            .send(ShardWorkerCommand::InstallStreamJobRuntimeState { runtime_state, respond_to })
             .await
             .map_err(|_| anyhow::anyhow!("shard worker stopped"))?;
         response_rx.await.map_err(|_| anyhow::anyhow!("shard worker stopped"))?
     }
 
-    async fn apply_stream_job_partition_work_batch(
+    async fn drain_installed_topic_stream_job_sources(
         &self,
         handle: StreamJobBridgeHandleRecord,
-        runtime_state_override: Option<local_state::LocalStreamJobRuntimeState>,
-        work_batch: Vec<stream_jobs::StreamJobPartitionWork>,
-    ) -> Result<StreamJobActivationResult> {
+        compiled_job: CompiledStreamJob,
+        throughput_partitions: i32,
+    ) -> Result<InstalledTopicSourceDrainResult> {
         let (respond_to, response_rx) = oneshot::channel();
         self.command_tx
-            .send(ShardWorkerCommand::ApplyStreamJobPartitionWorkBatch {
+            .send(ShardWorkerCommand::DrainInstalledTopicStreamJobSources {
                 handle,
-                runtime_state_override,
-                work_batch,
+                compiled_job,
+                throughput_partitions,
                 respond_to,
             })
             .await
@@ -474,22 +649,18 @@ impl ShardWorkerHandle {
         response_rx.await.map_err(|_| anyhow::anyhow!("shard worker stopped"))?
     }
 
-    async fn poll_topic_stream_job_source_partition(
+    async fn apply_stream_job_dataflow_batch_batch(
         &self,
         handle: StreamJobBridgeHandleRecord,
-        compiled_job: Option<CompiledStreamJob>,
         runtime_state_override: Option<local_state::LocalStreamJobRuntimeState>,
-        request: stream_jobs::TopicStreamJobPollRequest,
-        throughput_partitions: i32,
-    ) -> Result<stream_jobs::TopicStreamJobPollResult> {
+        batch_list: Vec<stream_jobs::StreamJobDataflowBatch>,
+    ) -> Result<stream_jobs::StreamJobDataflowApplyResult> {
         let (respond_to, response_rx) = oneshot::channel();
         self.command_tx
-            .send(ShardWorkerCommand::PollTopicStreamJobSourcePartition {
+            .send(ShardWorkerCommand::ApplyStreamJobDataflowBatchBatch {
                 handle,
-                compiled_job,
                 runtime_state_override,
-                request,
-                throughput_partitions,
+                batch_list,
                 respond_to,
             })
             .await
@@ -639,13 +810,16 @@ impl ShardWorkerPool {
         Ok(PollBulkActivityTaskResponse { tasks: Vec::new() })
     }
 
-    fn sync_stream_job_runtime_state_to_shards(
+    async fn sync_stream_job_runtime_state_to_shards(
         &self,
         runtime_state: &local_state::LocalStreamJobRuntimeState,
     ) -> Result<()> {
         self.state.local_state.upsert_stream_job_runtime_state(runtime_state)?;
         for local_state in self.local_state_by_partition.values() {
             local_state.upsert_stream_job_runtime_state(runtime_state)?;
+        }
+        for handle in self.handles.iter() {
+            handle.install_stream_job_runtime_state(runtime_state.clone()).await?;
         }
         Ok(())
     }
@@ -659,51 +833,35 @@ impl ShardWorkerPool {
         occurred_at: DateTime<Utc>,
     ) -> Result<Option<TopicStreamJobDirectActivationResult>> {
         let owner_epoch = stream_job_owner_epoch(&self.state, &handle.job_id).or(Some(1));
-        let fast_topic_plan = if handle.cancellation_requested_at.is_none()
-            && resolved_job_override.is_some()
-            && runtime_state_override.is_some()
-            && !stream_jobs::should_refresh_topic_frontier(runtime_state_override, occurred_at)
-        {
-            stream_jobs::plan_topic_stream_job_owner_polls_from_runtime_state(
-                handle,
-                resolved_job_override.expect("resolved job override should exist"),
-                throughput_partitions,
-                runtime_state_override.expect("runtime state override should exist"),
-                occurred_at,
-            )?
-        } else {
-            None
+        let Some(resolved_job) = resolved_job_override
+            .cloned()
+            .or(stream_jobs::resolve_stream_job_definition(Some(&self.state.store), handle).await?)
+        else {
+            return Ok(None);
         };
-        let Some(topic_plan) = (if let Some(topic_plan) = fast_topic_plan {
-            Some(topic_plan)
-        } else {
-            stream_jobs::plan_topic_stream_job_owner_polls(
-                &self.state.local_state,
-                Some(&self.state.store),
-                &self.state,
-                handle,
-                resolved_job_override,
-                throughput_partitions,
-                owner_epoch.unwrap_or(1),
-                runtime_state_override,
-                occurred_at,
-            )
-            .await?
-        })
+        let Some(topic_install) = stream_jobs::prepare_topic_stream_job_runtime_install(
+            &self.state.local_state,
+            Some(&self.state.store),
+            &self.state,
+            handle,
+            Some(&resolved_job),
+            throughput_partitions,
+            owner_epoch.unwrap_or(1),
+            runtime_state_override,
+            occurred_at,
+        )
+        .await?
         else {
             return Ok(None);
         };
 
         let mut projection_records = Vec::new();
-        let mut changelog_records = Vec::with_capacity(
-            topic_plan
-                .poll_requests
-                .len()
-                .saturating_add(topic_plan.post_apply_changelog_records.len() + 2),
-        );
-        let mut current_runtime_state = topic_plan.runtime_state_update.clone();
-        let mut work_by_partition = HashMap::<i32, Vec<stream_jobs::StreamJobPartitionWork>>::new();
-        if let Some(execution_planned) = topic_plan.execution_planned.clone() {
+        let mut changelog_records =
+            Vec::with_capacity(topic_install.post_apply_changelog_records.len().saturating_add(2));
+        let mut current_runtime_state = topic_install.runtime_state_update.clone();
+        let mut batches_by_partition =
+            HashMap::<i32, Vec<stream_jobs::StreamJobDataflowBatch>>::new();
+        if let Some(execution_planned) = topic_install.execution_planned.clone() {
             let ChangelogRecordEntry::Streams(streams_entry) = &execution_planned.entry else {
                 anyhow::bail!("stream job execution plan must use a streams changelog entry");
             };
@@ -713,7 +871,7 @@ impl ShardWorkerPool {
             }
             changelog_records.push(execution_planned);
         }
-        for record in &topic_plan.post_apply_changelog_records {
+        for record in &topic_install.post_apply_changelog_records {
             let ChangelogRecordEntry::Streams(streams_entry) = &record.entry else {
                 anyhow::bail!("topic stream job owner poll records must use streams changelog");
             };
@@ -722,59 +880,58 @@ impl ShardWorkerPool {
                 local_state.mirror_streams_changelog_entry(streams_entry)?;
             }
         }
-        let poll_runtime_state = current_runtime_state.clone();
-        let poll_results = try_join_all(topic_plan.poll_requests.into_iter().map(|request| {
-            let handle = handle.clone();
-            let compiled_job = resolved_job_override.cloned();
-            let runtime_state_override = poll_runtime_state.clone();
-            async move {
-                let Some(source_worker) =
-                    self.handles_by_partition.get(&request.source_owner_partition_id).cloned()
-                else {
-                    anyhow::bail!(
-                        "no shard worker configured for topic source owner partition {}",
-                        request.source_owner_partition_id
-                    );
-                };
-                source_worker
-                    .poll_topic_stream_job_source_partition(
-                        handle,
-                        compiled_job,
-                        runtime_state_override,
-                        request,
-                        throughput_partitions,
-                    )
-                    .await
-            }
-        }))
-        .await?;
-        for polled in poll_results {
-            for owner_input_batch in polled.owner_input_batches {
-                work_by_partition
-                    .entry(owner_input_batch.owner_partition_id)
-                    .or_default()
-                    .push(owner_input_batch.work);
-            }
-            if let Some(runtime_delta) = &polled.runtime_delta {
-                if let Some(runtime_state) = current_runtime_state.as_mut() {
-                    stream_jobs::apply_topic_stream_job_poll_runtime_delta(
-                        runtime_state,
-                        runtime_delta,
-                    );
-                } else if let Some(runtime_state) = &polled.runtime_state_update {
-                    current_runtime_state = Some(runtime_state.clone());
+        if let Some(runtime_state) = current_runtime_state.as_ref() {
+            self.sync_stream_job_runtime_state_to_shards(runtime_state).await?;
+            let mut source_owner_partitions = runtime_state
+                .source_partition_leases
+                .iter()
+                .map(|lease| lease.owner_partition_id)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            source_owner_partitions.sort_unstable();
+            let drain_results =
+                try_join_all(source_owner_partitions.into_iter().map(|partition_id| {
+                    let worker =
+                        self.handles_by_partition.get(&partition_id).cloned().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "no shard worker configured for topic source owner partition {}",
+                                partition_id
+                            )
+                        });
+                    let handle = handle.clone();
+                    let resolved_job = resolved_job.clone();
+                    async move {
+                        let worker = worker?;
+                        worker
+                            .drain_installed_topic_stream_job_sources(
+                                handle,
+                                resolved_job,
+                                throughput_partitions,
+                            )
+                            .await
+                    }
+                }))
+                .await?;
+            for drained in drain_results {
+                for owner_input_batch in drained.owner_input_batches {
+                    batches_by_partition
+                        .entry(owner_input_batch.program.stream_partition_id)
+                        .or_default()
+                        .push(owner_input_batch);
                 }
-            } else if let Some(runtime_state) = &polled.runtime_state_update {
-                current_runtime_state = Some(runtime_state.clone());
+                if let Some(runtime_state) = drained.runtime_state {
+                    current_runtime_state = Some(runtime_state);
+                }
+                projection_records.extend(drained.projection_records);
+                changelog_records.extend(drained.changelog_records);
             }
-            projection_records.extend(polled.projection_records);
-            changelog_records.extend(polled.changelog_records);
         }
-        if !work_by_partition.is_empty() {
+        if !batches_by_partition.is_empty() {
             if let Some(runtime_state) = current_runtime_state.as_ref() {
-                self.sync_stream_job_runtime_state_to_shards(runtime_state)?;
+                self.sync_stream_job_runtime_state_to_shards(runtime_state).await?;
             }
-            let mut partition_ids = work_by_partition.keys().copied().collect::<Vec<_>>();
+            let mut partition_ids = batches_by_partition.keys().copied().collect::<Vec<_>>();
             partition_ids.sort_unstable();
             let apply_results = try_join_all(partition_ids.into_iter().map(|partition_id| {
                 let worker =
@@ -785,35 +942,33 @@ impl ShardWorkerPool {
                         )
                     });
                 let handle = handle.clone();
-                let work_batch = work_by_partition.remove(&partition_id).unwrap_or_default();
+                let batch_list = batches_by_partition.remove(&partition_id).unwrap_or_default();
                 async move {
                     let worker = worker?;
                     let applied = worker
-                        .apply_stream_job_partition_work_batch(
-                            handle,
-                            None,
-                            work_batch,
-                        )
+                        .apply_stream_job_dataflow_batch_batch(handle, None, batch_list)
                         .await?;
                     Ok::<_, anyhow::Error>((partition_id, applied))
                 }
             }))
             .await?;
-            for (_partition_id, mut applied) in apply_results {
-                mirror_stream_job_callback_records_into_local_state(
-                    &self.state.local_state,
-                    &mut applied.changelog_records,
-                )?;
-                projection_records.extend(applied.projection_records);
-                changelog_records.extend(applied.changelog_records);
+            for (_partition_id, applied) in apply_results {
+                for mut batch_result in applied.batch_results {
+                    mirror_stream_job_callback_records_into_local_state(
+                        &self.state.local_state,
+                        &mut batch_result.activation_result.changelog_records,
+                    )?;
+                    projection_records.extend(batch_result.activation_result.projection_records);
+                    changelog_records.extend(batch_result.activation_result.changelog_records);
+                }
             }
         }
         if let Some(runtime_state) = current_runtime_state.as_ref() {
-            self.sync_stream_job_runtime_state_to_shards(runtime_state)?;
+            self.sync_stream_job_runtime_state_to_shards(runtime_state).await?;
         }
-        projection_records.extend(topic_plan.post_apply_projection_records);
-        changelog_records.extend(topic_plan.post_apply_changelog_records);
-        if let Some(terminalized) = topic_plan.terminalized {
+        projection_records.extend(topic_install.post_apply_projection_records);
+        changelog_records.extend(topic_install.post_apply_changelog_records);
+        if let Some(terminalized) = topic_install.terminalized {
             if current_runtime_state.as_ref().is_some_and(|state| {
                 state
                     .source_kind
@@ -864,47 +1019,47 @@ impl ShardWorkerPool {
             return Ok(None);
         };
 
+        let engine = dataflow_engine::LocalDataflowEngine::new(&self.state.local_state);
         let mut projection_records = Vec::new();
-        let mut changelog_records = Vec::with_capacity(
-            plan.partition_work.len().saturating_add(plan.post_apply_changelog_records.len() + 2),
-        );
-        if let Some(execution_planned) = plan.execution_planned.clone() {
+        let mut changelog_records = engine.stage_stream_job_plan(&handle, &plan)?;
+        if let Some(runtime_state) = plan.runtime_state_update.as_ref() {
+            self.sync_stream_job_runtime_state_to_shards(runtime_state).await?;
+        }
+        if let Some(execution_planned) = plan.execution_planned.as_ref()
+            && !plan.dataflow_batches.is_empty()
+        {
             let ChangelogRecordEntry::Streams(streams_entry) = &execution_planned.entry else {
                 anyhow::bail!("stream job execution plan must use a streams changelog entry");
             };
-            self.state.local_state.mirror_streams_changelog_entry(&streams_entry)?;
-            if let Some(runtime_state) = &plan.runtime_state_update {
-                self.state.local_state.upsert_stream_job_runtime_state(runtime_state)?;
-            }
-            if !plan.partition_work.is_empty() {
-                let manifest = plan
-                    .partition_work
-                    .iter()
-                    .map(stream_jobs::local_dispatch_batch_from_work)
-                    .collect::<Vec<_>>();
-                self.state.local_state.replace_stream_job_dispatch_manifest(
-                    &handle.handle_id,
-                    manifest.clone(),
-                    streams_entry.occurred_at,
-                )?;
-                for partition_id in
-                    manifest.iter().map(|batch| batch.stream_partition_id).collect::<HashSet<_>>()
-                {
-                    if let Some(local_state) = self.local_state_for_partition(partition_id) {
-                        local_state.mirror_streams_changelog_entry(&streams_entry)?;
-                        local_state.replace_stream_job_dispatch_manifest(
-                            &handle.handle_id,
-                            manifest.clone(),
-                            streams_entry.occurred_at,
-                        )?;
-                    }
+            let manifest = plan
+                .dataflow_batches
+                .iter()
+                .map(stream_jobs::local_dispatch_batch_from_dataflow_batch)
+                .collect::<Vec<_>>();
+            for partition_id in
+                manifest.iter().map(|batch| batch.stream_partition_id).collect::<HashSet<_>>()
+            {
+                if let Some(local_state) = self.local_state_for_partition(partition_id) {
+                    local_state.mirror_streams_changelog_entry(streams_entry)?;
+                    local_state.replace_stream_job_dispatch_manifest(
+                        &handle.handle_id,
+                        manifest.clone(),
+                        streams_entry.occurred_at,
+                    )?;
                 }
             }
-            changelog_records.push(execution_planned);
-        } else if let Some(runtime_state) = &plan.runtime_state_update {
-            self.state.local_state.upsert_stream_job_runtime_state(runtime_state)?;
         }
-        for work in plan.partition_work {
+        let mut batches_by_partition =
+            HashMap::<i32, Vec<stream_jobs::StreamJobDataflowBatch>>::new();
+        let mut partition_order = Vec::new();
+        for batch in plan.dataflow_batches.iter().cloned() {
+            let partition_id = batch.program.stream_partition_id;
+            if !batches_by_partition.contains_key(&partition_id) {
+                partition_order.push(partition_id);
+            }
+            batches_by_partition.entry(partition_id).or_default().push(batch);
+        }
+        for partition_id in partition_order {
             if self
                 .state
                 .store
@@ -917,53 +1072,41 @@ impl ShardWorkerPool {
                     .mark_stream_job_dispatch_cancelled(&handle.handle_id, Utc::now())?;
                 break;
             }
-            let Some(worker) = self.handles_by_partition.get(&work.stream_partition_id) else {
+            let Some(worker) = self.handles_by_partition.get(&partition_id) else {
                 anyhow::bail!(
                     "no shard worker configured for stream job partition {}",
-                    work.stream_partition_id
+                    partition_id
                 );
             };
-            let batch_id = work.batch_id.clone();
-            let completes_dispatch = work.completes_dispatch;
-            let occurred_at = work.occurred_at;
-            let mut applied = worker.apply_stream_job_partition_work(handle.clone(), work).await?;
-            mirror_stream_job_callback_records_into_local_state(
-                &self.state.local_state,
-                &mut applied.changelog_records,
-            )?;
-            self.state.local_state.mark_stream_job_dispatch_batch_applied(
-                &handle.handle_id,
-                &batch_id,
-                completes_dispatch,
-                occurred_at,
-            )?;
-            projection_records.extend(applied.projection_records);
-            changelog_records.extend(applied.changelog_records);
-        }
-        if let Some(source_cursors) = plan.source_cursor_updates {
-            self.state.local_state.replace_stream_job_source_cursors(
-                &handle.handle_id,
-                source_cursors,
-                Utc::now(),
-            )?;
-        }
-        projection_records.extend(plan.post_apply_projection_records);
-        changelog_records.extend(plan.post_apply_changelog_records);
-        if let Some(terminalized) = plan.terminalized {
-            if self.state.local_state.load_stream_job_runtime_state(&handle.handle_id)?.is_some_and(
-                |state| {
-                    let bounded_completed = state.dispatch_completed_at.is_some()
-                        && state.dispatch_cancelled_at.is_none();
-                    let topic_cancelled = state
-                        .source_kind
-                        .as_deref()
-                        .is_some_and(|kind| kind == fabrik_throughput::STREAM_SOURCE_TOPIC);
-                    bounded_completed || topic_cancelled
-                },
-            ) {
-                changelog_records.push(terminalized);
+            let applied = worker
+                .apply_stream_job_dataflow_batch_batch(
+                    handle.clone(),
+                    None,
+                    batches_by_partition.remove(&partition_id).unwrap_or_default(),
+                )
+                .await?;
+            for mut batch_result in applied.batch_results {
+                mirror_stream_job_callback_records_into_local_state(
+                    &self.state.local_state,
+                    &mut batch_result.activation_result.changelog_records,
+                )?;
+                self.state.local_state.mark_stream_job_dispatch_batch_applied(
+                    &handle.handle_id,
+                    &batch_result.batch.envelope.batch_id,
+                    batch_result.batch.program.completes_dispatch,
+                    batch_result.batch.program.occurred_at,
+                )?;
+                projection_records.extend(batch_result.activation_result.projection_records);
+                changelog_records.extend(batch_result.activation_result.changelog_records);
             }
         }
+        engine.finish_stream_job_plan(
+            &handle,
+            plan,
+            Utc::now(),
+            &mut projection_records,
+            &mut changelog_records,
+        )?;
         Ok(Some(StreamJobActivationResult { projection_records, changelog_records }))
     }
 
@@ -1081,84 +1224,53 @@ async fn run_shard_worker_loop(
     mut command_rx: mpsc::Receiver<ShardWorkerCommand>,
 ) {
     let mut topic_source_sessions = HashMap::<TopicSourceSessionKey, TopicSourceSession>::new();
+    let mut partition_executors = shard_worker
+        .shard_partitions
+        .iter()
+        .copied()
+        .map(|partition_id| (partition_id, PartitionExecutorState::default()))
+        .collect::<HashMap<_, _>>();
+    if partition_executors.is_empty() {
+        partition_executors.insert(0, PartitionExecutorState::default());
+    }
     while let Some(command) = command_rx.recv().await {
         match command {
-            ShardWorkerCommand::ApplyStreamJobPartitionWork { handle, work, respond_to } => {
+            ShardWorkerCommand::InstallStreamJobRuntimeState { runtime_state, respond_to } => {
                 let _ = respond_to.send(
-                    shard_worker.apply_stream_job_partition_work(&handle, &work, None),
+                    shard_worker
+                        .install_stream_job_runtime_state(&mut partition_executors, &runtime_state),
                 );
             }
-            ShardWorkerCommand::ApplyStreamJobPartitionWorkBatch {
-                handle,
-                runtime_state_override,
-                work_batch,
-                respond_to,
-            } => {
-                let _ = respond_to.send(shard_worker.apply_stream_job_partition_work_batch(
-                    &handle,
-                    runtime_state_override.as_ref(),
-                    &work_batch,
-                ));
-            }
-            ShardWorkerCommand::PollTopicStreamJobSourcePartition {
+            ShardWorkerCommand::DrainInstalledTopicStreamJobSources {
                 handle,
                 compiled_job,
-                runtime_state_override,
-                request,
                 throughput_partitions,
                 respond_to,
             } => {
-                let session_key = TopicSourceSessionKey {
-                    handle_id: handle.handle_id.clone(),
-                    source_partition_id: request.source_partition_id,
-                };
-                let result = {
-                    let session = topic_source_sessions.entry(session_key.clone()).or_default();
-                    if session.next_offset != Some(request.start_offset) {
-                        session.buffered_records.clear();
-                        session.next_offset = Some(request.start_offset);
-                    }
+                let _ = respond_to.send(
                     shard_worker
-                        .poll_topic_stream_job_source_partition(
+                        .drain_installed_topic_stream_job_sources(
+                            &mut partition_executors,
+                            &mut topic_source_sessions,
                             &handle,
-                            compiled_job.as_ref(),
-                            runtime_state_override.as_ref(),
-                            Some(&mut session.fetcher),
-                            Some(&mut session.buffered_records),
-                            &request,
+                            &compiled_job,
                             throughput_partitions,
                         )
-                        .await
-                };
-                let mut evict_session = false;
-                if let Ok(response) = &result {
-                    if let Some(runtime_delta) = response.runtime_delta.as_ref() {
-                        if let Some(session) = topic_source_sessions.get_mut(&session_key) {
-                            session.next_offset = Some(runtime_delta.source_cursor_update.next_offset);
-                        }
-                    } else if let Some(updated_runtime_state) = response.runtime_state_update.as_ref()
-                    {
-                        if let Some(next_offset) = updated_runtime_state
-                            .source_cursors
-                            .iter()
-                            .find(|cursor| {
-                                cursor.source_partition_id == request.source_partition_id
-                            })
-                            .map(|cursor| cursor.next_offset)
-                        {
-                            if let Some(session) = topic_source_sessions.get_mut(&session_key) {
-                                session.next_offset = Some(next_offset);
-                            }
-                        }
-                        evict_session = updated_runtime_state.terminal_status.is_some();
-                    }
-                } else {
-                    evict_session = true;
-                }
-                if evict_session {
-                    topic_source_sessions.remove(&session_key);
-                }
-                let _ = respond_to.send(result);
+                        .await,
+                );
+            }
+            ShardWorkerCommand::ApplyStreamJobDataflowBatchBatch {
+                handle,
+                runtime_state_override,
+                batch_list,
+                respond_to,
+            } => {
+                let _ = respond_to.send(shard_worker.apply_stream_job_dataflow_batch_batch(
+                    &mut partition_executors,
+                    &handle,
+                    runtime_state_override.as_ref(),
+                    &batch_list,
+                ));
             }
             ShardWorkerCommand::PollBulkActivityTasks { request, respond_to } => {
                 let _ = respond_to.send(shard_worker.poll_bulk_activity_tasks(request).await);
@@ -2015,7 +2127,9 @@ async fn get_strong_batch_snapshot(
         .await
         .map_err(internal_http_error)?
         .and_then(|run| match &run.command.payload {
-            ThroughputCommand::StartThroughputRun(start) => Some(start.dataflow_plan().summary_value()),
+            ThroughputCommand::StartThroughputRun(start) => {
+                Some(start.dataflow_plan().summary_value())
+            }
             _ => None,
         });
     Ok(Json(StrongBatchResponse { batch, dataflow_plan }))
@@ -4611,8 +4725,14 @@ async fn run_group_barrier_reconciler(state: AppState) {
 async fn run_active_topic_stream_job_loop(state: AppState) {
     let interval = Duration::from_millis(state.runtime.sweep_interval_ms.clamp(5, 25));
     loop {
-        if let Err(error) = bridge::reconcile_active_topic_stream_jobs(&state, 64).await {
-            error!(error = %error, "failed to reconcile active topic-backed stream jobs");
+        if let Err(error) = bridge::reconcile_stream_deployments(&state, 64).await {
+            error!(error = %error, "failed to reconcile stream deployments");
+        }
+        if let Err(error) = bridge::tick_active_topic_stream_job_workers(&state, 64).await {
+            error!(error = %error, "failed to tick active topic-backed stream jobs");
+        }
+        if let Err(error) = bridge::reconcile_stream_job_callback_repairs(&state, 64).await {
+            error!(error = %error, "failed to reconcile pending stream job callback repairs");
         }
         tokio::time::sleep(interval).await;
     }
@@ -9309,6 +9429,23 @@ mod tests {
         (first_key, first_partition, second_key, second_partition)
     }
 
+    fn stream_job_keys_for_partition(
+        partition_count: i32,
+        partition_id: i32,
+        count: usize,
+    ) -> Vec<String> {
+        let mut keys = Vec::with_capacity(count);
+        let mut candidate_index = 0usize;
+        while keys.len() < count {
+            let candidate = format!("acct_partition_target_{partition_id}_{candidate_index}");
+            candidate_index = candidate_index.saturating_add(1);
+            if throughput_partition_for_stream_key(&candidate, partition_count) == partition_id {
+                keys.push(candidate);
+            }
+        }
+        keys
+    }
+
     fn distinct_topic_partition_keys(partition_count: i32) -> (String, i32, String, i32) {
         let first_key = "topic_partition_a".to_owned();
         let first_partition = partition_for_key(&first_key, partition_count);
@@ -9941,6 +10078,415 @@ mod tests {
         fs::remove_dir_all(state_dir).ok();
         fs::remove_dir_all(restored_db_path).ok();
         fs::remove_dir_all(restored_checkpoint_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_job_schedule_batches_bounded_owner_work_per_shard() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir = temp_path("throughput-stream-job-owner-shard-batches");
+        let throughput_partitions = 8;
+        let app_state = test_app_state_with_partitions(
+            store.clone(),
+            &redpanda,
+            &state_dir,
+            throughput_partitions,
+        )
+        .await?;
+        let managed_partitions = (0..throughput_partitions).collect::<Vec<_>>();
+        let shard_workers = ShardWorkerPool::new(app_state.clone(), &managed_partitions);
+        let _ = app_state.shard_workers.set(shard_workers.clone());
+
+        let target_partition = 0;
+        let owner_keys = stream_job_keys_for_partition(throughput_partitions, target_partition, 65);
+        let items = owner_keys
+            .iter()
+            .map(|account_id| serde_json::json!({ "accountId": account_id, "amount": 1.0 }))
+            .collect::<Vec<_>>();
+
+        let tenant_id = "tenant";
+        let instance_id = "instance-stream-job-owner-shard-batches";
+        let run_id = "run-stream-job-owner-shard-batches";
+        let job_id = "job-stream-job-owner-shard-batches";
+        let handle_id =
+            fabrik_throughput::stream_job_handle_id(tenant_id, instance_id, run_id, job_id);
+        let occurred_at = Utc::now();
+
+        let handle = StreamJobBridgeHandleRecord {
+            workflow_event_id: Uuid::now_v7(),
+            protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+            tenant_id: tenant_id.to_owned(),
+            instance_id: instance_id.to_owned(),
+            run_id: run_id.to_owned(),
+            stream_instance_id: instance_id.to_owned(),
+            stream_run_id: run_id.to_owned(),
+            job_id: job_id.to_owned(),
+            handle_id: handle_id.clone(),
+            bridge_request_id: fabrik_throughput::stream_job_bridge_request_id(
+                tenant_id,
+                instance_id,
+                run_id,
+                job_id,
+            ),
+            origin_kind: fabrik_throughput::StreamJobOriginKind::Workflow.as_str().to_owned(),
+            definition_id: "demo".to_owned(),
+            definition_version: Some(1),
+            artifact_hash: Some("artifact-a".to_owned()),
+            job_name: stream_jobs::KEYED_ROLLUP_JOB_NAME.to_owned(),
+            input_ref: serde_json::json!({
+                "kind": "bounded_items",
+                "items": items
+            })
+            .to_string(),
+            config_ref: None,
+            checkpoint_policy: None,
+            view_definitions: None,
+            status: fabrik_throughput::StreamJobBridgeHandleStatus::Admitted.as_str().to_owned(),
+            workflow_owner_epoch: Some(3),
+            stream_owner_epoch: None,
+            cancellation_requested_at: None,
+            cancellation_reason: None,
+            terminal_event_id: None,
+            terminal_at: None,
+            workflow_accepted_at: None,
+            terminal_output: None,
+            terminal_error: None,
+            created_at: occurred_at,
+            updated_at: occurred_at,
+        };
+        store.upsert_stream_job_bridge_handle(&handle).await?;
+
+        let identity = WorkflowIdentity::new(
+            tenant_id,
+            "demo",
+            1,
+            "artifact-a",
+            instance_id,
+            run_id,
+            "throughput-runtime-test",
+        );
+        let mut event = EventEnvelope::new(
+            WorkflowEvent::StreamJobScheduled {
+                job_id: job_id.to_owned(),
+                job_name: stream_jobs::KEYED_ROLLUP_JOB_NAME.to_owned(),
+                input: serde_json::json!({
+                    "kind": "bounded_items",
+                    "items": owner_keys
+                        .iter()
+                        .map(|account_id| serde_json::json!({ "accountId": account_id, "amount": 1.0 }))
+                        .collect::<Vec<_>>()
+                }),
+                config: None,
+                state: None,
+            }
+            .event_type(),
+            identity,
+            WorkflowEvent::StreamJobScheduled {
+                job_id: job_id.to_owned(),
+                job_name: stream_jobs::KEYED_ROLLUP_JOB_NAME.to_owned(),
+                input: serde_json::json!({
+                    "kind": "bounded_items",
+                    "items": owner_keys
+                        .iter()
+                        .map(|account_id| serde_json::json!({ "accountId": account_id, "amount": 1.0 }))
+                        .collect::<Vec<_>>()
+                }),
+                config: None,
+                state: None,
+            },
+        );
+        event.occurred_at = occurred_at;
+        bridge::handle_bridge_event(app_state.clone(), event).await?;
+
+        let owner_state = shard_workers
+            .local_state_for_partition(target_partition)
+            .expect("owner shard should exist");
+        let accepted_progress =
+            owner_state.load_stream_job_accepted_progress_tail(&handle_id, 8)?;
+        assert_eq!(accepted_progress.len(), 2);
+        assert_eq!(
+            accepted_progress
+                .iter()
+                .map(|state| state.ack.accepted_progress_position)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(
+            accepted_progress.iter().all(|state| state.ack.durable),
+            "owner shard batches should durably ack after grouped batch apply"
+        );
+        let sealed = owner_state
+            .load_all_stream_job_sealed_checkpoints()?
+            .into_iter()
+            .filter(|state| state.handle_id == handle_id)
+            .collect::<Vec<_>>();
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(sealed[0].record.accepted_progress_position, 2);
+        let sample_view = owner_state
+            .load_stream_job_view_state(&handle_id, "accountTotals", &owner_keys[0])?
+            .context("sample owner key should materialize on owner shard")?;
+        assert_eq!(sample_view.output["totalAmount"], serde_json::json!(1.0));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn partition_executor_applies_topic_batches_after_runtime_install() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir = temp_path("throughput-stream-job-partition-executor-topic");
+        let app_state =
+            test_app_state_with_partitions(store.clone(), &redpanda, &state_dir, 1).await?;
+        let shard_workers = ShardWorkerPool::new(app_state.clone(), &[0]);
+        let _ = app_state.shard_workers.set(shard_workers.clone());
+
+        let occurred_at = Utc::now();
+        let handle = topic_stream_job_handle(
+            "tenant",
+            "instance-partition-executor-topic",
+            "run-partition-executor-topic",
+            "job-partition-executor-topic",
+            "payments",
+            fabrik_throughput::StreamJobBridgeHandleStatus::Admitted,
+            None,
+            None,
+            occurred_at,
+        );
+        store.upsert_stream_job_bridge_handle(&handle).await?;
+
+        let runtime_state = crate::local_state::LocalStreamJobRuntimeState {
+            handle_id: handle.handle_id.clone(),
+            job_id: handle.job_id.clone(),
+            job_name: handle.job_name.clone(),
+            view_name: "accountTotals".to_owned(),
+            checkpoint_name: stream_jobs::KEYED_ROLLUP_CHECKPOINT_NAME.to_owned(),
+            checkpoint_sequence: stream_jobs::KEYED_ROLLUP_CHECKPOINT_SEQUENCE + 1,
+            input_item_count: 0,
+            materialized_key_count: 0,
+            active_partitions: vec![0],
+            throughput_partition_count: 1,
+            source_kind: Some(fabrik_throughput::STREAM_SOURCE_TOPIC.to_owned()),
+            source_name: Some("payments".to_owned()),
+            source_cursors: vec![crate::local_state::LocalStreamJobSourceCursorState {
+                source_partition_id: 0,
+                next_offset: 0,
+                initial_checkpoint_target_offset: 2,
+                last_applied_offset: None,
+                last_high_watermark: Some(2),
+                last_event_time_watermark: None,
+                last_closed_window_end: None,
+                pending_window_ends: Vec::new(),
+                dropped_late_event_count: 0,
+                last_dropped_late_offset: None,
+                last_dropped_late_event_at: None,
+                last_dropped_late_window_end: None,
+                dropped_evicted_window_event_count: 0,
+                last_dropped_evicted_window_offset: None,
+                last_dropped_evicted_window_event_at: None,
+                last_dropped_evicted_window_end: None,
+                checkpoint_reached_at: None,
+                updated_at: occurred_at,
+            }],
+            source_partition_leases: vec![crate::local_state::LocalStreamJobSourceLeaseState {
+                source_partition_id: 0,
+                owner_partition_id: 0,
+                owner_epoch: 3,
+                lease_token: "lease-current".to_owned(),
+                updated_at: occurred_at,
+            }],
+            dispatch_dataflow_batches: Vec::new(),
+            applied_dispatch_batch_ids: Vec::new(),
+            dispatch_completed_at: None,
+            dispatch_cancelled_at: None,
+            stream_owner_epoch: 3,
+            planned_at: occurred_at,
+            latest_checkpoint_at: None,
+            evicted_window_count: 0,
+            last_evicted_window_end: None,
+            last_evicted_at: None,
+            view_runtime_stats: Vec::new(),
+            pre_key_runtime_stats: Vec::new(),
+            hot_key_runtime_stats: Vec::new(),
+            owner_partition_runtime_stats: Vec::new(),
+            checkpoint_partitions: Vec::new(),
+            terminal_status: None,
+            terminal_output: None,
+            terminal_error: None,
+            terminal_at: None,
+            updated_at: occurred_at,
+        };
+        shard_workers.sync_stream_job_runtime_state_to_shards(&runtime_state).await?;
+
+        let worker = shard_workers
+            .handles_by_partition
+            .get(&0)
+            .cloned()
+            .context("partition worker should exist")?;
+        let make_batch =
+            |batch_id: &str, offset: i64, value: f64| stream_jobs::StreamJobDataflowBatch {
+                envelope: fabrik_throughput::DataflowBatchEnvelope {
+                    plan_id: format!("stream-job:{}", handle.handle_id),
+                    batch_id: batch_id.to_owned(),
+                    source_id: format!("topic:{}", handle.handle_id),
+                    source_partition_id: 0,
+                    source_epoch: (stream_jobs::KEYED_ROLLUP_CHECKPOINT_SEQUENCE + 1) as u64,
+                    offset_range: Some(fabrik_throughput::DataflowOffsetRange {
+                        start: offset,
+                        end: offset,
+                    }),
+                    edge_id: "exchange:key_by:accountId".to_owned(),
+                    dest_partition_id: 0,
+                    owner_epoch: 3,
+                    lease_epoch: None,
+                    summary: fabrik_throughput::DataflowBatchSummary {
+                        record_count: 1,
+                        payload_checksum: None,
+                    },
+                },
+                program: dataflow_engine::BoundedDataflowBatchProgram {
+                    stream_partition_id: 0,
+                    checkpoint_partition_id: Some(0),
+                    source_owner_partition_id: Some(0),
+                    source_lease_token: Some("lease-current".to_owned()),
+                    routing_key: "acct_1".to_owned(),
+                    key_field: "accountId".to_owned(),
+                    reducer_kind: fabrik_throughput::STREAM_REDUCER_SUM.to_owned(),
+                    output_field: "totalAmount".to_owned(),
+                    view_name: "accountTotals".to_owned(),
+                    additional_view_names: Vec::new(),
+                    eventual_projection_view_names: Vec::new(),
+                    workflow_signals: Vec::new(),
+                    checkpoint_name: stream_jobs::KEYED_ROLLUP_CHECKPOINT_NAME.to_owned(),
+                    checkpoint_sequence: stream_jobs::KEYED_ROLLUP_CHECKPOINT_SEQUENCE + 1,
+                    owner_epoch: 3,
+                    occurred_at,
+                    items: vec![dataflow_engine::BoundedDataflowItem {
+                        logical_key: "acct_1".to_owned(),
+                        value,
+                        display_key: Some("acct_1".to_owned()),
+                        window_start: None,
+                        window_end: None,
+                        count: 1,
+                    }],
+                    is_final_partition_batch: false,
+                    completes_dispatch: false,
+                },
+            };
+
+        worker
+            .apply_stream_job_dataflow_batch_batch(
+                handle.clone(),
+                None,
+                vec![make_batch("topic-batch-1", 0, 2.0)],
+            )
+            .await?;
+        worker
+            .apply_stream_job_dataflow_batch_batch(
+                handle.clone(),
+                None,
+                vec![make_batch("topic-batch-2", 1, 3.0)],
+            )
+            .await?;
+
+        let owner_local_state =
+            shard_workers.local_state_for_partition(0).context("owner local state should exist")?;
+        let view = owner_local_state
+            .load_stream_job_view_state(&handle.handle_id, "accountTotals", "acct_1")?
+            .context("topic owner view should materialize on partition executor")?;
+        assert_eq!(view.output["totalAmount"], serde_json::json!(5.0));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_topic_worker_tick_progresses_topic_job_without_reconcile_wrapper() -> Result<()>
+    {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir = temp_path("throughput-topic-worker-tick");
+        let app_state =
+            test_app_state_with_partitions(store.clone(), &redpanda, &state_dir, 1).await?;
+        let shard_workers = ShardWorkerPool::new(app_state.clone(), &[0]);
+        let _ = app_state.shard_workers.set(shard_workers);
+
+        let source_topic = JsonTopicConfig::new(
+            redpanda.workflow_broker.brokers.clone(),
+            format!("stream-source-worker-tick-{}", Uuid::now_v7()),
+            1,
+        );
+        let source_publisher = redpanda
+            .connect_json_publisher::<Value>(&source_topic, "throughput-topic-worker-tick-source")
+            .await?;
+        source_publisher.publish(&json!({"accountId": "acct_1", "amount": 2.0}), "acct_1").await?;
+        source_publisher.publish(&json!({"accountId": "acct_1", "amount": 3.0}), "acct_1").await?;
+
+        let occurred_at = Utc::now();
+        let handle = topic_stream_job_handle(
+            "tenant",
+            "instance-topic-worker-tick",
+            "run-topic-worker-tick",
+            "job-topic-worker-tick",
+            &source_topic.topic_name,
+            fabrik_throughput::StreamJobBridgeHandleStatus::Admitted,
+            None,
+            None,
+            occurred_at,
+        );
+        let handle_id = handle.handle_id.clone();
+        store.upsert_stream_job_bridge_handle(&handle).await?;
+
+        bridge::tick_active_topic_stream_job_workers(&app_state, 64).await?;
+
+        let mut observed_total = None;
+        for _ in 0..40 {
+            if let Some(view) = app_state
+                .local_state
+                .load_stream_job_view_state(&handle_id, "accountTotals", "acct_1")?
+            {
+                observed_total = view.output.get("totalAmount").and_then(Value::as_f64);
+                if observed_total == Some(5.0) {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let runtime_state = app_state
+            .local_state
+            .load_stream_job_runtime_state(&handle_id)?
+            .context("topic runtime state should be installed by active worker tick")?;
+        assert_eq!(runtime_state.source_cursors.len(), 1);
+        assert_eq!(runtime_state.source_cursors[0].last_applied_offset, Some(1));
+        assert_eq!(observed_total, Some(5.0));
+        assert!(
+            app_state
+                .active_topic_job_workers
+                .lock()
+                .expect("active topic worker lock poisoned")
+                .contains_key(&handle_id),
+            "topic worker tick should spawn a long-lived active worker"
+        );
+
+        fs::remove_dir_all(state_dir).ok();
         Ok(())
     }
 
@@ -13217,7 +13763,7 @@ mod tests {
                     lease_token: "lease-0".to_owned(),
                     updated_at: occurred_at,
                 }],
-                dispatch_batches: Vec::new(),
+                dispatch_dataflow_batches: Vec::new(),
                 applied_dispatch_batch_ids: Vec::new(),
                 dispatch_completed_at: None,
                 dispatch_cancelled_at: None,

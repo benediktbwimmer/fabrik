@@ -481,9 +481,9 @@ impl LocalThroughputState {
                         .as_ref()
                         .map(|state| state.source_partition_leases.clone())
                         .unwrap_or_default(),
-                    dispatch_batches: existing
+                    dispatch_dataflow_batches: existing
                         .as_ref()
-                        .map(|state| state.dispatch_batches.clone())
+                        .map(|state| state.dispatch_manifest_batches().to_vec())
                         .unwrap_or_default(),
                     applied_dispatch_batch_ids: existing
                         .as_ref()
@@ -1514,9 +1514,9 @@ impl LocalThroughputState {
                         .as_ref()
                         .map(|state| state.source_partition_leases.clone())
                         .unwrap_or_default(),
-                    dispatch_batches: existing
+                    dispatch_dataflow_batches: existing
                         .as_ref()
-                        .map(|state| state.dispatch_batches.clone())
+                        .map(|state| state.dispatch_manifest_batches().to_vec())
                         .unwrap_or_default(),
                     applied_dispatch_batch_ids: existing
                         .as_ref()

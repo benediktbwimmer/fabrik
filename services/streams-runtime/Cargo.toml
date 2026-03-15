@@ -5,7 +5,7 @@ license.workspace = true
 version.workspace = true
 
 [[bin]]
-name = "throughput-runtime"
+name = "streams-runtime"
 path = "src/bin/throughput-runtime.rs"
 
 [dependencies]
