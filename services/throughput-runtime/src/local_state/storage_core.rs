@@ -133,6 +133,16 @@ impl LocalThroughputState {
         checkpoint_name: &str,
         stream_partition_id: i32,
     ) -> Result<Option<LocalStreamJobCheckpointState>> {
+        if let Some(state) =
+            self.load_stream_job_runtime_state(handle_id)?.and_then(|runtime_state| {
+                runtime_state.checkpoint_partitions.into_iter().find(|state| {
+                    state.checkpoint_name == checkpoint_name
+                        && state.stream_partition_id == stream_partition_id
+                })
+            })
+        {
+            return Ok(Some(state));
+        }
         self.get_cf_bytes_with_legacy_fallback(
             STREAM_JOBS_CF,
             &stream_job_checkpoint_key(handle_id, checkpoint_name, stream_partition_id),
@@ -151,6 +161,18 @@ impl LocalThroughputState {
         &self,
     ) -> Result<Vec<LocalStreamJobCheckpointState>> {
         let mut checkpoints = BTreeMap::new();
+        for runtime_state in self.load_all_stream_job_runtime_states()? {
+            for state in runtime_state.checkpoint_partitions {
+                checkpoints.insert(
+                    (
+                        state.handle_id.clone(),
+                        state.checkpoint_name.clone(),
+                        state.stream_partition_id,
+                    ),
+                    state,
+                );
+            }
+        }
         for (_key, value) in self.load_prefixed_entries_bytes(
             STREAM_JOBS_CF,
             STREAM_JOB_CHECKPOINT_BINARY_PREFIX,
@@ -181,12 +203,66 @@ impl LocalThroughputState {
         Ok(checkpoints.into_values().collect())
     }
 
+    pub(crate) fn load_stream_job_workflow_signal_state(
+        &self,
+        handle_id: &str,
+        operator_id: &str,
+        logical_key: &str,
+    ) -> Result<Option<LocalStreamJobWorkflowSignalState>> {
+        self.get_cf_bytes_with_legacy_fallback(
+            STREAM_JOBS_CF,
+            &stream_job_signal_key(handle_id, operator_id, logical_key),
+            Some(&legacy_stream_job_signal_key(handle_id, operator_id, logical_key)),
+            "stream job workflow signal state",
+        )?
+        .map(|value| decode_rocksdb_value(&value, "stream job workflow signal state"))
+        .transpose()
+    }
+
+    pub(crate) fn load_all_stream_job_workflow_signals(
+        &self,
+    ) -> Result<Vec<LocalStreamJobWorkflowSignalState>> {
+        let mut signals = BTreeMap::new();
+        for (_key, value) in self.load_prefixed_entries_bytes(
+            STREAM_JOBS_CF,
+            STREAM_JOB_SIGNAL_BINARY_PREFIX,
+            "stream job workflow signals",
+        )? {
+            let state: LocalStreamJobWorkflowSignalState =
+                decode_rocksdb_value(&value, "stream job workflow signal state")?;
+            signals.insert(
+                (state.handle_id.clone(), state.operator_id.clone(), state.logical_key.clone()),
+                state,
+            );
+        }
+        for (_key, value) in self.load_prefixed_entries(
+            STREAM_JOBS_CF,
+            STREAM_JOB_SIGNAL_KEY_PREFIX,
+            "legacy stream job workflow signals",
+        )? {
+            let state: LocalStreamJobWorkflowSignalState =
+                decode_rocksdb_value(&value, "stream job workflow signal state")?;
+            signals
+                .entry((
+                    state.handle_id.clone(),
+                    state.operator_id.clone(),
+                    state.logical_key.clone(),
+                ))
+                .or_insert(state);
+        }
+        Ok(signals.into_values().collect())
+    }
+
     pub(crate) fn load_stream_job_view_state(
         &self,
         handle_id: &str,
         view_name: &str,
         logical_key: &str,
     ) -> Result<Option<LocalStreamJobViewState>> {
+        if let Some(state) = self.overlay_stream_job_view_lookup(handle_id, view_name, logical_key)
+        {
+            return Ok(state);
+        }
         self.get_cf_bytes_with_legacy_fallback(
             STREAM_JOBS_CF,
             &stream_job_view_key(handle_id, view_name, logical_key),
@@ -229,6 +305,16 @@ impl LocalThroughputState {
                 ))
                 .or_insert(state);
         }
+        for (key, value) in self.overlay_all_stream_job_view_entries() {
+            match value {
+                StreamJobViewOverlayEntry::Present(state) => {
+                    views.insert(key, state);
+                }
+                StreamJobViewOverlayEntry::Deleted => {
+                    views.remove(&key);
+                }
+            }
+        }
         Ok(views.into_values().collect())
     }
 
@@ -260,6 +346,21 @@ impl LocalThroughputState {
             let state: LocalStreamJobViewState =
                 decode_rocksdb_value(&value, "stream job view state")?;
             views.entry(state.logical_key.clone()).or_insert(state);
+        }
+        for ((overlay_handle_id, overlay_view_name, logical_key), value) in
+            self.overlay_all_stream_job_view_entries()
+        {
+            if overlay_handle_id != handle_id || overlay_view_name != view_name {
+                continue;
+            }
+            match value {
+                StreamJobViewOverlayEntry::Present(state) => {
+                    views.insert(logical_key, state);
+                }
+                StreamJobViewOverlayEntry::Deleted => {
+                    views.remove(&logical_key);
+                }
+            }
         }
         Ok(views.into_values().collect())
     }

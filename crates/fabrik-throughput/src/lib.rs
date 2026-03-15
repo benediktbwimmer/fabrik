@@ -214,6 +214,8 @@ pub struct CompiledKeyedRollupKernel {
     pub query_name: String,
     pub checkpoint_name: String,
     pub checkpoint_sequence: i64,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub workflow_signals: Vec<CompiledAggregateV2WorkflowSignal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -260,6 +262,23 @@ pub struct CompiledAggregateV2MaterializedView {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub struct CompiledAggregateV2Filter {
+    pub operator_id: String,
+    pub predicate: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CompiledAggregateV2WorkflowSignal {
+    pub operator_id: String,
+    pub view_name: String,
+    pub signal_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when_output_field: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub struct CompiledAggregateV2Checkpoint {
     pub name: String,
     pub sequence: i64,
@@ -275,9 +294,13 @@ pub struct CompiledAggregateV2Kernel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<CompiledAggregateV2Window>,
     #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub filters: Vec<CompiledAggregateV2Filter>,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
     pub aggregates: Vec<CompiledAggregateV2Aggregate>,
     #[serde(default, skip_serializing_if = "vec_is_empty")]
     pub materialized_views: Vec<CompiledAggregateV2MaterializedView>,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub workflow_signals: Vec<CompiledAggregateV2WorkflowSignal>,
     #[serde(default, skip_serializing_if = "vec_is_empty")]
     pub query_names: Vec<String>,
     #[serde(default, skip_serializing_if = "vec_is_empty")]
@@ -431,8 +454,10 @@ impl CompiledStreamJob {
 
         let key_field =
             self.key_by.clone().context("stream runtime keyed_rollup requires key_by")?;
-        if self.operators.len() != 2 {
-            anyhow::bail!("stream runtime keyed_rollup requires exactly 2 operators");
+        if self.operators.len() != 2 && self.operators.len() != 3 {
+            anyhow::bail!(
+                "stream runtime keyed_rollup requires exactly 2 operators, or 3 with a trailing signal_workflow"
+            );
         }
 
         let reduce = &self.operators[0];
@@ -555,6 +580,48 @@ impl CompiledStreamJob {
             );
         }
 
+        let workflow_signals = if self.operators.len() == 3 {
+            let signal = &self.operators[2];
+            if signal.kind != STREAM_OPERATOR_SIGNAL_WORKFLOW {
+                anyhow::bail!(
+                    "stream runtime keyed_rollup requires operator[2]=signal_workflow when a third operator is declared"
+                );
+            }
+            let operator_id = signal.operator_id.clone().or_else(|| signal.name.clone()).context(
+                "stream runtime keyed_rollup signal_workflow operators require operator_id or name",
+            )?;
+            let config = json_object(
+                signal.config.as_ref().context(
+                    "stream runtime keyed_rollup signal_workflow operator requires config",
+                )?,
+                "runtime keyed_rollup signal_workflow.config",
+            )?;
+            let signal_view_name =
+                json_string_field(config, "view", "runtime keyed_rollup signal_workflow.config")?;
+            if signal_view_name != view.name {
+                anyhow::bail!(
+                    "stream runtime keyed_rollup signal_workflow view must match the declared materialized view"
+                );
+            }
+            vec![CompiledAggregateV2WorkflowSignal {
+                operator_id,
+                view_name: signal_view_name.to_owned(),
+                signal_type: json_string_field(
+                    config,
+                    "signalType",
+                    "runtime keyed_rollup signal_workflow.config",
+                )?
+                .to_owned(),
+                when_output_field: json_optional_string_field(
+                    config,
+                    "whenOutputField",
+                    "runtime keyed_rollup signal_workflow.config",
+                )?,
+            }]
+        } else {
+            Vec::new()
+        };
+
         Ok(Some(CompiledKeyedRollupKernel {
             key_field,
             value_field,
@@ -563,6 +630,7 @@ impl CompiledStreamJob {
             query_name: query.name.clone(),
             checkpoint_name,
             checkpoint_sequence,
+            workflow_signals,
         }))
     }
 
@@ -594,19 +662,48 @@ impl CompiledStreamJob {
         }
 
         let mut window = None;
+        let mut filters = Vec::new();
         let mut aggregates = Vec::new();
         let mut materialized_views = Vec::new();
+        let mut workflow_signals = Vec::new();
         let mut checkpoints = Vec::new();
         let mut has_materialize = false;
 
         for operator in &self.operators {
             match operator.kind.as_str() {
                 STREAM_OPERATOR_MAP
-                | STREAM_OPERATOR_FILTER
                 | STREAM_OPERATOR_ROUTE
-                | STREAM_OPERATOR_SIGNAL_WORKFLOW
                 | STREAM_OPERATOR_SINK
                 | STREAM_OPERATOR_DEDUPE => {}
+                STREAM_OPERATOR_FILTER => {
+                    let operator_id = operator
+                        .operator_id
+                        .clone()
+                        .or_else(|| operator.name.clone())
+                        .context(
+                            "stream runtime aggregate_v2 filter operators require operator_id or name",
+                        )?;
+                    let config = json_object(
+                        operator.config.as_ref().context(
+                            "stream runtime aggregate_v2 filter operator requires config",
+                        )?,
+                        "runtime aggregate_v2 filter.config",
+                    )?;
+                    let predicate = json_string_field(
+                        config,
+                        "predicate",
+                        "runtime aggregate_v2 filter.config",
+                    )?;
+                    if predicate.trim().is_empty() {
+                        anyhow::bail!(
+                            "stream runtime aggregate_v2 filter predicate must not be empty"
+                        );
+                    }
+                    filters.push(CompiledAggregateV2Filter {
+                        operator_id,
+                        predicate: predicate.trim().to_owned(),
+                    });
+                }
                 STREAM_OPERATOR_WINDOW => {
                     let operator_id = operator.operator_id.clone().or_else(|| operator.name.clone()).context(
                         "stream runtime aggregate_v2 window operators require operator_id or name",
@@ -794,6 +891,49 @@ impl CompiledStreamJob {
                         },
                     });
                 }
+                STREAM_OPERATOR_SIGNAL_WORKFLOW => {
+                    let operator_id = operator
+                        .operator_id
+                        .clone()
+                        .or_else(|| operator.name.clone())
+                        .context(
+                            "stream runtime aggregate_v2 signal_workflow operators require operator_id or name",
+                        )?;
+                    let config = json_object(
+                        operator.config.as_ref().context(
+                            "stream runtime aggregate_v2 signal_workflow operator requires config",
+                        )?,
+                        "runtime aggregate_v2 signal_workflow.config",
+                    )?;
+                    let view_name = json_string_field(
+                        config,
+                        "view",
+                        "runtime aggregate_v2 signal_workflow.config",
+                    )?
+                    .to_owned();
+                    self.views.iter().find(|candidate| candidate.name == view_name).with_context(
+                        || {
+                            format!(
+                                "stream runtime aggregate_v2 signal_workflow view {view_name} must be declared"
+                            )
+                        },
+                    )?;
+                    workflow_signals.push(CompiledAggregateV2WorkflowSignal {
+                        operator_id,
+                        view_name,
+                        signal_type: json_string_field(
+                            config,
+                            "signalType",
+                            "runtime aggregate_v2 signal_workflow.config",
+                        )?
+                        .to_owned(),
+                        when_output_field: json_optional_string_field(
+                            config,
+                            "whenOutputField",
+                            "runtime aggregate_v2 signal_workflow.config",
+                        )?,
+                    });
+                }
                 STREAM_OPERATOR_EMIT_CHECKPOINT => {
                     let checkpoint_name = operator
                         .name
@@ -850,8 +990,10 @@ impl CompiledStreamJob {
             source_name: self.source.name.clone(),
             key_field,
             window,
+            filters,
             aggregates,
             materialized_views,
+            workflow_signals,
             query_names: self.queries.iter().map(|query| query.name.clone()).collect(),
             checkpoints,
             classification: self.classification.clone(),
@@ -2321,6 +2463,18 @@ pub enum ThroughputChangelogPayload {
         owner_epoch: u64,
         reached_at: DateTime<Utc>,
     },
+    StreamJobWorkflowSignaled {
+        handle_id: String,
+        job_id: String,
+        operator_id: String,
+        view_name: String,
+        logical_key: String,
+        signal_id: String,
+        signal_type: String,
+        payload: Value,
+        owner_epoch: u64,
+        signaled_at: DateTime<Utc>,
+    },
     StreamJobSourceLeaseAssigned {
         handle_id: String,
         job_id: String,
@@ -2462,6 +2616,13 @@ pub enum ThroughputChangelogPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamJobViewBatchUpdate {
+    pub view_name: String,
+    pub logical_key: String,
+    pub output: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ThroughputChangelogEntry {
     pub entry_id: Uuid,
     pub occurred_at: DateTime<Utc>,
@@ -2528,6 +2689,13 @@ pub enum StreamsChangelogPayload {
         checkpoint_sequence: i64,
         updated_at: DateTime<Utc>,
     },
+    StreamJobViewBatchUpdated {
+        handle_id: String,
+        job_id: String,
+        updates: Vec<StreamJobViewBatchUpdate>,
+        checkpoint_sequence: i64,
+        updated_at: DateTime<Utc>,
+    },
     StreamJobViewEvicted {
         handle_id: String,
         job_id: String,
@@ -2552,6 +2720,18 @@ pub enum StreamsChangelogPayload {
         stream_partition_id: i32,
         owner_epoch: u64,
         reached_at: DateTime<Utc>,
+    },
+    StreamJobWorkflowSignaled {
+        handle_id: String,
+        job_id: String,
+        operator_id: String,
+        view_name: String,
+        logical_key: String,
+        signal_id: String,
+        signal_type: String,
+        payload: Value,
+        owner_epoch: u64,
+        signaled_at: DateTime<Utc>,
     },
     StreamJobSourceLeaseAssigned {
         handle_id: String,
@@ -3332,6 +3512,115 @@ mod tests {
                 query_name: "accountTotals".to_owned(),
                 checkpoint_name: "hourly-rollup-ready".to_owned(),
                 checkpoint_sequence: 1,
+                workflow_signals: vec![],
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compiled_stream_artifact_derives_keyed_rollup_workflow_signal_kernel() -> Result<()> {
+        let job = CompiledStreamJob {
+            name: STREAM_JOB_KEYED_ROLLUP.to_owned(),
+            runtime: STREAM_RUNTIME_KEYED_ROLLUP.to_owned(),
+            source: CompiledStreamSource {
+                kind: STREAM_SOURCE_BOUNDED_INPUT.to_owned(),
+                name: None,
+                binding: None,
+                config: None,
+            },
+            key_by: Some("accountId".to_owned()),
+            states: vec![],
+            operators: vec![
+                CompiledStreamOperator {
+                    kind: STREAM_OPERATOR_REDUCE.to_owned(),
+                    operator_id: Some("sum-account-totals".to_owned()),
+                    name: Some("sum-account-totals".to_owned()),
+                    inputs: vec![],
+                    outputs: vec![],
+                    state_ids: vec![],
+                    config: Some(serde_json::json!({
+                        "reducer": STREAM_REDUCER_SUM,
+                        "valueField": "amount",
+                        "outputField": "totalAmount",
+                    })),
+                },
+                CompiledStreamOperator {
+                    kind: STREAM_OPERATOR_EMIT_CHECKPOINT.to_owned(),
+                    operator_id: Some("hourly-rollup-ready".to_owned()),
+                    name: Some("hourly-rollup-ready".to_owned()),
+                    inputs: vec![],
+                    outputs: vec![],
+                    state_ids: vec![],
+                    config: Some(serde_json::json!({
+                        "sequence": 1,
+                    })),
+                },
+                CompiledStreamOperator {
+                    kind: STREAM_OPERATOR_SIGNAL_WORKFLOW.to_owned(),
+                    operator_id: Some("notify-account-rollup".to_owned()),
+                    name: Some("notify-account-rollup".to_owned()),
+                    inputs: vec![],
+                    outputs: vec![],
+                    state_ids: vec![],
+                    config: Some(serde_json::json!({
+                        "view": "accountTotals",
+                        "signalType": "account.rollup.ready",
+                        "whenOutputField": "totalAmount",
+                    })),
+                },
+            ],
+            checkpoint_policy: Some(serde_json::json!({
+                "kind": STREAM_CHECKPOINT_POLICY_NAMED,
+                "checkpoints": [
+                    {
+                        "name": "hourly-rollup-ready",
+                        "delivery": STREAM_CHECKPOINT_DELIVERY_WORKFLOW_AWAITABLE,
+                        "sequence": 1,
+                    }
+                ],
+            })),
+            views: vec![CompiledStreamView {
+                name: "accountTotals".to_owned(),
+                consistency: STREAM_CONSISTENCY_STRONG.to_owned(),
+                query_mode: STREAM_QUERY_MODE_BY_KEY.to_owned(),
+                view_id: None,
+                key_field: Some("accountId".to_owned()),
+                value_fields: vec![
+                    "accountId".to_owned(),
+                    "totalAmount".to_owned(),
+                    "asOfCheckpoint".to_owned(),
+                ],
+                supported_consistencies: vec![STREAM_CONSISTENCY_STRONG.to_owned()],
+                retention_seconds: None,
+            }],
+            queries: vec![CompiledStreamQuery {
+                name: "accountTotals".to_owned(),
+                view_name: "accountTotals".to_owned(),
+                consistency: STREAM_CONSISTENCY_STRONG.to_owned(),
+                query_id: None,
+                arg_fields: vec![],
+            }],
+            classification: None,
+            metadata: None,
+        };
+
+        assert_eq!(
+            job.keyed_rollup_kernel()?,
+            Some(CompiledKeyedRollupKernel {
+                key_field: "accountId".to_owned(),
+                value_field: "amount".to_owned(),
+                output_field: "totalAmount".to_owned(),
+                view_name: "accountTotals".to_owned(),
+                query_name: "accountTotals".to_owned(),
+                checkpoint_name: "hourly-rollup-ready".to_owned(),
+                checkpoint_sequence: 1,
+                workflow_signals: vec![CompiledAggregateV2WorkflowSignal {
+                    operator_id: "notify-account-rollup".to_owned(),
+                    view_name: "accountTotals".to_owned(),
+                    signal_type: "account.rollup.ready".to_owned(),
+                    when_output_field: Some("totalAmount".to_owned()),
+                }],
             })
         );
         Ok(())
@@ -3734,11 +4023,17 @@ mod tests {
                     time_field: None,
                     allowed_lateness: None,
                 }),
+                filters: vec![CompiledAggregateV2Filter {
+                    operator_id: "filter-valid".to_owned(),
+                    predicate: "amount > 0".to_owned(),
+                }],
                 aggregates: vec![CompiledAggregateV2Aggregate {
                     operator_id: "avg-risk".to_owned(),
                     reducer: STREAM_REDUCER_AVG.to_owned(),
                     value_field: Some("risk".to_owned()),
                     output_field: Some("avgRisk".to_owned()),
+                    threshold: None,
+                    comparison: None,
                     state_ids: vec!["risk-state".to_owned()],
                 }],
                 materialized_views: vec![CompiledAggregateV2MaterializedView {
@@ -3751,11 +4046,244 @@ mod tests {
                         STREAM_CONSISTENCY_EVENTUAL.to_owned(),
                     ],
                 }],
+                workflow_signals: vec![],
                 query_names: vec!["riskScoresByKey".to_owned(), "riskScoresScan".to_owned()],
                 checkpoints: vec![CompiledAggregateV2Checkpoint {
                     name: "minute-closed".to_owned(),
                     sequence: 1,
                 }],
+                classification: Some("fast_lane".to_owned()),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compiled_stream_job_derives_threshold_aggregate_v2_kernel() -> Result<()> {
+        let job = CompiledStreamJob {
+            name: "fraud-thresholds".to_owned(),
+            runtime: STREAM_RUNTIME_AGGREGATE_V2.to_owned(),
+            source: CompiledStreamSource {
+                kind: STREAM_SOURCE_BOUNDED_INPUT.to_owned(),
+                name: None,
+                binding: None,
+                config: None,
+            },
+            key_by: Some("accountId".to_owned()),
+            states: vec![CompiledStreamState {
+                id: "risk-threshold".to_owned(),
+                kind: STREAM_STATE_KIND_KEYED.to_owned(),
+                key_fields: vec!["accountId".to_owned()],
+                value_fields: vec!["riskExceeded".to_owned()],
+                retention_seconds: Some(3600),
+                config: Some(serde_json::json!({
+                    "reducer": STREAM_REDUCER_THRESHOLD
+                })),
+            }],
+            operators: vec![
+                CompiledStreamOperator {
+                    kind: STREAM_OPERATOR_AGGREGATE.to_owned(),
+                    operator_id: Some("risk-threshold".to_owned()),
+                    name: Some("risk-threshold".to_owned()),
+                    inputs: vec!["source".to_owned()],
+                    outputs: vec!["risk-view".to_owned()],
+                    state_ids: vec!["risk-threshold".to_owned()],
+                    config: Some(serde_json::json!({
+                        "reducer": STREAM_REDUCER_THRESHOLD,
+                        "valueField": "risk",
+                        "threshold": 0.97,
+                        "comparison": "gte",
+                        "outputField": "riskExceeded"
+                    })),
+                },
+                CompiledStreamOperator {
+                    kind: STREAM_OPERATOR_MATERIALIZE.to_owned(),
+                    operator_id: Some("materialize-threshold".to_owned()),
+                    name: Some("materialize-threshold".to_owned()),
+                    inputs: vec!["risk-view".to_owned()],
+                    outputs: vec!["riskThresholds".to_owned()],
+                    state_ids: vec!["risk-threshold".to_owned()],
+                    config: Some(serde_json::json!({
+                        "view": "riskThresholds"
+                    })),
+                },
+            ],
+            checkpoint_policy: None,
+            views: vec![CompiledStreamView {
+                name: "riskThresholds".to_owned(),
+                consistency: STREAM_CONSISTENCY_STRONG.to_owned(),
+                query_mode: STREAM_QUERY_MODE_BY_KEY.to_owned(),
+                view_id: Some("risk-thresholds".to_owned()),
+                key_field: Some("accountId".to_owned()),
+                value_fields: vec!["accountId".to_owned(), "riskExceeded".to_owned()],
+                supported_consistencies: vec![STREAM_CONSISTENCY_STRONG.to_owned()],
+                retention_seconds: Some(3600),
+            }],
+            queries: vec![CompiledStreamQuery {
+                name: "riskThresholdsByKey".to_owned(),
+                view_name: "riskThresholds".to_owned(),
+                consistency: STREAM_CONSISTENCY_STRONG.to_owned(),
+                query_id: Some("risk-thresholds-by-key".to_owned()),
+                arg_fields: vec!["accountId".to_owned()],
+            }],
+            classification: Some("fast_lane".to_owned()),
+            metadata: None,
+        };
+
+        assert_eq!(
+            job.aggregate_v2_kernel()?,
+            Some(CompiledAggregateV2Kernel {
+                source_kind: STREAM_SOURCE_BOUNDED_INPUT.to_owned(),
+                source_name: None,
+                key_field: "accountId".to_owned(),
+                window: None,
+                filters: vec![],
+                aggregates: vec![CompiledAggregateV2Aggregate {
+                    operator_id: "risk-threshold".to_owned(),
+                    reducer: STREAM_REDUCER_THRESHOLD.to_owned(),
+                    value_field: Some("risk".to_owned()),
+                    output_field: Some("riskExceeded".to_owned()),
+                    threshold: Some(
+                        serde_json::Number::from_f64(0.97).expect("threshold should be finite")
+                    ),
+                    comparison: Some("gte".to_owned()),
+                    state_ids: vec!["risk-threshold".to_owned()],
+                }],
+                materialized_views: vec![CompiledAggregateV2MaterializedView {
+                    operator_id: "materialize-threshold".to_owned(),
+                    view_name: "riskThresholds".to_owned(),
+                    state_ids: vec!["risk-threshold".to_owned()],
+                    query_mode: STREAM_QUERY_MODE_BY_KEY.to_owned(),
+                    supported_consistencies: vec![STREAM_CONSISTENCY_STRONG.to_owned()],
+                }],
+                workflow_signals: vec![],
+                query_names: vec!["riskThresholdsByKey".to_owned()],
+                checkpoints: vec![],
+                classification: Some("fast_lane".to_owned()),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compiled_stream_job_derives_threshold_signal_aggregate_v2_kernel() -> Result<()> {
+        let job = CompiledStreamJob {
+            name: "fraud-threshold-signal".to_owned(),
+            runtime: STREAM_RUNTIME_AGGREGATE_V2.to_owned(),
+            source: CompiledStreamSource {
+                kind: STREAM_SOURCE_BOUNDED_INPUT.to_owned(),
+                name: None,
+                binding: None,
+                config: None,
+            },
+            key_by: Some("accountId".to_owned()),
+            states: vec![CompiledStreamState {
+                id: "risk-threshold".to_owned(),
+                kind: STREAM_STATE_KIND_KEYED.to_owned(),
+                key_fields: vec!["accountId".to_owned()],
+                value_fields: vec!["riskExceeded".to_owned()],
+                retention_seconds: Some(3600),
+                config: Some(serde_json::json!({
+                    "reducer": STREAM_REDUCER_THRESHOLD
+                })),
+            }],
+            operators: vec![
+                CompiledStreamOperator {
+                    kind: STREAM_OPERATOR_AGGREGATE.to_owned(),
+                    operator_id: Some("risk-threshold".to_owned()),
+                    name: Some("risk-threshold".to_owned()),
+                    inputs: vec!["source".to_owned()],
+                    outputs: vec!["risk-view".to_owned()],
+                    state_ids: vec!["risk-threshold".to_owned()],
+                    config: Some(serde_json::json!({
+                        "reducer": STREAM_REDUCER_THRESHOLD,
+                        "valueField": "risk",
+                        "threshold": 0.97,
+                        "comparison": "gte",
+                        "outputField": "riskExceeded"
+                    })),
+                },
+                CompiledStreamOperator {
+                    kind: STREAM_OPERATOR_MATERIALIZE.to_owned(),
+                    operator_id: Some("materialize-threshold".to_owned()),
+                    name: Some("materialize-threshold".to_owned()),
+                    inputs: vec!["risk-view".to_owned()],
+                    outputs: vec!["riskThresholds".to_owned()],
+                    state_ids: vec!["risk-threshold".to_owned()],
+                    config: Some(serde_json::json!({
+                        "view": "riskThresholds"
+                    })),
+                },
+                CompiledStreamOperator {
+                    kind: STREAM_OPERATOR_SIGNAL_WORKFLOW.to_owned(),
+                    operator_id: Some("notify-fraud".to_owned()),
+                    name: Some("notify-fraud".to_owned()),
+                    inputs: vec!["riskThresholds".to_owned()],
+                    outputs: vec![],
+                    state_ids: vec![],
+                    config: Some(serde_json::json!({
+                        "view": "riskThresholds",
+                        "signalType": "fraud.threshold.crossed",
+                        "whenOutputField": "riskExceeded"
+                    })),
+                },
+            ],
+            checkpoint_policy: None,
+            views: vec![CompiledStreamView {
+                name: "riskThresholds".to_owned(),
+                consistency: STREAM_CONSISTENCY_STRONG.to_owned(),
+                query_mode: STREAM_QUERY_MODE_BY_KEY.to_owned(),
+                view_id: Some("risk-thresholds".to_owned()),
+                key_field: Some("accountId".to_owned()),
+                value_fields: vec!["accountId".to_owned(), "riskExceeded".to_owned()],
+                supported_consistencies: vec![STREAM_CONSISTENCY_STRONG.to_owned()],
+                retention_seconds: Some(3600),
+            }],
+            queries: vec![CompiledStreamQuery {
+                name: "riskThresholdsByKey".to_owned(),
+                view_name: "riskThresholds".to_owned(),
+                consistency: STREAM_CONSISTENCY_STRONG.to_owned(),
+                query_id: Some("risk-thresholds-by-key".to_owned()),
+                arg_fields: vec!["accountId".to_owned()],
+            }],
+            classification: Some("fast_lane".to_owned()),
+            metadata: None,
+        };
+
+        assert_eq!(
+            job.aggregate_v2_kernel()?,
+            Some(CompiledAggregateV2Kernel {
+                source_kind: STREAM_SOURCE_BOUNDED_INPUT.to_owned(),
+                source_name: None,
+                key_field: "accountId".to_owned(),
+                window: None,
+                filters: vec![],
+                aggregates: vec![CompiledAggregateV2Aggregate {
+                    operator_id: "risk-threshold".to_owned(),
+                    reducer: STREAM_REDUCER_THRESHOLD.to_owned(),
+                    value_field: Some("risk".to_owned()),
+                    output_field: Some("riskExceeded".to_owned()),
+                    threshold: Some(
+                        serde_json::Number::from_f64(0.97).expect("threshold should be finite")
+                    ),
+                    comparison: Some("gte".to_owned()),
+                    state_ids: vec!["risk-threshold".to_owned()],
+                }],
+                materialized_views: vec![CompiledAggregateV2MaterializedView {
+                    operator_id: "materialize-threshold".to_owned(),
+                    view_name: "riskThresholds".to_owned(),
+                    state_ids: vec!["risk-threshold".to_owned()],
+                    query_mode: STREAM_QUERY_MODE_BY_KEY.to_owned(),
+                    supported_consistencies: vec![STREAM_CONSISTENCY_STRONG.to_owned()],
+                }],
+                workflow_signals: vec![CompiledAggregateV2WorkflowSignal {
+                    operator_id: "notify-fraud".to_owned(),
+                    view_name: "riskThresholds".to_owned(),
+                    signal_type: "fraud.threshold.crossed".to_owned(),
+                    when_output_field: Some("riskExceeded".to_owned()),
+                }],
+                query_names: vec!["riskThresholdsByKey".to_owned()],
+                checkpoints: vec![],
                 classification: Some("fast_lane".to_owned()),
             })
         );

@@ -20,7 +20,7 @@ use fabrik_throughput::{
     throughput_start_dedupe_key,
 };
 use fabrik_workflow::{ExecutionTurnContext, WorkflowInstanceState, execution_state_for_event};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -799,8 +799,16 @@ pub(super) async fn await_stream_job_terminal_via_bridge(
         .get_stream_job_callback_handle_by_handle_id(&request.handle_id)
         .await?
         .with_context(|| format!("stream job handle {} was not admitted", request.handle_id))?;
+    let mut changed = false;
     if request.workflow_owner_epoch.is_some() && handle.workflow_owner_epoch.is_none() {
         handle.workflow_owner_epoch = request.workflow_owner_epoch;
+        changed = true;
+    }
+    if handle.workflow_accepted_at.is_none() {
+        handle.workflow_accepted_at = Some(request.requested_at);
+        changed = true;
+    }
+    if changed {
         handle.updated_at = request.requested_at;
         state.store.upsert_stream_job_callback_handle(&handle).await?;
     }
@@ -839,7 +847,7 @@ fn stream_job_checkpoint_already_accepted(checkpoint: &StreamJobCheckpointRecord
 }
 
 fn stream_job_terminal_already_accepted(handle: &StreamJobBridgeHandleRecord) -> bool {
-    handle.workflow_accepted_at.is_some()
+    handle.terminal_event_id.is_some()
         && handle.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal)
 }
 
@@ -1428,38 +1436,56 @@ pub(super) async fn accept_stream_job_terminal_via_bridge(
     state: &AppState,
     event: EventEnvelope<WorkflowEvent>,
 ) -> Result<StreamJobBridgeAcceptance> {
-    let (job_id, _handle_id, terminal_status, terminal_output, error, stream_owner_epoch) =
-        match &event.payload {
-            WorkflowEvent::StreamJobCompleted { job_id, handle_id, output, stream_owner_epoch } => {
-                (
-                    job_id.clone(),
-                    handle_id.clone(),
-                    StreamJobBridgeHandleStatus::Completed,
-                    Some(output.clone()),
-                    None,
-                    *stream_owner_epoch,
-                )
-            }
-            WorkflowEvent::StreamJobFailed { job_id, handle_id, error, stream_owner_epoch } => (
-                job_id.clone(),
-                handle_id.clone(),
-                StreamJobBridgeHandleStatus::Failed,
-                None,
-                Some(error.clone()),
-                *stream_owner_epoch,
-            ),
-            WorkflowEvent::StreamJobCancelled { job_id, handle_id, reason, stream_owner_epoch } => {
-                (
-                    job_id.clone(),
-                    handle_id.clone(),
-                    StreamJobBridgeHandleStatus::Cancelled,
-                    None,
-                    Some(reason.clone()),
-                    *stream_owner_epoch,
-                )
-            }
-            _ => return Ok(StreamJobBridgeAcceptance::IgnoredMissingRun),
-        };
+    let (
+        job_id,
+        _handle_id,
+        terminal_status,
+        terminal_output,
+        terminal_error,
+        workflow_error,
+        stream_owner_epoch,
+    ): (
+        String,
+        String,
+        StreamJobBridgeHandleStatus,
+        Option<Value>,
+        Option<String>,
+        Option<String>,
+        Option<u64>,
+    ) = match &event.payload {
+        WorkflowEvent::StreamJobCompleted { job_id, handle_id, output, stream_owner_epoch } => (
+            job_id.clone(),
+            handle_id.clone(),
+            StreamJobBridgeHandleStatus::Completed,
+            Some(output.clone()),
+            None,
+            None,
+            *stream_owner_epoch,
+        ),
+        WorkflowEvent::StreamJobFailed { job_id, handle_id, error, stream_owner_epoch } => (
+            job_id.clone(),
+            handle_id.clone(),
+            StreamJobBridgeHandleStatus::Failed,
+            None,
+            Some(error.clone()),
+            Some(error.clone()),
+            *stream_owner_epoch,
+        ),
+        WorkflowEvent::StreamJobCancelled { job_id, handle_id, reason, stream_owner_epoch } => (
+            job_id.clone(),
+            handle_id.clone(),
+            StreamJobBridgeHandleStatus::Cancelled,
+            Some(json!({
+                "jobId": job_id,
+                "status": "cancelled",
+                "reason": reason,
+            })),
+            Some(reason.clone()),
+            None,
+            *stream_owner_epoch,
+        ),
+        _ => return Ok(StreamJobBridgeAcceptance::IgnoredMissingRun),
+    };
     let Some(mut handle) = state
         .store
         .get_stream_job_callback_handle(
@@ -1483,7 +1509,7 @@ pub(super) async fn accept_stream_job_terminal_via_bridge(
     handle.terminal_event_id = Some(event.event_id);
     handle.terminal_at = Some(event.occurred_at);
     handle.terminal_output = terminal_output.clone();
-    handle.terminal_error = error.clone();
+    handle.terminal_error = terminal_error.clone();
     handle.updated_at = event.occurred_at;
     state.store.upsert_stream_job_callback_handle(&handle).await?;
     for mut checkpoint in state
@@ -1549,7 +1575,7 @@ pub(super) async fn accept_stream_job_terminal_via_bridge(
                         &current_state,
                         &job_id,
                         terminal_output.as_ref(),
-                        error.as_deref(),
+                        workflow_error.as_deref(),
                         execution_state_for_event(&runtime.instance, Some(&event)),
                         ExecutionTurnContext {
                             event_id: event.event_id,

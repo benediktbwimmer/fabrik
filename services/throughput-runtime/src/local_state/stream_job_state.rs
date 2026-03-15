@@ -7,6 +7,267 @@ pub(crate) struct StreamJobDispatchBatchAppliedOutcome {
 }
 
 impl LocalThroughputState {
+    fn write_stream_job_runtime_state_to_batch(
+        &self,
+        write_batch: &mut WriteBatch,
+        state: &LocalStreamJobRuntimeState,
+    ) -> Result<()> {
+        self.write_batch_delete_cf_and_legacy(
+            write_batch,
+            STREAM_JOBS_CF,
+            &legacy_stream_job_runtime_key(&state.handle_id),
+        );
+        self.write_batch_put_cf_bytes(
+            write_batch,
+            STREAM_JOBS_CF,
+            &stream_job_runtime_key(&state.handle_id),
+            encode_rocksdb_value(state, "stream job runtime state")?,
+        );
+        Ok(())
+    }
+
+    fn optimized_stream_job_mirror_supported(entry: &StreamsChangelogEntry) -> bool {
+        matches!(
+            entry.payload,
+            StreamsChangelogPayload::StreamJobCheckpointReached { .. }
+                | StreamsChangelogPayload::StreamJobWorkflowSignaled { .. }
+        )
+    }
+
+    fn write_optimized_stream_job_mirrors(
+        &self,
+        write_batch: &mut WriteBatch,
+        handle_id: &str,
+        compact_checkpoint_mirrors: bool,
+        write_mirrored_entry_markers: bool,
+        completes_dispatch: bool,
+        updated_at: DateTime<Utc>,
+        mirrored_stream_entries: &[StreamsChangelogEntry],
+    ) -> Result<bool> {
+        let requires_runtime_state = completes_dispatch
+            || mirrored_stream_entries.iter().any(|entry| {
+                matches!(entry.payload, StreamsChangelogPayload::StreamJobCheckpointReached { .. })
+            });
+        let mut runtime_state = if requires_runtime_state {
+            self.load_stream_job_runtime_state(handle_id)?
+        } else {
+            None
+        };
+        if requires_runtime_state && runtime_state.is_none() {
+            anyhow::bail!("stream job runtime state missing for handle {handle_id}");
+        }
+
+        let mut runtime_state_updated = false;
+        if completes_dispatch {
+            let state = runtime_state.as_mut().expect("checked runtime state existence");
+            state.dispatch_completed_at = Some(updated_at);
+            state.updated_at = updated_at;
+            runtime_state_updated = true;
+        }
+
+        for entry in mirrored_stream_entries {
+            match &entry.payload {
+                StreamsChangelogPayload::StreamJobCheckpointReached {
+                    handle_id,
+                    job_id,
+                    checkpoint_name,
+                    checkpoint_sequence,
+                    stream_partition_id,
+                    owner_epoch,
+                    reached_at,
+                } => {
+                    let checkpoint_state = LocalStreamJobCheckpointState {
+                        handle_id: handle_id.clone(),
+                        job_id: job_id.clone(),
+                        checkpoint_name: checkpoint_name.clone(),
+                        checkpoint_sequence: *checkpoint_sequence,
+                        stream_partition_id: *stream_partition_id,
+                        stream_owner_epoch: *owner_epoch,
+                        reached_at: *reached_at,
+                        updated_at: *reached_at,
+                    };
+                    if !compact_checkpoint_mirrors {
+                        self.write_batch_delete_cf_and_legacy(
+                            write_batch,
+                            STREAM_JOBS_CF,
+                            &legacy_stream_job_checkpoint_key(
+                                handle_id,
+                                checkpoint_name,
+                                *stream_partition_id,
+                            ),
+                        );
+                        self.write_batch_put_cf_bytes(
+                            write_batch,
+                            STREAM_JOBS_CF,
+                            &stream_job_checkpoint_key(
+                                handle_id,
+                                checkpoint_name,
+                                *stream_partition_id,
+                            ),
+                            encode_rocksdb_value(&checkpoint_state, "stream job checkpoint state")?,
+                        );
+                    }
+
+                    let state = runtime_state.as_mut().expect("checked runtime state existence");
+                    state.job_id = job_id.clone();
+                    state.checkpoint_name = checkpoint_name.clone();
+                    state.checkpoint_sequence = *checkpoint_sequence;
+                    state.stream_owner_epoch = *owner_epoch;
+                    if let Some(cursor) = state
+                        .source_cursors
+                        .iter_mut()
+                        .find(|cursor| cursor.source_partition_id == *stream_partition_id)
+                    {
+                        cursor.checkpoint_reached_at = Some(*reached_at);
+                        cursor.updated_at = *reached_at;
+                    }
+                    state.latest_checkpoint_at = Some(*reached_at);
+                    state.updated_at = *reached_at;
+                    if compact_checkpoint_mirrors {
+                        state.record_checkpoint_partition(checkpoint_state);
+                    }
+                    runtime_state_updated = true;
+                }
+                StreamsChangelogPayload::StreamJobWorkflowSignaled {
+                    handle_id,
+                    job_id,
+                    operator_id,
+                    view_name,
+                    logical_key,
+                    signal_id,
+                    signal_type,
+                    payload,
+                    owner_epoch,
+                    signaled_at,
+                } => {
+                    let signal_state = LocalStreamJobWorkflowSignalState {
+                        handle_id: handle_id.clone(),
+                        job_id: job_id.clone(),
+                        operator_id: operator_id.clone(),
+                        view_name: view_name.clone(),
+                        logical_key: logical_key.clone(),
+                        signal_id: signal_id.clone(),
+                        signal_type: signal_type.clone(),
+                        payload: payload.clone(),
+                        stream_owner_epoch: *owner_epoch,
+                        signaled_at: *signaled_at,
+                        published_at: None,
+                        updated_at: *signaled_at,
+                    };
+                    self.write_batch_delete_cf_and_legacy(
+                        write_batch,
+                        STREAM_JOBS_CF,
+                        &legacy_stream_job_signal_key(handle_id, operator_id, logical_key),
+                    );
+                    self.write_batch_put_cf_bytes(
+                        write_batch,
+                        STREAM_JOBS_CF,
+                        &stream_job_signal_key(handle_id, operator_id, logical_key),
+                        encode_rocksdb_value(&signal_state, "stream job workflow signal state")?,
+                    );
+                }
+                _ => unreachable!("optimized stream job mirror received unsupported entry"),
+            }
+            if write_mirrored_entry_markers {
+                self.write_batch_put_cf(
+                    write_batch,
+                    META_CF,
+                    &mirrored_entry_key(LocalChangelogPlane::Streams, entry.entry_id),
+                    b"1".to_vec(),
+                );
+            }
+        }
+
+        if let Some(state) = runtime_state.as_ref()
+            && runtime_state_updated
+        {
+            self.write_stream_job_runtime_state_to_batch(write_batch, state)?;
+        }
+
+        Ok(runtime_state_updated)
+    }
+
+    fn stream_job_view_overlay_key(
+        handle_id: &str,
+        view_name: &str,
+        logical_key: &str,
+    ) -> StreamJobViewOverlayKey {
+        (handle_id.to_owned(), view_name.to_owned(), logical_key.to_owned())
+    }
+
+    pub(crate) fn overlay_stream_job_view_state(&self, state: LocalStreamJobViewState) {
+        let key = Self::stream_job_view_overlay_key(
+            &state.handle_id,
+            &state.view_name,
+            &state.logical_key,
+        );
+        let mut overlay =
+            self.stream_job_view_overlay.lock().expect("stream job view overlay lock poisoned");
+        overlay.insert(key, StreamJobViewOverlayEntry::Present(state));
+    }
+
+    pub(crate) fn overlay_stream_job_view_states(&self, states: &[LocalStreamJobViewState]) {
+        if states.is_empty() {
+            return;
+        }
+        let mut overlay =
+            self.stream_job_view_overlay.lock().expect("stream job view overlay lock poisoned");
+        overlay.reserve(states.len());
+        for state in states {
+            let key = Self::stream_job_view_overlay_key(
+                &state.handle_id,
+                &state.view_name,
+                &state.logical_key,
+            );
+            overlay.insert(key, StreamJobViewOverlayEntry::Present(state.clone()));
+        }
+    }
+
+    pub(crate) fn overlay_delete_stream_job_view_state(
+        &self,
+        handle_id: &str,
+        view_name: &str,
+        logical_key: &str,
+    ) {
+        let key = Self::stream_job_view_overlay_key(handle_id, view_name, logical_key);
+        let mut overlay =
+            self.stream_job_view_overlay.lock().expect("stream job view overlay lock poisoned");
+        overlay.insert(key, StreamJobViewOverlayEntry::Deleted);
+    }
+
+    pub(crate) fn overlay_delete_stream_job_view_states(&self, views: &[(String, String, String)]) {
+        if views.is_empty() {
+            return;
+        }
+        let mut overlay =
+            self.stream_job_view_overlay.lock().expect("stream job view overlay lock poisoned");
+        for (handle_id, view_name, logical_key) in views {
+            let key = Self::stream_job_view_overlay_key(handle_id, view_name, logical_key);
+            overlay.insert(key, StreamJobViewOverlayEntry::Deleted);
+        }
+    }
+
+    pub(crate) fn overlay_stream_job_view_lookup(
+        &self,
+        handle_id: &str,
+        view_name: &str,
+        logical_key: &str,
+    ) -> Option<Option<LocalStreamJobViewState>> {
+        let overlay =
+            self.stream_job_view_overlay.lock().expect("stream job view overlay lock poisoned");
+        match overlay.get(&Self::stream_job_view_overlay_key(handle_id, view_name, logical_key)) {
+            Some(StreamJobViewOverlayEntry::Present(state)) => Some(Some(state.clone())),
+            Some(StreamJobViewOverlayEntry::Deleted) => Some(None),
+            None => None,
+        }
+    }
+
+    pub(crate) fn overlay_all_stream_job_view_entries(
+        &self,
+    ) -> HashMap<StreamJobViewOverlayKey, StreamJobViewOverlayEntry> {
+        self.stream_job_view_overlay.lock().expect("stream job view overlay lock poisoned").clone()
+    }
+
     fn write_stream_job_state_batch(
         &self,
         write_batch: WriteBatch,
@@ -157,9 +418,10 @@ impl LocalThroughputState {
         &self,
         handle_id: &str,
         batch_id: &str,
+        compact_checkpoint_mirrors: bool,
         completes_dispatch: bool,
         updated_at: DateTime<Utc>,
-        owner_view_updates: &[LocalStreamJobViewState],
+        owner_view_updates: Vec<LocalStreamJobViewState>,
         mirrored_stream_entries: &[StreamsChangelogEntry],
     ) -> Result<StreamJobDispatchBatchAppliedOutcome> {
         if self.has_stream_job_applied_dispatch_batch(handle_id, batch_id)? {
@@ -176,43 +438,136 @@ impl LocalThroughputState {
             &stream_job_dispatch_applied_key(handle_id, batch_id),
             Vec::new(),
         );
-        let runtime_state_updated = if completes_dispatch {
-            let Some(mut runtime_state) = self.load_stream_job_runtime_state(handle_id)? else {
-                anyhow::bail!("stream job runtime state missing for handle {handle_id}");
-            };
-            runtime_state.dispatch_completed_at = Some(updated_at);
-            runtime_state.updated_at = updated_at;
-            self.write_batch_delete_cf_and_legacy(
-                &mut write_batch,
-                STREAM_JOBS_CF,
-                &legacy_stream_job_runtime_key(&runtime_state.handle_id),
-            );
-            self.write_batch_put_cf_bytes(
-                &mut write_batch,
-                STREAM_JOBS_CF,
-                &stream_job_runtime_key(&runtime_state.handle_id),
-                encode_rocksdb_value(&runtime_state, "stream job runtime state")?,
-            );
-            true
-        } else {
-            false
-        };
+        let runtime_state_updated =
+            if mirrored_stream_entries.iter().all(Self::optimized_stream_job_mirror_supported) {
+                self.write_optimized_stream_job_mirrors(
+                    &mut write_batch,
+                    handle_id,
+                    compact_checkpoint_mirrors,
+                    true,
+                    completes_dispatch,
+                    updated_at,
+                    mirrored_stream_entries,
+                )?
+            } else {
+                let runtime_state_updated = if completes_dispatch {
+                    let Some(mut runtime_state) = self.load_stream_job_runtime_state(handle_id)?
+                    else {
+                        anyhow::bail!("stream job runtime state missing for handle {handle_id}");
+                    };
+                    runtime_state.dispatch_completed_at = Some(updated_at);
+                    runtime_state.updated_at = updated_at;
+                    self.write_stream_job_runtime_state_to_batch(&mut write_batch, &runtime_state)?;
+                    true
+                } else {
+                    false
+                };
 
-        self.write_stream_job_view_states_batch(&mut write_batch, owner_view_updates)?;
-        for entry in mirrored_stream_entries {
-            self.write_streams_entry_payload(&mut write_batch, entry)?;
-            self.write_batch_put_cf(
-                &mut write_batch,
-                META_CF,
-                &mirrored_entry_key(LocalChangelogPlane::Streams, entry.entry_id),
-                b"1".to_vec(),
-            );
-        }
+                for entry in mirrored_stream_entries {
+                    self.write_streams_entry_payload(&mut write_batch, entry)?;
+                    self.write_batch_put_cf(
+                        &mut write_batch,
+                        META_CF,
+                        &mirrored_entry_key(LocalChangelogPlane::Streams, entry.entry_id),
+                        b"1".to_vec(),
+                    );
+                }
+                runtime_state_updated
+            };
 
         self.write_stream_job_state_batch(
             write_batch,
             "failed to persist stream job batch apply to local state",
         )?;
+        let mut overlay =
+            self.stream_job_view_overlay.lock().expect("stream job view overlay lock poisoned");
+        overlay.reserve(owner_view_updates.len());
+        for state in owner_view_updates {
+            let key = Self::stream_job_view_overlay_key(
+                &state.handle_id,
+                &state.view_name,
+                &state.logical_key,
+            );
+            overlay.insert(key, StreamJobViewOverlayEntry::Present(state));
+        }
+        Ok(StreamJobDispatchBatchAppliedOutcome { inserted: true, runtime_state_updated })
+    }
+
+    pub(crate) fn persist_stream_job_activation_apply(
+        &self,
+        handle_id: &str,
+        batch_ids: &[String],
+        compact_checkpoint_mirrors: bool,
+        completes_dispatch: bool,
+        updated_at: DateTime<Utc>,
+        owner_view_updates: Vec<LocalStreamJobViewState>,
+        mirrored_stream_entries: &[StreamsChangelogEntry],
+    ) -> Result<StreamJobDispatchBatchAppliedOutcome> {
+        let mut pending_batch_ids = Vec::with_capacity(batch_ids.len());
+        for batch_id in batch_ids {
+            if !self.has_stream_job_applied_dispatch_batch(handle_id, batch_id)? {
+                pending_batch_ids.push(batch_id.clone());
+            }
+        }
+        if pending_batch_ids.is_empty() {
+            return Ok(StreamJobDispatchBatchAppliedOutcome {
+                inserted: false,
+                runtime_state_updated: false,
+            });
+        }
+
+        let mut write_batch = WriteBatch::default();
+        for batch_id in &pending_batch_ids {
+            self.write_batch_put_cf_bytes(
+                &mut write_batch,
+                STREAM_JOBS_CF,
+                &stream_job_dispatch_applied_key(handle_id, batch_id),
+                Vec::new(),
+            );
+        }
+
+        let runtime_state_updated =
+            if mirrored_stream_entries.iter().all(Self::optimized_stream_job_mirror_supported) {
+                self.write_optimized_stream_job_mirrors(
+                    &mut write_batch,
+                    handle_id,
+                    compact_checkpoint_mirrors,
+                    false,
+                    completes_dispatch,
+                    updated_at,
+                    mirrored_stream_entries,
+                )?
+            } else {
+                let runtime_state_updated = if completes_dispatch {
+                    let Some(mut runtime_state) = self.load_stream_job_runtime_state(handle_id)?
+                    else {
+                        anyhow::bail!("stream job runtime state missing for handle {handle_id}");
+                    };
+                    runtime_state.dispatch_completed_at = Some(updated_at);
+                    runtime_state.updated_at = updated_at;
+                    self.write_stream_job_runtime_state_to_batch(&mut write_batch, &runtime_state)?;
+                    true
+                } else {
+                    false
+                };
+                runtime_state_updated
+            };
+
+        self.write_stream_job_state_batch(
+            write_batch,
+            "failed to persist stream job activation apply to local state",
+        )?;
+        let mut overlay =
+            self.stream_job_view_overlay.lock().expect("stream job view overlay lock poisoned");
+        overlay.reserve(owner_view_updates.len());
+        for state in owner_view_updates {
+            let key = Self::stream_job_view_overlay_key(
+                &state.handle_id,
+                &state.view_name,
+                &state.logical_key,
+            );
+            overlay.insert(key, StreamJobViewOverlayEntry::Present(state));
+        }
         Ok(StreamJobDispatchBatchAppliedOutcome { inserted: true, runtime_state_updated })
     }
 
@@ -258,7 +613,9 @@ impl LocalThroughputState {
         self.write_stream_job_state_batch(
             write_batch,
             "failed to store stream job view state in column family stream_jobs",
-        )
+        )?;
+        self.overlay_stream_job_view_state(state);
+        Ok(())
     }
 
     pub(crate) fn upsert_stream_job_view_states(
@@ -273,7 +630,9 @@ impl LocalThroughputState {
         self.write_stream_job_state_batch(
             write_batch,
             "failed to store stream job view states in column family stream_jobs",
-        )
+        )?;
+        self.overlay_stream_job_view_states(states);
+        Ok(())
     }
 
     pub(crate) fn delete_stream_job_view_state(
@@ -283,6 +642,10 @@ impl LocalThroughputState {
         logical_key: &str,
     ) -> Result<()> {
         let mut write_batch = WriteBatch::default();
+        write_batch.delete_cf(
+            self.cf(STREAM_JOBS_CF),
+            &stream_job_view_key(handle_id, view_name, logical_key),
+        );
         self.write_batch_delete_cf_and_legacy(
             &mut write_batch,
             STREAM_JOBS_CF,
@@ -291,7 +654,9 @@ impl LocalThroughputState {
         self.write_stream_job_state_batch(
             write_batch,
             "failed to delete stream job view state from column family stream_jobs",
-        )
+        )?;
+        self.overlay_delete_stream_job_view_state(handle_id, view_name, logical_key);
+        Ok(())
     }
 
     pub(crate) fn delete_stream_job_view_states(
@@ -316,6 +681,43 @@ impl LocalThroughputState {
         self.write_stream_job_state_batch(
             write_batch,
             "failed to delete stream job view states from column family stream_jobs",
+        )?;
+        self.overlay_delete_stream_job_view_states(views);
+        Ok(())
+    }
+
+    pub(crate) fn mark_stream_job_workflow_signal_published(
+        &self,
+        handle_id: &str,
+        operator_id: &str,
+        logical_key: &str,
+        published_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let Some(mut state) =
+            self.load_stream_job_workflow_signal_state(handle_id, operator_id, logical_key)?
+        else {
+            return Ok(());
+        };
+        if state.published_at.is_some() {
+            return Ok(());
+        }
+        state.published_at = Some(published_at);
+        state.updated_at = published_at;
+        let mut write_batch = WriteBatch::default();
+        self.write_batch_delete_cf_and_legacy(
+            &mut write_batch,
+            STREAM_JOBS_CF,
+            &legacy_stream_job_signal_key(handle_id, operator_id, logical_key),
+        );
+        self.write_batch_put_cf_bytes(
+            &mut write_batch,
+            STREAM_JOBS_CF,
+            &stream_job_signal_key(handle_id, operator_id, logical_key),
+            encode_rocksdb_value(&state, "stream job workflow signal state")?,
+        );
+        self.write_stream_job_state_batch(
+            write_batch,
+            "failed to mark stream job workflow signal published in column family stream_jobs",
         )
     }
 }

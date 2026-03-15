@@ -7,14 +7,18 @@ impl LocalThroughputState {
         offset: i64,
         entry: &ThroughputChangelogEntry,
     ) -> Result<bool> {
-        self.apply_changelog_entry_for_plane(
+        let applied = self.apply_changelog_entry_for_plane(
             LocalChangelogPlane::Throughput,
             partition_id,
             offset,
             entry.entry_id,
             entry.occurred_at,
             |state, write_batch| state.write_entry_payload(write_batch, entry),
-        )
+        )?;
+        if applied {
+            self.sync_stream_job_view_overlay_from_throughput_entry(entry);
+        }
+        Ok(applied)
     }
 
     pub fn apply_streams_changelog_entry(
@@ -23,14 +27,18 @@ impl LocalThroughputState {
         offset: i64,
         entry: &StreamsChangelogEntry,
     ) -> Result<bool> {
-        self.apply_changelog_entry_for_plane(
+        let applied = self.apply_changelog_entry_for_plane(
             LocalChangelogPlane::Streams,
             partition_id,
             offset,
             entry.entry_id,
             entry.occurred_at,
             |state, write_batch| state.write_streams_entry_payload(write_batch, entry),
-        )
+        )?;
+        if applied {
+            self.sync_stream_job_view_overlay_from_streams_entry(entry);
+        }
+        Ok(applied)
     }
 
     pub fn mirror_changelog_entry(&self, entry: &ThroughputChangelogEntry) -> Result<()> {
@@ -45,7 +53,11 @@ impl LocalThroughputState {
                     state.write_entry_payload(write_batch, entry)
                 })
             }),
-        )
+        )?;
+        for entry in entries {
+            self.sync_stream_job_view_overlay_from_throughput_entry(entry);
+        }
+        Ok(())
     }
 
     pub fn mirror_streams_changelog_entry(&self, entry: &StreamsChangelogEntry) -> Result<()> {
@@ -63,7 +75,89 @@ impl LocalThroughputState {
                     state.write_streams_entry_payload(write_batch, entry)
                 })
             }),
-        )
+        )?;
+        for entry in entries {
+            self.sync_stream_job_view_overlay_from_streams_entry(entry);
+        }
+        Ok(())
+    }
+
+    fn sync_stream_job_view_overlay_from_throughput_entry(&self, entry: &ThroughputChangelogEntry) {
+        match &entry.payload {
+            ThroughputChangelogPayload::StreamJobViewUpdated {
+                handle_id,
+                job_id,
+                view_name,
+                logical_key,
+                output,
+                checkpoint_sequence,
+                updated_at,
+            } => self.overlay_stream_job_view_state(LocalStreamJobViewState {
+                handle_id: handle_id.clone(),
+                job_id: job_id.clone(),
+                view_name: view_name.clone(),
+                logical_key: logical_key.clone(),
+                output: output.clone(),
+                checkpoint_sequence: *checkpoint_sequence,
+                updated_at: *updated_at,
+            }),
+            ThroughputChangelogPayload::StreamJobViewEvicted {
+                handle_id,
+                view_name,
+                logical_key,
+                ..
+            } => self.overlay_delete_stream_job_view_state(handle_id, view_name, logical_key),
+            _ => {}
+        }
+    }
+
+    fn sync_stream_job_view_overlay_from_streams_entry(&self, entry: &StreamsChangelogEntry) {
+        match &entry.payload {
+            StreamsChangelogPayload::StreamJobViewUpdated {
+                handle_id,
+                job_id,
+                view_name,
+                logical_key,
+                output,
+                checkpoint_sequence,
+                updated_at,
+            } => self.overlay_stream_job_view_state(LocalStreamJobViewState {
+                handle_id: handle_id.clone(),
+                job_id: job_id.clone(),
+                view_name: view_name.clone(),
+                logical_key: logical_key.clone(),
+                output: output.clone(),
+                checkpoint_sequence: *checkpoint_sequence,
+                updated_at: *updated_at,
+            }),
+            StreamsChangelogPayload::StreamJobViewBatchUpdated {
+                handle_id,
+                job_id,
+                updates,
+                checkpoint_sequence,
+                updated_at,
+            } => self.overlay_stream_job_view_states(
+                &updates
+                    .iter()
+                    .map(|update| LocalStreamJobViewState {
+                        handle_id: handle_id.clone(),
+                        job_id: job_id.clone(),
+                        view_name: update.view_name.clone(),
+                        logical_key: update.logical_key.clone(),
+                        output: update.output.clone(),
+                        checkpoint_sequence: *checkpoint_sequence,
+                        updated_at: *updated_at,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            StreamsChangelogPayload::StreamJobViewEvicted {
+                handle_id,
+                view_name,
+                logical_key,
+                ..
+            } => self.overlay_delete_stream_job_view_state(handle_id, view_name, logical_key),
+            _ => {}
+        }
     }
 
     fn apply_changelog_entry_for_plane<F>(
@@ -408,6 +502,14 @@ impl LocalThroughputState {
                         .as_ref()
                         .and_then(|state| state.last_evicted_window_end),
                     last_evicted_at: existing.as_ref().and_then(|state| state.last_evicted_at),
+                    view_runtime_stats: existing
+                        .as_ref()
+                        .map(|state| state.view_runtime_stats.clone())
+                        .unwrap_or_default(),
+                    checkpoint_partitions: existing
+                        .as_ref()
+                        .map(|state| state.checkpoint_partitions.clone())
+                        .unwrap_or_default(),
                     terminal_status: existing
                         .as_ref()
                         .and_then(|state| state.terminal_status.clone()),
@@ -464,9 +566,11 @@ impl LocalThroughputState {
             }
             ThroughputChangelogPayload::StreamJobViewEvicted {
                 handle_id,
+                window_end,
                 evicted_window_count,
                 last_evicted_window_end,
                 last_evicted_at,
+                evicted_at,
                 view_name,
                 logical_key,
                 ..
@@ -484,6 +588,7 @@ impl LocalThroughputState {
                     runtime_state.evicted_window_count = *evicted_window_count;
                     runtime_state.last_evicted_window_end = *last_evicted_window_end;
                     runtime_state.last_evicted_at = *last_evicted_at;
+                    runtime_state.record_view_eviction(view_name, *window_end, Some(*evicted_at));
                     runtime_state.updated_at = last_evicted_at.unwrap_or(runtime_state.updated_at);
                     self.write_batch_delete_cf_and_legacy(
                         write_batch,
@@ -559,6 +664,44 @@ impl LocalThroughputState {
                         encode_rocksdb_value(&runtime_state, "stream job runtime state")?,
                     );
                 }
+            }
+            ThroughputChangelogPayload::StreamJobWorkflowSignaled {
+                handle_id,
+                job_id,
+                operator_id,
+                view_name,
+                logical_key,
+                signal_id,
+                signal_type,
+                payload,
+                owner_epoch,
+                signaled_at,
+            } => {
+                let signal_state = LocalStreamJobWorkflowSignalState {
+                    handle_id: handle_id.clone(),
+                    job_id: job_id.clone(),
+                    operator_id: operator_id.clone(),
+                    view_name: view_name.clone(),
+                    logical_key: logical_key.clone(),
+                    signal_id: signal_id.clone(),
+                    signal_type: signal_type.clone(),
+                    payload: payload.clone(),
+                    stream_owner_epoch: *owner_epoch,
+                    signaled_at: *signaled_at,
+                    published_at: None,
+                    updated_at: *signaled_at,
+                };
+                self.write_batch_delete_cf_and_legacy(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &legacy_stream_job_signal_key(handle_id, operator_id, logical_key),
+                );
+                self.write_batch_put_cf_bytes(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &stream_job_signal_key(handle_id, operator_id, logical_key),
+                    encode_rocksdb_value(&signal_state, "stream job workflow signal state")?,
+                );
             }
             ThroughputChangelogPayload::StreamJobSourceLeaseAssigned {
                 handle_id,
@@ -1359,6 +1502,14 @@ impl LocalThroughputState {
                         .as_ref()
                         .and_then(|state| state.last_evicted_window_end),
                     last_evicted_at: existing.as_ref().and_then(|state| state.last_evicted_at),
+                    view_runtime_stats: existing
+                        .as_ref()
+                        .map(|state| state.view_runtime_stats.clone())
+                        .unwrap_or_default(),
+                    checkpoint_partitions: existing
+                        .as_ref()
+                        .map(|state| state.checkpoint_partitions.clone())
+                        .unwrap_or_default(),
                     terminal_status: existing
                         .as_ref()
                         .and_then(|state| state.terminal_status.clone()),
@@ -1408,11 +1559,38 @@ impl LocalThroughputState {
                     encode_stream_job_view_state_value(&state)?,
                 );
             }
+            StreamsChangelogPayload::StreamJobViewBatchUpdated {
+                handle_id,
+                job_id,
+                updates,
+                checkpoint_sequence,
+                updated_at,
+            } => {
+                for update in updates {
+                    let state = LocalStreamJobViewState {
+                        handle_id: handle_id.clone(),
+                        job_id: job_id.clone(),
+                        view_name: update.view_name.clone(),
+                        logical_key: update.logical_key.clone(),
+                        output: update.output.clone(),
+                        checkpoint_sequence: *checkpoint_sequence,
+                        updated_at: *updated_at,
+                    };
+                    self.write_batch_put_cf_bytes(
+                        write_batch,
+                        STREAM_JOBS_CF,
+                        &stream_job_view_key(handle_id, &update.view_name, &update.logical_key),
+                        encode_stream_job_view_state_value(&state)?,
+                    );
+                }
+            }
             StreamsChangelogPayload::StreamJobViewEvicted {
                 handle_id,
+                window_end,
                 evicted_window_count,
                 last_evicted_window_end,
                 last_evicted_at,
+                evicted_at,
                 view_name,
                 logical_key,
                 ..
@@ -1430,6 +1608,7 @@ impl LocalThroughputState {
                     runtime_state.evicted_window_count = *evicted_window_count;
                     runtime_state.last_evicted_window_end = *last_evicted_window_end;
                     runtime_state.last_evicted_at = *last_evicted_at;
+                    runtime_state.record_view_eviction(view_name, *window_end, Some(*evicted_at));
                     runtime_state.updated_at = last_evicted_at.unwrap_or(runtime_state.updated_at);
                     self.write_batch_delete_cf_and_legacy(
                         write_batch,
@@ -1505,6 +1684,44 @@ impl LocalThroughputState {
                         encode_rocksdb_value(&runtime_state, "stream job runtime state")?,
                     );
                 }
+            }
+            StreamsChangelogPayload::StreamJobWorkflowSignaled {
+                handle_id,
+                job_id,
+                operator_id,
+                view_name,
+                logical_key,
+                signal_id,
+                signal_type,
+                payload,
+                owner_epoch,
+                signaled_at,
+            } => {
+                let signal_state = LocalStreamJobWorkflowSignalState {
+                    handle_id: handle_id.clone(),
+                    job_id: job_id.clone(),
+                    operator_id: operator_id.clone(),
+                    view_name: view_name.clone(),
+                    logical_key: logical_key.clone(),
+                    signal_id: signal_id.clone(),
+                    signal_type: signal_type.clone(),
+                    payload: payload.clone(),
+                    stream_owner_epoch: *owner_epoch,
+                    signaled_at: *signaled_at,
+                    published_at: None,
+                    updated_at: *signaled_at,
+                };
+                self.write_batch_delete_cf_and_legacy(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &legacy_stream_job_signal_key(handle_id, operator_id, logical_key),
+                );
+                self.write_batch_put_cf_bytes(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &stream_job_signal_key(handle_id, operator_id, logical_key),
+                    encode_rocksdb_value(&signal_state, "stream job workflow signal state")?,
+                );
             }
             StreamsChangelogPayload::StreamJobSourceLeaseAssigned {
                 handle_id,

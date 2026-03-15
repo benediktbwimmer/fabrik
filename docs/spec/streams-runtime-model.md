@@ -311,7 +311,23 @@ Eventual reads:
 - are suitable for UI, browsing, and cheap scans
 - must expose freshness or lag metadata where possible
 
+For the current stream-job path, eventual reads should expose projection metadata explicitly, including:
+
+- latest projected checkpoint sequence
+- latest projected update time when known
+- latest projected delete checkpoint or delete time when tombstone state exists
+- owner checkpoint sequence when known
+- lag between the owner checkpoint and the projected state
+
 Eventual reads are never authoritative for restore and never replay-stable workflow input.
+
+Projected rows must also obey monotonic ordering.
+
+That means:
+
+- a stale upsert must not overwrite a newer projected row
+- a newer delete must prevent stale row resurrection
+- explicit rebuild after projection loss must restore retained rows and delete stale projected rows deterministically
 
 ### Query Surface Types
 
@@ -337,6 +353,7 @@ At minimum, that diagnostics surface should expose:
 - source cursor state and lease state
 - checkpoint progress and latest accepted checkpoint boundary
 - declared materialized views and their retention policy
+- per-view policy for materialized outputs, including retention and late/evicted handling
 - event-time window policy such as mode, size, time field, and allowed lateness
 - explicit late-event policy
 - explicit post-retention eviction policy
@@ -345,6 +362,30 @@ That diagnostics payload exists so operators can answer both:
 
 - what happened?
 - what policy caused it?
+
+The diagnostics surface should support both:
+
+- job-level runtime stats
+- per-view runtime stats for one named materialized view
+
+Per-view runtime stats should expose view-local freshness and lag markers where available, such as:
+
+- latest materialized update time
+- checkpoint sequence lag relative to the owner
+- event-time watermark lag
+- closed-window lag
+
+When a view supports eventual reads, the same per-view runtime stats surface should also expose projection-side summary and freshness markers for that view so operators can compare owner-local state to the projected read model without switching tools.
+
+The same principle should hold for operator-facing strong scan surfaces: a strong scan may include projection-side summary and lag metadata for the scanned view so browsing current rows does not require a second call just to inspect eventual-read health.
+
+Per-view runtime stats should also expose retention history where available, such as:
+
+- current stored or active key counts
+- historical evicted-window counts for that view
+- latest per-view eviction boundary and eviction time
+
+The debug/operator surface should also support targeted projection rebuild for one materialized view in addition to whole-job projection rebuild.
 
 ## Execution Kernel Model
 

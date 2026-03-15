@@ -260,8 +260,27 @@ For the current stream-job eventual query path, the response should expose:
 - `consistency: "eventual"`
 - `consistencySource: "stream_projection_query"`
 - `checkpointSequence`
+- `projectionStats.summary` when available
+- `projectionStats.freshness` when available
 
-Projection freshness and lag should be visible in operator surfaces.
+The first implementation should report at least:
+
+- latest projected checkpoint sequence
+- latest projected update time
+- latest projected delete checkpoint sequence when tombstones exist
+- latest projected delete time when tombstones exist
+- owner checkpoint sequence when known
+- checkpoint-sequence lag between owner state and projection state
+
+Projection freshness and lag should be visible in operator surfaces and eventual query payloads.
+
+The projection store must also preserve monotonic delete ordering.
+
+In practice that means:
+
+- projected upserts must not overwrite newer projected rows
+- projected deletes must be recorded durably enough to prevent stale resurrection
+- rebuild after projection loss must restore retained owner rows and remove stale projected rows deterministically
 
 ## Ownership And Restore
 
@@ -284,6 +303,15 @@ That means:
 - checkpoint artifacts must be usable independently of the original host
 - durable changelog replay must be sufficient to reconstruct post-checkpoint progress
 - eventual projections may lag and recover later without affecting correctness
+
+The current implementation should also support an explicit projection rebuild path for stream jobs.
+
+That rebuild path should:
+
+1. enumerate the retained authoritative owner rows for eventual-supported views
+2. upsert those rows into the projection store with monotonic checkpoint ordering
+3. delete projected rows that no longer exist in retained authoritative state
+4. preserve delete tombstones so stale rows cannot reappear later
 
 ## Large Value Policy
 

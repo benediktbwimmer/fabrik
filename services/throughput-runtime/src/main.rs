@@ -21,7 +21,7 @@ use axum::{
     Json,
     extract::{Path, Query, State as AxumState},
     http::StatusCode,
-    routing::get,
+    routing::{get, post},
 };
 use chrono::{DateTime, Utc};
 use fabrik_broker::{
@@ -98,6 +98,9 @@ pub(crate) const STREAMS_RUNTIME_DEBUG_STREAM_JOB_VIEW_ROUTE: &str = "/debug/str
 pub(crate) const STREAMS_RUNTIME_DEBUG_STREAM_JOB_VIEW_KEYS_ROUTE: &str = "/debug/streams-runtime/stream-jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}/views/{view_name}/keys";
 pub(crate) const STREAMS_RUNTIME_DEBUG_STREAM_JOB_VIEW_ENTRIES_ROUTE: &str = "/debug/streams-runtime/stream-jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}/views/{view_name}/entries";
 pub(crate) const STREAMS_RUNTIME_DEBUG_STREAM_JOB_VIEW_SCAN_ROUTE: &str = "/debug/streams-runtime/stream-jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}/views/{view_name}/scan";
+pub(crate) const STREAMS_RUNTIME_DEBUG_STREAM_JOB_VIEW_RUNTIME_ROUTE: &str = "/debug/streams-runtime/stream-jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}/views/{view_name}/runtime";
+pub(crate) const STREAMS_RUNTIME_DEBUG_STREAM_JOB_VIEW_PROJECTION_REBUILD_ROUTE: &str = "/debug/streams-runtime/stream-jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}/views/{view_name}/projections/rebuild";
+pub(crate) const STREAMS_RUNTIME_DEBUG_STREAM_JOB_PROJECTION_REBUILD_ROUTE: &str = "/debug/streams-runtime/stream-jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}/projections/rebuild";
 pub(crate) const STREAMS_RUNTIME_DEBUG_STREAM_JOB_RUNTIME_ROUTE: &str =
     "/debug/streams-runtime/stream-jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}/runtime";
 const LEGACY_THROUGHPUT_DEBUG_ROUTE: &str = "/debug/throughput";
@@ -107,6 +110,10 @@ const LEGACY_THROUGHPUT_DEBUG_CHUNKS_ROUTE: &str =
     "/debug/throughput/batches/{tenant_id}/{instance_id}/{run_id}/{batch_id}/chunks";
 const LEGACY_THROUGHPUT_DEBUG_STREAM_JOB_RUNTIME_ROUTE: &str =
     "/debug/throughput/stream-jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}/runtime";
+const LEGACY_THROUGHPUT_DEBUG_STREAM_JOB_VIEW_RUNTIME_ROUTE: &str = "/debug/throughput/stream-jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}/views/{view_name}/runtime";
+const LEGACY_THROUGHPUT_DEBUG_STREAM_JOB_VIEW_PROJECTION_REBUILD_ROUTE: &str = "/debug/throughput/stream-jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}/views/{view_name}/projections/rebuild";
+const LEGACY_THROUGHPUT_DEBUG_STREAM_JOB_PROJECTION_REBUILD_ROUTE: &str =
+    "/debug/throughput/stream-jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}/projections/rebuild";
 const LOCAL_BENCHMARK_FASTLANE_WORKER_ID: &str = "streams-runtime-local-fastlane";
 const LOCAL_BENCHMARK_FASTLANE_WORKER_BUILD_ID: &str = "streams-runtime-local-fastlane";
 const LOCAL_BENCHMARK_FASTLANE_BATCH_SIZE: usize = 256;
@@ -209,6 +216,8 @@ struct AppState {
     outbox_publisher_id: String,
     debug: Arc<StdMutex<ThroughputDebugState>>,
     ownership: Arc<StdMutex<ThroughputOwnershipState>>,
+    #[cfg(test)]
+    fail_next_workflow_outbox_writes: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1117,6 +1126,7 @@ impl ChangelogRecordEntry {
 pub(crate) struct StreamChangelogRecord {
     key: String,
     entry: ChangelogRecordEntry,
+    local_mirror_applied: bool,
     partition_mirror_applied: bool,
 }
 
@@ -1125,12 +1135,18 @@ impl StreamChangelogRecord {
         Self {
             key,
             entry: ChangelogRecordEntry::Throughput(entry),
+            local_mirror_applied: false,
             partition_mirror_applied: false,
         }
     }
 
     fn streams(key: String, entry: StreamsChangelogEntry) -> Self {
-        Self { key, entry: ChangelogRecordEntry::Streams(entry), partition_mirror_applied: false }
+        Self {
+            key,
+            entry: ChangelogRecordEntry::Streams(entry),
+            local_mirror_applied: false,
+            partition_mirror_applied: false,
+        }
     }
 
     pub(crate) fn occurred_at(&self) -> DateTime<Utc> {
@@ -1346,6 +1362,8 @@ async fn main() -> Result<()> {
         outbox_publisher_id: format!("throughput-runtime:{}", Uuid::now_v7()),
         debug: debug.clone(),
         ownership: ownership.clone(),
+        #[cfg(test)]
+        fail_next_workflow_outbox_writes: Arc::new(AtomicUsize::new(0)),
     };
     {
         let mut runtime_debug = debug.lock().expect("throughput debug lock poisoned");
@@ -1501,8 +1519,32 @@ async fn main() -> Result<()> {
     .route(LEGACY_THROUGHPUT_DEBUG_CHUNKS_ROUTE, get(get_strong_chunk_snapshots))
     .route(STREAMS_RUNTIME_DEBUG_STREAM_JOB_RUNTIME_ROUTE, get(get_strong_stream_job_runtime_stats))
     .route(
+        STREAMS_RUNTIME_DEBUG_STREAM_JOB_VIEW_RUNTIME_ROUTE,
+        get(get_strong_stream_job_view_runtime_stats),
+    )
+    .route(
+        STREAMS_RUNTIME_DEBUG_STREAM_JOB_VIEW_PROJECTION_REBUILD_ROUTE,
+        post(rebuild_stream_job_view_projections),
+    )
+    .route(
+        STREAMS_RUNTIME_DEBUG_STREAM_JOB_PROJECTION_REBUILD_ROUTE,
+        post(rebuild_stream_job_projections),
+    )
+    .route(
         LEGACY_THROUGHPUT_DEBUG_STREAM_JOB_RUNTIME_ROUTE,
         get(get_strong_stream_job_runtime_stats),
+    )
+    .route(
+        LEGACY_THROUGHPUT_DEBUG_STREAM_JOB_VIEW_RUNTIME_ROUTE,
+        get(get_strong_stream_job_view_runtime_stats),
+    )
+    .route(
+        LEGACY_THROUGHPUT_DEBUG_STREAM_JOB_VIEW_PROJECTION_REBUILD_ROUTE,
+        post(rebuild_stream_job_view_projections),
+    )
+    .route(
+        LEGACY_THROUGHPUT_DEBUG_STREAM_JOB_PROJECTION_REBUILD_ROUTE,
+        post(rebuild_stream_job_projections),
     )
     .route(STREAMS_RUNTIME_DEBUG_STREAM_JOB_VIEW_KEYS_ROUTE, get(get_strong_stream_job_view_keys))
     .route(
@@ -1630,6 +1672,110 @@ async fn get_strong_stream_job_runtime_stats(
         (StatusCode::NOT_FOUND, format!("stream job runtime stats for {job_id} not found"))
     })?;
     Ok(Json(output))
+}
+
+async fn get_strong_stream_job_view_runtime_stats(
+    Path((tenant_id, instance_id, run_id, job_id, view_name)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+    AxumState(state): AxumState<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let handle = state
+        .store
+        .get_stream_job_bridge_handle(&tenant_id, &instance_id, &run_id, &job_id)
+        .await
+        .map_err(internal_http_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("stream job {job_id} not found")))?;
+    let requested_at = Utc::now();
+    let output = stream_jobs::build_stream_job_query_output(
+        &state,
+        &handle,
+        &fabrik_store::StreamJobQueryRecord {
+            protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+            workflow_event_id: Uuid::now_v7(),
+            tenant_id: tenant_id.clone(),
+            instance_id: instance_id.clone(),
+            run_id: run_id.clone(),
+            job_id: job_id.clone(),
+            handle_id: handle.handle_id.clone(),
+            bridge_request_id: handle.bridge_request_id.clone(),
+            query_id: format!("debug-view-runtime-{}", Uuid::now_v7()),
+            query_name: stream_jobs::STREAM_JOB_VIEW_RUNTIME_STATS_QUERY_NAME.to_owned(),
+            query_args: Some(json!({
+                "viewName": view_name
+            })),
+            consistency: "strong".to_owned(),
+            status: fabrik_throughput::StreamJobQueryStatus::Completed.as_str().to_owned(),
+            workflow_owner_epoch: handle.workflow_owner_epoch,
+            stream_owner_epoch: handle.stream_owner_epoch,
+            output: None,
+            error: None,
+            requested_at,
+            completed_at: None,
+            accepted_at: None,
+            cancelled_at: None,
+            created_at: requested_at,
+            updated_at: requested_at,
+        },
+    )
+    .await
+    .map_err(internal_http_error)?
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("stream job view runtime stats for {job_id}/{view_name} not found"),
+        )
+    })?;
+    Ok(Json(output))
+}
+
+async fn rebuild_stream_job_projections(
+    Path((tenant_id, instance_id, run_id, job_id)): Path<(String, String, String, String)>,
+    AxumState(state): AxumState<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let handle = state
+        .store
+        .get_stream_job_bridge_handle(&tenant_id, &instance_id, &run_id, &job_id)
+        .await
+        .map_err(internal_http_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("stream job {job_id} not found")))?;
+    let rebuilt =
+        stream_jobs::rebuild_stream_job_eventual_projections(&state, &handle, None, Utc::now())
+            .await
+            .map_err(internal_http_error)?;
+    Ok(Json(rebuilt))
+}
+
+async fn rebuild_stream_job_view_projections(
+    Path((tenant_id, instance_id, run_id, job_id, view_name)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+    AxumState(state): AxumState<AppState>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let handle = state
+        .store
+        .get_stream_job_bridge_handle(&tenant_id, &instance_id, &run_id, &job_id)
+        .await
+        .map_err(internal_http_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("stream job {job_id} not found")))?;
+    let rebuilt = stream_jobs::rebuild_stream_job_eventual_projections(
+        &state,
+        &handle,
+        Some(view_name.as_str()),
+        Utc::now(),
+    )
+    .await
+    .map_err(internal_http_error)?;
+    Ok(Json(rebuilt))
 }
 
 async fn get_strong_stream_job_view_keys(
@@ -5890,6 +6036,7 @@ async fn publish_changelog_records(state: &AppState, records: Vec<StreamChangelo
                     streams_payloads.push((
                         record.key.clone(),
                         entry.clone(),
+                        record.local_mirror_applied,
                         record.partition_mirror_applied,
                     ));
                     streams_count = streams_count.saturating_add(1);
@@ -5916,7 +6063,7 @@ async fn publish_changelog_records(state: &AppState, records: Vec<StreamChangelo
         if !streams_payloads.is_empty() {
             let publish_payloads = streams_payloads
                 .iter()
-                .map(|(key, entry, _)| (key.clone(), entry.clone()))
+                .map(|(key, entry, _, _)| (key.clone(), entry.clone()))
                 .collect::<Vec<_>>();
             if let Err(error) =
                 state.streams_changelog_publisher.publish_all(publish_payloads).await
@@ -5924,11 +6071,13 @@ async fn publish_changelog_records(state: &AppState, records: Vec<StreamChangelo
                 error!(error = %error, "failed to publish streams changelog entries");
                 return;
             }
-            for (_key, entry, partition_mirror_applied) in streams_payloads {
-                if let Err(error) = state.local_state.mirror_streams_changelog_entry(&entry) {
-                    state.local_state.record_changelog_apply_failure();
-                    error!(error = %error, "failed to mirror streams changelog entry into local state");
-                    return;
+            for (_key, entry, local_mirror_applied, partition_mirror_applied) in streams_payloads {
+                if !local_mirror_applied {
+                    if let Err(error) = state.local_state.mirror_streams_changelog_entry(&entry) {
+                        state.local_state.record_changelog_apply_failure();
+                        error!(error = %error, "failed to mirror streams changelog entry into local state");
+                        return;
+                    }
                 }
                 if partition_mirror_applied {
                     continue;
@@ -7421,6 +7570,72 @@ mod tests {
         .to_string()
     }
 
+    fn aggregate_v2_bounded_threshold_signal_job_config() -> String {
+        serde_json::json!({
+            "name": "fraud-threshold-signal",
+            "runtime": "aggregate_v2",
+            "source": {
+                "kind": "bounded_input"
+            },
+            "keyBy": "accountId",
+            "states": [
+                {
+                    "id": "risk-threshold-state",
+                    "kind": "keyed",
+                    "keyFields": ["accountId"],
+                    "valueFields": ["riskExceeded"]
+                }
+            ],
+            "operators": [
+                {
+                    "kind": "aggregate",
+                    "operatorId": "risk-threshold",
+                    "config": {
+                        "reducer": "threshold",
+                        "valueField": "risk",
+                        "threshold": 0.97,
+                        "comparison": "gte",
+                        "outputField": "riskExceeded"
+                    },
+                    "stateIds": ["risk-threshold-state"]
+                },
+                {
+                    "kind": "materialize",
+                    "operatorId": "materialize-threshold",
+                    "config": {
+                        "view": "riskThresholds"
+                    },
+                    "stateIds": ["risk-threshold-state"]
+                },
+                {
+                    "kind": "signal_workflow",
+                    "operatorId": "notify-fraud",
+                    "config": {
+                        "view": "riskThresholds",
+                        "signalType": "fraud.threshold.crossed",
+                        "whenOutputField": "riskExceeded"
+                    }
+                }
+            ],
+            "views": [
+                {
+                    "name": "riskThresholds",
+                    "consistency": "strong",
+                    "queryMode": "by_key",
+                    "keyField": "accountId"
+                }
+            ],
+            "queries": [
+                {
+                    "name": "riskThresholdsByKey",
+                    "viewName": "riskThresholds",
+                    "consistency": "strong"
+                }
+            ]
+        })
+        .to_string()
+    }
+
     fn aggregate_v2_topic_window_job_config_with_retention(
         topic_name: &str,
         allowed_lateness: Option<&str>,
@@ -7505,6 +7720,7 @@ mod tests {
                     "consistency": "strong",
                     "queryMode": "by_key",
                     "keyField": "accountId",
+                    "supportedConsistencies": ["strong", "eventual"],
                     "retentionSeconds": retention_seconds
                 }
             ],
@@ -7830,6 +8046,8 @@ mod tests {
             outbox_publisher_id: "throughput-runtime-outbox-test".to_owned(),
             debug: Arc::new(StdMutex::new(empty_debug_state())),
             ownership: Arc::new(StdMutex::new(empty_ownership_state())),
+            #[cfg(test)]
+            fail_next_workflow_outbox_writes: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -10217,6 +10435,40 @@ mod tests {
                 .and_then(Value::as_bool),
             Some(false)
         );
+        assert_eq!(
+            runtime_query
+                .output
+                .as_ref()
+                .and_then(|value| value.get("materializedViews"))
+                .and_then(Value::as_array)
+                .and_then(|views| views.first())
+                .and_then(|view| view.get("lateEventPolicy"))
+                .and_then(Value::as_str),
+            Some("drop_after_closed_window")
+        );
+        assert_eq!(
+            runtime_query
+                .output
+                .as_ref()
+                .and_then(|value| value.get("materializedViews"))
+                .and_then(Value::as_array)
+                .and_then(|views| views.first())
+                .and_then(|view| view.get("windowPolicy"))
+                .and_then(|policy| policy.get("allowedLateness"))
+                .and_then(Value::as_str),
+            Some("30s")
+        );
+        assert_eq!(
+            runtime_query
+                .output
+                .as_ref()
+                .and_then(|value| value.get("materializedViews"))
+                .and_then(Value::as_array)
+                .and_then(|views| views.first())
+                .and_then(|view| view.get("retentionEvictionEnabled"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
 
         let checkpoints =
             store.list_stream_job_bridge_checkpoints_for_handle_page(&handle_id, 10, 0).await?;
@@ -10376,6 +10628,17 @@ mod tests {
             Some(first_window_end.to_rfc3339())
         );
         assert!(runtime_state.last_evicted_at.is_some());
+        assert_eq!(
+            runtime_state.view_runtime_stats("riskScores").map(|stats| stats.evicted_window_count),
+            Some(1)
+        );
+        assert_eq!(
+            runtime_state
+                .view_runtime_stats("riskScores")
+                .and_then(|stats| stats.last_evicted_window_end)
+                .map(|value| value.to_rfc3339()),
+            Some(first_window_end.to_rfc3339())
+        );
         let window_key =
             stream_jobs::windowed_logical_key("acct_1", &first_window_start.to_rfc3339());
         assert!(
@@ -10439,6 +10702,19 @@ mod tests {
         assert_eq!(restored_runtime_state.evicted_window_count, 1);
         assert_eq!(
             restored_runtime_state.last_evicted_window_end.map(|value| value.to_rfc3339()),
+            Some(first_window_end.to_rfc3339())
+        );
+        assert_eq!(
+            restored_runtime_state
+                .view_runtime_stats("riskScores")
+                .map(|stats| stats.evicted_window_count),
+            Some(1)
+        );
+        assert_eq!(
+            restored_runtime_state
+                .view_runtime_stats("riskScores")
+                .and_then(|stats| stats.last_evicted_window_end)
+                .map(|value| value.to_rfc3339()),
             Some(first_window_end.to_rfc3339())
         );
         let restored_cursor = restored_runtime_state
@@ -10572,6 +10848,702 @@ mod tests {
         assert_eq!(
             output["sourceCursors"][0]["lastDroppedLateWindowEnd"],
             "2026-03-15T10:01:00+00:00"
+        );
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn debug_view_runtime_stats_endpoint_returns_view_policy_and_counts() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir = temp_path("throughput-debug-view-runtime-stats");
+        let app_state = test_app_state(store.clone(), &redpanda, &state_dir).await?;
+        let source_topic = JsonTopicConfig::new(
+            redpanda.workflow_broker.brokers.clone(),
+            format!("stream-debug-view-runtime-stats-{}", Uuid::now_v7()),
+            1,
+        );
+        let tenant_id = "tenant";
+        let instance_id = "instance-debug-view-runtime-stats";
+        let run_id = "run-debug-view-runtime-stats";
+        let job_id = "job-debug-view-runtime-stats";
+        let occurred_at = Utc::now();
+        let handle = aggregate_v2_topic_window_stream_job_handle_with_policy(
+            tenant_id,
+            instance_id,
+            run_id,
+            job_id,
+            &source_topic.topic_name,
+            fabrik_throughput::StreamJobBridgeHandleStatus::Admitted,
+            Some("30s"),
+            Some(120),
+            occurred_at,
+        );
+        store.upsert_stream_job_bridge_handle(&handle).await?;
+
+        bridge::handle_throughput_command(
+            app_state.clone(),
+            ThroughputCommandEnvelope {
+                command_id: Uuid::now_v7(),
+                occurred_at,
+                dedupe_key: format!("stream-job-submit:{}", handle.handle_id),
+                partition_key: throughput_partition_key(job_id, 0),
+                payload: ThroughputCommand::ScheduleStreamJob(
+                    fabrik_throughput::ScheduleStreamJobCommand {
+                        tenant_id: tenant_id.to_owned(),
+                        stream_instance_id: instance_id.to_owned(),
+                        stream_run_id: run_id.to_owned(),
+                        job_id: job_id.to_owned(),
+                        handle_id: handle.handle_id.clone(),
+                    },
+                ),
+            },
+        )
+        .await?;
+
+        let source_publisher = redpanda
+            .connect_json_publisher::<Value>(
+                &source_topic,
+                "throughput-debug-view-runtime-stats-source",
+            )
+            .await?;
+        source_publisher
+            .publish(
+                &json!({"accountId": "acct_1", "risk": 0.9, "eventTime": "2026-03-15T10:00:55Z"}),
+                "acct_1",
+            )
+            .await?;
+        source_publisher
+            .publish(
+                &json!({"accountId": "acct_1", "risk": 0.8, "eventTime": "2026-03-15T10:01:35Z"}),
+                "acct_1",
+            )
+            .await?;
+        bridge::reconcile_active_topic_stream_jobs(&app_state, 64).await?;
+
+        let Json(output) = get_strong_stream_job_view_runtime_stats(
+            Path((
+                tenant_id.to_owned(),
+                instance_id.to_owned(),
+                run_id.to_owned(),
+                job_id.to_owned(),
+                "riskScores".to_owned(),
+            )),
+            AxumState(app_state.clone()),
+        )
+        .await
+        .map_err(|(_, message)| anyhow::anyhow!(message))?;
+
+        assert_eq!(output["queryName"], stream_jobs::STREAM_JOB_VIEW_RUNTIME_STATS_QUERY_NAME);
+        assert_eq!(output["viewName"], "riskScores");
+        assert_eq!(output["storedKeyCount"], 2);
+        assert_eq!(output["activeKeyCount"], 2);
+        assert_eq!(output["policy"]["operatorId"], "materialize-risk");
+        assert_eq!(output["policy"]["retentionSeconds"], 120);
+        assert_eq!(output["policy"]["lateEventPolicy"], "drop_after_closed_window");
+        assert_eq!(output["policy"]["windowPolicy"]["allowedLateness"], "30s");
+        assert_eq!(output["policy"]["windowPolicy"]["retentionSeconds"], 120);
+        assert_eq!(output["freshness"]["checkpointSequenceLag"], 0);
+        assert_eq!(output["freshness"]["latestEventTimeWatermark"], "2026-03-15T10:01:35+00:00");
+        assert_eq!(output["freshness"]["latestClosedWindowEnd"], "2026-03-15T10:01:00+00:00");
+        assert_eq!(output["freshness"]["latestMaterializedWindowEnd"], "2026-03-15T10:02:00+00:00");
+        assert_eq!(output["freshness"]["closedWindowLagSeconds"], -60);
+        assert_eq!(output["historicalEvictedWindowCount"], 0);
+        assert_eq!(output["historicalLastEvictedWindowEnd"], Value::Null);
+        assert_eq!(output["historicalLastEvictedAt"], Value::Null);
+        assert_eq!(output["projectionStats"]["supported"], true);
+        assert_eq!(output["projectionStats"]["rebuildSupported"], true);
+        assert_eq!(output["projectionStats"]["summary"]["latestProjectedCheckpointSequence"], 1);
+        assert_eq!(output["projectionStats"]["freshness"]["ownerCheckpointSequence"], 1);
+        assert_eq!(output["projectionStats"]["freshness"]["checkpointSequenceLag"], 0);
+        assert_eq!(output["consistency"], "strong");
+        assert_eq!(output["consistencySource"], "stream_owner_local_state");
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn debug_view_scan_endpoint_returns_projection_stats_for_strong_scan() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir = temp_path("throughput-debug-view-scan-projection-stats");
+        let app_state = test_app_state(store.clone(), &redpanda, &state_dir).await?;
+        let source_topic = JsonTopicConfig::new(
+            redpanda.workflow_broker.brokers.clone(),
+            format!("stream-topic-debug-view-scan-{}", Uuid::now_v7()),
+            1,
+        );
+        let tenant_id = "tenant";
+        let instance_id = "instance-stream-topic-debug-view-scan";
+        let run_id = "run-stream-topic-debug-view-scan";
+        let job_id = "job-stream-topic-debug-view-scan";
+        let occurred_at = Utc::now();
+        let mut handle = aggregate_v2_topic_window_stream_job_handle_with_policy(
+            tenant_id,
+            instance_id,
+            run_id,
+            job_id,
+            &source_topic.topic_name,
+            fabrik_throughput::StreamJobBridgeHandleStatus::Admitted,
+            Some("30s"),
+            Some(120),
+            occurred_at,
+        );
+        if let Some(config_ref) = handle.config_ref.as_mut() {
+            let mut config: Value = serde_json::from_str(config_ref)?;
+            config["views"][0]["queryMode"] = json!("prefix_scan");
+            *config_ref = config.to_string();
+        }
+        store.upsert_stream_job_bridge_handle(&handle).await?;
+        let owner_local_state = owner_local_state_for_stream_job(&app_state, &handle.job_id);
+        owner_local_state.upsert_stream_job_runtime_state(
+            &crate::local_state::LocalStreamJobRuntimeState {
+                handle_id: handle.handle_id.clone(),
+                job_id: handle.job_id.clone(),
+                job_name: handle.job_name.clone(),
+                view_name: "riskScores".to_owned(),
+                checkpoint_name: "initial-risk-ready".to_owned(),
+                checkpoint_sequence: 4,
+                input_item_count: 0,
+                materialized_key_count: 2,
+                active_partitions: vec![0],
+                source_kind: Some(fabrik_throughput::STREAM_SOURCE_TOPIC.to_owned()),
+                source_name: Some(source_topic.topic_name.clone()),
+                source_cursors: vec![crate::local_state::LocalStreamJobSourceCursorState {
+                    source_partition_id: 0,
+                    next_offset: 3,
+                    initial_checkpoint_target_offset: 3,
+                    last_applied_offset: Some(2),
+                    last_high_watermark: Some(3),
+                    last_event_time_watermark: Some(
+                        DateTime::parse_from_rfc3339("2026-03-15T10:01:35Z")
+                            .expect("event watermark should parse")
+                            .with_timezone(&Utc),
+                    ),
+                    last_closed_window_end: Some(
+                        DateTime::parse_from_rfc3339("2026-03-15T10:01:00Z")
+                            .expect("closed window should parse")
+                            .with_timezone(&Utc),
+                    ),
+                    pending_window_ends: Vec::new(),
+                    dropped_late_event_count: 0,
+                    last_dropped_late_offset: None,
+                    last_dropped_late_event_at: None,
+                    last_dropped_late_window_end: None,
+                    dropped_evicted_window_event_count: 0,
+                    last_dropped_evicted_window_offset: None,
+                    last_dropped_evicted_window_event_at: None,
+                    last_dropped_evicted_window_end: None,
+                    checkpoint_reached_at: Some(occurred_at),
+                    updated_at: occurred_at,
+                }],
+                source_partition_leases: vec![crate::local_state::LocalStreamJobSourceLeaseState {
+                    source_partition_id: 0,
+                    owner_partition_id: 0,
+                    owner_epoch: 7,
+                    lease_token: "lease-0".to_owned(),
+                    updated_at: occurred_at,
+                }],
+                dispatch_batches: Vec::new(),
+                applied_dispatch_batch_ids: Vec::new(),
+                dispatch_completed_at: None,
+                dispatch_cancelled_at: None,
+                stream_owner_epoch: 7,
+                planned_at: occurred_at,
+                latest_checkpoint_at: Some(occurred_at),
+                evicted_window_count: 0,
+                last_evicted_window_end: None,
+                last_evicted_at: None,
+                view_runtime_stats: Vec::new(),
+                checkpoint_partitions: Vec::new(),
+                terminal_status: None,
+                terminal_output: None,
+                terminal_error: None,
+                terminal_at: None,
+                updated_at: occurred_at,
+            },
+        )?;
+        let first_key = stream_jobs::windowed_logical_key("acct_1", "2026-03-15T10:00:00+00:00");
+        let second_key = stream_jobs::windowed_logical_key("acct_1", "2026-03-15T10:01:00+00:00");
+        for (logical_key, window_start, avg_risk) in [
+            (first_key.as_str(), "2026-03-15T10:00:00+00:00", 0.9),
+            (second_key.as_str(), "2026-03-15T10:01:00+00:00", 0.8),
+        ] {
+            owner_local_state.upsert_stream_job_view_value(
+                &handle.handle_id,
+                &handle.job_id,
+                "riskScores",
+                logical_key,
+                json!({
+                    "accountId": "acct_1",
+                    "avgRisk": avg_risk,
+                    "windowStart": window_start,
+                    "windowEnd": if window_start == "2026-03-15T10:00:00+00:00" {
+                        "2026-03-15T10:01:00+00:00"
+                    } else {
+                        "2026-03-15T10:02:00+00:00"
+                    },
+                    "asOfCheckpoint": 4
+                }),
+                4,
+                occurred_at,
+            )?;
+            store
+                .upsert_stream_job_view_query(&fabrik_store::StreamJobViewRecord {
+                    tenant_id: tenant_id.to_owned(),
+                    instance_id: instance_id.to_owned(),
+                    run_id: run_id.to_owned(),
+                    job_id: job_id.to_owned(),
+                    handle_id: handle.handle_id.clone(),
+                    view_name: "riskScores".to_owned(),
+                    logical_key: logical_key.to_owned(),
+                    output: json!({
+                        "accountId": "acct_1",
+                        "avgRisk": avg_risk,
+                        "windowStart": window_start,
+                        "windowEnd": if window_start == "2026-03-15T10:00:00+00:00" {
+                            "2026-03-15T10:01:00+00:00"
+                        } else {
+                            "2026-03-15T10:02:00+00:00"
+                        },
+                        "asOfCheckpoint": 3
+                    }),
+                    checkpoint_sequence: 3,
+                    updated_at: occurred_at,
+                })
+                .await?;
+        }
+
+        let Json(output) = get_stream_job_view_scan(
+            Path((
+                tenant_id.to_owned(),
+                instance_id.to_owned(),
+                run_id.to_owned(),
+                job_id.to_owned(),
+                "riskScores".to_owned(),
+            )),
+            Query(StreamJobViewScanQuery {
+                consistency: Some("strong".to_owned()),
+                prefix: Some("acct_1".to_owned()),
+                key_prefix: None,
+                limit: Some(10),
+                offset: Some(0),
+            }),
+            AxumState(app_state.clone()),
+        )
+        .await
+        .map_err(|(_, message)| anyhow::anyhow!(message))?;
+
+        assert_eq!(output["consistency"], "strong");
+        assert_eq!(output["consistencySource"], "stream_owner_local_state");
+        assert_eq!(output["total"], 2);
+        assert_eq!(output["items"].as_array().map(Vec::len), Some(2));
+        assert_eq!(output["runtimeStats"]["streamOwnerEpoch"], 7);
+        assert_eq!(output["projectionStats"]["supported"], true);
+        assert_eq!(output["projectionStats"]["rebuildSupported"], true);
+        assert_eq!(output["projectionStats"]["summary"]["keyCount"], 2);
+        assert_eq!(output["projectionStats"]["summary"]["latestProjectedCheckpointSequence"], 3);
+        assert_eq!(output["projectionStats"]["freshness"]["ownerCheckpointSequence"], 4);
+        assert_eq!(output["projectionStats"]["freshness"]["checkpointSequenceLag"], 1);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workflow_topic_windowed_eventual_query_reports_projection_freshness() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir = temp_path("throughput-topic-windowed-eventual-query-freshness");
+        let app_state = test_app_state(store.clone(), &redpanda, &state_dir).await?;
+        let source_topic = JsonTopicConfig::new(
+            redpanda.workflow_broker.brokers.clone(),
+            format!("stream-topic-eventual-query-{}", Uuid::now_v7()),
+            1,
+        );
+        let tenant_id = "tenant";
+        let instance_id = "instance-stream-topic-eventual-query";
+        let run_id = "run-stream-topic-eventual-query";
+        let job_id = "job-stream-topic-eventual-query";
+        let occurred_at = Utc::now();
+        let handle = aggregate_v2_topic_window_stream_job_handle_with_policy(
+            tenant_id,
+            instance_id,
+            run_id,
+            job_id,
+            &source_topic.topic_name,
+            fabrik_throughput::StreamJobBridgeHandleStatus::Admitted,
+            Some("30s"),
+            Some(120),
+            occurred_at,
+        );
+        store.upsert_stream_job_bridge_handle(&handle).await?;
+        bridge::handle_throughput_command(
+            app_state.clone(),
+            ThroughputCommandEnvelope {
+                command_id: Uuid::now_v7(),
+                occurred_at,
+                dedupe_key: format!("stream-job-submit:{}", handle.handle_id),
+                partition_key: throughput_partition_key(job_id, 0),
+                payload: ThroughputCommand::ScheduleStreamJob(
+                    fabrik_throughput::ScheduleStreamJobCommand {
+                        tenant_id: tenant_id.to_owned(),
+                        stream_instance_id: instance_id.to_owned(),
+                        stream_run_id: run_id.to_owned(),
+                        job_id: job_id.to_owned(),
+                        handle_id: handle.handle_id.clone(),
+                    },
+                ),
+            },
+        )
+        .await?;
+
+        let source_publisher = redpanda
+            .connect_json_publisher::<Value>(
+                &source_topic,
+                "throughput-topic-eventual-query-source",
+            )
+            .await?;
+        source_publisher
+            .publish(
+                &json!({"accountId": "acct_1", "risk": 0.9, "eventTime": "2026-03-15T10:00:55Z"}),
+                "acct_1",
+            )
+            .await?;
+        source_publisher
+            .publish(
+                &json!({"accountId": "acct_1", "risk": 0.8, "eventTime": "2026-03-15T10:01:35Z"}),
+                "acct_1",
+            )
+            .await?;
+        bridge::reconcile_active_topic_stream_jobs(&app_state, 64).await?;
+
+        let requested_at = Utc::now();
+        let output = stream_jobs::build_stream_job_query_output(
+            &app_state,
+            &handle,
+            &fabrik_store::StreamJobQueryRecord {
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                workflow_event_id: Uuid::now_v7(),
+                tenant_id: tenant_id.to_owned(),
+                instance_id: instance_id.to_owned(),
+                run_id: run_id.to_owned(),
+                job_id: job_id.to_owned(),
+                handle_id: handle.handle_id.clone(),
+                bridge_request_id: handle.bridge_request_id.clone(),
+                query_id: format!("eventual-query-{}", Uuid::now_v7()),
+                query_name: "riskScoresByKey".to_owned(),
+                query_args: Some(json!({
+                    "key": "acct_1",
+                    "windowStart": "2026-03-15T10:00:00+00:00"
+                })),
+                consistency: fabrik_throughput::StreamJobQueryConsistency::Eventual
+                    .as_str()
+                    .to_owned(),
+                status: fabrik_throughput::StreamJobQueryStatus::Completed.as_str().to_owned(),
+                workflow_owner_epoch: handle.workflow_owner_epoch,
+                stream_owner_epoch: handle.stream_owner_epoch,
+                output: None,
+                error: None,
+                requested_at,
+                completed_at: None,
+                accepted_at: None,
+                cancelled_at: None,
+                created_at: requested_at,
+                updated_at: requested_at,
+            },
+        )
+        .await?
+        .context("eventual query output should exist")?;
+
+        assert_eq!(output["consistency"], "eventual");
+        assert_eq!(output["consistencySource"], "stream_projection_query");
+        assert_eq!(output["avgRisk"], 0.9);
+        assert_eq!(output["projectionStats"]["summary"]["keyCount"], 2);
+        assert_eq!(output["projectionStats"]["summary"]["latestProjectedCheckpointSequence"], 1);
+        assert_eq!(output["projectionStats"]["freshness"]["ownerCheckpointSequence"], 1);
+        assert_eq!(output["projectionStats"]["freshness"]["checkpointSequenceLag"], 0);
+        assert_eq!(
+            output["projectionStats"]["summary"]["latestDeletedCheckpointSequence"],
+            Value::Null
+        );
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn debug_projection_rebuild_restores_missing_rows_and_deletes_stale_rows() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir = temp_path("throughput-debug-projection-rebuild");
+        let app_state = test_app_state(store.clone(), &redpanda, &state_dir).await?;
+        let source_topic = JsonTopicConfig::new(
+            redpanda.workflow_broker.brokers.clone(),
+            format!("stream-debug-projection-rebuild-{}", Uuid::now_v7()),
+            1,
+        );
+        let tenant_id = "tenant";
+        let instance_id = "instance-debug-projection-rebuild";
+        let run_id = "run-debug-projection-rebuild";
+        let job_id = "job-debug-projection-rebuild";
+        let occurred_at = Utc::now();
+        let handle = aggregate_v2_topic_window_stream_job_handle_with_policy(
+            tenant_id,
+            instance_id,
+            run_id,
+            job_id,
+            &source_topic.topic_name,
+            fabrik_throughput::StreamJobBridgeHandleStatus::Admitted,
+            Some("30s"),
+            Some(120),
+            occurred_at,
+        );
+        store.upsert_stream_job_bridge_handle(&handle).await?;
+        bridge::handle_throughput_command(
+            app_state.clone(),
+            ThroughputCommandEnvelope {
+                command_id: Uuid::now_v7(),
+                occurred_at,
+                dedupe_key: format!("stream-job-submit:{}", handle.handle_id),
+                partition_key: throughput_partition_key(job_id, 0),
+                payload: ThroughputCommand::ScheduleStreamJob(
+                    fabrik_throughput::ScheduleStreamJobCommand {
+                        tenant_id: tenant_id.to_owned(),
+                        stream_instance_id: instance_id.to_owned(),
+                        stream_run_id: run_id.to_owned(),
+                        job_id: job_id.to_owned(),
+                        handle_id: handle.handle_id.clone(),
+                    },
+                ),
+            },
+        )
+        .await?;
+        let source_publisher = redpanda
+            .connect_json_publisher::<Value>(
+                &source_topic,
+                "throughput-debug-projection-rebuild-source",
+            )
+            .await?;
+        source_publisher
+            .publish(
+                &json!({"accountId": "acct_1", "risk": 0.9, "eventTime": "2026-03-15T10:00:55Z"}),
+                "acct_1",
+            )
+            .await?;
+        bridge::reconcile_active_topic_stream_jobs(&app_state, 64).await?;
+
+        let logical_key = stream_jobs::windowed_logical_key("acct_1", "2026-03-15T10:00:00+00:00");
+        store
+            .purge_stream_job_view_query_row_unchecked(
+                tenant_id,
+                instance_id,
+                run_id,
+                job_id,
+                "riskScores",
+                &logical_key,
+            )
+            .await?;
+        store
+            .upsert_stream_job_view_query(&fabrik_store::StreamJobViewRecord {
+                tenant_id: tenant_id.to_owned(),
+                instance_id: instance_id.to_owned(),
+                run_id: run_id.to_owned(),
+                job_id: job_id.to_owned(),
+                handle_id: handle.handle_id.clone(),
+                view_name: "riskScores".to_owned(),
+                logical_key: "acct_ghost".to_owned(),
+                output: json!({"accountId": "acct_ghost", "avgRisk": 0.1}),
+                checkpoint_sequence: 0,
+                updated_at: occurred_at,
+            })
+            .await?;
+
+        let Json(rebuilt) = rebuild_stream_job_projections(
+            Path((
+                tenant_id.to_owned(),
+                instance_id.to_owned(),
+                run_id.to_owned(),
+                job_id.to_owned(),
+            )),
+            AxumState(app_state.clone()),
+        )
+        .await
+        .map_err(|(_, message)| anyhow::anyhow!(message))?;
+
+        assert_eq!(rebuilt["views"][0]["viewName"], "riskScores");
+        assert_eq!(rebuilt["views"][0]["upsertedCount"], 1);
+        assert_eq!(rebuilt["views"][0]["deletedCount"], 1);
+        assert!(
+            store
+                .get_stream_job_view_query(
+                    tenant_id,
+                    instance_id,
+                    run_id,
+                    job_id,
+                    "riskScores",
+                    &logical_key,
+                )
+                .await?
+                .is_some()
+        );
+        assert!(
+            store
+                .get_stream_job_view_query(
+                    tenant_id,
+                    instance_id,
+                    run_id,
+                    job_id,
+                    "riskScores",
+                    "acct_ghost",
+                )
+                .await?
+                .is_none()
+        );
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn debug_view_projection_rebuild_restores_missing_rows_for_one_view() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir = temp_path("throughput-debug-view-projection-rebuild");
+        let app_state = test_app_state(store.clone(), &redpanda, &state_dir).await?;
+        let source_topic = JsonTopicConfig::new(
+            redpanda.workflow_broker.brokers.clone(),
+            format!("stream-debug-view-projection-rebuild-{}", Uuid::now_v7()),
+            1,
+        );
+        let tenant_id = "tenant";
+        let instance_id = "instance-debug-view-projection-rebuild";
+        let run_id = "run-debug-view-projection-rebuild";
+        let job_id = "job-debug-view-projection-rebuild";
+        let occurred_at = Utc::now();
+        let handle = aggregate_v2_topic_window_stream_job_handle_with_policy(
+            tenant_id,
+            instance_id,
+            run_id,
+            job_id,
+            &source_topic.topic_name,
+            fabrik_throughput::StreamJobBridgeHandleStatus::Admitted,
+            Some("30s"),
+            Some(120),
+            occurred_at,
+        );
+        store.upsert_stream_job_bridge_handle(&handle).await?;
+        bridge::handle_throughput_command(
+            app_state.clone(),
+            ThroughputCommandEnvelope {
+                command_id: Uuid::now_v7(),
+                occurred_at,
+                dedupe_key: format!("stream-job-submit:{}", handle.handle_id),
+                partition_key: throughput_partition_key(job_id, 0),
+                payload: ThroughputCommand::ScheduleStreamJob(
+                    fabrik_throughput::ScheduleStreamJobCommand {
+                        tenant_id: tenant_id.to_owned(),
+                        stream_instance_id: instance_id.to_owned(),
+                        stream_run_id: run_id.to_owned(),
+                        job_id: job_id.to_owned(),
+                        handle_id: handle.handle_id.clone(),
+                    },
+                ),
+            },
+        )
+        .await?;
+
+        let source_publisher = redpanda
+            .connect_json_publisher::<Value>(
+                &source_topic,
+                "throughput-debug-view-projection-rebuild-source",
+            )
+            .await?;
+        source_publisher
+            .publish(
+                &json!({"accountId": "acct_1", "risk": 0.9, "eventTime": "2026-03-15T10:00:55Z"}),
+                "acct_1",
+            )
+            .await?;
+        source_publisher
+            .publish(
+                &json!({"accountId": "acct_1", "risk": 0.8, "eventTime": "2026-03-15T10:01:35Z"}),
+                "acct_1",
+            )
+            .await?;
+        bridge::reconcile_active_topic_stream_jobs(&app_state, 64).await?;
+
+        let logical_key = stream_jobs::windowed_logical_key("acct_1", "2026-03-15T10:00:00+00:00");
+        store
+            .purge_stream_job_view_query_row_unchecked(
+                tenant_id,
+                instance_id,
+                run_id,
+                job_id,
+                "riskScores",
+                &logical_key,
+            )
+            .await?;
+
+        let Json(rebuilt) = rebuild_stream_job_view_projections(
+            Path((
+                tenant_id.to_owned(),
+                instance_id.to_owned(),
+                run_id.to_owned(),
+                job_id.to_owned(),
+                "riskScores".to_owned(),
+            )),
+            AxumState(app_state.clone()),
+        )
+        .await
+        .map_err(|(_, message)| anyhow::anyhow!(message))?;
+
+        assert_eq!(rebuilt["viewName"], "riskScores");
+        assert_eq!(rebuilt["views"].as_array().map(Vec::len), Some(1));
+        assert_eq!(rebuilt["views"][0]["viewName"], "riskScores");
+        assert_eq!(rebuilt["views"][0]["upsertedCount"], 2);
+        assert_eq!(rebuilt["views"][0]["deletedCount"], 0);
+        assert!(
+            store
+                .get_stream_job_view_query(
+                    tenant_id,
+                    instance_id,
+                    run_id,
+                    job_id,
+                    "riskScores",
+                    &logical_key,
+                )
+                .await?
+                .is_some()
         );
 
         fs::remove_dir_all(state_dir).ok();
@@ -11034,6 +12006,572 @@ mod tests {
             debug.last_duplicate_stream_job_query_request_at,
             Some(occurred_at + chrono::Duration::milliseconds(2))
         );
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_job_query_outbox_publication_replays_after_reconcile() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir = temp_path("throughput-stream-job-query-reconcile");
+        let app_state = test_app_state(store.clone(), &redpanda, &state_dir).await?;
+
+        let tenant_id = "tenant";
+        let instance_id = "instance-stream-job-query-reconcile";
+        let run_id = "run-stream-job-query-reconcile";
+        let job_id = "job-stream-job-query-reconcile";
+        let handle_id =
+            fabrik_throughput::stream_job_handle_id(tenant_id, instance_id, run_id, job_id);
+        let occurred_at = Utc::now();
+
+        store
+            .upsert_stream_job_bridge_handle(&StreamJobBridgeHandleRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: tenant_id.to_owned(),
+                instance_id: instance_id.to_owned(),
+                run_id: run_id.to_owned(),
+                stream_instance_id: instance_id.to_owned(),
+                stream_run_id: run_id.to_owned(),
+                job_id: job_id.to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: fabrik_throughput::stream_job_bridge_request_id(
+                    tenant_id,
+                    instance_id,
+                    run_id,
+                    job_id,
+                ),
+                origin_kind: fabrik_throughput::StreamJobOriginKind::Workflow.as_str().to_owned(),
+                definition_id: "payments-rollup".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                job_name: stream_jobs::KEYED_ROLLUP_JOB_NAME.to_owned(),
+                input_ref: serde_json::json!({
+                    "kind": "bounded_items",
+                    "items": [
+                        { "accountId": "acct_1", "amount": 2.0 },
+                        { "accountId": "acct_1", "amount": 3.0 }
+                    ]
+                })
+                .to_string(),
+                config_ref: None,
+                checkpoint_policy: None,
+                view_definitions: None,
+                status: fabrik_throughput::StreamJobBridgeHandleStatus::Admitted
+                    .as_str()
+                    .to_owned(),
+                workflow_owner_epoch: None,
+                stream_owner_epoch: None,
+                cancellation_requested_at: None,
+                cancellation_reason: None,
+                terminal_event_id: None,
+                terminal_at: None,
+                workflow_accepted_at: None,
+                terminal_output: None,
+                terminal_error: None,
+                created_at: occurred_at,
+                updated_at: occurred_at,
+            })
+            .await?;
+
+        let identity = WorkflowIdentity::new(
+            tenant_id,
+            "payments-rollup",
+            1,
+            "artifact-a",
+            instance_id,
+            run_id,
+            "throughput-runtime-test",
+        );
+        let schedule_payload = WorkflowEvent::StreamJobScheduled {
+            job_id: job_id.to_owned(),
+            job_name: stream_jobs::KEYED_ROLLUP_JOB_NAME.to_owned(),
+            input: serde_json::json!({
+                "kind": "bounded_items",
+                "items": [
+                    { "accountId": "acct_1", "amount": 2.0 },
+                    { "accountId": "acct_1", "amount": 3.0 }
+                ]
+            }),
+            config: None,
+            state: None,
+        };
+        let mut schedule_event =
+            EventEnvelope::new(schedule_payload.event_type(), identity.clone(), schedule_payload);
+        schedule_event.occurred_at = occurred_at;
+        bridge::handle_bridge_event(app_state.clone(), schedule_event).await?;
+
+        let query_payload = WorkflowEvent::StreamJobQueryRequested {
+            job_id: job_id.to_owned(),
+            query_id: "query-a".to_owned(),
+            query_name: "accountTotals".to_owned(),
+            args: Some(serde_json::json!({ "key": "acct_1" })),
+            consistency: "strong".to_owned(),
+            state: None,
+        };
+        let mut query_request =
+            EventEnvelope::new(query_payload.event_type(), identity, query_payload);
+        query_request.occurred_at = occurred_at + chrono::Duration::milliseconds(1);
+        store
+            .upsert_stream_job_bridge_query(&fabrik_store::StreamJobQueryRecord {
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                workflow_event_id: Uuid::now_v7(),
+                tenant_id: tenant_id.to_owned(),
+                instance_id: instance_id.to_owned(),
+                run_id: run_id.to_owned(),
+                job_id: job_id.to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: fabrik_throughput::stream_job_bridge_request_id(
+                    tenant_id,
+                    instance_id,
+                    run_id,
+                    job_id,
+                ),
+                query_id: "query-a".to_owned(),
+                query_name: "accountTotals".to_owned(),
+                query_args: Some(serde_json::json!({ "key": "acct_1" })),
+                consistency: "strong".to_owned(),
+                status: fabrik_throughput::StreamJobQueryStatus::Requested.as_str().to_owned(),
+                workflow_owner_epoch: None,
+                stream_owner_epoch: None,
+                output: None,
+                error: None,
+                requested_at: query_request.occurred_at,
+                completed_at: None,
+                accepted_at: None,
+                cancelled_at: None,
+                created_at: query_request.occurred_at,
+                updated_at: query_request.occurred_at,
+            })
+            .await?;
+
+        app_state.fail_next_workflow_outbox_writes.store(1, Ordering::SeqCst);
+        let error = bridge::handle_bridge_event(app_state.clone(), query_request)
+            .await
+            .expect_err("query outbox failpoint should force query callback failure");
+        assert!(error.to_string().contains("test failpoint: workflow event outbox enqueue failed"));
+
+        let failed_query = store
+            .get_stream_job_bridge_query("query-a")
+            .await?
+            .context("query should exist after failed callback publication")?;
+        assert_eq!(
+            failed_query.parsed_status(),
+            Some(fabrik_throughput::StreamJobQueryStatus::Completed)
+        );
+        assert!(failed_query.accepted_at.is_none());
+        assert!(failed_query.output.is_some());
+
+        let initial_outbox = store
+            .lease_workflow_event_outbox(
+                "stream-job-query-reconcile-initial",
+                chrono::Duration::seconds(30),
+                20,
+                occurred_at + chrono::Duration::seconds(1),
+            )
+            .await?;
+        assert!(
+            !initial_outbox.iter().any(|record| record.event_type == "StreamJobQueryCompleted")
+        );
+        assert!(!initial_outbox.iter().any(|record| record.event_type == "StreamJobQueryFailed"));
+        assert!(!initial_outbox.iter().any(|record| record.event_type == "StreamJobCompleted"));
+
+        bridge::reconcile_active_topic_stream_jobs(&app_state, 64).await?;
+        bridge::reconcile_active_topic_stream_jobs(&app_state, 64).await?;
+
+        let outbox = store
+            .lease_workflow_event_outbox(
+                "stream-job-query-reconcile-outbox",
+                chrono::Duration::seconds(30),
+                20,
+                occurred_at + chrono::Duration::seconds(2),
+            )
+            .await?;
+        assert_eq!(
+            outbox.iter().filter(|record| record.event_type == "StreamJobQueryCompleted").count(),
+            1
+        );
+        assert_eq!(
+            outbox.iter().filter(|record| record.event_type == "StreamJobCompleted").count(),
+            1
+        );
+        let query_outbox = outbox
+            .iter()
+            .find(|record| record.event_type == "StreamJobQueryCompleted")
+            .context("query callback should be enqueued after reconcile")?;
+        match &query_outbox.event.payload {
+            WorkflowEvent::StreamJobQueryCompleted { query_id, query_name, output, .. } => {
+                assert_eq!(query_id, "query-a");
+                assert_eq!(query_name, "accountTotals");
+                assert_eq!(output["accountId"], serde_json::json!("acct_1"));
+                assert_eq!(output["totalAmount"], serde_json::json!(5.0));
+            }
+            other => panic!("unexpected query outbox payload after reconcile: {other:?}"),
+        }
+
+        let repaired_query = store
+            .get_stream_job_bridge_query("query-a")
+            .await?
+            .context("query should still exist after reconcile repair")?;
+        assert!(repaired_query.accepted_at.is_none());
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_job_signal_outbox_publication_replays_after_reconcile() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir = temp_path("throughput-stream-job-signal-reconcile");
+        let app_state = test_app_state(store.clone(), &redpanda, &state_dir).await?;
+
+        let tenant_id = "tenant";
+        let instance_id = "instance-stream-job-signal-reconcile";
+        let run_id = "run-stream-job-signal-reconcile";
+        let job_id = "job-stream-job-signal-reconcile";
+        let handle_id =
+            fabrik_throughput::stream_job_handle_id(tenant_id, instance_id, run_id, job_id);
+        let occurred_at = Utc::now();
+
+        store
+            .upsert_stream_job_bridge_handle(&StreamJobBridgeHandleRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: tenant_id.to_owned(),
+                instance_id: instance_id.to_owned(),
+                run_id: run_id.to_owned(),
+                stream_instance_id: instance_id.to_owned(),
+                stream_run_id: run_id.to_owned(),
+                job_id: job_id.to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: fabrik_throughput::stream_job_bridge_request_id(
+                    tenant_id,
+                    instance_id,
+                    run_id,
+                    job_id,
+                ),
+                origin_kind: fabrik_throughput::StreamJobOriginKind::Workflow.as_str().to_owned(),
+                definition_id: "fraud-threshold-signal".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-threshold-signal".to_owned()),
+                job_name: "fraud-threshold-signal".to_owned(),
+                input_ref: serde_json::json!({
+                    "kind": "bounded_items",
+                    "items": [
+                        { "accountId": "acct_1", "risk": 0.96 },
+                        { "accountId": "acct_1", "risk": 0.99 },
+                        { "accountId": "acct_2", "risk": 0.72 }
+                    ]
+                })
+                .to_string(),
+                config_ref: Some(aggregate_v2_bounded_threshold_signal_job_config()),
+                checkpoint_policy: None,
+                view_definitions: None,
+                status: fabrik_throughput::StreamJobBridgeHandleStatus::Admitted
+                    .as_str()
+                    .to_owned(),
+                workflow_owner_epoch: None,
+                stream_owner_epoch: None,
+                cancellation_requested_at: None,
+                cancellation_reason: None,
+                terminal_event_id: None,
+                terminal_at: None,
+                workflow_accepted_at: None,
+                terminal_output: None,
+                terminal_error: None,
+                created_at: occurred_at,
+                updated_at: occurred_at,
+            })
+            .await?;
+
+        app_state.fail_next_workflow_outbox_writes.store(1, Ordering::SeqCst);
+        let error = bridge::handle_throughput_command(
+            app_state.clone(),
+            ThroughputCommandEnvelope {
+                command_id: Uuid::now_v7(),
+                occurred_at,
+                dedupe_key: format!("stream-job-submit:{handle_id}"),
+                partition_key: throughput_partition_key(job_id, 0),
+                payload: ThroughputCommand::ScheduleStreamJob(
+                    fabrik_throughput::ScheduleStreamJobCommand {
+                        tenant_id: tenant_id.to_owned(),
+                        stream_instance_id: instance_id.to_owned(),
+                        stream_run_id: run_id.to_owned(),
+                        job_id: job_id.to_owned(),
+                        handle_id: handle_id.clone(),
+                    },
+                ),
+            },
+        )
+        .await
+        .expect_err("signal outbox failpoint should force schedule failure");
+        assert!(error.to_string().contains("test failpoint: workflow event outbox enqueue failed"));
+
+        let pending_signal = app_state
+            .local_state
+            .load_stream_job_workflow_signal_state(&handle_id, "notify-fraud", "acct_1")?
+            .context("signal state should be durable before callback publication")?;
+        assert!(pending_signal.published_at.is_none());
+
+        let failed_handle = store
+            .get_stream_job_bridge_handle(tenant_id, instance_id, run_id, job_id)
+            .await?
+            .context("stream job handle should still exist after failed signal publish")?;
+        assert_eq!(
+            failed_handle.parsed_status(),
+            Some(fabrik_throughput::StreamJobBridgeHandleStatus::Admitted)
+        );
+        assert!(failed_handle.terminal_at.is_none());
+
+        let initial_outbox = store
+            .lease_workflow_event_outbox(
+                "stream-job-signal-reconcile-initial",
+                chrono::Duration::seconds(30),
+                10,
+                occurred_at + chrono::Duration::seconds(1),
+            )
+            .await?;
+        assert!(initial_outbox.is_empty());
+
+        bridge::reconcile_active_topic_stream_jobs(&app_state, 64).await?;
+        bridge::reconcile_active_topic_stream_jobs(&app_state, 64).await?;
+
+        let outbox = store
+            .lease_workflow_event_outbox(
+                "stream-job-signal-reconcile-outbox",
+                chrono::Duration::seconds(30),
+                20,
+                occurred_at + chrono::Duration::seconds(2),
+            )
+            .await?;
+        assert_eq!(outbox.iter().filter(|record| record.event_type == "SignalQueued").count(), 1);
+        assert!(!outbox.iter().any(|record| record.event_type == "StreamJobCompleted"));
+        let signal_outbox = outbox
+            .iter()
+            .find(|record| record.event_type == "SignalQueued")
+            .context("signal callback should be enqueued after reconcile")?;
+        match &signal_outbox.event.payload {
+            WorkflowEvent::SignalQueued { signal_type, payload, .. } => {
+                assert_eq!(signal_type, "fraud.threshold.crossed");
+                assert_eq!(payload["jobId"], serde_json::json!(job_id));
+                assert_eq!(payload["logicalKey"], serde_json::json!("acct_1"));
+                assert_eq!(payload["output"]["riskExceeded"], serde_json::json!(true));
+            }
+            other => panic!("unexpected outbox payload after reconcile: {other:?}"),
+        }
+
+        let published_signal = app_state
+            .local_state
+            .load_stream_job_workflow_signal_state(&handle_id, "notify-fraud", "acct_1")?
+            .context("signal state should still exist after publish")?;
+        assert!(published_signal.published_at.is_some());
+
+        let completed_handle = store
+            .get_stream_job_bridge_handle(tenant_id, instance_id, run_id, job_id)
+            .await?
+            .context("stream job handle should exist after reconcile replay")?;
+        assert_eq!(
+            completed_handle.parsed_status(),
+            Some(fabrik_throughput::StreamJobBridgeHandleStatus::Completed)
+        );
+        assert!(completed_handle.terminal_at.is_some());
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_job_checkpoint_outbox_publication_replays_after_reconcile() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir = temp_path("throughput-stream-job-checkpoint-reconcile");
+        let app_state = test_app_state(store.clone(), &redpanda, &state_dir).await?;
+
+        let tenant_id = "tenant";
+        let instance_id = "instance-stream-job-checkpoint-reconcile";
+        let run_id = "run-stream-job-checkpoint-reconcile";
+        let job_id = "job-stream-job-checkpoint-reconcile";
+        let handle_id =
+            fabrik_throughput::stream_job_handle_id(tenant_id, instance_id, run_id, job_id);
+        let occurred_at = Utc::now();
+
+        store
+            .upsert_stream_job_bridge_handle(&StreamJobBridgeHandleRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: tenant_id.to_owned(),
+                instance_id: instance_id.to_owned(),
+                run_id: run_id.to_owned(),
+                stream_instance_id: instance_id.to_owned(),
+                stream_run_id: run_id.to_owned(),
+                job_id: job_id.to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: fabrik_throughput::stream_job_bridge_request_id(
+                    tenant_id,
+                    instance_id,
+                    run_id,
+                    job_id,
+                ),
+                origin_kind: fabrik_throughput::StreamJobOriginKind::Workflow.as_str().to_owned(),
+                definition_id: "payments-rollup".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                job_name: stream_jobs::KEYED_ROLLUP_JOB_NAME.to_owned(),
+                input_ref: serde_json::json!({
+                    "kind": "bounded_items",
+                    "items": [
+                        { "accountId": "acct_1", "amount": 2.0 },
+                        { "accountId": "acct_1", "amount": 3.0 },
+                        { "accountId": "acct_2", "amount": 11.0 }
+                    ]
+                })
+                .to_string(),
+                config_ref: None,
+                checkpoint_policy: None,
+                view_definitions: None,
+                status: fabrik_throughput::StreamJobBridgeHandleStatus::Admitted
+                    .as_str()
+                    .to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: None,
+                cancellation_requested_at: None,
+                cancellation_reason: None,
+                terminal_event_id: None,
+                terminal_at: None,
+                workflow_accepted_at: None,
+                terminal_output: None,
+                terminal_error: None,
+                created_at: occurred_at,
+                updated_at: occurred_at,
+            })
+            .await?;
+
+        app_state.fail_next_workflow_outbox_writes.store(1, Ordering::SeqCst);
+        let error = bridge::handle_throughput_command(
+            app_state.clone(),
+            ThroughputCommandEnvelope {
+                command_id: Uuid::now_v7(),
+                occurred_at,
+                dedupe_key: format!("stream-job-submit:{handle_id}"),
+                partition_key: throughput_partition_key(job_id, 0),
+                payload: ThroughputCommand::ScheduleStreamJob(
+                    fabrik_throughput::ScheduleStreamJobCommand {
+                        tenant_id: tenant_id.to_owned(),
+                        stream_instance_id: instance_id.to_owned(),
+                        stream_run_id: run_id.to_owned(),
+                        job_id: job_id.to_owned(),
+                        handle_id: handle_id.clone(),
+                    },
+                ),
+            },
+        )
+        .await
+        .expect_err("checkpoint outbox failpoint should force schedule failure");
+        assert!(error.to_string().contains("test failpoint: workflow event outbox enqueue failed"));
+
+        let checkpoints =
+            store.list_stream_job_bridge_checkpoints_for_handle_page(&handle_id, 10, 0).await?;
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(
+            checkpoints[0].parsed_status(),
+            Some(fabrik_throughput::StreamJobCheckpointStatus::Reached)
+        );
+        assert!(checkpoints[0].accepted_at.is_none());
+        assert!(checkpoints[0].cancelled_at.is_none());
+
+        let failed_handle = store
+            .get_stream_job_bridge_handle(tenant_id, instance_id, run_id, job_id)
+            .await?
+            .context("stream job handle should still exist after failed checkpoint publish")?;
+        assert_eq!(
+            failed_handle.parsed_status(),
+            Some(fabrik_throughput::StreamJobBridgeHandleStatus::Completed)
+        );
+        assert!(failed_handle.terminal_at.is_some());
+        assert!(failed_handle.workflow_accepted_at.is_none());
+
+        let pending_repairs = store.list_pending_stream_job_checkpoint_repairs(10).await?;
+        assert_eq!(pending_repairs.len(), 1);
+        assert_eq!(pending_repairs[0].await_request_id, checkpoints[0].await_request_id);
+
+        let initial_outbox = store
+            .lease_workflow_event_outbox(
+                "stream-job-checkpoint-reconcile-initial",
+                chrono::Duration::seconds(30),
+                10,
+                occurred_at + chrono::Duration::seconds(1),
+            )
+            .await?;
+        assert!(initial_outbox.is_empty());
+
+        bridge::reconcile_active_topic_stream_jobs(&app_state, 64).await?;
+        bridge::reconcile_active_topic_stream_jobs(&app_state, 64).await?;
+
+        let outbox = store
+            .lease_workflow_event_outbox(
+                "stream-job-checkpoint-reconcile-outbox",
+                chrono::Duration::seconds(30),
+                20,
+                occurred_at + chrono::Duration::seconds(2),
+            )
+            .await?;
+        assert_eq!(
+            outbox
+                .iter()
+                .filter(|record| record.event_type == "StreamJobCheckpointReached")
+                .count(),
+            1
+        );
+        assert!(!outbox.iter().any(|record| record.event_type == "StreamJobCompleted"));
+        let checkpoint_outbox = outbox
+            .iter()
+            .find(|record| record.event_type == "StreamJobCheckpointReached")
+            .context("checkpoint callback should be enqueued after reconcile")?;
+        match &checkpoint_outbox.event.payload {
+            WorkflowEvent::StreamJobCheckpointReached {
+                checkpoint_name,
+                checkpoint_sequence,
+                output,
+                ..
+            } => {
+                assert_eq!(checkpoint_name, stream_jobs::KEYED_ROLLUP_CHECKPOINT_NAME);
+                assert_eq!(*checkpoint_sequence, stream_jobs::KEYED_ROLLUP_CHECKPOINT_SEQUENCE);
+                assert_eq!(
+                    output.as_ref().and_then(|value| value.get("checkpoint")),
+                    Some(&serde_json::json!(stream_jobs::KEYED_ROLLUP_CHECKPOINT_NAME))
+                );
+            }
+            other => panic!("unexpected checkpoint outbox payload after reconcile: {other:?}"),
+        }
+
+        let repaired_checkpoint = store
+            .get_stream_job_bridge_checkpoint(&checkpoints[0].await_request_id)
+            .await?
+            .context("checkpoint should still exist after reconcile repair")?;
+        assert!(repaired_checkpoint.accepted_at.is_none());
+        assert!(repaired_checkpoint.cancelled_at.is_none());
 
         fs::remove_dir_all(state_dir).ok();
         Ok(())

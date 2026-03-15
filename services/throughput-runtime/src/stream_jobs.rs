@@ -5,22 +5,25 @@ use fabrik_broker::{
     load_json_topic_latest_offsets,
 };
 use fabrik_store::{
-    StreamJobBridgeHandleRecord, StreamJobCheckpointRecord, StreamJobQueryRecord, WorkflowStore,
+    StreamJobBridgeHandleRecord, StreamJobCheckpointRecord, StreamJobQueryRecord,
+    StreamJobViewDeleteRecord, StreamJobViewProjectionSummaryRecord, StreamJobViewRecord,
+    WorkflowStore,
 };
 use fabrik_throughput::{
     CompiledAggregateV2Kernel, CompiledStreamJob, CompiledStreamOperator, CompiledStreamQuery,
     CompiledStreamSource, CompiledStreamState, CompiledStreamView, STREAM_CONSISTENCY_STRONG,
     STREAM_JOB_KEYED_ROLLUP, STREAM_QUERY_MODE_BY_KEY, STREAM_QUERY_MODE_PREFIX_SCAN,
     STREAM_REDUCER_AVG, STREAM_REDUCER_COUNT, STREAM_REDUCER_HISTOGRAM, STREAM_REDUCER_MAX,
-    STREAM_REDUCER_MIN, STREAM_REDUCER_SUM, STREAM_REDUCER_THRESHOLD,
-    STREAM_RUNTIME_AGGREGATE_V2, STREAM_RUNTIME_KEYED_ROLLUP, STREAM_SOURCE_BOUNDED_INPUT,
-    STREAM_SOURCE_TOPIC, StreamJobBridgeHandleStatus, StreamJobOriginKind,
-    StreamJobQueryConsistency, StreamsChangelogEntry, StreamsChangelogPayload,
+    STREAM_REDUCER_MIN, STREAM_REDUCER_SUM, STREAM_REDUCER_THRESHOLD, STREAM_RUNTIME_AGGREGATE_V2,
+    STREAM_RUNTIME_KEYED_ROLLUP, STREAM_SOURCE_BOUNDED_INPUT, STREAM_SOURCE_TOPIC,
+    StreamJobBridgeHandleStatus, StreamJobOriginKind, StreamJobQueryConsistency,
+    StreamJobViewBatchUpdate, StreamsChangelogEntry, StreamsChangelogPayload,
     StreamsProjectionEvent, StreamsViewDeleteRecord, StreamsViewRecord,
+    stream_job_signal_callback_dedupe_key,
 };
 use futures_util::StreamExt;
 use serde::{
-    Deserialize,
+    Deserialize, Serialize,
     de::{self, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::{Map, Value, json};
@@ -31,6 +34,7 @@ use uuid::Uuid;
 use crate::local_state::{
     LocalStreamJobDispatchBatch, LocalStreamJobDispatchItem, LocalStreamJobRuntimeState,
     LocalStreamJobSourceCursorState, LocalStreamJobSourceLeaseState, LocalStreamJobViewState,
+    LocalStreamJobWorkflowSignalState,
 };
 use crate::{
     AppState, LocalThroughputState, StreamChangelogRecord, StreamJobActivationResult,
@@ -43,6 +47,7 @@ pub(crate) const KEYED_ROLLUP_JOB_NAME: &str = STREAM_JOB_KEYED_ROLLUP;
 pub(crate) const KEYED_ROLLUP_CHECKPOINT_NAME: &str = "initial-rollup-ready";
 pub(crate) const KEYED_ROLLUP_CHECKPOINT_SEQUENCE: i64 = 1;
 pub(crate) const STREAM_JOB_RUNTIME_STATS_QUERY_NAME: &str = "__runtime_stats";
+pub(crate) const STREAM_JOB_VIEW_RUNTIME_STATS_QUERY_NAME: &str = "__view_runtime_stats";
 const STREAM_INTERNAL_AVG_SUM_FIELD: &str = "_stream_sum";
 const STREAM_INTERNAL_AVG_COUNT_FIELD: &str = "_stream_count";
 const STREAM_WINDOW_LOGICAL_KEY_SEPARATOR: char = '\u{1f}';
@@ -51,6 +56,7 @@ const STREAM_WINDOW_LOGICAL_KEY_SEPARATOR: char = '\u{1f}';
 pub(crate) struct StreamJobMaterializationOutcome {
     pub checkpoint: Option<StreamJobCheckpointRecord>,
     pub terminal: Option<StreamJobTerminalResult>,
+    pub workflow_signals: Vec<LocalStreamJobWorkflowSignalState>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +102,8 @@ pub(crate) struct StreamJobPartitionWork {
     pub output_field: String,
     pub view_name: String,
     pub additional_view_names: Vec<String>,
+    pub eventual_projection_view_names: Vec<String>,
+    pub workflow_signals: Vec<StreamJobWorkflowSignalPlan>,
     pub checkpoint_name: String,
     pub checkpoint_sequence: i64,
     pub owner_epoch: u64,
@@ -103,6 +111,14 @@ pub(crate) struct StreamJobPartitionWork {
     pub items: Vec<StreamJobPartitionItem>,
     pub is_final_partition_batch: bool,
     pub completes_dispatch: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct StreamJobWorkflowSignalPlan {
+    pub operator_id: String,
+    pub view_name: String,
+    pub signal_type: String,
+    pub when_output_field: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +186,21 @@ type TopicStreamSourceRecord = (
 );
 
 #[derive(Debug, Clone)]
+struct StreamJobFilterPredicate {
+    field: String,
+    comparison: StreamFilterComparison,
+    value: StreamFilterValue,
+}
+
+#[derive(Debug, Clone)]
+enum StreamFilterValue {
+    Number(f64),
+    String(String),
+    Bool(bool),
+    Null,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct TopicStreamJobOwnerPollPlan {
     pub execution_planned: Option<StreamChangelogRecord>,
     pub runtime_state_update: Option<LocalStreamJobRuntimeState>,
@@ -185,10 +216,13 @@ struct BoundedStreamAggregationPlan {
     reducer_kind: String,
     value_field: Option<String>,
     output_field: String,
+    filters: Vec<StreamJobFilterPredicate>,
     threshold: Option<f64>,
     threshold_comparison: StreamThresholdComparison,
     view_name: String,
     additional_view_names: Vec<String>,
+    eventual_projection_view_names: Vec<String>,
+    workflow_signals: Vec<StreamJobWorkflowSignalPlan>,
     view_retention_seconds: Option<u64>,
     window_time_field: Option<String>,
     window_size: Option<ChronoDuration>,
@@ -203,6 +237,16 @@ enum StreamThresholdComparison {
     Gte,
     Lt,
     Lte,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamFilterComparison {
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    Eq,
+    Ne,
 }
 
 impl StreamThresholdComparison {
@@ -230,12 +274,120 @@ impl StreamThresholdComparison {
     }
 }
 
+impl StreamFilterComparison {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            ">" => Ok(Self::Gt),
+            ">=" => Ok(Self::Gte),
+            "<" => Ok(Self::Lt),
+            "<=" => Ok(Self::Lte),
+            "==" => Ok(Self::Eq),
+            "!=" => Ok(Self::Ne),
+            other => anyhow::bail!("unsupported stream filter comparison {other}"),
+        }
+    }
+
+    fn matches(self, actual: &Value, expected: &StreamFilterValue) -> bool {
+        match self {
+            Self::Gt => match (actual.as_f64(), expected) {
+                (Some(actual), StreamFilterValue::Number(expected)) => actual > *expected,
+                _ => false,
+            },
+            Self::Gte => match (actual.as_f64(), expected) {
+                (Some(actual), StreamFilterValue::Number(expected)) => actual >= *expected,
+                _ => false,
+            },
+            Self::Lt => match (actual.as_f64(), expected) {
+                (Some(actual), StreamFilterValue::Number(expected)) => actual < *expected,
+                _ => false,
+            },
+            Self::Lte => match (actual.as_f64(), expected) {
+                (Some(actual), StreamFilterValue::Number(expected)) => actual <= *expected,
+                _ => false,
+            },
+            Self::Eq => match expected {
+                StreamFilterValue::Number(expected) => {
+                    actual.as_f64().is_some_and(|actual| actual == *expected)
+                }
+                StreamFilterValue::String(expected) => {
+                    actual.as_str().is_some_and(|actual| actual == expected)
+                }
+                StreamFilterValue::Bool(expected) => {
+                    actual.as_bool().is_some_and(|actual| actual == *expected)
+                }
+                StreamFilterValue::Null => actual.is_null(),
+            },
+            Self::Ne => !Self::Eq.matches(actual, expected),
+        }
+    }
+}
+
 fn threshold_value(plan: &BoundedStreamAggregationPlan, raw_value: f64) -> f64 {
     match plan.threshold {
         Some(threshold) if plan.threshold_comparison.matches(raw_value, threshold) => 1.0,
         Some(_) => 0.0,
         None => raw_value,
     }
+}
+
+fn parse_stream_job_filter_predicate(
+    _operator_id: &str,
+    predicate: &str,
+) -> Result<StreamJobFilterPredicate> {
+    let mut parts = predicate.split_whitespace();
+    let field = parts.next().context("stream filter predicate must include a field name")?;
+    let comparison =
+        parts.next().context("stream filter predicate must include a comparison operator")?;
+    let raw_value =
+        parts.next().context("stream filter predicate must include a comparison value")?;
+    if parts.next().is_some() {
+        anyhow::bail!("stream filter predicate must be of the form '<field> <op> <value>'");
+    }
+    let value = if (raw_value.starts_with('"') && raw_value.ends_with('"'))
+        || (raw_value.starts_with('\'') && raw_value.ends_with('\''))
+    {
+        StreamFilterValue::String(raw_value[1..raw_value.len() - 1].to_owned())
+    } else if raw_value == "true" {
+        StreamFilterValue::Bool(true)
+    } else if raw_value == "false" {
+        StreamFilterValue::Bool(false)
+    } else if raw_value == "null" {
+        StreamFilterValue::Null
+    } else {
+        StreamFilterValue::Number(
+            raw_value
+                .parse::<f64>()
+                .with_context(|| format!("stream filter literal {raw_value} must be a number"))?,
+        )
+    };
+    Ok(StreamJobFilterPredicate {
+        field: field.to_owned(),
+        comparison: StreamFilterComparison::parse(comparison)?,
+        value,
+    })
+}
+
+fn source_item_matches_filters(item: &Value, filters: &[StreamJobFilterPredicate]) -> bool {
+    filters.iter().all(|filter| {
+        item.as_object()
+            .and_then(|object| object.get(&filter.field))
+            .is_some_and(|actual| filter.comparison.matches(actual, &filter.value))
+    })
+}
+
+fn ensure_signal_workflows_supported(
+    handle: &StreamJobBridgeHandleRecord,
+    plan: &BoundedStreamAggregationPlan,
+) -> Result<()> {
+    if !plan.workflow_signals.is_empty()
+        && !matches!(handle.parsed_origin_kind(), Some(StreamJobOriginKind::Workflow))
+    {
+        anyhow::bail!(
+            "stream runtime {} signal_workflow operators currently require workflow-origin stream jobs",
+            STREAM_RUNTIME_AGGREGATE_V2
+        );
+    }
+    Ok(())
 }
 
 fn value_property<'a>(value: &'a Value, camel: &str, snake: &str) -> Option<&'a Value> {
@@ -573,6 +725,35 @@ fn parse_compiled_job_from_config_ref(
     }))
 }
 
+fn view_supports_eventual_reads(view: &CompiledStreamView) -> bool {
+    view.consistency == StreamJobQueryConsistency::Eventual.as_str()
+        || view
+            .supported_consistencies
+            .iter()
+            .any(|consistency| consistency == StreamJobQueryConsistency::Eventual.as_str())
+}
+
+fn eventual_projection_view_names(
+    handle: &StreamJobBridgeHandleRecord,
+    view_names: &[String],
+) -> Result<Vec<String>> {
+    let definitions = if let Some(job) = parse_compiled_job_from_config_ref(handle)? {
+        job.views
+    } else {
+        parse_compiled_views(handle.view_definitions.as_ref())?
+    };
+    Ok(view_names
+        .iter()
+        .filter(|view_name| {
+            definitions
+                .iter()
+                .find(|view| view.name == view_name.as_str())
+                .is_some_and(view_supports_eventual_reads)
+        })
+        .cloned()
+        .collect())
+}
+
 pub(crate) async fn resolve_stream_job_definition(
     store: Option<&WorkflowStore>,
     handle: &StreamJobBridgeHandleRecord,
@@ -757,13 +938,37 @@ fn bounded_stream_plan_for_job(
     job: &CompiledStreamJob,
 ) -> Result<Option<BoundedStreamAggregationPlan>> {
     if let Some(kernel) = job.keyed_rollup_kernel()? {
+        let all_view_names = vec![kernel.view_name.clone()];
         return Ok(Some(BoundedStreamAggregationPlan {
             key_field: kernel.key_field.clone(),
             reducer_kind: STREAM_REDUCER_SUM.to_owned(),
             value_field: Some(kernel.value_field.clone()),
             output_field: kernel.output_field.clone(),
+            filters: Vec::new(),
+            threshold: None,
+            threshold_comparison: StreamThresholdComparison::Gte,
             view_name: kernel.view_name.clone(),
             additional_view_names: Vec::new(),
+            eventual_projection_view_names: all_view_names
+                .iter()
+                .filter(|view_name| {
+                    job.views
+                        .iter()
+                        .find(|view| view.name == view_name.as_str())
+                        .is_some_and(view_supports_eventual_reads)
+                })
+                .cloned()
+                .collect(),
+            workflow_signals: kernel
+                .workflow_signals
+                .iter()
+                .map(|signal| StreamJobWorkflowSignalPlan {
+                    operator_id: signal.operator_id.clone(),
+                    view_name: signal.view_name.clone(),
+                    signal_type: signal.signal_type.clone(),
+                    when_output_field: signal.when_output_field.clone(),
+                })
+                .collect(),
             view_retention_seconds: None,
             window_time_field: None,
             window_size: None,
@@ -1165,6 +1370,7 @@ struct StreamJobWindowRetentionSweep {
     delete_keys: Vec<(String, String, String)>,
     projection_records: Vec<StreamProjectionRecord>,
     changelog_records: Vec<StreamChangelogRecord>,
+    evicted_views: Vec<(String, Option<DateTime<Utc>>)>,
     evicted_window_count: u64,
     last_evicted_window_end: Option<DateTime<Utc>>,
     last_evicted_at: Option<DateTime<Utc>>,
@@ -1181,6 +1387,7 @@ fn sweep_expired_stream_job_windows(
             delete_keys: Vec::new(),
             projection_records: Vec::new(),
             changelog_records: Vec::new(),
+            evicted_views: Vec::new(),
             evicted_window_count: 0,
             last_evicted_window_end: None,
             last_evicted_at: None,
@@ -1211,6 +1418,7 @@ fn sweep_expired_stream_job_windows(
             delete_keys: Vec::new(),
             projection_records: Vec::new(),
             changelog_records: Vec::new(),
+            evicted_views: Vec::new(),
             evicted_window_count: 0,
             last_evicted_window_end: None,
             last_evicted_at: None,
@@ -1228,7 +1436,9 @@ fn sweep_expired_stream_job_windows(
 
     let mut projection_records = Vec::with_capacity(candidates.len());
     let mut changelog_records = Vec::with_capacity(candidates.len());
+    let mut evicted_views = Vec::with_capacity(candidates.len());
     for (view_state, window_end, retention_seconds) in candidates {
+        evicted_views.push((view_state.view_name.clone(), window_end));
         projection_records.push(delete_view_projection_record(
             handle,
             &view_state.view_name,
@@ -1254,10 +1464,40 @@ fn sweep_expired_stream_job_windows(
         delete_keys,
         projection_records,
         changelog_records,
+        evicted_views,
         evicted_window_count,
         last_evicted_window_end,
         last_evicted_at,
     })
+}
+
+fn apply_window_retention_job_counters_to_runtime_state(
+    runtime_state: &mut LocalStreamJobRuntimeState,
+    sweep: &StreamJobWindowRetentionSweep,
+) {
+    runtime_state.evicted_window_count = sweep.evicted_window_count;
+    runtime_state.last_evicted_window_end = sweep.last_evicted_window_end;
+    runtime_state.last_evicted_at = sweep.last_evicted_at;
+}
+
+fn apply_window_retention_view_history_to_runtime_state(
+    runtime_state: &mut LocalStreamJobRuntimeState,
+    sweep: &StreamJobWindowRetentionSweep,
+    occurred_at: DateTime<Utc>,
+) {
+    for (view_name, window_end) in &sweep.evicted_views {
+        runtime_state.record_view_eviction(view_name, *window_end, Some(occurred_at));
+    }
+}
+
+fn apply_window_retention_sweep_to_runtime_state(
+    runtime_state: &mut LocalStreamJobRuntimeState,
+    sweep: &StreamJobWindowRetentionSweep,
+    occurred_at: DateTime<Utc>,
+) {
+    apply_window_retention_job_counters_to_runtime_state(runtime_state, sweep);
+    apply_window_retention_view_history_to_runtime_state(runtime_state, sweep, occurred_at);
+    runtime_state.updated_at = occurred_at;
 }
 
 fn apply_stream_job_window_retention_sweep_on_local_state(
@@ -1271,10 +1511,7 @@ fn apply_stream_job_window_retention_sweep_on_local_state(
     }
     local_state.delete_stream_job_view_states(&sweep.delete_keys)?;
     let mut updated_runtime_state = runtime_state.clone();
-    updated_runtime_state.evicted_window_count = sweep.evicted_window_count;
-    updated_runtime_state.last_evicted_window_end = sweep.last_evicted_window_end;
-    updated_runtime_state.last_evicted_at = sweep.last_evicted_at;
-    updated_runtime_state.updated_at = occurred_at;
+    apply_window_retention_sweep_to_runtime_state(&mut updated_runtime_state, sweep, occurred_at);
     local_state.upsert_stream_job_runtime_state(&updated_runtime_state)?;
     Ok(())
 }
@@ -1299,26 +1536,86 @@ fn query_source_partition_id(query: &StreamJobQueryRecord) -> Result<Option<i32>
     anyhow::bail!("stream job query sourcePartitionId must be an integer");
 }
 
+fn query_view_name(query: &StreamJobQueryRecord) -> Result<Option<String>> {
+    let Some(args) = query.query_args.as_ref() else {
+        return Ok(None);
+    };
+    let Some(value) = value_property(args, "viewName", "view_name") else {
+        return Ok(None);
+    };
+    value
+        .as_str()
+        .map(str::to_owned)
+        .with_context(|| "stream job query viewName must be a string".to_owned())
+        .map(Some)
+}
+
 fn optional_datetime_value(value: Option<DateTime<Utc>>) -> Value {
     value.map(|value| Value::String(value.to_rfc3339())).unwrap_or(Value::Null)
 }
 
-fn materialized_view_runtime_policy(job: &CompiledStreamJob) -> Value {
-    Value::Array(
+fn build_materialized_view_runtime_policy(
+    job: &CompiledStreamJob,
+    view_name: &str,
+) -> Result<Option<Value>> {
+    let aggregate_v2 = job.aggregate_v2_kernel()?;
+    let aggregate_views = job
+        .operators
+        .iter()
+        .filter(|operator| operator.kind == fabrik_throughput::STREAM_OPERATOR_MATERIALIZE)
+        .filter_map(|operator| {
+            let config = operator.config.as_ref()?.as_object()?;
+            let view_name = config.get("view").and_then(Value::as_str)?;
+            Some((view_name, operator))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let window = aggregate_v2.as_ref().and_then(|kernel| kernel.window.clone());
+    let Some(view) = job.views.iter().find(|view| view.name == view_name) else {
+        return Ok(None);
+    };
+    let aggregate_view = aggregate_views.get(view.name.as_str()).copied();
+    Ok(Some(json!({
+        "name": view.name,
+        "operatorId": aggregate_view.and_then(|compiled| compiled.operator_id.clone()),
+        "stateIds": aggregate_view.map(|compiled| compiled.state_ids.clone()).unwrap_or_default(),
+        "queryMode": view.query_mode,
+        "keyField": view.key_field,
+        "consistency": view.consistency,
+        "supportedConsistencies": view.supported_consistencies,
+        "retentionSeconds": view.retention_seconds,
+        "lateEventPolicy": window
+            .as_ref()
+            .map(|_| "drop_after_closed_window")
+            .unwrap_or("not_applicable"),
+        "retentionEvictionEnabled": view.retention_seconds.is_some(),
+        "evictedWindowEventPolicy": if view.retention_seconds.is_some() {
+            window
+                .as_ref()
+                .map(|_| Value::String("drop_after_retention".to_owned()))
+                .unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        },
+        "windowPolicy": window.as_ref().map(|window| {
+            json!({
+                "mode": window.mode,
+                "size": window.size,
+                "timeField": window.time_field,
+                "allowedLateness": window.allowed_lateness,
+                "retentionSeconds": view.retention_seconds,
+                "checkpointReadiness": "closed_windows",
+            })
+        }),
+    })))
+}
+
+fn materialized_view_runtime_policy(job: &CompiledStreamJob) -> Result<Value> {
+    Ok(Value::Array(
         job.views
             .iter()
-            .map(|view| {
-                json!({
-                    "name": view.name,
-                    "queryMode": view.query_mode,
-                    "keyField": view.key_field,
-                    "consistency": view.consistency,
-                    "supportedConsistencies": view.supported_consistencies,
-                    "retentionSeconds": view.retention_seconds,
-                })
-            })
-            .collect(),
-    )
+            .filter_map(|view| build_materialized_view_runtime_policy(job, &view.name).transpose())
+            .collect::<Result<Vec<_>>>()?,
+    ))
 }
 
 fn common_window_retention_seconds(job: &CompiledStreamJob) -> Option<u64> {
@@ -1398,6 +1695,17 @@ fn source_lease_runtime_stats(lease: &LocalStreamJobSourceLeaseState) -> Value {
     })
 }
 
+fn max_optional_datetime<I>(values: I) -> Option<DateTime<Utc>>
+where
+    I: IntoIterator<Item = Option<DateTime<Utc>>>,
+{
+    values.into_iter().flatten().max()
+}
+
+fn optional_duration_seconds(value: Option<chrono::Duration>) -> Value {
+    value.map(|duration| Value::from(duration.num_seconds())).unwrap_or(Value::Null)
+}
+
 fn build_stream_job_runtime_stats_output_from_runtime_state(
     runtime_state: &LocalStreamJobRuntimeState,
     handle: &StreamJobBridgeHandleRecord,
@@ -1441,7 +1749,7 @@ fn build_stream_job_runtime_stats_output_from_runtime_state(
             "jobClassification".to_owned(),
             job.classification.clone().map(Value::String).unwrap_or(Value::Null),
         );
-        output.insert("materializedViews".to_owned(), materialized_view_runtime_policy(&job));
+        output.insert("materializedViews".to_owned(), materialized_view_runtime_policy(&job)?);
         output.insert("windowPolicy".to_owned(), window_runtime_policy(&job)?);
     }
     output.insert(
@@ -1508,6 +1816,153 @@ fn build_stream_job_runtime_stats_output_on_local_state(
         handle,
         query,
     )?))
+}
+
+fn build_stream_job_view_runtime_stats_output_on_local_state(
+    local_state: &LocalThroughputState,
+    handle: &StreamJobBridgeHandleRecord,
+    query: &StreamJobQueryRecord,
+) -> Result<Option<Value>> {
+    let Some(runtime_state) = local_state.load_stream_job_runtime_state(&handle.handle_id)? else {
+        return Ok(None);
+    };
+    if matches!(query.parsed_consistency(), Some(StreamJobQueryConsistency::Eventual)) {
+        anyhow::bail!(
+            "{STREAM_JOB_VIEW_RUNTIME_STATS_QUERY_NAME} only supports strong consistency"
+        );
+    }
+    let Some(view_name) = query_view_name(query)? else {
+        anyhow::bail!("{STREAM_JOB_VIEW_RUNTIME_STATS_QUERY_NAME} requires viewName");
+    };
+    let Some(job) = parse_compiled_job_from_config_ref(handle)? else {
+        return Ok(None);
+    };
+    let Some(view) = job.views.iter().find(|view| view.name == view_name) else {
+        return Ok(None);
+    };
+    let Some(policy) = build_materialized_view_runtime_policy(&job, &view_name)? else {
+        return Ok(None);
+    };
+    let stored_entries =
+        local_state.load_stream_job_views_for_view(&handle.handle_id, &view_name)?;
+    let latest_materialized_window_end =
+        max_optional_datetime(stored_entries.iter().map(|view_state| {
+            view_state
+                .output
+                .get("windowEnd")
+                .and_then(Value::as_str)
+                .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok())
+                .map(|value| value.with_timezone(&Utc))
+        }));
+    let active_entries = stored_entries
+        .iter()
+        .filter(|view_state| {
+            !window_expired_from_deadline(
+                view_window_expired_at(Some(&job), view, &view_state.output).ok().flatten(),
+                query.requested_at,
+            )
+        })
+        .count();
+    let latest_checkpoint_sequence =
+        stored_entries.iter().map(|view| view.checkpoint_sequence).max();
+    let latest_updated_at = stored_entries.iter().map(|view| view.updated_at).max();
+    let latest_event_time_watermark = max_optional_datetime(
+        runtime_state.source_cursors.iter().map(|cursor| cursor.last_event_time_watermark),
+    );
+    let latest_closed_window_end = max_optional_datetime(
+        runtime_state.source_cursors.iter().map(|cursor| cursor.last_closed_window_end),
+    );
+    let freshness = json!({
+        "latestUpdateAgeSeconds": optional_duration_seconds(
+            latest_updated_at.map(|updated_at| query.requested_at - updated_at)
+        ),
+        "checkpointSequenceLag": latest_checkpoint_sequence
+            .map(|sequence| Value::from(runtime_state.checkpoint_sequence.saturating_sub(sequence)))
+            .unwrap_or(Value::Null),
+        "latestEventTimeWatermark": optional_datetime_value(latest_event_time_watermark),
+        "latestClosedWindowEnd": optional_datetime_value(latest_closed_window_end),
+        "latestMaterializedWindowEnd": optional_datetime_value(latest_materialized_window_end),
+        "eventTimeLagSeconds": optional_duration_seconds(
+            latest_event_time_watermark.zip(latest_materialized_window_end).map(|(watermark, materialized)| {
+                watermark - materialized
+            })
+        ),
+        "closedWindowLagSeconds": optional_duration_seconds(
+            latest_closed_window_end.zip(latest_materialized_window_end).map(|(closed, materialized)| {
+                closed - materialized
+            })
+        ),
+    });
+    let view_runtime_stats = runtime_state.view_runtime_stats(&view_name);
+
+    Ok(Some(json!({
+        "queryName": query.query_name,
+        "handleId": runtime_state.handle_id,
+        "jobId": runtime_state.job_id,
+        "jobName": runtime_state.job_name,
+        "viewName": view_name,
+        "policy": policy,
+        "storedKeyCount": stored_entries.len(),
+        "activeKeyCount": active_entries,
+        "latestCheckpointSequence": latest_checkpoint_sequence,
+        "latestUpdatedAt": latest_updated_at.map(|value| value.to_rfc3339()),
+        "freshness": freshness,
+        "historicalEvictedWindowCount": view_runtime_stats
+            .map(|stats| stats.evicted_window_count)
+            .unwrap_or_default(),
+        "historicalLastEvictedWindowEnd": optional_datetime_value(
+            view_runtime_stats.and_then(|stats| stats.last_evicted_window_end)
+        ),
+        "historicalLastEvictedAt": optional_datetime_value(
+            view_runtime_stats.and_then(|stats| stats.last_evicted_at)
+        ),
+        "jobEvictedWindowCount": runtime_state.evicted_window_count,
+        "lastEvictedWindowEnd": optional_datetime_value(runtime_state.last_evicted_window_end),
+        "lastEvictedAt": optional_datetime_value(runtime_state.last_evicted_at),
+        "streamOwnerEpoch": runtime_state.stream_owner_epoch,
+        "consistency": STREAM_CONSISTENCY_STRONG,
+        "consistencySource": "stream_owner_local_state",
+    })))
+}
+
+async fn build_stream_job_view_runtime_stats_output(
+    state: &AppState,
+    handle: &StreamJobBridgeHandleRecord,
+    query: &StreamJobQueryRecord,
+) -> Result<Option<Value>> {
+    let Some(mut output) = build_stream_job_view_runtime_stats_output_on_local_state(
+        owner_local_state_for_stream_job(state, &handle.job_id),
+        handle,
+        query,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(view_name) = query_view_name(query)? else {
+        return Ok(Some(output));
+    };
+    let Some(job) = parse_compiled_job_from_config_ref(handle)? else {
+        return Ok(Some(output));
+    };
+    let Some(view) = job.views.iter().find(|view| view.name == view_name) else {
+        return Ok(Some(output));
+    };
+    let projection_stats = if let Some(projection_stats) =
+        eventual_projection_stats_output(state, handle, view, query.requested_at).await?
+    {
+        projection_stats
+    } else {
+        json!({
+            "supported": false,
+            "rebuildSupported": false,
+            "summary": Value::Null,
+            "freshness": Value::Null,
+        })
+    };
+    if let Some(object) = output.as_object_mut() {
+        object.insert("projectionStats".to_owned(), projection_stats);
+    }
+    Ok(Some(output))
 }
 
 fn prunable_window_views(
@@ -1626,6 +2081,24 @@ fn boolean_output_field(output: &Map<String, Value>, field: &str) -> Option<bool
         .or_else(|| numeric_output_field(output, field).map(|value| value > 0.0))
 }
 
+fn truthy_output_field(output: &Map<String, Value>, field: &str) -> bool {
+    output.get(field).is_some_and(|value| match value {
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_some_and(|value| value > 0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Null => false,
+        Value::Array(values) => !values.is_empty(),
+        Value::Object(values) => !values.is_empty(),
+    })
+}
+
+fn signal_output_matches(output: &Value, when_output_field: Option<&str>) -> bool {
+    match when_output_field {
+        Some(field) => output.as_object().is_some_and(|output| truthy_output_field(output, field)),
+        None => true,
+    }
+}
+
 fn sanitize_stream_view_output(mut output: Value) -> Value {
     if let Some(object) = output.as_object_mut() {
         object.remove(STREAM_INTERNAL_AVG_SUM_FIELD);
@@ -1688,9 +2161,9 @@ impl StreamReducerAccumulator {
                     hidden_avg_count(output).max(u64::from(output.contains_key(output_field)));
                 Ok(Self::Avg { sum, count })
             }
-            STREAM_REDUCER_THRESHOLD => {
-                Ok(Self::Threshold { crossed: boolean_output_field(output, output_field).unwrap_or(false) })
-            }
+            STREAM_REDUCER_THRESHOLD => Ok(Self::Threshold {
+                crossed: boolean_output_field(output, output_field).unwrap_or(false),
+            }),
             other => anyhow::bail!("stream reducer {other} is not implemented in local activation"),
         }
     }
@@ -1840,18 +2313,19 @@ fn load_stream_job_view_accumulator(
     output_field: &str,
     key_field: &str,
     logical_key: &str,
-) -> Result<Option<StreamJobViewAccumulator>> {
+) -> Result<Option<(Map<String, Value>, StreamJobViewAccumulator)>> {
     local_state
         .load_stream_job_view_state(handle_id, view_name, logical_key)?
         .and_then(|view_state| view_state.output.as_object().cloned())
         .map(|output| {
-            StreamJobViewAccumulator::from_output(
+            let accumulator = StreamJobViewAccumulator::from_output(
                 &output,
                 reducer_kind,
                 output_field,
                 key_field,
                 logical_key,
-            )
+            )?;
+            Ok((output, accumulator))
         })
         .transpose()
 }
@@ -1863,6 +2337,17 @@ struct StreamJobMaterializedBatch {
     owner_view_updates: Vec<LocalStreamJobViewState>,
 }
 
+#[derive(Debug)]
+struct PreparedStreamJobPartitionApply {
+    activation_result: StreamJobActivationResult,
+    owner_view_updates: Vec<LocalStreamJobViewState>,
+    mirrored_stream_entries: Vec<StreamsChangelogEntry>,
+    batch_id: String,
+    compact_checkpoint_mirrors: bool,
+    completes_dispatch: bool,
+    occurred_at: DateTime<Utc>,
+}
+
 fn materialize_stream_job_batch_updates(
     handle: &StreamJobBridgeHandleRecord,
     work: &StreamJobPartitionWork,
@@ -1870,12 +2355,19 @@ fn materialize_stream_job_batch_updates(
     mirror_owner_state: bool,
 ) -> StreamJobMaterializedBatch {
     let view_count = 1 + work.additional_view_names.len();
-    let mut projection_records = Vec::with_capacity(updated_outputs.len() * view_count);
+    let use_batched_materialization = work.source_lease_token.is_none();
+    let mut projection_records =
+        Vec::with_capacity(updated_outputs.len() * work.eventual_projection_view_names.len());
     let mut changelog_records = Vec::with_capacity(updated_outputs.len() * view_count);
+    let mut changelog_updates = Vec::with_capacity(updated_outputs.len() * view_count);
     let mut owner_view_updates = if mirror_owner_state {
         Vec::with_capacity(updated_outputs.len() * view_count)
     } else {
         Vec::new()
+    };
+    let should_project_view = |view_name: &str| {
+        !use_batched_materialization
+            || work.eventual_projection_view_names.iter().any(|candidate| candidate == view_name)
     };
     for (logical_key, output) in updated_outputs {
         let (internal_output, public_output) = output.into_output_values(
@@ -1897,32 +2389,42 @@ fn materialize_stream_job_batch_updates(
                     updated_at: work.occurred_at,
                 });
             }
-            projection_records.push(StreamProjectionRecord::streams(
-                partition_key,
-                StreamsProjectionEvent::UpsertStreamJobView {
-                    view: StreamsViewRecord {
-                        tenant_id: handle.tenant_id.clone(),
-                        instance_id: handle.instance_id.clone(),
-                        run_id: handle.run_id.clone(),
-                        job_id: handle.job_id.clone(),
-                        handle_id: handle.handle_id.clone(),
-                        view_name: work.view_name.clone(),
-                        logical_key: logical_key.clone(),
-                        output: public_output.clone(),
-                        checkpoint_sequence: work.checkpoint_sequence,
-                        updated_at: work.occurred_at,
+            if should_project_view(&work.view_name) {
+                projection_records.push(StreamProjectionRecord::streams(
+                    partition_key,
+                    StreamsProjectionEvent::UpsertStreamJobView {
+                        view: StreamsViewRecord {
+                            tenant_id: handle.tenant_id.clone(),
+                            instance_id: handle.instance_id.clone(),
+                            run_id: handle.run_id.clone(),
+                            job_id: handle.job_id.clone(),
+                            handle_id: handle.handle_id.clone(),
+                            view_name: work.view_name.clone(),
+                            logical_key: logical_key.clone(),
+                            output: public_output.clone(),
+                            checkpoint_sequence: work.checkpoint_sequence,
+                            updated_at: work.occurred_at,
+                        },
                     },
-                },
-            ));
-            changelog_records.push(view_update_changelog_record(
-                handle,
-                &work.view_name,
-                &logical_key,
-                &logical_key,
-                internal_output.clone(),
-                work.checkpoint_sequence,
-                work.occurred_at,
-            ));
+                ));
+            }
+            if use_batched_materialization {
+                changelog_updates.push(StreamJobViewBatchUpdate {
+                    view_name: work.view_name.clone(),
+                    logical_key,
+                    output: internal_output,
+                });
+            } else {
+                changelog_records.push(view_update_changelog_record(
+                    handle,
+                    &work.view_name,
+                    &logical_key,
+                    &logical_key,
+                    internal_output,
+                    work.checkpoint_sequence,
+                    work.occurred_at,
+                ));
+            }
             continue;
         }
 
@@ -1938,33 +2440,52 @@ fn materialize_stream_job_batch_updates(
                     updated_at: work.occurred_at,
                 });
             }
-            projection_records.push(StreamProjectionRecord::streams(
-                partition_key.clone(),
-                StreamsProjectionEvent::UpsertStreamJobView {
-                    view: StreamsViewRecord {
-                        tenant_id: handle.tenant_id.clone(),
-                        instance_id: handle.instance_id.clone(),
-                        run_id: handle.run_id.clone(),
-                        job_id: handle.job_id.clone(),
-                        handle_id: handle.handle_id.clone(),
-                        view_name: view_name.clone(),
-                        logical_key: logical_key.clone(),
-                        output: public_output.clone(),
-                        checkpoint_sequence: work.checkpoint_sequence,
-                        updated_at: work.occurred_at,
+            if should_project_view(view_name) {
+                projection_records.push(StreamProjectionRecord::streams(
+                    partition_key.clone(),
+                    StreamsProjectionEvent::UpsertStreamJobView {
+                        view: StreamsViewRecord {
+                            tenant_id: handle.tenant_id.clone(),
+                            instance_id: handle.instance_id.clone(),
+                            run_id: handle.run_id.clone(),
+                            job_id: handle.job_id.clone(),
+                            handle_id: handle.handle_id.clone(),
+                            view_name: view_name.clone(),
+                            logical_key: logical_key.clone(),
+                            output: public_output.clone(),
+                            checkpoint_sequence: work.checkpoint_sequence,
+                            updated_at: work.occurred_at,
+                        },
                     },
-                },
-            ));
-            changelog_records.push(view_update_changelog_record(
-                handle,
-                view_name,
-                &logical_key,
-                &logical_key,
-                internal_output.clone(),
-                work.checkpoint_sequence,
-                work.occurred_at,
-            ));
+                ));
+            }
+            if use_batched_materialization {
+                changelog_updates.push(StreamJobViewBatchUpdate {
+                    view_name: view_name.clone(),
+                    logical_key: logical_key.clone(),
+                    output: internal_output.clone(),
+                });
+            } else {
+                changelog_records.push(view_update_changelog_record(
+                    handle,
+                    view_name,
+                    &logical_key,
+                    &logical_key,
+                    internal_output.clone(),
+                    work.checkpoint_sequence,
+                    work.occurred_at,
+                ));
+            }
         }
+    }
+    if use_batched_materialization && !changelog_updates.is_empty() {
+        changelog_records.push(view_batch_update_changelog_record(
+            handle,
+            &work.routing_key,
+            changelog_updates,
+            work.checkpoint_sequence,
+            work.occurred_at,
+        ));
     }
     StreamJobMaterializedBatch { projection_records, changelog_records, owner_view_updates }
 }
@@ -2025,8 +2546,12 @@ fn bounded_aggregate_v2_kernel_subset(
 
     let aggregate = &kernel.aggregates[0];
     match aggregate.reducer.as_str() {
-        STREAM_REDUCER_COUNT | STREAM_REDUCER_SUM | STREAM_REDUCER_MIN | STREAM_REDUCER_MAX
-        | STREAM_REDUCER_AVG | STREAM_REDUCER_THRESHOLD => {}
+        STREAM_REDUCER_COUNT
+        | STREAM_REDUCER_SUM
+        | STREAM_REDUCER_MIN
+        | STREAM_REDUCER_MAX
+        | STREAM_REDUCER_AVG
+        | STREAM_REDUCER_THRESHOLD => {}
         STREAM_REDUCER_HISTOGRAM => {
             anyhow::bail!(
                 "stream runtime {} local activation does not support histogram reducers yet",
@@ -2051,14 +2576,10 @@ fn bounded_aggregate_v2_kernel_subset(
     let threshold_comparison = StreamThresholdComparison::parse(aggregate.comparison.as_deref())?;
     let threshold = match aggregate.reducer.as_str() {
         STREAM_REDUCER_THRESHOLD => Some(
-            aggregate
-                .threshold
-                .as_ref()
-                .and_then(serde_json::Number::as_f64)
-                .context(format!(
-                    "stream runtime {} threshold reducer requires a finite numeric threshold",
-                    STREAM_RUNTIME_AGGREGATE_V2
-                ))?,
+            aggregate.threshold.as_ref().and_then(serde_json::Number::as_f64).context(format!(
+                "stream runtime {} threshold reducer requires a finite numeric threshold",
+                STREAM_RUNTIME_AGGREGATE_V2
+            ))?,
         ),
         _ => None,
     };
@@ -2110,6 +2631,25 @@ fn bounded_aggregate_v2_kernel_subset(
         }
         view_names.push(materialized_view.view_name.clone());
     }
+    let workflow_signals = kernel
+        .workflow_signals
+        .iter()
+        .map(|signal| {
+            if !view_names.iter().any(|view_name| view_name == &signal.view_name) {
+                anyhow::bail!(
+                    "stream runtime {} signal_workflow view {} must also be materialized",
+                    STREAM_RUNTIME_AGGREGATE_V2,
+                    signal.view_name
+                );
+            }
+            Ok(StreamJobWorkflowSignalPlan {
+                operator_id: signal.operator_id.clone(),
+                view_name: signal.view_name.clone(),
+                signal_type: signal.signal_type.clone(),
+                when_output_field: signal.when_output_field.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
     let primary_view_name = view_names
         .first()
         .cloned()
@@ -2137,15 +2677,33 @@ fn bounded_aggregate_v2_kernel_subset(
     };
 
     let checkpoint = kernel.checkpoints.first();
+    let filters = kernel
+        .filters
+        .iter()
+        .map(|filter| parse_stream_job_filter_predicate(&filter.operator_id, &filter.predicate))
+        .collect::<Result<Vec<_>>>()?;
+    let eventual_projection_view_names = view_names
+        .iter()
+        .filter(|view_name| {
+            job.views
+                .iter()
+                .find(|view| view.name == view_name.as_str())
+                .is_some_and(view_supports_eventual_reads)
+        })
+        .cloned()
+        .collect();
     Ok(BoundedStreamAggregationPlan {
         key_field: kernel.key_field.clone(),
         reducer_kind: aggregate.reducer.clone(),
         value_field: aggregate.value_field.clone(),
         output_field: aggregate.output_field.clone().unwrap_or_else(|| "value".to_owned()),
+        filters,
         threshold,
         threshold_comparison,
         view_name: primary_view_name,
         additional_view_names: view_names.into_iter().skip(1).collect(),
+        eventual_projection_view_names,
+        workflow_signals,
         view_retention_seconds: view_retention_seconds.flatten(),
         window_time_field,
         window_size,
@@ -2219,6 +2777,29 @@ fn execution_planned_changelog_record(
     StreamChangelogRecord::streams(key, entry)
 }
 
+fn view_batch_update_changelog_record(
+    handle: &StreamJobBridgeHandleRecord,
+    routing_key: &str,
+    updates: Vec<StreamJobViewBatchUpdate>,
+    checkpoint_sequence: i64,
+    updated_at: DateTime<Utc>,
+) -> StreamChangelogRecord {
+    let key = throughput_partition_key(routing_key, 0);
+    let entry = StreamsChangelogEntry {
+        entry_id: Uuid::now_v7(),
+        occurred_at: updated_at,
+        partition_key: key.clone(),
+        payload: StreamsChangelogPayload::StreamJobViewBatchUpdated {
+            handle_id: handle.handle_id.clone(),
+            job_id: handle.job_id.clone(),
+            updates,
+            checkpoint_sequence,
+            updated_at,
+        },
+    };
+    StreamChangelogRecord::streams(key, entry)
+}
+
 fn view_update_changelog_record(
     handle: &StreamJobBridgeHandleRecord,
     view_name: &str,
@@ -2228,19 +2809,68 @@ fn view_update_changelog_record(
     checkpoint_sequence: i64,
     updated_at: DateTime<Utc>,
 ) -> StreamChangelogRecord {
-    let key = throughput_partition_key(routing_key, 0);
-    let entry = StreamsChangelogEntry {
-        entry_id: Uuid::now_v7(),
-        occurred_at: updated_at,
-        partition_key: key.clone(),
-        payload: StreamsChangelogPayload::StreamJobViewUpdated {
-            handle_id: handle.handle_id.clone(),
-            job_id: handle.job_id.clone(),
+    view_batch_update_changelog_record(
+        handle,
+        routing_key,
+        vec![StreamJobViewBatchUpdate {
             view_name: view_name.to_owned(),
             logical_key: logical_key.to_owned(),
             output,
-            checkpoint_sequence,
-            updated_at,
+        }],
+        checkpoint_sequence,
+        updated_at,
+    )
+}
+
+fn workflow_signal_payload(
+    handle: &StreamJobBridgeHandleRecord,
+    signal: &StreamJobWorkflowSignalPlan,
+    logical_key: &str,
+    output: Value,
+) -> Value {
+    json!({
+        "jobId": handle.job_id,
+        "handleId": handle.handle_id,
+        "jobName": handle.job_name,
+        "operatorId": signal.operator_id,
+        "viewName": signal.view_name,
+        "logicalKey": logical_key,
+        "output": output,
+    })
+}
+
+fn workflow_signaled_changelog_record(
+    handle: &StreamJobBridgeHandleRecord,
+    signal: &StreamJobWorkflowSignalPlan,
+    logical_key: &str,
+    payload: Value,
+    owner_epoch: u64,
+    signaled_at: DateTime<Utc>,
+) -> StreamChangelogRecord {
+    let key = throughput_partition_key(logical_key, 0);
+    let signal_id = stream_job_signal_callback_dedupe_key(
+        &handle.tenant_id,
+        &handle.instance_id,
+        &handle.run_id,
+        &handle.job_id,
+        &signal.operator_id,
+        logical_key,
+    );
+    let entry = StreamsChangelogEntry {
+        entry_id: Uuid::now_v7(),
+        occurred_at: signaled_at,
+        partition_key: key.clone(),
+        payload: StreamsChangelogPayload::StreamJobWorkflowSignaled {
+            handle_id: handle.handle_id.clone(),
+            job_id: handle.job_id.clone(),
+            operator_id: signal.operator_id.clone(),
+            view_name: signal.view_name.clone(),
+            logical_key: logical_key.to_owned(),
+            signal_id,
+            signal_type: signal.signal_type.clone(),
+            payload,
+            owner_epoch,
+            signaled_at,
         },
     };
     StreamChangelogRecord::streams(key, entry)
@@ -2480,6 +3110,8 @@ pub(crate) fn local_dispatch_batch_from_work(
         output_field: work.output_field.clone(),
         view_name: work.view_name.clone(),
         additional_view_names: work.additional_view_names.clone(),
+        eventual_projection_view_names: work.eventual_projection_view_names.clone(),
+        workflow_signals: work.workflow_signals.clone(),
         checkpoint_name: work.checkpoint_name.clone(),
         checkpoint_sequence: work.checkpoint_sequence,
         owner_epoch: work.owner_epoch,
@@ -2513,6 +3145,8 @@ fn work_from_local_dispatch_batch(batch: &LocalStreamJobDispatchBatch) -> Stream
         output_field: batch.output_field.clone(),
         view_name: batch.view_name.clone(),
         additional_view_names: batch.additional_view_names.clone(),
+        eventual_projection_view_names: batch.eventual_projection_view_names.clone(),
+        workflow_signals: batch.workflow_signals.clone(),
         checkpoint_name: batch.checkpoint_name.clone(),
         checkpoint_sequence: batch.checkpoint_sequence,
         owner_epoch: batch.owner_epoch,
@@ -2636,6 +3270,8 @@ async fn plan_topic_stream_job_activation(
                 evicted_window_count: 0,
                 last_evicted_window_end: None,
                 last_evicted_at: None,
+                view_runtime_stats: Vec::new(),
+                checkpoint_partitions: Vec::new(),
                 terminal_status: None,
                 terminal_output: None,
                 terminal_error: None,
@@ -2810,17 +3446,23 @@ async fn plan_topic_stream_job_activation(
         };
         let item: Value = decode_json_record(&record.record)
             .context("failed to decode topic-backed stream job source record")?;
+        if !source_item_matches_filters(&item, &plan.filters) {
+            continue;
+        }
         let logical_key = string_field_ref(&item, &plan.key_field)?.to_owned();
         let value = if plan.reducer_kind == STREAM_REDUCER_COUNT {
             1.0
         } else {
-            numeric_field(
-                &item,
-                plan.value_field.as_deref().context(format!(
-                    "stream reducer {} requires valueField for topic sources",
-                    plan.reducer_kind
-                ))?,
-            )?
+            threshold_value(
+                plan,
+                numeric_field(
+                    &item,
+                    plan.value_field.as_deref().context(format!(
+                        "stream reducer {} requires valueField for topic sources",
+                        plan.reducer_kind
+                    ))?,
+                )?,
+            )
         };
         let (materialized_logical_key, window_start, window_end) =
             windowed_item_identity(&item, &logical_key, plan)?;
@@ -2901,6 +3543,8 @@ async fn plan_topic_stream_job_activation(
                 output_field: plan.output_field.clone(),
                 view_name: plan.view_name.clone(),
                 additional_view_names: plan.additional_view_names.clone(),
+                eventual_projection_view_names: plan.eventual_projection_view_names.clone(),
+                workflow_signals: plan.workflow_signals.clone(),
                 checkpoint_name: plan.checkpoint_name.clone(),
                 checkpoint_sequence: plan.checkpoint_sequence,
                 owner_epoch,
@@ -3041,9 +3685,10 @@ async fn plan_topic_stream_job_activation(
     )?;
     if !retention_sweep.delete_keys.is_empty() {
         let mut updated_runtime_state = runtime_state_for_eviction.clone();
-        updated_runtime_state.evicted_window_count = retention_sweep.evicted_window_count;
-        updated_runtime_state.last_evicted_window_end = retention_sweep.last_evicted_window_end;
-        updated_runtime_state.last_evicted_at = retention_sweep.last_evicted_at;
+        apply_window_retention_job_counters_to_runtime_state(
+            &mut updated_runtime_state,
+            &retention_sweep,
+        );
         updated_runtime_state.updated_at = occurred_at;
         runtime_state_update = Some(updated_runtime_state);
     }
@@ -3079,6 +3724,7 @@ pub(crate) async fn plan_topic_stream_job_owner_polls(
     let Some(plan) = bounded_stream_plan_for_job(&job)? else {
         return Ok(None);
     };
+    ensure_signal_workflows_supported(handle, &plan)?;
     let topic = parse_topic_source_spec(handle, &job)?
         .context("topic-backed stream job activation requires topic source metadata")?;
     let topic_config = JsonTopicConfig::new(
@@ -3195,6 +3841,8 @@ pub(crate) async fn plan_topic_stream_job_owner_polls(
                 evicted_window_count: 0,
                 last_evicted_window_end: None,
                 last_evicted_at: None,
+                view_runtime_stats: Vec::new(),
+                checkpoint_partitions: Vec::new(),
                 terminal_status: None,
                 terminal_output: None,
                 terminal_error: None,
@@ -3417,9 +4065,7 @@ pub(crate) async fn plan_topic_stream_job_owner_polls(
     let retention_sweep =
         sweep_expired_stream_job_windows(local_state, handle, &runtime_state, occurred_at)?;
     if !retention_sweep.delete_keys.is_empty() {
-        runtime_state.evicted_window_count = retention_sweep.evicted_window_count;
-        runtime_state.last_evicted_window_end = retention_sweep.last_evicted_window_end;
-        runtime_state.last_evicted_at = retention_sweep.last_evicted_at;
+        apply_window_retention_job_counters_to_runtime_state(&mut runtime_state, &retention_sweep);
         runtime_state.updated_at = occurred_at;
     }
     let post_apply_projection_records = retention_sweep.projection_records;
@@ -3460,6 +4106,7 @@ pub(crate) async fn poll_topic_stream_job_source_partition_on_local_state(
             changelog_records: Vec::new(),
         });
     };
+    ensure_signal_workflows_supported(handle, &plan)?;
     let topic = parse_topic_source_spec(handle, &job)?
         .context("topic-backed stream job activation requires topic source metadata")?;
     let topic_config = JsonTopicConfig::new(
@@ -3486,17 +4133,23 @@ pub(crate) async fn poll_topic_stream_job_source_partition_on_local_state(
         };
         let item: Value = decode_json_record(&record.record)
             .context("failed to decode topic-backed stream job source record")?;
+        if !source_item_matches_filters(&item, &plan.filters) {
+            continue;
+        }
         let logical_key = string_field_ref(&item, &plan.key_field)?.to_owned();
         let value = if plan.reducer_kind == STREAM_REDUCER_COUNT {
             1.0
         } else {
-            numeric_field(
-                &item,
-                plan.value_field.as_deref().context(format!(
-                    "stream reducer {} requires valueField for topic sources",
-                    plan.reducer_kind
-                ))?,
-            )?
+            threshold_value(
+                &plan,
+                numeric_field(
+                    &item,
+                    plan.value_field.as_deref().context(format!(
+                        "stream reducer {} requires valueField for topic sources",
+                        plan.reducer_kind
+                    ))?,
+                )?,
+            )
         };
         let (materialized_logical_key, window_start, window_end) =
             windowed_item_identity(&item, &logical_key, &plan)?;
@@ -3641,6 +4294,8 @@ pub(crate) async fn poll_topic_stream_job_source_partition_on_local_state(
             output_field: plan.output_field.clone(),
             view_name: plan.view_name.clone(),
             additional_view_names: plan.additional_view_names.clone(),
+            eventual_projection_view_names: plan.eventual_projection_view_names.clone(),
+            workflow_signals: plan.workflow_signals.clone(),
             checkpoint_name: plan.checkpoint_name.clone(),
             checkpoint_sequence: request.checkpoint_sequence,
             owner_epoch: crate::throughput_partition_owner_epoch(
@@ -3750,6 +4405,7 @@ pub(crate) async fn plan_stream_job_activation(
     let Some(plan) = bounded_plan else {
         return Ok(None);
     };
+    ensure_signal_workflows_supported(handle, &plan)?;
 
     if job.source.kind == STREAM_SOURCE_TOPIC {
         let app_state =
@@ -3834,13 +4490,20 @@ pub(crate) async fn plan_stream_job_activation(
             job.runtime, plan.reducer_kind
         ))?)
     };
-    let input_item_count = for_each_bounded_input_item(&handle.input_ref, |item| {
+    let mut accepted_item_count = 0usize;
+    let _total_item_count = for_each_bounded_input_item(&handle.input_ref, |item| {
+        if !source_item_matches_filters(&item, &plan.filters) {
+            return Ok(());
+        }
         let key = string_field_ref(&item, &plan.key_field)?;
         let (logical_key, window_start, window_end) = windowed_item_identity(&item, key, &plan)?;
         let value = if plan.reducer_kind == STREAM_REDUCER_COUNT {
             1.0
         } else {
-            numeric_field(&item, reducer_value_field.expect("reducer value field must exist"))?
+            threshold_value(
+                &plan,
+                numeric_field(&item, reducer_value_field.expect("reducer value field must exist"))?,
+            )
         };
         let stream_partition_id = throughput_partition_for_stream_key(key, throughput_partitions);
         unique_keys.insert(logical_key.clone());
@@ -3862,8 +4525,10 @@ pub(crate) async fn plan_stream_job_activation(
                 },
             );
         }
+        accepted_item_count += 1;
         Ok(())
     })?;
+    let input_item_count = accepted_item_count;
     let active_partitions = active_partitions.into_iter().collect::<Vec<_>>();
     let execution_planned = execution_planned_changelog_record(
         handle,
@@ -3907,6 +4572,8 @@ pub(crate) async fn plan_stream_job_activation(
                 output_field: plan.output_field.clone(),
                 view_name: plan.view_name.clone(),
                 additional_view_names: plan.additional_view_names.clone(),
+                eventual_projection_view_names: plan.eventual_projection_view_names.clone(),
+                workflow_signals: plan.workflow_signals.clone(),
                 checkpoint_name: plan.checkpoint_name.clone(),
                 checkpoint_sequence: plan.checkpoint_sequence,
                 owner_epoch,
@@ -3953,11 +4620,70 @@ pub(crate) fn apply_stream_job_partition_work_on_local_state_with_metrics(
     mirror_owner_state: bool,
     mut metrics: Option<&mut StreamJobApplyMetrics>,
 ) -> Result<StreamJobActivationResult> {
-    if local_state.has_stream_job_applied_dispatch_batch(&handle.handle_id, &work.batch_id)? {
+    let Some(prepared) = prepare_stream_job_partition_work_apply(
+        local_state,
+        handle,
+        work,
+        mirror_owner_state,
+        metrics.as_deref_mut(),
+    )?
+    else {
         return Ok(StreamJobActivationResult {
             projection_records: Vec::new(),
             changelog_records: Vec::new(),
         });
+    };
+    let mut activation_result = prepared.activation_result;
+    if mirror_owner_state {
+        let persist_started = std::time::Instant::now();
+        let owner_view_update_count = prepared.owner_view_updates.len();
+        let applied = local_state.persist_stream_job_batch_apply(
+            &handle.handle_id,
+            &prepared.batch_id,
+            prepared.compact_checkpoint_mirrors,
+            prepared.completes_dispatch,
+            prepared.occurred_at,
+            prepared.owner_view_updates,
+            &prepared.mirrored_stream_entries,
+        )?;
+        if let Some(metrics) = metrics.as_deref_mut()
+            && applied.runtime_state_updated
+        {
+            metrics.runtime_state_write_count += 1;
+        }
+        if let Some(metrics) = metrics.as_deref_mut() {
+            metrics.view_state_write_count += owner_view_update_count;
+            metrics.changelog_mirror_write_count += prepared.mirrored_stream_entries.len();
+            metrics.mirrored_stream_entry_count += prepared.mirrored_stream_entries.len();
+            metrics.persist_elapsed += persist_started.elapsed();
+        }
+        for record in &mut activation_result.changelog_records {
+            if matches!(
+                &record.entry,
+                crate::ChangelogRecordEntry::Streams(entry)
+                    if !matches!(
+                        entry.payload,
+                        StreamsChangelogPayload::StreamJobViewUpdated { .. }
+                            | StreamsChangelogPayload::StreamJobViewBatchUpdated { .. }
+                    )
+            ) {
+                record.local_mirror_applied = true;
+                record.partition_mirror_applied = true;
+            }
+        }
+    }
+    Ok(activation_result)
+}
+
+fn prepare_stream_job_partition_work_apply(
+    local_state: &LocalThroughputState,
+    handle: &StreamJobBridgeHandleRecord,
+    work: &StreamJobPartitionWork,
+    mirror_owner_state: bool,
+    mut metrics: Option<&mut StreamJobApplyMetrics>,
+) -> Result<Option<PreparedStreamJobPartitionApply>> {
+    if local_state.has_stream_job_applied_dispatch_batch(&handle.handle_id, &work.batch_id)? {
+        return Ok(None);
     }
     if let (Some(source_partition_id), Some(source_lease_token)) =
         (work.checkpoint_partition_id, work.source_lease_token.as_ref())
@@ -3967,36 +4693,29 @@ pub(crate) fn apply_stream_job_partition_work_on_local_state_with_metrics(
         }
         let Some(runtime_state) = local_state.load_stream_job_runtime_state(&handle.handle_id)?
         else {
-            return Ok(StreamJobActivationResult {
-                projection_records: Vec::new(),
-                changelog_records: Vec::new(),
-            });
+            return Ok(None);
         };
         let Some(lease) = runtime_state
             .source_partition_leases
             .iter()
             .find(|lease| lease.source_partition_id == source_partition_id)
         else {
-            return Ok(StreamJobActivationResult {
-                projection_records: Vec::new(),
-                changelog_records: Vec::new(),
-            });
+            return Ok(None);
         };
         if lease.lease_token != *source_lease_token
             || work
                 .source_owner_partition_id
                 .is_some_and(|owner_partition_id| lease.owner_partition_id != owner_partition_id)
         {
-            return Ok(StreamJobActivationResult {
-                projection_records: Vec::new(),
-                changelog_records: Vec::new(),
-            });
+            return Ok(None);
         }
     }
 
     let accumulate_started = std::time::Instant::now();
     let mut updated_outputs =
         HashMap::<String, StreamJobViewAccumulator>::with_capacity(work.items.len());
+    let mut prior_outputs =
+        HashMap::<String, Option<Map<String, Value>>>::with_capacity(work.items.len());
     for item in &work.items {
         if let Some(output) = updated_outputs.get_mut(&item.logical_key) {
             output.apply_item(item);
@@ -4022,9 +4741,12 @@ pub(crate) fn apply_stream_job_partition_work_on_local_state_with_metrics(
                 metrics.view_state_misses += 1;
             }
         }
-        let mut output =
-            output.unwrap_or(StreamJobViewAccumulator::from_item(item, &work.reducer_kind)?);
+        let (previous_output, mut output) = match output {
+            Some((previous_output, accumulator)) => (Some(previous_output), accumulator),
+            None => (None, StreamJobViewAccumulator::from_item(item, &work.reducer_kind)?),
+        };
         output.apply_item(item);
+        prior_outputs.insert(item.logical_key.clone(), previous_output);
         updated_outputs.insert(item.logical_key.clone(), output);
     }
     if let Some(metrics) = metrics.as_deref_mut() {
@@ -4032,6 +4754,59 @@ pub(crate) fn apply_stream_job_partition_work_on_local_state_with_metrics(
     }
 
     let materialize_started = std::time::Instant::now();
+    let signal_records = updated_outputs
+        .iter()
+        .flat_map(|(logical_key, output)| {
+            let previous_output = prior_outputs.get(logical_key).and_then(|value| value.as_ref());
+            let public_output = sanitize_stream_view_output(output.into_output_value(
+                &work.key_field,
+                &work.output_field,
+                work.checkpoint_sequence,
+                true,
+            ));
+            work.workflow_signals.iter().filter_map(move |signal| {
+                if signal.view_name != work.view_name
+                    && !work
+                        .additional_view_names
+                        .iter()
+                        .any(|view_name| view_name == &signal.view_name)
+                {
+                    return None;
+                }
+                if local_state
+                    .load_stream_job_workflow_signal_state(
+                        &handle.handle_id,
+                        &signal.operator_id,
+                        logical_key,
+                    )
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    return None;
+                }
+                if !signal_output_matches(&public_output, signal.when_output_field.as_deref()) {
+                    return None;
+                }
+                if previous_output.is_some_and(|output| {
+                    signal_output_matches(
+                        &Value::Object(output.clone()),
+                        signal.when_output_field.as_deref(),
+                    )
+                }) {
+                    return None;
+                }
+                Some(workflow_signaled_changelog_record(
+                    handle,
+                    signal,
+                    logical_key,
+                    workflow_signal_payload(handle, signal, logical_key, public_output.clone()),
+                    work.owner_epoch,
+                    work.occurred_at,
+                ))
+            })
+        })
+        .collect::<Vec<_>>();
     let materialized = materialize_stream_job_batch_updates(
         handle,
         work,
@@ -4041,11 +4816,13 @@ pub(crate) fn apply_stream_job_partition_work_on_local_state_with_metrics(
     if let Some(metrics) = metrics.as_deref_mut() {
         metrics.materialize_elapsed += materialize_started.elapsed();
         metrics.projection_record_count += materialized.projection_records.len();
-        metrics.changelog_record_count += materialized.changelog_records.len();
+        metrics.changelog_record_count +=
+            materialized.changelog_records.len() + signal_records.len();
         metrics.owner_view_update_count += materialized.owner_view_updates.len();
     }
     let projection_records = materialized.projection_records;
     let mut changelog_records = materialized.changelog_records;
+    changelog_records.extend(signal_records);
     let owner_view_updates = materialized.owner_view_updates;
     if work.is_final_partition_batch && !work.checkpoint_name.is_empty() {
         changelog_records.push(checkpoint_reached_changelog_record(
@@ -4061,51 +4838,47 @@ pub(crate) fn apply_stream_job_partition_work_on_local_state_with_metrics(
             metrics.changelog_record_count += 1;
         }
     }
+    let mirrored_stream_entries = changelog_records
+        .iter()
+        .filter_map(|record| match &record.entry {
+            crate::ChangelogRecordEntry::Streams(entry)
+                if !matches!(
+                    entry.payload,
+                    StreamsChangelogPayload::StreamJobViewUpdated { .. }
+                        | StreamsChangelogPayload::StreamJobViewBatchUpdated { .. }
+                ) =>
+            {
+                Some(entry.clone())
+            }
+            crate::ChangelogRecordEntry::Throughput(_) => None,
+            crate::ChangelogRecordEntry::Streams(_) => None,
+        })
+        .collect::<Vec<_>>();
     if mirror_owner_state {
-        let persist_started = std::time::Instant::now();
-        let stream_entries = changelog_records
-            .iter()
-            .filter_map(|record| match &record.entry {
+        for record in &mut changelog_records {
+            if matches!(
+                &record.entry,
                 crate::ChangelogRecordEntry::Streams(entry)
                     if !matches!(
                         entry.payload,
                         StreamsChangelogPayload::StreamJobViewUpdated { .. }
-                    ) =>
-                {
-                    Some(entry.clone())
-                }
-                crate::ChangelogRecordEntry::Throughput(_) => None,
-                crate::ChangelogRecordEntry::Streams(_) => None,
-            })
-            .collect::<Vec<_>>();
-        let applied = local_state.persist_stream_job_batch_apply(
-            &handle.handle_id,
-            &work.batch_id,
-            work.completes_dispatch,
-            work.occurred_at,
-            &owner_view_updates,
-            &stream_entries,
-        )?;
-        if let Some(metrics) = metrics.as_deref_mut()
-            && applied.runtime_state_updated
-        {
-            metrics.runtime_state_write_count += 1;
-        }
-        if let Some(metrics) = metrics.as_deref_mut() {
-            metrics.view_state_write_count += owner_view_updates.len();
-        }
-        if let Some(metrics) = metrics.as_deref_mut() {
-            metrics.changelog_mirror_write_count += stream_entries.len();
-        }
-        for record in &mut changelog_records {
-            record.partition_mirror_applied = true;
-        }
-        if let Some(metrics) = metrics.as_deref_mut() {
-            metrics.mirrored_stream_entry_count += stream_entries.len();
-            metrics.persist_elapsed += persist_started.elapsed();
+                            | StreamsChangelogPayload::StreamJobViewBatchUpdated { .. }
+                    )
+            ) {
+                record.local_mirror_applied = true;
+                record.partition_mirror_applied = true;
+            }
         }
     }
-    Ok(StreamJobActivationResult { projection_records, changelog_records })
+    Ok(Some(PreparedStreamJobPartitionApply {
+        activation_result: StreamJobActivationResult { projection_records, changelog_records },
+        owner_view_updates,
+        mirrored_stream_entries,
+        batch_id: work.batch_id.clone(),
+        compact_checkpoint_mirrors: work.source_lease_token.is_none(),
+        completes_dispatch: work.completes_dispatch,
+        occurred_at: work.occurred_at,
+    }))
 }
 
 pub(crate) async fn activate_stream_job_on_local_state(
@@ -4135,6 +4908,8 @@ pub(crate) async fn activate_stream_job_on_local_state(
     let mut changelog_records = Vec::with_capacity(
         plan.partition_work.len().saturating_add(plan.post_apply_changelog_records.len() + 2),
     );
+    let bounded_batch_persist = !plan.partition_work.is_empty()
+        && plan.partition_work.iter().all(|work| work.source_lease_token.is_none());
     if let Some(execution_planned) = plan.execution_planned.clone() {
         let crate::ChangelogRecordEntry::Streams(streams_entry) = &execution_planned.entry else {
             anyhow::bail!("stream job execution plan must use a streams changelog entry");
@@ -4154,6 +4929,11 @@ pub(crate) async fn activate_stream_job_on_local_state(
     } else if let Some(runtime_state) = &plan.runtime_state_update {
         local_state.upsert_stream_job_runtime_state(runtime_state)?;
     }
+    let mut batched_owner_view_updates = Vec::new();
+    let mut batched_stream_entries = Vec::new();
+    let mut batched_dispatch_batch_ids = Vec::new();
+    let mut batched_completes_dispatch = false;
+    let mut batched_updated_at = occurred_at;
     for partition_work in &plan.partition_work {
         if handle.cancellation_requested_at.is_some() {
             local_state.mark_stream_job_dispatch_cancelled(
@@ -4161,6 +4941,26 @@ pub(crate) async fn activate_stream_job_on_local_state(
                 handle.cancellation_requested_at.unwrap_or(occurred_at),
             )?;
             break;
+        }
+        if bounded_batch_persist {
+            let Some(prepared) = prepare_stream_job_partition_work_apply(
+                local_state,
+                handle,
+                partition_work,
+                true,
+                None,
+            )?
+            else {
+                continue;
+            };
+            projection_records.extend(prepared.activation_result.projection_records);
+            changelog_records.extend(prepared.activation_result.changelog_records);
+            batched_owner_view_updates.extend(prepared.owner_view_updates);
+            batched_stream_entries.extend(prepared.mirrored_stream_entries);
+            batched_dispatch_batch_ids.push(prepared.batch_id);
+            batched_completes_dispatch |= prepared.completes_dispatch;
+            batched_updated_at = batched_updated_at.max(prepared.occurred_at);
+            continue;
         }
         let applied = apply_stream_job_partition_work_on_local_state(
             local_state,
@@ -4170,6 +4970,17 @@ pub(crate) async fn activate_stream_job_on_local_state(
         )?;
         projection_records.extend(applied.projection_records);
         changelog_records.extend(applied.changelog_records);
+    }
+    if bounded_batch_persist && !batched_dispatch_batch_ids.is_empty() {
+        local_state.persist_stream_job_activation_apply(
+            &handle.handle_id,
+            &batched_dispatch_batch_ids,
+            true,
+            batched_completes_dispatch,
+            batched_updated_at,
+            batched_owner_view_updates,
+            &batched_stream_entries,
+        )?;
     }
     if let Some(source_cursors) = plan.source_cursor_updates {
         local_state.replace_stream_job_source_cursors(
@@ -4306,7 +5117,16 @@ pub(crate) fn materialization_outcome_from_local_state(
             None => None,
         }
     };
-    Ok(Some(StreamJobMaterializationOutcome { checkpoint, terminal }))
+    let mut workflow_signals = local_state
+        .load_all_stream_job_workflow_signals()?
+        .into_iter()
+        .filter(|state| state.handle_id == handle.handle_id && state.published_at.is_none())
+        .collect::<Vec<_>>();
+    workflow_signals.sort_by(|left, right| {
+        left.signaled_at.cmp(&right.signaled_at).then_with(|| left.signal_id.cmp(&right.signal_id))
+    });
+
+    Ok(Some(StreamJobMaterializationOutcome { checkpoint, terminal, workflow_signals }))
 }
 
 fn resolve_query_view(
@@ -4407,6 +5227,7 @@ fn stream_scan_output(
     consistency_source: &str,
     items: Vec<Value>,
     runtime_stats: Option<Value>,
+    projection_stats: Option<Value>,
 ) -> Value {
     let mut output = Map::new();
     output.insert("queryName".to_owned(), Value::String(query.query_name.clone()));
@@ -4420,7 +5241,250 @@ fn stream_scan_output(
     if let Some(runtime_stats) = runtime_stats {
         output.insert("runtimeStats".to_owned(), runtime_stats);
     }
+    if let Some(projection_stats) = projection_stats {
+        output.insert("projectionStats".to_owned(), projection_stats);
+    }
     Value::Object(output)
+}
+
+fn projection_summary_output(summary: Option<&StreamJobViewProjectionSummaryRecord>) -> Value {
+    match summary {
+        Some(summary) => json!({
+            "keyCount": summary.key_count,
+            "latestProjectedCheckpointSequence": summary.latest_checkpoint_sequence,
+            "latestProjectedUpdatedAt": optional_datetime_value(summary.latest_updated_at),
+            "latestDeletedCheckpointSequence": summary.latest_deleted_checkpoint_sequence,
+            "latestDeletedAt": optional_datetime_value(summary.latest_deleted_at),
+        }),
+        None => json!({
+            "keyCount": 0u64,
+            "latestProjectedCheckpointSequence": Value::Null,
+            "latestProjectedUpdatedAt": Value::Null,
+            "latestDeletedCheckpointSequence": Value::Null,
+            "latestDeletedAt": Value::Null,
+        }),
+    }
+}
+
+fn eventual_projection_freshness_output(
+    summary: Option<&StreamJobViewProjectionSummaryRecord>,
+    owner_runtime_state: Option<&LocalStreamJobRuntimeState>,
+    requested_at: DateTime<Utc>,
+) -> Value {
+    let latest_projected_checkpoint_sequence =
+        summary.and_then(|summary| summary.latest_checkpoint_sequence);
+    let latest_projected_updated_at = summary.and_then(|summary| summary.latest_updated_at);
+    let owner_checkpoint_sequence = owner_runtime_state.map(|state| state.checkpoint_sequence);
+    let owner_latest_checkpoint_at =
+        owner_runtime_state.and_then(|state| state.latest_checkpoint_at);
+    json!({
+        "latestProjectedCheckpointSequence": latest_projected_checkpoint_sequence,
+        "latestProjectedUpdatedAt": optional_datetime_value(latest_projected_updated_at),
+        "latestDeletedCheckpointSequence": summary.and_then(|summary| summary.latest_deleted_checkpoint_sequence),
+        "latestDeletedAt": optional_datetime_value(summary.and_then(|summary| summary.latest_deleted_at)),
+        "ownerCheckpointSequence": owner_checkpoint_sequence,
+        "ownerLatestCheckpointAt": optional_datetime_value(owner_latest_checkpoint_at),
+        "checkpointSequenceLag": owner_checkpoint_sequence
+            .zip(latest_projected_checkpoint_sequence)
+            .map(|(owner, projected)| Value::from(owner.saturating_sub(projected)))
+            .unwrap_or(Value::Null),
+        "projectedUpdateAgeSeconds": optional_duration_seconds(
+            latest_projected_updated_at.map(|updated_at| requested_at - updated_at)
+        ),
+        "ownerCheckpointAgeSeconds": optional_duration_seconds(
+            owner_latest_checkpoint_at.map(|updated_at| requested_at - updated_at)
+        ),
+    })
+}
+
+async fn eventual_projection_stats_output(
+    state: &AppState,
+    handle: &StreamJobBridgeHandleRecord,
+    view: &CompiledStreamView,
+    requested_at: DateTime<Utc>,
+) -> Result<Option<Value>> {
+    if !view_supports_eventual_reads(view) {
+        return Ok(None);
+    }
+    let projection_summary = load_eventual_projection_summary(state, handle, &view.name).await?;
+    let owner_runtime_state = owner_local_state_for_stream_job(state, &handle.job_id)
+        .load_stream_job_runtime_state(&handle.handle_id)?;
+    Ok(Some(json!({
+        "supported": true,
+        "rebuildSupported": true,
+        "summary": projection_summary_output(projection_summary.as_ref()),
+        "freshness": eventual_projection_freshness_output(
+            projection_summary.as_ref(),
+            owner_runtime_state.as_ref(),
+            requested_at,
+        ),
+    })))
+}
+
+async fn load_eventual_projection_summary(
+    state: &AppState,
+    handle: &StreamJobBridgeHandleRecord,
+    view_name: &str,
+) -> Result<Option<StreamJobViewProjectionSummaryRecord>> {
+    state
+        .store
+        .get_stream_job_view_projection_summary(
+            &handle.tenant_id,
+            &handle.instance_id,
+            &handle.run_id,
+            &handle.job_id,
+            view_name,
+        )
+        .await
+}
+
+fn public_projection_view_record(
+    handle: &StreamJobBridgeHandleRecord,
+    view_name: &str,
+    view_state: &LocalStreamJobViewState,
+) -> StreamJobViewRecord {
+    StreamJobViewRecord {
+        tenant_id: handle.tenant_id.clone(),
+        instance_id: handle.instance_id.clone(),
+        run_id: handle.run_id.clone(),
+        job_id: handle.job_id.clone(),
+        handle_id: handle.handle_id.clone(),
+        view_name: view_name.to_owned(),
+        logical_key: view_state.logical_key.clone(),
+        output: sanitize_stream_view_output(view_state.output.clone()),
+        checkpoint_sequence: view_state.checkpoint_sequence,
+        updated_at: view_state.updated_at,
+    }
+}
+
+async fn load_all_projected_view_rows(
+    state: &AppState,
+    handle: &StreamJobBridgeHandleRecord,
+    view_name: &str,
+) -> Result<Vec<StreamJobViewRecord>> {
+    let mut offset = 0i64;
+    let page_size = 512i64;
+    let mut rows = Vec::new();
+    loop {
+        let page = state
+            .store
+            .list_stream_job_view_query_page(
+                &handle.tenant_id,
+                &handle.instance_id,
+                &handle.run_id,
+                &handle.job_id,
+                view_name,
+                None,
+                page_size,
+                offset,
+            )
+            .await?;
+        if page.is_empty() {
+            break;
+        }
+        offset = offset.saturating_add(i64::try_from(page.len()).unwrap_or(page_size));
+        rows.extend(page);
+    }
+    Ok(rows)
+}
+
+pub(crate) async fn rebuild_stream_job_eventual_projections(
+    state: &AppState,
+    handle: &StreamJobBridgeHandleRecord,
+    requested_view_name: Option<&str>,
+    requested_at: DateTime<Utc>,
+) -> Result<Value> {
+    let Some(job) = parse_compiled_job_from_config_ref(handle)? else {
+        anyhow::bail!(
+            "stream job {} has no compiled config to rebuild projections from",
+            handle.job_id
+        );
+    };
+    let owner_local_state = owner_local_state_for_stream_job(state, &handle.job_id);
+    let owner_runtime_state = owner_local_state.load_stream_job_runtime_state(&handle.handle_id)?;
+    let mut view_results = Vec::new();
+    for view in job.views.iter().filter(|view| {
+        view_supports_eventual_reads(view)
+            && requested_view_name.is_none_or(|view_name| view.name == view_name)
+    }) {
+        let owner_rows = owner_local_state
+            .load_stream_job_views_for_view(&handle.handle_id, &view.name)?
+            .into_iter()
+            .filter(|view_state| {
+                !window_expired_from_deadline(
+                    view_window_expired_at(Some(&job), view, &view_state.output).ok().flatten(),
+                    requested_at,
+                )
+            })
+            .collect::<Vec<_>>();
+        let projected_rows = load_all_projected_view_rows(state, handle, &view.name).await?;
+        let owner_by_key = owner_rows
+            .iter()
+            .map(|view_state| {
+                (
+                    view_state.logical_key.clone(),
+                    public_projection_view_record(handle, &view.name, view_state),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let projected_by_key = projected_rows
+            .iter()
+            .map(|row| (row.logical_key.clone(), row))
+            .collect::<HashMap<_, _>>();
+        let mut upserted = 0usize;
+        let mut deleted = 0usize;
+
+        for row in owner_by_key.values() {
+            state.store.upsert_stream_job_view_query(row).await?;
+            upserted = upserted.saturating_add(1);
+        }
+        let delete_checkpoint_sequence = owner_runtime_state
+            .as_ref()
+            .map(|runtime_state| runtime_state.checkpoint_sequence)
+            .unwrap_or_default();
+        for (logical_key, projected_row) in projected_by_key {
+            if owner_by_key.contains_key(&logical_key) {
+                continue;
+            }
+            state
+                .store
+                .delete_stream_job_view_query(&StreamJobViewDeleteRecord {
+                    tenant_id: handle.tenant_id.clone(),
+                    instance_id: handle.instance_id.clone(),
+                    run_id: handle.run_id.clone(),
+                    job_id: handle.job_id.clone(),
+                    handle_id: handle.handle_id.clone(),
+                    view_name: view.name.clone(),
+                    logical_key,
+                    checkpoint_sequence: delete_checkpoint_sequence
+                        .max(projected_row.checkpoint_sequence),
+                    evicted_at: requested_at,
+                })
+                .await?;
+            deleted = deleted.saturating_add(1);
+        }
+
+        let projection_summary =
+            load_eventual_projection_summary(state, handle, &view.name).await?;
+        view_results.push(json!({
+            "viewName": view.name,
+            "upsertedCount": upserted,
+            "deletedCount": deleted,
+            "projectionSummary": projection_summary_output(projection_summary.as_ref()),
+            "freshness": eventual_projection_freshness_output(
+                projection_summary.as_ref(),
+                owner_runtime_state.as_ref(),
+                requested_at,
+            ),
+        }));
+    }
+    Ok(json!({
+        "jobId": handle.job_id,
+        "handleId": handle.handle_id,
+        "viewName": requested_view_name,
+        "rebuiltAt": requested_at.to_rfc3339(),
+        "views": view_results,
+    }))
 }
 
 pub(crate) async fn build_stream_job_query_output(
@@ -4435,11 +5499,16 @@ pub(crate) async fn build_stream_job_query_output(
             query,
         );
     }
+    if query.query_name == STREAM_JOB_VIEW_RUNTIME_STATS_QUERY_NAME {
+        return build_stream_job_view_runtime_stats_output(state, handle, query).await;
+    }
     let Some(view) = resolve_query_view(handle, &query.query_name)? else {
         return Ok(None);
     };
     let job = parse_compiled_job_from_config_ref(handle)?;
     if view.query_mode == STREAM_QUERY_MODE_PREFIX_SCAN {
+        let projection_stats =
+            eventual_projection_stats_output(state, handle, &view, query.requested_at).await?;
         if matches!(query.parsed_consistency(), Some(StreamJobQueryConsistency::Eventual)) {
             let prefix = query_scan_prefix(query).unwrap_or_default();
             let offset = query_page_offset(query);
@@ -4495,16 +5564,30 @@ pub(crate) async fn build_stream_job_query_output(
                 "stream_projection_query",
                 items,
                 None,
+                projection_stats,
             )));
         }
-        return build_stream_job_query_output_on_local_state(
+        let Some(mut output) = build_stream_job_query_output_on_local_state(
             owner_local_state_for_stream_job(state, &handle.job_id),
             handle,
             query,
-        );
+        )?
+        else {
+            return Ok(None);
+        };
+        if let Some(projection_stats) = projection_stats
+            && let Some(object) = output.as_object_mut()
+        {
+            object.insert("projectionStats".to_owned(), projection_stats);
+        }
+        return Ok(Some(output));
     }
     let logical_key = query_logical_key(handle, query, &view)?;
     if matches!(query.parsed_consistency(), Some(StreamJobQueryConsistency::Eventual)) {
+        let projection_summary =
+            load_eventual_projection_summary(state, handle, &view.name).await?;
+        let owner_runtime_state = owner_local_state_for_stream_job(state, &handle.job_id)
+            .load_stream_job_runtime_state(&handle.handle_id)?;
         let Some(record) = state
             .store
             .get_stream_job_view_query(
@@ -4537,6 +5620,17 @@ pub(crate) async fn build_stream_job_query_output(
                 Value::String("stream_projection_query".to_owned()),
             );
             object.insert("checkpointSequence".to_owned(), Value::from(record.checkpoint_sequence));
+            object.insert(
+                "projectionStats".to_owned(),
+                json!({
+                    "summary": projection_summary_output(projection_summary.as_ref()),
+                    "freshness": eventual_projection_freshness_output(
+                        projection_summary.as_ref(),
+                        owner_runtime_state.as_ref(),
+                        query.requested_at,
+                    ),
+                }),
+            );
         }
         return Ok(Some(output));
     }
@@ -4554,6 +5648,13 @@ pub(crate) fn build_stream_job_query_output_on_local_state(
 ) -> Result<Option<Value>> {
     if query.query_name == STREAM_JOB_RUNTIME_STATS_QUERY_NAME {
         return build_stream_job_runtime_stats_output_on_local_state(local_state, handle, query);
+    }
+    if query.query_name == STREAM_JOB_VIEW_RUNTIME_STATS_QUERY_NAME {
+        return build_stream_job_view_runtime_stats_output_on_local_state(
+            local_state,
+            handle,
+            query,
+        );
     }
     let Some(view) = resolve_query_view(handle, &query.query_name)? else {
         return Ok(None);
@@ -4610,6 +5711,7 @@ pub(crate) fn build_stream_job_query_output_on_local_state(
             "stream_owner_local_state",
             items,
             runtime_stats,
+            None,
         )));
     }
     if view.query_mode != STREAM_QUERY_MODE_BY_KEY {
@@ -4686,7 +5788,7 @@ mod tests {
     use fabrik_throughput::{
         STREAM_CHECKPOINT_DELIVERY_WORKFLOW_AWAITABLE, STREAM_CHECKPOINT_POLICY_NAMED,
         STREAM_OPERATOR_EMIT_CHECKPOINT, STREAM_OPERATOR_MATERIALIZE, STREAM_OPERATOR_REDUCE,
-        StreamsChangelogEntry, StreamsChangelogPayload,
+        STREAM_OPERATOR_SIGNAL_WORKFLOW, StreamsChangelogEntry, StreamsChangelogPayload,
     };
     use std::{hint::black_box, path::PathBuf, time::Instant};
 
@@ -4888,6 +5990,48 @@ mod tests {
         }
     }
 
+    fn eventual_keyed_query(
+        handle: &StreamJobBridgeHandleRecord,
+        query_name: &str,
+        key: &str,
+        window_start: Option<&str>,
+    ) -> StreamJobQueryRecord {
+        let now = Utc::now();
+        let mut query_args = serde_json::Map::new();
+        query_args.insert("key".to_owned(), Value::String(key.to_owned()));
+        if let Some(window_start) = window_start {
+            query_args.insert("windowStart".to_owned(), Value::String(window_start.to_owned()));
+        }
+        StreamJobQueryRecord {
+            protocol_version: fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: fabrik_throughput::ThroughputBridgeOperationKind::StreamJob
+                .as_str()
+                .to_owned(),
+            workflow_event_id: Uuid::now_v7(),
+            tenant_id: handle.tenant_id.clone(),
+            instance_id: handle.instance_id.clone(),
+            run_id: handle.run_id.clone(),
+            job_id: handle.job_id.clone(),
+            handle_id: handle.handle_id.clone(),
+            bridge_request_id: handle.bridge_request_id.clone(),
+            query_id: format!("query-{}", Uuid::now_v7()),
+            query_name: query_name.to_owned(),
+            query_args: Some(Value::Object(query_args)),
+            consistency: StreamJobQueryConsistency::Eventual.as_str().to_owned(),
+            status: fabrik_throughput::StreamJobQueryStatus::Completed.as_str().to_owned(),
+            workflow_owner_epoch: handle.workflow_owner_epoch,
+            stream_owner_epoch: handle.stream_owner_epoch,
+            output: None,
+            error: None,
+            requested_at: now,
+            completed_at: None,
+            accepted_at: None,
+            cancelled_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
     fn windowed_scan_handle() -> StreamJobBridgeHandleRecord {
         let now = Utc::now();
         StreamJobBridgeHandleRecord {
@@ -4977,6 +6121,7 @@ mod tests {
                             "consistency": "strong",
                             "queryMode": "prefix_scan",
                             "keyField": "accountId",
+                            "supportedConsistencies": ["strong", "eventual"],
                             "retentionSeconds": 120
                         }
                     ],
@@ -5053,6 +6198,15 @@ mod tests {
         }
     }
 
+    fn eventual_scan_query(
+        handle: &StreamJobBridgeHandleRecord,
+        prefix: &str,
+    ) -> StreamJobQueryRecord {
+        let mut query = strong_scan_query(handle, prefix);
+        query.consistency = StreamJobQueryConsistency::Eventual.as_str().to_owned();
+        query
+    }
+
     fn stream_job_runtime_stats_query(
         handle: &StreamJobBridgeHandleRecord,
         source_partition_id: Option<i32>,
@@ -5077,6 +6231,43 @@ mod tests {
                     "sourcePartitionId": source_partition_id
                 })
             }),
+            consistency: StreamJobQueryConsistency::Strong.as_str().to_owned(),
+            status: fabrik_throughput::StreamJobQueryStatus::Completed.as_str().to_owned(),
+            workflow_owner_epoch: handle.workflow_owner_epoch,
+            stream_owner_epoch: handle.stream_owner_epoch,
+            output: None,
+            error: None,
+            requested_at: now,
+            completed_at: None,
+            accepted_at: None,
+            cancelled_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn stream_job_view_runtime_stats_query(
+        handle: &StreamJobBridgeHandleRecord,
+        view_name: &str,
+    ) -> StreamJobQueryRecord {
+        let now = Utc::now();
+        StreamJobQueryRecord {
+            protocol_version: fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: fabrik_throughput::ThroughputBridgeOperationKind::StreamJob
+                .as_str()
+                .to_owned(),
+            tenant_id: handle.tenant_id.clone(),
+            instance_id: handle.instance_id.clone(),
+            run_id: handle.run_id.clone(),
+            job_id: handle.job_id.clone(),
+            handle_id: handle.handle_id.clone(),
+            bridge_request_id: handle.bridge_request_id.clone(),
+            workflow_event_id: Uuid::now_v7(),
+            query_id: format!("query-{}", Uuid::now_v7()),
+            query_name: STREAM_JOB_VIEW_RUNTIME_STATS_QUERY_NAME.to_owned(),
+            query_args: Some(json!({
+                "viewName": view_name
+            })),
             consistency: StreamJobQueryConsistency::Strong.as_str().to_owned(),
             status: fabrik_throughput::StreamJobQueryStatus::Completed.as_str().to_owned(),
             workflow_owner_epoch: handle.workflow_owner_epoch,
@@ -5228,7 +6419,7 @@ mod tests {
         .await?
         .expect("keyed-rollup activation should exist");
 
-        assert_eq!(activation.projection_records.len(), 2);
+        assert!(activation.projection_records.is_empty());
         let checkpoint_record_count = activation
             .changelog_records
             .iter()
@@ -5280,6 +6471,134 @@ mod tests {
             .load_stream_job_view_state(&handle.handle_id, "accountTotals", "acct_2")?
             .expect("acct_2 view should exist");
         assert_eq!(acct_2.output["totalAmount"], 1.0);
+
+        std::fs::remove_dir_all(db_path).ok();
+        std::fs::remove_dir_all(checkpoint_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keyed_rollup_activation_materializes_workflow_signal() -> Result<()> {
+        let db_path = temp_path("stream-jobs-keyed-rollup-signal-db");
+        let checkpoint_dir = temp_path("stream-jobs-keyed-rollup-signal-checkpoints");
+        let local_state = LocalThroughputState::open(&db_path, &checkpoint_dir, 3)?;
+        let mut handle = keyed_rollup_handle(
+            r#"{"kind":"bounded_items","items":[{"accountId":"acct_1","amount":4},{"accountId":"acct_2","amount":0}]}"#,
+        );
+        handle.definition_id = "keyed-rollup-signal".to_owned();
+        handle.job_id = "job-signal".to_owned();
+        handle.handle_id = "handle-signal".to_owned();
+        handle.bridge_request_id = "bridge-request-signal".to_owned();
+        handle.config_ref = Some(
+            json!({
+                "name": KEYED_ROLLUP_JOB_NAME,
+                "runtime": STREAM_RUNTIME_KEYED_ROLLUP,
+                "source": {
+                    "kind": STREAM_SOURCE_BOUNDED_INPUT,
+                },
+                "keyBy": "accountId",
+                "operators": [
+                    {
+                        "kind": STREAM_OPERATOR_REDUCE,
+                        "operatorId": "sum-account-totals",
+                        "config": {
+                            "reducer": STREAM_REDUCER_SUM,
+                            "valueField": "amount",
+                            "outputField": "totalAmount"
+                        }
+                    },
+                    {
+                        "kind": STREAM_OPERATOR_EMIT_CHECKPOINT,
+                        "operatorId": KEYED_ROLLUP_CHECKPOINT_NAME,
+                        "name": KEYED_ROLLUP_CHECKPOINT_NAME,
+                        "config": {
+                            "sequence": KEYED_ROLLUP_CHECKPOINT_SEQUENCE
+                        }
+                    },
+                    {
+                        "kind": STREAM_OPERATOR_SIGNAL_WORKFLOW,
+                        "operatorId": "notify-account-rollup",
+                        "config": {
+                            "view": "accountTotals",
+                            "signalType": "account.rollup.ready",
+                            "whenOutputField": "totalAmount"
+                        }
+                    }
+                ],
+                "views": [
+                    {
+                        "name": "accountTotals",
+                        "consistency": STREAM_CONSISTENCY_STRONG,
+                        "queryMode": STREAM_QUERY_MODE_BY_KEY,
+                        "keyField": "accountId",
+                        "valueFields": ["accountId", "totalAmount", "asOfCheckpoint"]
+                    }
+                ],
+                "queries": [
+                    {
+                        "name": "accountTotals",
+                        "viewName": "accountTotals",
+                        "consistency": STREAM_CONSISTENCY_STRONG
+                    }
+                ],
+                "checkpointPolicy": {
+                    "kind": STREAM_CHECKPOINT_POLICY_NAMED,
+                    "checkpoints": [
+                        {
+                            "name": KEYED_ROLLUP_CHECKPOINT_NAME,
+                            "delivery": STREAM_CHECKPOINT_DELIVERY_WORKFLOW_AWAITABLE,
+                            "sequence": KEYED_ROLLUP_CHECKPOINT_SEQUENCE
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+        );
+
+        let activation = activate_stream_job_on_local_state(
+            None,
+            None,
+            &local_state,
+            &handle,
+            8,
+            Some(9),
+            Utc::now(),
+        )
+        .await?
+        .expect("keyed-rollup signal activation should exist");
+
+        for (offset, record) in activation.changelog_records.iter().enumerate() {
+            let entry = streams_entry_from_record(record);
+            assert!(local_state.apply_streams_changelog_entry(0, offset as i64, &entry)?);
+        }
+
+        let materialized = materialization_outcome_from_local_state(&local_state, &handle)?
+            .expect("materialized stream job outcome should exist");
+        assert_eq!(materialized.workflow_signals.len(), 1);
+        let signal = &materialized.workflow_signals[0];
+        assert_eq!(signal.operator_id, "notify-account-rollup");
+        assert_eq!(signal.view_name, "accountTotals");
+        assert_eq!(signal.logical_key, "acct_1");
+        assert_eq!(signal.signal_type, "account.rollup.ready");
+        assert_eq!(signal.payload["jobId"], "job-signal");
+        assert_eq!(signal.payload["logicalKey"], "acct_1");
+        assert_eq!(signal.payload["output"]["totalAmount"], json!(4.0));
+
+        let query_output = build_stream_job_query_output_on_local_state(
+            &local_state,
+            &handle,
+            &keyed_rollup_query(&handle, "accountTotals", "acct_1"),
+        )?
+        .expect("query output should exist");
+        assert_eq!(query_output["accountId"], "acct_1");
+        assert_eq!(query_output["totalAmount"], json!(4.0));
+
+        let duplicate_free = local_state.load_stream_job_workflow_signal_state(
+            &handle.handle_id,
+            "notify-account-rollup",
+            "acct_2",
+        )?;
+        assert!(duplicate_free.is_none());
 
         std::fs::remove_dir_all(db_path).ok();
         std::fs::remove_dir_all(checkpoint_dir).ok();
@@ -5410,6 +6729,8 @@ mod tests {
             evicted_window_count: 0,
             last_evicted_window_end: None,
             last_evicted_at: None,
+            view_runtime_stats: Vec::new(),
+            checkpoint_partitions: Vec::new(),
             terminal_status: None,
             terminal_output: None,
             terminal_error: None,
@@ -5626,6 +6947,8 @@ mod tests {
             evicted_window_count: 0,
             last_evicted_window_end: None,
             last_evicted_at: None,
+            view_runtime_stats: Vec::new(),
+            checkpoint_partitions: Vec::new(),
             terminal_status: None,
             terminal_output: None,
             terminal_error: None,
@@ -5648,6 +6971,8 @@ mod tests {
                 output_field: "totalAmount".to_owned(),
                 view_name: "accountTotals".to_owned(),
                 additional_view_names: Vec::new(),
+                eventual_projection_view_names: Vec::new(),
+                workflow_signals: Vec::new(),
                 checkpoint_name: KEYED_ROLLUP_CHECKPOINT_NAME.to_owned(),
                 checkpoint_sequence: KEYED_ROLLUP_CHECKPOINT_SEQUENCE + 1,
                 owner_epoch: 3,
@@ -5761,7 +7086,7 @@ mod tests {
             &first_partition_work[0],
             true,
         )?;
-        assert_eq!(first_batch.projection_records.len(), 64);
+        assert!(first_batch.projection_records.is_empty());
         let partial_view = owner_state
             .load_stream_job_view_state(&handle.handle_id, "accountTotals", &first_key)?
             .expect("partial owner state should materialize the first key");
@@ -6133,6 +7458,495 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aggregate_v2_bounded_activation_filters_source_items() -> Result<()> {
+        let local_state = LocalThroughputState::open(
+            &temp_path("stream-jobs-aggregate-v2-filter-db"),
+            &temp_path("stream-jobs-aggregate-v2-filter-checkpoints"),
+            3,
+        )
+        .expect("local state should open");
+        let handle = StreamJobBridgeHandleRecord {
+            workflow_event_id: Uuid::now_v7(),
+            protocol_version: fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: fabrik_throughput::ThroughputBridgeOperationKind::StreamJob
+                .as_str()
+                .to_owned(),
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "instance-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            stream_instance_id: "stream-a".to_owned(),
+            stream_run_id: "stream-run-a".to_owned(),
+            job_id: "job-filter".to_owned(),
+            handle_id: "handle-filter".to_owned(),
+            bridge_request_id: "bridge-filter".to_owned(),
+            origin_kind: StreamJobOriginKind::Workflow.as_str().to_owned(),
+            definition_id: "positive-amounts".to_owned(),
+            definition_version: Some(1),
+            artifact_hash: Some("artifact-filter".to_owned()),
+            job_name: "positive-amounts".to_owned(),
+            input_ref: json!({
+                "kind": "bounded_items",
+                "items": [
+                    { "accountId": "acct_1", "amount": 2.0 },
+                    { "accountId": "acct_1", "amount": -1.0 },
+                    { "accountId": "acct_1", "amount": 3.0 },
+                    { "accountId": "acct_2", "amount": 0.0 }
+                ]
+            })
+            .to_string(),
+            config_ref: Some(
+                json!({
+                    "name": "positive-amounts",
+                    "runtime": "aggregate_v2",
+                    "source": {
+                        "kind": "bounded_input"
+                    },
+                    "keyBy": "accountId",
+                    "states": [
+                        {
+                            "id": "positive-amount-state",
+                            "kind": "keyed",
+                            "keyFields": ["accountId"],
+                            "valueFields": ["totalAmount"]
+                        }
+                    ],
+                    "operators": [
+                        {
+                            "kind": "filter",
+                            "operatorId": "filter-positive",
+                            "config": {
+                                "predicate": "amount > 0"
+                            }
+                        },
+                        {
+                            "kind": "aggregate",
+                            "operatorId": "sum-positive",
+                            "config": {
+                                "reducer": "sum",
+                                "valueField": "amount",
+                                "outputField": "totalAmount"
+                            },
+                            "stateIds": ["positive-amount-state"]
+                        },
+                        {
+                            "kind": "materialize",
+                            "operatorId": "materialize-positive",
+                            "config": {
+                                "view": "positiveAmounts"
+                            },
+                            "stateIds": ["positive-amount-state"]
+                        }
+                    ],
+                    "views": [
+                        {
+                            "name": "positiveAmounts",
+                            "consistency": "strong",
+                            "queryMode": "by_key",
+                            "keyField": "accountId"
+                        }
+                    ],
+                    "queries": [
+                        {
+                            "name": "positiveAmountsByKey",
+                            "viewName": "positiveAmounts",
+                            "consistency": "strong"
+                        }
+                    ]
+                })
+                .to_string(),
+            ),
+            checkpoint_policy: None,
+            view_definitions: None,
+            status: StreamJobBridgeHandleStatus::Admitted.as_str().to_owned(),
+            workflow_owner_epoch: Some(1),
+            stream_owner_epoch: Some(1),
+            cancellation_requested_at: None,
+            cancellation_reason: None,
+            terminal_event_id: None,
+            terminal_at: None,
+            workflow_accepted_at: None,
+            terminal_output: None,
+            terminal_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let activation = activate_stream_job_on_local_state(
+            None,
+            None,
+            &local_state,
+            &handle,
+            8,
+            Some(1),
+            Utc::now(),
+        )
+        .await
+        .expect("filtered aggregate_v2 activation should succeed")
+        .expect("filtered aggregate_v2 activation should produce work");
+
+        for (offset, record) in activation.changelog_records.iter().enumerate() {
+            let entry = streams_entry_from_record(record);
+            assert!(local_state.apply_streams_changelog_entry(0, offset as i64, &entry)?);
+        }
+
+        let acct_1 = build_stream_job_query_output_on_local_state(
+            &local_state,
+            &handle,
+            &keyed_rollup_query(&handle, "positiveAmountsByKey", "acct_1"),
+        )?
+        .expect("filtered query output should exist for acct_1");
+        assert_eq!(acct_1["accountId"], "acct_1");
+        assert_eq!(acct_1["totalAmount"], json!(5.0));
+
+        assert!(
+            local_state
+                .load_stream_job_view_state(&handle.handle_id, "positiveAmounts", "acct_2")?
+                .is_none()
+        );
+        let acct_2_error = build_stream_job_query_output_on_local_state(
+            &local_state,
+            &handle,
+            &keyed_rollup_query(&handle, "positiveAmountsByKey", "acct_2"),
+        )
+        .expect_err("fully filtered key should not materialize");
+        assert!(acct_2_error.to_string().contains("not materialized"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_v2_bounded_activation_materializes_threshold_view() -> Result<()> {
+        let local_state = LocalThroughputState::open(
+            &temp_path("stream-jobs-aggregate-v2-threshold-db"),
+            &temp_path("stream-jobs-aggregate-v2-threshold-checkpoints"),
+            3,
+        )
+        .expect("local state should open");
+        let handle = StreamJobBridgeHandleRecord {
+            workflow_event_id: Uuid::now_v7(),
+            protocol_version: fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: fabrik_throughput::ThroughputBridgeOperationKind::StreamJob
+                .as_str()
+                .to_owned(),
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "instance-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            stream_instance_id: "stream-a".to_owned(),
+            stream_run_id: "stream-run-a".to_owned(),
+            job_id: "job-threshold".to_owned(),
+            handle_id: "handle-threshold".to_owned(),
+            bridge_request_id: "bridge-threshold".to_owned(),
+            origin_kind: StreamJobOriginKind::Workflow.as_str().to_owned(),
+            definition_id: "fraud-threshold".to_owned(),
+            definition_version: Some(1),
+            artifact_hash: Some("artifact-threshold".to_owned()),
+            job_name: "fraud-threshold".to_owned(),
+            input_ref: json!({
+                "kind": "bounded_items",
+                "items": [
+                    {
+                        "accountId": "acct_1",
+                        "risk": 0.96
+                    },
+                    {
+                        "accountId": "acct_1",
+                        "risk": 0.99
+                    },
+                    {
+                        "accountId": "acct_2",
+                        "risk": 0.72
+                    }
+                ]
+            })
+            .to_string(),
+            config_ref: Some(
+                json!({
+                    "name": "fraud-threshold",
+                    "runtime": "aggregate_v2",
+                    "source": {
+                        "kind": "bounded_input"
+                    },
+                    "keyBy": "accountId",
+                    "states": [
+                        {
+                            "id": "risk-threshold-state",
+                            "kind": "keyed",
+                            "keyFields": ["accountId"],
+                            "valueFields": ["riskExceeded"]
+                        }
+                    ],
+                    "operators": [
+                        {
+                            "kind": "aggregate",
+                            "operatorId": "risk-threshold",
+                            "config": {
+                                "reducer": "threshold",
+                                "valueField": "risk",
+                                "threshold": 0.97,
+                                "comparison": "gte",
+                                "outputField": "riskExceeded"
+                            },
+                            "stateIds": ["risk-threshold-state"]
+                        },
+                        {
+                            "kind": "materialize",
+                            "operatorId": "materialize-threshold",
+                            "config": {
+                                "view": "riskThresholds"
+                            },
+                            "stateIds": ["risk-threshold-state"]
+                        }
+                    ],
+                    "views": [
+                        {
+                            "name": "riskThresholds",
+                            "consistency": "strong",
+                            "queryMode": "by_key",
+                            "keyField": "accountId"
+                        }
+                    ],
+                    "queries": [
+                        {
+                            "name": "riskThresholdsByKey",
+                            "viewName": "riskThresholds",
+                            "consistency": "strong"
+                        }
+                    ]
+                })
+                .to_string(),
+            ),
+            checkpoint_policy: None,
+            view_definitions: None,
+            status: StreamJobBridgeHandleStatus::Admitted.as_str().to_owned(),
+            workflow_owner_epoch: Some(1),
+            stream_owner_epoch: Some(1),
+            cancellation_requested_at: None,
+            cancellation_reason: None,
+            terminal_event_id: None,
+            terminal_at: None,
+            workflow_accepted_at: None,
+            terminal_output: None,
+            terminal_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let activation = activate_stream_job_on_local_state(
+            None,
+            None,
+            &local_state,
+            &handle,
+            8,
+            Some(1),
+            Utc::now(),
+        )
+        .await
+        .expect("threshold aggregate_v2 activation should succeed")
+        .expect("threshold aggregate_v2 activation should produce work");
+
+        for (offset, record) in activation.changelog_records.iter().enumerate() {
+            let entry = streams_entry_from_record(record);
+            assert!(local_state.apply_streams_changelog_entry(0, offset as i64, &entry)?);
+        }
+
+        let crossed = local_state
+            .load_stream_job_view_state(&handle.handle_id, "riskThresholds", "acct_1")?
+            .expect("threshold view for acct_1 should exist");
+        assert_eq!(crossed.output["riskExceeded"], json!(true));
+
+        let not_crossed = local_state
+            .load_stream_job_view_state(&handle.handle_id, "riskThresholds", "acct_2")?
+            .expect("threshold view for acct_2 should exist");
+        assert_eq!(not_crossed.output["riskExceeded"], json!(false));
+
+        let crossed_output = build_stream_job_query_output_on_local_state(
+            &local_state,
+            &handle,
+            &keyed_rollup_query(&handle, "riskThresholdsByKey", "acct_1"),
+        )?
+        .expect("threshold query output should exist");
+        assert_eq!(crossed_output["accountId"], "acct_1");
+        assert_eq!(crossed_output["riskExceeded"], json!(true));
+
+        let not_crossed_output = build_stream_job_query_output_on_local_state(
+            &local_state,
+            &handle,
+            &keyed_rollup_query(&handle, "riskThresholdsByKey", "acct_2"),
+        )?
+        .expect("threshold query output should exist");
+        assert_eq!(not_crossed_output["accountId"], "acct_2");
+        assert_eq!(not_crossed_output["riskExceeded"], json!(false));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aggregate_v2_bounded_activation_materializes_workflow_signal() -> Result<()> {
+        let local_state = LocalThroughputState::open(
+            &temp_path("stream-jobs-aggregate-v2-threshold-signal-db"),
+            &temp_path("stream-jobs-aggregate-v2-threshold-signal-checkpoints"),
+            3,
+        )
+        .expect("local state should open");
+        let handle = StreamJobBridgeHandleRecord {
+            workflow_event_id: Uuid::now_v7(),
+            protocol_version: fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: fabrik_throughput::ThroughputBridgeOperationKind::StreamJob
+                .as_str()
+                .to_owned(),
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "instance-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            stream_instance_id: "stream-a".to_owned(),
+            stream_run_id: "stream-run-a".to_owned(),
+            job_id: "job-threshold-signal".to_owned(),
+            handle_id: "handle-threshold-signal".to_owned(),
+            bridge_request_id: "bridge-threshold-signal".to_owned(),
+            origin_kind: StreamJobOriginKind::Workflow.as_str().to_owned(),
+            definition_id: "fraud-threshold-signal".to_owned(),
+            definition_version: Some(1),
+            artifact_hash: Some("artifact-threshold-signal".to_owned()),
+            job_name: "fraud-threshold-signal".to_owned(),
+            input_ref: json!({
+                "kind": "bounded_items",
+                "items": [
+                    {
+                        "accountId": "acct_1",
+                        "risk": 0.96
+                    },
+                    {
+                        "accountId": "acct_1",
+                        "risk": 0.99
+                    },
+                    {
+                        "accountId": "acct_2",
+                        "risk": 0.72
+                    }
+                ]
+            })
+            .to_string(),
+            config_ref: Some(
+                json!({
+                    "name": "fraud-threshold-signal",
+                    "runtime": "aggregate_v2",
+                    "source": {
+                        "kind": "bounded_input"
+                    },
+                    "keyBy": "accountId",
+                    "states": [
+                        {
+                            "id": "risk-threshold-state",
+                            "kind": "keyed",
+                            "keyFields": ["accountId"],
+                            "valueFields": ["riskExceeded"]
+                        }
+                    ],
+                    "operators": [
+                        {
+                            "kind": "aggregate",
+                            "operatorId": "risk-threshold",
+                            "config": {
+                                "reducer": "threshold",
+                                "valueField": "risk",
+                                "threshold": 0.97,
+                                "comparison": "gte",
+                                "outputField": "riskExceeded"
+                            },
+                            "stateIds": ["risk-threshold-state"]
+                        },
+                        {
+                            "kind": "materialize",
+                            "operatorId": "materialize-threshold",
+                            "config": {
+                                "view": "riskThresholds"
+                            },
+                            "stateIds": ["risk-threshold-state"]
+                        },
+                        {
+                            "kind": "signal_workflow",
+                            "operatorId": "notify-fraud",
+                            "config": {
+                                "view": "riskThresholds",
+                                "signalType": "fraud.threshold.crossed",
+                                "whenOutputField": "riskExceeded"
+                            }
+                        }
+                    ],
+                    "views": [
+                        {
+                            "name": "riskThresholds",
+                            "consistency": "strong",
+                            "queryMode": "by_key",
+                            "keyField": "accountId"
+                        }
+                    ],
+                    "queries": [
+                        {
+                            "name": "riskThresholdsByKey",
+                            "viewName": "riskThresholds",
+                            "consistency": "strong"
+                        }
+                    ]
+                })
+                .to_string(),
+            ),
+            checkpoint_policy: None,
+            view_definitions: None,
+            status: StreamJobBridgeHandleStatus::Admitted.as_str().to_owned(),
+            workflow_owner_epoch: Some(1),
+            stream_owner_epoch: Some(1),
+            cancellation_requested_at: None,
+            cancellation_reason: None,
+            terminal_event_id: None,
+            terminal_at: None,
+            workflow_accepted_at: None,
+            terminal_output: None,
+            terminal_error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let activation = activate_stream_job_on_local_state(
+            None,
+            None,
+            &local_state,
+            &handle,
+            8,
+            Some(1),
+            Utc::now(),
+        )
+        .await
+        .expect("threshold aggregate_v2 signal activation should succeed")
+        .expect("threshold aggregate_v2 signal activation should produce work");
+
+        for (offset, record) in activation.changelog_records.iter().enumerate() {
+            let entry = streams_entry_from_record(record);
+            assert!(local_state.apply_streams_changelog_entry(0, offset as i64, &entry)?);
+        }
+
+        let materialized = materialization_outcome_from_local_state(&local_state, &handle)?
+            .expect("signal materialization should exist");
+        assert_eq!(materialized.workflow_signals.len(), 1);
+        let signal = &materialized.workflow_signals[0];
+        assert_eq!(signal.operator_id, "notify-fraud");
+        assert_eq!(signal.view_name, "riskThresholds");
+        assert_eq!(signal.logical_key, "acct_1");
+        assert_eq!(signal.signal_type, "fraud.threshold.crossed");
+        assert_eq!(signal.payload["jobId"], "job-threshold-signal");
+        assert_eq!(signal.payload["logicalKey"], "acct_1");
+        assert_eq!(signal.payload["output"]["riskExceeded"], json!(true));
+
+        let duplicate_free = local_state.load_stream_job_workflow_signal_state(
+            &handle.handle_id,
+            "notify-fraud",
+            "acct_2",
+        )?;
+        assert!(duplicate_free.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn aggregate_v2_bounded_activation_materializes_multiple_views() -> Result<()> {
         let local_state = LocalThroughputState::open(
             &temp_path("stream-jobs-aggregate-v2-multi-view-db"),
@@ -6273,7 +8087,7 @@ mod tests {
         )
         .await?
         .expect("aggregate_v2 activation should produce work");
-        assert_eq!(activation.projection_records.len(), 2);
+        assert!(activation.projection_records.is_empty());
 
         for (offset, record) in activation.changelog_records.iter().enumerate() {
             let entry = streams_entry_from_record(record);
@@ -6589,6 +8403,8 @@ mod tests {
             evicted_window_count: 0,
             last_evicted_window_end: None,
             last_evicted_at: None,
+            view_runtime_stats: Vec::new(),
+            checkpoint_partitions: Vec::new(),
             terminal_status: None,
             terminal_output: None,
             terminal_error: None,
@@ -6715,6 +8531,8 @@ mod tests {
             evicted_window_count: 0,
             last_evicted_window_end: None,
             last_evicted_at: None,
+            view_runtime_stats: Vec::new(),
+            checkpoint_partitions: Vec::new(),
             terminal_status: None,
             terminal_output: None,
             terminal_error: None,
@@ -6771,6 +8589,28 @@ mod tests {
             )
         );
         assert_eq!(updated_runtime_state.last_evicted_at, Some(occurred_at));
+        assert_eq!(
+            updated_runtime_state
+                .view_runtime_stats("riskScores")
+                .map(|stats| stats.evicted_window_count),
+            Some(1)
+        );
+        assert_eq!(
+            updated_runtime_state
+                .view_runtime_stats("riskScores")
+                .and_then(|stats| stats.last_evicted_window_end),
+            Some(
+                DateTime::parse_from_rfc3339("2026-03-15T10:01:00Z")
+                    .expect("window end should parse")
+                    .with_timezone(&Utc)
+            )
+        );
+        assert_eq!(
+            updated_runtime_state
+                .view_runtime_stats("riskScores")
+                .and_then(|stats| stats.last_evicted_at),
+            Some(occurred_at)
+        );
         match &projection_records[0].event {
             crate::ProjectionRecordEvent::Streams(
                 StreamsProjectionEvent::DeleteStreamJobView { view },
@@ -6838,8 +8678,13 @@ mod tests {
             reducer_kind: STREAM_REDUCER_AVG.to_owned(),
             value_field: Some("risk".to_owned()),
             output_field: "avgRisk".to_owned(),
+            filters: Vec::new(),
+            threshold: None,
+            threshold_comparison: StreamThresholdComparison::Gte,
             view_name: "riskScores".to_owned(),
             additional_view_names: Vec::new(),
+            eventual_projection_view_names: Vec::new(),
+            workflow_signals: Vec::new(),
             view_retention_seconds: Some(120),
             window_time_field: Some("eventTime".to_owned()),
             window_size: Some(ChronoDuration::minutes(1)),
@@ -6960,6 +8805,8 @@ mod tests {
                 evicted_window_count: 0,
                 last_evicted_window_end: None,
                 last_evicted_at: None,
+                view_runtime_stats: Vec::new(),
+                checkpoint_partitions: Vec::new(),
                 terminal_status: None,
                 terminal_output: None,
                 terminal_error: None,
@@ -6990,8 +8837,19 @@ mod tests {
         assert_eq!(output["windowPolicy"]["retentionEvictionEnabled"], true);
         assert_eq!(output["windowPolicy"]["evictedWindowEventPolicy"], "drop_after_retention");
         assert_eq!(output["materializedViews"][0]["name"], "riskScores");
+        assert_eq!(output["materializedViews"][0]["operatorId"], "materialize-risk");
+        assert_eq!(output["materializedViews"][0]["stateIds"][0], "risk-state");
         assert_eq!(output["materializedViews"][0]["queryMode"], "prefix_scan");
         assert_eq!(output["materializedViews"][0]["retentionSeconds"], 120);
+        assert_eq!(output["materializedViews"][0]["lateEventPolicy"], "drop_after_closed_window");
+        assert_eq!(output["materializedViews"][0]["retentionEvictionEnabled"], true);
+        assert_eq!(
+            output["materializedViews"][0]["evictedWindowEventPolicy"],
+            "drop_after_retention"
+        );
+        assert_eq!(output["materializedViews"][0]["windowPolicy"]["mode"], "tumbling");
+        assert_eq!(output["materializedViews"][0]["windowPolicy"]["allowedLateness"], "10s");
+        assert_eq!(output["materializedViews"][0]["windowPolicy"]["retentionSeconds"], 120);
         assert_eq!(output["sourceCursors"][0]["droppedLateEventCount"], 1);
         assert_eq!(output["sourceCursors"][0]["lastDroppedLateOffset"], 2);
         assert_eq!(
@@ -7003,6 +8861,155 @@ mod tests {
             "2026-03-15T10:01:00+00:00"
         );
         assert_eq!(output["sourceLeases"][0]["leaseToken"], "lease-0");
+
+        std::fs::remove_dir_all(db_path).ok();
+        std::fs::remove_dir_all(checkpoint_dir).ok();
+    }
+
+    #[test]
+    fn stream_job_view_runtime_stats_query_returns_view_policy_and_counts() {
+        let db_path = temp_path("stream-jobs-view-runtime-stats-query-db");
+        let checkpoint_dir = temp_path("stream-jobs-view-runtime-stats-query-checkpoints");
+        let local_state = LocalThroughputState::open(&db_path, &checkpoint_dir, 3)
+            .expect("local state should open");
+        let occurred_at = Utc::now();
+        let handle = windowed_scan_handle();
+        local_state
+            .upsert_stream_job_runtime_state(&LocalStreamJobRuntimeState {
+                handle_id: handle.handle_id.clone(),
+                job_id: handle.job_id.clone(),
+                job_name: handle.job_name.clone(),
+                view_name: "riskScores".to_owned(),
+                checkpoint_name: "initial-risk-ready".to_owned(),
+                checkpoint_sequence: 4,
+                input_item_count: 0,
+                materialized_key_count: 2,
+                active_partitions: vec![0],
+                source_kind: Some(STREAM_SOURCE_TOPIC.to_owned()),
+                source_name: Some("payments".to_owned()),
+                source_cursors: vec![LocalStreamJobSourceCursorState {
+                    source_partition_id: 0,
+                    next_offset: 3,
+                    initial_checkpoint_target_offset: 3,
+                    last_applied_offset: Some(2),
+                    last_high_watermark: Some(3),
+                    last_event_time_watermark: Some(
+                        DateTime::parse_from_rfc3339("2026-03-15T10:03:20Z")
+                            .expect("event watermark should parse")
+                            .with_timezone(&Utc),
+                    ),
+                    last_closed_window_end: Some(
+                        DateTime::parse_from_rfc3339("2026-03-15T10:03:00Z")
+                            .expect("closed window should parse")
+                            .with_timezone(&Utc),
+                    ),
+                    pending_window_ends: Vec::new(),
+                    dropped_late_event_count: 0,
+                    last_dropped_late_offset: None,
+                    last_dropped_late_event_at: None,
+                    last_dropped_late_window_end: None,
+                    dropped_evicted_window_event_count: 0,
+                    last_dropped_evicted_window_offset: None,
+                    last_dropped_evicted_window_event_at: None,
+                    last_dropped_evicted_window_end: None,
+                    checkpoint_reached_at: Some(occurred_at),
+                    updated_at: occurred_at,
+                }],
+                source_partition_leases: Vec::new(),
+                dispatch_batches: Vec::new(),
+                applied_dispatch_batch_ids: Vec::new(),
+                dispatch_completed_at: None,
+                dispatch_cancelled_at: None,
+                stream_owner_epoch: 7,
+                planned_at: occurred_at,
+                latest_checkpoint_at: Some(occurred_at),
+                evicted_window_count: 1,
+                last_evicted_window_end: Some(
+                    DateTime::parse_from_rfc3339("2026-03-15T10:01:00Z")
+                        .expect("window end should parse")
+                        .with_timezone(&Utc),
+                ),
+                last_evicted_at: Some(occurred_at),
+                view_runtime_stats: vec![crate::local_state::LocalStreamJobViewRuntimeStatsState {
+                    view_name: "riskScores".to_owned(),
+                    evicted_window_count: 1,
+                    last_evicted_window_end: Some(
+                        DateTime::parse_from_rfc3339("2026-03-15T10:01:00Z")
+                            .expect("window end should parse")
+                            .with_timezone(&Utc),
+                    ),
+                    last_evicted_at: Some(occurred_at),
+                }],
+                checkpoint_partitions: Vec::new(),
+                terminal_status: None,
+                terminal_output: None,
+                terminal_error: None,
+                terminal_at: None,
+                updated_at: occurred_at,
+            })
+            .expect("runtime state should persist");
+        local_state
+            .upsert_stream_job_view_value(
+                &handle.handle_id,
+                &handle.job_id,
+                "riskScores",
+                &windowed_logical_key("acct_1", "2026-03-15T10:00:00+00:00"),
+                json!({
+                    "accountId": "acct_1",
+                    "avgRisk": 0.9,
+                    "windowStart": "2026-03-15T10:00:00+00:00",
+                    "windowEnd": "2026-03-15T10:01:00+00:00",
+                    "asOfCheckpoint": 4
+                }),
+                4,
+                occurred_at,
+            )
+            .expect("view state should persist");
+        local_state
+            .upsert_stream_job_view_value(
+                &handle.handle_id,
+                &handle.job_id,
+                "riskScores",
+                &windowed_logical_key("acct_1", "2026-03-15T10:02:00+00:00"),
+                json!({
+                    "accountId": "acct_1",
+                    "avgRisk": 0.8,
+                    "windowStart": "2026-03-15T10:02:00+00:00",
+                    "windowEnd": "2026-03-15T10:03:00+00:00",
+                    "asOfCheckpoint": 4
+                }),
+                4,
+                occurred_at,
+            )
+            .expect("second view state should persist");
+
+        let query = stream_job_view_runtime_stats_query(&handle, "riskScores");
+        let output = build_stream_job_query_output_on_local_state(&local_state, &handle, &query)
+            .expect("view runtime stats output should build")
+            .expect("view runtime stats output should exist");
+        assert_eq!(output["queryName"], STREAM_JOB_VIEW_RUNTIME_STATS_QUERY_NAME);
+        assert_eq!(output["viewName"], "riskScores");
+        assert_eq!(output["storedKeyCount"], 2);
+        assert_eq!(output["activeKeyCount"], 2);
+        assert_eq!(output["latestCheckpointSequence"], 4);
+        assert_eq!(output["streamOwnerEpoch"], 7);
+        assert_eq!(output["jobEvictedWindowCount"], 1);
+        assert_eq!(output["freshness"]["checkpointSequenceLag"], 0);
+        assert_eq!(output["freshness"]["latestEventTimeWatermark"], "2026-03-15T10:03:20+00:00");
+        assert_eq!(output["freshness"]["latestClosedWindowEnd"], "2026-03-15T10:03:00+00:00");
+        assert_eq!(output["freshness"]["latestMaterializedWindowEnd"], "2026-03-15T10:03:00+00:00");
+        assert_eq!(output["freshness"]["eventTimeLagSeconds"], 20);
+        assert_eq!(output["freshness"]["closedWindowLagSeconds"], 0);
+        assert_eq!(output["historicalEvictedWindowCount"], 1);
+        assert_eq!(output["historicalLastEvictedWindowEnd"], "2026-03-15T10:01:00+00:00");
+        assert_eq!(output["historicalLastEvictedAt"], occurred_at.to_rfc3339());
+        assert_eq!(output["policy"]["operatorId"], "materialize-risk");
+        assert_eq!(output["policy"]["stateIds"][0], "risk-state");
+        assert_eq!(output["policy"]["retentionSeconds"], 120);
+        assert_eq!(output["policy"]["lateEventPolicy"], "drop_after_closed_window");
+        assert_eq!(output["policy"]["windowPolicy"]["allowedLateness"], "10s");
+        assert_eq!(output["consistency"], "strong");
+        assert_eq!(output["consistencySource"], "stream_owner_local_state");
 
         std::fs::remove_dir_all(db_path).ok();
         std::fs::remove_dir_all(checkpoint_dir).ok();
@@ -7043,10 +9050,16 @@ mod tests {
             for record in applied.changelog_records {
                 match &record.entry {
                     crate::ChangelogRecordEntry::Streams(StreamsChangelogEntry {
-                        payload: StreamsChangelogPayload::StreamJobViewUpdated { logical_key, .. },
+                        payload: StreamsChangelogPayload::StreamJobViewBatchUpdated { updates, .. },
                         ..
                     }) => {
-                        assert_eq!(record.key, throughput_partition_key(logical_key, 0));
+                        assert!(!updates.is_empty());
+                        for update in updates {
+                            assert_eq!(
+                                record.key,
+                                throughput_partition_key(&update.logical_key, 0)
+                            );
+                        }
                         let entry = streams_entry_from_record(&record);
                         assert!(local_state.apply_streams_changelog_entry(
                             0,

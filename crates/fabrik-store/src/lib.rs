@@ -856,6 +856,8 @@ pub struct StreamJobViewProjectionSummaryRecord {
     pub key_count: u64,
     pub latest_checkpoint_sequence: Option<i64>,
     pub latest_updated_at: Option<DateTime<Utc>>,
+    pub latest_deleted_checkpoint_sequence: Option<i64>,
+    pub latest_deleted_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -3547,6 +3549,51 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize stream_job_view_query handle index")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS stream_job_view_query_tombstone (
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                handle_id TEXT NOT NULL,
+                view_name TEXT NOT NULL,
+                logical_key TEXT NOT NULL,
+                deleted_checkpoint_sequence BIGINT NOT NULL,
+                deleted_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    job_id,
+                    view_name,
+                    logical_key
+                )
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize stream_job_view_query_tombstone table")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS stream_job_view_query_tombstone_handle_idx
+            ON stream_job_view_query_tombstone (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                handle_id,
+                view_name,
+                deleted_at,
+                logical_key
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize stream_job_view_query_tombstone handle index")?;
 
         sqlx::query(
             r#"
@@ -16285,6 +16332,50 @@ impl WorkflowStore {
     }
 
     pub async fn upsert_stream_job_view_query(&self, view: &StreamJobViewRecord) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to open transaction for stream job view query upsert")?;
+        let tombstone = sqlx::query(
+            r#"
+            SELECT deleted_checkpoint_sequence, deleted_at
+            FROM stream_job_view_query_tombstone
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND job_id = $4
+              AND view_name = $5
+              AND logical_key = $6
+            "#,
+        )
+        .bind(&view.tenant_id)
+        .bind(&view.instance_id)
+        .bind(&view.run_id)
+        .bind(&view.job_id)
+        .bind(&view.view_name)
+        .bind(&view.logical_key)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("failed to load stream job view query tombstone")?;
+        if let Some(row) = tombstone {
+            let deleted_checkpoint_sequence: i64 = row
+                .try_get("deleted_checkpoint_sequence")
+                .context("stream job view query tombstone deleted_checkpoint_sequence missing")?;
+            let deleted_at: DateTime<Utc> = row
+                .try_get("deleted_at")
+                .context("stream job view query tombstone deleted_at missing")?;
+            if deleted_checkpoint_sequence > view.checkpoint_sequence
+                || (deleted_checkpoint_sequence == view.checkpoint_sequence
+                    && deleted_at >= view.updated_at)
+            {
+                tx.commit()
+                    .await
+                    .context("failed to commit skipped stream job view upsert transaction")?;
+                return Ok(());
+            }
+        }
+
         sqlx::query(
             r#"
             INSERT INTO stream_job_view_query (
@@ -16313,6 +16404,11 @@ impl WorkflowStore {
                 output = EXCLUDED.output,
                 checkpoint_sequence = EXCLUDED.checkpoint_sequence,
                 updated_at = EXCLUDED.updated_at
+            WHERE stream_job_view_query.checkpoint_sequence < EXCLUDED.checkpoint_sequence
+               OR (
+                    stream_job_view_query.checkpoint_sequence = EXCLUDED.checkpoint_sequence
+                AND stream_job_view_query.updated_at <= EXCLUDED.updated_at
+               )
             "#,
         )
         .bind(&view.tenant_id)
@@ -16325,9 +16421,41 @@ impl WorkflowStore {
         .bind(Json(&view.output))
         .bind(view.checkpoint_sequence)
         .bind(view.updated_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .context("failed to upsert stream job view query record")?;
+
+        sqlx::query(
+            r#"
+            DELETE FROM stream_job_view_query_tombstone
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND job_id = $4
+              AND view_name = $5
+              AND logical_key = $6
+              AND (
+                    deleted_checkpoint_sequence < $7
+                 OR (
+                        deleted_checkpoint_sequence = $7
+                    AND deleted_at < $8
+                 )
+              )
+            "#,
+        )
+        .bind(&view.tenant_id)
+        .bind(&view.instance_id)
+        .bind(&view.run_id)
+        .bind(&view.job_id)
+        .bind(&view.view_name)
+        .bind(&view.logical_key)
+        .bind(view.checkpoint_sequence)
+        .bind(view.updated_at)
+        .execute(&mut *tx)
+        .await
+        .context("failed to clear stale stream job view query tombstone")?;
+
+        tx.commit().await.context("failed to commit stream job view query upsert transaction")?;
         Ok(())
     }
 
@@ -16335,6 +16463,57 @@ impl WorkflowStore {
         &self,
         view: &StreamJobViewDeleteRecord,
     ) -> Result<()> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .context("failed to open transaction for stream job view delete")?;
+        sqlx::query(
+            r#"
+            INSERT INTO stream_job_view_query_tombstone (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                job_id,
+                handle_id,
+                view_name,
+                logical_key,
+                deleted_checkpoint_sequence,
+                deleted_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9
+            )
+            ON CONFLICT (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                job_id,
+                view_name,
+                logical_key
+            ) DO UPDATE SET
+                handle_id = EXCLUDED.handle_id,
+                deleted_checkpoint_sequence = EXCLUDED.deleted_checkpoint_sequence,
+                deleted_at = EXCLUDED.deleted_at
+            WHERE stream_job_view_query_tombstone.deleted_checkpoint_sequence < EXCLUDED.deleted_checkpoint_sequence
+               OR (
+                    stream_job_view_query_tombstone.deleted_checkpoint_sequence = EXCLUDED.deleted_checkpoint_sequence
+                AND stream_job_view_query_tombstone.deleted_at < EXCLUDED.deleted_at
+               )
+            "#,
+        )
+        .bind(&view.tenant_id)
+        .bind(&view.instance_id)
+        .bind(&view.run_id)
+        .bind(&view.job_id)
+        .bind(&view.handle_id)
+        .bind(&view.view_name)
+        .bind(&view.logical_key)
+        .bind(view.checkpoint_sequence)
+        .bind(view.evicted_at)
+        .execute(&mut *tx)
+        .await
+        .context("failed to upsert stream job view query tombstone")?;
+
         sqlx::query(
             r#"
             DELETE FROM stream_job_view_query
@@ -16344,6 +16523,13 @@ impl WorkflowStore {
               AND job_id = $4
               AND view_name = $5
               AND logical_key = $6
+              AND (
+                    checkpoint_sequence < $7
+                 OR (
+                        checkpoint_sequence = $7
+                    AND updated_at <= $8
+                 )
+              )
             "#,
         )
         .bind(&view.tenant_id)
@@ -16352,10 +16538,106 @@ impl WorkflowStore {
         .bind(&view.job_id)
         .bind(&view.view_name)
         .bind(&view.logical_key)
-        .execute(&self.pool)
+        .bind(view.checkpoint_sequence)
+        .bind(view.evicted_at)
+        .execute(&mut *tx)
         .await
         .context("failed to delete stream job view query record")?;
+
+        tx.commit().await.context("failed to commit stream job view delete transaction")?;
         Ok(())
+    }
+
+    pub async fn get_stream_job_view_projection_summary(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        job_id: &str,
+        view_name: &str,
+    ) -> Result<Option<StreamJobViewProjectionSummaryRecord>> {
+        let row = sqlx::query(
+            r#"
+            WITH live AS (
+                SELECT
+                    job_id,
+                    view_name,
+                    COUNT(*)::BIGINT AS key_count,
+                    MAX(checkpoint_sequence) AS latest_checkpoint_sequence,
+                    MAX(updated_at) AS latest_updated_at
+                FROM stream_job_view_query
+                WHERE tenant_id = $1
+                  AND workflow_instance_id = $2
+                  AND run_id = $3
+                  AND job_id = $4
+                  AND view_name = $5
+                GROUP BY job_id, view_name
+            ),
+            tombstones AS (
+                SELECT
+                    job_id,
+                    view_name,
+                    MAX(deleted_checkpoint_sequence) AS latest_deleted_checkpoint_sequence,
+                    MAX(deleted_at) AS latest_deleted_at
+                FROM stream_job_view_query_tombstone
+                WHERE tenant_id = $1
+                  AND workflow_instance_id = $2
+                  AND run_id = $3
+                  AND job_id = $4
+                  AND view_name = $5
+                GROUP BY job_id, view_name
+            )
+            SELECT
+                COALESCE(live.job_id, tombstones.job_id) AS job_id,
+                COALESCE(live.view_name, tombstones.view_name) AS view_name,
+                COALESCE(live.key_count, 0)::BIGINT AS key_count,
+                live.latest_checkpoint_sequence,
+                live.latest_updated_at,
+                tombstones.latest_deleted_checkpoint_sequence,
+                tombstones.latest_deleted_at
+            FROM live
+            FULL OUTER JOIN tombstones
+              ON live.job_id = tombstones.job_id
+             AND live.view_name = tombstones.view_name
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(job_id)
+        .bind(view_name)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load stream job view projection summary")?;
+        row.map(|row| {
+            Ok(StreamJobViewProjectionSummaryRecord {
+                job_id: row
+                    .try_get("job_id")
+                    .context("stream job view projection summary job_id missing")?,
+                view_name: row
+                    .try_get("view_name")
+                    .context("stream job view projection summary view_name missing")?,
+                key_count: row
+                    .try_get::<i64, _>("key_count")
+                    .context("stream job view projection summary key_count missing")?
+                    as u64,
+                latest_checkpoint_sequence: row.try_get("latest_checkpoint_sequence").context(
+                    "stream job view projection summary latest_checkpoint_sequence missing",
+                )?,
+                latest_updated_at: row
+                    .try_get("latest_updated_at")
+                    .context("stream job view projection summary latest_updated_at missing")?,
+                latest_deleted_checkpoint_sequence: row
+                    .try_get("latest_deleted_checkpoint_sequence")
+                    .context(
+                        "stream job view projection summary latest_deleted_checkpoint_sequence missing",
+                    )?,
+                latest_deleted_at: row
+                    .try_get("latest_deleted_at")
+                    .context("stream job view projection summary latest_deleted_at missing")?,
+            })
+        })
+        .transpose()
     }
 
     pub async fn get_stream_job_view_query(
@@ -16473,18 +16755,45 @@ impl WorkflowStore {
     ) -> Result<Vec<StreamJobViewProjectionSummaryRecord>> {
         let rows = sqlx::query(
             r#"
+            WITH live AS (
+                SELECT
+                    job_id,
+                    view_name,
+                    COUNT(*)::BIGINT AS key_count,
+                    MAX(checkpoint_sequence) AS latest_checkpoint_sequence,
+                    MAX(updated_at) AS latest_updated_at
+                FROM stream_job_view_query
+                WHERE tenant_id = $1
+                  AND workflow_instance_id = $2
+                  AND run_id = $3
+                  AND job_id = $4
+                GROUP BY job_id, view_name
+            ),
+            tombstones AS (
+                SELECT
+                    job_id,
+                    view_name,
+                    MAX(deleted_checkpoint_sequence) AS latest_deleted_checkpoint_sequence,
+                    MAX(deleted_at) AS latest_deleted_at
+                FROM stream_job_view_query_tombstone
+                WHERE tenant_id = $1
+                  AND workflow_instance_id = $2
+                  AND run_id = $3
+                  AND job_id = $4
+                GROUP BY job_id, view_name
+            )
             SELECT
-                job_id,
-                view_name,
-                COUNT(*)::BIGINT AS key_count,
-                MAX(checkpoint_sequence) AS latest_checkpoint_sequence,
-                MAX(updated_at) AS latest_updated_at
-            FROM stream_job_view_query
-            WHERE tenant_id = $1
-              AND workflow_instance_id = $2
-              AND run_id = $3
-              AND job_id = $4
-            GROUP BY job_id, view_name
+                COALESCE(live.job_id, tombstones.job_id) AS job_id,
+                COALESCE(live.view_name, tombstones.view_name) AS view_name,
+                COALESCE(live.key_count, 0)::BIGINT AS key_count,
+                live.latest_checkpoint_sequence,
+                live.latest_updated_at,
+                tombstones.latest_deleted_checkpoint_sequence,
+                tombstones.latest_deleted_at
+            FROM live
+            FULL OUTER JOIN tombstones
+              ON live.job_id = tombstones.job_id
+             AND live.view_name = tombstones.view_name
             ORDER BY view_name ASC
             "#,
         )
@@ -16514,6 +16823,14 @@ impl WorkflowStore {
                     latest_updated_at: row
                         .try_get("latest_updated_at")
                         .context("stream job view projection summary latest_updated_at missing")?,
+                    latest_deleted_checkpoint_sequence: row
+                        .try_get("latest_deleted_checkpoint_sequence")
+                        .context(
+                            "stream job view projection summary latest_deleted_checkpoint_sequence missing",
+                        )?,
+                    latest_deleted_at: row
+                        .try_get("latest_deleted_at")
+                        .context("stream job view projection summary latest_deleted_at missing")?,
                 })
             })
             .collect()
@@ -16531,18 +16848,45 @@ impl WorkflowStore {
         }
         let rows = sqlx::query(
             r#"
+            WITH live AS (
+                SELECT
+                    job_id,
+                    view_name,
+                    COUNT(*)::BIGINT AS key_count,
+                    MAX(checkpoint_sequence) AS latest_checkpoint_sequence,
+                    MAX(updated_at) AS latest_updated_at
+                FROM stream_job_view_query
+                WHERE tenant_id = $1
+                  AND workflow_instance_id = $2
+                  AND run_id = $3
+                  AND job_id = ANY($4)
+                GROUP BY job_id, view_name
+            ),
+            tombstones AS (
+                SELECT
+                    job_id,
+                    view_name,
+                    MAX(deleted_checkpoint_sequence) AS latest_deleted_checkpoint_sequence,
+                    MAX(deleted_at) AS latest_deleted_at
+                FROM stream_job_view_query_tombstone
+                WHERE tenant_id = $1
+                  AND workflow_instance_id = $2
+                  AND run_id = $3
+                  AND job_id = ANY($4)
+                GROUP BY job_id, view_name
+            )
             SELECT
-                job_id,
-                view_name,
-                COUNT(*)::BIGINT AS key_count,
-                MAX(checkpoint_sequence) AS latest_checkpoint_sequence,
-                MAX(updated_at) AS latest_updated_at
-            FROM stream_job_view_query
-            WHERE tenant_id = $1
-              AND workflow_instance_id = $2
-              AND run_id = $3
-              AND job_id = ANY($4)
-            GROUP BY job_id, view_name
+                COALESCE(live.job_id, tombstones.job_id) AS job_id,
+                COALESCE(live.view_name, tombstones.view_name) AS view_name,
+                COALESCE(live.key_count, 0)::BIGINT AS key_count,
+                live.latest_checkpoint_sequence,
+                live.latest_updated_at,
+                tombstones.latest_deleted_checkpoint_sequence,
+                tombstones.latest_deleted_at
+            FROM live
+            FULL OUTER JOIN tombstones
+              ON live.job_id = tombstones.job_id
+             AND live.view_name = tombstones.view_name
             ORDER BY job_id ASC, view_name ASC
             "#,
         )
@@ -16572,6 +16916,14 @@ impl WorkflowStore {
                     latest_updated_at: row
                         .try_get("latest_updated_at")
                         .context("stream job view projection summary latest_updated_at missing")?,
+                    latest_deleted_checkpoint_sequence: row
+                        .try_get("latest_deleted_checkpoint_sequence")
+                        .context(
+                            "stream job view projection summary latest_deleted_checkpoint_sequence missing",
+                        )?,
+                    latest_deleted_at: row
+                        .try_get("latest_deleted_at")
+                        .context("stream job view projection summary latest_deleted_at missing")?,
                 })
             })
             .collect()
@@ -16688,6 +17040,38 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to upsert stream job bridge handle")?;
+        Ok(())
+    }
+
+    pub async fn purge_stream_job_view_query_row_unchecked(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        job_id: &str,
+        view_name: &str,
+        logical_key: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            DELETE FROM stream_job_view_query
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND job_id = $4
+              AND view_name = $5
+              AND logical_key = $6
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(job_id)
+        .bind(view_name)
+        .bind(logical_key)
+        .execute(&self.pool)
+        .await
+        .context("failed to purge stream job view query row without tombstone")?;
         Ok(())
     }
 
@@ -26705,6 +27089,8 @@ mod tests {
         assert_eq!(summaries[0].key_count, 1);
         assert_eq!(summaries[0].latest_checkpoint_sequence, Some(7));
         assert_eq!(summaries[0].latest_updated_at, Some(now + chrono::Duration::seconds(3)));
+        assert_eq!(summaries[0].latest_deleted_checkpoint_sequence, None);
+        assert_eq!(summaries[0].latest_deleted_at, None);
         let batch_summaries = store
             .list_stream_job_view_projection_summaries_for_jobs(
                 "tenant-a",
@@ -26714,6 +27100,69 @@ mod tests {
             )
             .await?;
         assert_eq!(batch_summaries, summaries);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_job_view_query_tombstone_prevents_stale_resurrection() -> Result<()> {
+        let store = test_store().await?;
+        let now = Utc::now();
+        let view = StreamJobViewRecord {
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "instance-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            job_id: "job-a".to_owned(),
+            handle_id: "handle-a".to_owned(),
+            view_name: "riskScores".to_owned(),
+            logical_key: "acct_1".to_owned(),
+            output: json!({"accountId": "acct_1", "avgRisk": 0.9}),
+            checkpoint_sequence: 4,
+            updated_at: now,
+        };
+        store.upsert_stream_job_view_query(&view).await?;
+        store
+            .delete_stream_job_view_query(&StreamJobViewDeleteRecord {
+                tenant_id: view.tenant_id.clone(),
+                instance_id: view.instance_id.clone(),
+                run_id: view.run_id.clone(),
+                job_id: view.job_id.clone(),
+                handle_id: view.handle_id.clone(),
+                view_name: view.view_name.clone(),
+                logical_key: view.logical_key.clone(),
+                checkpoint_sequence: 5,
+                evicted_at: now + chrono::Duration::seconds(10),
+            })
+            .await?;
+        store.upsert_stream_job_view_query(&view).await?;
+
+        assert!(
+            store
+                .get_stream_job_view_query(
+                    "tenant-a",
+                    "instance-a",
+                    "run-a",
+                    "job-a",
+                    "riskScores",
+                    "acct_1",
+                )
+                .await?
+                .is_none()
+        );
+        let summary = store
+            .get_stream_job_view_projection_summary(
+                "tenant-a",
+                "instance-a",
+                "run-a",
+                "job-a",
+                "riskScores",
+            )
+            .await?
+            .context("projection summary should exist after delete tombstone")?;
+        assert_eq!(summary.key_count, 0);
+        assert_eq!(summary.latest_checkpoint_sequence, None);
+        assert_eq!(summary.latest_deleted_checkpoint_sequence, Some(5));
+        assert_eq!(summary.latest_deleted_at, Some(now + chrono::Duration::seconds(10)));
+
         Ok(())
     }
 

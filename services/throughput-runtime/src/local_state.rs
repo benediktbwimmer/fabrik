@@ -16,11 +16,12 @@ use self::derivation::{
 };
 use self::keyspace::{
     STREAM_JOB_CHECKPOINT_BINARY_PREFIX, STREAM_JOB_RUNTIME_BINARY_PREFIX,
-    STREAM_JOB_VIEW_BINARY_PREFIX, batch_chunk_index_key, batch_chunk_index_prefix, batch_key,
-    chunk_key, group_key, legacy_cf_for_key, legacy_stream_job_checkpoint_key,
-    legacy_stream_job_runtime_key, legacy_stream_job_view_key, legacy_stream_job_view_prefix,
-    mirrored_entry_key, offset_key, parse_stream_job_view_key, stream_job_checkpoint_key,
-    stream_job_dispatch_applied_key, stream_job_dispatch_applied_prefix, stream_job_runtime_key,
+    STREAM_JOB_SIGNAL_BINARY_PREFIX, STREAM_JOB_VIEW_BINARY_PREFIX, batch_chunk_index_key,
+    batch_chunk_index_prefix, batch_key, chunk_key, group_key, legacy_cf_for_key,
+    legacy_stream_job_checkpoint_key, legacy_stream_job_runtime_key, legacy_stream_job_signal_key,
+    legacy_stream_job_view_key, legacy_stream_job_view_prefix, mirrored_entry_key, offset_key,
+    parse_stream_job_view_key, stream_job_checkpoint_key, stream_job_dispatch_applied_key,
+    stream_job_dispatch_applied_prefix, stream_job_runtime_key, stream_job_signal_key,
     stream_job_view_key, stream_job_view_prefix, throughput_partition_id, timestamp_sort_key,
 };
 #[cfg(test)]
@@ -72,6 +73,7 @@ const LEASE_EXPIRY_INDEX_PREFIX: &str = "idx:lease-expiry:";
 const STREAM_JOB_VIEW_KEY_PREFIX: &str = "stream-job-view:";
 const STREAM_JOB_RUNTIME_KEY_PREFIX: &str = "stream-job-runtime:";
 const STREAM_JOB_CHECKPOINT_KEY_PREFIX: &str = "stream-job-checkpoint:";
+const STREAM_JOB_SIGNAL_KEY_PREFIX: &str = "stream-job-signal:";
 const STREAMS_OFFSET_KEY_PREFIX: &str = "meta:streams-offset:";
 const STREAMS_MIRRORED_ENTRY_KEY_PREFIX: &str = "meta:streams-mirrored-entry:";
 const LATEST_CHECKPOINT_FILE: &str = "latest.json";
@@ -306,6 +308,8 @@ pub struct LocalThroughputState {
     checkpoint_retention: usize,
     meta: Arc<Mutex<LocalStateMeta>>,
     lease_lock: Arc<Mutex<()>>,
+    stream_job_view_overlay:
+        Arc<Mutex<HashMap<StreamJobViewOverlayKey, StreamJobViewOverlayEntry>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,6 +411,8 @@ struct CheckpointFile {
     stream_job_applied_dispatch_batches: Vec<LocalStreamJobAppliedDispatchBatchState>,
     #[serde(default)]
     stream_job_checkpoints: Vec<LocalStreamJobCheckpointState>,
+    #[serde(default)]
+    stream_job_workflow_signals: Vec<LocalStreamJobWorkflowSignalState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -530,6 +536,25 @@ pub(crate) struct LocalStreamJobViewState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalStreamJobViewRuntimeStatsState {
+    pub(crate) view_name: String,
+    #[serde(default)]
+    pub(crate) evicted_window_count: u64,
+    #[serde(default)]
+    pub(crate) last_evicted_window_end: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) last_evicted_at: Option<DateTime<Utc>>,
+}
+
+pub(crate) type StreamJobViewOverlayKey = (String, String, String);
+
+#[derive(Debug, Clone)]
+pub(crate) enum StreamJobViewOverlayEntry {
+    Present(LocalStreamJobViewState),
+    Deleted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct LocalStreamJobRuntimeState {
     pub(crate) handle_id: String,
     pub(crate) job_id: String,
@@ -565,11 +590,71 @@ pub(crate) struct LocalStreamJobRuntimeState {
     pub(crate) last_evicted_window_end: Option<DateTime<Utc>>,
     #[serde(default)]
     pub(crate) last_evicted_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) view_runtime_stats: Vec<LocalStreamJobViewRuntimeStatsState>,
+    #[serde(default)]
+    pub(crate) checkpoint_partitions: Vec<LocalStreamJobCheckpointState>,
     pub(crate) terminal_status: Option<String>,
     pub(crate) terminal_output: Option<Value>,
     pub(crate) terminal_error: Option<String>,
     pub(crate) terminal_at: Option<DateTime<Utc>>,
     pub(crate) updated_at: DateTime<Utc>,
+}
+
+impl LocalStreamJobRuntimeState {
+    pub(crate) fn view_runtime_stats(
+        &self,
+        view_name: &str,
+    ) -> Option<&LocalStreamJobViewRuntimeStatsState> {
+        self.view_runtime_stats.iter().find(|stats| stats.view_name == view_name)
+    }
+
+    pub(crate) fn record_view_eviction(
+        &mut self,
+        view_name: &str,
+        window_end: Option<DateTime<Utc>>,
+        evicted_at: Option<DateTime<Utc>>,
+    ) {
+        let stats = if let Some(stats) =
+            self.view_runtime_stats.iter_mut().find(|stats| stats.view_name == view_name)
+        {
+            stats
+        } else {
+            self.view_runtime_stats.push(LocalStreamJobViewRuntimeStatsState {
+                view_name: view_name.to_owned(),
+                evicted_window_count: 0,
+                last_evicted_window_end: None,
+                last_evicted_at: None,
+            });
+            self.view_runtime_stats
+                .last_mut()
+                .expect("view runtime stats should exist after insertion")
+        };
+        stats.evicted_window_count = stats.evicted_window_count.saturating_add(1);
+        if let Some(window_end) = window_end {
+            stats.last_evicted_window_end = Some(
+                stats.last_evicted_window_end.map_or(window_end, |current| current.max(window_end)),
+            );
+        }
+        if let Some(evicted_at) = evicted_at {
+            stats.last_evicted_at =
+                Some(stats.last_evicted_at.map_or(evicted_at, |current| current.max(evicted_at)));
+        }
+    }
+
+    pub(crate) fn record_checkpoint_partition(
+        &mut self,
+        checkpoint: LocalStreamJobCheckpointState,
+    ) {
+        if let Some(existing) = self.checkpoint_partitions.iter_mut().find(|state| {
+            state.checkpoint_name == checkpoint.checkpoint_name
+                && state.stream_partition_id == checkpoint.stream_partition_id
+        }) {
+            *existing = checkpoint;
+            return;
+        }
+        self.checkpoint_partitions.push(checkpoint);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -596,6 +681,10 @@ pub(crate) struct LocalStreamJobDispatchBatch {
     pub(crate) view_name: String,
     #[serde(default)]
     pub(crate) additional_view_names: Vec<String>,
+    #[serde(default)]
+    pub(crate) workflow_signals: Vec<crate::stream_jobs::StreamJobWorkflowSignalPlan>,
+    #[serde(default)]
+    pub(crate) eventual_projection_view_names: Vec<String>,
     pub(crate) checkpoint_name: String,
     pub(crate) checkpoint_sequence: i64,
     pub(crate) owner_epoch: u64,
@@ -676,6 +765,23 @@ pub(crate) struct LocalStreamJobCheckpointState {
     pub(crate) stream_partition_id: i32,
     pub(crate) stream_owner_epoch: u64,
     pub(crate) reached_at: DateTime<Utc>,
+    pub(crate) updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalStreamJobWorkflowSignalState {
+    pub(crate) handle_id: String,
+    pub(crate) job_id: String,
+    pub(crate) operator_id: String,
+    pub(crate) view_name: String,
+    pub(crate) logical_key: String,
+    pub(crate) signal_id: String,
+    pub(crate) signal_type: String,
+    pub(crate) payload: Value,
+    pub(crate) stream_owner_epoch: u64,
+    pub(crate) signaled_at: DateTime<Utc>,
+    #[serde(default)]
+    pub(crate) published_at: Option<DateTime<Utc>>,
     pub(crate) updated_at: DateTime<Utc>,
 }
 

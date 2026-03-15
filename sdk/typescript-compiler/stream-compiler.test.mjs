@@ -45,6 +45,31 @@ test("stream compiler emits keyed-rollup standalone artifacts", async () => {
   assert.ok(artifact.source_files.some((file) => file.endsWith("standalone-stream-job.ts")));
 });
 
+test("stream compiler emits keyed-rollup workflow signal artifacts", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/keyed-rollup-signal-stream-job.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "keyedRollupSignalStreamJob",
+    "--definition-id",
+    "payments-rollup-signal",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+
+  assert.equal(artifact.runtime_contract, "streams_kernel_v1");
+  assert.equal(artifact.job.runtime, "keyed_rollup");
+  assert.equal(artifact.job.operators[2].kind, "signal_workflow");
+  assert.equal(artifact.job.operators[2].config.view, "accountTotals");
+  assert.equal(artifact.job.operators[2].config.signalType, "account.rollup.ready");
+  assert.equal(artifact.job.operators[2].config.whenOutputField, "totalAmount");
+});
+
 test("stream compiler rejects keyed-rollup jobs that violate the kernel contract", async () => {
   const fixture = path.join(
     root,
@@ -94,4 +119,55 @@ test("stream compiler emits aggregate-v2 artifacts with widened schema", async (
   assert.equal(artifact.job.classification, "fast_lane");
   assert.equal(artifact.job.metadata.kernel, "aggregate_v2");
   assert.ok(artifact.source_map.states);
+});
+
+test("stream compiler emits threshold aggregate-v2 artifacts", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/aggregate-v2-threshold-stream-job.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "fraudThresholdStreamJob",
+    "--definition-id",
+    "fraud-threshold",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+
+  assert.equal(artifact.runtime_contract, "streams_kernel_v2");
+  assert.equal(artifact.job.runtime, "aggregate_v2");
+  assert.equal(artifact.job.source.kind, "bounded_input");
+  assert.equal(artifact.job.operators[0].config.reducer, "threshold");
+  assert.equal(artifact.job.operators[0].config.threshold, 0.97);
+  assert.equal(artifact.job.operators[0].config.comparison, "gte");
+  assert.equal(artifact.job.views[0].value_fields[1], "riskExceeded");
+});
+
+test("stream compiler emits aggregate-v2 workflow signal artifacts", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/aggregate-v2-threshold-signal-stream-job.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "fraudThresholdSignalStreamJob",
+    "--definition-id",
+    "fraud-threshold-signal",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+
+  assert.equal(artifact.runtime_contract, "streams_kernel_v2");
+  assert.equal(artifact.job.runtime, "aggregate_v2");
+  assert.equal(artifact.job.operators[2].kind, "signal_workflow");
+  assert.equal(artifact.job.operators[2].config.view, "riskThresholds");
+  assert.equal(artifact.job.operators[2].config.signalType, "fraud.threshold.crossed");
+  assert.equal(artifact.job.operators[2].config.whenOutputField, "riskExceeded");
 });

@@ -167,6 +167,13 @@ Optional near-term reducer:
 
 - `threshold`
 
+Threshold reducer config:
+
+- `valueField`
+- numeric `threshold`
+- optional `comparison` of `gt`, `gte`, `lt`, or `lte` (default `gte`)
+- optional `outputField` for the materialized boolean result
+
 Rules:
 
 - reducers must be built-in and statically known

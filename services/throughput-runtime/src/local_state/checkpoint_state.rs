@@ -408,6 +408,7 @@ impl LocalThroughputState {
             stream_job_applied_dispatch_batches: self
                 .load_all_stream_job_applied_dispatch_batches()?,
             stream_job_checkpoints: self.load_all_stream_job_checkpoints()?,
+            stream_job_workflow_signals: self.load_all_stream_job_workflow_signals()?,
         })
     }
 
@@ -476,6 +477,13 @@ impl LocalThroughputState {
             .into_iter()
             .filter(|state| state.stream_partition_id == partition_id)
             .collect::<Vec<_>>();
+        let stream_job_workflow_signals = self
+            .load_all_stream_job_workflow_signals()?
+            .into_iter()
+            .filter(|state| {
+                throughput_partition_id(&state.logical_key, 0, partition_count) == partition_id
+            })
+            .collect::<Vec<_>>();
         Ok(CheckpointFile {
             created_at,
             offsets: self
@@ -497,6 +505,7 @@ impl LocalThroughputState {
             stream_job_runtime_states,
             stream_job_applied_dispatch_batches,
             stream_job_checkpoints,
+            stream_job_workflow_signals,
         })
     }
 
@@ -604,6 +613,23 @@ impl LocalThroughputState {
                     state.stream_partition_id,
                 ),
                 encode_rocksdb_value(state, "checkpoint stream job checkpoint state")?,
+            );
+        }
+        for state in &checkpoint.stream_job_workflow_signals {
+            self.write_batch_delete_cf_and_legacy(
+                &mut batch,
+                STREAM_JOBS_CF,
+                &legacy_stream_job_signal_key(
+                    &state.handle_id,
+                    &state.operator_id,
+                    &state.logical_key,
+                ),
+            );
+            self.write_batch_put_cf_bytes(
+                &mut batch,
+                STREAM_JOBS_CF,
+                &stream_job_signal_key(&state.handle_id, &state.operator_id, &state.logical_key),
+                encode_rocksdb_value(state, "stream job workflow signal state")?,
             );
         }
         self.db.write(batch).context("failed to restore throughput checkpoint into state db")?;

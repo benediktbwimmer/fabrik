@@ -9969,6 +9969,216 @@ mod tests {
         )
     }
 
+    fn topic_keyed_rollup_stream_job_artifact() -> CompiledWorkflowArtifact {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "start_stream".to_owned(),
+            CompiledStateNode::StartStreamJob {
+                job_name: "keyed-rollup".to_owned(),
+                input: Expression::Member {
+                    object: Box::new(Expression::Identifier { name: "input".to_owned() }),
+                    property: "streamInput".to_owned(),
+                },
+                config: Some(Expression::Member {
+                    object: Box::new(Expression::Identifier { name: "input".to_owned() }),
+                    property: "streamConfig".to_owned(),
+                }),
+                next: "wait_checkpoint".to_owned(),
+                handle_var: "job".to_owned(),
+            },
+        );
+        states.insert(
+            "wait_checkpoint".to_owned(),
+            CompiledStateNode::WaitForStreamCheckpoint {
+                stream_job_ref_var: "job".to_owned(),
+                checkpoint_name: "hourly-rollup-ready".to_owned(),
+                next: "query_stream".to_owned(),
+                output_var: Some("checkpoint".to_owned()),
+                on_error: None,
+            },
+        );
+        states.insert(
+            "query_stream".to_owned(),
+            CompiledStateNode::QueryStreamJob {
+                stream_job_ref_var: "job".to_owned(),
+                query_name: "accountTotals".to_owned(),
+                args: Some(Expression::Object {
+                    fields: BTreeMap::from([(
+                        "key".to_owned(),
+                        Expression::Member {
+                            object: Box::new(Expression::Identifier { name: "input".to_owned() }),
+                            property: "accountId".to_owned(),
+                        },
+                    )]),
+                }),
+                consistency: Some("strong".to_owned()),
+                next: "cancel_stream".to_owned(),
+                output_var: Some("account".to_owned()),
+                on_error: None,
+            },
+        );
+        states.insert(
+            "cancel_stream".to_owned(),
+            CompiledStateNode::CancelStreamJob {
+                stream_job_ref_var: "job".to_owned(),
+                reason: Some(Expression::Literal { value: json!("workflow-requested-cancel") }),
+                next: "await_terminal".to_owned(),
+            },
+        );
+        states.insert(
+            "await_terminal".to_owned(),
+            CompiledStateNode::AwaitStreamJobTerminal {
+                stream_job_ref_var: "job".to_owned(),
+                next: "done".to_owned(),
+                output_var: Some("result".to_owned()),
+                on_error: None,
+            },
+        );
+        states.insert(
+            "done".to_owned(),
+            CompiledStateNode::Succeed {
+                output: Some(Expression::Object {
+                    fields: BTreeMap::from([
+                        (
+                            "checkpoint".to_owned(),
+                            Expression::Identifier { name: "checkpoint".to_owned() },
+                        ),
+                        (
+                            "account".to_owned(),
+                            Expression::Identifier { name: "account".to_owned() },
+                        ),
+                        ("cancelRequested".to_owned(), Expression::Literal { value: json!(true) }),
+                        (
+                            "terminalStatus".to_owned(),
+                            Expression::Member {
+                                object: Box::new(Expression::Identifier {
+                                    name: "result".to_owned(),
+                                }),
+                                property: "status".to_owned(),
+                            },
+                        ),
+                    ]),
+                }),
+            },
+        );
+
+        CompiledWorkflowArtifact::new(
+            "topic-keyed-rollup-stream-job-demo".to_owned(),
+            1,
+            "unified-runtime-test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "start_stream".to_owned(),
+                states,
+                params: Vec::new(),
+                async_helpers: BTreeMap::new(),
+                non_cancellable_states: BTreeSet::new(),
+            },
+        )
+    }
+
+    fn topic_keyed_rollup_signal_stream_job_artifact() -> CompiledWorkflowArtifact {
+        let mut states = BTreeMap::new();
+        states.insert(
+            "start_stream".to_owned(),
+            CompiledStateNode::StartStreamJob {
+                job_name: "keyed-rollup".to_owned(),
+                input: Expression::Member {
+                    object: Box::new(Expression::Identifier { name: "input".to_owned() }),
+                    property: "streamInput".to_owned(),
+                },
+                config: Some(Expression::Member {
+                    object: Box::new(Expression::Identifier { name: "input".to_owned() }),
+                    property: "streamConfig".to_owned(),
+                }),
+                next: "wait_signal".to_owned(),
+                handle_var: "job".to_owned(),
+            },
+        );
+        states.insert(
+            "wait_signal".to_owned(),
+            CompiledStateNode::WaitForEvent {
+                event_type: "account.rollup.ready".to_owned(),
+                next: "query_stream".to_owned(),
+                output_var: Some("alert".to_owned()),
+            },
+        );
+        states.insert(
+            "query_stream".to_owned(),
+            CompiledStateNode::QueryStreamJob {
+                stream_job_ref_var: "job".to_owned(),
+                query_name: "accountTotals".to_owned(),
+                args: Some(Expression::Object {
+                    fields: BTreeMap::from([(
+                        "key".to_owned(),
+                        Expression::Member {
+                            object: Box::new(Expression::Identifier { name: "alert".to_owned() }),
+                            property: "logicalKey".to_owned(),
+                        },
+                    )]),
+                }),
+                consistency: Some("strong".to_owned()),
+                next: "cancel_stream".to_owned(),
+                output_var: Some("account".to_owned()),
+                on_error: None,
+            },
+        );
+        states.insert(
+            "cancel_stream".to_owned(),
+            CompiledStateNode::CancelStreamJob {
+                stream_job_ref_var: "job".to_owned(),
+                reason: Some(Expression::Literal { value: json!("workflow-threshold-handled") }),
+                next: "await_terminal".to_owned(),
+            },
+        );
+        states.insert(
+            "await_terminal".to_owned(),
+            CompiledStateNode::AwaitStreamJobTerminal {
+                stream_job_ref_var: "job".to_owned(),
+                next: "done".to_owned(),
+                output_var: Some("result".to_owned()),
+                on_error: None,
+            },
+        );
+        states.insert(
+            "done".to_owned(),
+            CompiledStateNode::Succeed {
+                output: Some(Expression::Object {
+                    fields: BTreeMap::from([
+                        ("signal".to_owned(), Expression::Identifier { name: "alert".to_owned() }),
+                        (
+                            "account".to_owned(),
+                            Expression::Identifier { name: "account".to_owned() },
+                        ),
+                        (
+                            "terminalStatus".to_owned(),
+                            Expression::Member {
+                                object: Box::new(Expression::Identifier {
+                                    name: "result".to_owned(),
+                                }),
+                                property: "status".to_owned(),
+                            },
+                        ),
+                    ]),
+                }),
+            },
+        );
+
+        CompiledWorkflowArtifact::new(
+            "topic-keyed-rollup-signal-stream-job-demo".to_owned(),
+            1,
+            "unified-runtime-test",
+            ArtifactEntrypoint { module: "workflow.ts".to_owned(), export: "workflow".to_owned() },
+            CompiledWorkflow {
+                initial_state: "start_stream".to_owned(),
+                states,
+                params: Vec::new(),
+                async_helpers: BTreeMap::new(),
+                non_cancellable_states: BTreeSet::new(),
+            },
+        )
+    }
+
     #[test]
     fn stream_job_metadata_prefers_declared_config_fields() {
         let config = json!({
@@ -10029,6 +10239,67 @@ mod tests {
             if Instant::now() >= deadline {
                 anyhow::bail!(
                     "timed out waiting for workflow instance {tenant_id}/{instance_id} to complete"
+                );
+            }
+            sleep(StdDuration::from_millis(50)).await;
+        }
+    }
+
+    async fn wait_for_stream_job_handle_status(
+        store: &WorkflowStore,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        expected: StreamJobBridgeHandleStatus,
+    ) -> Result<StreamJobBridgeHandleRecord> {
+        let deadline = Instant::now() + StdDuration::from_secs(15);
+        loop {
+            if let Some(handle) = store
+                .list_stream_job_bridge_handles_for_run_page(tenant_id, instance_id, run_id, 10, 0)
+                .await?
+                .into_iter()
+                .next()
+                && handle.parsed_status() == Some(expected)
+            {
+                return Ok(handle);
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for stream job handle {tenant_id}/{instance_id}/{run_id} to reach {}",
+                    expected.as_str()
+                );
+            }
+            sleep(StdDuration::from_millis(50)).await;
+        }
+    }
+
+    async fn wait_for_stream_job_view_query(
+        store: &WorkflowStore,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        job_id: &str,
+        view_name: &str,
+        logical_key: &str,
+    ) -> Result<fabrik_store::StreamJobViewRecord> {
+        let deadline = Instant::now() + StdDuration::from_secs(15);
+        loop {
+            if let Some(view) = store
+                .get_stream_job_view_query(
+                    tenant_id,
+                    instance_id,
+                    run_id,
+                    job_id,
+                    view_name,
+                    logical_key,
+                )
+                .await?
+            {
+                return Ok(view);
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for stream job view {tenant_id}/{instance_id}/{run_id}/{job_id}/{view_name}/{logical_key}"
                 );
             }
             sleep(StdDuration::from_millis(50)).await;
@@ -15271,6 +15542,450 @@ mod tests {
         assert_eq!(accepted_twice.completed_at, first_completed_at);
         assert_eq!(accepted_twice.accepted_at, first_accepted_at);
         assert_eq!(accepted_twice.output, Some(json!({"anomalies": 2})));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workflow_topic_keyed_rollup_stream_job_waits_queries_and_drains_on_cancel()
+    -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = topic_keyed_rollup_stream_job_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-topic-keyed-rollup-{}", Uuid::now_v7()));
+        let publisher = redpanda.connect_publisher().await?;
+        let app_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher,
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+        let consumer = build_workflow_consumer(
+            &redpanda.broker,
+            "unified-runtime-topic-keyed-rollup-consumer",
+            &redpanda.broker.all_partition_ids(),
+        )
+        .await?;
+        let trigger_loop = tokio::spawn(run_trigger_consumer(app_state.clone(), consumer));
+        let outbox_loop = tokio::spawn(run_workflow_event_outbox_publisher(app_state.clone()));
+        let _throughput_runtime =
+            TestThroughputRuntime::start(&postgres, &redpanda, &state_dir).await?;
+
+        let source_topic = JsonTopicConfig::new(
+            redpanda.broker.brokers.clone(),
+            format!("workflow-topic-keyed-rollup-source-{}", Uuid::now_v7()),
+            1,
+        );
+        let source_publisher =
+            JsonTopicPublisher::<Value>::new(&source_topic, "workflow-topic-keyed-rollup-source")
+                .await?;
+
+        let input = json!({
+            "streamInput": {
+                "topic": source_topic.topic_name
+            },
+            "streamConfig": {
+                "checkpoint": "hourly-rollup-ready",
+                "source": {
+                    "kind": "topic",
+                    "name": source_topic.topic_name
+                },
+                "checkpointPolicy": {
+                    "kind": "named_checkpoints",
+                    "checkpoints": [
+                        {
+                            "name": "hourly-rollup-ready",
+                            "delivery": "workflow_awaitable",
+                            "sequence": 1
+                        }
+                    ]
+                },
+                "viewDefinitions": [
+                    {
+                        "name": "accountTotals",
+                        "consistency": "strong",
+                        "queryMode": "by_key",
+                        "keyField": "accountId",
+                        "valueFields": ["accountId", "totalAmount", "asOfCheckpoint"]
+                    }
+                ]
+            },
+            "accountId": "acct_1"
+        });
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-topic-keyed-rollup",
+            "run-topic-keyed-rollup",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(&identity, WorkflowEvent::WorkflowTriggered { input }, Utc::now());
+        redpanda.connect_publisher().await?.publish(&trigger, &trigger.partition_key).await?;
+
+        let filter = WorkflowHistoryFilter::new(
+            "tenant",
+            "instance-topic-keyed-rollup",
+            "run-topic-keyed-rollup",
+        );
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobScheduled").await?;
+
+        source_publisher.publish(&json!({"accountId": "acct_1", "amount": 2.0}), "acct_1").await?;
+        source_publisher.publish(&json!({"accountId": "acct_1", "amount": 3.0}), "acct_1").await?;
+
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobCheckpointReached").await?;
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobQueryCompleted").await?;
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobCancellationRequested").await?;
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobCancelled").await?;
+
+        let completed =
+            wait_for_instance_completion(&store, "tenant", "instance-topic-keyed-rollup").await?;
+        assert_eq!(completed.status, WorkflowStatus::Completed);
+        assert_eq!(
+            completed.output.as_ref().and_then(|output| output.get("cancelRequested")),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            completed.output.as_ref().and_then(|output| output.get("terminalStatus")),
+            Some(&json!("cancelled"))
+        );
+        assert_eq!(
+            completed.output.as_ref().and_then(|output| {
+                output
+                    .get("account")
+                    .and_then(|account| account.get("accountId"))
+                    .and_then(Value::as_str)
+            }),
+            Some("acct_1")
+        );
+        assert_eq!(
+            completed.output.as_ref().and_then(|output| {
+                output
+                    .get("account")
+                    .and_then(|account| account.get("totalAmount"))
+                    .and_then(Value::as_f64)
+            }),
+            Some(5.0)
+        );
+
+        let cancelled_handle = wait_for_stream_job_handle_status(
+            &store,
+            "tenant",
+            "instance-topic-keyed-rollup",
+            "run-topic-keyed-rollup",
+            StreamJobBridgeHandleStatus::Cancelled,
+        )
+        .await?;
+        assert_eq!(cancelled_handle.terminal_error.as_deref(), Some("workflow-requested-cancel"));
+
+        let projected_before_cancel = wait_for_stream_job_view_query(
+            &store,
+            "tenant",
+            "instance-topic-keyed-rollup",
+            "run-topic-keyed-rollup",
+            &cancelled_handle.job_id,
+            "accountTotals",
+            "acct_1",
+        )
+        .await?;
+        assert_eq!(projected_before_cancel.output["totalAmount"], json!(5.0));
+
+        source_publisher.publish(&json!({"accountId": "acct_1", "amount": 7.0}), "acct_1").await?;
+        sleep(StdDuration::from_millis(750)).await;
+
+        let projected_after_cancel = store
+            .get_stream_job_view_query(
+                "tenant",
+                "instance-topic-keyed-rollup",
+                "run-topic-keyed-rollup",
+                &cancelled_handle.job_id,
+                "accountTotals",
+                "acct_1",
+            )
+            .await?
+            .context("projected stream job view should remain queryable after cancel")?;
+        assert_eq!(projected_after_cancel.output["totalAmount"], json!(5.0));
+
+        let history = read_workflow_history(
+            &redpanda.broker,
+            "unified-runtime-topic-keyed-rollup-history",
+            &filter,
+            StdDuration::from_millis(500),
+            StdDuration::from_secs(5),
+        )
+        .await?;
+        assert_eq!(
+            history.iter().filter(|event| event.event_type == "StreamJobScheduled").count(),
+            1
+        );
+        assert_eq!(
+            history.iter().filter(|event| event.event_type == "StreamJobCheckpointReached").count(),
+            1
+        );
+        assert_eq!(
+            history.iter().filter(|event| event.event_type == "StreamJobQueryCompleted").count(),
+            1
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| event.event_type == "StreamJobCancellationRequested")
+                .count(),
+            1
+        );
+        assert_eq!(
+            history.iter().filter(|event| event.event_type == "StreamJobCancelled").count(),
+            1
+        );
+
+        trigger_loop.abort();
+        outbox_loop.abort();
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workflow_topic_keyed_rollup_signal_queries_state_after_stream_signal() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = topic_keyed_rollup_signal_stream_job_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-topic-keyed-rollup-signal-{}", Uuid::now_v7()));
+        let publisher = redpanda.connect_publisher().await?;
+        let app_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher,
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+        let consumer = build_workflow_consumer(
+            &redpanda.broker,
+            "unified-runtime-topic-keyed-rollup-signal-consumer",
+            &redpanda.broker.all_partition_ids(),
+        )
+        .await?;
+        let trigger_loop = tokio::spawn(run_trigger_consumer(app_state.clone(), consumer));
+        let outbox_loop = tokio::spawn(run_workflow_event_outbox_publisher(app_state.clone()));
+        let _throughput_runtime =
+            TestThroughputRuntime::start(&postgres, &redpanda, &state_dir).await?;
+
+        let source_topic = JsonTopicConfig::new(
+            redpanda.broker.brokers.clone(),
+            format!("workflow-topic-keyed-rollup-signal-source-{}", Uuid::now_v7()),
+            1,
+        );
+        let source_publisher = JsonTopicPublisher::<Value>::new(
+            &source_topic,
+            "workflow-topic-keyed-rollup-signal-source",
+        )
+        .await?;
+
+        let input = json!({
+            "streamInput": {
+                "topic": source_topic.topic_name
+            },
+            "streamConfig": {
+                "checkpoint": "hourly-rollup-ready",
+                "source": {
+                    "kind": "topic",
+                    "name": source_topic.topic_name
+                },
+                "operators": [
+                    {
+                        "kind": "reduce",
+                        "name": "sum-account-totals",
+                        "config": {
+                            "reducer": "sum",
+                            "valueField": "amount",
+                            "outputField": "totalAmount"
+                        }
+                    },
+                    {
+                        "kind": "emit_checkpoint",
+                        "name": "hourly-rollup-ready",
+                        "config": {
+                            "sequence": 1
+                        }
+                    },
+                    {
+                        "kind": "signal_workflow",
+                        "name": "notify-account-rollup",
+                        "config": {
+                            "view": "accountTotals",
+                            "signalType": "account.rollup.ready",
+                            "whenOutputField": "totalAmount"
+                        }
+                    }
+                ],
+                "checkpointPolicy": {
+                    "kind": "named_checkpoints",
+                    "checkpoints": [
+                        {
+                            "name": "hourly-rollup-ready",
+                            "delivery": "workflow_awaitable",
+                            "sequence": 1
+                        }
+                    ]
+                },
+                "viewDefinitions": [
+                    {
+                        "name": "accountTotals",
+                        "consistency": "strong",
+                        "queryMode": "by_key",
+                        "keyField": "accountId",
+                        "valueFields": ["accountId", "totalAmount", "asOfCheckpoint"]
+                    }
+                ],
+                "views": [
+                    {
+                        "name": "accountTotals",
+                        "consistency": "strong",
+                        "queryMode": "by_key",
+                        "keyField": "accountId",
+                        "valueFields": ["accountId", "totalAmount", "asOfCheckpoint"]
+                    }
+                ],
+                "queries": [
+                    {
+                        "name": "accountTotals",
+                        "viewName": "accountTotals",
+                        "consistency": "strong"
+                    }
+                ]
+            }
+        });
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-topic-keyed-rollup-signal",
+            "run-topic-keyed-rollup-signal",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(&identity, WorkflowEvent::WorkflowTriggered { input }, Utc::now());
+        redpanda.connect_publisher().await?.publish(&trigger, &trigger.partition_key).await?;
+
+        let filter = WorkflowHistoryFilter::new(
+            "tenant",
+            "instance-topic-keyed-rollup-signal",
+            "run-topic-keyed-rollup-signal",
+        );
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobScheduled").await?;
+
+        source_publisher.publish(&json!({"accountId": "acct_2", "amount": 0.0}), "acct_2").await?;
+        source_publisher.publish(&json!({"accountId": "acct_1", "amount": 2.0}), "acct_1").await?;
+
+        redpanda.wait_for_workflow_history_event(&filter, "SignalReceived").await?;
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobQueryCompleted").await?;
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobCancellationRequested").await?;
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobCancelled").await?;
+
+        let completed =
+            wait_for_instance_completion(&store, "tenant", "instance-topic-keyed-rollup-signal")
+                .await?;
+        assert_eq!(completed.status, WorkflowStatus::Completed);
+        assert_eq!(
+            completed.output.as_ref().and_then(|output| {
+                output
+                    .get("signal")
+                    .and_then(|signal| signal.get("operatorId"))
+                    .and_then(Value::as_str)
+            }),
+            Some("notify-account-rollup")
+        );
+        assert_eq!(
+            completed.output.as_ref().and_then(|output| {
+                output
+                    .get("signal")
+                    .and_then(|signal| signal.get("logicalKey"))
+                    .and_then(Value::as_str)
+            }),
+            Some("acct_1")
+        );
+        assert_eq!(
+            completed.output.as_ref().and_then(|output| {
+                output
+                    .get("signal")
+                    .and_then(|signal| signal.get("output"))
+                    .and_then(|signal| signal.get("totalAmount"))
+                    .and_then(Value::as_f64)
+            }),
+            Some(2.0)
+        );
+        assert_eq!(
+            completed.output.as_ref().and_then(|output| {
+                output
+                    .get("account")
+                    .and_then(|account| account.get("accountId"))
+                    .and_then(Value::as_str)
+            }),
+            Some("acct_1")
+        );
+        assert_eq!(
+            completed.output.as_ref().and_then(|output| {
+                output
+                    .get("account")
+                    .and_then(|account| account.get("totalAmount"))
+                    .and_then(Value::as_f64)
+            }),
+            Some(2.0)
+        );
+        assert_eq!(
+            completed.output.as_ref().and_then(|output| output.get("terminalStatus")),
+            Some(&json!("cancelled"))
+        );
+
+        let cancelled_handle = wait_for_stream_job_handle_status(
+            &store,
+            "tenant",
+            "instance-topic-keyed-rollup-signal",
+            "run-topic-keyed-rollup-signal",
+            StreamJobBridgeHandleStatus::Cancelled,
+        )
+        .await?;
+        assert_eq!(cancelled_handle.terminal_error.as_deref(), Some("workflow-threshold-handled"));
+
+        let history = read_workflow_history(
+            &redpanda.broker,
+            "unified-runtime-topic-keyed-rollup-signal-history",
+            &filter,
+            StdDuration::from_millis(500),
+            StdDuration::from_secs(5),
+        )
+        .await?;
+        assert_eq!(history.iter().filter(|event| event.event_type == "SignalReceived").count(), 1);
+        assert_eq!(
+            history.iter().filter(|event| event.event_type == "StreamJobQueryCompleted").count(),
+            1
+        );
+        assert_eq!(
+            history.iter().filter(|event| event.event_type == "StreamJobCancelled").count(),
+            1
+        );
+
+        trigger_loop.abort();
+        outbox_loop.abort();
 
         fs::remove_dir_all(state_dir).ok();
         Ok(())

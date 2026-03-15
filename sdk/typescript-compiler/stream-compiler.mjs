@@ -410,8 +410,10 @@ function validateKeyedRollupJob(job) {
   if (job.key_by !== "accountId") {
     throw new CompilerError(`keyed_rollup runtime requires keyBy "accountId"`);
   }
-  if (job.operators.length !== 2) {
-    throw new CompilerError(`keyed_rollup runtime requires exactly 2 operators`);
+  if (job.operators.length !== 2 && job.operators.length !== 3) {
+    throw new CompilerError(
+      `keyed_rollup runtime requires exactly 2 operators, or 3 with a trailing signal_workflow`,
+    );
   }
 
   const reduce = job.operators[0];
@@ -474,6 +476,33 @@ function validateKeyedRollupJob(job) {
   if (declaredCheckpoint.sequence !== checkpointConfig.sequence) {
     throw new CompilerError(`emit_checkpoint.config.sequence must match checkpoint policy sequence`);
   }
+
+  if (job.operators.length === 3) {
+    const signal = job.operators[2];
+    if (signal.kind !== "signal_workflow") {
+      throw new CompilerError(
+        `keyed_rollup runtime requires operator[2] to be signal_workflow when a third operator is declared`,
+      );
+    }
+    const signalConfig = expectObject(signal.config, "keyed_rollup signal_workflow.config");
+    if (signalConfig.view !== view.name) {
+      throw new CompilerError(
+        `keyed_rollup signal_workflow.config.view must match the declared materialized view`,
+      );
+    }
+    if (typeof signalConfig.signalType !== "string" || signalConfig.signalType.length === 0) {
+      throw new CompilerError(`keyed_rollup signal_workflow.config.signalType must be present`);
+    }
+    if (
+      signalConfig.whenOutputField !== undefined &&
+      (typeof signalConfig.whenOutputField !== "string" ||
+        signalConfig.whenOutputField.length === 0)
+    ) {
+      throw new CompilerError(
+        `keyed_rollup signal_workflow.config.whenOutputField must be a non-empty string`,
+      );
+    }
+  }
 }
 
 function validateAggregateV2Job(job) {
@@ -513,12 +542,41 @@ function validateAggregateV2Job(job) {
   }
   const reducerKinds = new Set(["count", "sum", "min", "max", "avg", "histogram", "threshold"]);
   for (const operator of job.operators) {
+    if (operator.kind !== "filter") {
+      continue;
+    }
+    const config = expectObject(operator.config, "aggregate_v2 filter.config");
+    if (typeof config.predicate !== "string" || config.predicate.trim().length === 0) {
+      throw new CompilerError(`aggregate_v2 filter.config.predicate must be present`);
+    }
+  }
+  for (const operator of job.operators) {
     if (operator.kind !== "reduce" && operator.kind !== "aggregate") {
       continue;
     }
     const config = expectObject(operator.config, `aggregate_v2 ${operator.kind}.config`);
     if (!reducerKinds.has(config.reducer)) {
       throw new CompilerError(`aggregate_v2 ${operator.kind}.config.reducer must be a built-in reducer`);
+    }
+    if (config.reducer === "threshold") {
+      if (typeof config.threshold !== "number" || !Number.isFinite(config.threshold)) {
+        throw new CompilerError(`aggregate_v2 ${operator.kind}.config.threshold must be a finite number`);
+      }
+      if (
+        config.comparison !== undefined &&
+        config.comparison !== "gt" &&
+        config.comparison !== "gte" &&
+        config.comparison !== "lt" &&
+        config.comparison !== "lte"
+      ) {
+        throw new CompilerError(
+          `aggregate_v2 ${operator.kind}.config.comparison must be one of "gt", "gte", "lt", "lte"`,
+        );
+      }
+    } else if (config.threshold !== undefined || config.comparison !== undefined) {
+      throw new CompilerError(
+        `aggregate_v2 ${operator.kind}.config.threshold and .comparison are only valid for threshold reducers`,
+      );
     }
   }
   for (const operator of job.operators) {
@@ -531,6 +589,26 @@ function validateAggregateV2Job(job) {
     }
     if (typeof config.size !== "string" || config.size.length === 0) {
       throw new CompilerError(`aggregate_v2 window.config.size must be present`);
+    }
+  }
+  for (const operator of job.operators) {
+    if (operator.kind !== "signal_workflow") {
+      continue;
+    }
+    const config = expectObject(operator.config, "aggregate_v2 signal_workflow.config");
+    if (typeof config.view !== "string" || config.view.length === 0) {
+      throw new CompilerError(`aggregate_v2 signal_workflow.config.view must be present`);
+    }
+    if (typeof config.signalType !== "string" || config.signalType.length === 0) {
+      throw new CompilerError(`aggregate_v2 signal_workflow.config.signalType must be present`);
+    }
+    if (
+      config.whenOutputField !== undefined &&
+      (typeof config.whenOutputField !== "string" || config.whenOutputField.length === 0)
+    ) {
+      throw new CompilerError(
+        `aggregate_v2 signal_workflow.config.whenOutputField must be a non-empty string`,
+      );
     }
   }
   const supportedQueryModes = new Set(["by_key", "prefix_scan"]);

@@ -34,6 +34,8 @@ export interface StreamReduceOperatorDefinition {
     readonly reducer: "count" | "sum" | "min" | "max" | "avg" | "histogram" | "threshold";
     readonly valueField: string;
     readonly outputField?: string;
+    readonly threshold?: number;
+    readonly comparison?: "gt" | "gte" | "lt" | "lte";
   };
 }
 
@@ -94,6 +96,8 @@ export interface StreamAggregateOperatorDefinition {
     readonly reducer: "count" | "sum" | "min" | "max" | "avg" | "histogram" | "threshold";
     readonly valueField?: string;
     readonly outputField?: string;
+    readonly threshold?: number;
+    readonly comparison?: "gt" | "gte" | "lt" | "lte";
   };
 }
 
@@ -138,7 +142,11 @@ export interface StreamSignalWorkflowOperatorDefinition {
   readonly inputs?: readonly string[];
   readonly outputs?: readonly string[];
   readonly stateIds?: readonly string[];
-  readonly config: JsonValue;
+  readonly config: {
+    readonly view: string;
+    readonly signalType: string;
+    readonly whenOutputField?: string;
+  };
 }
 
 export interface StreamSinkOperatorDefinition {

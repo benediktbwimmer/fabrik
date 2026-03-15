@@ -89,6 +89,20 @@ Rules:
 - eventual reads are non-authoritative and not replay-stable
 - operator and UI surfaces should expose projection lag metadata when serving eventual reads
 
+When an eventual stream read is served from the projection store, the response should expose enough metadata to explain how fresh it is.
+
+At minimum that means:
+
+- latest projected checkpoint sequence
+- latest projected update time when known
+- latest projected delete checkpoint or delete time when tombstone state exists
+- owner checkpoint sequence when known
+- lag between the owner checkpoint and the projected checkpoint
+
+The eventual query surface should also support explicit projection summaries such as projected key count when available.
+
+For debug or operator-facing scan surfaces, strong scans over owner state may also carry the corresponding projection summary and lag metadata for the same view so one scan response can show both the authoritative rows and the current eventual-read health.
+
 ## Stream Diagnostics Queries
 
 Stateful stream runtimes should also expose a strong diagnostics query for operators.
@@ -98,5 +112,28 @@ That query should return not only live counters and cursor state, but also the e
 - window mode and size
 - event-time field
 - allowed lateness
-- view retention or eviction policy
+- per-view retention or eviction policy
 - explicit late-event handling semantics
+
+The diagnostics surface should also support narrowing to one materialized view so operators can inspect view-local policy and owner-local counts without reading the entire job payload.
+
+When the runtime has event-time or checkpoint metadata available, that per-view diagnostics surface should also expose freshness and lag markers for the view.
+
+When that same view supports eventual reads, the per-view diagnostics surface should also expose projection-side freshness for that view, including projected checkpoint/update markers, projected delete markers when tombstones exist, projected key count when available, and lag relative to the owner checkpoint.
+
+When retention eviction is enabled, that per-view diagnostics surface should also expose the view's historical eviction counters and latest eviction markers so operators can distinguish current retained state from already-evicted window history.
+
+## Projection Rebuild
+
+Eventual stream projections must support explicit rebuild without changing stream correctness.
+
+The rebuild contract is:
+
+- authoritative owner state remains the source of truth
+- retained owner rows may be re-projected after projection loss
+- stale projected rows must be deleted during rebuild
+- projection deletes must remain monotonic so an older upsert cannot resurrect a newer delete
+
+Projection rebuild is therefore an operator and recovery primitive, not an execution primitive.
+
+Where practical, operators should be able to rebuild one materialized view at a time rather than forcing a whole-job rebuild for a single damaged or lagging projection.

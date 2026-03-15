@@ -3,6 +3,7 @@ use super::*;
 pub(super) const STREAM_JOB_VIEW_BINARY_PREFIX: &[u8] = b"sjv1\0";
 pub(super) const STREAM_JOB_RUNTIME_BINARY_PREFIX: &[u8] = b"sjr1\0";
 pub(super) const STREAM_JOB_CHECKPOINT_BINARY_PREFIX: &[u8] = b"sjc1\0";
+pub(super) const STREAM_JOB_SIGNAL_BINARY_PREFIX: &[u8] = b"sjs1\0";
 pub(super) const STREAM_JOB_DISPATCH_APPLIED_BINARY_PREFIX: &[u8] = b"sjd1\0";
 
 fn append_binary_key_component(buffer: &mut Vec<u8>, component: &str) {
@@ -52,6 +53,7 @@ pub(super) fn legacy_cf_for_key(key: &str) -> Option<&'static str> {
     }
     if key.starts_with(STREAM_JOB_RUNTIME_KEY_PREFIX)
         || key.starts_with(STREAM_JOB_CHECKPOINT_KEY_PREFIX)
+        || key.starts_with(STREAM_JOB_SIGNAL_KEY_PREFIX)
     {
         return Some(STREAM_JOBS_CF);
     }
@@ -135,6 +137,14 @@ pub(super) fn legacy_stream_job_checkpoint_key(
     format!("{STREAM_JOB_CHECKPOINT_KEY_PREFIX}{handle_id}:{checkpoint_name}:{stream_partition_id}")
 }
 
+pub(super) fn legacy_stream_job_signal_key(
+    handle_id: &str,
+    operator_id: &str,
+    logical_key: &str,
+) -> String {
+    format!("{STREAM_JOB_SIGNAL_KEY_PREFIX}{handle_id}:{operator_id}:{logical_key}")
+}
+
 pub(super) fn stream_job_view_prefix(handle_id: &str, view_name: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(
         STREAM_JOB_VIEW_BINARY_PREFIX.len() + handle_id.len() + view_name.len() + 5,
@@ -201,6 +211,27 @@ pub(super) fn stream_job_checkpoint_key(
     append_binary_key_component(&mut key, handle_id);
     append_binary_key_component(&mut key, checkpoint_name);
     key.extend_from_slice(&stream_partition_id.to_be_bytes());
+    key
+}
+
+pub(super) fn stream_job_signal_prefix(handle_id: &str, operator_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(
+        STREAM_JOB_SIGNAL_BINARY_PREFIX.len() + handle_id.len() + operator_id.len() + 5,
+    );
+    key.extend_from_slice(STREAM_JOB_SIGNAL_BINARY_PREFIX);
+    append_binary_key_component(&mut key, handle_id);
+    append_binary_key_component(&mut key, operator_id);
+    key.push(0);
+    key
+}
+
+pub(super) fn stream_job_signal_key(
+    handle_id: &str,
+    operator_id: &str,
+    logical_key: &str,
+) -> Vec<u8> {
+    let mut key = stream_job_signal_prefix(handle_id, operator_id);
+    key.extend_from_slice(logical_key.as_bytes());
     key
 }
 

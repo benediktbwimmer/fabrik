@@ -80,6 +80,7 @@ impl LocalThroughputState {
             checkpoint_retention: checkpoint_retention.max(1),
             meta: Arc::new(Mutex::new(LocalStateMeta::default())),
             lease_lock: Arc::new(Mutex::new(())),
+            stream_job_view_overlay: Arc::new(Mutex::new(HashMap::new())),
         };
         state.migrate_legacy_default_cf()?;
         Ok(state)

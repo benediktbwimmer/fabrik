@@ -362,7 +362,16 @@ Eventual reads must expose:
 
 - `consistency: "eventual"`
 - a freshness marker such as latest projected checkpoint or projection lag
+- projection summary metadata such as projected key count when available
+- delete freshness when retained-window or key tombstones exist
 - the projection source when relevant
+
+For the current stream-job query path, eventual responses should surface projection freshness explicitly so a caller can compare:
+
+- latest projected checkpoint or update time
+- latest projected delete checkpoint or delete time when relevant
+- owner checkpoint sequence when known
+- lag between the owner and the eventual read model
 
 ### Workflow Interop Rule
 
@@ -393,6 +402,26 @@ Properties:
 - projections are fed asynchronously from durable progress or owner-emitted projection deltas
 - projections may be dropped and rebuilt
 - projection writes must never sit on the hot path required for authoritative mutation
+
+Projection updates must be monotonic.
+
+That means:
+
+- an older projected upsert must not overwrite a newer projected row
+- a newer delete must prevent stale row resurrection during replay or rebuild
+- tombstone-like delete metadata may remain even after the live projected row is gone
+
+Projection rebuild must also be explicit rather than magical.
+
+The rebuild contract is:
+
+1. start from authoritative owner state or another restore-valid source
+2. re-emit the currently retained rows for the view
+3. delete projected rows that no longer exist in authoritative retained state
+4. preserve delete ordering so stale rows are not resurrected after rebuild
+
+Rebuild is a recovery and convenience operation only.
+It does not affect stream correctness because projections are never authoritative.
 
 The first implementation should strongly prefer:
 

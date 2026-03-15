@@ -690,6 +690,19 @@ pub fn stream_job_query_callback_dedupe_key(
     )
 }
 
+pub fn stream_job_signal_callback_dedupe_key(
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    job_id: &str,
+    operator_id: &str,
+    logical_key: &str,
+) -> String {
+    format!(
+        "stream-job-signal:{tenant_id}:{instance_id}:{run_id}:{job_id}:{operator_id}:{logical_key}"
+    )
+}
+
 pub fn stream_job_callback_event_id(dedupe_key: &str) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_URL, dedupe_key.as_bytes())
 }

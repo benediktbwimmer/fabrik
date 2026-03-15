@@ -10,10 +10,11 @@ use fabrik_throughput::{
     ThroughputBatchIdentity, ThroughputCommand, ThroughputCommandEnvelope, ThroughputRunStatus,
     stream_job_bridge_request_id, stream_job_callback_event_id,
     stream_job_checkpoint_callback_dedupe_key, stream_job_query_callback_dedupe_key,
-    stream_job_terminal_callback_dedupe_key,
+    stream_job_signal_callback_dedupe_key, stream_job_terminal_callback_dedupe_key,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
@@ -403,88 +404,103 @@ pub(crate) async fn materialize_stream_job_from_handle(
                 "failed to publish stream job projection records"
             );
         }
-        let materialized = materialization_outcome_from_local_state(&state.local_state, &handle)?;
-        let mut checkpoint_to_publish = None;
-        if let Some(checkpoint) =
-            materialized.as_ref().and_then(|outcome| outcome.checkpoint.clone())
-        {
-            let checkpoint = merge_stream_job_checkpoint_bridge_state(state, checkpoint).await?;
-            state.store.upsert_stream_job_callback_checkpoint(&checkpoint).await?;
-            if handle.stream_owner_epoch.is_none() && checkpoint.stream_owner_epoch.is_some() {
-                handle.stream_owner_epoch = checkpoint.stream_owner_epoch;
-                handle.updated_at = checkpoint.reached_at.unwrap_or(occurred_at);
-                state.store.upsert_stream_job_callback_handle(&handle).await?;
-            }
-            sync_stream_job_record(
-                state,
-                &handle,
-                StreamJobStatus::Running,
-                Some(&checkpoint),
-                checkpoint.reached_at.unwrap_or(occurred_at),
-            )
-            .await?;
-            checkpoint_to_publish = Some(checkpoint);
+    }
+    let Some(materialized) = materialization_outcome_from_local_state(&state.local_state, &handle)?
+    else {
+        return Ok(());
+    };
+    let mut checkpoint_to_publish = None;
+    if let Some(checkpoint) = materialized.checkpoint.clone() {
+        let checkpoint = merge_stream_job_checkpoint_bridge_state(state, checkpoint).await?;
+        state.store.upsert_stream_job_callback_checkpoint(&checkpoint).await?;
+        if handle.stream_owner_epoch.is_none() && checkpoint.stream_owner_epoch.is_some() {
+            handle.stream_owner_epoch = checkpoint.stream_owner_epoch;
+            handle.updated_at = checkpoint.reached_at.unwrap_or(occurred_at);
+            state.store.upsert_stream_job_callback_handle(&handle).await?;
         }
-        if let Some(terminal) = materialized.and_then(|outcome| outcome.terminal) {
-            let finalized =
-                persist_stream_job_terminal_result(state, &handle, terminal, occurred_at).await?;
-            sync_stream_job_record(
-                state,
-                &finalized,
-                default_stream_job_status(&finalized),
-                None,
-                finalized.terminal_at.unwrap_or(occurred_at),
-            )
-            .await?;
-            if !should_emit_workflow_callbacks(&finalized) {
-                return Ok(());
-            }
-            if let Some(checkpoint) = checkpoint_to_publish.as_ref() {
-                if checkpoint.reached_at.is_some()
-                    && checkpoint.accepted_at.is_none()
-                    && checkpoint.cancelled_at.is_none()
-                {
-                    info!(
-                        handle_id = %finalized.handle_id,
-                        job_id = %finalized.job_id,
-                        checkpoint_name = %checkpoint.checkpoint_name,
-                        checkpoint_sequence = checkpoint.checkpoint_sequence,
-                        "streams-runtime publishing stream job checkpoint callback"
-                    );
-                    publish_stream_job_checkpoint_event(state, &finalized, checkpoint).await?;
-                } else if checkpoint.reached_at.is_some() {
-                    record_duplicate_stream_job_checkpoint_publication(
-                        state, &finalized, checkpoint,
-                    );
-                }
-            }
-            if should_defer_terminal_callback_until_query_boundary(&finalized) {
-                info!(
-                    handle_id = %finalized.handle_id,
-                    job_id = %finalized.job_id,
-                    "streams-runtime deferring stream job terminal callback until workflow bridge is ready"
-                );
-            } else {
-                publish_stream_job_terminal_event(state, &finalized).await?;
-            }
-        } else if let Some(checkpoint) = checkpoint_to_publish.as_ref()
-            && should_emit_workflow_callbacks(&handle)
+        sync_stream_job_record(
+            state,
+            &handle,
+            StreamJobStatus::Running,
+            Some(&checkpoint),
+            checkpoint.reached_at.unwrap_or(occurred_at),
+        )
+        .await?;
+        checkpoint_to_publish = Some(checkpoint);
+    }
+    if should_emit_workflow_callbacks(&handle) {
+        for signal in &materialized.workflow_signals {
+            publish_stream_job_signal_event(state, &handle, signal).await?;
+        }
+    }
+    if let Some(terminal) = materialized.terminal {
+        let finalized =
+            persist_stream_job_terminal_result(state, &handle, terminal, occurred_at).await?;
+        let mut synced_finalized = finalized.clone();
+        if let Some(latest_finalized) =
+            state.store.get_stream_job_callback_handle_by_handle_id(&finalized.handle_id).await?
         {
+            synced_finalized.workflow_accepted_at =
+                latest_finalized.workflow_accepted_at.or(synced_finalized.workflow_accepted_at);
+        }
+        sync_stream_job_record(
+            state,
+            &synced_finalized,
+            default_stream_job_status(&synced_finalized),
+            None,
+            synced_finalized.terminal_at.unwrap_or(occurred_at),
+        )
+        .await?;
+        if !should_emit_workflow_callbacks(&synced_finalized) {
+            return Ok(());
+        }
+        if let Some(checkpoint) = checkpoint_to_publish.as_ref() {
             if checkpoint.reached_at.is_some()
                 && checkpoint.accepted_at.is_none()
                 && checkpoint.cancelled_at.is_none()
             {
                 info!(
-                    handle_id = %handle.handle_id,
-                    job_id = %handle.job_id,
+                    handle_id = %synced_finalized.handle_id,
+                    job_id = %synced_finalized.job_id,
                     checkpoint_name = %checkpoint.checkpoint_name,
                     checkpoint_sequence = checkpoint.checkpoint_sequence,
                     "streams-runtime publishing stream job checkpoint callback"
                 );
-                publish_stream_job_checkpoint_event(state, &handle, checkpoint).await?;
+                publish_stream_job_checkpoint_event(state, &synced_finalized, checkpoint).await?;
             } else if checkpoint.reached_at.is_some() {
-                record_duplicate_stream_job_checkpoint_publication(state, &handle, checkpoint);
+                record_duplicate_stream_job_checkpoint_publication(
+                    state,
+                    &synced_finalized,
+                    checkpoint,
+                );
             }
+        }
+        if should_defer_terminal_callback_until_query_boundary(&synced_finalized) {
+            info!(
+                handle_id = %synced_finalized.handle_id,
+                job_id = %synced_finalized.job_id,
+                "streams-runtime deferring stream job terminal callback until workflow bridge is ready"
+            );
+        } else {
+            publish_stream_job_terminal_event(state, &synced_finalized).await?;
+        }
+    } else if let Some(checkpoint) = checkpoint_to_publish.as_ref()
+        && should_emit_workflow_callbacks(&handle)
+    {
+        if checkpoint.reached_at.is_some()
+            && checkpoint.accepted_at.is_none()
+            && checkpoint.cancelled_at.is_none()
+        {
+            info!(
+                handle_id = %handle.handle_id,
+                job_id = %handle.job_id,
+                checkpoint_name = %checkpoint.checkpoint_name,
+                checkpoint_sequence = checkpoint.checkpoint_sequence,
+                "streams-runtime publishing stream job checkpoint callback"
+            );
+            publish_stream_job_checkpoint_event(state, &handle, checkpoint).await?;
+        } else if checkpoint.reached_at.is_some() {
+            record_duplicate_stream_job_checkpoint_publication(state, &handle, checkpoint);
         }
     }
     Ok(())
@@ -535,7 +551,12 @@ async fn handle_cancel_stream_job_command(
     } else {
         let finalized = finalize_stream_job_cancellation(state, &handle, occurred_at).await?;
         if should_emit_workflow_callbacks(&finalized) {
-            publish_stream_job_terminal_event(state, &finalized).await?;
+            let latest_finalized = state
+                .store
+                .get_stream_job_callback_handle_by_handle_id(&finalized.handle_id)
+                .await?
+                .unwrap_or(finalized);
+            publish_stream_job_terminal_event(state, &latest_finalized).await?;
         }
     }
     Ok(())
@@ -555,23 +576,68 @@ pub(crate) async fn reconcile_active_topic_stream_jobs(
     state: &AppState,
     page_size: i64,
 ) -> Result<()> {
+    let mut reconciled_handle_ids = HashSet::new();
     let mut offset = 0;
     loop {
         let handles =
             state.store.list_active_stream_job_callback_handles_page(page_size, offset).await?;
         if handles.is_empty() {
-            return Ok(());
+            break;
         }
         for handle in &handles {
-            if stream_job_uses_topic_source(state, handle).await? {
-                materialize_stream_job_from_handle(state, handle.clone(), Utc::now()).await?;
-            }
+            reconciled_handle_ids.insert(handle.handle_id.clone());
+            materialize_stream_job_from_handle(state, handle.clone(), Utc::now()).await?;
         }
         if handles.len() < usize::try_from(page_size).unwrap_or(usize::MAX) {
-            return Ok(());
+            break;
         }
         offset += page_size;
     }
+    let repair_limit = page_size.max(1);
+    loop {
+        let pending_repairs =
+            state.store.list_pending_stream_job_callback_repairs(repair_limit).await?;
+        if pending_repairs.is_empty() {
+            break;
+        }
+        let mut repaired_any = false;
+        for ledger in pending_repairs {
+            if !reconciled_handle_ids.insert(ledger.handle_id.clone()) {
+                continue;
+            }
+            let Some(handle) =
+                state.store.get_stream_job_callback_handle_by_handle_id(&ledger.handle_id).await?
+            else {
+                continue;
+            };
+            materialize_stream_job_from_handle(state, handle, Utc::now()).await?;
+            repaired_any = true;
+        }
+        if !repaired_any {
+            break;
+        }
+    }
+    let pending_queries =
+        state.store.list_pending_stream_job_query_callback_repairs(repair_limit).await?;
+    let mut reconciled_query_ids = HashSet::new();
+    for query in pending_queries {
+        if !reconciled_query_ids.insert(query.query_id.clone()) {
+            continue;
+        }
+        let Some(handle) =
+            state.store.get_stream_job_callback_handle_by_handle_id(&query.handle_id).await?
+        else {
+            continue;
+        };
+        publish_stream_job_query_callback_event(
+            state,
+            &handle,
+            &query,
+            query.completed_at.unwrap_or_else(Utc::now),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn await_stream_job_bridge_handle(
@@ -774,6 +840,56 @@ async fn publish_stream_job_checkpoint_event(
     enqueue_stream_job_callback_event(state, &envelope).await
 }
 
+async fn publish_stream_job_signal_event(
+    state: &AppState,
+    handle: &fabrik_store::StreamJobBridgeHandleRecord,
+    signal: &crate::local_state::LocalStreamJobWorkflowSignalState,
+) -> Result<()> {
+    if signal.published_at.is_some() {
+        return Ok(());
+    }
+    let identity = WorkflowIdentity::new(
+        handle.tenant_id.clone(),
+        handle.definition_id.clone(),
+        handle.definition_version.unwrap_or_default(),
+        handle.artifact_hash.clone().unwrap_or_default(),
+        handle.instance_id.clone(),
+        handle.run_id.clone(),
+        "throughput-runtime",
+    );
+    let payload = WorkflowEvent::SignalQueued {
+        signal_id: signal.signal_id.clone(),
+        signal_type: signal.signal_type.clone(),
+        payload: signal.payload.clone(),
+    };
+    let dedupe_key = stream_job_signal_callback_dedupe_key(
+        &handle.tenant_id,
+        &handle.instance_id,
+        &handle.run_id,
+        &handle.job_id,
+        &signal.operator_id,
+        &signal.logical_key,
+    );
+    let mut envelope = EventEnvelope::new(payload.event_type(), identity, payload);
+    envelope.event_id = stream_job_callback_event_id(&dedupe_key);
+    envelope.occurred_at = signal.signaled_at;
+    envelope.dedupe_key = Some(dedupe_key);
+    attach_stream_job_bridge_metadata(
+        state,
+        handle,
+        Some(signal.stream_owner_epoch),
+        &mut envelope,
+    );
+    enqueue_stream_job_callback_event(state, &envelope).await?;
+    state.local_state.mark_stream_job_workflow_signal_published(
+        &signal.handle_id,
+        &signal.operator_id,
+        &signal.logical_key,
+        Utc::now(),
+    )?;
+    Ok(())
+}
+
 async fn publish_stream_job_terminal_event(
     state: &AppState,
     handle: &fabrik_store::StreamJobBridgeHandleRecord,
@@ -783,7 +899,7 @@ async fn publish_stream_job_terminal_event(
         .get_stream_job_callback_handle_by_handle_id(&handle.handle_id)
         .await?
         .unwrap_or_else(|| handle.clone());
-    if handle.workflow_accepted_at.is_some() || handle.terminal_event_id.is_some() {
+    if handle.terminal_event_id.is_some() {
         record_duplicate_stream_job_terminal_publication(state, &handle);
         return Ok(());
     }
@@ -891,6 +1007,21 @@ async fn publish_stream_job_query_callback_from_bridge(
     query.updated_at = event.occurred_at;
     state.store.upsert_stream_job_callback_query(&query).await?;
 
+    publish_stream_job_query_callback_event(state, &handle, &query, event.occurred_at).await
+}
+
+async fn publish_stream_job_query_callback_event(
+    state: &AppState,
+    handle: &fabrik_store::StreamJobBridgeHandleRecord,
+    query: &fabrik_store::StreamJobQueryRecord,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    if query.parsed_status().is_some_and(|status| {
+        matches!(status, StreamJobQueryStatus::Accepted | StreamJobQueryStatus::Cancelled)
+    }) {
+        return Ok(());
+    }
+
     let identity = WorkflowIdentity::new(
         handle.tenant_id.clone(),
         handle.definition_id.clone(),
@@ -914,11 +1045,11 @@ async fn publish_stream_job_query_callback_from_bridge(
     );
     let mut envelope = EventEnvelope::new(payload.event_type(), identity, payload);
     envelope.event_id = stream_job_callback_event_id(&dedupe_key);
-    envelope.occurred_at = query.completed_at.unwrap_or(event.occurred_at);
+    envelope.occurred_at = query.completed_at.unwrap_or(occurred_at);
     envelope.dedupe_key = Some(dedupe_key);
     attach_stream_job_bridge_metadata(state, &handle, query.stream_owner_epoch, &mut envelope);
     enqueue_stream_job_callback_event(state, &envelope).await?;
-    publish_stream_job_terminal_after_query_if_pending(state, &handle, event.occurred_at).await
+    publish_stream_job_terminal_after_query_if_pending(state, handle, occurred_at).await
 }
 
 fn record_duplicate_stream_job_query_request(
@@ -1163,6 +1294,20 @@ async fn enqueue_stream_job_callback_event(
     state: &AppState,
     envelope: &EventEnvelope<WorkflowEvent>,
 ) -> Result<()> {
+    #[cfg(test)]
+    if state
+        .fail_next_workflow_outbox_writes
+        .fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |remaining| {
+                if remaining > 0 { Some(remaining - 1) } else { None }
+            },
+        )
+        .is_ok()
+    {
+        anyhow::bail!("test failpoint: workflow event outbox enqueue failed");
+    }
     state.store.put_workflow_event_outbox(envelope, envelope.occurred_at).await?;
     state.outbox_notify.notify_waiters();
     Ok(())
