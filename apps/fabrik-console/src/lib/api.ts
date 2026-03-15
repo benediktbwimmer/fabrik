@@ -1335,11 +1335,12 @@ export const api = {
     jobId: string,
     viewName: string,
     consistency = "strong",
+    prefix: string | null | undefined = undefined,
     limit = 50,
     offset = 0
   ) =>
     request<StreamJobViewKeysResponse>(
-      `/tenants/${tenantId}/stream-jobs/${encodeURIComponent(instanceId)}/${encodeURIComponent(runId)}/${encodeURIComponent(jobId)}/views/${encodeURIComponent(viewName)}/keys?consistency=${encodeURIComponent(consistency)}&limit=${limit}&offset=${offset}`
+      `/tenants/${tenantId}/stream-jobs/${encodeURIComponent(instanceId)}/${encodeURIComponent(runId)}/${encodeURIComponent(jobId)}/views/${encodeURIComponent(viewName)}/keys?consistency=${encodeURIComponent(consistency)}${prefix ? `&prefix=${encodeURIComponent(prefix)}` : ""}&limit=${limit}&offset=${offset}`
     ),
   getStreamJobViewEntries: (
     tenantId: string,
@@ -1348,11 +1349,12 @@ export const api = {
     jobId: string,
     viewName: string,
     consistency = "strong",
+    prefix: string | null | undefined = undefined,
     limit = 50,
     offset = 0
   ) =>
     request<StreamJobViewEntriesResponse>(
-      `/tenants/${tenantId}/stream-jobs/${encodeURIComponent(instanceId)}/${encodeURIComponent(runId)}/${encodeURIComponent(jobId)}/views/${encodeURIComponent(viewName)}/entries?consistency=${encodeURIComponent(consistency)}&limit=${limit}&offset=${offset}`
+      `/tenants/${tenantId}/stream-jobs/${encodeURIComponent(instanceId)}/${encodeURIComponent(runId)}/${encodeURIComponent(jobId)}/views/${encodeURIComponent(viewName)}/entries?consistency=${encodeURIComponent(consistency)}${prefix ? `&prefix=${encodeURIComponent(prefix)}` : ""}&limit=${limit}&offset=${offset}`
     ),
   getWorkflowSignals: (tenantId: string, instanceId: string, runId?: string) =>
     request<WorkflowSignalsResponse>(

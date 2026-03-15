@@ -3,12 +3,22 @@ use super::*;
 pub(super) const STREAM_JOB_VIEW_BINARY_PREFIX: &[u8] = b"sjv1\0";
 pub(super) const STREAM_JOB_RUNTIME_BINARY_PREFIX: &[u8] = b"sjr1\0";
 pub(super) const STREAM_JOB_CHECKPOINT_BINARY_PREFIX: &[u8] = b"sjc1\0";
+pub(super) const STREAM_JOB_DISPATCH_APPLIED_BINARY_PREFIX: &[u8] = b"sjd1\0";
 
 fn append_binary_key_component(buffer: &mut Vec<u8>, component: &str) {
     let bytes = component.as_bytes();
     let len = u16::try_from(bytes.len()).expect("stream job view key component exceeds u16");
     buffer.extend_from_slice(&len.to_be_bytes());
     buffer.extend_from_slice(bytes);
+}
+
+fn parse_binary_key_component(key: &[u8], offset: &mut usize) -> Option<String> {
+    let len_bytes = key.get(*offset..(*offset + 2))?;
+    let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
+    *offset += 2;
+    let value = key.get(*offset..(*offset + len))?;
+    *offset += len;
+    std::str::from_utf8(value).ok().map(str::to_owned)
 }
 
 pub(super) fn legacy_cf_for_key(key: &str) -> Option<&'static str> {
@@ -142,10 +152,40 @@ pub(super) fn stream_job_view_key(handle_id: &str, view_name: &str, logical_key:
     key
 }
 
+pub(super) fn parse_stream_job_view_key(key: &[u8]) -> Option<(String, String, String)> {
+    if !key.starts_with(STREAM_JOB_VIEW_BINARY_PREFIX) {
+        return None;
+    }
+    let mut offset = STREAM_JOB_VIEW_BINARY_PREFIX.len();
+    let handle_id = parse_binary_key_component(key, &mut offset)?;
+    let view_name = parse_binary_key_component(key, &mut offset)?;
+    if *key.get(offset)? != 0 {
+        return None;
+    }
+    offset += 1;
+    let logical_key = std::str::from_utf8(key.get(offset..)?).ok()?.to_owned();
+    Some((handle_id, view_name, logical_key))
+}
+
 pub(super) fn stream_job_runtime_key(handle_id: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(STREAM_JOB_RUNTIME_BINARY_PREFIX.len() + handle_id.len() + 2);
     key.extend_from_slice(STREAM_JOB_RUNTIME_BINARY_PREFIX);
     append_binary_key_component(&mut key, handle_id);
+    key
+}
+
+pub(super) fn stream_job_dispatch_applied_prefix(handle_id: &str) -> Vec<u8> {
+    let mut key =
+        Vec::with_capacity(STREAM_JOB_DISPATCH_APPLIED_BINARY_PREFIX.len() + handle_id.len() + 3);
+    key.extend_from_slice(STREAM_JOB_DISPATCH_APPLIED_BINARY_PREFIX);
+    append_binary_key_component(&mut key, handle_id);
+    key.push(0);
+    key
+}
+
+pub(super) fn stream_job_dispatch_applied_key(handle_id: &str, batch_id: &str) -> Vec<u8> {
+    let mut key = stream_job_dispatch_applied_prefix(handle_id);
+    key.extend_from_slice(batch_id.as_bytes());
     key
 }
 

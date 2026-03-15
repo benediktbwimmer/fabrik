@@ -405,6 +405,8 @@ impl LocalThroughputState {
             groups: self.load_all_groups()?,
             stream_job_views: self.load_all_stream_job_views()?,
             stream_job_runtime_states: self.load_all_stream_job_runtime_states()?,
+            stream_job_applied_dispatch_batches: self
+                .load_all_stream_job_applied_dispatch_batches()?,
             stream_job_checkpoints: self.load_all_stream_job_checkpoints()?,
         })
     }
@@ -462,6 +464,13 @@ impl LocalThroughputState {
                         .any(|batch| batch.stream_partition_id == partition_id)
             })
             .collect::<Vec<_>>();
+        let stream_job_applied_dispatch_batches = self
+            .load_all_stream_job_applied_dispatch_batches()?
+            .into_iter()
+            .filter(|state| {
+                stream_job_runtime_states.iter().any(|runtime| runtime.handle_id == state.handle_id)
+            })
+            .collect::<Vec<_>>();
         let stream_job_checkpoints = self
             .load_all_stream_job_checkpoints()?
             .into_iter()
@@ -486,6 +495,7 @@ impl LocalThroughputState {
             groups,
             stream_job_views,
             stream_job_runtime_states,
+            stream_job_applied_dispatch_batches,
             stream_job_checkpoints,
         })
     }
@@ -551,7 +561,7 @@ impl LocalThroughputState {
                 &mut batch,
                 STREAM_JOBS_CF,
                 &stream_job_view_key(&state.handle_id, &state.view_name, &state.logical_key),
-                encode_rocksdb_value(state, "checkpoint stream job view state")?,
+                encode_stream_job_view_state_value(state)?,
             );
         }
         for state in &checkpoint.stream_job_runtime_states {
@@ -565,6 +575,14 @@ impl LocalThroughputState {
                 STREAM_JOBS_CF,
                 &stream_job_runtime_key(&state.handle_id),
                 encode_rocksdb_value(state, "checkpoint stream job runtime state")?,
+            );
+        }
+        for state in &checkpoint.stream_job_applied_dispatch_batches {
+            self.write_batch_put_cf_bytes(
+                &mut batch,
+                STREAM_JOBS_CF,
+                &stream_job_dispatch_applied_key(&state.handle_id, &state.batch_id),
+                Vec::new(),
             );
         }
         for state in &checkpoint.stream_job_checkpoints {

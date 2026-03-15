@@ -121,6 +121,7 @@ export function StreamJobsPage() {
   const { tenantId } = useTenant();
   const [searchParams, setSearchParams] = useSearchParams();
   const viewConsistency = searchParams.get("consistency") === "eventual" ? "eventual" : "strong";
+  const viewPrefix = searchParams.get("prefix")?.trim() || null;
   const jobListParams = useMemo(() => buildJobListParams(searchParams), [searchParams]);
 
   const jobsQuery = useQuery({
@@ -168,6 +169,7 @@ export function StreamJobsPage() {
       selectedJobDetail?.job_id,
       selectedView?.view_name,
       viewConsistency,
+      viewPrefix,
     ],
     enabled:
       tenantId !== "" &&
@@ -183,6 +185,7 @@ export function StreamJobsPage() {
         selectedJobDetail!.job_id,
         selectedView!.view_name,
         viewConsistency,
+        viewPrefix,
         VIEW_ENTRY_PAGE_SIZE,
         0,
       ),

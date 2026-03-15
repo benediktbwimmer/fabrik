@@ -247,17 +247,24 @@ The first slice uses the runtime durability contract:
 - authoritative hot state in the active owner's local state store
 - durable stream progress entries for:
   - execution planned
+  - source lease assignment per source partition
   - per-key materialization
+  - topic source cursor advancement per source partition
   - checkpoint reached
   - terminalized
 - periodic or completion-driven checkpoint
 
-Because the source is bounded, the implementation may force a checkpoint at the completion of the initial rollup.
+Bounded jobs may force a checkpoint at completion.
+Topic-backed jobs restore from `checkpoint + durable source-progress tail` and keep their source frontier in authoritative stream state.
+For the narrow windowed `aggregate_v2` topic slice, the same durable source-progress records also carry owner-local watermark, pending-window, and dropped-late-event state.
 
 ### Checkpoint Barrier
 
 - `checkpoint reached` is recorded per active stream partition
 - the bridge-visible named checkpoint is materialized only after every active partition has recorded that checkpoint
+- for topic sources, the barrier is tied to the currently observed source frontier rather than only to initial backlog catch-up
+- later source frontiers reuse the checkpoint name but advance a new checkpoint sequence
+- for windowed `aggregate_v2` topic jobs, a partition only records `checkpoint reached` after its owner has closed the relevant tumbling window, either from later event-time progress or an idle owner timer tick
 - terminal completion is withheld until that checkpoint barrier is complete
 
 ### Restore
@@ -265,6 +272,9 @@ Because the source is bounded, the implementation may force a checkpoint at the 
 On owner failover:
 
 - the new owner restores from the latest checkpoint plus durable progress after that checkpoint
+- topic-backed source cursors are reconstructed from `StreamJobSourceProgressed` entries in that same tail
+- topic source-owner leases are reconstructed from `StreamJobSourceLeaseAssigned` entries and used to fence stale source-owner work
+- windowed topic jobs also reconstruct watermark, pending-window, and late-drop state from that same source-progress tail
 - shard checkpoints include stream-job view rows by logical-key ownership and checkpoint rows by `stream_partition_id`
 - stale reports from prior owners are fenced by `owner_epoch`
 - the strong query route follows the new owner
@@ -302,8 +312,8 @@ The first slice does not require:
 
 - standalone stream-job deployment without workflows
 - joins
-- windows beyond the checkpoint boundary itself
-- timers exposed to users
+- arbitrary joins-and-windows authoring beyond the current tumbling `aggregate_v2` slice
+- timers exposed to users beyond the internal owner-driven watermark tick
 - generic sink connectors
 - generic TypeScript DSL design
 - arbitrary reducer plugins

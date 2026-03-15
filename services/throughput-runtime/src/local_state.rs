@@ -19,7 +19,8 @@ use self::keyspace::{
     STREAM_JOB_VIEW_BINARY_PREFIX, batch_chunk_index_key, batch_chunk_index_prefix, batch_key,
     chunk_key, group_key, legacy_cf_for_key, legacy_stream_job_checkpoint_key,
     legacy_stream_job_runtime_key, legacy_stream_job_view_key, legacy_stream_job_view_prefix,
-    mirrored_entry_key, offset_key, stream_job_checkpoint_key, stream_job_runtime_key,
+    mirrored_entry_key, offset_key, parse_stream_job_view_key, stream_job_checkpoint_key,
+    stream_job_dispatch_applied_key, stream_job_dispatch_applied_prefix, stream_job_runtime_key,
     stream_job_view_key, stream_job_view_prefix, throughput_partition_id, timestamp_sort_key,
 };
 #[cfg(test)]
@@ -75,6 +76,7 @@ const STREAMS_OFFSET_KEY_PREFIX: &str = "meta:streams-offset:";
 const STREAMS_MIRRORED_ENTRY_KEY_PREFIX: &str = "meta:streams-mirrored-entry:";
 const LATEST_CHECKPOINT_FILE: &str = "latest.json";
 const ROCKSDB_ENCODING_PREFIX: &[u8] = b"fs2\0";
+const STREAM_JOB_VIEW_VALUE_ENCODING_PREFIX: &[u8] = b"fsv2\0";
 const META_CF: &str = "meta";
 const BATCHES_CF: &str = "batches";
 const CHUNKS_CF: &str = "chunks";
@@ -97,6 +99,51 @@ fn decode_rocksdb_value<T: DeserializeOwned>(bytes: &[u8], subject: &str) -> Res
     }
     serde_json::from_slice(bytes)
         .with_context(|| format!("failed to deserialize legacy JSON {subject}"))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredStreamJobViewValue {
+    job_id: String,
+    output: Value,
+    checkpoint_sequence: i64,
+    updated_at: DateTime<Utc>,
+}
+
+fn encode_stream_job_view_state_value(state: &LocalStreamJobViewState) -> Result<Vec<u8>> {
+    let encoded = encode_cbor(
+        &StoredStreamJobViewValue {
+            job_id: state.job_id.clone(),
+            output: state.output.clone(),
+            checkpoint_sequence: state.checkpoint_sequence,
+            updated_at: state.updated_at,
+        },
+        "stream job view state",
+    )?;
+    let mut bytes = Vec::with_capacity(STREAM_JOB_VIEW_VALUE_ENCODING_PREFIX.len() + encoded.len());
+    bytes.extend_from_slice(STREAM_JOB_VIEW_VALUE_ENCODING_PREFIX);
+    bytes.extend_from_slice(&encoded);
+    Ok(bytes)
+}
+
+fn decode_stream_job_view_state_value(
+    bytes: &[u8],
+    handle_id: &str,
+    view_name: &str,
+    logical_key: &str,
+) -> Result<LocalStreamJobViewState> {
+    if let Some(cbor_bytes) = bytes.strip_prefix(STREAM_JOB_VIEW_VALUE_ENCODING_PREFIX) {
+        let stored: StoredStreamJobViewValue = decode_cbor(cbor_bytes, "stream job view state")?;
+        return Ok(LocalStreamJobViewState {
+            handle_id: handle_id.to_owned(),
+            job_id: stored.job_id,
+            view_name: view_name.to_owned(),
+            logical_key: logical_key.to_owned(),
+            output: stored.output,
+            checkpoint_sequence: stored.checkpoint_sequence,
+            updated_at: stored.updated_at,
+        });
+    }
+    decode_rocksdb_value(bytes, "stream job view state")
 }
 
 fn nth_colon_prefix(key: &[u8], colon_count: usize) -> &[u8] {
@@ -203,6 +250,17 @@ fn groups_cf_options() -> Options {
     opts.set_compaction_style(DBCompactionStyle::Level);
     opts.set_optimize_filters_for_hits(true);
     let block = configured_block_based_options(4 * 1024, true);
+    opts.set_block_based_table_factory(&block);
+    opts
+}
+
+fn stream_jobs_cf_options() -> Options {
+    let mut opts = Options::default();
+    opts.set_write_buffer_size(64 * 1024 * 1024);
+    opts.set_target_file_size_base(64 * 1024 * 1024);
+    opts.set_compaction_style(DBCompactionStyle::Universal);
+    opts.set_optimize_filters_for_hits(true);
+    let block = configured_block_based_options(8 * 1024, true);
     opts.set_block_based_table_factory(&block);
     opts
 }
@@ -346,6 +404,8 @@ struct CheckpointFile {
     #[serde(default)]
     stream_job_runtime_states: Vec<LocalStreamJobRuntimeState>,
     #[serde(default)]
+    stream_job_applied_dispatch_batches: Vec<LocalStreamJobAppliedDispatchBatchState>,
+    #[serde(default)]
     stream_job_checkpoints: Vec<LocalStreamJobCheckpointState>,
 }
 
@@ -481,6 +541,14 @@ pub(crate) struct LocalStreamJobRuntimeState {
     pub(crate) materialized_key_count: u64,
     pub(crate) active_partitions: Vec<i32>,
     #[serde(default)]
+    pub(crate) source_kind: Option<String>,
+    #[serde(default)]
+    pub(crate) source_name: Option<String>,
+    #[serde(default)]
+    pub(crate) source_cursors: Vec<LocalStreamJobSourceCursorState>,
+    #[serde(default)]
+    pub(crate) source_partition_leases: Vec<LocalStreamJobSourceLeaseState>,
+    #[serde(default)]
     pub(crate) dispatch_batches: Vec<LocalStreamJobDispatchBatch>,
     #[serde(default)]
     pub(crate) applied_dispatch_batch_ids: Vec<String>,
@@ -491,6 +559,12 @@ pub(crate) struct LocalStreamJobRuntimeState {
     pub(crate) stream_owner_epoch: u64,
     pub(crate) planned_at: DateTime<Utc>,
     pub(crate) latest_checkpoint_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) evicted_window_count: u64,
+    #[serde(default)]
+    pub(crate) last_evicted_window_end: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) last_evicted_at: Option<DateTime<Utc>>,
     pub(crate) terminal_status: Option<String>,
     pub(crate) terminal_output: Option<Value>,
     pub(crate) terminal_error: Option<String>,
@@ -499,13 +573,29 @@ pub(crate) struct LocalStreamJobRuntimeState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalStreamJobAppliedDispatchBatchState {
+    pub(crate) handle_id: String,
+    pub(crate) batch_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct LocalStreamJobDispatchBatch {
     pub(crate) batch_id: String,
     pub(crate) stream_partition_id: i32,
+    #[serde(default)]
+    pub(crate) checkpoint_partition_id: Option<i32>,
+    #[serde(default)]
+    pub(crate) source_owner_partition_id: Option<i32>,
+    #[serde(default)]
+    pub(crate) source_lease_token: Option<String>,
     pub(crate) routing_key: String,
     pub(crate) key_field: String,
+    #[serde(default)]
+    pub(crate) reducer_kind: String,
     pub(crate) output_field: String,
     pub(crate) view_name: String,
+    #[serde(default)]
+    pub(crate) additional_view_names: Vec<String>,
     pub(crate) checkpoint_name: String,
     pub(crate) checkpoint_sequence: i64,
     pub(crate) owner_epoch: u64,
@@ -518,6 +608,63 @@ pub(crate) struct LocalStreamJobDispatchBatch {
 pub(crate) struct LocalStreamJobDispatchItem {
     pub(crate) logical_key: String,
     pub(crate) value: f64,
+    #[serde(default)]
+    pub(crate) display_key: Option<String>,
+    #[serde(default)]
+    pub(crate) window_start: Option<String>,
+    #[serde(default)]
+    pub(crate) window_end: Option<String>,
+    #[serde(default = "default_stream_job_item_count")]
+    pub(crate) count: u64,
+}
+
+fn default_stream_job_item_count() -> u64 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalStreamJobSourceCursorState {
+    pub(crate) source_partition_id: i32,
+    pub(crate) next_offset: i64,
+    pub(crate) initial_checkpoint_target_offset: i64,
+    #[serde(default)]
+    pub(crate) last_applied_offset: Option<i64>,
+    #[serde(default)]
+    pub(crate) last_high_watermark: Option<i64>,
+    #[serde(default)]
+    pub(crate) last_event_time_watermark: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) last_closed_window_end: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) pending_window_ends: Vec<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) dropped_late_event_count: u64,
+    #[serde(default)]
+    pub(crate) last_dropped_late_offset: Option<i64>,
+    #[serde(default)]
+    pub(crate) last_dropped_late_event_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) last_dropped_late_window_end: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) dropped_evicted_window_event_count: u64,
+    #[serde(default)]
+    pub(crate) last_dropped_evicted_window_offset: Option<i64>,
+    #[serde(default)]
+    pub(crate) last_dropped_evicted_window_event_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) last_dropped_evicted_window_end: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) checkpoint_reached_at: Option<DateTime<Utc>>,
+    pub(crate) updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalStreamJobSourceLeaseState {
+    pub(crate) source_partition_id: i32,
+    pub(crate) owner_partition_id: i32,
+    pub(crate) owner_epoch: u64,
+    pub(crate) lease_token: String,
+    pub(crate) updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

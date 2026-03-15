@@ -371,6 +371,16 @@ impl LocalThroughputState {
                     input_item_count: *input_item_count,
                     materialized_key_count: *materialized_key_count,
                     active_partitions: active_partitions.clone(),
+                    source_kind: existing.as_ref().and_then(|state| state.source_kind.clone()),
+                    source_name: existing.as_ref().and_then(|state| state.source_name.clone()),
+                    source_cursors: existing
+                        .as_ref()
+                        .map(|state| state.source_cursors.clone())
+                        .unwrap_or_default(),
+                    source_partition_leases: existing
+                        .as_ref()
+                        .map(|state| state.source_partition_leases.clone())
+                        .unwrap_or_default(),
                     dispatch_batches: existing
                         .as_ref()
                         .map(|state| state.dispatch_batches.clone())
@@ -390,6 +400,14 @@ impl LocalThroughputState {
                     latest_checkpoint_at: existing
                         .as_ref()
                         .and_then(|state| state.latest_checkpoint_at),
+                    evicted_window_count: existing
+                        .as_ref()
+                        .map(|state| state.evicted_window_count)
+                        .unwrap_or_default(),
+                    last_evicted_window_end: existing
+                        .as_ref()
+                        .and_then(|state| state.last_evicted_window_end),
+                    last_evicted_at: existing.as_ref().and_then(|state| state.last_evicted_at),
                     terminal_status: existing
                         .as_ref()
                         .and_then(|state| state.terminal_status.clone()),
@@ -441,8 +459,44 @@ impl LocalThroughputState {
                     write_batch,
                     STREAM_JOBS_CF,
                     &stream_job_view_key(handle_id, view_name, logical_key),
-                    encode_rocksdb_value(&state, "stream job view state")?,
+                    encode_stream_job_view_state_value(&state)?,
                 );
+            }
+            ThroughputChangelogPayload::StreamJobViewEvicted {
+                handle_id,
+                evicted_window_count,
+                last_evicted_window_end,
+                last_evicted_at,
+                view_name,
+                logical_key,
+                ..
+            } => {
+                self.write_batch_delete_cf_and_legacy(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &legacy_stream_job_view_key(handle_id, view_name, logical_key),
+                );
+                write_batch.delete_cf(
+                    self.cf(STREAM_JOBS_CF),
+                    &stream_job_view_key(handle_id, view_name, logical_key),
+                );
+                if let Some(mut runtime_state) = self.load_stream_job_runtime_state(handle_id)? {
+                    runtime_state.evicted_window_count = *evicted_window_count;
+                    runtime_state.last_evicted_window_end = *last_evicted_window_end;
+                    runtime_state.last_evicted_at = *last_evicted_at;
+                    runtime_state.updated_at = last_evicted_at.unwrap_or(runtime_state.updated_at);
+                    self.write_batch_delete_cf_and_legacy(
+                        write_batch,
+                        STREAM_JOBS_CF,
+                        &legacy_stream_job_runtime_key(handle_id),
+                    );
+                    self.write_batch_put_cf_bytes(
+                        write_batch,
+                        STREAM_JOBS_CF,
+                        &stream_job_runtime_key(handle_id),
+                        encode_rocksdb_value(&runtime_state, "stream job runtime state")?,
+                    );
+                }
             }
             ThroughputChangelogPayload::StreamJobCheckpointReached {
                 handle_id,
@@ -483,6 +537,14 @@ impl LocalThroughputState {
                     runtime_state.checkpoint_name = checkpoint_name.clone();
                     runtime_state.checkpoint_sequence = *checkpoint_sequence;
                     runtime_state.stream_owner_epoch = *owner_epoch;
+                    if let Some(cursor) = runtime_state
+                        .source_cursors
+                        .iter_mut()
+                        .find(|cursor| cursor.source_partition_id == *stream_partition_id)
+                    {
+                        cursor.checkpoint_reached_at = Some(*reached_at);
+                        cursor.updated_at = *reached_at;
+                    }
                     runtime_state.latest_checkpoint_at = Some(*reached_at);
                     runtime_state.updated_at = *reached_at;
                     self.write_batch_delete_cf_and_legacy(
@@ -497,6 +559,174 @@ impl LocalThroughputState {
                         encode_rocksdb_value(&runtime_state, "stream job runtime state")?,
                     );
                 }
+            }
+            ThroughputChangelogPayload::StreamJobSourceLeaseAssigned {
+                handle_id,
+                job_id,
+                source_partition_id,
+                owner_partition_id,
+                owner_epoch,
+                lease_token,
+                assigned_at,
+            } => {
+                let Some(mut runtime_state) = self.load_stream_job_runtime_state(handle_id)? else {
+                    anyhow::bail!(
+                        "stream job source lease arrived before runtime state existed for handle {handle_id}"
+                    );
+                };
+                runtime_state.job_id = job_id.clone();
+                runtime_state.stream_owner_epoch = *owner_epoch;
+                if let Some(existing) = runtime_state
+                    .source_partition_leases
+                    .iter_mut()
+                    .find(|lease| lease.source_partition_id == *source_partition_id)
+                {
+                    existing.owner_partition_id = *owner_partition_id;
+                    existing.owner_epoch = *owner_epoch;
+                    existing.lease_token = lease_token.clone();
+                    existing.updated_at = *assigned_at;
+                } else {
+                    runtime_state.source_partition_leases.push(
+                        crate::local_state::LocalStreamJobSourceLeaseState {
+                            source_partition_id: *source_partition_id,
+                            owner_partition_id: *owner_partition_id,
+                            owner_epoch: *owner_epoch,
+                            lease_token: lease_token.clone(),
+                            updated_at: *assigned_at,
+                        },
+                    );
+                    runtime_state
+                        .source_partition_leases
+                        .sort_by_key(|lease| lease.source_partition_id);
+                }
+                runtime_state.updated_at = *assigned_at;
+                self.write_batch_delete_cf_and_legacy(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &legacy_stream_job_runtime_key(handle_id),
+                );
+                self.write_batch_put_cf_bytes(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &stream_job_runtime_key(handle_id),
+                    encode_rocksdb_value(&runtime_state, "stream job runtime state")?,
+                );
+            }
+            ThroughputChangelogPayload::StreamJobSourceProgressed {
+                handle_id,
+                job_id,
+                source_partition_id,
+                next_offset,
+                checkpoint_sequence,
+                checkpoint_target_offset,
+                last_applied_offset,
+                last_high_watermark,
+                last_event_time_watermark,
+                last_closed_window_end,
+                pending_window_ends,
+                dropped_late_event_count,
+                last_dropped_late_offset,
+                last_dropped_late_event_at,
+                last_dropped_late_window_end,
+                dropped_evicted_window_event_count,
+                last_dropped_evicted_window_offset,
+                last_dropped_evicted_window_event_at,
+                last_dropped_evicted_window_end,
+                source_owner_partition_id,
+                lease_token,
+                owner_epoch,
+                progressed_at,
+            } => {
+                let Some(mut runtime_state) = self.load_stream_job_runtime_state(handle_id)? else {
+                    anyhow::bail!(
+                        "stream job source progress arrived before runtime state existed for handle {handle_id}"
+                    );
+                };
+                runtime_state.job_id = job_id.clone();
+                runtime_state.stream_owner_epoch = *owner_epoch;
+                runtime_state.checkpoint_sequence = *checkpoint_sequence;
+                if let Some(existing) = runtime_state
+                    .source_partition_leases
+                    .iter_mut()
+                    .find(|lease| lease.source_partition_id == *source_partition_id)
+                {
+                    existing.owner_partition_id = *source_owner_partition_id;
+                    existing.owner_epoch = *owner_epoch;
+                    existing.lease_token = lease_token.clone();
+                    existing.updated_at = *progressed_at;
+                } else {
+                    runtime_state.source_partition_leases.push(
+                        crate::local_state::LocalStreamJobSourceLeaseState {
+                            source_partition_id: *source_partition_id,
+                            owner_partition_id: *source_owner_partition_id,
+                            owner_epoch: *owner_epoch,
+                            lease_token: lease_token.clone(),
+                            updated_at: *progressed_at,
+                        },
+                    );
+                    runtime_state
+                        .source_partition_leases
+                        .sort_by_key(|lease| lease.source_partition_id);
+                }
+                if let Some(existing) = runtime_state
+                    .source_cursors
+                    .iter_mut()
+                    .find(|cursor| cursor.source_partition_id == *source_partition_id)
+                {
+                    existing.next_offset = *next_offset;
+                    existing.initial_checkpoint_target_offset = *checkpoint_target_offset;
+                    existing.last_applied_offset = *last_applied_offset;
+                    existing.last_high_watermark = *last_high_watermark;
+                    existing.last_event_time_watermark = *last_event_time_watermark;
+                    existing.last_closed_window_end = *last_closed_window_end;
+                    existing.pending_window_ends = pending_window_ends.clone();
+                    existing.dropped_late_event_count = *dropped_late_event_count;
+                    existing.last_dropped_late_offset = *last_dropped_late_offset;
+                    existing.last_dropped_late_event_at = *last_dropped_late_event_at;
+                    existing.last_dropped_late_window_end = *last_dropped_late_window_end;
+                    existing.dropped_evicted_window_event_count =
+                        *dropped_evicted_window_event_count;
+                    existing.last_dropped_evicted_window_offset =
+                        *last_dropped_evicted_window_offset;
+                    existing.last_dropped_evicted_window_event_at =
+                        *last_dropped_evicted_window_event_at;
+                    existing.last_dropped_evicted_window_end = *last_dropped_evicted_window_end;
+                    existing.updated_at = *progressed_at;
+                } else {
+                    runtime_state.source_cursors.push(LocalStreamJobSourceCursorState {
+                        source_partition_id: *source_partition_id,
+                        next_offset: *next_offset,
+                        initial_checkpoint_target_offset: *checkpoint_target_offset,
+                        last_applied_offset: *last_applied_offset,
+                        last_high_watermark: *last_high_watermark,
+                        last_event_time_watermark: *last_event_time_watermark,
+                        last_closed_window_end: *last_closed_window_end,
+                        pending_window_ends: pending_window_ends.clone(),
+                        dropped_late_event_count: *dropped_late_event_count,
+                        last_dropped_late_offset: *last_dropped_late_offset,
+                        last_dropped_late_event_at: *last_dropped_late_event_at,
+                        last_dropped_late_window_end: *last_dropped_late_window_end,
+                        dropped_evicted_window_event_count: *dropped_evicted_window_event_count,
+                        last_dropped_evicted_window_offset: *last_dropped_evicted_window_offset,
+                        last_dropped_evicted_window_event_at: *last_dropped_evicted_window_event_at,
+                        last_dropped_evicted_window_end: *last_dropped_evicted_window_end,
+                        checkpoint_reached_at: None,
+                        updated_at: *progressed_at,
+                    });
+                    runtime_state.source_cursors.sort_by_key(|cursor| cursor.source_partition_id);
+                }
+                runtime_state.updated_at = *progressed_at;
+                self.write_batch_delete_cf_and_legacy(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &legacy_stream_job_runtime_key(handle_id),
+                );
+                self.write_batch_put_cf_bytes(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &stream_job_runtime_key(handle_id),
+                    encode_rocksdb_value(&runtime_state, "stream job runtime state")?,
+                );
             }
             ThroughputChangelogPayload::StreamJobTerminalized {
                 handle_id,
@@ -1062,7 +1292,7 @@ impl LocalThroughputState {
         Ok(())
     }
 
-    fn write_streams_entry_payload(
+    pub(crate) fn write_streams_entry_payload(
         &self,
         write_batch: &mut WriteBatch,
         entry: &StreamsChangelogEntry,
@@ -1092,6 +1322,16 @@ impl LocalThroughputState {
                     input_item_count: *input_item_count,
                     materialized_key_count: *materialized_key_count,
                     active_partitions: active_partitions.clone(),
+                    source_kind: existing.as_ref().and_then(|state| state.source_kind.clone()),
+                    source_name: existing.as_ref().and_then(|state| state.source_name.clone()),
+                    source_cursors: existing
+                        .as_ref()
+                        .map(|state| state.source_cursors.clone())
+                        .unwrap_or_default(),
+                    source_partition_leases: existing
+                        .as_ref()
+                        .map(|state| state.source_partition_leases.clone())
+                        .unwrap_or_default(),
                     dispatch_batches: existing
                         .as_ref()
                         .map(|state| state.dispatch_batches.clone())
@@ -1111,6 +1351,14 @@ impl LocalThroughputState {
                     latest_checkpoint_at: existing
                         .as_ref()
                         .and_then(|state| state.latest_checkpoint_at),
+                    evicted_window_count: existing
+                        .as_ref()
+                        .map(|state| state.evicted_window_count)
+                        .unwrap_or_default(),
+                    last_evicted_window_end: existing
+                        .as_ref()
+                        .and_then(|state| state.last_evicted_window_end),
+                    last_evicted_at: existing.as_ref().and_then(|state| state.last_evicted_at),
                     terminal_status: existing
                         .as_ref()
                         .and_then(|state| state.terminal_status.clone()),
@@ -1157,8 +1405,44 @@ impl LocalThroughputState {
                     write_batch,
                     STREAM_JOBS_CF,
                     &stream_job_view_key(handle_id, view_name, logical_key),
-                    encode_rocksdb_value(&state, "stream job view state")?,
+                    encode_stream_job_view_state_value(&state)?,
                 );
+            }
+            StreamsChangelogPayload::StreamJobViewEvicted {
+                handle_id,
+                evicted_window_count,
+                last_evicted_window_end,
+                last_evicted_at,
+                view_name,
+                logical_key,
+                ..
+            } => {
+                self.write_batch_delete_cf_and_legacy(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &legacy_stream_job_view_key(handle_id, view_name, logical_key),
+                );
+                write_batch.delete_cf(
+                    self.cf(STREAM_JOBS_CF),
+                    &stream_job_view_key(handle_id, view_name, logical_key),
+                );
+                if let Some(mut runtime_state) = self.load_stream_job_runtime_state(handle_id)? {
+                    runtime_state.evicted_window_count = *evicted_window_count;
+                    runtime_state.last_evicted_window_end = *last_evicted_window_end;
+                    runtime_state.last_evicted_at = *last_evicted_at;
+                    runtime_state.updated_at = last_evicted_at.unwrap_or(runtime_state.updated_at);
+                    self.write_batch_delete_cf_and_legacy(
+                        write_batch,
+                        STREAM_JOBS_CF,
+                        &legacy_stream_job_runtime_key(handle_id),
+                    );
+                    self.write_batch_put_cf_bytes(
+                        write_batch,
+                        STREAM_JOBS_CF,
+                        &stream_job_runtime_key(handle_id),
+                        encode_rocksdb_value(&runtime_state, "stream job runtime state")?,
+                    );
+                }
             }
             StreamsChangelogPayload::StreamJobCheckpointReached {
                 handle_id,
@@ -1199,6 +1483,14 @@ impl LocalThroughputState {
                     runtime_state.checkpoint_name = checkpoint_name.clone();
                     runtime_state.checkpoint_sequence = *checkpoint_sequence;
                     runtime_state.stream_owner_epoch = *owner_epoch;
+                    if let Some(cursor) = runtime_state
+                        .source_cursors
+                        .iter_mut()
+                        .find(|cursor| cursor.source_partition_id == *stream_partition_id)
+                    {
+                        cursor.checkpoint_reached_at = Some(*reached_at);
+                        cursor.updated_at = *reached_at;
+                    }
                     runtime_state.latest_checkpoint_at = Some(*reached_at);
                     runtime_state.updated_at = *reached_at;
                     self.write_batch_delete_cf_and_legacy(
@@ -1213,6 +1505,174 @@ impl LocalThroughputState {
                         encode_rocksdb_value(&runtime_state, "stream job runtime state")?,
                     );
                 }
+            }
+            StreamsChangelogPayload::StreamJobSourceLeaseAssigned {
+                handle_id,
+                job_id,
+                source_partition_id,
+                owner_partition_id,
+                owner_epoch,
+                lease_token,
+                assigned_at,
+            } => {
+                let Some(mut runtime_state) = self.load_stream_job_runtime_state(handle_id)? else {
+                    anyhow::bail!(
+                        "stream job source lease arrived before runtime state existed for handle {handle_id}"
+                    );
+                };
+                runtime_state.job_id = job_id.clone();
+                runtime_state.stream_owner_epoch = *owner_epoch;
+                if let Some(existing) = runtime_state
+                    .source_partition_leases
+                    .iter_mut()
+                    .find(|lease| lease.source_partition_id == *source_partition_id)
+                {
+                    existing.owner_partition_id = *owner_partition_id;
+                    existing.owner_epoch = *owner_epoch;
+                    existing.lease_token = lease_token.clone();
+                    existing.updated_at = *assigned_at;
+                } else {
+                    runtime_state.source_partition_leases.push(
+                        crate::local_state::LocalStreamJobSourceLeaseState {
+                            source_partition_id: *source_partition_id,
+                            owner_partition_id: *owner_partition_id,
+                            owner_epoch: *owner_epoch,
+                            lease_token: lease_token.clone(),
+                            updated_at: *assigned_at,
+                        },
+                    );
+                    runtime_state
+                        .source_partition_leases
+                        .sort_by_key(|lease| lease.source_partition_id);
+                }
+                runtime_state.updated_at = *assigned_at;
+                self.write_batch_delete_cf_and_legacy(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &legacy_stream_job_runtime_key(handle_id),
+                );
+                self.write_batch_put_cf_bytes(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &stream_job_runtime_key(handle_id),
+                    encode_rocksdb_value(&runtime_state, "stream job runtime state")?,
+                );
+            }
+            StreamsChangelogPayload::StreamJobSourceProgressed {
+                handle_id,
+                job_id,
+                source_partition_id,
+                next_offset,
+                checkpoint_sequence,
+                checkpoint_target_offset,
+                last_applied_offset,
+                last_high_watermark,
+                last_event_time_watermark,
+                last_closed_window_end,
+                pending_window_ends,
+                dropped_late_event_count,
+                last_dropped_late_offset,
+                last_dropped_late_event_at,
+                last_dropped_late_window_end,
+                dropped_evicted_window_event_count,
+                last_dropped_evicted_window_offset,
+                last_dropped_evicted_window_event_at,
+                last_dropped_evicted_window_end,
+                source_owner_partition_id,
+                lease_token,
+                owner_epoch,
+                progressed_at,
+            } => {
+                let Some(mut runtime_state) = self.load_stream_job_runtime_state(handle_id)? else {
+                    anyhow::bail!(
+                        "stream job source progress arrived before runtime state existed for handle {handle_id}"
+                    );
+                };
+                runtime_state.job_id = job_id.clone();
+                runtime_state.stream_owner_epoch = *owner_epoch;
+                runtime_state.checkpoint_sequence = *checkpoint_sequence;
+                if let Some(existing) = runtime_state
+                    .source_partition_leases
+                    .iter_mut()
+                    .find(|lease| lease.source_partition_id == *source_partition_id)
+                {
+                    existing.owner_partition_id = *source_owner_partition_id;
+                    existing.owner_epoch = *owner_epoch;
+                    existing.lease_token = lease_token.clone();
+                    existing.updated_at = *progressed_at;
+                } else {
+                    runtime_state.source_partition_leases.push(
+                        crate::local_state::LocalStreamJobSourceLeaseState {
+                            source_partition_id: *source_partition_id,
+                            owner_partition_id: *source_owner_partition_id,
+                            owner_epoch: *owner_epoch,
+                            lease_token: lease_token.clone(),
+                            updated_at: *progressed_at,
+                        },
+                    );
+                    runtime_state
+                        .source_partition_leases
+                        .sort_by_key(|lease| lease.source_partition_id);
+                }
+                if let Some(existing) = runtime_state
+                    .source_cursors
+                    .iter_mut()
+                    .find(|cursor| cursor.source_partition_id == *source_partition_id)
+                {
+                    existing.next_offset = *next_offset;
+                    existing.initial_checkpoint_target_offset = *checkpoint_target_offset;
+                    existing.last_applied_offset = *last_applied_offset;
+                    existing.last_high_watermark = *last_high_watermark;
+                    existing.last_event_time_watermark = *last_event_time_watermark;
+                    existing.last_closed_window_end = *last_closed_window_end;
+                    existing.pending_window_ends = pending_window_ends.clone();
+                    existing.dropped_late_event_count = *dropped_late_event_count;
+                    existing.last_dropped_late_offset = *last_dropped_late_offset;
+                    existing.last_dropped_late_event_at = *last_dropped_late_event_at;
+                    existing.last_dropped_late_window_end = *last_dropped_late_window_end;
+                    existing.dropped_evicted_window_event_count =
+                        *dropped_evicted_window_event_count;
+                    existing.last_dropped_evicted_window_offset =
+                        *last_dropped_evicted_window_offset;
+                    existing.last_dropped_evicted_window_event_at =
+                        *last_dropped_evicted_window_event_at;
+                    existing.last_dropped_evicted_window_end = *last_dropped_evicted_window_end;
+                    existing.updated_at = *progressed_at;
+                } else {
+                    runtime_state.source_cursors.push(LocalStreamJobSourceCursorState {
+                        source_partition_id: *source_partition_id,
+                        next_offset: *next_offset,
+                        initial_checkpoint_target_offset: *checkpoint_target_offset,
+                        last_applied_offset: *last_applied_offset,
+                        last_high_watermark: *last_high_watermark,
+                        last_event_time_watermark: *last_event_time_watermark,
+                        last_closed_window_end: *last_closed_window_end,
+                        pending_window_ends: pending_window_ends.clone(),
+                        dropped_late_event_count: *dropped_late_event_count,
+                        last_dropped_late_offset: *last_dropped_late_offset,
+                        last_dropped_late_event_at: *last_dropped_late_event_at,
+                        last_dropped_late_window_end: *last_dropped_late_window_end,
+                        dropped_evicted_window_event_count: *dropped_evicted_window_event_count,
+                        last_dropped_evicted_window_offset: *last_dropped_evicted_window_offset,
+                        last_dropped_evicted_window_event_at: *last_dropped_evicted_window_event_at,
+                        last_dropped_evicted_window_end: *last_dropped_evicted_window_end,
+                        checkpoint_reached_at: None,
+                        updated_at: *progressed_at,
+                    });
+                    runtime_state.source_cursors.sort_by_key(|cursor| cursor.source_partition_id);
+                }
+                runtime_state.updated_at = *progressed_at;
+                self.write_batch_delete_cf_and_legacy(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &legacy_stream_job_runtime_key(handle_id),
+                );
+                self.write_batch_put_cf_bytes(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &stream_job_runtime_key(handle_id),
+                    encode_rocksdb_value(&runtime_state, "stream job runtime state")?,
+                );
             }
             StreamsChangelogPayload::StreamJobTerminalized {
                 handle_id,

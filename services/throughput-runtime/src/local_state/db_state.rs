@@ -69,7 +69,7 @@ impl LocalThroughputState {
                 ColumnFamilyDescriptor::new(GROUPS_CF, groups_cf_options()),
                 ColumnFamilyDescriptor::new(BATCH_INDEXES_CF, batch_indexes_cf_options()),
                 ColumnFamilyDescriptor::new(SCHEDULING_CF, scheduling_cf_options()),
-                ColumnFamilyDescriptor::new(STREAM_JOBS_CF, batches_cf_options()),
+                ColumnFamilyDescriptor::new(STREAM_JOBS_CF, stream_jobs_cf_options()),
             ],
         )
         .with_context(|| format!("failed to open throughput state db {}", db_path.display()))?;

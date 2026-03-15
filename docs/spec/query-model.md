@@ -88,3 +88,15 @@ Rules:
 - `eventual` reads may come from projections or other derived read models
 - eventual reads are non-authoritative and not replay-stable
 - operator and UI surfaces should expose projection lag metadata when serving eventual reads
+
+## Stream Diagnostics Queries
+
+Stateful stream runtimes should also expose a strong diagnostics query for operators.
+
+That query should return not only live counters and cursor state, but also the effective runtime policy for the job, including:
+
+- window mode and size
+- event-time field
+- allowed lateness
+- view retention or eviction policy
+- explicit late-event handling semantics

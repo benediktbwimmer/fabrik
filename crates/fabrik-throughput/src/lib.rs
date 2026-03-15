@@ -216,6 +216,76 @@ pub struct CompiledKeyedRollupKernel {
     pub checkpoint_sequence: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CompiledAggregateV2Window {
+    pub operator_id: String,
+    pub state_id: String,
+    pub mode: String,
+    pub size: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_lateness: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CompiledAggregateV2Aggregate {
+    pub operator_id: String,
+    pub reducer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<serde_json::Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<String>,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub state_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CompiledAggregateV2MaterializedView {
+    pub operator_id: String,
+    pub view_name: String,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub state_ids: Vec<String>,
+    pub query_mode: String,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub supported_consistencies: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CompiledAggregateV2Checkpoint {
+    pub name: String,
+    pub sequence: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CompiledAggregateV2Kernel {
+    pub source_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
+    pub key_field: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<CompiledAggregateV2Window>,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub aggregates: Vec<CompiledAggregateV2Aggregate>,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub materialized_views: Vec<CompiledAggregateV2MaterializedView>,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub query_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub checkpoints: Vec<CompiledAggregateV2Checkpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub struct CompiledStreamJobArtifact {
@@ -264,6 +334,38 @@ fn json_i64_field(
         .with_context(|| format!("stream {subject}.{field} must be an integer"))
 }
 
+fn json_optional_string_field(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    subject: &str,
+) -> Result<Option<String>> {
+    object
+        .get(field)
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .with_context(|| format!("stream {subject}.{field} must be a string"))
+        })
+        .transpose()
+}
+
+fn json_optional_number_field(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    subject: &str,
+) -> Result<Option<serde_json::Number>> {
+    object
+        .get(field)
+        .map(|value| {
+            value
+                .as_number()
+                .cloned()
+                .with_context(|| format!("stream {subject}.{field} must be a number"))
+        })
+        .transpose()
+}
+
 impl CompiledStreamJob {
     pub fn validate_well_formed(&self) -> Result<()> {
         if self.name.trim().is_empty() {
@@ -303,6 +405,9 @@ impl CompiledStreamJob {
         if self.runtime == STREAM_RUNTIME_KEYED_ROLLUP {
             self.keyed_rollup_kernel()?;
         }
+        if self.runtime == STREAM_RUNTIME_AGGREGATE_V2 {
+            self.aggregate_v2_kernel()?;
+        }
         Ok(())
     }
 
@@ -316,9 +421,11 @@ impl CompiledStreamJob {
                 "stream runtime {STREAM_RUNTIME_KEYED_ROLLUP} requires job.name={STREAM_JOB_KEYED_ROLLUP}"
             );
         }
-        if self.source.kind != STREAM_SOURCE_BOUNDED_INPUT {
+        if self.source.kind != STREAM_SOURCE_BOUNDED_INPUT
+            && self.source.kind != STREAM_SOURCE_TOPIC
+        {
             anyhow::bail!(
-                "stream runtime {STREAM_RUNTIME_KEYED_ROLLUP} requires source.kind={STREAM_SOURCE_BOUNDED_INPUT}"
+                "stream runtime {STREAM_RUNTIME_KEYED_ROLLUP} requires source.kind={STREAM_SOURCE_BOUNDED_INPUT} or {STREAM_SOURCE_TOPIC}"
             );
         }
 
@@ -456,6 +563,298 @@ impl CompiledStreamJob {
             query_name: query.name.clone(),
             checkpoint_name,
             checkpoint_sequence,
+        }))
+    }
+
+    pub fn aggregate_v2_kernel(&self) -> Result<Option<CompiledAggregateV2Kernel>> {
+        if self.runtime != STREAM_RUNTIME_AGGREGATE_V2 {
+            return Ok(None);
+        }
+
+        if self.source.kind != STREAM_SOURCE_BOUNDED_INPUT
+            && self.source.kind != STREAM_SOURCE_TOPIC
+        {
+            anyhow::bail!(
+                "stream runtime {STREAM_RUNTIME_AGGREGATE_V2} requires source.kind to be {STREAM_SOURCE_BOUNDED_INPUT} or {STREAM_SOURCE_TOPIC}"
+            );
+        }
+
+        let key_field =
+            self.key_by.clone().context("stream runtime aggregate_v2 requires key_by")?;
+        if self.operators.is_empty() {
+            anyhow::bail!("stream runtime aggregate_v2 requires at least 1 operator");
+        }
+        if self.views.is_empty() {
+            anyhow::bail!("stream runtime aggregate_v2 requires at least 1 materialized view");
+        }
+
+        let mut state_ids = BTreeMap::new();
+        for state in &self.states {
+            state_ids.insert(state.id.as_str(), state);
+        }
+
+        let mut window = None;
+        let mut aggregates = Vec::new();
+        let mut materialized_views = Vec::new();
+        let mut checkpoints = Vec::new();
+        let mut has_materialize = false;
+
+        for operator in &self.operators {
+            match operator.kind.as_str() {
+                STREAM_OPERATOR_MAP
+                | STREAM_OPERATOR_FILTER
+                | STREAM_OPERATOR_ROUTE
+                | STREAM_OPERATOR_SIGNAL_WORKFLOW
+                | STREAM_OPERATOR_SINK
+                | STREAM_OPERATOR_DEDUPE => {}
+                STREAM_OPERATOR_WINDOW => {
+                    let operator_id = operator.operator_id.clone().or_else(|| operator.name.clone()).context(
+                        "stream runtime aggregate_v2 window operators require operator_id or name",
+                    )?;
+                    if window.is_some() {
+                        anyhow::bail!(
+                            "stream runtime aggregate_v2 supports at most 1 window operator"
+                        );
+                    }
+                    if operator.state_ids.len() != 1 {
+                        anyhow::bail!(
+                            "stream runtime aggregate_v2 window operator must reference exactly 1 state id"
+                        );
+                    }
+                    let state_id = operator.state_ids[0].clone();
+                    let state = state_ids.get(state_id.as_str()).with_context(|| {
+                        format!("stream runtime aggregate_v2 window state {state_id} must exist")
+                    })?;
+                    if state.kind != STREAM_STATE_KIND_WINDOW {
+                        anyhow::bail!(
+                            "stream runtime aggregate_v2 window state {} must have kind={STREAM_STATE_KIND_WINDOW}",
+                            state.id
+                        );
+                    }
+                    let config = json_object(
+                        operator.config.as_ref().context(
+                            "stream runtime aggregate_v2 window operator requires config",
+                        )?,
+                        "runtime aggregate_v2 window.config",
+                    )?;
+                    let mode =
+                        json_string_field(config, "mode", "runtime aggregate_v2 window.config")?;
+                    if mode != "tumbling" {
+                        anyhow::bail!(
+                            "stream runtime aggregate_v2 only supports window.config.mode=tumbling"
+                        );
+                    }
+                    let size =
+                        json_string_field(config, "size", "runtime aggregate_v2 window.config")?
+                            .to_owned();
+                    window = Some(CompiledAggregateV2Window {
+                        operator_id,
+                        state_id,
+                        mode: mode.to_owned(),
+                        size,
+                        time_field: json_optional_string_field(
+                            config,
+                            "timeField",
+                            "runtime aggregate_v2 window.config",
+                        )?,
+                        allowed_lateness: json_optional_string_field(
+                            config,
+                            "allowedLateness",
+                            "runtime aggregate_v2 window.config",
+                        )?,
+                    });
+                }
+                STREAM_OPERATOR_REDUCE | STREAM_OPERATOR_AGGREGATE => {
+                    let operator_id = operator.operator_id.clone().or_else(|| operator.name.clone()).context(
+                        "stream runtime aggregate_v2 aggregate operators require operator_id or name",
+                    )?;
+                    let config = json_object(
+                        operator.config.as_ref().context(
+                            "stream runtime aggregate_v2 aggregate operator requires config",
+                        )?,
+                        "runtime aggregate_v2 aggregate.config",
+                    )?;
+                    let reducer = json_string_field(
+                        config,
+                        "reducer",
+                        "runtime aggregate_v2 aggregate.config",
+                    )?;
+                    let threshold = json_optional_number_field(
+                        config,
+                        "threshold",
+                        "runtime aggregate_v2 aggregate.config",
+                    )?;
+                    let comparison = json_optional_string_field(
+                        config,
+                        "comparison",
+                        "runtime aggregate_v2 aggregate.config",
+                    )?;
+                    match reducer {
+                        STREAM_REDUCER_COUNT
+                        | STREAM_REDUCER_SUM
+                        | STREAM_REDUCER_MIN
+                        | STREAM_REDUCER_MAX
+                        | STREAM_REDUCER_AVG
+                        | STREAM_REDUCER_HISTOGRAM
+                        | STREAM_REDUCER_THRESHOLD => {}
+                        _ => anyhow::bail!(
+                            "stream runtime aggregate_v2 aggregate reducer must be built-in"
+                        ),
+                    }
+                    match reducer {
+                        STREAM_REDUCER_THRESHOLD => {
+                            if threshold.is_none() {
+                                anyhow::bail!(
+                                    "stream runtime aggregate_v2 threshold reducer requires config.threshold"
+                                );
+                            }
+                            if let Some(comparison) = comparison.as_deref() {
+                                match comparison {
+                                    "gt" | "gte" | "lt" | "lte" => {}
+                                    _ => anyhow::bail!(
+                                        "stream runtime aggregate_v2 threshold comparison must be one of gt, gte, lt, lte"
+                                    ),
+                                }
+                            }
+                        }
+                        _ => {
+                            if threshold.is_some() || comparison.is_some() {
+                                anyhow::bail!(
+                                    "stream runtime aggregate_v2 only threshold reducers may declare config.threshold or config.comparison"
+                                );
+                            }
+                        }
+                    }
+                    if !operator.state_ids.is_empty() {
+                        for state_id in &operator.state_ids {
+                            let state = state_ids.get(state_id.as_str()).with_context(|| {
+                                format!(
+                                    "stream runtime aggregate_v2 aggregate state {state_id} must exist"
+                                )
+                            })?;
+                            if state.kind != STREAM_STATE_KIND_KEYED
+                                && state.kind != STREAM_STATE_KIND_WINDOW
+                            {
+                                anyhow::bail!(
+                                    "stream runtime aggregate_v2 aggregate state {} must be keyed or window",
+                                    state.id
+                                );
+                            }
+                        }
+                    }
+                    aggregates.push(CompiledAggregateV2Aggregate {
+                        operator_id,
+                        reducer: reducer.to_owned(),
+                        value_field: json_optional_string_field(
+                            config,
+                            "valueField",
+                            "runtime aggregate_v2 aggregate.config",
+                        )?,
+                        output_field: json_optional_string_field(
+                            config,
+                            "outputField",
+                            "runtime aggregate_v2 aggregate.config",
+                        )?,
+                        threshold,
+                        comparison,
+                        state_ids: operator.state_ids.clone(),
+                    });
+                }
+                STREAM_OPERATOR_MATERIALIZE => {
+                    let operator_id = operator.operator_id.clone().or_else(|| operator.name.clone()).context(
+                        "stream runtime aggregate_v2 materialize operators require operator_id or name",
+                    )?;
+                    let config = json_object(
+                        operator.config.as_ref().context(
+                            "stream runtime aggregate_v2 materialize operator requires config",
+                        )?,
+                        "runtime aggregate_v2 materialize.config",
+                    )?;
+                    let view_name = json_string_field(
+                        config,
+                        "view",
+                        "runtime aggregate_v2 materialize.config",
+                    )?
+                    .to_owned();
+                    let view = self.views.iter().find(|candidate| candidate.name == view_name).with_context(|| {
+                        format!(
+                            "stream runtime aggregate_v2 materialize view {view_name} must be declared"
+                        )
+                    })?;
+                    has_materialize = true;
+                    materialized_views.push(CompiledAggregateV2MaterializedView {
+                        operator_id,
+                        view_name,
+                        state_ids: operator.state_ids.clone(),
+                        query_mode: view.query_mode.clone(),
+                        supported_consistencies: if view.supported_consistencies.is_empty() {
+                            vec![view.consistency.clone()]
+                        } else {
+                            view.supported_consistencies.clone()
+                        },
+                    });
+                }
+                STREAM_OPERATOR_EMIT_CHECKPOINT => {
+                    let checkpoint_name = operator
+                        .name
+                        .clone()
+                        .or_else(|| operator.operator_id.clone())
+                        .context("stream runtime aggregate_v2 emit_checkpoint requires name or operator_id")?;
+                    let config = json_object(
+                        operator.config.as_ref().context(
+                            "stream runtime aggregate_v2 emit_checkpoint requires config",
+                        )?,
+                        "runtime aggregate_v2 emit_checkpoint.config",
+                    )?;
+                    let checkpoint_sequence = json_i64_field(
+                        config,
+                        "sequence",
+                        "runtime aggregate_v2 emit_checkpoint.config",
+                    )?;
+                    checkpoints.push(CompiledAggregateV2Checkpoint {
+                        name: checkpoint_name,
+                        sequence: checkpoint_sequence,
+                    });
+                }
+                _ => anyhow::bail!(
+                    "stream runtime aggregate_v2 does not support operator kind {}",
+                    operator.kind
+                ),
+            }
+        }
+
+        if !has_materialize {
+            anyhow::bail!("stream runtime aggregate_v2 requires at least 1 materialize operator");
+        }
+        if aggregates.is_empty() {
+            anyhow::bail!("stream runtime aggregate_v2 requires at least 1 aggregate operator");
+        }
+        if self.views.iter().any(|view| {
+            view.query_mode != STREAM_QUERY_MODE_BY_KEY
+                && view.query_mode != STREAM_QUERY_MODE_PREFIX_SCAN
+        }) {
+            anyhow::bail!(
+                "stream runtime aggregate_v2 views must use query_mode={STREAM_QUERY_MODE_BY_KEY} or {STREAM_QUERY_MODE_PREFIX_SCAN}"
+            );
+        }
+        if self
+            .queries
+            .iter()
+            .any(|query| !self.views.iter().any(|view| view.name == query.view_name))
+        {
+            anyhow::bail!("stream runtime aggregate_v2 queries must target a declared view");
+        }
+
+        Ok(Some(CompiledAggregateV2Kernel {
+            source_kind: self.source.kind.clone(),
+            source_name: self.source.name.clone(),
+            key_field,
+            window,
+            aggregates,
+            materialized_views,
+            query_names: self.queries.iter().map(|query| query.name.clone()).collect(),
+            checkpoints,
+            classification: self.classification.clone(),
         }))
     }
 }
@@ -1897,6 +2296,22 @@ pub enum ThroughputChangelogPayload {
         checkpoint_sequence: i64,
         updated_at: DateTime<Utc>,
     },
+    StreamJobViewEvicted {
+        handle_id: String,
+        job_id: String,
+        view_name: String,
+        logical_key: String,
+        checkpoint_sequence: i64,
+        window_end: Option<DateTime<Utc>>,
+        retention_seconds: Option<u64>,
+        #[serde(default)]
+        evicted_window_count: u64,
+        #[serde(default)]
+        last_evicted_window_end: Option<DateTime<Utc>>,
+        #[serde(default)]
+        last_evicted_at: Option<DateTime<Utc>>,
+        evicted_at: DateTime<Utc>,
+    },
     StreamJobCheckpointReached {
         handle_id: String,
         job_id: String,
@@ -1905,6 +2320,51 @@ pub enum ThroughputChangelogPayload {
         stream_partition_id: i32,
         owner_epoch: u64,
         reached_at: DateTime<Utc>,
+    },
+    StreamJobSourceLeaseAssigned {
+        handle_id: String,
+        job_id: String,
+        source_partition_id: i32,
+        owner_partition_id: i32,
+        owner_epoch: u64,
+        lease_token: String,
+        assigned_at: DateTime<Utc>,
+    },
+    StreamJobSourceProgressed {
+        handle_id: String,
+        job_id: String,
+        source_partition_id: i32,
+        next_offset: i64,
+        checkpoint_sequence: i64,
+        checkpoint_target_offset: i64,
+        last_applied_offset: Option<i64>,
+        last_high_watermark: Option<i64>,
+        #[serde(default)]
+        last_event_time_watermark: Option<DateTime<Utc>>,
+        #[serde(default)]
+        last_closed_window_end: Option<DateTime<Utc>>,
+        #[serde(default)]
+        pending_window_ends: Vec<DateTime<Utc>>,
+        #[serde(default)]
+        dropped_late_event_count: u64,
+        #[serde(default)]
+        last_dropped_late_offset: Option<i64>,
+        #[serde(default)]
+        last_dropped_late_event_at: Option<DateTime<Utc>>,
+        #[serde(default)]
+        last_dropped_late_window_end: Option<DateTime<Utc>>,
+        #[serde(default)]
+        dropped_evicted_window_event_count: u64,
+        #[serde(default)]
+        last_dropped_evicted_window_offset: Option<i64>,
+        #[serde(default)]
+        last_dropped_evicted_window_event_at: Option<DateTime<Utc>>,
+        #[serde(default)]
+        last_dropped_evicted_window_end: Option<DateTime<Utc>>,
+        source_owner_partition_id: i32,
+        lease_token: String,
+        owner_epoch: u64,
+        progressed_at: DateTime<Utc>,
     },
     StreamJobTerminalized {
         handle_id: String,
@@ -2024,9 +2484,23 @@ pub struct StreamsViewRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamsViewDeleteRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub job_id: String,
+    pub handle_id: String,
+    pub view_name: String,
+    pub logical_key: String,
+    pub checkpoint_sequence: i64,
+    pub evicted_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StreamsProjectionEvent {
     UpsertStreamJobView { view: StreamsViewRecord },
+    DeleteStreamJobView { view: StreamsViewDeleteRecord },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2054,6 +2528,22 @@ pub enum StreamsChangelogPayload {
         checkpoint_sequence: i64,
         updated_at: DateTime<Utc>,
     },
+    StreamJobViewEvicted {
+        handle_id: String,
+        job_id: String,
+        view_name: String,
+        logical_key: String,
+        checkpoint_sequence: i64,
+        window_end: Option<DateTime<Utc>>,
+        retention_seconds: Option<u64>,
+        #[serde(default)]
+        evicted_window_count: u64,
+        #[serde(default)]
+        last_evicted_window_end: Option<DateTime<Utc>>,
+        #[serde(default)]
+        last_evicted_at: Option<DateTime<Utc>>,
+        evicted_at: DateTime<Utc>,
+    },
     StreamJobCheckpointReached {
         handle_id: String,
         job_id: String,
@@ -2062,6 +2552,51 @@ pub enum StreamsChangelogPayload {
         stream_partition_id: i32,
         owner_epoch: u64,
         reached_at: DateTime<Utc>,
+    },
+    StreamJobSourceLeaseAssigned {
+        handle_id: String,
+        job_id: String,
+        source_partition_id: i32,
+        owner_partition_id: i32,
+        owner_epoch: u64,
+        lease_token: String,
+        assigned_at: DateTime<Utc>,
+    },
+    StreamJobSourceProgressed {
+        handle_id: String,
+        job_id: String,
+        source_partition_id: i32,
+        next_offset: i64,
+        checkpoint_sequence: i64,
+        checkpoint_target_offset: i64,
+        last_applied_offset: Option<i64>,
+        last_high_watermark: Option<i64>,
+        #[serde(default)]
+        last_event_time_watermark: Option<DateTime<Utc>>,
+        #[serde(default)]
+        last_closed_window_end: Option<DateTime<Utc>>,
+        #[serde(default)]
+        pending_window_ends: Vec<DateTime<Utc>>,
+        #[serde(default)]
+        dropped_late_event_count: u64,
+        #[serde(default)]
+        last_dropped_late_offset: Option<i64>,
+        #[serde(default)]
+        last_dropped_late_event_at: Option<DateTime<Utc>>,
+        #[serde(default)]
+        last_dropped_late_window_end: Option<DateTime<Utc>>,
+        #[serde(default)]
+        dropped_evicted_window_event_count: u64,
+        #[serde(default)]
+        last_dropped_evicted_window_offset: Option<i64>,
+        #[serde(default)]
+        last_dropped_evicted_window_event_at: Option<DateTime<Utc>>,
+        #[serde(default)]
+        last_dropped_evicted_window_end: Option<DateTime<Utc>>,
+        source_owner_partition_id: i32,
+        lease_token: String,
+        owner_epoch: u64,
+        progressed_at: DateTime<Utc>,
     },
     StreamJobTerminalized {
         handle_id: String,
@@ -3040,6 +3575,190 @@ mod tests {
             .validate()
             .expect_err("kernel v2 artifact should not validate as runnable yet");
         assert!(error.to_string().contains(STREAMS_KERNEL_V1_CONTRACT));
+        Ok(())
+    }
+
+    #[test]
+    fn compiled_stream_job_derives_aggregate_v2_kernel() -> Result<()> {
+        let job = CompiledStreamJob {
+            name: "fraud-detector".to_owned(),
+            runtime: STREAM_RUNTIME_AGGREGATE_V2.to_owned(),
+            source: CompiledStreamSource {
+                kind: STREAM_SOURCE_TOPIC.to_owned(),
+                name: Some("payments".to_owned()),
+                binding: Some("payments".to_owned()),
+                config: Some(serde_json::json!({
+                    "topic": "payments"
+                })),
+            },
+            key_by: Some("accountId".to_owned()),
+            states: vec![
+                CompiledStreamState {
+                    id: "risk-state".to_owned(),
+                    kind: STREAM_STATE_KIND_KEYED.to_owned(),
+                    key_fields: vec!["accountId".to_owned()],
+                    value_fields: vec!["avgRisk".to_owned()],
+                    retention_seconds: Some(3600),
+                    config: Some(serde_json::json!({
+                        "reducer": STREAM_REDUCER_AVG
+                    })),
+                },
+                CompiledStreamState {
+                    id: "minute-window".to_owned(),
+                    kind: STREAM_STATE_KIND_WINDOW.to_owned(),
+                    key_fields: vec!["accountId".to_owned(), "windowStart".to_owned()],
+                    value_fields: vec!["avgRisk".to_owned()],
+                    retention_seconds: Some(3600),
+                    config: Some(serde_json::json!({
+                        "mode": "tumbling",
+                        "size": "1m"
+                    })),
+                },
+            ],
+            operators: vec![
+                CompiledStreamOperator {
+                    kind: STREAM_OPERATOR_FILTER.to_owned(),
+                    operator_id: Some("filter-valid".to_owned()),
+                    name: Some("filter-valid".to_owned()),
+                    inputs: vec!["source:payments".to_owned()],
+                    outputs: vec!["filtered".to_owned()],
+                    state_ids: vec![],
+                    config: Some(serde_json::json!({
+                        "predicate": "amount > 0"
+                    })),
+                },
+                CompiledStreamOperator {
+                    kind: STREAM_OPERATOR_WINDOW.to_owned(),
+                    operator_id: Some("minute-window".to_owned()),
+                    name: Some("minute-window".to_owned()),
+                    inputs: vec!["filtered".to_owned()],
+                    outputs: vec!["windowed".to_owned()],
+                    state_ids: vec!["minute-window".to_owned()],
+                    config: Some(serde_json::json!({
+                        "mode": "tumbling",
+                        "size": "1m"
+                    })),
+                },
+                CompiledStreamOperator {
+                    kind: STREAM_OPERATOR_AGGREGATE.to_owned(),
+                    operator_id: Some("avg-risk".to_owned()),
+                    name: Some("avg-risk".to_owned()),
+                    inputs: vec!["windowed".to_owned()],
+                    outputs: vec!["risk-view".to_owned()],
+                    state_ids: vec!["risk-state".to_owned()],
+                    config: Some(serde_json::json!({
+                        "reducer": STREAM_REDUCER_AVG,
+                        "valueField": "risk",
+                        "outputField": "avgRisk"
+                    })),
+                },
+                CompiledStreamOperator {
+                    kind: STREAM_OPERATOR_MATERIALIZE.to_owned(),
+                    operator_id: Some("materialize-risk".to_owned()),
+                    name: Some("materialize-risk".to_owned()),
+                    inputs: vec!["risk-view".to_owned()],
+                    outputs: vec!["riskScores".to_owned()],
+                    state_ids: vec!["risk-state".to_owned()],
+                    config: Some(serde_json::json!({
+                        "view": "riskScores"
+                    })),
+                },
+                CompiledStreamOperator {
+                    kind: STREAM_OPERATOR_EMIT_CHECKPOINT.to_owned(),
+                    operator_id: Some("minute-closed".to_owned()),
+                    name: Some("minute-closed".to_owned()),
+                    inputs: vec!["riskScores".to_owned()],
+                    outputs: vec!["checkpoint".to_owned()],
+                    state_ids: vec![],
+                    config: Some(serde_json::json!({
+                        "sequence": 1
+                    })),
+                },
+            ],
+            checkpoint_policy: Some(serde_json::json!({
+                "kind": STREAM_CHECKPOINT_POLICY_NAMED,
+                "checkpoints": [
+                    {
+                        "name": "minute-closed",
+                        "delivery": STREAM_CHECKPOINT_DELIVERY_WORKFLOW_AWAITABLE,
+                        "sequence": 1
+                    }
+                ]
+            })),
+            views: vec![CompiledStreamView {
+                name: "riskScores".to_owned(),
+                consistency: STREAM_CONSISTENCY_STRONG.to_owned(),
+                query_mode: STREAM_QUERY_MODE_BY_KEY.to_owned(),
+                view_id: Some("risk-scores".to_owned()),
+                key_field: Some("accountId".to_owned()),
+                value_fields: vec!["accountId".to_owned(), "avgRisk".to_owned()],
+                supported_consistencies: vec![
+                    STREAM_CONSISTENCY_STRONG.to_owned(),
+                    STREAM_CONSISTENCY_EVENTUAL.to_owned(),
+                ],
+                retention_seconds: Some(3600),
+            }],
+            queries: vec![
+                CompiledStreamQuery {
+                    name: "riskScoresByKey".to_owned(),
+                    view_name: "riskScores".to_owned(),
+                    consistency: STREAM_CONSISTENCY_STRONG.to_owned(),
+                    query_id: Some("risk-scores-by-key".to_owned()),
+                    arg_fields: vec!["accountId".to_owned()],
+                },
+                CompiledStreamQuery {
+                    name: "riskScoresScan".to_owned(),
+                    view_name: "riskScores".to_owned(),
+                    consistency: STREAM_CONSISTENCY_EVENTUAL.to_owned(),
+                    query_id: Some("risk-scores-scan".to_owned()),
+                    arg_fields: vec!["prefix".to_owned()],
+                },
+            ],
+            classification: Some("fast_lane".to_owned()),
+            metadata: Some(serde_json::json!({
+                "kernel": "aggregate_v2"
+            })),
+        };
+
+        assert_eq!(
+            job.aggregate_v2_kernel()?,
+            Some(CompiledAggregateV2Kernel {
+                source_kind: STREAM_SOURCE_TOPIC.to_owned(),
+                source_name: Some("payments".to_owned()),
+                key_field: "accountId".to_owned(),
+                window: Some(CompiledAggregateV2Window {
+                    operator_id: "minute-window".to_owned(),
+                    state_id: "minute-window".to_owned(),
+                    mode: "tumbling".to_owned(),
+                    size: "1m".to_owned(),
+                    time_field: None,
+                    allowed_lateness: None,
+                }),
+                aggregates: vec![CompiledAggregateV2Aggregate {
+                    operator_id: "avg-risk".to_owned(),
+                    reducer: STREAM_REDUCER_AVG.to_owned(),
+                    value_field: Some("risk".to_owned()),
+                    output_field: Some("avgRisk".to_owned()),
+                    state_ids: vec!["risk-state".to_owned()],
+                }],
+                materialized_views: vec![CompiledAggregateV2MaterializedView {
+                    operator_id: "materialize-risk".to_owned(),
+                    view_name: "riskScores".to_owned(),
+                    state_ids: vec!["risk-state".to_owned()],
+                    query_mode: STREAM_QUERY_MODE_BY_KEY.to_owned(),
+                    supported_consistencies: vec![
+                        STREAM_CONSISTENCY_STRONG.to_owned(),
+                        STREAM_CONSISTENCY_EVENTUAL.to_owned(),
+                    ],
+                }],
+                query_names: vec!["riskScoresByKey".to_owned(), "riskScoresScan".to_owned()],
+                checkpoints: vec![CompiledAggregateV2Checkpoint {
+                    name: "minute-closed".to_owned(),
+                    sequence: 1,
+                }],
+                classification: Some("fast_lane".to_owned()),
+            })
+        );
         Ok(())
     }
 

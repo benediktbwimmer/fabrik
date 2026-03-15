@@ -4,10 +4,10 @@ use fabrik_broker::{decode_consumed_workflow_event, decode_json_record};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_store::{StreamJobCheckpointRecord, StreamJobRecord};
 use fabrik_throughput::{
-    CancelStreamJobCommand, ScheduleStreamJobCommand, StreamJobBridgeHandleStatus,
-    StreamJobCheckpointStatus, StreamJobOriginKind, StreamJobQueryConsistency,
-    StreamJobQueryStatus, StreamJobStatus, ThroughputBackend, ThroughputBatchIdentity,
-    ThroughputCommand, ThroughputCommandEnvelope, ThroughputRunStatus,
+    CancelStreamJobCommand, STREAM_SOURCE_TOPIC, ScheduleStreamJobCommand,
+    StreamJobBridgeHandleStatus, StreamJobCheckpointStatus, StreamJobOriginKind,
+    StreamJobQueryConsistency, StreamJobQueryStatus, StreamJobStatus, ThroughputBackend,
+    ThroughputBatchIdentity, ThroughputCommand, ThroughputCommandEnvelope, ThroughputRunStatus,
     stream_job_bridge_request_id, stream_job_callback_event_id,
     stream_job_checkpoint_callback_dedupe_key, stream_job_query_callback_dedupe_key,
     stream_job_terminal_callback_dedupe_key,
@@ -23,7 +23,7 @@ use crate::{
     publish_changelog_records, publish_projection_records, stream_job_owner_epoch,
     stream_jobs::{
         activate_stream_job_on_local_state, build_stream_job_query_output,
-        materialization_outcome_from_local_state,
+        materialization_outcome_from_local_state, resolve_stream_job_definition,
         should_defer_terminal_callback_until_query_boundary, terminal_result_after_query,
     },
     workflow_event_from_throughput_command,
@@ -107,9 +107,20 @@ pub(super) async fn handle_bridge_event(
 
     if let WorkflowEvent::StreamJobCancellationRequested { job_id, .. } = &event.payload {
         if let Some(handle) = await_stream_job_bridge_handle(&state, &event, job_id).await? {
-            let finalized =
-                finalize_stream_job_cancellation(&state, &handle, event.occurred_at).await?;
-            publish_stream_job_terminal_event(&state, &finalized).await?;
+            if stream_job_uses_topic_source(&state, &handle).await? {
+                sync_stream_job_record(
+                    &state,
+                    &handle,
+                    StreamJobStatus::Draining,
+                    None,
+                    event.occurred_at,
+                )
+                .await?;
+            } else {
+                let finalized =
+                    finalize_stream_job_cancellation(&state, &handle, event.occurred_at).await?;
+                publish_stream_job_terminal_event(&state, &finalized).await?;
+            }
         }
         return Ok(());
     }
@@ -369,7 +380,7 @@ fn should_emit_workflow_callbacks(handle: &fabrik_store::StreamJobBridgeHandleRe
     !matches!(handle.parsed_origin_kind(), Some(StreamJobOriginKind::Standalone))
 }
 
-async fn materialize_stream_job_from_handle(
+pub(crate) async fn materialize_stream_job_from_handle(
     state: &AppState,
     mut handle: fabrik_store::StreamJobBridgeHandleRecord,
     occurred_at: DateTime<Utc>,
@@ -380,7 +391,8 @@ async fn materialize_stream_job_from_handle(
         job_name = %handle.job_name,
         "streams-runtime materializing stream job"
     );
-    sync_stream_job_record(state, &handle, StreamJobStatus::Starting, None, occurred_at).await?;
+    sync_stream_job_record(state, &handle, default_stream_job_status(&handle), None, occurred_at)
+        .await?;
     if let Some(activation) = activate_stream_job(state, &handle).await? {
         publish_changelog_records(state, activation.changelog_records).await;
         if let Err(error) = publish_projection_records(state, activation.projection_records).await {
@@ -517,11 +529,49 @@ async fn handle_cancel_stream_job_command(
         );
         return Ok(());
     };
-    let finalized = finalize_stream_job_cancellation(state, &handle, occurred_at).await?;
-    if should_emit_workflow_callbacks(&finalized) {
-        publish_stream_job_terminal_event(state, &finalized).await?;
+    if stream_job_uses_topic_source(state, &handle).await? {
+        sync_stream_job_record(state, &handle, StreamJobStatus::Draining, None, occurred_at)
+            .await?;
+    } else {
+        let finalized = finalize_stream_job_cancellation(state, &handle, occurred_at).await?;
+        if should_emit_workflow_callbacks(&finalized) {
+            publish_stream_job_terminal_event(state, &finalized).await?;
+        }
     }
     Ok(())
+}
+
+async fn stream_job_uses_topic_source(
+    state: &AppState,
+    handle: &fabrik_store::StreamJobBridgeHandleRecord,
+) -> Result<bool> {
+    let Some(job) = resolve_stream_job_definition(Some(&state.store), handle).await? else {
+        return Ok(false);
+    };
+    Ok(job.source.kind == STREAM_SOURCE_TOPIC)
+}
+
+pub(crate) async fn reconcile_active_topic_stream_jobs(
+    state: &AppState,
+    page_size: i64,
+) -> Result<()> {
+    let mut offset = 0;
+    loop {
+        let handles =
+            state.store.list_active_stream_job_callback_handles_page(page_size, offset).await?;
+        if handles.is_empty() {
+            return Ok(());
+        }
+        for handle in &handles {
+            if stream_job_uses_topic_source(state, handle).await? {
+                materialize_stream_job_from_handle(state, handle.clone(), Utc::now()).await?;
+            }
+        }
+        if handles.len() < usize::try_from(page_size).unwrap_or(usize::MAX) {
+            return Ok(());
+        }
+        offset += page_size;
+    }
 }
 
 async fn await_stream_job_bridge_handle(
@@ -567,6 +617,7 @@ async fn activate_stream_job(
     let Some(shard_workers) = state.shard_workers.get() else {
         return activate_stream_job_on_local_state(
             Some(&state.store),
+            Some(state),
             &state.local_state,
             handle,
             state.throughput_partitions,

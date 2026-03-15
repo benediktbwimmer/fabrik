@@ -11071,8 +11071,8 @@ mod tests {
 
             let docker_guard = DockerIntegrationTestGuard::acquire()?;
             let container_name = format!("fabrik-unified-test-pg-{}", Uuid::now_v7());
-            let data_dir =
-                std::env::temp_dir().join(format!("fabrik-unified-test-pgdata-{}", Uuid::now_v7()));
+            let data_dir = docker_test_data_root()?
+                .join(format!("fabrik-unified-test-pgdata-{}", Uuid::now_v7()));
             fs::create_dir_all(&data_dir).with_context(|| {
                 format!("failed to create postgres test data dir {}", data_dir.display())
             })?;
@@ -11198,7 +11198,7 @@ mod tests {
             for _ in 0..5 {
                 kafka_port = choose_free_port().context("failed to allocate kafka host port")?;
                 container_name = format!("fabrik-unified-test-rp-{}", Uuid::now_v7());
-                data_dir = std::env::temp_dir()
+                data_dir = docker_test_data_root()?
                     .join(format!("fabrik-unified-test-rpdata-{}", Uuid::now_v7()));
                 fs::create_dir_all(&data_dir).with_context(|| {
                     format!("failed to create redpanda test data dir {}", data_dir.display())
@@ -11510,6 +11510,18 @@ mod tests {
 
     fn docker_test_lock_dir() -> Result<PathBuf> {
         Ok(TestThroughputRuntime::workspace_root()?.join("target/unified-runtime-docker-test.lock"))
+    }
+
+    fn docker_test_data_root() -> Result<PathBuf> {
+        let root = if let Ok(explicit) = env::var("FABRIK_TEST_CONTAINER_DATA_ROOT") {
+            PathBuf::from(explicit)
+        } else {
+            TestThroughputRuntime::workspace_root()?.join("target/unified-runtime-docker-data")
+        };
+        fs::create_dir_all(&root).with_context(|| {
+            format!("failed to create docker test data root {}", root.display())
+        })?;
+        Ok(root)
     }
 
     fn stale_lock_dir(path: &Path, timeout: StdDuration) -> Result<bool> {

@@ -24,16 +24,27 @@ It is the first strict runtime contract that can be implemented, benchmarked, an
 
 ## Current Scope
 
-The kernel supports exactly one runtime shape:
+The kernel has one frozen base shape and one narrow extension already implemented on the same owner-runtime substrate.
+
+Base shape:
 
 - job name: `keyed-rollup`
 - runtime: `keyed_rollup`
-- source: `bounded_input`
+- source: `bounded_input` or `topic`
 - operator graph:
   `reduce(sum) -> emit_checkpoint`
 - one strong keyed materialized view
 - one strong keyed query
 - one workflow-awaitable named checkpoint
+
+Narrow extension:
+
+- runtime: `aggregate_v2`
+- source: `bounded_input` or `topic`
+- reducer: built-in `count|sum|min|max|avg`
+- optional one tumbling event-time window
+- strong keyed window queries
+- owner-driven watermark advancement with idle-source timer ticks for topic-backed windows
 
 ## Storage Contract
 
@@ -86,6 +97,7 @@ For kernel v1, accepted post-checkpoint progress is represented by the existing 
 
 - `StreamJobExecutionPlanned { ... }`
 - `StreamJobViewUpdated { ... }`
+- `StreamJobSourceProgressed { ... }`
 - `StreamJobCheckpointReached { ... }`
 - `StreamJobTerminalized { ... }`
 
@@ -96,13 +108,33 @@ For the bounded `keyed_rollup` slice, the durable progression is:
 3. checkpoint reached
 4. terminalized
 
+For the topic-backed `keyed_rollup` slice, the durable progression is:
+
+1. execution planned
+2. source lease assigned per source partition
+3. materialized view updates per key
+4. source progress advanced per source partition
+5. checkpoint reached for the current source frontier sequence
+6. later source frontiers advance the checkpoint sequence while reusing the declared checkpoint name
+
 Owner-local state, checkpoint callbacks, and terminal callbacks are reconstructed from those owner-applied stream entries rather than from the initial schedule request alone.
+
+For the topic-backed windowed `aggregate_v2` slice, `StreamJobSourceProgressed` also carries:
+
+- per-source-partition event-time watermark
+- last closed window end
+- pending window ends
+- dropped late-event counters and last dropped-late metadata
+
+That lets restore replay both source cursor advancement and window/timer progress from the same tail.
 
 ## Execution Kernel Contract
 
 ### Input
 
-The only supported source is workflow-submitted bounded input:
+The kernel supports two source shapes.
+
+Bounded input:
 
 ```json
 {
@@ -119,13 +151,23 @@ The only supported source is workflow-submitted bounded input:
 
 The runtime may also accept a raw array payload with equivalent item objects.
 
+Topic input:
+
+```json
+{
+  "kind": "topic",
+  "topic": "payments",
+  "startOffset": "earliest"
+}
+```
+
 ### Required Job Shape
 
 The compiled job must satisfy all of the following:
 
 - `job.name == "keyed-rollup"`
 - `job.runtime == "keyed_rollup"`
-- `job.source.kind == "bounded_input"`
+- `job.source.kind == "bounded_input"` or `job.source.kind == "topic"`
 - `job.key_by == "accountId"`
 - exactly 2 operators
 - operator 0 is `reduce` with config:
@@ -153,7 +195,15 @@ For each input item:
 3. accumulate a running sum per key
 4. materialize one current output per key
 5. stamp the output with `asOfCheckpoint`
-6. emit a named checkpoint once all bounded input is incorporated
+6. emit a named checkpoint once the current bounded input or topic frontier is incorporated
+
+For topic sources, the runtime must also:
+
+1. persist `source_partition -> next_offset` as `StreamJobSourceProgressed`
+2. persist `source_partition -> source-owner lease` as `StreamJobSourceLeaseAssigned`
+3. persist the current checkpoint frontier target and sequence per source partition
+4. restore source cursors and source leases from `checkpoint + streams source-progress tail`
+5. advance the same named checkpoint with a new sequence when a later source frontier is reached
 
 Materialized output shape:
 
@@ -216,7 +266,7 @@ Kernel v1 does not attempt to support:
 
 - arbitrary operator graphs
 - joins
-- windows
+- arbitrary window types beyond the current tumbling `aggregate_v2` slice
 - scans
 - generic user-defined functions
 - SQL authoring

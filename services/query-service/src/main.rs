@@ -595,6 +595,34 @@ struct StreamJobViewEntriesResponse {
     entries: Vec<StreamJobViewEntryRecord>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct StreamJobViewScanItemRecord {
+    logical_key: String,
+    output: Value,
+    checkpoint_sequence: i64,
+    updated_at: DateTime<Utc>,
+    window_expired_at: Option<DateTime<Utc>>,
+    window_retention_seconds: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamJobViewScanResponse {
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    job_id: String,
+    view_name: String,
+    consistency: String,
+    source: String,
+    projection_lag_ms: Option<i64>,
+    watch_cursor: String,
+    prefix: String,
+    page: PageInfo,
+    item_count: usize,
+    items: Vec<StreamJobViewScanItemRecord>,
+    runtime_stats: Option<Value>,
+}
+
 #[derive(Debug, Serialize)]
 struct WorkflowSignalsResponse {
     tenant_id: String,
@@ -1019,6 +1047,9 @@ struct StreamJobViewQuery {
     consistency: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
+    prefix: Option<String>,
+    #[serde(alias = "logicalKeyPrefix", alias = "logical_key_prefix")]
+    logical_key_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1246,6 +1277,14 @@ async fn main() -> Result<()> {
     .route(
         "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/keys",
         get(get_stream_job_view_keys),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/scan",
+        get(get_stream_job_view_scan),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/scan",
+        get(get_stream_job_view_scan),
     )
     .route(
         "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/entries",
@@ -1577,6 +1616,11 @@ async fn get_stream_job_view_keys(
             .map_err(invalid_request)?;
     let page =
         resolve_page(&state.query, &PaginationQuery { limit: query.limit, offset: query.offset });
+    let logical_key_prefix = query
+        .logical_key_prefix
+        .clone()
+        .or_else(|| query.prefix.clone())
+        .filter(|value| !value.is_empty());
     let response = match consistency {
         ReadConsistency::Strong => {
             let response = fetch_strong_stream_job_view_keys(
@@ -1586,6 +1630,7 @@ async fn get_stream_job_view_keys(
                 &job.run_id,
                 &job_id,
                 &view_name,
+                logical_key_prefix.as_deref(),
                 page.limit,
                 page.offset,
             )
@@ -1626,6 +1671,7 @@ async fn get_stream_job_view_keys(
                 &job.run_id,
                 &job_id,
                 &view_name,
+                logical_key_prefix.as_deref(),
                 page.limit,
                 page.offset,
             )
@@ -1663,6 +1709,104 @@ async fn get_stream_job_view_keys(
     Ok(Json(response))
 }
 
+async fn get_stream_job_view_scan(
+    Path((tenant_id, instance_id, run_id, job_id, view_name)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+    Query(query): Query<StreamJobViewQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<StreamJobViewScanResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let job = resolve_stream_job(&state, &tenant_id, &instance_id, &run_id, &job_id)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                not_found(error.to_string())
+            } else {
+                internal_error(error)
+            }
+        })?;
+    let consistency =
+        parse_read_consistency(Some(query.consistency.as_deref().unwrap_or("strong")))
+            .map_err(invalid_request)?;
+    let page =
+        resolve_page(&state.query, &PaginationQuery { limit: query.limit, offset: query.offset });
+    let logical_key_prefix =
+        query.logical_key_prefix.clone().or_else(|| query.prefix.clone()).unwrap_or_default();
+    let response = fetch_stream_job_view_scan(
+        &state,
+        &tenant_id,
+        &job.instance_id,
+        &job.run_id,
+        &job_id,
+        &view_name,
+        match consistency {
+            ReadConsistency::Strong => "strong",
+            ReadConsistency::Eventual => "eventual",
+        },
+        &logical_key_prefix,
+        page.limit,
+        page.offset,
+    )
+    .await
+    .map_err(|error| {
+        if error.to_string().contains("not found") {
+            not_found(error.to_string())
+        } else {
+            internal_error(error)
+        }
+    })?;
+    let consistency = response
+        .get("consistency")
+        .and_then(Value::as_str)
+        .unwrap_or(match consistency {
+            ReadConsistency::Strong => "strong",
+            ReadConsistency::Eventual => "eventual",
+        })
+        .to_owned();
+    let source = stream_query_source_label(
+        response.get("consistencySource").and_then(Value::as_str).unwrap_or_default(),
+    );
+    let total = response.get("total").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let items = response
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(stream_job_view_scan_item_from_value)
+        .collect::<Result<Vec<_>>>()
+        .map_err(internal_error)?;
+    let watch_cursor =
+        items.iter().map(|item| item.updated_at).max().unwrap_or_else(Utc::now).to_rfc3339();
+    let projection_lag_ms = (consistency == "eventual")
+        .then(|| projection_lag_ms_from_times(items.iter().map(|item| Some(item.updated_at))))
+        .flatten();
+    Ok(Json(StreamJobViewScanResponse {
+        tenant_id,
+        instance_id,
+        run_id,
+        job_id,
+        view_name,
+        consistency,
+        source,
+        projection_lag_ms,
+        watch_cursor,
+        prefix: response
+            .get("prefix")
+            .and_then(Value::as_str)
+            .unwrap_or(logical_key_prefix.as_str())
+            .to_owned(),
+        page: build_page_info(&page, total, items.len()),
+        item_count: total,
+        items,
+        runtime_stats: response.get("runtimeStats").cloned(),
+    }))
+}
+
 async fn get_stream_job_view_entries(
     Path((tenant_id, instance_id, run_id, job_id, view_name)): Path<(
         String,
@@ -1688,6 +1832,11 @@ async fn get_stream_job_view_entries(
             .map_err(invalid_request)?;
     let page =
         resolve_page(&state.query, &PaginationQuery { limit: query.limit, offset: query.offset });
+    let logical_key_prefix = query
+        .logical_key_prefix
+        .clone()
+        .or_else(|| query.prefix.clone())
+        .filter(|value| !value.is_empty());
     let response = match consistency {
         ReadConsistency::Strong => {
             let response = fetch_strong_stream_job_view_entries(
@@ -1697,6 +1846,7 @@ async fn get_stream_job_view_entries(
                 &job.run_id,
                 &job_id,
                 &view_name,
+                logical_key_prefix.as_deref(),
                 page.limit,
                 page.offset,
             )
@@ -1737,6 +1887,7 @@ async fn get_stream_job_view_entries(
                 &job.run_id,
                 &job_id,
                 &view_name,
+                logical_key_prefix.as_deref(),
                 page.limit,
                 page.offset,
             )
@@ -4574,6 +4725,58 @@ fn projection_lag_ms_from_times(
         .map(|updated_at| now.signed_duration_since(updated_at).num_milliseconds().max(0))
 }
 
+fn stream_query_source_label(consistency_source: &str) -> String {
+    match consistency_source {
+        "stream_owner_local_state" => "stream-owner",
+        "stream_projection_query" => "stream-view-query",
+        other if !other.is_empty() => other,
+        _ => "stream-owner",
+    }
+    .to_owned()
+}
+
+fn stream_job_view_scan_item_from_value(value: Value) -> Result<StreamJobViewScanItemRecord> {
+    let object = value
+        .as_object()
+        .with_context(|| format!("stream job scan item must be an object: {value}"))?;
+    let logical_key = object
+        .get("logicalKey")
+        .and_then(Value::as_str)
+        .context("stream job scan item missing logicalKey")?
+        .to_owned();
+    let output = object.get("output").cloned().context("stream job scan item missing output")?;
+    let checkpoint_sequence = object
+        .get("checkpointSequence")
+        .and_then(Value::as_i64)
+        .context("stream job scan item missing checkpointSequence")?;
+    let updated_at = parse_rfc3339_value(
+        object
+            .get("updatedAt")
+            .and_then(Value::as_str)
+            .context("stream job scan item missing updatedAt")?,
+    )?;
+    let window_expired_at = object
+        .get("windowExpiredAt")
+        .and_then(Value::as_str)
+        .map(parse_rfc3339_value)
+        .transpose()?;
+    let window_retention_seconds = object.get("windowRetentionSeconds").and_then(Value::as_i64);
+    Ok(StreamJobViewScanItemRecord {
+        logical_key,
+        output,
+        checkpoint_sequence,
+        updated_at,
+        window_expired_at,
+        window_retention_seconds,
+    })
+}
+
+fn parse_rfc3339_value(value: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(value)
+        .with_context(|| format!("invalid RFC3339 timestamp {value}"))?
+        .with_timezone(&Utc))
+}
+
 fn stream_job_view_summaries(
     view_definitions: Option<&Value>,
     projection_summaries: Vec<StreamJobViewProjectionSummaryRecord>,
@@ -6601,16 +6804,22 @@ async fn fetch_strong_stream_job_view_keys(
     run_id: &str,
     job_id: &str,
     view_name: &str,
+    logical_key_prefix: Option<&str>,
     limit: usize,
     offset: usize,
 ) -> Result<StrongStreamJobViewKeysResponse> {
     let endpoint = stream_job_owner_query_endpoint(state, job_id).await?;
+    let mut query =
+        vec![("limit".to_owned(), limit.to_string()), ("offset".to_owned(), offset.to_string())];
+    if let Some(prefix) = logical_key_prefix {
+        query.push(("prefix".to_owned(), prefix.to_owned()));
+    }
     let response = state
         .client
         .get(format!(
             "{endpoint}/debug/streams-runtime/stream-jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}/views/{view_name}/keys"
         ))
-        .query(&[("limit", limit), ("offset", offset)])
+        .query(&query)
         .send()
         .await
         .context("failed to fetch strong stream job view keys")?;
@@ -6632,16 +6841,22 @@ async fn fetch_strong_stream_job_view_entries(
     run_id: &str,
     job_id: &str,
     view_name: &str,
+    logical_key_prefix: Option<&str>,
     limit: usize,
     offset: usize,
 ) -> Result<StrongStreamJobViewEntriesResponse> {
     let endpoint = stream_job_owner_query_endpoint(state, job_id).await?;
+    let mut query =
+        vec![("limit".to_owned(), limit.to_string()), ("offset".to_owned(), offset.to_string())];
+    if let Some(prefix) = logical_key_prefix {
+        query.push(("prefix".to_owned(), prefix.to_owned()));
+    }
     let response = state
         .client
         .get(format!(
             "{endpoint}/debug/streams-runtime/stream-jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}/views/{view_name}/entries"
         ))
-        .query(&[("limit", limit), ("offset", offset)])
+        .query(&query)
         .send()
         .await
         .context("failed to fetch strong stream job view entries")?;
@@ -6654,6 +6869,44 @@ async fn fetch_strong_stream_job_view_entries(
         .json::<StrongStreamJobViewEntriesResponse>()
         .await
         .context("failed to decode strong stream job view entries response")
+}
+
+async fn fetch_stream_job_view_scan(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    job_id: &str,
+    view_name: &str,
+    consistency: &str,
+    logical_key_prefix: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<Value> {
+    let endpoint = stream_job_owner_query_endpoint(state, job_id).await?;
+    let response = state
+        .client
+        .get(format!(
+            "{endpoint}/debug/streams-runtime/stream-jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}/views/{view_name}/scan"
+        ))
+        .query(&[
+            ("consistency", consistency),
+            ("prefix", logical_key_prefix),
+            ("limit", &limit.to_string()),
+            ("offset", &offset.to_string()),
+        ])
+        .send()
+        .await
+        .context("failed to fetch stream job view scan")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("stream job {job_id} view {view_name} not found");
+    }
+    response
+        .error_for_status()
+        .context("stream job view scan request failed")?
+        .json::<Value>()
+        .await
+        .context("failed to decode stream job view scan response")
 }
 
 async fn load_eventual_stream_job_view(
@@ -6690,12 +6943,20 @@ async fn load_eventual_stream_job_view_keys(
     run_id: &str,
     job_id: &str,
     view_name: &str,
+    logical_key_prefix: Option<&str>,
     limit: usize,
     offset: usize,
 ) -> Result<(usize, Vec<StreamJobViewKeyRecord>)> {
     let total = state
         .store
-        .count_stream_job_view_query_keys(tenant_id, instance_id, run_id, job_id, view_name)
+        .count_stream_job_view_query_keys(
+            tenant_id,
+            instance_id,
+            run_id,
+            job_id,
+            view_name,
+            logical_key_prefix,
+        )
         .await? as usize;
     let views = state
         .store
@@ -6705,6 +6966,7 @@ async fn load_eventual_stream_job_view_keys(
             run_id,
             job_id,
             view_name,
+            logical_key_prefix,
             i64::try_from(limit).context("stream job view page limit exceeds i64")?,
             i64::try_from(offset).context("stream job view page offset exceeds i64")?,
         )
@@ -6727,12 +6989,20 @@ async fn load_eventual_stream_job_view_entries(
     run_id: &str,
     job_id: &str,
     view_name: &str,
+    logical_key_prefix: Option<&str>,
     limit: usize,
     offset: usize,
 ) -> Result<(usize, Vec<StreamJobViewEntryRecord>)> {
     let total = state
         .store
-        .count_stream_job_view_query_keys(tenant_id, instance_id, run_id, job_id, view_name)
+        .count_stream_job_view_query_keys(
+            tenant_id,
+            instance_id,
+            run_id,
+            job_id,
+            view_name,
+            logical_key_prefix,
+        )
         .await? as usize;
     let views = state
         .store
@@ -6742,6 +7012,7 @@ async fn load_eventual_stream_job_view_entries(
             run_id,
             job_id,
             view_name,
+            logical_key_prefix,
             i64::try_from(limit).context("stream job view page limit exceeds i64")?,
             i64::try_from(offset).context("stream job view page offset exceeds i64")?,
         )
@@ -7436,6 +7707,7 @@ mod tests {
     use chrono::Utc;
     use fabrik_config::{ThroughputPayloadStoreConfig, ThroughputPayloadStoreKind};
     use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
+    use fabrik_store::StreamJobViewRecord;
     use fabrik_workflow::{
         ArtifactEntrypoint, CompiledQueryHandler, CompiledUpdateHandler, CompiledWorkflow,
         Expression, SourceLocation, WorkflowStatus,
@@ -7503,6 +7775,34 @@ mod tests {
         assert_eq!(summaries[1].sequence, Some(2));
         assert!(!summaries[1].reached);
         assert_eq!(summaries[1].reached_at, None);
+    }
+
+    #[test]
+    fn stream_job_view_scan_item_parses_window_metadata() {
+        let item = stream_job_view_scan_item_from_value(json!({
+            "logicalKey": "acct_1",
+            "output": { "totalAmount": 12 },
+            "checkpointSequence": 9,
+            "updatedAt": "2026-03-15T10:00:00Z",
+            "windowExpiredAt": "2026-03-15T10:02:00Z",
+            "windowRetentionSeconds": 120
+        }))
+        .expect("scan item should parse");
+        assert_eq!(item.logical_key, "acct_1");
+        assert_eq!(item.output["totalAmount"], 12);
+        assert_eq!(item.checkpoint_sequence, 9);
+        assert_eq!(item.updated_at.to_rfc3339(), "2026-03-15T10:00:00+00:00");
+        assert_eq!(
+            item.window_expired_at.map(|value| value.to_rfc3339()),
+            Some("2026-03-15T10:02:00+00:00".to_owned())
+        );
+        assert_eq!(item.window_retention_seconds, Some(120));
+    }
+
+    #[test]
+    fn stream_query_source_label_maps_runtime_sources() {
+        assert_eq!(stream_query_source_label("stream_owner_local_state"), "stream-owner");
+        assert_eq!(stream_query_source_label("stream_projection_query"), "stream-view-query");
     }
 
     #[test]
@@ -8679,7 +8979,10 @@ mod tests {
             Some("workflow-instance")
         );
         assert_eq!(response.jobs[0].bridge_surface.pending_repair_count, 1);
-        assert_eq!(response.jobs[0].bridge_surface.next_repair.as_deref(), Some("accept_query"));
+        assert_eq!(
+            response.jobs[0].bridge_surface.next_repair.as_deref(),
+            Some("accept_stream_query")
+        );
         assert_eq!(
             response.jobs[0].bridge_surface.latest_query_name.as_deref(),
             Some("currentStats")
@@ -8715,6 +9018,75 @@ mod tests {
         .await?;
         assert_eq!(filtered.job_count, 1);
         assert_eq!(filtered.jobs[0].job_id, "job-workflow");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn eventual_stream_job_view_browse_filters_by_prefix() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state = test_state(store.clone()).await?;
+        let now = Utc::now();
+
+        for (logical_key, value) in [
+            ("acct_1", json!({"accountId": "acct_1", "totalAmount": 10})),
+            ("acct_2", json!({"accountId": "acct_2", "totalAmount": 20})),
+            ("cust_1", json!({"accountId": "cust_1", "totalAmount": 30})),
+        ] {
+            store
+                .upsert_stream_job_view_query(&StreamJobViewRecord {
+                    tenant_id: "tenant-a".to_owned(),
+                    instance_id: "instance-a".to_owned(),
+                    run_id: "run-a".to_owned(),
+                    job_id: "job-a".to_owned(),
+                    handle_id: "handle-a".to_owned(),
+                    view_name: "accountTotals".to_owned(),
+                    logical_key: logical_key.to_owned(),
+                    output: value,
+                    checkpoint_sequence: 7,
+                    updated_at: now,
+                })
+                .await?;
+        }
+
+        let (key_total, keys) = load_eventual_stream_job_view_keys(
+            &state,
+            "tenant-a",
+            "instance-a",
+            "run-a",
+            "job-a",
+            "accountTotals",
+            Some("acct_"),
+            10,
+            0,
+        )
+        .await?;
+        assert_eq!(key_total, 2);
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].logical_key, "acct_1");
+        assert_eq!(keys[1].logical_key, "acct_2");
+
+        let (entry_total, entries) = load_eventual_stream_job_view_entries(
+            &state,
+            "tenant-a",
+            "instance-a",
+            "run-a",
+            "job-a",
+            "accountTotals",
+            Some("acct_"),
+            10,
+            0,
+        )
+        .await?;
+        assert_eq!(entry_total, 2);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].logical_key, "acct_1");
+        assert_eq!(entries[0].output["totalAmount"], 10);
+        assert_eq!(entries[1].logical_key, "acct_2");
+        assert_eq!(entries[1].output["totalAmount"], 20);
 
         Ok(())
     }

@@ -402,8 +402,10 @@ function validateKeyedRollupJob(job) {
   if (job.name !== "keyed-rollup") {
     throw new CompilerError(`keyed_rollup runtime requires job name "keyed-rollup"`);
   }
-  if (job.source.kind !== "bounded_input") {
-    throw new CompilerError(`keyed_rollup runtime requires source.kind "bounded_input"`);
+  if (job.source.kind !== "bounded_input" && job.source.kind !== "topic") {
+    throw new CompilerError(
+      `keyed_rollup runtime requires source.kind "bounded_input" or "topic"`,
+    );
   }
   if (job.key_by !== "accountId") {
     throw new CompilerError(`keyed_rollup runtime requires keyBy "accountId"`);

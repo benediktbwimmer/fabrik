@@ -1,0 +1,11 @@
+[alias]
+bench-stream-jobs = [
+  "test",
+  "-p",
+  "streams-runtime",
+  "--release",
+  "perf_keyed_rollup_",
+  "--",
+  "--ignored",
+  "--nocapture",
+]

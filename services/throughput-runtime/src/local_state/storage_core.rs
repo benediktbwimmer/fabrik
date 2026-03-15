@@ -2,18 +2,92 @@ use super::*;
 use std::collections::BTreeMap;
 
 impl LocalThroughputState {
+    pub(crate) fn load_stream_job_applied_dispatch_batch_ids(
+        &self,
+        handle_id: &str,
+    ) -> Result<Vec<String>> {
+        let prefix = stream_job_dispatch_applied_prefix(handle_id);
+        let mut batch_ids = self
+            .load_prefixed_entries_bytes(
+                STREAM_JOBS_CF,
+                &prefix,
+                "stream job applied dispatch batch ids",
+            )?
+            .into_iter()
+            .filter_map(|(key, _)| {
+                key.strip_prefix(prefix.as_slice()).map(|suffix| suffix.to_vec())
+            })
+            .map(|suffix| {
+                String::from_utf8(suffix)
+                    .context("stream job applied dispatch batch id key suffix must be utf-8")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        batch_ids.sort();
+        batch_ids.dedup();
+        Ok(batch_ids)
+    }
+
+    pub(crate) fn load_all_stream_job_applied_dispatch_batches(
+        &self,
+    ) -> Result<Vec<LocalStreamJobAppliedDispatchBatchState>> {
+        let mut states = Vec::new();
+        for runtime_state in self.load_all_stream_job_runtime_states()? {
+            for batch_id in runtime_state.applied_dispatch_batch_ids {
+                states.push(LocalStreamJobAppliedDispatchBatchState {
+                    handle_id: runtime_state.handle_id.clone(),
+                    batch_id,
+                });
+            }
+        }
+        states.sort_by(|left, right| {
+            left.handle_id.cmp(&right.handle_id).then_with(|| left.batch_id.cmp(&right.batch_id))
+        });
+        states.dedup_by(|left, right| {
+            left.handle_id == right.handle_id && left.batch_id == right.batch_id
+        });
+        Ok(states)
+    }
+
+    pub(crate) fn has_stream_job_applied_dispatch_batch(
+        &self,
+        handle_id: &str,
+        batch_id: &str,
+    ) -> Result<bool> {
+        Ok(self
+            .db
+            .get_cf(self.cf(STREAM_JOBS_CF), &stream_job_dispatch_applied_key(handle_id, batch_id))
+            .context("failed to load stream job applied dispatch batch marker")?
+            .is_some())
+    }
+
     pub(crate) fn load_stream_job_runtime_state(
         &self,
         handle_id: &str,
     ) -> Result<Option<LocalStreamJobRuntimeState>> {
-        self.get_cf_bytes_with_legacy_fallback(
-            STREAM_JOBS_CF,
-            &stream_job_runtime_key(handle_id),
-            Some(&legacy_stream_job_runtime_key(handle_id)),
-            "stream job runtime state",
-        )?
-        .map(|value| decode_rocksdb_value(&value, "stream job runtime state"))
-        .transpose()
+        let state = self
+            .get_cf_bytes_with_legacy_fallback(
+                STREAM_JOBS_CF,
+                &stream_job_runtime_key(handle_id),
+                Some(&legacy_stream_job_runtime_key(handle_id)),
+                "stream job runtime state",
+            )?
+            .map(|value| decode_rocksdb_value(&value, "stream job runtime state"))
+            .transpose()?;
+        state
+            .map(|mut state: LocalStreamJobRuntimeState| {
+                let applied = self.load_stream_job_applied_dispatch_batch_ids(handle_id)?;
+                if !applied.is_empty() {
+                    state.applied_dispatch_batch_ids = applied;
+                    if state.dispatch_completed_at.is_none()
+                        && !state.dispatch_batches.is_empty()
+                        && state.applied_dispatch_batch_ids.len() == state.dispatch_batches.len()
+                    {
+                        state.dispatch_completed_at = Some(state.updated_at);
+                    }
+                }
+                Ok(state)
+            })
+            .transpose()
     }
 
     pub(crate) fn load_all_stream_job_runtime_states(
@@ -37,6 +111,18 @@ impl LocalThroughputState {
             let state: LocalStreamJobRuntimeState =
                 decode_rocksdb_value(&value, "stream job runtime state")?;
             states.entry(state.handle_id.clone()).or_insert(state);
+        }
+        for state in states.values_mut() {
+            let applied = self.load_stream_job_applied_dispatch_batch_ids(&state.handle_id)?;
+            if !applied.is_empty() {
+                state.applied_dispatch_batch_ids = applied;
+                if state.dispatch_completed_at.is_none()
+                    && !state.dispatch_batches.is_empty()
+                    && state.applied_dispatch_batch_ids.len() == state.dispatch_batches.len()
+                {
+                    state.dispatch_completed_at = Some(state.updated_at);
+                }
+            }
         }
         Ok(states.into_values().collect())
     }
@@ -107,19 +193,22 @@ impl LocalThroughputState {
             Some(&legacy_stream_job_view_key(handle_id, view_name, logical_key)),
             "stream job view state",
         )?
-        .map(|value| decode_rocksdb_value(&value, "stream job view state"))
+        .map(|value| decode_stream_job_view_state_value(&value, handle_id, view_name, logical_key))
         .transpose()
     }
 
     pub(crate) fn load_all_stream_job_views(&self) -> Result<Vec<LocalStreamJobViewState>> {
         let mut views = BTreeMap::new();
-        for (_key, value) in self.load_prefixed_entries_bytes(
+        for (key, value) in self.load_prefixed_entries_bytes(
             STREAM_JOBS_CF,
             STREAM_JOB_VIEW_BINARY_PREFIX,
             "stream job view states",
         )? {
-            let state: LocalStreamJobViewState =
-                decode_rocksdb_value(&value, "stream job view state")?;
+            let Some((handle_id, view_name, logical_key)) = parse_stream_job_view_key(&key) else {
+                continue;
+            };
+            let state =
+                decode_stream_job_view_state_value(&value, &handle_id, &view_name, &logical_key)?;
             views.insert(
                 (state.handle_id.clone(), state.view_name.clone(), state.logical_key.clone()),
                 state,
@@ -149,13 +238,18 @@ impl LocalThroughputState {
         view_name: &str,
     ) -> Result<Vec<LocalStreamJobViewState>> {
         let mut views = BTreeMap::new();
-        for (_key, value) in self.load_prefixed_entries_bytes(
+        for (key, value) in self.load_prefixed_entries_bytes(
             STREAM_JOBS_CF,
             &stream_job_view_prefix(handle_id, view_name),
             "stream job view states",
         )? {
-            let state: LocalStreamJobViewState =
-                decode_rocksdb_value(&value, "stream job view state")?;
+            let Some((_stored_handle_id, _stored_view_name, logical_key)) =
+                parse_stream_job_view_key(&key)
+            else {
+                continue;
+            };
+            let state =
+                decode_stream_job_view_state_value(&value, handle_id, view_name, &logical_key)?;
             views.insert(state.logical_key.clone(), state);
         }
         for (_key, value) in self.load_prefixed_entries(

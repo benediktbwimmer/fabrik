@@ -623,8 +623,8 @@ const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
             },
             bridge_surface: {
               pending_repair_count: 1,
-              pending_repairs: ["accept_query"],
-              next_repair: "accept_query",
+              pending_repairs: ["accept_stream_query"],
+              next_repair: "accept_stream_query",
               latest_query_id: "query-1",
               latest_query_name: "currentStats",
               latest_query_status: "accepted",
@@ -938,8 +938,8 @@ const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
           },
           bridge_surface: {
             pending_repair_count: 1,
-            pending_repairs: ["accept_query"],
-            next_repair: "accept_query",
+            pending_repairs: ["accept_stream_query"],
+            next_repair: "accept_stream_query",
             latest_query_id: "query-1",
             latest_query_name: "currentStats",
             latest_query_status: "accepted",
@@ -1119,8 +1119,8 @@ const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
             },
             bridge_surface: {
               pending_repair_count: 1,
-              pending_repairs: ["accept_query"],
-              next_repair: "accept_query",
+              pending_repairs: ["accept_stream_query"],
+              next_repair: "accept_stream_query",
               latest_query_id: "query-1",
               latest_query_name: "currentStats",
               latest_query_status: "accepted",

@@ -328,6 +328,24 @@ The runtime should distinguish at least these query shapes:
 
 The runtime must not pretend all materialized state is one table with one consistency model.
 
+### Runtime Diagnostics
+
+The runtime must also expose an operator-facing diagnostics query for live stream jobs.
+
+At minimum, that diagnostics surface should expose:
+
+- source cursor state and lease state
+- checkpoint progress and latest accepted checkpoint boundary
+- declared materialized views and their retention policy
+- event-time window policy such as mode, size, time field, and allowed lateness
+- explicit late-event policy
+- explicit post-retention eviction policy
+
+That diagnostics payload exists so operators can answer both:
+
+- what happened?
+- what policy caused it?
+
 ## Execution Kernel Model
 
 ### Authoring and Execution Split

@@ -837,6 +837,19 @@ pub struct StreamJobViewRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamJobViewDeleteRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub job_id: String,
+    pub handle_id: String,
+    pub view_name: String,
+    pub logical_key: String,
+    pub checkpoint_sequence: i64,
+    pub evicted_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StreamJobViewProjectionSummaryRecord {
     pub job_id: String,
     pub view_name: String,
@@ -1099,6 +1112,7 @@ pub enum ThroughputProjectionEvent {
     UpsertBatch { batch: WorkflowBulkBatchRecord },
     UpsertChunk { chunk: WorkflowBulkChunkRecord },
     UpsertStreamJobView { view: StreamJobViewRecord },
+    DeleteStreamJobView { view: StreamJobViewDeleteRecord },
     UpdateBatchState { update: ThroughputProjectionBatchStateUpdate },
     UpdateChunkState { update: ThroughputProjectionChunkStateUpdate },
 }
@@ -16317,6 +16331,33 @@ impl WorkflowStore {
         Ok(())
     }
 
+    pub async fn delete_stream_job_view_query(
+        &self,
+        view: &StreamJobViewDeleteRecord,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            DELETE FROM stream_job_view_query
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND job_id = $4
+              AND view_name = $5
+              AND logical_key = $6
+            "#,
+        )
+        .bind(&view.tenant_id)
+        .bind(&view.instance_id)
+        .bind(&view.run_id)
+        .bind(&view.job_id)
+        .bind(&view.view_name)
+        .bind(&view.logical_key)
+        .execute(&self.pool)
+        .await
+        .context("failed to delete stream job view query record")?;
+        Ok(())
+    }
+
     pub async fn get_stream_job_view_query(
         &self,
         tenant_id: &str,
@@ -16357,6 +16398,7 @@ impl WorkflowStore {
         run_id: &str,
         job_id: &str,
         view_name: &str,
+        logical_key_prefix: Option<&str>,
     ) -> Result<u64> {
         let count = sqlx::query_scalar::<_, i64>(
             r#"
@@ -16367,6 +16409,7 @@ impl WorkflowStore {
               AND run_id = $3
               AND job_id = $4
               AND view_name = $5
+              AND ($6::TEXT IS NULL OR logical_key LIKE ($6 || '%'))
             "#,
         )
         .bind(tenant_id)
@@ -16374,6 +16417,7 @@ impl WorkflowStore {
         .bind(run_id)
         .bind(job_id)
         .bind(view_name)
+        .bind(logical_key_prefix)
         .fetch_one(&self.pool)
         .await
         .context("failed to count stream job view query keys")?;
@@ -16387,6 +16431,7 @@ impl WorkflowStore {
         run_id: &str,
         job_id: &str,
         view_name: &str,
+        logical_key_prefix: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<StreamJobViewRecord>> {
@@ -16399,9 +16444,10 @@ impl WorkflowStore {
               AND run_id = $3
               AND job_id = $4
               AND view_name = $5
+              AND ($6::TEXT IS NULL OR logical_key LIKE ($6 || '%'))
             ORDER BY logical_key ASC
-            LIMIT $6
-            OFFSET $7
+            LIMIT $7
+            OFFSET $8
             "#,
         )
         .bind(tenant_id)
@@ -16409,6 +16455,7 @@ impl WorkflowStore {
         .bind(run_id)
         .bind(job_id)
         .bind(view_name)
+        .bind(logical_key_prefix)
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -16803,6 +16850,29 @@ impl WorkflowStore {
             offset,
         )
         .await
+    }
+
+    pub async fn list_active_stream_job_callback_handles_page(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StreamJobCallbackHandleRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_job_bridge_handles
+            WHERE status IN ('admitted', 'running', 'cancellation_requested')
+            ORDER BY updated_at ASC, created_at ASC, handle_id ASC
+            LIMIT $1
+            OFFSET $2
+            "#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list active stream job callback handles")?;
+        rows.into_iter().map(Self::decode_stream_job_bridge_handle_row).collect()
     }
 
     pub async fn upsert_stream_job_bridge_checkpoint(
