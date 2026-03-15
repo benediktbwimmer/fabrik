@@ -337,6 +337,9 @@ async fn apply_projection_event(state: &AppState, event: &BufferedProjectionEven
             ThroughputProjectionEvent::UpsertStreamJobView { view } => {
                 state.store.upsert_stream_job_view_query(view).await?
             }
+            ThroughputProjectionEvent::DeleteStreamJobView { view } => {
+                state.store.delete_stream_job_view_query(view).await?
+            }
             ThroughputProjectionEvent::UpdateBatchState { update } => {
                 state.store.update_throughput_projection_batch_state(update).await?;
                 if update.terminal_at.is_some() {
@@ -369,6 +372,22 @@ async fn apply_projection_event(state: &AppState, event: &BufferedProjectionEven
                         output: view.output.clone(),
                         checkpoint_sequence: view.checkpoint_sequence,
                         updated_at: view.updated_at,
+                    })
+                    .await?;
+            }
+            StreamsProjectionEvent::DeleteStreamJobView { view } => {
+                state
+                    .store
+                    .delete_stream_job_view_query(&fabrik_store::StreamJobViewDeleteRecord {
+                        tenant_id: view.tenant_id.clone(),
+                        instance_id: view.instance_id.clone(),
+                        run_id: view.run_id.clone(),
+                        job_id: view.job_id.clone(),
+                        handle_id: view.handle_id.clone(),
+                        view_name: view.view_name.clone(),
+                        logical_key: view.logical_key.clone(),
+                        checkpoint_sequence: view.checkpoint_sequence,
+                        evicted_at: view.evicted_at,
                     })
                     .await?;
             }

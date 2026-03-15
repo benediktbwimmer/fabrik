@@ -119,6 +119,39 @@ pub struct ConsumedJsonRecord {
     pub high_watermark: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct JsonPartitionFetcher {
+    partition_id: i32,
+    client: Arc<rskafka::client::partition::PartitionClient>,
+}
+
+impl JsonPartitionFetcher {
+    pub async fn fetch_records(
+        &self,
+        offset: i64,
+        bytes: std::ops::Range<i32>,
+        max_wait_ms: i32,
+    ) -> Result<(Vec<ConsumedJsonRecord>, i64)> {
+        let (records, high_watermark) =
+            self.client.fetch_records(offset, bytes, max_wait_ms).await.with_context(|| {
+                format!(
+                    "failed to fetch json topic records for partition {} at offset {}",
+                    self.partition_id, offset
+                )
+            })?;
+        let records = records
+            .into_iter()
+            .map(|record| ConsumedJsonRecord {
+                partition_id: self.partition_id,
+                record,
+                high_watermark,
+            })
+            .collect();
+        Ok((records, high_watermark))
+    }
+}
+
+pub type JsonPartitionConsumer = StreamConsumer;
 pub type JsonConsumerStream = BoxStream<'static, Result<ConsumedJsonRecord>>;
 
 impl WorkflowPublisher {
@@ -415,6 +448,30 @@ pub async fn build_json_partition_consumer(
         StartOffset::Earliest,
     )
     .await
+}
+
+pub async fn build_json_partition_fetcher(
+    config: &JsonTopicConfig,
+    client_id: &str,
+    partition_id: i32,
+) -> Result<JsonPartitionFetcher> {
+    let client = ClientBuilder::new(vec![config.brokers.clone()])
+        .client_id(format!("{client_id}-partition-{partition_id}"))
+        .build()
+        .await
+        .context("failed to create kafka client")?;
+    ensure_topic(&client, &config.topic_name, config.partitions).await?;
+
+    let partition_client = Arc::new(
+        client
+            .partition_client(config.topic_name.clone(), partition_id, UnknownTopicHandling::Retry)
+            .await
+            .with_context(|| {
+                format!("failed to create fetcher partition client for partition {partition_id}")
+            })?,
+    );
+
+    Ok(JsonPartitionFetcher { partition_id, client: partition_client })
 }
 
 pub async fn build_json_partition_consumer_from_offset(

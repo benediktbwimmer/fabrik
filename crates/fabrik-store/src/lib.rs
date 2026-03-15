@@ -822,6 +822,28 @@ impl StreamJobRecord {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamDeploymentRecord {
+    pub tenant_id: String,
+    pub deployment_id: String,
+    pub definition_id: String,
+    pub definition_version: Option<u32>,
+    pub artifact_hash: Option<String>,
+    pub desired_state: String,
+    pub rollout_phase: String,
+    pub rollout_generation: u64,
+    pub active_stream_run_id: Option<String>,
+    pub active_job_id: Option<String>,
+    pub active_handle_id: Option<String>,
+    pub previous_stream_run_id: Option<String>,
+    pub rollout_checkpoint_name: Option<String>,
+    pub rollout_handoff_checkpoint_sequence: Option<i64>,
+    pub failed_revision_id: Option<String>,
+    pub rollout_failure: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StreamJobViewRecord {
     pub tenant_id: String,
@@ -3503,6 +3525,85 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize stream_jobs status index")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS stream_deployments (
+                tenant_id TEXT NOT NULL,
+                deployment_id TEXT NOT NULL,
+                definition_id TEXT NOT NULL,
+                definition_version INTEGER,
+                artifact_hash TEXT,
+                desired_state TEXT NOT NULL,
+                rollout_phase TEXT NOT NULL DEFAULT 'running',
+                rollout_generation BIGINT NOT NULL DEFAULT 0,
+                active_stream_run_id TEXT,
+                active_job_id TEXT,
+                active_handle_id TEXT,
+                previous_stream_run_id TEXT,
+                rollout_checkpoint_name TEXT,
+                rollout_handoff_checkpoint_sequence BIGINT,
+                failed_revision_id TEXT,
+                rollout_failure TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (tenant_id, deployment_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize stream_deployments table")?;
+
+        sqlx::query(
+            r#"
+            ALTER TABLE stream_deployments
+            ADD COLUMN IF NOT EXISTS rollout_phase TEXT NOT NULL DEFAULT 'running'
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add stream_deployments rollout_phase column")?;
+
+        sqlx::query(
+            r#"
+            ALTER TABLE stream_deployments
+            ADD COLUMN IF NOT EXISTS rollout_handoff_checkpoint_sequence BIGINT
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add stream_deployments rollout_handoff_checkpoint_sequence column")?;
+
+        sqlx::query(
+            r#"
+            ALTER TABLE stream_deployments
+            ADD COLUMN IF NOT EXISTS failed_revision_id TEXT
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add stream_deployments failed_revision_id column")?;
+
+        sqlx::query(
+            r#"
+            ALTER TABLE stream_deployments
+            ADD COLUMN IF NOT EXISTS rollout_failure TEXT
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add stream_deployments rollout_failure column")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS stream_deployments_updated_idx
+            ON stream_deployments (tenant_id, updated_at, deployment_id)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize stream_deployments updated index")?;
 
         sqlx::query(
             r#"
@@ -11914,6 +12015,48 @@ impl WorkflowStore {
         row.map(Self::decode_signal_row).transpose()
     }
 
+    pub async fn get_signal_any_status(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        signal_id: &str,
+    ) -> Result<Option<WorkflowSignalRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                signal_id,
+                signal_type,
+                dedupe_key,
+                payload,
+                status,
+                source_event_id,
+                dispatch_event_id,
+                consumed_event_id,
+                enqueued_at,
+                consumed_at,
+                updated_at
+            FROM workflow_signals
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND signal_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(signal_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load workflow signal regardless of status")?;
+
+        row.map(Self::decode_signal_row).transpose()
+    }
+
     pub async fn claim_signal_for_dispatch(
         &self,
         tenant_id: &str,
@@ -16331,129 +16474,336 @@ impl WorkflowStore {
         rows.into_iter().map(Self::decode_stream_job_row).collect()
     }
 
+    pub async fn list_stream_jobs_for_stream_instance_page(
+        &self,
+        tenant_id: &str,
+        stream_instance_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StreamJobRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_jobs
+            WHERE tenant_id = $1
+              AND stream_instance_id = $2
+            ORDER BY created_at DESC, stream_run_id DESC, job_id ASC
+            LIMIT $3
+            OFFSET $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(stream_instance_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list stream jobs by stream instance")?;
+        rows.into_iter().map(Self::decode_stream_job_row).collect()
+    }
+
+    pub async fn upsert_stream_deployment(
+        &self,
+        deployment: &StreamDeploymentRecord,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO stream_deployments (
+                tenant_id,
+                deployment_id,
+                definition_id,
+                definition_version,
+                artifact_hash,
+                desired_state,
+                rollout_phase,
+                rollout_generation,
+                active_stream_run_id,
+                active_job_id,
+                active_handle_id,
+                previous_stream_run_id,
+                rollout_checkpoint_name,
+                rollout_handoff_checkpoint_sequence,
+                failed_revision_id,
+                rollout_failure,
+                created_at,
+                updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
+            )
+            ON CONFLICT (tenant_id, deployment_id) DO UPDATE SET
+                definition_id = EXCLUDED.definition_id,
+                definition_version = EXCLUDED.definition_version,
+                artifact_hash = EXCLUDED.artifact_hash,
+                desired_state = EXCLUDED.desired_state,
+                rollout_phase = EXCLUDED.rollout_phase,
+                rollout_generation = EXCLUDED.rollout_generation,
+                active_stream_run_id = EXCLUDED.active_stream_run_id,
+                active_job_id = EXCLUDED.active_job_id,
+                active_handle_id = EXCLUDED.active_handle_id,
+                previous_stream_run_id = EXCLUDED.previous_stream_run_id,
+                rollout_checkpoint_name = EXCLUDED.rollout_checkpoint_name,
+                rollout_handoff_checkpoint_sequence =
+                    EXCLUDED.rollout_handoff_checkpoint_sequence,
+                failed_revision_id = EXCLUDED.failed_revision_id,
+                rollout_failure = EXCLUDED.rollout_failure,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(&deployment.tenant_id)
+        .bind(&deployment.deployment_id)
+        .bind(&deployment.definition_id)
+        .bind(deployment.definition_version.map(|value| value as i32))
+        .bind(&deployment.artifact_hash)
+        .bind(&deployment.desired_state)
+        .bind(&deployment.rollout_phase)
+        .bind(
+            i64::try_from(deployment.rollout_generation)
+                .context("stream deployment rollout_generation exceeds i64")?,
+        )
+        .bind(&deployment.active_stream_run_id)
+        .bind(&deployment.active_job_id)
+        .bind(&deployment.active_handle_id)
+        .bind(&deployment.previous_stream_run_id)
+        .bind(&deployment.rollout_checkpoint_name)
+        .bind(deployment.rollout_handoff_checkpoint_sequence)
+        .bind(&deployment.failed_revision_id)
+        .bind(&deployment.rollout_failure)
+        .bind(deployment.created_at)
+        .bind(deployment.updated_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert stream deployment")?;
+        Ok(())
+    }
+
+    pub async fn get_stream_deployment(
+        &self,
+        tenant_id: &str,
+        deployment_id: &str,
+    ) -> Result<Option<StreamDeploymentRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_deployments
+            WHERE tenant_id = $1
+              AND deployment_id = $2
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(deployment_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load stream deployment")?;
+        row.map(Self::decode_stream_deployment_row).transpose()
+    }
+
+    pub async fn list_stream_deployments_for_tenant_page(
+        &self,
+        tenant_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StreamDeploymentRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_deployments
+            WHERE tenant_id = $1
+            ORDER BY updated_at DESC, deployment_id ASC
+            LIMIT $2
+            OFFSET $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list stream deployments")?;
+        rows.into_iter().map(Self::decode_stream_deployment_row).collect()
+    }
+
+    pub async fn list_stream_deployments_page(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StreamDeploymentRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_deployments
+            ORDER BY updated_at DESC, tenant_id ASC, deployment_id ASC
+            LIMIT $1
+            OFFSET $2
+            "#,
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list stream deployments across tenants")?;
+        rows.into_iter().map(Self::decode_stream_deployment_row).collect()
+    }
+
     pub async fn upsert_stream_job_view_query(&self, view: &StreamJobViewRecord) -> Result<()> {
+        self.upsert_stream_job_view_queries(std::slice::from_ref(view)).await
+    }
+
+    pub async fn upsert_stream_job_view_queries(&self, views: &[StreamJobViewRecord]) -> Result<()> {
+        if views.is_empty() {
+            return Ok(());
+        }
+        const STREAM_JOB_VIEW_QUERY_BATCH_SIZE: usize = 256;
         let mut tx = self
             .pool
             .begin()
             .await
             .context("failed to open transaction for stream job view query upsert")?;
-        let tombstone = sqlx::query(
-            r#"
-            SELECT deleted_checkpoint_sequence, deleted_at
-            FROM stream_job_view_query_tombstone
-            WHERE tenant_id = $1
-              AND workflow_instance_id = $2
-              AND run_id = $3
-              AND job_id = $4
-              AND view_name = $5
-              AND logical_key = $6
-            "#,
-        )
-        .bind(&view.tenant_id)
-        .bind(&view.instance_id)
-        .bind(&view.run_id)
-        .bind(&view.job_id)
-        .bind(&view.view_name)
-        .bind(&view.logical_key)
-        .fetch_optional(&mut *tx)
-        .await
-        .context("failed to load stream job view query tombstone")?;
-        if let Some(row) = tombstone {
-            let deleted_checkpoint_sequence: i64 = row
-                .try_get("deleted_checkpoint_sequence")
-                .context("stream job view query tombstone deleted_checkpoint_sequence missing")?;
-            let deleted_at: DateTime<Utc> = row
-                .try_get("deleted_at")
-                .context("stream job view query tombstone deleted_at missing")?;
-            if deleted_checkpoint_sequence > view.checkpoint_sequence
-                || (deleted_checkpoint_sequence == view.checkpoint_sequence
-                    && deleted_at >= view.updated_at)
-            {
-                tx.commit()
-                    .await
-                    .context("failed to commit skipped stream job view upsert transaction")?;
-                return Ok(());
-            }
+        for batch in views.chunks(STREAM_JOB_VIEW_QUERY_BATCH_SIZE) {
+            let mut insert = QueryBuilder::<Postgres>::new(
+                r#"
+                INSERT INTO stream_job_view_query (
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    job_id,
+                    handle_id,
+                    view_name,
+                    logical_key,
+                    output,
+                    checkpoint_sequence,
+                    updated_at
+                )
+                SELECT
+                    v.tenant_id,
+                    v.workflow_instance_id,
+                    v.run_id,
+                    v.job_id,
+                    v.handle_id,
+                    v.view_name,
+                    v.logical_key,
+                    v.output,
+                    v.checkpoint_sequence,
+                    v.updated_at
+                FROM (
+                "#,
+            );
+            insert.push_values(batch, |mut row, view| {
+                row.push_bind(&view.tenant_id)
+                    .push_bind(&view.instance_id)
+                    .push_bind(&view.run_id)
+                    .push_bind(&view.job_id)
+                    .push_bind(&view.handle_id)
+                    .push_bind(&view.view_name)
+                    .push_bind(&view.logical_key)
+                    .push_bind(Json(&view.output))
+                    .push_bind(view.checkpoint_sequence)
+                    .push_bind(view.updated_at);
+            });
+            insert.push(
+                r#"
+                ) AS v(
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    job_id,
+                    handle_id,
+                    view_name,
+                    logical_key,
+                    output,
+                    checkpoint_sequence,
+                    updated_at
+                )
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM stream_job_view_query_tombstone tombstone
+                    WHERE tombstone.tenant_id = v.tenant_id
+                      AND tombstone.workflow_instance_id = v.workflow_instance_id
+                      AND tombstone.run_id = v.run_id
+                      AND tombstone.job_id = v.job_id
+                      AND tombstone.view_name = v.view_name
+                      AND tombstone.logical_key = v.logical_key
+                      AND (
+                            tombstone.deleted_checkpoint_sequence > v.checkpoint_sequence
+                         OR (
+                                tombstone.deleted_checkpoint_sequence = v.checkpoint_sequence
+                            AND tombstone.deleted_at >= v.updated_at
+                         )
+                      )
+                )
+                ON CONFLICT (
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    job_id,
+                    view_name,
+                    logical_key
+                ) DO UPDATE SET
+                    handle_id = EXCLUDED.handle_id,
+                    output = EXCLUDED.output,
+                    checkpoint_sequence = EXCLUDED.checkpoint_sequence,
+                    updated_at = EXCLUDED.updated_at
+                WHERE stream_job_view_query.checkpoint_sequence < EXCLUDED.checkpoint_sequence
+                   OR (
+                        stream_job_view_query.checkpoint_sequence = EXCLUDED.checkpoint_sequence
+                    AND stream_job_view_query.updated_at <= EXCLUDED.updated_at
+                   )
+                "#,
+            );
+            insert
+                .build()
+                .execute(&mut *tx)
+                .await
+                .context("failed to batch upsert stream job view query records")?;
+
+            let mut delete_tombstones = QueryBuilder::<Postgres>::new(
+                r#"
+                DELETE FROM stream_job_view_query_tombstone tombstone
+                USING (
+                "#,
+            );
+            delete_tombstones.push_values(batch, |mut row, view| {
+                row.push_bind(&view.tenant_id)
+                    .push_bind(&view.instance_id)
+                    .push_bind(&view.run_id)
+                    .push_bind(&view.job_id)
+                    .push_bind(&view.view_name)
+                    .push_bind(&view.logical_key)
+                    .push_bind(view.checkpoint_sequence)
+                    .push_bind(view.updated_at);
+            });
+            delete_tombstones.push(
+                r#"
+                ) AS v(
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    job_id,
+                    view_name,
+                    logical_key,
+                    checkpoint_sequence,
+                    updated_at
+                )
+                WHERE tombstone.tenant_id = v.tenant_id
+                  AND tombstone.workflow_instance_id = v.workflow_instance_id
+                  AND tombstone.run_id = v.run_id
+                  AND tombstone.job_id = v.job_id
+                  AND tombstone.view_name = v.view_name
+                  AND tombstone.logical_key = v.logical_key
+                  AND (
+                        tombstone.deleted_checkpoint_sequence < v.checkpoint_sequence
+                     OR (
+                            tombstone.deleted_checkpoint_sequence = v.checkpoint_sequence
+                        AND tombstone.deleted_at < v.updated_at
+                     )
+                  )
+                "#,
+            );
+            delete_tombstones
+                .build()
+                .execute(&mut *tx)
+                .await
+                .context("failed to clear stale stream job view query tombstones")?;
         }
-
-        sqlx::query(
-            r#"
-            INSERT INTO stream_job_view_query (
-                tenant_id,
-                workflow_instance_id,
-                run_id,
-                job_id,
-                handle_id,
-                view_name,
-                logical_key,
-                output,
-                checkpoint_sequence,
-                updated_at
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
-            )
-            ON CONFLICT (
-                tenant_id,
-                workflow_instance_id,
-                run_id,
-                job_id,
-                view_name,
-                logical_key
-            ) DO UPDATE SET
-                handle_id = EXCLUDED.handle_id,
-                output = EXCLUDED.output,
-                checkpoint_sequence = EXCLUDED.checkpoint_sequence,
-                updated_at = EXCLUDED.updated_at
-            WHERE stream_job_view_query.checkpoint_sequence < EXCLUDED.checkpoint_sequence
-               OR (
-                    stream_job_view_query.checkpoint_sequence = EXCLUDED.checkpoint_sequence
-                AND stream_job_view_query.updated_at <= EXCLUDED.updated_at
-               )
-            "#,
-        )
-        .bind(&view.tenant_id)
-        .bind(&view.instance_id)
-        .bind(&view.run_id)
-        .bind(&view.job_id)
-        .bind(&view.handle_id)
-        .bind(&view.view_name)
-        .bind(&view.logical_key)
-        .bind(Json(&view.output))
-        .bind(view.checkpoint_sequence)
-        .bind(view.updated_at)
-        .execute(&mut *tx)
-        .await
-        .context("failed to upsert stream job view query record")?;
-
-        sqlx::query(
-            r#"
-            DELETE FROM stream_job_view_query_tombstone
-            WHERE tenant_id = $1
-              AND workflow_instance_id = $2
-              AND run_id = $3
-              AND job_id = $4
-              AND view_name = $5
-              AND logical_key = $6
-              AND (
-                    deleted_checkpoint_sequence < $7
-                 OR (
-                        deleted_checkpoint_sequence = $7
-                    AND deleted_at < $8
-                 )
-              )
-            "#,
-        )
-        .bind(&view.tenant_id)
-        .bind(&view.instance_id)
-        .bind(&view.run_id)
-        .bind(&view.job_id)
-        .bind(&view.view_name)
-        .bind(&view.logical_key)
-        .bind(view.checkpoint_sequence)
-        .bind(view.updated_at)
-        .execute(&mut *tx)
-        .await
-        .context("failed to clear stale stream job view query tombstone")?;
 
         tx.commit().await.context("failed to commit stream job view query upsert transaction")?;
         Ok(())
@@ -16463,86 +16813,124 @@ impl WorkflowStore {
         &self,
         view: &StreamJobViewDeleteRecord,
     ) -> Result<()> {
+        self.delete_stream_job_view_queries(std::slice::from_ref(view)).await
+    }
+
+    pub async fn delete_stream_job_view_queries(
+        &self,
+        views: &[StreamJobViewDeleteRecord],
+    ) -> Result<()> {
+        if views.is_empty() {
+            return Ok(());
+        }
+        const STREAM_JOB_VIEW_QUERY_BATCH_SIZE: usize = 256;
         let mut tx = self
             .pool
             .begin()
             .await
             .context("failed to open transaction for stream job view delete")?;
-        sqlx::query(
-            r#"
-            INSERT INTO stream_job_view_query_tombstone (
-                tenant_id,
-                workflow_instance_id,
-                run_id,
-                job_id,
-                handle_id,
-                view_name,
-                logical_key,
-                deleted_checkpoint_sequence,
-                deleted_at
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9
-            )
-            ON CONFLICT (
-                tenant_id,
-                workflow_instance_id,
-                run_id,
-                job_id,
-                view_name,
-                logical_key
-            ) DO UPDATE SET
-                handle_id = EXCLUDED.handle_id,
-                deleted_checkpoint_sequence = EXCLUDED.deleted_checkpoint_sequence,
-                deleted_at = EXCLUDED.deleted_at
-            WHERE stream_job_view_query_tombstone.deleted_checkpoint_sequence < EXCLUDED.deleted_checkpoint_sequence
-               OR (
-                    stream_job_view_query_tombstone.deleted_checkpoint_sequence = EXCLUDED.deleted_checkpoint_sequence
-                AND stream_job_view_query_tombstone.deleted_at < EXCLUDED.deleted_at
-               )
-            "#,
-        )
-        .bind(&view.tenant_id)
-        .bind(&view.instance_id)
-        .bind(&view.run_id)
-        .bind(&view.job_id)
-        .bind(&view.handle_id)
-        .bind(&view.view_name)
-        .bind(&view.logical_key)
-        .bind(view.checkpoint_sequence)
-        .bind(view.evicted_at)
-        .execute(&mut *tx)
-        .await
-        .context("failed to upsert stream job view query tombstone")?;
+        for batch in views.chunks(STREAM_JOB_VIEW_QUERY_BATCH_SIZE) {
+            let mut tombstones = QueryBuilder::<Postgres>::new(
+                r#"
+                INSERT INTO stream_job_view_query_tombstone (
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    job_id,
+                    handle_id,
+                    view_name,
+                    logical_key,
+                    deleted_checkpoint_sequence,
+                    deleted_at
+                )
+                "#,
+            );
+            tombstones.push_values(batch, |mut row, view| {
+                row.push_bind(&view.tenant_id)
+                    .push_bind(&view.instance_id)
+                    .push_bind(&view.run_id)
+                    .push_bind(&view.job_id)
+                    .push_bind(&view.handle_id)
+                    .push_bind(&view.view_name)
+                    .push_bind(&view.logical_key)
+                    .push_bind(view.checkpoint_sequence)
+                    .push_bind(view.evicted_at);
+            });
+            tombstones.push(
+                r#"
+                ON CONFLICT (
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    job_id,
+                    view_name,
+                    logical_key
+                ) DO UPDATE SET
+                    handle_id = EXCLUDED.handle_id,
+                    deleted_checkpoint_sequence = EXCLUDED.deleted_checkpoint_sequence,
+                    deleted_at = EXCLUDED.deleted_at
+                WHERE stream_job_view_query_tombstone.deleted_checkpoint_sequence < EXCLUDED.deleted_checkpoint_sequence
+                   OR (
+                        stream_job_view_query_tombstone.deleted_checkpoint_sequence = EXCLUDED.deleted_checkpoint_sequence
+                    AND stream_job_view_query_tombstone.deleted_at < EXCLUDED.deleted_at
+                   )
+                "#,
+            );
+            tombstones
+                .build()
+                .execute(&mut *tx)
+                .await
+                .context("failed to batch upsert stream job view query tombstones")?;
 
-        sqlx::query(
-            r#"
-            DELETE FROM stream_job_view_query
-            WHERE tenant_id = $1
-              AND workflow_instance_id = $2
-              AND run_id = $3
-              AND job_id = $4
-              AND view_name = $5
-              AND logical_key = $6
-              AND (
-                    checkpoint_sequence < $7
-                 OR (
-                        checkpoint_sequence = $7
-                    AND updated_at <= $8
-                 )
-              )
-            "#,
-        )
-        .bind(&view.tenant_id)
-        .bind(&view.instance_id)
-        .bind(&view.run_id)
-        .bind(&view.job_id)
-        .bind(&view.view_name)
-        .bind(&view.logical_key)
-        .bind(view.checkpoint_sequence)
-        .bind(view.evicted_at)
-        .execute(&mut *tx)
-        .await
-        .context("failed to delete stream job view query record")?;
+            let mut deletes = QueryBuilder::<Postgres>::new(
+                r#"
+                DELETE FROM stream_job_view_query live
+                USING (
+                "#,
+            );
+            deletes.push_values(batch, |mut row, view| {
+                row.push_bind(&view.tenant_id)
+                    .push_bind(&view.instance_id)
+                    .push_bind(&view.run_id)
+                    .push_bind(&view.job_id)
+                    .push_bind(&view.view_name)
+                    .push_bind(&view.logical_key)
+                    .push_bind(view.checkpoint_sequence)
+                    .push_bind(view.evicted_at);
+            });
+            deletes.push(
+                r#"
+                ) AS v(
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    job_id,
+                    view_name,
+                    logical_key,
+                    checkpoint_sequence,
+                    evicted_at
+                )
+                WHERE live.tenant_id = v.tenant_id
+                  AND live.workflow_instance_id = v.workflow_instance_id
+                  AND live.run_id = v.run_id
+                  AND live.job_id = v.job_id
+                  AND live.view_name = v.view_name
+                  AND live.logical_key = v.logical_key
+                  AND (
+                        live.checkpoint_sequence < v.checkpoint_sequence
+                     OR (
+                            live.checkpoint_sequence = v.checkpoint_sequence
+                        AND live.updated_at <= v.evicted_at
+                     )
+                  )
+                "#,
+            );
+            deletes
+                .build()
+                .execute(&mut *tx)
+                .await
+                .context("failed to batch delete stream job view query records")?;
+        }
 
         tx.commit().await.context("failed to commit stream job view delete transaction")?;
         Ok(())
@@ -17245,7 +17633,7 @@ impl WorkflowStore {
             r#"
             SELECT *
             FROM stream_job_bridge_handles
-            WHERE status IN ('admitted', 'running', 'cancellation_requested')
+            WHERE status IN ('admitted', 'running', 'paused', 'cancellation_requested')
             ORDER BY updated_at ASC, created_at ASC, handle_id ASC
             LIMIT $1
             OFFSET $2
@@ -23354,6 +23742,66 @@ impl WorkflowStore {
         })
     }
 
+    fn decode_stream_deployment_row(row: sqlx::postgres::PgRow) -> Result<StreamDeploymentRecord> {
+        Ok(StreamDeploymentRecord {
+            tenant_id: row.try_get("tenant_id").context("stream deployment tenant_id missing")?,
+            deployment_id: row
+                .try_get("deployment_id")
+                .context("stream deployment deployment_id missing")?,
+            definition_id: row
+                .try_get("definition_id")
+                .context("stream deployment definition_id missing")?,
+            definition_version: row
+                .try_get::<Option<i32>, _>("definition_version")
+                .context("stream deployment definition_version missing")?
+                .map(|value| value as u32),
+            artifact_hash: row
+                .try_get("artifact_hash")
+                .context("stream deployment artifact_hash missing")?,
+            desired_state: row
+                .try_get("desired_state")
+                .context("stream deployment desired_state missing")?,
+            rollout_phase: row
+                .try_get("rollout_phase")
+                .context("stream deployment rollout_phase missing")?,
+            rollout_generation: u64::try_from(
+                row.try_get::<i64, _>("rollout_generation")
+                    .context("stream deployment rollout_generation missing")?,
+            )
+            .context("stream deployment rollout_generation cannot be negative")?,
+            active_stream_run_id: row
+                .try_get("active_stream_run_id")
+                .context("stream deployment active_stream_run_id missing")?,
+            active_job_id: row
+                .try_get("active_job_id")
+                .context("stream deployment active_job_id missing")?,
+            active_handle_id: row
+                .try_get("active_handle_id")
+                .context("stream deployment active_handle_id missing")?,
+            previous_stream_run_id: row
+                .try_get("previous_stream_run_id")
+                .context("stream deployment previous_stream_run_id missing")?,
+            rollout_checkpoint_name: row
+                .try_get("rollout_checkpoint_name")
+                .context("stream deployment rollout_checkpoint_name missing")?,
+            rollout_handoff_checkpoint_sequence: row
+                .try_get("rollout_handoff_checkpoint_sequence")
+                .context("stream deployment rollout_handoff_checkpoint_sequence missing")?,
+            failed_revision_id: row
+                .try_get("failed_revision_id")
+                .context("stream deployment failed_revision_id missing")?,
+            rollout_failure: row
+                .try_get("rollout_failure")
+                .context("stream deployment rollout_failure missing")?,
+            created_at: row
+                .try_get("created_at")
+                .context("stream deployment created_at missing")?,
+            updated_at: row
+                .try_get("updated_at")
+                .context("stream deployment updated_at missing")?,
+        })
+    }
+
     fn decode_stream_job_bridge_checkpoint_row(
         row: sqlx::postgres::PgRow,
     ) -> Result<StreamJobCheckpointRecord> {
@@ -23986,13 +24434,20 @@ mod tests {
                 runtime: "keyed_rollup".to_owned(),
                 source: fabrik_throughput::CompiledStreamSource {
                     kind: "bounded_input".to_owned(),
+                    name: None,
                     binding: None,
+                    config: None,
                 },
                 key_by: Some("accountId".to_owned()),
+                states: vec![],
                 operators: vec![
                     fabrik_throughput::CompiledStreamOperator {
                         kind: "reduce".to_owned(),
+                        operator_id: None,
                         name: Some("sum-account-totals".to_owned()),
+                        inputs: vec![],
+                        outputs: vec![],
+                        state_ids: vec![],
                         config: Some(json!({
                             "reducer": "sum",
                             "value_field": "amount",
@@ -24001,7 +24456,11 @@ mod tests {
                     },
                     fabrik_throughput::CompiledStreamOperator {
                         kind: "emit_checkpoint".to_owned(),
+                        operator_id: None,
                         name: Some(checkpoint_name.to_owned()),
+                        inputs: vec![],
+                        outputs: vec![],
+                        state_ids: vec![],
                         config: Some(json!({"sequence": 1})),
                     },
                 ],
@@ -24015,18 +24474,25 @@ mod tests {
                     name: "accountTotals".to_owned(),
                     consistency: "strong".to_owned(),
                     query_mode: "by_key".to_owned(),
+                    view_id: None,
                     key_field: Some("accountId".to_owned()),
                     value_fields: vec![
                         "accountId".to_owned(),
                         "totalAmount".to_owned(),
                         "asOfCheckpoint".to_owned(),
                     ],
+                    supported_consistencies: vec![],
+                    retention_seconds: None,
                 }],
                 queries: vec![fabrik_throughput::CompiledStreamQuery {
                     name: "accountTotals".to_owned(),
                     view_name: "accountTotals".to_owned(),
                     consistency: "strong".to_owned(),
+                    query_id: None,
+                    arg_fields: vec![],
                 }],
+                classification: None,
+                metadata: None,
             },
             artifact_hash: String::new(),
         };
@@ -27105,7 +27571,10 @@ mod tests {
 
     #[tokio::test]
     async fn stream_job_view_query_tombstone_prevents_stale_resurrection() -> Result<()> {
-        let store = test_store().await?;
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
         let now = Utc::now();
         let view = StreamJobViewRecord {
             tenant_id: "tenant-a".to_owned(),
@@ -27162,6 +27631,142 @@ mod tests {
         assert_eq!(summary.latest_checkpoint_sequence, None);
         assert_eq!(summary.latest_deleted_checkpoint_sequence, Some(5));
         assert_eq!(summary.latest_deleted_at, Some(now + chrono::Duration::seconds(10)));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_deployments_round_trip_and_list_revisions() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+        let rev1 = StreamJobRecord {
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "deploy-a".to_owned(),
+            run_id: "rev-1".to_owned(),
+            stream_instance_id: "deploy-a".to_owned(),
+            stream_run_id: "rev-1".to_owned(),
+            job_id: "deploy-a-job".to_owned(),
+            handle_id: "stream-job-handle:tenant-a:deploy-a:rev-1:deploy-a-job".to_owned(),
+            protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+            workflow_event_id: Uuid::now_v7(),
+            bridge_request_id: "stream-job-bridge:tenant-a:deploy-a:rev-1:deploy-a-job".to_owned(),
+            origin_kind: StreamJobOriginKind::Standalone.as_str().to_owned(),
+            definition_id: "fraud-stream".to_owned(),
+            definition_version: Some(1),
+            artifact_hash: Some("artifact-v1".to_owned()),
+            job_name: "fraud-stream".to_owned(),
+            input_ref: "topic:payments".to_owned(),
+            config_ref: None,
+            checkpoint_policy: None,
+            view_definitions: None,
+            status: StreamJobStatus::Draining.as_str().to_owned(),
+            workflow_owner_epoch: None,
+            stream_owner_epoch: Some(1),
+            starting_at: Some(now),
+            running_at: Some(now),
+            draining_at: Some(now + chrono::Duration::seconds(10)),
+            latest_checkpoint_name: Some("rollup-ready".to_owned()),
+            latest_checkpoint_sequence: Some(1),
+            latest_checkpoint_at: Some(now + chrono::Duration::seconds(5)),
+            latest_checkpoint_output: None,
+            cancellation_requested_at: Some(now + chrono::Duration::seconds(10)),
+            cancellation_reason: Some("deploy rollout".to_owned()),
+            workflow_accepted_at: None,
+            terminal_event_id: None,
+            terminal_at: None,
+            terminal_output: None,
+            terminal_error: None,
+            created_at: now,
+            updated_at: now + chrono::Duration::seconds(10),
+        };
+        let rev2 = StreamJobRecord {
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "deploy-a".to_owned(),
+            run_id: "rev-2".to_owned(),
+            stream_instance_id: "deploy-a".to_owned(),
+            stream_run_id: "rev-2".to_owned(),
+            job_id: "deploy-a-job".to_owned(),
+            handle_id: "stream-job-handle:tenant-a:deploy-a:rev-2:deploy-a-job".to_owned(),
+            protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+            workflow_event_id: Uuid::now_v7(),
+            bridge_request_id: "stream-job-bridge:tenant-a:deploy-a:rev-2:deploy-a-job".to_owned(),
+            origin_kind: StreamJobOriginKind::Standalone.as_str().to_owned(),
+            definition_id: "fraud-stream".to_owned(),
+            definition_version: Some(2),
+            artifact_hash: Some("artifact-v2".to_owned()),
+            job_name: "fraud-stream".to_owned(),
+            input_ref: "topic:payments".to_owned(),
+            config_ref: None,
+            checkpoint_policy: None,
+            view_definitions: None,
+            status: StreamJobStatus::Running.as_str().to_owned(),
+            workflow_owner_epoch: None,
+            stream_owner_epoch: Some(2),
+            starting_at: Some(now + chrono::Duration::seconds(11)),
+            running_at: Some(now + chrono::Duration::seconds(11)),
+            draining_at: None,
+            latest_checkpoint_name: Some("rollup-ready".to_owned()),
+            latest_checkpoint_sequence: Some(2),
+            latest_checkpoint_at: Some(now + chrono::Duration::seconds(15)),
+            latest_checkpoint_output: None,
+            cancellation_requested_at: None,
+            cancellation_reason: None,
+            workflow_accepted_at: None,
+            terminal_event_id: None,
+            terminal_at: None,
+            terminal_output: None,
+            terminal_error: None,
+            created_at: now + chrono::Duration::seconds(11),
+            updated_at: now + chrono::Duration::seconds(15),
+        };
+        store.upsert_stream_job(&rev1).await?;
+        store.upsert_stream_job(&rev2).await?;
+
+        store
+            .upsert_stream_deployment(&StreamDeploymentRecord {
+                tenant_id: "tenant-a".to_owned(),
+                deployment_id: "deploy-a".to_owned(),
+                definition_id: "fraud-stream".to_owned(),
+                definition_version: Some(2),
+                artifact_hash: Some("artifact-v2".to_owned()),
+                desired_state: "running".to_owned(),
+                rollout_generation: 2,
+                active_stream_run_id: Some("rev-2".to_owned()),
+                active_job_id: Some("deploy-a-job".to_owned()),
+                active_handle_id: Some(rev2.handle_id.clone()),
+                previous_stream_run_id: Some("rev-1".to_owned()),
+                rollout_checkpoint_name: Some("rollup-ready".to_owned()),
+                rollout_phase: "steady".to_owned(),
+                rollout_handoff_checkpoint_sequence: None,
+                failed_revision_id: None,
+                rollout_failure: None,
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(15),
+            })
+            .await?;
+
+        let stored = store
+            .get_stream_deployment("tenant-a", "deploy-a")
+            .await?
+            .context("stream deployment should exist")?;
+        assert_eq!(stored.rollout_generation, 2);
+        assert_eq!(stored.active_stream_run_id.as_deref(), Some("rev-2"));
+        assert_eq!(stored.previous_stream_run_id.as_deref(), Some("rev-1"));
+
+        let listed = store.list_stream_deployments_for_tenant_page("tenant-a", 10, 0).await?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].deployment_id, "deploy-a");
+
+        let revisions =
+            store.list_stream_jobs_for_stream_instance_page("tenant-a", "deploy-a", 10, 0).await?;
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(revisions[0].stream_run_id, "rev-2");
+        assert_eq!(revisions[1].stream_run_id, "rev-1");
 
         Ok(())
     }

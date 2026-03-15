@@ -121,6 +121,81 @@ test("stream compiler emits aggregate-v2 artifacts with widened schema", async (
   assert.ok(artifact.source_map.states);
 });
 
+test("stream compiler emits aggregate-v2 map artifacts", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/aggregate-v2-map-stream-job.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "fraudMapStreamJob",
+    "--definition-id",
+    "fraud-map",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+
+  assert.equal(artifact.runtime_contract, "streams_kernel_v2");
+  assert.equal(artifact.job.runtime, "aggregate_v2");
+  assert.equal(artifact.job.operators[0].kind, "map");
+  assert.equal(artifact.job.operators[0].config.inputField, "riskPoints");
+  assert.equal(artifact.job.operators[0].config.outputField, "risk");
+  assert.equal(artifact.job.operators[0].config.multiplyBy, 0.01);
+  assert.equal(artifact.job.operators[1].config.valueField, "risk");
+});
+
+test("stream compiler accepts aggregate-v2 filter then map ordering", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/aggregate-v2-filter-map-stream-job.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "fraudFilterMapStreamJob",
+    "--definition-id",
+    "fraud-filter-map",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+
+  assert.equal(artifact.runtime_contract, "streams_kernel_v2");
+  assert.equal(artifact.job.runtime, "aggregate_v2");
+  assert.equal(artifact.job.operators[0].kind, "filter");
+  assert.equal(artifact.job.operators[1].kind, "map");
+  assert.equal(artifact.job.operators[1].config.outputField, "risk");
+});
+
+test("stream compiler emits aggregate-v2 route artifacts", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/aggregate-v2-route-stream-job.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "fraudRouteStreamJob",
+    "--definition-id",
+    "fraud-route",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+
+  assert.equal(artifact.runtime_contract, "streams_kernel_v2");
+  assert.equal(artifact.job.runtime, "aggregate_v2");
+  assert.equal(artifact.job.operators[0].kind, "route");
+  assert.equal(artifact.job.operators[0].config.outputField, "riskBucket");
+  assert.equal(artifact.job.operators[0].config.branches[0].value, "high");
+  assert.equal(artifact.job.operators[1].kind, "filter");
+});
+
 test("stream compiler emits threshold aggregate-v2 artifacts", async () => {
   const fixture = path.join(
     root,

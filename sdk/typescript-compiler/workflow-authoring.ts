@@ -89,6 +89,21 @@ type StreamJobQueryArgs<TDefinition> =
 type StreamJobQueryResult<TDefinition> =
   TDefinition extends StreamJobQueryDefinition<any, infer TResult> ? TResult : JsonValue;
 
+export type StreamJobCheckpointFor<
+  TJob extends StreamJobTypes<any, any, any, any, any>,
+  TCheckpointName extends Extract<keyof TJob["checkpoints"], string>,
+> = TJob["checkpoints"][TCheckpointName];
+
+export type StreamJobQueryArgsFor<
+  TJob extends StreamJobTypes<any, any, any, any, any>,
+  TQueryName extends Extract<keyof TJob["queries"], string>,
+> = StreamJobQueryArgs<TJob["queries"][TQueryName]>;
+
+export type StreamJobQueryResultFor<
+  TJob extends StreamJobTypes<any, any, any, any, any>,
+  TQueryName extends Extract<keyof TJob["queries"], string>,
+> = StreamJobQueryResult<TJob["queries"][TQueryName]>;
+
 export interface StreamJobHandle<
   TCheckpoints extends StreamJobCheckpointMap = StreamJobCheckpointMap,
   TQueries extends StreamJobQueryMap = StreamJobQueryMap,
@@ -96,6 +111,9 @@ export interface StreamJobHandle<
 > {
   readonly jobId: string;
   readonly handleId?: string;
+  awaitCheckpoint<TCheckpointName extends Extract<keyof TCheckpoints, string>>(
+    checkpointName: TCheckpointName,
+  ): Promise<TCheckpoints[TCheckpointName]>;
   untilCheckpoint<TCheckpointName extends Extract<keyof TCheckpoints, string>>(
     checkpointName: TCheckpointName,
   ): Promise<TCheckpoints[TCheckpointName]>;
@@ -104,6 +122,7 @@ export interface StreamJobHandle<
     args: StreamJobQueryArgs<TQueries[TQueryName]>,
     options?: StreamJobQueryOptions,
   ): Promise<StreamJobQueryResult<TQueries[TQueryName]>>;
+  awaitTerminal(): Promise<TTerminal>;
   result(): Promise<TTerminal>;
   cancel(reason?: JsonValue): Promise<void>;
 }

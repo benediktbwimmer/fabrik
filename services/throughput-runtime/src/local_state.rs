@@ -555,6 +555,62 @@ pub(crate) enum StreamJobViewOverlayEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalStreamJobRouteBranchRuntimeStatsState {
+    pub(crate) value: String,
+    #[serde(default)]
+    pub(crate) matched_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalStreamJobPreKeyRuntimeStatsState {
+    pub(crate) operator_id: String,
+    pub(crate) kind: String,
+    #[serde(default)]
+    pub(crate) processed_count: u64,
+    #[serde(default)]
+    pub(crate) dropped_count: u64,
+    #[serde(default)]
+    pub(crate) failure_count: u64,
+    #[serde(default)]
+    pub(crate) route_default_count: u64,
+    #[serde(default)]
+    pub(crate) route_branch_counts: Vec<LocalStreamJobRouteBranchRuntimeStatsState>,
+    #[serde(default)]
+    pub(crate) last_failure: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalStreamJobHotKeyRuntimeStatsState {
+    pub(crate) display_key: String,
+    pub(crate) logical_key: String,
+    #[serde(default)]
+    pub(crate) observed_count: u64,
+    #[serde(default)]
+    pub(crate) source_partition_ids: Vec<i32>,
+    #[serde(default)]
+    pub(crate) last_seen_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalStreamJobOwnerPartitionRuntimeStatsState {
+    pub(crate) stream_partition_id: i32,
+    #[serde(default)]
+    pub(crate) observed_batch_count: u64,
+    #[serde(default)]
+    pub(crate) observed_item_count: u64,
+    #[serde(default)]
+    pub(crate) last_batch_item_count: u64,
+    #[serde(default)]
+    pub(crate) max_batch_item_count: u64,
+    #[serde(default)]
+    pub(crate) state_key_count: u64,
+    #[serde(default)]
+    pub(crate) source_partition_ids: Vec<i32>,
+    #[serde(default)]
+    pub(crate) last_updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct LocalStreamJobRuntimeState {
     pub(crate) handle_id: String,
     pub(crate) job_id: String,
@@ -565,6 +621,8 @@ pub(crate) struct LocalStreamJobRuntimeState {
     pub(crate) input_item_count: u64,
     pub(crate) materialized_key_count: u64,
     pub(crate) active_partitions: Vec<i32>,
+    #[serde(default)]
+    pub(crate) throughput_partition_count: i32,
     #[serde(default)]
     pub(crate) source_kind: Option<String>,
     #[serde(default)]
@@ -592,6 +650,12 @@ pub(crate) struct LocalStreamJobRuntimeState {
     pub(crate) last_evicted_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub(crate) view_runtime_stats: Vec<LocalStreamJobViewRuntimeStatsState>,
+    #[serde(default)]
+    pub(crate) pre_key_runtime_stats: Vec<LocalStreamJobPreKeyRuntimeStatsState>,
+    #[serde(default)]
+    pub(crate) hot_key_runtime_stats: Vec<LocalStreamJobHotKeyRuntimeStatsState>,
+    #[serde(default)]
+    pub(crate) owner_partition_runtime_stats: Vec<LocalStreamJobOwnerPartitionRuntimeStatsState>,
     #[serde(default)]
     pub(crate) checkpoint_partitions: Vec<LocalStreamJobCheckpointState>,
     pub(crate) terminal_status: Option<String>,
@@ -654,6 +718,169 @@ impl LocalStreamJobRuntimeState {
             return;
         }
         self.checkpoint_partitions.push(checkpoint);
+    }
+
+    pub(crate) fn merge_pre_key_runtime_stats(
+        &mut self,
+        updates: &[LocalStreamJobPreKeyRuntimeStatsState],
+    ) {
+        for update in updates {
+            let stats = if let Some(existing) = self
+                .pre_key_runtime_stats
+                .iter_mut()
+                .find(|existing| existing.operator_id == update.operator_id)
+            {
+                existing
+            } else {
+                self.pre_key_runtime_stats.push(update.clone());
+                self.pre_key_runtime_stats
+                    .last_mut()
+                    .expect("pre-key runtime stats should exist after insertion")
+            };
+            stats.kind = update.kind.clone();
+            stats.processed_count = stats.processed_count.saturating_add(update.processed_count);
+            stats.dropped_count = stats.dropped_count.saturating_add(update.dropped_count);
+            stats.failure_count = stats.failure_count.saturating_add(update.failure_count);
+            stats.route_default_count =
+                stats.route_default_count.saturating_add(update.route_default_count);
+            if update.last_failure.is_some() {
+                stats.last_failure = update.last_failure.clone();
+            }
+            for branch in &update.route_branch_counts {
+                if let Some(existing_branch) = stats
+                    .route_branch_counts
+                    .iter_mut()
+                    .find(|existing| existing.value == branch.value)
+                {
+                    existing_branch.matched_count =
+                        existing_branch.matched_count.saturating_add(branch.matched_count);
+                } else {
+                    stats.route_branch_counts.push(branch.clone());
+                }
+            }
+        }
+    }
+
+    pub(crate) fn merge_hot_key_runtime_stats(
+        &mut self,
+        updates: &[LocalStreamJobHotKeyRuntimeStatsState],
+        limit: usize,
+    ) {
+        for update in updates {
+            let stats = if let Some(existing) = self
+                .hot_key_runtime_stats
+                .iter_mut()
+                .find(|existing| existing.display_key == update.display_key)
+            {
+                existing
+            } else {
+                self.hot_key_runtime_stats.push(update.clone());
+                self.hot_key_runtime_stats
+                    .last_mut()
+                    .expect("hot key runtime stats should exist after insertion")
+            };
+            stats.logical_key = update.logical_key.clone();
+            stats.observed_count = stats.observed_count.saturating_add(update.observed_count);
+            for source_partition_id in &update.source_partition_ids {
+                if !stats.source_partition_ids.contains(source_partition_id) {
+                    stats.source_partition_ids.push(*source_partition_id);
+                }
+            }
+            stats.source_partition_ids.sort_unstable();
+            if update.last_seen_at.is_some() {
+                stats.last_seen_at = match (stats.last_seen_at, update.last_seen_at) {
+                    (Some(existing), Some(update)) => Some(existing.max(update)),
+                    (None, Some(update)) => Some(update),
+                    (existing, None) => existing,
+                };
+            }
+        }
+        self.hot_key_runtime_stats.sort_by(|left, right| {
+            right
+                .observed_count
+                .cmp(&left.observed_count)
+                .then_with(|| left.display_key.cmp(&right.display_key))
+        });
+        if self.hot_key_runtime_stats.len() > limit {
+            self.hot_key_runtime_stats.truncate(limit);
+        }
+    }
+
+    pub(crate) fn merge_owner_partition_runtime_stats(
+        &mut self,
+        updates: &[LocalStreamJobOwnerPartitionRuntimeStatsState],
+    ) {
+        for update in updates {
+            let stats = if let Some(existing) = self
+                .owner_partition_runtime_stats
+                .iter_mut()
+                .find(|existing| existing.stream_partition_id == update.stream_partition_id)
+            {
+                existing
+            } else {
+                self.owner_partition_runtime_stats.push(update.clone());
+                self.owner_partition_runtime_stats
+                    .last_mut()
+                    .expect("owner partition runtime stats should exist after insertion")
+            };
+            stats.observed_batch_count =
+                stats.observed_batch_count.saturating_add(update.observed_batch_count);
+            stats.observed_item_count =
+                stats.observed_item_count.saturating_add(update.observed_item_count);
+            stats.last_batch_item_count = update.last_batch_item_count;
+            stats.max_batch_item_count =
+                stats.max_batch_item_count.max(update.max_batch_item_count);
+            stats.state_key_count = stats.state_key_count.saturating_add(update.state_key_count);
+            for source_partition_id in &update.source_partition_ids {
+                if !stats.source_partition_ids.contains(source_partition_id) {
+                    stats.source_partition_ids.push(*source_partition_id);
+                }
+            }
+            stats.source_partition_ids.sort_unstable();
+            if update.last_updated_at.is_some() {
+                stats.last_updated_at = match (stats.last_updated_at, update.last_updated_at) {
+                    (Some(existing), Some(update)) => Some(existing.max(update)),
+                    (None, Some(update)) => Some(update),
+                    (existing, None) => existing,
+                };
+            }
+        }
+        self.owner_partition_runtime_stats.sort_by_key(|stats| stats.stream_partition_id);
+    }
+
+    pub(crate) fn record_owner_partition_state_key_delta(
+        &mut self,
+        stream_partition_id: i32,
+        state_key_delta: u64,
+        updated_at: DateTime<Utc>,
+    ) {
+        let stats = if let Some(existing) = self
+            .owner_partition_runtime_stats
+            .iter_mut()
+            .find(|existing| existing.stream_partition_id == stream_partition_id)
+        {
+            existing
+        } else {
+            self.owner_partition_runtime_stats.push(
+                LocalStreamJobOwnerPartitionRuntimeStatsState {
+                    stream_partition_id,
+                    observed_batch_count: 0,
+                    observed_item_count: 0,
+                    last_batch_item_count: 0,
+                    max_batch_item_count: 0,
+                    state_key_count: 0,
+                    source_partition_ids: Vec::new(),
+                    last_updated_at: Some(updated_at),
+                },
+            );
+            self.owner_partition_runtime_stats
+                .last_mut()
+                .expect("owner partition runtime stats should exist after insertion")
+        };
+        stats.state_key_count = stats.state_key_count.saturating_add(state_key_delta);
+        stats.last_updated_at =
+            Some(stats.last_updated_at.map_or(updated_at, |current| current.max(updated_at)));
+        self.owner_partition_runtime_stats.sort_by_key(|stats| stats.stream_partition_id);
     }
 }
 

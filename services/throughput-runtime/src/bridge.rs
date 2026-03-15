@@ -4,11 +4,11 @@ use fabrik_broker::{decode_consumed_workflow_event, decode_json_record};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_store::{StreamJobCheckpointRecord, StreamJobRecord};
 use fabrik_throughput::{
-    CancelStreamJobCommand, STREAM_SOURCE_TOPIC, ScheduleStreamJobCommand,
-    StreamJobBridgeHandleStatus, StreamJobCheckpointStatus, StreamJobOriginKind,
-    StreamJobQueryConsistency, StreamJobQueryStatus, StreamJobStatus, ThroughputBackend,
-    ThroughputBatchIdentity, ThroughputCommand, ThroughputCommandEnvelope, ThroughputRunStatus,
-    stream_job_bridge_request_id, stream_job_callback_event_id,
+    CancelStreamJobCommand, PauseStreamJobCommand, ResumeStreamJobCommand, STREAM_SOURCE_TOPIC,
+    ScheduleStreamJobCommand, StreamJobBridgeHandleStatus, StreamJobCheckpointStatus,
+    StreamJobOriginKind, StreamJobQueryConsistency, StreamJobQueryStatus, StreamJobStatus,
+    ThroughputBackend, ThroughputBatchIdentity, ThroughputCommand, ThroughputCommandEnvelope,
+    ThroughputRunStatus, stream_job_bridge_request_id, stream_job_callback_event_id,
     stream_job_checkpoint_callback_dedupe_key, stream_job_query_callback_dedupe_key,
     stream_job_signal_callback_dedupe_key, stream_job_terminal_callback_dedupe_key,
 };
@@ -29,6 +29,16 @@ use crate::{
     },
     workflow_event_from_throughput_command,
 };
+
+const STREAM_DEPLOYMENT_PHASE_RUNNING: &str = "running";
+const STREAM_DEPLOYMENT_PHASE_PENDING_CHECKPOINT: &str = "pending_checkpoint";
+const STREAM_DEPLOYMENT_PHASE_HANDOFF_IN_PROGRESS: &str = "handoff_in_progress";
+const STREAM_DEPLOYMENT_PHASE_STABILIZING: &str = "stabilizing";
+const STREAM_DEPLOYMENT_PHASE_PAUSED: &str = "paused";
+const STREAM_DEPLOYMENT_PHASE_DRAINING: &str = "draining";
+const STREAM_DEPLOYMENT_PHASE_ROLLBACK_PENDING: &str = "rollback_pending";
+const STREAM_DEPLOYMENT_PHASE_ROLLED_BACK: &str = "rolled_back";
+const STREAM_DEPLOYMENT_PHASE_FAILED: &str = "failed";
 
 pub(super) async fn run_bridge_loop(
     state: AppState,
@@ -318,6 +328,14 @@ async fn sync_stream_job_record(
                 record.running_at = Some(occurred_at);
             }
         }
+        StreamJobStatus::Paused => {
+            if record.starting_at.is_none() {
+                record.starting_at = Some(occurred_at);
+            }
+            if record.running_at.is_none() {
+                record.running_at = Some(occurred_at);
+            }
+        }
         StreamJobStatus::Draining => {
             if record.starting_at.is_none() {
                 record.starting_at = Some(occurred_at);
@@ -381,6 +399,819 @@ fn should_emit_workflow_callbacks(handle: &fabrik_store::StreamJobBridgeHandleRe
     !matches!(handle.parsed_origin_kind(), Some(StreamJobOriginKind::Standalone))
 }
 
+fn rollout_checkpoint_reached(
+    job: &StreamJobRecord,
+    rollout_checkpoint_name: Option<&str>,
+) -> bool {
+    rollout_checkpoint_name.is_none_or(|checkpoint_name| {
+        job.latest_checkpoint_name.as_deref() == Some(checkpoint_name)
+            && job.latest_checkpoint_at.is_some()
+    })
+}
+
+fn rollout_stable_after_handoff(
+    job: &StreamJobRecord,
+    handoff_checkpoint_sequence: Option<i64>,
+    rollout_checkpoint_name: Option<&str>,
+) -> bool {
+    if !rollout_checkpoint_reached(job, rollout_checkpoint_name) {
+        return false;
+    }
+    match (job.latest_checkpoint_sequence, handoff_checkpoint_sequence) {
+        (Some(current), Some(handoff)) => current > handoff,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+async fn persist_stream_deployment(
+    state: &AppState,
+    deployment: &mut fabrik_store::StreamDeploymentRecord,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    deployment.updated_at = occurred_at;
+    state.store.upsert_stream_deployment(deployment).await
+}
+
+async fn set_deployment_phase(
+    state: &AppState,
+    deployment: &mut fabrik_store::StreamDeploymentRecord,
+    phase: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    if deployment.rollout_phase == phase {
+        return Ok(());
+    }
+    deployment.rollout_phase = phase.to_owned();
+    persist_stream_deployment(state, deployment, occurred_at).await
+}
+
+async fn mark_stream_job_drain_requested(
+    state: &AppState,
+    handle: &mut fabrik_store::StreamJobBridgeHandleRecord,
+    occurred_at: DateTime<Utc>,
+    reason: &str,
+) -> Result<()> {
+    if handle.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal)
+        || handle.cancellation_requested_at.is_some()
+    {
+        return Ok(());
+    }
+    handle.status = StreamJobBridgeHandleStatus::CancellationRequested.as_str().to_owned();
+    handle.cancellation_requested_at = Some(occurred_at);
+    handle.cancellation_reason = Some(reason.to_owned());
+    handle.updated_at = occurred_at;
+    state.store.upsert_stream_job_callback_handle(handle).await?;
+    if let Some(mut job) = state
+        .store
+        .get_stream_job(&handle.tenant_id, &handle.instance_id, &handle.run_id, &handle.job_id)
+        .await?
+    {
+        job.status = StreamJobStatus::Draining.as_str().to_owned();
+        job.draining_at = job.draining_at.or(Some(occurred_at));
+        job.cancellation_requested_at = Some(occurred_at);
+        job.cancellation_reason = Some(reason.to_owned());
+        job.updated_at = occurred_at;
+        state.store.upsert_stream_job(&job).await?;
+    }
+    Ok(())
+}
+
+async fn pause_stream_job_for_deployment(
+    state: &AppState,
+    handle: &mut fabrik_store::StreamJobBridgeHandleRecord,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    if handle.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal)
+        || matches!(
+            handle.parsed_status(),
+            Some(StreamJobBridgeHandleStatus::CancellationRequested)
+                | Some(StreamJobBridgeHandleStatus::Paused)
+        )
+    {
+        return Ok(());
+    }
+    if !stream_job_uses_topic_source(state, handle).await? {
+        return Ok(());
+    }
+    handle.status = StreamJobBridgeHandleStatus::Paused.as_str().to_owned();
+    handle.updated_at = occurred_at;
+    handle.stream_owner_epoch = handle
+        .stream_owner_epoch
+        .or_else(|| stream_job_owner_epoch(state, &handle.job_id))
+        .or(Some(1));
+    state.store.upsert_stream_job_callback_handle(handle).await?;
+    sync_stream_job_record(state, handle, StreamJobStatus::Paused, None, occurred_at).await
+}
+
+async fn resume_stream_job_for_deployment(
+    state: &AppState,
+    handle: &mut fabrik_store::StreamJobBridgeHandleRecord,
+    occurred_at: DateTime<Utc>,
+    clear_terminal: bool,
+) -> Result<()> {
+    if !clear_terminal
+        && (handle.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal)
+            || matches!(
+                handle.parsed_status(),
+                Some(StreamJobBridgeHandleStatus::CancellationRequested)
+            ))
+    {
+        return Ok(());
+    }
+    if !stream_job_uses_topic_source(state, handle).await? {
+        return Ok(());
+    }
+    if clear_terminal {
+        handle.terminal_event_id = None;
+        handle.terminal_at = None;
+        handle.terminal_output = None;
+        handle.terminal_error = None;
+    }
+    handle.status = if handle.stream_owner_epoch.is_some() {
+        StreamJobBridgeHandleStatus::Running.as_str().to_owned()
+    } else {
+        StreamJobBridgeHandleStatus::Admitted.as_str().to_owned()
+    };
+    handle.cancellation_requested_at = None;
+    handle.cancellation_reason = None;
+    handle.updated_at = occurred_at;
+    handle.stream_owner_epoch = handle
+        .stream_owner_epoch
+        .or_else(|| stream_job_owner_epoch(state, &handle.job_id))
+        .or(Some(1));
+    state.store.upsert_stream_job_callback_handle(handle).await?;
+
+    if let Some(mut job) = state
+        .store
+        .get_stream_job(&handle.tenant_id, &handle.instance_id, &handle.run_id, &handle.job_id)
+        .await?
+    {
+        job.status = if job.running_at.is_some() {
+            StreamJobStatus::Running.as_str().to_owned()
+        } else {
+            StreamJobStatus::Starting.as_str().to_owned()
+        };
+        job.draining_at = None;
+        job.cancellation_requested_at = None;
+        job.cancellation_reason = None;
+        if clear_terminal {
+            job.terminal_event_id = None;
+            job.terminal_at = None;
+            job.terminal_output = None;
+            job.terminal_error = None;
+        }
+        job.updated_at = occurred_at;
+        state.store.upsert_stream_job(&job).await?;
+    }
+
+    if clear_terminal
+        && let Some(mut runtime_state) =
+            state.local_state.load_stream_job_runtime_state(&handle.handle_id)?
+    {
+        runtime_state.terminal_status = None;
+        runtime_state.terminal_output = None;
+        runtime_state.terminal_error = None;
+        runtime_state.terminal_at = None;
+        runtime_state.source_partition_leases.clear();
+        runtime_state.updated_at = occurred_at;
+        state.local_state.upsert_stream_job_runtime_state(&runtime_state)?;
+    }
+
+    materialize_stream_job_from_handle(state, handle.clone(), occurred_at).await
+}
+
+fn runtime_state_has_advanced_beyond(
+    active_runtime: Option<&crate::local_state::LocalStreamJobRuntimeState>,
+    previous_runtime: Option<&crate::local_state::LocalStreamJobRuntimeState>,
+) -> bool {
+    let Some(active_runtime) = active_runtime else {
+        return false;
+    };
+    let Some(previous_runtime) = previous_runtime else {
+        return active_runtime
+            .source_cursors
+            .iter()
+            .any(|cursor| cursor.last_applied_offset.is_some());
+    };
+    active_runtime.source_cursors.iter().any(|active_cursor| {
+        let previous_offset = previous_runtime
+            .source_cursors
+            .iter()
+            .find(|cursor| cursor.source_partition_id == active_cursor.source_partition_id)
+            .and_then(|cursor| cursor.last_applied_offset);
+        match (active_cursor.last_applied_offset, previous_offset) {
+            (Some(active), Some(previous)) => active > previous,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    })
+}
+
+async fn handoff_stream_rollout_state(
+    state: &AppState,
+    deployment: &mut fabrik_store::StreamDeploymentRecord,
+    active_handle: &fabrik_store::StreamJobBridgeHandleRecord,
+    previous_handle: &fabrik_store::StreamJobBridgeHandleRecord,
+    previous_job: &StreamJobRecord,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    let existing_runtime_state =
+        state.local_state.load_stream_job_runtime_state(&active_handle.handle_id)?;
+    let should_copy_runtime = existing_runtime_state.as_ref().is_none_or(|runtime_state| {
+        runtime_state.source_cursors.is_empty() && runtime_state.materialized_key_count == 0
+    });
+    if should_copy_runtime
+        && let Some(previous_runtime_state) =
+            state.local_state.load_stream_job_runtime_state(&previous_handle.handle_id)?
+    {
+        let mut next_runtime_state = previous_runtime_state;
+        next_runtime_state.handle_id = active_handle.handle_id.clone();
+        next_runtime_state.job_id = active_handle.job_id.clone();
+        next_runtime_state.job_name = active_handle.job_name.clone();
+        next_runtime_state.stream_owner_epoch =
+            stream_job_owner_epoch(state, &active_handle.job_id)
+                .or(active_handle.stream_owner_epoch)
+                .or(Some(1))
+                .unwrap_or(1);
+        next_runtime_state.terminal_status = None;
+        next_runtime_state.terminal_output = None;
+        next_runtime_state.terminal_error = None;
+        next_runtime_state.terminal_at = None;
+        next_runtime_state.updated_at = occurred_at;
+        next_runtime_state.source_partition_leases.clear();
+        state.local_state.upsert_stream_job_runtime_state(&next_runtime_state)?;
+    }
+
+    let copied_views = state
+        .local_state
+        .load_all_stream_job_views()?
+        .into_iter()
+        .filter(|state| state.handle_id == previous_handle.handle_id)
+        .map(|mut state| {
+            state.handle_id = active_handle.handle_id.clone();
+            state.job_id = active_handle.job_id.clone();
+            state.updated_at = occurred_at;
+            state
+        })
+        .collect::<Vec<_>>();
+    if !copied_views.is_empty() {
+        state.local_state.upsert_stream_job_view_states(&copied_views)?;
+        for view in &copied_views {
+            state
+                .store
+                .upsert_stream_job_view_query(&fabrik_store::StreamJobViewRecord {
+                    tenant_id: active_handle.tenant_id.clone(),
+                    instance_id: active_handle.instance_id.clone(),
+                    run_id: active_handle.run_id.clone(),
+                    job_id: active_handle.job_id.clone(),
+                    handle_id: active_handle.handle_id.clone(),
+                    view_name: view.view_name.clone(),
+                    logical_key: view.logical_key.clone(),
+                    output: view.output.clone(),
+                    checkpoint_sequence: view.checkpoint_sequence,
+                    updated_at: view.updated_at,
+                })
+                .await?;
+        }
+    }
+
+    if let Some(mut active_job) = state
+        .store
+        .get_stream_job(
+            &active_handle.tenant_id,
+            &active_handle.instance_id,
+            &active_handle.run_id,
+            &active_handle.job_id,
+        )
+        .await?
+    {
+        active_job.latest_checkpoint_name = previous_job.latest_checkpoint_name.clone();
+        active_job.latest_checkpoint_sequence = previous_job.latest_checkpoint_sequence;
+        active_job.latest_checkpoint_at = previous_job.latest_checkpoint_at;
+        active_job.latest_checkpoint_output = previous_job.latest_checkpoint_output.clone();
+        active_job.updated_at = occurred_at;
+        state.store.upsert_stream_job(&active_job).await?;
+    }
+
+    deployment.rollout_phase = STREAM_DEPLOYMENT_PHASE_STABILIZING.to_owned();
+    deployment.rollout_handoff_checkpoint_sequence = previous_job.latest_checkpoint_sequence;
+    deployment.failed_revision_id = None;
+    deployment.rollout_failure = None;
+    persist_stream_deployment(state, deployment, occurred_at).await?;
+    Ok(())
+}
+
+async fn gate_stream_job_rollout(
+    state: &AppState,
+    handle: &mut fabrik_store::StreamJobBridgeHandleRecord,
+    occurred_at: DateTime<Utc>,
+) -> Result<bool> {
+    if !matches!(handle.parsed_origin_kind(), Some(StreamJobOriginKind::Standalone)) {
+        return Ok(true);
+    }
+    let Some(mut deployment) =
+        state.store.get_stream_deployment(&handle.tenant_id, &handle.stream_instance_id).await?
+    else {
+        return Ok(true);
+    };
+
+    if deployment.active_stream_run_id.as_deref() == Some(handle.stream_run_id.as_str())
+        && deployment.desired_state == StreamJobStatus::Draining.as_str()
+    {
+        set_deployment_phase(state, &mut deployment, STREAM_DEPLOYMENT_PHASE_DRAINING, occurred_at)
+            .await?;
+        mark_stream_job_drain_requested(state, handle, occurred_at, "deployment drain requested")
+            .await?;
+        return Ok(false);
+    }
+
+    if deployment.active_stream_run_id.as_deref() == Some(handle.stream_run_id.as_str())
+        && deployment.desired_state == StreamJobStatus::Paused.as_str()
+    {
+        set_deployment_phase(state, &mut deployment, STREAM_DEPLOYMENT_PHASE_PAUSED, occurred_at)
+            .await?;
+        pause_stream_job_for_deployment(state, handle, occurred_at).await?;
+        return Ok(false);
+    }
+
+    if deployment.active_stream_run_id.as_deref() != Some(handle.stream_run_id.as_str()) {
+        return Ok(true);
+    }
+    let Some(previous_stream_run_id) = deployment.previous_stream_run_id.clone() else {
+        if deployment.desired_state == StreamJobStatus::Running.as_str()
+            && deployment.rollout_phase != STREAM_DEPLOYMENT_PHASE_ROLLED_BACK
+        {
+            set_deployment_phase(
+                state,
+                &mut deployment,
+                STREAM_DEPLOYMENT_PHASE_RUNNING,
+                occurred_at,
+            )
+            .await?;
+        }
+        return Ok(true);
+    };
+    if deployment.rollout_handoff_checkpoint_sequence.is_some() {
+        return Ok(true);
+    }
+
+    let Some(mut previous_handle) = state
+        .store
+        .get_stream_job_callback_handle_by_stream_identity(
+            &handle.tenant_id,
+            &handle.stream_instance_id,
+            &previous_stream_run_id,
+            &handle.job_id,
+        )
+        .await?
+    else {
+        deployment.previous_stream_run_id = None;
+        deployment.rollout_phase = STREAM_DEPLOYMENT_PHASE_RUNNING.to_owned();
+        deployment.rollout_handoff_checkpoint_sequence = None;
+        persist_stream_deployment(state, &mut deployment, occurred_at).await?;
+        return Ok(true);
+    };
+    let Some(previous_job) = state
+        .store
+        .get_stream_job_by_stream_identity(
+            &handle.tenant_id,
+            &handle.stream_instance_id,
+            &previous_stream_run_id,
+            &handle.job_id,
+        )
+        .await?
+    else {
+        deployment.previous_stream_run_id = None;
+        deployment.rollout_phase = STREAM_DEPLOYMENT_PHASE_RUNNING.to_owned();
+        deployment.rollout_handoff_checkpoint_sequence = None;
+        persist_stream_deployment(state, &mut deployment, occurred_at).await?;
+        return Ok(true);
+    };
+
+    if !rollout_checkpoint_reached(&previous_job, deployment.rollout_checkpoint_name.as_deref()) {
+        set_deployment_phase(
+            state,
+            &mut deployment,
+            STREAM_DEPLOYMENT_PHASE_PENDING_CHECKPOINT,
+            occurred_at,
+        )
+        .await?;
+        sync_stream_job_record(state, handle, StreamJobStatus::Starting, None, occurred_at).await?;
+        return Ok(false);
+    }
+
+    if !previous_handle.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal)
+        && previous_handle.cancellation_requested_at.is_none()
+    {
+        set_deployment_phase(
+            state,
+            &mut deployment,
+            STREAM_DEPLOYMENT_PHASE_HANDOFF_IN_PROGRESS,
+            occurred_at,
+        )
+        .await?;
+        mark_stream_job_drain_requested(
+            state,
+            &mut previous_handle,
+            occurred_at,
+            "deployment checkpoint handoff",
+        )
+        .await?;
+        sync_stream_job_record(state, handle, StreamJobStatus::Starting, None, occurred_at).await?;
+        return Ok(false);
+    }
+
+    if !previous_handle.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal) {
+        set_deployment_phase(
+            state,
+            &mut deployment,
+            STREAM_DEPLOYMENT_PHASE_HANDOFF_IN_PROGRESS,
+            occurred_at,
+        )
+        .await?;
+        sync_stream_job_record(state, handle, StreamJobStatus::Starting, None, occurred_at).await?;
+        return Ok(false);
+    }
+
+    handoff_stream_rollout_state(
+        state,
+        &mut deployment,
+        handle,
+        &previous_handle,
+        &previous_job,
+        occurred_at,
+    )
+    .await?;
+    Ok(true)
+}
+
+async fn mark_deployment_failed(
+    state: &AppState,
+    deployment: &mut fabrik_store::StreamDeploymentRecord,
+    failed_revision_id: Option<String>,
+    failure: impl Into<String>,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    deployment.rollout_phase = STREAM_DEPLOYMENT_PHASE_FAILED.to_owned();
+    deployment.failed_revision_id = failed_revision_id;
+    deployment.rollout_failure = Some(failure.into());
+    persist_stream_deployment(state, deployment, occurred_at).await
+}
+
+async fn rollback_deployment_to_previous_revision(
+    state: &AppState,
+    deployment: &mut fabrik_store::StreamDeploymentRecord,
+    active_handle: &fabrik_store::StreamJobBridgeHandleRecord,
+    active_job: Option<&StreamJobRecord>,
+    previous_handle: &fabrik_store::StreamJobBridgeHandleRecord,
+    previous_job: Option<&StreamJobRecord>,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    let active_runtime =
+        state.local_state.load_stream_job_runtime_state(&active_handle.handle_id)?;
+    let previous_runtime =
+        state.local_state.load_stream_job_runtime_state(&previous_handle.handle_id)?;
+    let active_checkpoint_sequence = active_job.and_then(|job| job.latest_checkpoint_sequence);
+    if matches!(
+        (active_checkpoint_sequence, deployment.rollout_handoff_checkpoint_sequence),
+        (Some(active), Some(handoff)) if active > handoff
+    ) || runtime_state_has_advanced_beyond(active_runtime.as_ref(), previous_runtime.as_ref())
+    {
+        let failure = active_job
+            .and_then(|job| job.terminal_error.clone())
+            .or_else(|| active_handle.terminal_error.clone())
+            .unwrap_or_else(|| {
+                "rollback blocked because failed revision advanced source progress past handoff"
+                    .to_owned()
+            });
+        return mark_deployment_failed(
+            state,
+            deployment,
+            Some(active_handle.stream_run_id.clone()),
+            failure,
+            occurred_at,
+        )
+        .await;
+    }
+
+    let mut resumed_previous = previous_handle.clone();
+    resume_stream_job_for_deployment(
+        state,
+        &mut resumed_previous,
+        occurred_at,
+        previous_handle.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal)
+            || previous_handle.cancellation_requested_at.is_some(),
+    )
+    .await?;
+
+    deployment.desired_state = StreamJobStatus::Running.as_str().to_owned();
+    deployment.rollout_phase = STREAM_DEPLOYMENT_PHASE_ROLLED_BACK.to_owned();
+    deployment.active_stream_run_id = Some(resumed_previous.stream_run_id.clone());
+    deployment.active_job_id = Some(resumed_previous.job_id.clone());
+    deployment.active_handle_id = Some(resumed_previous.handle_id.clone());
+    deployment.previous_stream_run_id = None;
+    deployment.rollout_handoff_checkpoint_sequence = None;
+    deployment.failed_revision_id = Some(active_handle.stream_run_id.clone());
+    deployment.rollout_failure = active_job
+        .and_then(|job| job.terminal_error.clone())
+        .or_else(|| active_handle.terminal_error.clone())
+        .or_else(|| {
+            previous_job.map(|job| {
+                format!(
+                    "rolled back to {} after failed revision {}",
+                    job.stream_run_id, active_handle.stream_run_id
+                )
+            })
+        })
+        .or_else(|| {
+            Some(format!("rolled back after failed revision {}", active_handle.stream_run_id))
+        });
+    persist_stream_deployment(state, deployment, occurred_at).await
+}
+
+async fn reconcile_stream_deployment(
+    state: &AppState,
+    deployment: &mut fabrik_store::StreamDeploymentRecord,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    let Some(active_revision_id) = deployment.active_stream_run_id.clone() else {
+        return Ok(());
+    };
+    let Some(active_job_id) = deployment.active_job_id.clone() else {
+        return Ok(());
+    };
+    let active_handle = state
+        .store
+        .get_stream_job_callback_handle_by_stream_identity(
+            &deployment.tenant_id,
+            &deployment.deployment_id,
+            &active_revision_id,
+            &active_job_id,
+        )
+        .await?;
+    let active_job = state
+        .store
+        .get_stream_job_by_stream_identity(
+            &deployment.tenant_id,
+            &deployment.deployment_id,
+            &active_revision_id,
+            &active_job_id,
+        )
+        .await?;
+
+    if deployment.desired_state == StreamJobStatus::Draining.as_str() {
+        if let Some(mut active_handle) = active_handle {
+            mark_stream_job_drain_requested(
+                state,
+                &mut active_handle,
+                occurred_at,
+                "deployment desired_state draining",
+            )
+            .await?;
+        }
+        return set_deployment_phase(
+            state,
+            deployment,
+            STREAM_DEPLOYMENT_PHASE_DRAINING,
+            occurred_at,
+        )
+        .await;
+    }
+
+    if deployment.desired_state == StreamJobStatus::Paused.as_str() {
+        if let Some(mut active_handle) = active_handle {
+            pause_stream_job_for_deployment(state, &mut active_handle, occurred_at).await?;
+        }
+        return set_deployment_phase(
+            state,
+            deployment,
+            STREAM_DEPLOYMENT_PHASE_PAUSED,
+            occurred_at,
+        )
+        .await;
+    }
+
+    let previous_handle =
+        if let Some(previous_stream_run_id) = deployment.previous_stream_run_id.clone() {
+            state
+                .store
+                .get_stream_job_callback_handle_by_stream_identity(
+                    &deployment.tenant_id,
+                    &deployment.deployment_id,
+                    &previous_stream_run_id,
+                    &active_job_id,
+                )
+                .await?
+        } else {
+            None
+        };
+    let previous_job =
+        if let Some(previous_stream_run_id) = deployment.previous_stream_run_id.clone() {
+            state
+                .store
+                .get_stream_job_by_stream_identity(
+                    &deployment.tenant_id,
+                    &deployment.deployment_id,
+                    &previous_stream_run_id,
+                    &active_job_id,
+                )
+                .await?
+        } else {
+            None
+        };
+
+    let active_failed = active_handle.as_ref().is_some_and(|handle| {
+        matches!(handle.parsed_status(), Some(StreamJobBridgeHandleStatus::Failed))
+    }) || active_job
+        .as_ref()
+        .is_some_and(|job| matches!(job.parsed_status(), Some(StreamJobStatus::Failed)));
+
+    if deployment.rollout_phase == STREAM_DEPLOYMENT_PHASE_ROLLBACK_PENDING || active_failed {
+        if deployment.rollout_phase == STREAM_DEPLOYMENT_PHASE_ROLLBACK_PENDING
+            && !active_failed
+            && let Some(mut active_handle) = active_handle.clone()
+            && !active_handle.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal)
+        {
+            mark_stream_job_drain_requested(
+                state,
+                &mut active_handle,
+                occurred_at,
+                "deployment rollback requested",
+            )
+            .await?;
+            return Ok(());
+        }
+        let Some(active_handle) = active_handle.as_ref() else {
+            return mark_deployment_failed(
+                state,
+                deployment,
+                Some(active_revision_id),
+                "rollback failed because active deployment handle is missing",
+                occurred_at,
+            )
+            .await;
+        };
+        let Some(previous_handle) = previous_handle.as_ref() else {
+            return mark_deployment_failed(
+                state,
+                deployment,
+                Some(active_revision_id),
+                "rollback failed because no previous revision is available",
+                occurred_at,
+            )
+            .await;
+        };
+        return rollback_deployment_to_previous_revision(
+            state,
+            deployment,
+            active_handle,
+            active_job.as_ref(),
+            previous_handle,
+            previous_job.as_ref(),
+            occurred_at,
+        )
+        .await;
+    }
+
+    if deployment.previous_stream_run_id.is_some() {
+        if let (Some(active_job), Some(active_handle)) =
+            (active_job.as_ref(), active_handle.as_ref())
+        {
+            let active_runtime =
+                state.local_state.load_stream_job_runtime_state(&active_handle.handle_id)?;
+            let previous_runtime = if let Some(previous_handle) = previous_handle.as_ref() {
+                state.local_state.load_stream_job_runtime_state(&previous_handle.handle_id)?
+            } else {
+                None
+            };
+            if rollout_stable_after_handoff(
+                active_job,
+                deployment.rollout_handoff_checkpoint_sequence,
+                deployment.rollout_checkpoint_name.as_deref(),
+            ) || runtime_state_has_advanced_beyond(
+                active_runtime.as_ref(),
+                previous_runtime.as_ref(),
+            ) {
+                deployment.desired_state = StreamJobStatus::Running.as_str().to_owned();
+                deployment.rollout_phase = STREAM_DEPLOYMENT_PHASE_RUNNING.to_owned();
+                deployment.previous_stream_run_id = None;
+                deployment.rollout_handoff_checkpoint_sequence = None;
+                deployment.rollout_failure = None;
+                persist_stream_deployment(state, deployment, occurred_at).await?;
+                return Ok(());
+            }
+        }
+
+        if deployment.rollout_handoff_checkpoint_sequence.is_some() {
+            return set_deployment_phase(
+                state,
+                deployment,
+                STREAM_DEPLOYMENT_PHASE_STABILIZING,
+                occurred_at,
+            )
+            .await;
+        }
+
+        if previous_job.as_ref().is_some_and(|job| {
+            rollout_checkpoint_reached(job, deployment.rollout_checkpoint_name.as_deref())
+        }) {
+            return set_deployment_phase(
+                state,
+                deployment,
+                STREAM_DEPLOYMENT_PHASE_HANDOFF_IN_PROGRESS,
+                occurred_at,
+            )
+            .await;
+        }
+
+        return set_deployment_phase(
+            state,
+            deployment,
+            STREAM_DEPLOYMENT_PHASE_PENDING_CHECKPOINT,
+            occurred_at,
+        )
+        .await;
+    }
+
+    if let Some(mut active_handle) = active_handle {
+        if matches!(active_handle.parsed_status(), Some(StreamJobBridgeHandleStatus::Paused)) {
+            resume_stream_job_for_deployment(state, &mut active_handle, occurred_at, false).await?;
+        }
+    }
+    if deployment.rollout_phase != STREAM_DEPLOYMENT_PHASE_ROLLED_BACK {
+        set_deployment_phase(state, deployment, STREAM_DEPLOYMENT_PHASE_RUNNING, occurred_at)
+            .await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn reconcile_stream_deployments(state: &AppState, page_size: i64) -> Result<()> {
+    let mut offset = 0_i64;
+    loop {
+        let mut batch = state.store.list_stream_deployments_page(page_size, offset).await?;
+        if batch.is_empty() {
+            break;
+        }
+        for deployment in &mut batch {
+            reconcile_stream_deployment(state, deployment, Utc::now()).await?;
+        }
+        if batch.len() < usize::try_from(page_size).unwrap_or(usize::MAX) {
+            break;
+        }
+        offset += page_size;
+    }
+    Ok(())
+}
+
+async fn resolve_stream_job_signal_target_identity(
+    state: &AppState,
+    handle: &fabrik_store::StreamJobBridgeHandleRecord,
+    signal: &crate::local_state::LocalStreamJobWorkflowSignalState,
+) -> Result<Option<WorkflowIdentity>> {
+    if !matches!(handle.parsed_origin_kind(), Some(StreamJobOriginKind::Standalone)) {
+        return Ok(Some(WorkflowIdentity::new(
+            handle.tenant_id.clone(),
+            handle.definition_id.clone(),
+            handle.definition_version.unwrap_or_default(),
+            handle.artifact_hash.clone().unwrap_or_default(),
+            handle.instance_id.clone(),
+            handle.run_id.clone(),
+            "throughput-runtime",
+        )));
+    }
+
+    let target_instance_id = signal
+        .payload
+        .get("targetWorkflowInstanceId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(signal.logical_key.as_str());
+    let Some(instance) = state.store.get_instance(&handle.tenant_id, target_instance_id).await?
+    else {
+        warn!(
+            tenant_id = %handle.tenant_id,
+            handle_id = %handle.handle_id,
+            job_id = %handle.job_id,
+            target_instance_id = %target_instance_id,
+            signal_id = %signal.signal_id,
+            signal_type = %signal.signal_type,
+            "standalone stream signal target workflow instance not found; leaving signal unpublished for retry"
+        );
+        return Ok(None);
+    };
+
+    Ok(Some(WorkflowIdentity::new(
+        handle.tenant_id.clone(),
+        instance.definition_id.clone(),
+        instance.definition_version.unwrap_or_default(),
+        instance.artifact_hash.clone().unwrap_or_default(),
+        instance.instance_id.clone(),
+        instance.run_id.clone(),
+        "throughput-runtime",
+    )))
+}
+
 pub(crate) async fn materialize_stream_job_from_handle(
     state: &AppState,
     mut handle: fabrik_store::StreamJobBridgeHandleRecord,
@@ -392,9 +1223,29 @@ pub(crate) async fn materialize_stream_job_from_handle(
         job_name = %handle.job_name,
         "streams-runtime materializing stream job"
     );
+    if matches!(handle.parsed_status(), Some(StreamJobBridgeHandleStatus::Paused)) {
+        sync_stream_job_record(state, &handle, StreamJobStatus::Paused, None, occurred_at).await?;
+        return Ok(());
+    }
     sync_stream_job_record(state, &handle, default_stream_job_status(&handle), None, occurred_at)
         .await?;
+    if !gate_stream_job_rollout(state, &mut handle, occurred_at).await? {
+        return Ok(());
+    }
     if let Some(activation) = activate_stream_job(state, &handle).await? {
+        crate::repair_eventual_stream_job_views_from_changelog(
+            state,
+            &handle,
+            &activation.changelog_records,
+        )
+        .await?;
+        crate::repair_eventual_stream_job_views_from_projection_records(
+            state,
+            &handle,
+            &activation.projection_records,
+        )
+        .await?;
+        crate::repair_eventual_stream_job_views_from_owner_state(state, &handle).await?;
         publish_changelog_records(state, activation.changelog_records).await;
         if let Err(error) = publish_projection_records(state, activation.projection_records).await {
             error!(
@@ -428,10 +1279,8 @@ pub(crate) async fn materialize_stream_job_from_handle(
         .await?;
         checkpoint_to_publish = Some(checkpoint);
     }
-    if should_emit_workflow_callbacks(&handle) {
-        for signal in &materialized.workflow_signals {
-            publish_stream_job_signal_event(state, &handle, signal).await?;
-        }
+    for signal in &materialized.workflow_signals {
+        publish_stream_job_signal_event(state, &handle, signal).await?;
     }
     if let Some(terminal) = materialized.terminal {
         let finalized =
@@ -562,6 +1411,83 @@ async fn handle_cancel_stream_job_command(
     Ok(())
 }
 
+async fn handle_pause_stream_job_command(
+    state: &AppState,
+    command: &PauseStreamJobCommand,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    let Some(mut handle) =
+        state.store.get_stream_job_callback_handle_by_handle_id(&command.handle_id).await?
+    else {
+        info!(
+            tenant_id = %command.tenant_id,
+            stream_instance_id = %command.stream_instance_id,
+            stream_run_id = %command.stream_run_id,
+            job_id = %command.job_id,
+            handle_id = %command.handle_id,
+            "streams-runtime did not find stream job handle for pause command"
+        );
+        return Ok(());
+    };
+    if handle.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal)
+        || matches!(
+            handle.parsed_status(),
+            Some(StreamJobBridgeHandleStatus::CancellationRequested)
+        )
+    {
+        return Ok(());
+    }
+    if !stream_job_uses_topic_source(state, &handle).await? {
+        return Ok(());
+    }
+    handle.status = StreamJobBridgeHandleStatus::Paused.as_str().to_owned();
+    handle.updated_at = occurred_at;
+    if handle.stream_owner_epoch.is_none() {
+        handle.stream_owner_epoch = stream_job_owner_epoch(state, &handle.job_id);
+    }
+    state.store.upsert_stream_job_callback_handle(&handle).await?;
+    sync_stream_job_record(state, &handle, StreamJobStatus::Paused, None, occurred_at).await
+}
+
+async fn handle_resume_stream_job_command(
+    state: &AppState,
+    command: &ResumeStreamJobCommand,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    let Some(mut handle) =
+        state.store.get_stream_job_callback_handle_by_handle_id(&command.handle_id).await?
+    else {
+        info!(
+            tenant_id = %command.tenant_id,
+            stream_instance_id = %command.stream_instance_id,
+            stream_run_id = %command.stream_run_id,
+            job_id = %command.job_id,
+            handle_id = %command.handle_id,
+            "streams-runtime did not find stream job handle for resume command"
+        );
+        return Ok(());
+    };
+    if handle.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal)
+        || matches!(
+            handle.parsed_status(),
+            Some(StreamJobBridgeHandleStatus::CancellationRequested)
+        )
+    {
+        return Ok(());
+    }
+    if !stream_job_uses_topic_source(state, &handle).await? {
+        return Ok(());
+    }
+    handle.status = StreamJobBridgeHandleStatus::Running.as_str().to_owned();
+    handle.updated_at = occurred_at;
+    if handle.stream_owner_epoch.is_none() {
+        handle.stream_owner_epoch = stream_job_owner_epoch(state, &handle.job_id);
+    }
+    state.store.upsert_stream_job_callback_handle(&handle).await?;
+    sync_stream_job_record(state, &handle, StreamJobStatus::Running, None, occurred_at).await?;
+    materialize_stream_job_from_handle(state, handle, occurred_at).await
+}
+
 async fn stream_job_uses_topic_source(
     state: &AppState,
     handle: &fabrik_store::StreamJobBridgeHandleRecord,
@@ -576,6 +1502,12 @@ pub(crate) async fn reconcile_active_topic_stream_jobs(
     state: &AppState,
     page_size: i64,
 ) -> Result<()> {
+    reconcile_stream_deployments(state, page_size).await?;
+    {
+        let mut workers =
+            state.active_topic_job_workers.lock().expect("active topic worker lock poisoned");
+        workers.retain(|_, task| !task.is_finished());
+    }
     let mut reconciled_handle_ids = HashSet::new();
     let mut offset = 0;
     loop {
@@ -586,7 +1518,15 @@ pub(crate) async fn reconcile_active_topic_stream_jobs(
         }
         for handle in &handles {
             reconciled_handle_ids.insert(handle.handle_id.clone());
-            materialize_stream_job_from_handle(state, handle.clone(), Utc::now()).await?;
+            let is_topic_backed = resolve_stream_job_definition(Some(&state.store), handle)
+                .await?
+                .is_some_and(|job| job.source.kind == STREAM_SOURCE_TOPIC);
+            if is_topic_backed {
+                ensure_active_topic_stream_job_worker(state.clone(), handle.handle_id.clone());
+                materialize_stream_job_from_handle(state, handle.clone(), Utc::now()).await?;
+            } else {
+                materialize_stream_job_from_handle(state, handle.clone(), Utc::now()).await?;
+            }
         }
         if handles.len() < usize::try_from(page_size).unwrap_or(usize::MAX) {
             break;
@@ -638,6 +1578,118 @@ pub(crate) async fn reconcile_active_topic_stream_jobs(
         .await?;
     }
     Ok(())
+}
+
+fn ensure_active_topic_stream_job_worker(state: AppState, handle_id: String) -> bool {
+    let mut workers =
+        state.active_topic_job_workers.lock().expect("active topic worker lock poisoned");
+    if workers.contains_key(&handle_id) {
+        return false;
+    }
+    let worker_handle_id = handle_id.clone();
+    let worker_state = state.clone();
+    let task = tokio::spawn(async move {
+        run_active_topic_stream_job_worker(worker_state, worker_handle_id).await;
+    });
+    workers.insert(handle_id, task);
+    true
+}
+
+fn topic_runtime_is_caught_up(runtime_state: Option<&crate::local_state::LocalStreamJobRuntimeState>) -> bool {
+    let Some(runtime_state) = runtime_state else {
+        return true;
+    };
+    runtime_state.source_cursors.iter().all(|cursor| {
+        let frontier = cursor
+            .last_high_watermark
+            .unwrap_or(cursor.initial_checkpoint_target_offset)
+            .max(cursor.initial_checkpoint_target_offset);
+        cursor.next_offset >= frontier
+    })
+}
+
+fn topic_runtime_progressed(
+    previous: Option<&crate::local_state::LocalStreamJobRuntimeState>,
+    current: Option<&crate::local_state::LocalStreamJobRuntimeState>,
+) -> bool {
+    let Some(current) = current else {
+        return false;
+    };
+    let Some(previous) = previous else {
+        return current
+            .source_cursors
+            .iter()
+            .any(|cursor| cursor.last_applied_offset.is_some());
+    };
+    current.source_cursors.iter().any(|cursor| {
+        let previous_cursor = previous
+            .source_cursors
+            .iter()
+            .find(|candidate| candidate.source_partition_id == cursor.source_partition_id);
+        cursor.last_applied_offset
+            > previous_cursor.and_then(|candidate| candidate.last_applied_offset)
+            || cursor.next_offset > previous_cursor.map(|candidate| candidate.next_offset).unwrap_or(0)
+    }) || current.checkpoint_sequence > previous.checkpoint_sequence
+}
+
+async fn run_active_topic_stream_job_worker(state: AppState, handle_id: String) {
+    loop {
+        let handle = match state
+            .store
+            .get_stream_job_callback_handle_by_handle_id(&handle_id)
+            .await
+        {
+            Ok(Some(handle)) => handle,
+            Ok(None) => break,
+            Err(error) => {
+                error!(error = %error, handle_id = %handle_id, "failed to load active topic stream job handle");
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        if handle.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal) {
+            break;
+        }
+        let is_topic_backed = match resolve_stream_job_definition(Some(&state.store), &handle).await {
+            Ok(Some(job)) => job.source.kind == STREAM_SOURCE_TOPIC,
+            Ok(None) => false,
+            Err(error) => {
+                error!(error = %error, handle_id = %handle_id, "failed to resolve active topic stream job definition");
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        if !is_topic_backed {
+            break;
+        }
+
+        let before_runtime = state
+            .local_state
+            .load_stream_job_runtime_state(&handle.handle_id)
+            .ok()
+            .flatten();
+        if let Err(error) = materialize_stream_job_from_handle(&state, handle.clone(), Utc::now()).await {
+            error!(error = %error, handle_id = %handle_id, job_id = %handle.job_id, "active topic stream job worker materialization failed");
+            sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        let after_runtime = state
+            .local_state
+            .load_stream_job_runtime_state(&handle.handle_id)
+            .ok()
+            .flatten();
+        let caught_up = topic_runtime_is_caught_up(after_runtime.as_ref());
+        let progressed = topic_runtime_progressed(before_runtime.as_ref(), after_runtime.as_ref());
+        if caught_up && !progressed {
+            sleep(Duration::from_millis(20)).await;
+        } else {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    let mut workers =
+        state.active_topic_job_workers.lock().expect("active topic worker lock poisoned");
+    workers.remove(&handle_id);
 }
 
 async fn await_stream_job_bridge_handle(
@@ -702,6 +1754,7 @@ fn default_stream_job_status(
         Some(StreamJobBridgeHandleStatus::Completed) => StreamJobStatus::Completed,
         Some(StreamJobBridgeHandleStatus::Failed) => StreamJobStatus::Failed,
         Some(StreamJobBridgeHandleStatus::Cancelled) => StreamJobStatus::Cancelled,
+        Some(StreamJobBridgeHandleStatus::Paused) => StreamJobStatus::Paused,
         Some(StreamJobBridgeHandleStatus::CancellationRequested) => StreamJobStatus::Draining,
         Some(StreamJobBridgeHandleStatus::Admitted) => StreamJobStatus::Starting,
         Some(StreamJobBridgeHandleStatus::Running) | None => StreamJobStatus::Running,
@@ -848,15 +1901,10 @@ async fn publish_stream_job_signal_event(
     if signal.published_at.is_some() {
         return Ok(());
     }
-    let identity = WorkflowIdentity::new(
-        handle.tenant_id.clone(),
-        handle.definition_id.clone(),
-        handle.definition_version.unwrap_or_default(),
-        handle.artifact_hash.clone().unwrap_or_default(),
-        handle.instance_id.clone(),
-        handle.run_id.clone(),
-        "throughput-runtime",
-    );
+    let Some(identity) = resolve_stream_job_signal_target_identity(state, handle, signal).await?
+    else {
+        return Ok(());
+    };
     let payload = WorkflowEvent::SignalQueued {
         signal_id: signal.signal_id.clone(),
         signal_type: signal.signal_type.clone(),
@@ -1373,6 +2421,12 @@ pub(crate) async fn handle_throughput_command(
         ThroughputCommand::ScheduleStreamJob(schedule) => {
             return handle_schedule_stream_job_command(&state, schedule, command.occurred_at).await;
         }
+        ThroughputCommand::PauseStreamJob(pause) => {
+            return handle_pause_stream_job_command(&state, pause, command.occurred_at).await;
+        }
+        ThroughputCommand::ResumeStreamJob(resume) => {
+            return handle_resume_stream_job_command(&state, resume, command.occurred_at).await;
+        }
         ThroughputCommand::CancelStreamJob(cancel) => {
             return handle_cancel_stream_job_command(&state, cancel, command.occurred_at).await;
         }
@@ -1403,6 +2457,8 @@ pub(crate) async fn handle_throughput_command(
         ThroughputCommand::TinyWorkflowStart(_)
         | ThroughputCommand::TinyWorkflowStartBatch(_)
         | ThroughputCommand::ScheduleStreamJob(_)
+        | ThroughputCommand::PauseStreamJob(_)
+        | ThroughputCommand::ResumeStreamJob(_)
         | ThroughputCommand::CancelStreamJob(_) => {
             return Ok(());
         }

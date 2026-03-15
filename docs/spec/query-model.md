@@ -101,7 +101,7 @@ At minimum that means:
 
 The eventual query surface should also support explicit projection summaries such as projected key count when available.
 
-For debug or operator-facing scan surfaces, strong scans over owner state may also carry the corresponding projection summary and lag metadata for the same view so one scan response can show both the authoritative rows and the current eventual-read health.
+For debug or operator-facing browse surfaces, strong scans over owner state, keyed entry listings, and key-only listings may also carry the corresponding projection summary and lag metadata for the same view so one response can show both the authoritative browse result and the current eventual-read health.
 
 ## Stream Diagnostics Queries
 
@@ -137,3 +137,22 @@ The rebuild contract is:
 Projection rebuild is therefore an operator and recovery primitive, not an execution primitive.
 
 Where practical, operators should be able to rebuild one materialized view at a time rather than forcing a whole-job rebuild for a single damaged or lagging projection.
+
+The non-debug stream query surface should also support a compact per-view projection summary query so workflows and operators can ask for projected key count, latest projected checkpoint or delete markers, and owner-relative lag without relying on debug HTTP.
+
+That same surface should support lightweight filtering for job-level projection summary queries, such as:
+
+- only stale views
+- views at or above a checkpoint-lag threshold
+- explicit subsets of view names
+
+The strong query surface should also support a compact bridge-state query for one stream job.
+
+That bridge-state query should expose:
+
+- workflow and bridge identity for the handle
+- current bridge lifecycle state and stored stream lifecycle state
+- control availability such as pause, resume, and cancel
+- awaited checkpoint rows with repair and stale-owner classification
+- recent query rows with repair and stale-owner classification
+- recent `signal_workflow` rows with callback dedupe identity, target workflow identity, and queued/dispatching/consumed bridge status

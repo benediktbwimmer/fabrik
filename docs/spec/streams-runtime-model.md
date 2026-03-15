@@ -367,6 +367,8 @@ The diagnostics surface should support both:
 
 - job-level runtime stats
 - per-view runtime stats for one named materialized view
+- job-level bridge state for lifecycle, awaited checkpoints, query acceptance, and repair debt
+- job-level signal bridge state for `signal_workflow` emissions, including callback dedupe ids, target workflow ids, and queue/consumption status
 
 Per-view runtime stats should expose view-local freshness and lag markers where available, such as:
 
@@ -377,7 +379,7 @@ Per-view runtime stats should expose view-local freshness and lag markers where 
 
 When a view supports eventual reads, the same per-view runtime stats surface should also expose projection-side summary and freshness markers for that view so operators can compare owner-local state to the projected read model without switching tools.
 
-The same principle should hold for operator-facing strong scan surfaces: a strong scan may include projection-side summary and lag metadata for the scanned view so browsing current rows does not require a second call just to inspect eventual-read health.
+The same principle should hold for operator-facing strong browse surfaces: strong scans, key listings, and entry listings may include projection-side summary and lag metadata for the browsed view so browsing current rows does not require a second call just to inspect eventual-read health.
 
 Per-view runtime stats should also expose retention history where available, such as:
 
@@ -386,6 +388,18 @@ Per-view runtime stats should also expose retention history where available, suc
 - latest per-view eviction boundary and eviction time
 
 The debug/operator surface should also support targeted projection rebuild for one materialized view in addition to whole-job projection rebuild.
+
+The regular stream query surface should also expose a compact per-view projection-stats query so workflows can inspect eventual-read freshness and lag through the bridge without using debug endpoints.
+
+For job-level projection stats, the query surface should also support basic filtering such as stale-only views, minimum checkpoint lag, and explicit view-name subsets so workflows can ask which projections need attention without client-side filtering.
+
+For long-lived topic-backed jobs, the runtime should also support explicit lifecycle control operations:
+
+- pause
+- resume
+- cancel
+
+Those control operations must be idempotent at the bridge boundary and must not mutate authoritative stream state through any path other than the active owner.
 
 ## Execution Kernel Model
 

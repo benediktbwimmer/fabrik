@@ -451,6 +451,7 @@ impl LocalThroughputState {
                 input_item_count,
                 materialized_key_count,
                 active_partitions,
+                throughput_partition_count,
                 owner_epoch,
                 planned_at,
             } => {
@@ -465,6 +466,11 @@ impl LocalThroughputState {
                     input_item_count: *input_item_count,
                     materialized_key_count: *materialized_key_count,
                     active_partitions: active_partitions.clone(),
+                    throughput_partition_count: existing
+                        .as_ref()
+                        .map(|state| state.throughput_partition_count)
+                        .filter(|count| *count > 0)
+                        .unwrap_or(*throughput_partition_count),
                     source_kind: existing.as_ref().and_then(|state| state.source_kind.clone()),
                     source_name: existing.as_ref().and_then(|state| state.source_name.clone()),
                     source_cursors: existing
@@ -505,6 +511,18 @@ impl LocalThroughputState {
                     view_runtime_stats: existing
                         .as_ref()
                         .map(|state| state.view_runtime_stats.clone())
+                        .unwrap_or_default(),
+                    pre_key_runtime_stats: existing
+                        .as_ref()
+                        .map(|state| state.pre_key_runtime_stats.clone())
+                        .unwrap_or_default(),
+                    hot_key_runtime_stats: existing
+                        .as_ref()
+                        .map(|state| state.hot_key_runtime_stats.clone())
+                        .unwrap_or_default(),
+                    owner_partition_runtime_stats: existing
+                        .as_ref()
+                        .map(|state| state.owner_partition_runtime_stats.clone())
                         .unwrap_or_default(),
                     checkpoint_partitions: existing
                         .as_ref()
@@ -1451,6 +1469,7 @@ impl LocalThroughputState {
                 input_item_count,
                 materialized_key_count,
                 active_partitions,
+                throughput_partition_count,
                 owner_epoch,
                 planned_at,
             } => {
@@ -1465,6 +1484,11 @@ impl LocalThroughputState {
                     input_item_count: *input_item_count,
                     materialized_key_count: *materialized_key_count,
                     active_partitions: active_partitions.clone(),
+                    throughput_partition_count: existing
+                        .as_ref()
+                        .map(|state| state.throughput_partition_count)
+                        .filter(|count| *count > 0)
+                        .unwrap_or(*throughput_partition_count),
                     source_kind: existing.as_ref().and_then(|state| state.source_kind.clone()),
                     source_name: existing.as_ref().and_then(|state| state.source_name.clone()),
                     source_cursors: existing
@@ -1505,6 +1529,18 @@ impl LocalThroughputState {
                     view_runtime_stats: existing
                         .as_ref()
                         .map(|state| state.view_runtime_stats.clone())
+                        .unwrap_or_default(),
+                    pre_key_runtime_stats: existing
+                        .as_ref()
+                        .map(|state| state.pre_key_runtime_stats.clone())
+                        .unwrap_or_default(),
+                    hot_key_runtime_stats: existing
+                        .as_ref()
+                        .map(|state| state.hot_key_runtime_stats.clone())
+                        .unwrap_or_default(),
+                    owner_partition_runtime_stats: existing
+                        .as_ref()
+                        .map(|state| state.owner_partition_runtime_stats.clone())
                         .unwrap_or_default(),
                     checkpoint_partitions: existing
                         .as_ref()

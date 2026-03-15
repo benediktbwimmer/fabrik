@@ -541,14 +541,67 @@ function validateAggregateV2Job(job) {
     }
   }
   const reducerKinds = new Set(["count", "sum", "min", "max", "avg", "histogram", "threshold"]);
+  let seenStatefulOperator = false;
   for (const operator of job.operators) {
-    if (operator.kind !== "filter") {
+    if (operator.kind === "map" || operator.kind === "filter" || operator.kind === "route") {
+      if (seenStatefulOperator) {
+        throw new CompilerError(
+          `aggregate_v2 pre-key operators must appear before window/aggregate/materialize/checkpoint/signal_workflow/sink operators`,
+        );
+      }
+      if (operator.kind === "map") {
+        const config = expectObject(operator.config, "aggregate_v2 map.config");
+        if (typeof config.inputField !== "string" || config.inputField.trim().length === 0) {
+          throw new CompilerError(`aggregate_v2 map.config.inputField must be present`);
+        }
+        if (typeof config.outputField !== "string" || config.outputField.trim().length === 0) {
+          throw new CompilerError(`aggregate_v2 map.config.outputField must be present`);
+        }
+        if (
+          config.multiplyBy !== undefined &&
+          (typeof config.multiplyBy !== "number" || !Number.isFinite(config.multiplyBy))
+        ) {
+          throw new CompilerError(`aggregate_v2 map.config.multiplyBy must be a finite number`);
+        }
+        if (config.add !== undefined && (typeof config.add !== "number" || !Number.isFinite(config.add))) {
+          throw new CompilerError(`aggregate_v2 map.config.add must be a finite number`);
+        }
+      } else {
+        if (operator.kind === "filter") {
+          const config = expectObject(operator.config, "aggregate_v2 filter.config");
+          if (typeof config.predicate !== "string" || config.predicate.trim().length === 0) {
+            throw new CompilerError(`aggregate_v2 filter.config.predicate must be present`);
+          }
+        } else {
+          const config = expectObject(operator.config, "aggregate_v2 route.config");
+          if (typeof config.outputField !== "string" || config.outputField.trim().length === 0) {
+            throw new CompilerError(`aggregate_v2 route.config.outputField must be present`);
+          }
+          if (!Array.isArray(config.branches) || config.branches.length === 0) {
+            throw new CompilerError(`aggregate_v2 route.config.branches must contain at least 1 branch`);
+          }
+          for (const branch of config.branches) {
+            if (branch === null || typeof branch !== "object" || Array.isArray(branch)) {
+              throw new CompilerError(`aggregate_v2 route.config.branches[] must be objects`);
+            }
+            if (typeof branch.predicate !== "string" || branch.predicate.trim().length === 0) {
+              throw new CompilerError(`aggregate_v2 route.config.branches[].predicate must be present`);
+            }
+            if (typeof branch.value !== "string" || branch.value.trim().length === 0) {
+              throw new CompilerError(`aggregate_v2 route.config.branches[].value must be present`);
+            }
+          }
+          if (
+            config.defaultValue !== undefined &&
+            (typeof config.defaultValue !== "string" || config.defaultValue.trim().length === 0)
+          ) {
+            throw new CompilerError(`aggregate_v2 route.config.defaultValue must be a non-empty string`);
+          }
+        }
+      }
       continue;
     }
-    const config = expectObject(operator.config, "aggregate_v2 filter.config");
-    if (typeof config.predicate !== "string" || config.predicate.trim().length === 0) {
-      throw new CompilerError(`aggregate_v2 filter.config.predicate must be present`);
-    }
+    seenStatefulOperator = true;
   }
   for (const operator of job.operators) {
     if (operator.kind !== "reduce" && operator.kind !== "aggregate") {

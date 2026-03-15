@@ -19,6 +19,7 @@ Three example workflows live under [`examples/typescript-workflows`](/Users/bene
 - [`bulk-enrichment-workflow.ts`](/Users/bene/code/fabrik/examples/typescript-workflows/bulk-enrichment-workflow.ts) shows topic-driven fan-out with a `histogram` reducer.
 - [`inventory-signal-workflow.ts`](/Users/bene/code/fabrik/examples/typescript-workflows/inventory-signal-workflow.ts) shows a signal-driven workflow that uses a `sum` reducer over inventory adjustments.
 - [`stream-job-rollup-workflow.ts`](/Users/bene/code/fabrik/examples/typescript-workflows/stream-job-rollup-workflow.ts) shows the stream-native path: a workflow starts the `keyed-rollup` stream job, waits for `hourly-rollup-ready`, then issues a strong keyed query against `accountTotals`.
+- [`stream-job-signal-workflow.ts`](/Users/bene/code/fabrik/examples/typescript-workflows/stream-job-signal-workflow.ts) shows the hybrid path: a workflow starts a topic-backed stream job, waits for a `signal_workflow` callback such as `account.rollup.ready`, then issues a strong query and shuts the job down explicitly.
 
 The bulk examples use the current throughput-mode pattern:
 
@@ -49,13 +50,38 @@ const job = await ctx.startStreamJob<KeyedRollupJob>("keyed-rollup", {
   },
 });
 
-await job.untilCheckpoint("hourly-rollup-ready");
+await job.awaitCheckpoint("hourly-rollup-ready");
 const account = await job.query("accountTotals", { key: input.accountId }, {
   consistency: "strong",
 });
 
 return ctx.complete({ account });
 }
+```
+
+The stream-to-workflow hybrid example uses the same bridge plus a declared `signal_workflow` operator:
+
+```ts
+const job = await ctx.startStreamJob("keyed-rollup", {
+  input: { topic: input.topic },
+  config: {
+    source: { kind: "topic", name: input.topic },
+    operators: [
+      { kind: "reduce", name: "sum-account-totals", config: { reducer: "sum", valueField: "amount", outputField: "totalAmount" } },
+      { kind: "emit_checkpoint", name: "hourly-rollup-ready", config: { sequence: 1 } },
+      { kind: "signal_workflow", name: "notify-account-rollup", config: { view: "accountTotals", signalType: "account.rollup.ready", whenOutputField: "totalAmount" } },
+    ],
+  },
+});
+
+const signal = await ctx.waitForSignal("account.rollup.ready");
+const account = await job.query("accountTotals", { key: input.accountId }, {
+  consistency: "strong",
+});
+await job.cancel({ reason: "workflow-threshold-handled" });
+const result = await job.awaitTerminal();
+
+return ctx.complete({ signal, account, terminalStatus: result.status });
 ```
 
 ## 2. Compile A Workflow Artifact

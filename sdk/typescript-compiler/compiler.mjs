@@ -6312,10 +6312,11 @@ class WorkflowLowerer {
     }
     if (
       ts.isPropertyAccessExpression(call.expression) &&
-      call.expression.name.text === "result" &&
+      (call.expression.name.text === "result" || call.expression.name.text === "awaitTerminal") &&
       ts.isIdentifier(call.expression.expression)
     ) {
       const handleName = call.expression.expression.text;
+      const method = call.expression.name.text;
       if (this.childHandleVars.has(handleName)) {
         return this.addState("wait_child", {
           type: "wait_for_child",
@@ -6335,6 +6336,9 @@ class WorkflowLowerer {
         }, awaitExpression);
       }
       if (this.streamJobHandleVars.has(handleName)) {
+        if (method !== "result" && method !== "awaitTerminal") {
+          throw compilerError(`unknown handle ${handleName}.${method}()`, awaitExpression);
+        }
         return this.addState("wait_stream_terminal", {
           type: "await_stream_job_terminal",
           stream_job_ref_var: handleName,
@@ -6343,7 +6347,7 @@ class WorkflowLowerer {
           on_error: errorTarget ?? undefined,
         }, awaitExpression);
       }
-      throw compilerError(`unknown handle ${handleName}.result()`, awaitExpression);
+      throw compilerError(`unknown handle ${handleName}.${method}()`, awaitExpression);
     }
     if (
       ts.isPropertyAccessExpression(call.expression) &&
@@ -6359,14 +6363,20 @@ class WorkflowLowerer {
             next: nextState,
           }, awaitExpression)
         : nextState;
-      if (method === "untilCheckpoint") {
+      if (method === "untilCheckpoint" || method === "awaitCheckpoint") {
         if (call.arguments.length !== 1) {
-          throw compilerError(`streamJobHandle.untilCheckpoint requires exactly one checkpoint name`, call);
+          throw compilerError(
+            `streamJobHandle.${method} requires exactly one checkpoint name`,
+            call,
+          );
         }
         return this.addState("wait_stream_checkpoint", {
           type: "wait_for_stream_checkpoint",
           stream_job_ref_var: handleName,
-          checkpoint_name: literalString(call.arguments[0], "streamJobHandle.untilCheckpoint checkpoint name"),
+          checkpoint_name: literalString(
+            call.arguments[0],
+            `streamJobHandle.${method} checkpoint name`,
+          ),
           next: nextState,
           output_var: targetVar ?? undefined,
           on_error: errorTarget ?? undefined,

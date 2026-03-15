@@ -104,6 +104,17 @@ Rules:
 - these must be deterministic
 - these must not mutate durable state
 - these must compile to built-in runtime expressions, not arbitrary user code blobs
+- pre-key operators preserve declared order before the keyed/windowed stage
+- initial `map` support is limited to built-in field transforms:
+  - `inputField`
+  - `outputField`
+  - optional `multiplyBy`
+  - optional `add`
+- initial runtime support currently accepts `map` and `filter` in any declared pre-key order
+- initial `route` support writes a string field from ordered predicate branches:
+  - `outputField`
+  - `branches[] = { predicate, value }`
+  - optional `defaultValue`
 
 Examples:
 

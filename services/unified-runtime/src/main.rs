@@ -9230,6 +9230,33 @@ mod tests {
         }
     }
 
+    fn perf_items_per_second(total_items: usize, elapsed: StdDuration) -> f64 {
+        let seconds = elapsed.as_secs_f64();
+        if seconds <= f64::EPSILON { 0.0 } else { total_items as f64 / seconds }
+    }
+
+    fn perf_topic_workload() -> (usize, usize) {
+        if cfg!(debug_assertions) { (100, 20) } else { (20_000, 4_000) }
+    }
+
+    fn keyed_rollup_perf_bounded_items(
+        item_count: usize,
+        distinct_keys: usize,
+    ) -> (Vec<Value>, String, f64) {
+        assert!(distinct_keys > 0, "distinct_keys must be greater than zero");
+        let mut items = Vec::with_capacity(item_count);
+        for item_index in 0..item_count {
+            let logical_key = format!("acct_{}", (item_index % distinct_keys) + 1);
+            items.push(json!({
+                "accountId": logical_key,
+                "amount": 1.0
+            }));
+        }
+        let tracked_key = "acct_1".to_owned();
+        let tracked_total = (item_count / distinct_keys) as f64;
+        (items, tracked_key, tracked_total)
+    }
+
     fn continue_as_new_artifact() -> CompiledWorkflowArtifact {
         CompiledWorkflowArtifact::new(
             "continue-as-new-demo".to_owned(),
@@ -10376,20 +10403,28 @@ mod tests {
             workspace_root.join("target/unified-runtime-docker-runtime-build.lock")
         }
 
-        fn throughput_runtime_cache_key(latest_source_mtime: SystemTime) -> String {
+        fn current_build_profile() -> &'static str {
+            if cfg!(debug_assertions) { "debug" } else { "release" }
+        }
+
+        fn throughput_runtime_cache_key(
+            build_profile: &str,
+            latest_source_mtime: SystemTime,
+        ) -> String {
             let duration = latest_source_mtime
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_else(|_| StdDuration::from_secs(0));
-            format!("{}-{}", duration.as_secs(), duration.subsec_nanos())
+            format!("{build_profile}-{}-{}", duration.as_secs(), duration.subsec_nanos())
         }
 
         fn cached_runtime_binary_path(
             workspace_root: &Path,
+            build_profile: &str,
             latest_source_mtime: SystemTime,
         ) -> PathBuf {
             Self::runtime_binary_cache_dir(workspace_root).join(format!(
                 "throughput-runtime-{}",
-                Self::throughput_runtime_cache_key(latest_source_mtime)
+                Self::throughput_runtime_cache_key(build_profile, latest_source_mtime)
             ))
         }
 
@@ -10408,10 +10443,14 @@ mod tests {
 
         fn binary_path() -> Result<PathBuf> {
             let workspace_root = Self::workspace_root()?;
+            let build_profile = Self::current_build_profile();
             let latest_source_mtime =
                 Self::throughput_runtime_latest_source_mtime(&workspace_root)?;
-            let cached_binary_path =
-                Self::cached_runtime_binary_path(&workspace_root, latest_source_mtime);
+            let cached_binary_path = Self::cached_runtime_binary_path(
+                &workspace_root,
+                build_profile,
+                latest_source_mtime,
+            );
             if cached_binary_path.exists() {
                 return Ok(cached_binary_path);
             }
@@ -10435,7 +10474,8 @@ mod tests {
                 return Ok(cached_binary_path);
             }
 
-            let build_binary_path = cargo_target_dir.join("debug/throughput-runtime");
+            let build_binary_path =
+                cargo_target_dir.join(format!("{build_profile}/throughput-runtime"));
             if !build_binary_path.exists()
                 || latest_source_mtime
                     > fs::metadata(&build_binary_path)
@@ -10443,12 +10483,16 @@ mod tests {
                         .unwrap_or(SystemTime::UNIX_EPOCH)
             {
                 let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-                let output = Command::new(cargo)
+                let mut command = Command::new(cargo);
+                command
                     .args(["build", "-p", "streams-runtime", "--bin", "throughput-runtime"])
                     .env("CARGO_TARGET_DIR", &cargo_target_dir)
-                    .current_dir(&workspace_root)
-                    .output()
-                    .context("failed to build throughput-runtime test binary")?;
+                    .current_dir(&workspace_root);
+                if build_profile == "release" {
+                    command.arg("--release");
+                }
+                let output =
+                    command.output().context("failed to build throughput-runtime test binary")?;
                 if !output.status.success() {
                     anyhow::bail!(
                         "failed to build throughput-runtime test binary in {}:\nstdout:\n{}\nstderr:\n{}",
@@ -11676,7 +11720,21 @@ mod tests {
             filter: &WorkflowHistoryFilter,
             expected_event_type: &str,
         ) -> Result<EventEnvelope<WorkflowEvent>> {
-            let deadline = Instant::now() + StdDuration::from_secs(15);
+            self.wait_for_workflow_history_event_with_timeout(
+                filter,
+                expected_event_type,
+                StdDuration::from_secs(15),
+            )
+            .await
+        }
+
+        async fn wait_for_workflow_history_event_with_timeout(
+            &self,
+            filter: &WorkflowHistoryFilter,
+            expected_event_type: &str,
+            timeout: StdDuration,
+        ) -> Result<EventEnvelope<WorkflowEvent>> {
+            let deadline = Instant::now() + timeout;
             loop {
                 let history = read_workflow_history(
                     &self.broker,
@@ -15747,6 +15805,145 @@ mod tests {
         assert_eq!(
             history.iter().filter(|event| event.event_type == "StreamJobCancelled").count(),
             1
+        );
+
+        trigger_loop.abort();
+        outbox_loop.abort();
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "perf harness"]
+    async fn perf_stream_job_end_to_end_workflow_bounded_reports_throughput() -> Result<()> {
+        let (item_count, distinct_keys) = perf_topic_workload();
+
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        eprintln!("perf workflow bounded: postgres ready");
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        eprintln!("perf workflow bounded: redpanda ready");
+        let store = postgres.connect_store().await?;
+        let artifact = keyed_rollup_stream_job_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+        eprintln!("perf workflow bounded: artifact stored");
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-keyed-rollup-e2e-perf-{}", Uuid::now_v7()));
+        let publisher = redpanda.connect_publisher().await?;
+        let app_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher,
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+        let consumer = build_workflow_consumer(
+            &redpanda.broker,
+            "unified-runtime-keyed-rollup-e2e-perf-consumer",
+            &redpanda.broker.all_partition_ids(),
+        )
+        .await?;
+        let trigger_loop = tokio::spawn(run_trigger_consumer(app_state.clone(), consumer));
+        let outbox_loop = tokio::spawn(run_workflow_event_outbox_publisher(app_state.clone()));
+        let _throughput_runtime =
+            TestThroughputRuntime::start(&postgres, &redpanda, &state_dir).await?;
+        eprintln!("perf workflow bounded: throughput runtime ready");
+        let (items, tracked_key, tracked_total) =
+            keyed_rollup_perf_bounded_items(item_count, distinct_keys);
+
+        let input = json!({
+            "streamInput": {
+                "kind": "bounded_items",
+                "items": items
+            },
+            "accountId": tracked_key
+        });
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-keyed-rollup-e2e-perf",
+            "run-keyed-rollup-e2e-perf",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(&identity, WorkflowEvent::WorkflowTriggered { input }, Utc::now());
+        let trigger_started_at = Instant::now();
+        redpanda.connect_publisher().await?.publish(&trigger, &trigger.partition_key).await?;
+        eprintln!("perf workflow bounded: trigger published");
+
+        let filter = WorkflowHistoryFilter::new(
+            "tenant",
+            "instance-keyed-rollup-e2e-perf",
+            "run-keyed-rollup-e2e-perf",
+        );
+        redpanda
+            .wait_for_workflow_history_event_with_timeout(
+                &filter,
+                "StreamJobScheduled",
+                StdDuration::from_secs(60),
+            )
+            .await?;
+        let trigger_to_scheduled_elapsed = trigger_started_at.elapsed();
+        eprintln!("perf workflow bounded: scheduled");
+        redpanda
+            .wait_for_workflow_history_event_with_timeout(
+                &filter,
+                "StreamJobCheckpointReached",
+                StdDuration::from_secs(60),
+            )
+            .await?;
+        eprintln!("perf workflow bounded: checkpoint reached");
+        redpanda
+            .wait_for_workflow_history_event_with_timeout(
+                &filter,
+                "StreamJobQueryCompleted",
+                StdDuration::from_secs(60),
+            )
+            .await?;
+        eprintln!("perf workflow bounded: query completed");
+        redpanda
+            .wait_for_workflow_history_event_with_timeout(
+                &filter,
+                "StreamJobCompleted",
+                StdDuration::from_secs(60),
+            )
+            .await?;
+        eprintln!("perf workflow bounded: terminal received");
+
+        let completed =
+            wait_for_instance_completion(&store, "tenant", "instance-keyed-rollup-e2e-perf")
+                .await?;
+        assert_eq!(completed.status, WorkflowStatus::Completed);
+        assert_eq!(
+            completed.output.as_ref().and_then(|output| {
+                output
+                    .get("account")
+                    .and_then(|account| account.get("totalAmount"))
+                    .and_then(Value::as_f64)
+            }),
+            Some(tracked_total)
+        );
+
+        let trigger_to_terminal_elapsed = trigger_started_at.elapsed();
+        let scheduled_to_terminal_elapsed = trigger_to_terminal_elapsed
+            .checked_sub(trigger_to_scheduled_elapsed)
+            .unwrap_or_default();
+
+        eprintln!(
+            "perf_stream_job_end_to_end_workflow_bounded_reports_throughput items={} distinct_keys={} trigger_to_scheduled_ms={:.2} scheduled_to_terminal_ms={:.2} scheduled_to_terminal_items_per_sec={:.0} trigger_to_terminal_ms={:.2} trigger_to_terminal_items_per_sec={:.0}",
+            item_count,
+            distinct_keys,
+            trigger_to_scheduled_elapsed.as_secs_f64() * 1_000.0,
+            scheduled_to_terminal_elapsed.as_secs_f64() * 1_000.0,
+            perf_items_per_second(item_count, scheduled_to_terminal_elapsed),
+            trigger_to_terminal_elapsed.as_secs_f64() * 1_000.0,
+            perf_items_per_second(item_count, trigger_to_terminal_elapsed),
         );
 
         trigger_loop.abort();

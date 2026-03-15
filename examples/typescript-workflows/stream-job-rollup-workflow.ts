@@ -20,13 +20,13 @@ export async function streamJobRollupWorkflow(
     },
   });
 
-  const checkpoint = await job.untilCheckpoint("hourly-rollup-ready");
+  const checkpoint = await job.awaitCheckpoint("hourly-rollup-ready");
   const account = await job.query(
     "accountTotals",
     { key: input.accountId },
     { consistency: "strong" },
   );
-  const result = await job.result();
+  const result = await job.awaitTerminal();
   const projectedTotal = account.totalAmount;
 
   return ctx.complete({

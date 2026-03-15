@@ -337,7 +337,7 @@ test("compiler lowers dynamic ctx.bulkActivity calls into dynamic bulk descripto
   assert.match(serialized, /"activity_capabilities":\{"kind":"object","fields":\{"payloadless_transport":\{"kind":"literal","value":true\}\}\}/);
 });
 
-test("compiler lowers stream job handles, checkpoint waits, and strong queries", async () => {
+test("compiler lowers explicit stream bridge waits and strong queries", async () => {
   const fixture = path.join(root, "sdk/typescript-compiler/test-fixtures/stream-job-workflow.ts");
   const { stdout } = await runCompiler([
     "--entry",
@@ -391,6 +391,38 @@ test("compiler lowers topic-backed stream handle cancel flow", async () => {
   assert.match(serialized, /"type":"await_stream_job_terminal"/);
   assert.match(serialized, /"output_var":"result"/);
   assert.match(serialized, /"cancelRequested"/);
+  assert.match(serialized, /"terminalStatus"/);
+});
+
+test("compiler lowers stream signal hybrid workflow flow", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/stream-job-signal-workflow.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "streamJobSignalWorkflow",
+    "--definition-id",
+    "stream-job-signal-workflow",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+  const serialized = JSON.stringify(artifact.workflow.states);
+
+  assert.match(serialized, /"type":"start_stream_job"/);
+  assert.match(serialized, /"kind":\{"kind":"literal","value":"signal_workflow"\}/);
+  assert.match(serialized, /"signalType":\{"kind":"literal","value":"account\.rollup\.ready"\}/);
+  assert.match(serialized, /"type":"wait_for_event"/);
+  assert.match(serialized, /"event_type":"account\.rollup\.ready"/);
+  assert.match(serialized, /"output_var":"signal"/);
+  assert.match(serialized, /"type":"query_stream_job"/);
+  assert.match(serialized, /"query_name":"accountTotals"/);
+  assert.match(serialized, /"type":"cancel_stream_job"/);
+  assert.match(serialized, /"type":"await_stream_job_terminal"/);
+  assert.match(serialized, /"output_var":"result"/);
   assert.match(serialized, /"terminalStatus"/);
 });
 

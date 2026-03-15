@@ -262,9 +262,47 @@ pub struct CompiledAggregateV2MaterializedView {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub struct CompiledAggregateV2Map {
+    pub operator_id: String,
+    pub input_field: String,
+    pub output_field: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multiply_by: Option<serde_json::Number>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add: Option<serde_json::Number>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub struct CompiledAggregateV2Filter {
     pub operator_id: String,
     pub predicate: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CompiledAggregateV2RouteBranch {
+    pub predicate: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CompiledAggregateV2Route {
+    pub operator_id: String,
+    pub output_field: String,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub branches: Vec<CompiledAggregateV2RouteBranch>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CompiledAggregateV2PreKeyOperator {
+    Map(CompiledAggregateV2Map),
+    Filter(CompiledAggregateV2Filter),
+    Route(CompiledAggregateV2Route),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -294,7 +332,7 @@ pub struct CompiledAggregateV2Kernel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<CompiledAggregateV2Window>,
     #[serde(default, skip_serializing_if = "vec_is_empty")]
-    pub filters: Vec<CompiledAggregateV2Filter>,
+    pub pre_key_operators: Vec<CompiledAggregateV2PreKeyOperator>,
     #[serde(default, skip_serializing_if = "vec_is_empty")]
     pub aggregates: Vec<CompiledAggregateV2Aggregate>,
     #[serde(default, skip_serializing_if = "vec_is_empty")]
@@ -662,20 +700,146 @@ impl CompiledStreamJob {
         }
 
         let mut window = None;
-        let mut filters = Vec::new();
+        let mut pre_key_operators = Vec::new();
         let mut aggregates = Vec::new();
         let mut materialized_views = Vec::new();
         let mut workflow_signals = Vec::new();
         let mut checkpoints = Vec::new();
         let mut has_materialize = false;
+        let mut closed_pre_key_operators = false;
 
         for operator in &self.operators {
             match operator.kind.as_str() {
-                STREAM_OPERATOR_MAP
-                | STREAM_OPERATOR_ROUTE
-                | STREAM_OPERATOR_SINK
-                | STREAM_OPERATOR_DEDUPE => {}
+                STREAM_OPERATOR_MAP => {
+                    if closed_pre_key_operators {
+                        anyhow::bail!(
+                            "stream runtime {STREAM_RUNTIME_AGGREGATE_V2} currently requires pre-key operators to appear before window/aggregate/materialize/checkpoint/signal_workflow/sink operators"
+                        );
+                    }
+                    let operator_id =
+                        operator.operator_id.clone().or_else(|| operator.name.clone()).context(
+                            "stream runtime aggregate_v2 map operators require operator_id or name",
+                        )?;
+                    let config = json_object(
+                        operator
+                            .config
+                            .as_ref()
+                            .context("stream runtime aggregate_v2 map operator requires config")?,
+                        "runtime aggregate_v2 map.config",
+                    )?;
+                    pre_key_operators.push(CompiledAggregateV2PreKeyOperator::Map(
+                        CompiledAggregateV2Map {
+                            operator_id,
+                            input_field: json_string_field(
+                                config,
+                                "inputField",
+                                "runtime aggregate_v2 map.config",
+                            )?
+                            .to_owned(),
+                            output_field: json_string_field(
+                                config,
+                                "outputField",
+                                "runtime aggregate_v2 map.config",
+                            )?
+                            .to_owned(),
+                            multiply_by: json_optional_number_field(
+                                config,
+                                "multiplyBy",
+                                "runtime aggregate_v2 map.config",
+                            )?,
+                            add: json_optional_number_field(
+                                config,
+                                "add",
+                                "runtime aggregate_v2 map.config",
+                            )?,
+                        },
+                    ));
+                }
+                STREAM_OPERATOR_ROUTE => {
+                    if closed_pre_key_operators {
+                        anyhow::bail!(
+                            "stream runtime {STREAM_RUNTIME_AGGREGATE_V2} currently requires pre-key operators to appear before window/aggregate/materialize/checkpoint/signal_workflow/sink operators"
+                        );
+                    }
+                    let operator_id = operator
+                        .operator_id
+                        .clone()
+                        .or_else(|| operator.name.clone())
+                        .context(
+                            "stream runtime aggregate_v2 route operators require operator_id or name",
+                        )?;
+                    let config = json_object(
+                        operator.config.as_ref().context(
+                            "stream runtime aggregate_v2 route operator requires config",
+                        )?,
+                        "runtime aggregate_v2 route.config",
+                    )?;
+                    let output_field = json_string_field(
+                        config,
+                        "outputField",
+                        "runtime aggregate_v2 route.config",
+                    )?;
+                    let branches = config
+                        .get("branches")
+                        .and_then(Value::as_array)
+                        .context(
+                            "stream runtime aggregate_v2 route.config.branches must be an array",
+                        )?
+                        .iter()
+                        .map(|branch| {
+                            let branch = json_object(
+                                branch,
+                                "runtime aggregate_v2 route.config.branches[]",
+                            )?;
+                            Ok(CompiledAggregateV2RouteBranch {
+                                predicate: json_string_field(
+                                    branch,
+                                    "predicate",
+                                    "runtime aggregate_v2 route.config.branches[]",
+                                )?
+                                .trim()
+                                .to_owned(),
+                                value: json_string_field(
+                                    branch,
+                                    "value",
+                                    "runtime aggregate_v2 route.config.branches[]",
+                                )?
+                                .to_owned(),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    if branches.is_empty() {
+                        anyhow::bail!(
+                            "stream runtime aggregate_v2 route.config.branches must contain at least 1 branch"
+                        );
+                    }
+                    if branches.iter().any(|branch| branch.predicate.is_empty()) {
+                        anyhow::bail!(
+                            "stream runtime aggregate_v2 route predicates must not be empty"
+                        );
+                    }
+                    pre_key_operators.push(CompiledAggregateV2PreKeyOperator::Route(
+                        CompiledAggregateV2Route {
+                            operator_id,
+                            output_field: output_field.to_owned(),
+                            branches,
+                            default_value: json_optional_string_field(
+                                config,
+                                "defaultValue",
+                                "runtime aggregate_v2 route.config",
+                            )?,
+                        },
+                    ));
+                }
+                STREAM_OPERATOR_SINK | STREAM_OPERATOR_DEDUPE => {
+                    closed_pre_key_operators = true;
+                }
                 STREAM_OPERATOR_FILTER => {
+                    if closed_pre_key_operators {
+                        anyhow::bail!(
+                            "stream runtime {STREAM_RUNTIME_AGGREGATE_V2} currently requires pre-key operators to appear before window/aggregate/materialize/checkpoint/signal_workflow/sink operators"
+                        );
+                    }
                     let operator_id = operator
                         .operator_id
                         .clone()
@@ -699,12 +863,15 @@ impl CompiledStreamJob {
                             "stream runtime aggregate_v2 filter predicate must not be empty"
                         );
                     }
-                    filters.push(CompiledAggregateV2Filter {
-                        operator_id,
-                        predicate: predicate.trim().to_owned(),
-                    });
+                    pre_key_operators.push(CompiledAggregateV2PreKeyOperator::Filter(
+                        CompiledAggregateV2Filter {
+                            operator_id,
+                            predicate: predicate.trim().to_owned(),
+                        },
+                    ));
                 }
                 STREAM_OPERATOR_WINDOW => {
+                    closed_pre_key_operators = true;
                     let operator_id = operator.operator_id.clone().or_else(|| operator.name.clone()).context(
                         "stream runtime aggregate_v2 window operators require operator_id or name",
                     )?;
@@ -762,6 +929,7 @@ impl CompiledStreamJob {
                     });
                 }
                 STREAM_OPERATOR_REDUCE | STREAM_OPERATOR_AGGREGATE => {
+                    closed_pre_key_operators = true;
                     let operator_id = operator.operator_id.clone().or_else(|| operator.name.clone()).context(
                         "stream runtime aggregate_v2 aggregate operators require operator_id or name",
                     )?;
@@ -858,6 +1026,7 @@ impl CompiledStreamJob {
                     });
                 }
                 STREAM_OPERATOR_MATERIALIZE => {
+                    closed_pre_key_operators = true;
                     let operator_id = operator.operator_id.clone().or_else(|| operator.name.clone()).context(
                         "stream runtime aggregate_v2 materialize operators require operator_id or name",
                     )?;
@@ -892,6 +1061,7 @@ impl CompiledStreamJob {
                     });
                 }
                 STREAM_OPERATOR_SIGNAL_WORKFLOW => {
+                    closed_pre_key_operators = true;
                     let operator_id = operator
                         .operator_id
                         .clone()
@@ -935,6 +1105,7 @@ impl CompiledStreamJob {
                     });
                 }
                 STREAM_OPERATOR_EMIT_CHECKPOINT => {
+                    closed_pre_key_operators = true;
                     let checkpoint_name = operator
                         .name
                         .clone()
@@ -990,7 +1161,7 @@ impl CompiledStreamJob {
             source_name: self.source.name.clone(),
             key_field,
             window,
-            filters,
+            pre_key_operators,
             aggregates,
             materialized_views,
             workflow_signals,
@@ -2332,6 +2503,8 @@ pub enum ThroughputCommand {
     StartThroughputRun(StartThroughputRunCommand),
     CreateBatch(CreateBatchCommand),
     ScheduleStreamJob(ScheduleStreamJobCommand),
+    PauseStreamJob(PauseStreamJobCommand),
+    ResumeStreamJob(ResumeStreamJobCommand),
     CancelStreamJob(CancelStreamJobCommand),
     TinyWorkflowStart(TinyWorkflowStartCommand),
     TinyWorkflowStartBatch(TinyWorkflowStartBatchCommand),
@@ -2357,6 +2530,25 @@ pub struct CancelStreamJobCommand {
     pub job_id: String,
     pub handle_id: String,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PauseStreamJobCommand {
+    pub tenant_id: String,
+    pub stream_instance_id: String,
+    pub stream_run_id: String,
+    pub job_id: String,
+    pub handle_id: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResumeStreamJobCommand {
+    pub tenant_id: String,
+    pub stream_instance_id: String,
+    pub stream_run_id: String,
+    pub job_id: String,
+    pub handle_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2426,6 +2618,8 @@ pub enum ThroughputChangelogPayload {
         input_item_count: u64,
         materialized_key_count: u64,
         active_partitions: Vec<i32>,
+        #[serde(default)]
+        throughput_partition_count: i32,
         owner_epoch: u64,
         planned_at: DateTime<Utc>,
     },
@@ -2677,6 +2871,8 @@ pub enum StreamsChangelogPayload {
         input_item_count: u64,
         materialized_key_count: u64,
         active_partitions: Vec<i32>,
+        #[serde(default)]
+        throughput_partition_count: i32,
         owner_epoch: u64,
         planned_at: DateTime<Utc>,
     },
@@ -3906,10 +4102,23 @@ mod tests {
             ],
             operators: vec![
                 CompiledStreamOperator {
+                    kind: STREAM_OPERATOR_MAP.to_owned(),
+                    operator_id: Some("normalize-risk".to_owned()),
+                    name: Some("normalize-risk".to_owned()),
+                    inputs: vec!["source:payments".to_owned()],
+                    outputs: vec!["normalized".to_owned()],
+                    state_ids: vec![],
+                    config: Some(serde_json::json!({
+                        "inputField": "riskPoints",
+                        "outputField": "risk",
+                        "multiplyBy": 0.01
+                    })),
+                },
+                CompiledStreamOperator {
                     kind: STREAM_OPERATOR_FILTER.to_owned(),
                     operator_id: Some("filter-valid".to_owned()),
                     name: Some("filter-valid".to_owned()),
-                    inputs: vec!["source:payments".to_owned()],
+                    inputs: vec!["normalized".to_owned()],
                     outputs: vec!["filtered".to_owned()],
                     state_ids: vec![],
                     config: Some(serde_json::json!({
@@ -4023,10 +4232,22 @@ mod tests {
                     time_field: None,
                     allowed_lateness: None,
                 }),
-                filters: vec![CompiledAggregateV2Filter {
-                    operator_id: "filter-valid".to_owned(),
-                    predicate: "amount > 0".to_owned(),
-                }],
+                pre_key_operators: vec![
+                    CompiledAggregateV2PreKeyOperator::Map(CompiledAggregateV2Map {
+                        operator_id: "normalize-risk".to_owned(),
+                        input_field: "riskPoints".to_owned(),
+                        output_field: "risk".to_owned(),
+                        multiply_by: Some(
+                            serde_json::Number::from_f64(0.01)
+                                .expect("multiply_by should be finite")
+                        ),
+                        add: None,
+                    }),
+                    CompiledAggregateV2PreKeyOperator::Filter(CompiledAggregateV2Filter {
+                        operator_id: "filter-valid".to_owned(),
+                        predicate: "amount > 0".to_owned(),
+                    }),
+                ],
                 aggregates: vec![CompiledAggregateV2Aggregate {
                     operator_id: "avg-risk".to_owned(),
                     reducer: STREAM_REDUCER_AVG.to_owned(),
@@ -4137,7 +4358,7 @@ mod tests {
                 source_name: None,
                 key_field: "accountId".to_owned(),
                 window: None,
-                filters: vec![],
+                pre_key_operators: vec![],
                 aggregates: vec![CompiledAggregateV2Aggregate {
                     operator_id: "risk-threshold".to_owned(),
                     reducer: STREAM_REDUCER_THRESHOLD.to_owned(),
@@ -4257,7 +4478,7 @@ mod tests {
                 source_name: None,
                 key_field: "accountId".to_owned(),
                 window: None,
-                filters: vec![],
+                pre_key_operators: vec![],
                 aggregates: vec![CompiledAggregateV2Aggregate {
                     operator_id: "risk-threshold".to_owned(),
                     reducer: STREAM_REDUCER_THRESHOLD.to_owned(),
@@ -4291,6 +4512,155 @@ mod tests {
     }
 
     #[test]
+    fn compiled_stream_job_derives_route_aggregate_v2_kernel() -> Result<()> {
+        let job = CompiledStreamJob {
+            name: "fraud-route".to_owned(),
+            runtime: STREAM_RUNTIME_AGGREGATE_V2.to_owned(),
+            source: CompiledStreamSource {
+                kind: STREAM_SOURCE_BOUNDED_INPUT.to_owned(),
+                name: None,
+                binding: None,
+                config: None,
+            },
+            key_by: Some("accountId".to_owned()),
+            states: vec![CompiledStreamState {
+                id: "high-risk-state".to_owned(),
+                kind: STREAM_STATE_KIND_KEYED.to_owned(),
+                key_fields: vec!["accountId".to_owned()],
+                value_fields: vec!["highRiskCount".to_owned()],
+                retention_seconds: Some(3600),
+                config: Some(serde_json::json!({
+                    "reducer": STREAM_REDUCER_COUNT
+                })),
+            }],
+            operators: vec![
+                CompiledStreamOperator {
+                    kind: STREAM_OPERATOR_ROUTE.to_owned(),
+                    operator_id: Some("bucket-risk".to_owned()),
+                    name: Some("bucket-risk".to_owned()),
+                    inputs: vec!["source".to_owned()],
+                    outputs: vec!["bucketed".to_owned()],
+                    state_ids: vec![],
+                    config: Some(serde_json::json!({
+                        "outputField": "riskBucket",
+                        "branches": [
+                            { "predicate": "risk >= 0.8", "value": "high" },
+                            { "predicate": "risk >= 0.5", "value": "medium" }
+                        ],
+                        "defaultValue": "low"
+                    })),
+                },
+                CompiledStreamOperator {
+                    kind: STREAM_OPERATOR_FILTER.to_owned(),
+                    operator_id: Some("keep-high".to_owned()),
+                    name: Some("keep-high".to_owned()),
+                    inputs: vec!["bucketed".to_owned()],
+                    outputs: vec!["high-only".to_owned()],
+                    state_ids: vec![],
+                    config: Some(serde_json::json!({
+                        "predicate": "riskBucket == \"high\""
+                    })),
+                },
+                CompiledStreamOperator {
+                    kind: STREAM_OPERATOR_AGGREGATE.to_owned(),
+                    operator_id: Some("count-high".to_owned()),
+                    name: Some("count-high".to_owned()),
+                    inputs: vec!["high-only".to_owned()],
+                    outputs: vec!["high-view".to_owned()],
+                    state_ids: vec!["high-risk-state".to_owned()],
+                    config: Some(serde_json::json!({
+                        "reducer": STREAM_REDUCER_COUNT,
+                        "outputField": "highRiskCount"
+                    })),
+                },
+                CompiledStreamOperator {
+                    kind: STREAM_OPERATOR_MATERIALIZE.to_owned(),
+                    operator_id: Some("materialize-high".to_owned()),
+                    name: Some("materialize-high".to_owned()),
+                    inputs: vec!["high-view".to_owned()],
+                    outputs: vec!["highRiskCounts".to_owned()],
+                    state_ids: vec!["high-risk-state".to_owned()],
+                    config: Some(serde_json::json!({
+                        "view": "highRiskCounts"
+                    })),
+                },
+            ],
+            checkpoint_policy: None,
+            views: vec![CompiledStreamView {
+                name: "highRiskCounts".to_owned(),
+                consistency: STREAM_CONSISTENCY_STRONG.to_owned(),
+                query_mode: STREAM_QUERY_MODE_BY_KEY.to_owned(),
+                view_id: Some("high-risk-counts".to_owned()),
+                key_field: Some("accountId".to_owned()),
+                value_fields: vec!["accountId".to_owned(), "highRiskCount".to_owned()],
+                supported_consistencies: vec![STREAM_CONSISTENCY_STRONG.to_owned()],
+                retention_seconds: Some(3600),
+            }],
+            queries: vec![CompiledStreamQuery {
+                name: "highRiskCountsByKey".to_owned(),
+                view_name: "highRiskCounts".to_owned(),
+                consistency: STREAM_CONSISTENCY_STRONG.to_owned(),
+                query_id: Some("high-risk-counts-by-key".to_owned()),
+                arg_fields: vec!["accountId".to_owned()],
+            }],
+            classification: Some("fast_lane".to_owned()),
+            metadata: None,
+        };
+
+        assert_eq!(
+            job.aggregate_v2_kernel()?,
+            Some(CompiledAggregateV2Kernel {
+                source_kind: STREAM_SOURCE_BOUNDED_INPUT.to_owned(),
+                source_name: None,
+                key_field: "accountId".to_owned(),
+                window: None,
+                pre_key_operators: vec![
+                    CompiledAggregateV2PreKeyOperator::Route(CompiledAggregateV2Route {
+                        operator_id: "bucket-risk".to_owned(),
+                        output_field: "riskBucket".to_owned(),
+                        branches: vec![
+                            CompiledAggregateV2RouteBranch {
+                                predicate: "risk >= 0.8".to_owned(),
+                                value: "high".to_owned(),
+                            },
+                            CompiledAggregateV2RouteBranch {
+                                predicate: "risk >= 0.5".to_owned(),
+                                value: "medium".to_owned(),
+                            },
+                        ],
+                        default_value: Some("low".to_owned()),
+                    }),
+                    CompiledAggregateV2PreKeyOperator::Filter(CompiledAggregateV2Filter {
+                        operator_id: "keep-high".to_owned(),
+                        predicate: "riskBucket == \"high\"".to_owned(),
+                    }),
+                ],
+                aggregates: vec![CompiledAggregateV2Aggregate {
+                    operator_id: "count-high".to_owned(),
+                    reducer: STREAM_REDUCER_COUNT.to_owned(),
+                    value_field: None,
+                    output_field: Some("highRiskCount".to_owned()),
+                    threshold: None,
+                    comparison: None,
+                    state_ids: vec!["high-risk-state".to_owned()],
+                }],
+                materialized_views: vec![CompiledAggregateV2MaterializedView {
+                    operator_id: "materialize-high".to_owned(),
+                    view_name: "highRiskCounts".to_owned(),
+                    state_ids: vec!["high-risk-state".to_owned()],
+                    query_mode: STREAM_QUERY_MODE_BY_KEY.to_owned(),
+                    supported_consistencies: vec![STREAM_CONSISTENCY_STRONG.to_owned()],
+                }],
+                workflow_signals: vec![],
+                query_names: vec!["highRiskCountsByKey".to_owned()],
+                checkpoints: vec![],
+                classification: Some("fast_lane".to_owned()),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
     fn cancel_stream_job_command_round_trips() -> Result<()> {
         let command = ThroughputCommandEnvelope {
             command_id: Uuid::now_v7(),
@@ -4311,6 +4681,53 @@ mod tests {
         let round_tripped: ThroughputCommandEnvelope = serde_json::from_value(encoded.clone())?;
         assert_eq!(round_tripped, command);
         assert!(encoded.to_string().contains("\"cancel_stream_job\""));
+        Ok(())
+    }
+
+    #[test]
+    fn pause_stream_job_command_round_trips() -> Result<()> {
+        let command = ThroughputCommandEnvelope {
+            command_id: Uuid::now_v7(),
+            occurred_at: Utc::now(),
+            dedupe_key: "stream-job-pause:handle-a".to_owned(),
+            partition_key: throughput_partition_key("job-a", 0),
+            payload: ThroughputCommand::PauseStreamJob(PauseStreamJobCommand {
+                tenant_id: "tenant-a".to_owned(),
+                stream_instance_id: "stream-a".to_owned(),
+                stream_run_id: "run-a".to_owned(),
+                job_id: "job-a".to_owned(),
+                handle_id: "handle-a".to_owned(),
+                reason: Some("operator pause".to_owned()),
+            }),
+        };
+
+        let encoded = serde_json::to_value(&command)?;
+        let round_tripped: ThroughputCommandEnvelope = serde_json::from_value(encoded.clone())?;
+        assert_eq!(round_tripped, command);
+        assert!(encoded.to_string().contains("\"pause_stream_job\""));
+        Ok(())
+    }
+
+    #[test]
+    fn resume_stream_job_command_round_trips() -> Result<()> {
+        let command = ThroughputCommandEnvelope {
+            command_id: Uuid::now_v7(),
+            occurred_at: Utc::now(),
+            dedupe_key: "stream-job-resume:handle-a".to_owned(),
+            partition_key: throughput_partition_key("job-a", 0),
+            payload: ThroughputCommand::ResumeStreamJob(ResumeStreamJobCommand {
+                tenant_id: "tenant-a".to_owned(),
+                stream_instance_id: "stream-a".to_owned(),
+                stream_run_id: "run-a".to_owned(),
+                job_id: "job-a".to_owned(),
+                handle_id: "handle-a".to_owned(),
+            }),
+        };
+
+        let encoded = serde_json::to_value(&command)?;
+        let round_tripped: ThroughputCommandEnvelope = serde_json::from_value(encoded.clone())?;
+        assert_eq!(round_tripped, command);
+        assert!(encoded.to_string().contains("\"resume_stream_job\""));
         Ok(())
     }
 

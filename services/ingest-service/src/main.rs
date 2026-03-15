@@ -20,9 +20,9 @@ use fabrik_config::{HttpServiceConfig, PostgresConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
-    StreamJobBridgeHandleRecord, StreamJobRecord, TopicAdapterRecord, TopicAdapterResolvedDispatch,
-    WorkflowFastStartMode, WorkflowFastStartRecord, WorkflowFastStartStatus,
-    WorkflowFastStartTerminalUpdate, WorkflowRunFilters, WorkflowStore,
+    StreamDeploymentRecord, StreamJobBridgeHandleRecord, StreamJobRecord, TopicAdapterRecord,
+    TopicAdapterResolvedDispatch, WorkflowFastStartMode, WorkflowFastStartRecord,
+    WorkflowFastStartStatus, WorkflowFastStartTerminalUpdate, WorkflowRunFilters, WorkflowStore,
     resolve_topic_adapter_dispatch,
 };
 use fabrik_throughput::{
@@ -419,13 +419,82 @@ struct SubmitStandaloneStreamJobResponse {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+struct DeployStandaloneStreamRequest {
+    definition_id: String,
+    #[serde(default)]
+    version: Option<u32>,
+    input: Value,
+    #[serde(default)]
+    config: Option<Value>,
+    #[serde(default)]
+    deployment_id: Option<String>,
+    #[serde(default)]
+    job_id: Option<String>,
+    #[serde(default = "default_cancel_reason")]
+    drain_reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DeployStandaloneStreamResponse {
+    tenant_id: String,
+    deployment_id: String,
+    revision_id: String,
+    definition_id: String,
+    version: u32,
+    artifact_hash: String,
+    desired_state: String,
+    rollout_phase: String,
+    stream_instance_id: String,
+    stream_run_id: String,
+    job_id: String,
+    handle_id: String,
+    rollout_generation: u64,
+    replaced_revision_id: Option<String>,
+    rollout_checkpoint_name: Option<String>,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamDeploymentLifecycleResponse {
+    tenant_id: String,
+    deployment_id: String,
+    desired_state: String,
+    rollout_phase: String,
+    active_revision_id: Option<String>,
+    active_job_id: Option<String>,
+    active_handle_id: Option<String>,
+    previous_revision_id: Option<String>,
+    failed_revision_id: Option<String>,
+    rollout_failure: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 struct CancelStandaloneStreamJobRequest {
+    #[serde(default = "default_cancel_reason")]
+    reason: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DrainStandaloneStreamJobRequest {
     #[serde(default = "default_cancel_reason")]
     reason: String,
 }
 
 #[derive(Debug, Serialize)]
 struct CancelStandaloneStreamJobResponse {
+    tenant_id: String,
+    instance_id: String,
+    stream_instance_id: String,
+    run_id: String,
+    stream_run_id: String,
+    job_id: String,
+    handle_id: String,
+    origin_kind: String,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ResumeStandaloneStreamJobResponse {
     tenant_id: String,
     instance_id: String,
     stream_instance_id: String,
@@ -533,7 +602,68 @@ async fn main() -> Result<()> {
     .route("/tenants/{tenant_id}/workflow-artifacts", post(publish_workflow_artifact))
     .route("/tenants/{tenant_id}/workflow-artifacts/validate", post(validate_workflow_artifact))
     .route("/tenants/{tenant_id}/stream-artifacts", post(publish_stream_artifact))
+    .route(
+        "/tenants/{tenant_id}/streams/deployments",
+        post(deploy_standalone_stream),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-deployments",
+        post(deploy_standalone_stream),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/deployments/{deployment_id}/drain",
+        post(drain_stream_deployment),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-deployments/{deployment_id}/drain",
+        post(drain_stream_deployment),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/deployments/{deployment_id}/pause",
+        post(pause_stream_deployment),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-deployments/{deployment_id}/pause",
+        post(pause_stream_deployment),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/deployments/{deployment_id}/resume",
+        post(resume_stream_deployment),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-deployments/{deployment_id}/resume",
+        post(resume_stream_deployment),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/deployments/{deployment_id}/rollback",
+        post(rollback_stream_deployment),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-deployments/{deployment_id}/rollback",
+        post(rollback_stream_deployment),
+    )
+    .route("/tenants/{tenant_id}/streams/jobs", post(submit_standalone_stream_job))
     .route("/tenants/{tenant_id}/stream-jobs", post(submit_standalone_stream_job))
+    .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/drain",
+        post(drain_standalone_stream_job),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/drain",
+        post(drain_standalone_stream_job),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/resume",
+        post(resume_standalone_stream_job),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/resume",
+        post(resume_standalone_stream_job),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/cancel",
+        post(cancel_standalone_stream_job),
+    )
     .route(
         "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/cancel",
         post(cancel_standalone_stream_job),
@@ -1372,6 +1502,60 @@ fn default_standalone_stream_instance_id(definition_id: &str) -> String {
     format!("stream-{definition_id}")
 }
 
+fn default_stream_deployment_id(definition_id: &str) -> String {
+    format!("deployment-{definition_id}")
+}
+
+fn rollout_checkpoint_name_from_policy(policy: Option<&Value>) -> Option<String> {
+    policy
+        .and_then(|value| value.get("checkpoints"))
+        .and_then(Value::as_array)
+        .and_then(|checkpoints| checkpoints.first())
+        .and_then(|checkpoint| checkpoint.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+fn stream_deployment_record(
+    tenant_id: &str,
+    deployment_id: &str,
+    artifact: &CompiledStreamJobArtifact,
+    desired_state: &str,
+    rollout_phase: &str,
+    rollout_generation: u64,
+    active_stream_run_id: Option<String>,
+    active_job_id: Option<String>,
+    active_handle_id: Option<String>,
+    previous_stream_run_id: Option<String>,
+    rollout_checkpoint_name: Option<String>,
+    rollout_handoff_checkpoint_sequence: Option<i64>,
+    failed_revision_id: Option<String>,
+    rollout_failure: Option<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+) -> StreamDeploymentRecord {
+    StreamDeploymentRecord {
+        tenant_id: tenant_id.to_owned(),
+        deployment_id: deployment_id.to_owned(),
+        definition_id: artifact.definition_id.clone(),
+        definition_version: Some(artifact.definition_version),
+        artifact_hash: Some(artifact.artifact_hash.clone()),
+        desired_state: desired_state.to_owned(),
+        rollout_phase: rollout_phase.to_owned(),
+        rollout_generation,
+        active_stream_run_id,
+        active_job_id,
+        active_handle_id,
+        previous_stream_run_id,
+        rollout_checkpoint_name,
+        rollout_handoff_checkpoint_sequence,
+        failed_revision_id,
+        rollout_failure,
+        created_at,
+        updated_at,
+    }
+}
+
 fn standalone_stream_job_record(
     tenant_id: &str,
     handle: &StreamJobBridgeHandleRecord,
@@ -1420,6 +1604,168 @@ fn standalone_stream_job_record(
         created_at: occurred_at,
         updated_at: occurred_at,
     }
+}
+
+fn standalone_stream_job_control_response(
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    handle: &StreamJobBridgeHandleRecord,
+) -> ResumeStandaloneStreamJobResponse {
+    ResumeStandaloneStreamJobResponse {
+        tenant_id,
+        instance_id,
+        stream_instance_id: handle.stream_instance_id.clone(),
+        run_id,
+        stream_run_id: handle.stream_run_id.clone(),
+        job_id: handle.job_id.clone(),
+        handle_id: handle.handle_id.clone(),
+        origin_kind: handle.origin_kind.clone(),
+        status: handle.status.clone(),
+    }
+}
+
+async fn request_standalone_stream_job_drain(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    job_id: &str,
+    reason: String,
+    occurred_at: DateTime<Utc>,
+) -> Result<Option<StreamJobBridgeHandleRecord>, (StatusCode, String)> {
+    let Some(mut handle) = state
+        .store
+        .get_stream_job_bridge_handle(tenant_id, instance_id, run_id, job_id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Ok(None);
+    };
+
+    if handle.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal) {
+        return Ok(Some(handle));
+    }
+
+    handle.status = StreamJobBridgeHandleStatus::CancellationRequested.as_str().to_owned();
+    handle.cancellation_requested_at = Some(occurred_at);
+    handle.cancellation_reason = Some(reason.clone());
+    handle.updated_at = occurred_at;
+    state.store.upsert_stream_job_bridge_handle(&handle).await.map_err(internal_error)?;
+
+    if let Some(mut job) = state
+        .store
+        .get_stream_job(tenant_id, instance_id, run_id, job_id)
+        .await
+        .map_err(internal_error)?
+    {
+        job.status = StreamJobStatus::Draining.as_str().to_owned();
+        job.draining_at = job.draining_at.or(Some(occurred_at));
+        job.cancellation_requested_at = Some(occurred_at);
+        job.cancellation_reason = Some(reason.clone());
+        job.updated_at = occurred_at;
+        state.store.upsert_stream_job(&job).await.map_err(internal_error)?;
+    }
+
+    let command = ThroughputCommandEnvelope {
+        command_id: Uuid::now_v7(),
+        occurred_at,
+        dedupe_key: format!("stream-job-cancel:{}", handle.handle_id),
+        partition_key: fabrik_throughput::throughput_partition_key(job_id, 0),
+        payload: ThroughputCommand::CancelStreamJob(CancelStreamJobCommand {
+            tenant_id: tenant_id.to_owned(),
+            stream_instance_id: handle.stream_instance_id.clone(),
+            stream_run_id: handle.stream_run_id.clone(),
+            job_id: job_id.to_owned(),
+            handle_id: handle.handle_id.clone(),
+            reason: Some(reason),
+        }),
+    };
+    state
+        .streams_command_publisher
+        .publish(&command, &command.partition_key)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Some(handle))
+}
+
+async fn request_standalone_stream_job_resume(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    job_id: &str,
+    occurred_at: DateTime<Utc>,
+) -> Result<StreamJobBridgeHandleRecord, (StatusCode, String)> {
+    let mut handle = state
+        .store
+        .get_stream_job_bridge_handle(tenant_id, instance_id, run_id, job_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("stream job {job_id} not found for {tenant_id}/{instance_id}/{run_id}"),
+            )
+        })?;
+
+    if handle.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal) {
+        return Ok(handle);
+    }
+
+    handle.status = if handle.stream_owner_epoch.is_some() {
+        StreamJobBridgeHandleStatus::Running.as_str().to_owned()
+    } else {
+        StreamJobBridgeHandleStatus::Admitted.as_str().to_owned()
+    };
+    handle.cancellation_requested_at = None;
+    handle.cancellation_reason = None;
+    handle.updated_at = occurred_at;
+    state.store.upsert_stream_job_bridge_handle(&handle).await.map_err(internal_error)?;
+
+    if let Some(mut job) = state
+        .store
+        .get_stream_job(tenant_id, instance_id, run_id, job_id)
+        .await
+        .map_err(internal_error)?
+    {
+        job.status = if job.running_at.is_some() {
+            StreamJobStatus::Running.as_str().to_owned()
+        } else {
+            StreamJobStatus::Starting.as_str().to_owned()
+        };
+        job.draining_at = None;
+        job.cancellation_requested_at = None;
+        job.cancellation_reason = None;
+        job.updated_at = occurred_at;
+        state.store.upsert_stream_job(&job).await.map_err(internal_error)?;
+    }
+
+    let command = ThroughputCommandEnvelope {
+        command_id: Uuid::now_v7(),
+        occurred_at,
+        dedupe_key: format!(
+            "stream-job-resume:{}:{}",
+            handle.handle_id,
+            occurred_at.timestamp_millis()
+        ),
+        partition_key: fabrik_throughput::throughput_partition_key(job_id, 0),
+        payload: ThroughputCommand::ScheduleStreamJob(ScheduleStreamJobCommand {
+            tenant_id: tenant_id.to_owned(),
+            stream_instance_id: handle.stream_instance_id.clone(),
+            stream_run_id: handle.stream_run_id.clone(),
+            job_id: job_id.to_owned(),
+            handle_id: handle.handle_id.clone(),
+        }),
+    };
+    state
+        .streams_command_publisher
+        .publish(&command, &command.partition_key)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(handle)
 }
 
 async fn submit_standalone_stream_job(
@@ -1602,63 +1948,364 @@ async fn submit_standalone_stream_job(
     ))
 }
 
-async fn cancel_standalone_stream_job(
-    Path((tenant_id, instance_id, run_id, job_id)): Path<(String, String, String, String)>,
+async fn deploy_standalone_stream(
+    Path(tenant_id): Path<String>,
     State(state): State<AppState>,
-    Json(request): Json<CancelStandaloneStreamJobRequest>,
-) -> Result<Json<CancelStandaloneStreamJobResponse>, (StatusCode, String)> {
-    let mut handle = state
+    Json(request): Json<DeployStandaloneStreamRequest>,
+) -> Result<(StatusCode, Json<DeployStandaloneStreamResponse>), (StatusCode, String)> {
+    let artifact = match request.version {
+        Some(version) => state
+            .store
+            .get_stream_artifact_version(&tenant_id, &request.definition_id, version)
+            .await
+            .map_err(internal_error)?,
+        None => state
+            .store
+            .get_latest_stream_artifact(&tenant_id, &request.definition_id)
+            .await
+            .map_err(internal_error)?,
+    }
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!(
+                "stream artifact {}{} not found for tenant {}",
+                request.definition_id,
+                request
+                    .version
+                    .map(|value| format!(" version {value}"))
+                    .unwrap_or_else(String::new),
+                tenant_id
+            ),
+        )
+    })?;
+
+    let deployment_id = request
+        .deployment_id
+        .clone()
+        .unwrap_or_else(|| default_stream_deployment_id(&artifact.definition_id));
+    let existing_deployment = state
         .store
-        .get_stream_job_bridge_handle(&tenant_id, &instance_id, &run_id, &job_id)
+        .get_stream_deployment(&tenant_id, &deployment_id)
+        .await
+        .map_err(internal_error)?;
+    let rollout_generation = existing_deployment
+        .as_ref()
+        .map(|deployment| deployment.rollout_generation + 1)
+        .unwrap_or(1);
+    let revision_id = format!("rev-{rollout_generation}");
+    let job_id = request.job_id.clone().unwrap_or_else(|| format!("{deployment_id}-job"));
+    let handle_id = stream_job_handle_id(&tenant_id, &deployment_id, &revision_id, &job_id);
+    let bridge_request_id =
+        stream_job_bridge_request_id(&tenant_id, &deployment_id, &revision_id, &job_id);
+    let checkpoint_policy = if artifact.job.checkpoint_policy.is_some() {
+        Some(
+            serde_json::to_value(&artifact.job.checkpoint_policy)
+                .map_err(|error| internal_error(anyhow::Error::new(error)))?,
+        )
+    } else {
+        None
+    };
+    let view_definitions = if artifact.job.views.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_value(&artifact.job.views)
+                .map_err(|error| internal_error(anyhow::Error::new(error)))?,
+        )
+    };
+    let rollout_checkpoint_name = rollout_checkpoint_name_from_policy(checkpoint_policy.as_ref());
+    let occurred_at = Utc::now();
+    let workflow_event_id = Uuid::now_v7();
+    let handle = StreamJobBridgeHandleRecord {
+        workflow_event_id,
+        protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+        operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+        tenant_id: tenant_id.clone(),
+        instance_id: deployment_id.clone(),
+        run_id: revision_id.clone(),
+        stream_instance_id: deployment_id.clone(),
+        stream_run_id: revision_id.clone(),
+        job_id: job_id.clone(),
+        handle_id: handle_id.clone(),
+        bridge_request_id: bridge_request_id.clone(),
+        origin_kind: StreamJobOriginKind::Standalone.as_str().to_owned(),
+        definition_id: artifact.definition_id.clone(),
+        definition_version: Some(artifact.definition_version),
+        artifact_hash: Some(artifact.artifact_hash.clone()),
+        job_name: artifact.job.name.clone(),
+        input_ref: serde_json::to_string(&request.input)
+            .map_err(|error| internal_error(anyhow::Error::new(error)))?,
+        config_ref: request
+            .config
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| internal_error(anyhow::Error::new(error)))?,
+        checkpoint_policy: checkpoint_policy.clone(),
+        view_definitions: view_definitions.clone(),
+        status: StreamJobBridgeHandleStatus::Admitted.as_str().to_owned(),
+        workflow_owner_epoch: None,
+        stream_owner_epoch: None,
+        cancellation_requested_at: None,
+        cancellation_reason: None,
+        terminal_event_id: None,
+        terminal_at: None,
+        workflow_accepted_at: None,
+        terminal_output: None,
+        terminal_error: None,
+        created_at: occurred_at,
+        updated_at: occurred_at,
+    };
+
+    state.store.upsert_stream_job_bridge_handle(&handle).await.map_err(internal_error)?;
+    state
+        .store
+        .upsert_stream_job(&standalone_stream_job_record(
+            &tenant_id,
+            &handle,
+            checkpoint_policy.clone(),
+            view_definitions.clone(),
+            occurred_at,
+        ))
+        .await
+        .map_err(internal_error)?;
+
+    let replaced_revision_id =
+        existing_deployment.as_ref().and_then(|deployment| deployment.active_stream_run_id.clone());
+    let (desired_state, rollout_phase) = if replaced_revision_id.is_some() {
+        ("rolling_forward", "pending_checkpoint")
+    } else {
+        (StreamJobStatus::Running.as_str(), "running")
+    };
+
+    let deployment_record = stream_deployment_record(
+        &tenant_id,
+        &deployment_id,
+        &artifact,
+        desired_state,
+        rollout_phase,
+        rollout_generation,
+        Some(revision_id.clone()),
+        Some(job_id.clone()),
+        Some(handle_id.clone()),
+        replaced_revision_id.clone(),
+        rollout_checkpoint_name.clone(),
+        None,
+        None,
+        None,
+        existing_deployment.as_ref().map(|deployment| deployment.created_at).unwrap_or(occurred_at),
+        occurred_at,
+    );
+    state.store.upsert_stream_deployment(&deployment_record).await.map_err(internal_error)?;
+
+    let command = ThroughputCommandEnvelope {
+        command_id: Uuid::now_v7(),
+        occurred_at,
+        dedupe_key: format!("stream-job-submit:{handle_id}"),
+        partition_key: fabrik_throughput::throughput_partition_key(&job_id, 0),
+        payload: ThroughputCommand::ScheduleStreamJob(ScheduleStreamJobCommand {
+            tenant_id: tenant_id.clone(),
+            stream_instance_id: deployment_id.clone(),
+            stream_run_id: revision_id.clone(),
+            job_id: job_id.clone(),
+            handle_id: handle_id.clone(),
+        }),
+    };
+    state
+        .streams_command_publisher
+        .publish(&command, &command.partition_key)
+        .await
+        .map_err(internal_error)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(DeployStandaloneStreamResponse {
+            tenant_id,
+            deployment_id,
+            revision_id: revision_id.clone(),
+            definition_id: artifact.definition_id,
+            version: artifact.definition_version,
+            artifact_hash: artifact.artifact_hash,
+            desired_state: desired_state.to_owned(),
+            rollout_phase: rollout_phase.to_owned(),
+            stream_instance_id: handle.stream_instance_id.clone(),
+            stream_run_id: handle.stream_run_id.clone(),
+            job_id,
+            handle_id,
+            rollout_generation,
+            replaced_revision_id,
+            rollout_checkpoint_name,
+            status: handle.status,
+        }),
+    ))
+}
+
+async fn drain_stream_deployment(
+    Path((tenant_id, deployment_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<DrainStandaloneStreamJobRequest>,
+) -> Result<Json<StreamDeploymentLifecycleResponse>, (StatusCode, String)> {
+    let mut deployment = state
+        .store
+        .get_stream_deployment(&tenant_id, &deployment_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
-                format!("stream job {job_id} not found for {tenant_id}/{instance_id}/{run_id}"),
+                format!("stream deployment {deployment_id} not found for tenant {tenant_id}"),
             )
         })?;
+    let occurred_at = Utc::now();
+    let _ = request.reason;
+    deployment.desired_state = StreamJobStatus::Draining.as_str().to_owned();
+    deployment.rollout_phase = "draining".to_owned();
+    deployment.updated_at = occurred_at;
+    state.store.upsert_stream_deployment(&deployment).await.map_err(internal_error)?;
+    Ok(Json(StreamDeploymentLifecycleResponse {
+        tenant_id,
+        deployment_id,
+        desired_state: deployment.desired_state,
+        rollout_phase: deployment.rollout_phase,
+        active_revision_id: deployment.active_stream_run_id,
+        active_job_id: deployment.active_job_id,
+        active_handle_id: deployment.active_handle_id,
+        previous_revision_id: deployment.previous_stream_run_id,
+        failed_revision_id: deployment.failed_revision_id,
+        rollout_failure: deployment.rollout_failure,
+    }))
+}
 
-    if !handle.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal) {
-        let occurred_at = Utc::now();
-        handle.status = StreamJobBridgeHandleStatus::CancellationRequested.as_str().to_owned();
-        handle.cancellation_requested_at = Some(occurred_at);
-        handle.cancellation_reason = Some(request.reason.clone());
-        handle.updated_at = occurred_at;
-        state.store.upsert_stream_job_bridge_handle(&handle).await.map_err(internal_error)?;
-        if let Some(mut job) = state
-            .store
-            .get_stream_job(&tenant_id, &instance_id, &run_id, &job_id)
-            .await
-            .map_err(internal_error)?
-        {
-            job.status = StreamJobStatus::Draining.as_str().to_owned();
-            job.draining_at = job.draining_at.or(Some(occurred_at));
-            job.cancellation_requested_at = Some(occurred_at);
-            job.cancellation_reason = Some(request.reason.clone());
-            job.updated_at = occurred_at;
-            state.store.upsert_stream_job(&job).await.map_err(internal_error)?;
-        }
-        let command = ThroughputCommandEnvelope {
-            command_id: Uuid::now_v7(),
-            occurred_at,
-            dedupe_key: format!("stream-job-cancel:{}", handle.handle_id),
-            partition_key: fabrik_throughput::throughput_partition_key(&job_id, 0),
-            payload: ThroughputCommand::CancelStreamJob(CancelStreamJobCommand {
-                tenant_id: tenant_id.clone(),
-                stream_instance_id: handle.stream_instance_id.clone(),
-                stream_run_id: handle.stream_run_id.clone(),
-                job_id: job_id.clone(),
-                handle_id: handle.handle_id.clone(),
-                reason: Some(request.reason),
-            }),
-        };
-        state
-            .streams_command_publisher
-            .publish(&command, &command.partition_key)
-            .await
-            .map_err(internal_error)?;
+async fn pause_stream_deployment(
+    Path((tenant_id, deployment_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<StreamDeploymentLifecycleResponse>, (StatusCode, String)> {
+    let mut deployment = state
+        .store
+        .get_stream_deployment(&tenant_id, &deployment_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("stream deployment {deployment_id} not found for tenant {tenant_id}"),
+            )
+        })?;
+    deployment.desired_state = StreamJobStatus::Paused.as_str().to_owned();
+    deployment.rollout_phase = "paused".to_owned();
+    deployment.updated_at = Utc::now();
+    state.store.upsert_stream_deployment(&deployment).await.map_err(internal_error)?;
+    Ok(Json(StreamDeploymentLifecycleResponse {
+        tenant_id,
+        deployment_id,
+        desired_state: deployment.desired_state,
+        rollout_phase: deployment.rollout_phase,
+        active_revision_id: deployment.active_stream_run_id,
+        active_job_id: deployment.active_job_id,
+        active_handle_id: deployment.active_handle_id,
+        previous_revision_id: deployment.previous_stream_run_id,
+        failed_revision_id: deployment.failed_revision_id,
+        rollout_failure: deployment.rollout_failure,
+    }))
+}
+
+async fn resume_stream_deployment(
+    Path((tenant_id, deployment_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<StreamDeploymentLifecycleResponse>, (StatusCode, String)> {
+    let mut deployment = state
+        .store
+        .get_stream_deployment(&tenant_id, &deployment_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("stream deployment {deployment_id} not found for tenant {tenant_id}"),
+            )
+        })?;
+    let occurred_at = Utc::now();
+    deployment.desired_state = StreamJobStatus::Running.as_str().to_owned();
+    if deployment.previous_stream_run_id.is_none() {
+        deployment.rollout_phase = "running".to_owned();
     }
+    deployment.updated_at = occurred_at;
+    state.store.upsert_stream_deployment(&deployment).await.map_err(internal_error)?;
+    Ok(Json(StreamDeploymentLifecycleResponse {
+        tenant_id,
+        deployment_id,
+        desired_state: deployment.desired_state,
+        rollout_phase: deployment.rollout_phase,
+        active_revision_id: deployment.active_stream_run_id,
+        active_job_id: deployment.active_job_id,
+        active_handle_id: deployment.active_handle_id,
+        previous_revision_id: deployment.previous_stream_run_id,
+        failed_revision_id: deployment.failed_revision_id,
+        rollout_failure: deployment.rollout_failure,
+    }))
+}
+
+async fn rollback_stream_deployment(
+    Path((tenant_id, deployment_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<StreamDeploymentLifecycleResponse>, (StatusCode, String)> {
+    let mut deployment = state
+        .store
+        .get_stream_deployment(&tenant_id, &deployment_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("stream deployment {deployment_id} not found for tenant {tenant_id}"),
+            )
+        })?;
+    if deployment.previous_stream_run_id.is_none() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("stream deployment {deployment_id} has no rollback revision"),
+        ));
+    }
+    deployment.desired_state = StreamJobStatus::Running.as_str().to_owned();
+    deployment.rollout_phase = "rollback_pending".to_owned();
+    deployment.updated_at = Utc::now();
+    state.store.upsert_stream_deployment(&deployment).await.map_err(internal_error)?;
+    Ok(Json(StreamDeploymentLifecycleResponse {
+        tenant_id,
+        deployment_id,
+        desired_state: deployment.desired_state,
+        rollout_phase: deployment.rollout_phase,
+        active_revision_id: deployment.active_stream_run_id,
+        active_job_id: deployment.active_job_id,
+        active_handle_id: deployment.active_handle_id,
+        previous_revision_id: deployment.previous_stream_run_id,
+        failed_revision_id: deployment.failed_revision_id,
+        rollout_failure: deployment.rollout_failure,
+    }))
+}
+
+async fn cancel_standalone_stream_job(
+    Path((tenant_id, instance_id, run_id, job_id)): Path<(String, String, String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<CancelStandaloneStreamJobRequest>,
+) -> Result<Json<CancelStandaloneStreamJobResponse>, (StatusCode, String)> {
+    let handle = request_standalone_stream_job_drain(
+        &state,
+        &tenant_id,
+        &instance_id,
+        &run_id,
+        &job_id,
+        request.reason,
+        Utc::now(),
+    )
+    .await?
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("stream job {job_id} not found for {tenant_id}/{instance_id}/{run_id}"),
+        )
+    })?;
 
     Ok(Json(CancelStandaloneStreamJobResponse {
         tenant_id,
@@ -1671,6 +2318,47 @@ async fn cancel_standalone_stream_job(
         origin_kind: handle.origin_kind.clone(),
         status: handle.status,
     }))
+}
+
+async fn drain_standalone_stream_job(
+    Path((tenant_id, instance_id, run_id, job_id)): Path<(String, String, String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<DrainStandaloneStreamJobRequest>,
+) -> Result<Json<ResumeStandaloneStreamJobResponse>, (StatusCode, String)> {
+    let response = cancel_standalone_stream_job(
+        Path((tenant_id.clone(), instance_id.clone(), run_id.clone(), job_id)),
+        State(state),
+        Json(CancelStandaloneStreamJobRequest { reason: request.reason }),
+    )
+    .await?;
+    Ok(Json(ResumeStandaloneStreamJobResponse {
+        tenant_id,
+        instance_id,
+        stream_instance_id: response.0.stream_instance_id,
+        run_id,
+        stream_run_id: response.0.stream_run_id,
+        job_id: response.0.job_id,
+        handle_id: response.0.handle_id,
+        origin_kind: response.0.origin_kind,
+        status: response.0.status,
+    }))
+}
+
+async fn resume_standalone_stream_job(
+    Path((tenant_id, instance_id, run_id, job_id)): Path<(String, String, String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<ResumeStandaloneStreamJobResponse>, (StatusCode, String)> {
+    let handle = request_standalone_stream_job_resume(
+        &state,
+        &tenant_id,
+        &instance_id,
+        &run_id,
+        &job_id,
+        Utc::now(),
+    )
+    .await?;
+
+    Ok(Json(standalone_stream_job_control_response(tenant_id, instance_id, run_id, &handle)))
 }
 
 async fn validate_artifact_against_recent_runs(
@@ -4208,6 +4896,94 @@ mod tests {
         )
     }
 
+    fn simple_stream_artifact(definition_id: &str, version: u32) -> CompiledStreamJobArtifact {
+        let mut artifact = CompiledStreamJobArtifact {
+            definition_id: definition_id.to_owned(),
+            definition_version: version,
+            compiler_version: "ingest-test".to_owned(),
+            runtime_contract: fabrik_throughput::STREAMS_KERNEL_V1_CONTRACT.to_owned(),
+            source_language: "typescript".to_owned(),
+            entrypoint: fabrik_throughput::StreamArtifactEntrypoint {
+                module: "streams.ts".to_owned(),
+                export: "streamJob".to_owned(),
+            },
+            source_files: vec!["streams.ts".to_owned()],
+            source_map: std::collections::BTreeMap::new(),
+            job: fabrik_throughput::CompiledStreamJob {
+                name: fabrik_throughput::STREAM_JOB_KEYED_ROLLUP.to_owned(),
+                runtime: fabrik_throughput::STREAM_RUNTIME_KEYED_ROLLUP.to_owned(),
+                source: fabrik_throughput::CompiledStreamSource {
+                    kind: fabrik_throughput::STREAM_SOURCE_TOPIC.to_owned(),
+                    name: Some("payments".to_owned()),
+                    binding: Some("payments".to_owned()),
+                    config: Some(json!({"partitions": 1})),
+                },
+                key_by: Some("accountId".to_owned()),
+                states: vec![],
+                operators: vec![
+                    fabrik_throughput::CompiledStreamOperator {
+                        kind: fabrik_throughput::STREAM_OPERATOR_REDUCE.to_owned(),
+                        operator_id: None,
+                        name: Some("sum-account-totals".to_owned()),
+                        inputs: vec![],
+                        outputs: vec![],
+                        state_ids: vec![],
+                        config: Some(json!({
+                            "reducer": fabrik_throughput::STREAM_REDUCER_SUM,
+                            "valueField": "amount",
+                            "outputField": "totalAmount",
+                        })),
+                    },
+                    fabrik_throughput::CompiledStreamOperator {
+                        kind: fabrik_throughput::STREAM_OPERATOR_EMIT_CHECKPOINT.to_owned(),
+                        operator_id: None,
+                        name: Some("rollup-ready".to_owned()),
+                        inputs: vec![],
+                        outputs: vec![],
+                        state_ids: vec![],
+                        config: Some(json!({ "sequence": 1 })),
+                    },
+                ],
+                checkpoint_policy: Some(json!({
+                    "kind": fabrik_throughput::STREAM_CHECKPOINT_POLICY_NAMED,
+                    "checkpoints": [
+                        {
+                            "name": "rollup-ready",
+                            "delivery": fabrik_throughput::STREAM_CHECKPOINT_DELIVERY_WORKFLOW_AWAITABLE,
+                            "sequence": 1,
+                        }
+                    ],
+                })),
+                views: vec![fabrik_throughput::CompiledStreamView {
+                    name: "accountTotals".to_owned(),
+                    consistency: fabrik_throughput::STREAM_CONSISTENCY_STRONG.to_owned(),
+                    query_mode: fabrik_throughput::STREAM_QUERY_MODE_BY_KEY.to_owned(),
+                    view_id: None,
+                    key_field: Some("accountId".to_owned()),
+                    value_fields: vec![
+                        "accountId".to_owned(),
+                        "totalAmount".to_owned(),
+                        "asOfCheckpoint".to_owned(),
+                    ],
+                    supported_consistencies: vec![],
+                    retention_seconds: None,
+                }],
+                queries: vec![fabrik_throughput::CompiledStreamQuery {
+                    name: "accountTotals".to_owned(),
+                    view_name: "accountTotals".to_owned(),
+                    consistency: fabrik_throughput::STREAM_CONSISTENCY_STRONG.to_owned(),
+                    query_id: None,
+                    arg_fields: vec![],
+                }],
+                classification: None,
+                metadata: None,
+            },
+            artifact_hash: String::new(),
+        };
+        artifact.artifact_hash = artifact.hash();
+        artifact
+    }
+
     async fn wait_for_adapter_counts(
         store: &WorkflowStore,
         tenant_id: &str,
@@ -4253,6 +5029,98 @@ mod tests {
             }
             sleep(StdDuration::from_millis(100)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn deploy_standalone_stream_rolls_revision_and_drains_previous_active_revision()
+    -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state = test_state(store.clone(), &redpanda).await?;
+
+        store.put_stream_artifact("tenant-a", &simple_stream_artifact("fraud-stream", 1)).await?;
+        store.put_stream_artifact("tenant-a", &simple_stream_artifact("fraud-stream", 2)).await?;
+
+        let (_, first_response) = deploy_standalone_stream(
+            Path("tenant-a".to_owned()),
+            State(state.clone()),
+            Json(DeployStandaloneStreamRequest {
+                definition_id: "fraud-stream".to_owned(),
+                version: Some(1),
+                input: json!({"source": "payments"}),
+                config: Some(json!({"threshold": 0.9})),
+                deployment_id: Some("fraud-deploy".to_owned()),
+                job_id: Some("fraud-job".to_owned()),
+                drain_reason: "deploy rollout".to_owned(),
+            }),
+        )
+        .await
+        .map_err(|(status, message)| anyhow::anyhow!("{status}: {message}"))?;
+        assert_eq!(first_response.0.revision_id, "rev-1");
+        assert_eq!(first_response.0.replaced_revision_id, None);
+
+        let (_, second_response) = deploy_standalone_stream(
+            Path("tenant-a".to_owned()),
+            State(state.clone()),
+            Json(DeployStandaloneStreamRequest {
+                definition_id: "fraud-stream".to_owned(),
+                version: Some(2),
+                input: json!({"source": "payments"}),
+                config: Some(json!({"threshold": 0.95})),
+                deployment_id: Some("fraud-deploy".to_owned()),
+                job_id: Some("fraud-job".to_owned()),
+                drain_reason: "deploy rollout".to_owned(),
+            }),
+        )
+        .await
+        .map_err(|(status, message)| anyhow::anyhow!("{status}: {message}"))?;
+        assert_eq!(second_response.0.revision_id, "rev-2");
+        assert_eq!(second_response.0.replaced_revision_id.as_deref(), Some("rev-1"));
+        assert_eq!(second_response.0.rollout_generation, 2);
+        assert_eq!(second_response.0.rollout_checkpoint_name.as_deref(), Some("rollup-ready"));
+        assert_eq!(second_response.0.desired_state, "rolling_forward");
+        assert_eq!(second_response.0.rollout_phase, "pending_checkpoint");
+
+        let deployment = store
+            .get_stream_deployment("tenant-a", "fraud-deploy")
+            .await?
+            .context("deployment should exist after rollout")?;
+        assert_eq!(deployment.rollout_generation, 2);
+        assert_eq!(deployment.active_stream_run_id.as_deref(), Some("rev-2"));
+        assert_eq!(deployment.previous_stream_run_id.as_deref(), Some("rev-1"));
+        assert_eq!(deployment.active_job_id.as_deref(), Some("fraud-job"));
+        assert_eq!(deployment.desired_state, "rolling_forward");
+        assert_eq!(deployment.rollout_phase, "pending_checkpoint");
+
+        let rev1 = store
+            .get_stream_job_bridge_handle("tenant-a", "fraud-deploy", "rev-1", "fraud-job")
+            .await?
+            .context("rev-1 handle should exist")?;
+        assert_eq!(
+            rev1.parsed_status(),
+            Some(fabrik_throughput::StreamJobBridgeHandleStatus::Admitted)
+        );
+        assert!(rev1.cancellation_requested_at.is_none());
+
+        let rev1_job = store
+            .get_stream_job("tenant-a", "fraud-deploy", "rev-1", "fraud-job")
+            .await?
+            .context("rev-1 job should exist")?;
+        assert_eq!(rev1_job.parsed_status(), Some(fabrik_throughput::StreamJobStatus::Created));
+
+        let rev2 = store
+            .get_stream_job_bridge_handle("tenant-a", "fraud-deploy", "rev-2", "fraud-job")
+            .await?
+            .context("rev-2 handle should exist")?;
+        assert_eq!(rev2.stream_run_id, "rev-2");
+        assert_ne!(rev1.handle_id, rev2.handle_id);
+
+        Ok(())
     }
 
     #[tokio::test]

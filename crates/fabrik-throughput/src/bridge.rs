@@ -194,6 +194,7 @@ impl StreamJobBridgeRepairKind {
 pub enum StreamJobBridgeHandleStatus {
     Admitted,
     Running,
+    Paused,
     CancellationRequested,
     Completed,
     Failed,
@@ -205,6 +206,7 @@ impl StreamJobBridgeHandleStatus {
         match self {
             Self::Admitted => "admitted",
             Self::Running => "running",
+            Self::Paused => "paused",
             Self::CancellationRequested => "cancellation_requested",
             Self::Completed => "completed",
             Self::Failed => "failed",
@@ -216,6 +218,7 @@ impl StreamJobBridgeHandleStatus {
         match value {
             "admitted" => Some(Self::Admitted),
             "running" => Some(Self::Running),
+            "paused" => Some(Self::Paused),
             "cancellation_requested" => Some(Self::CancellationRequested),
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
@@ -235,6 +238,7 @@ pub enum StreamJobStatus {
     Created,
     Starting,
     Running,
+    Paused,
     Draining,
     Completed,
     Failed,
@@ -247,6 +251,7 @@ impl StreamJobStatus {
             Self::Created => "created",
             Self::Starting => "starting",
             Self::Running => "running",
+            Self::Paused => "paused",
             Self::Draining => "draining",
             Self::Completed => "completed",
             Self::Failed => "failed",
@@ -259,6 +264,7 @@ impl StreamJobStatus {
             "created" => Some(Self::Created),
             "starting" => Some(Self::Starting),
             "running" => Some(Self::Running),
+            "paused" => Some(Self::Paused),
             "draining" => Some(Self::Draining),
             "completed" => Some(Self::Completed),
             "failed" => Some(Self::Failed),

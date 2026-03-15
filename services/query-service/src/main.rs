@@ -15,14 +15,15 @@ use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
     QueryRetentionCutoffs, QueryRetentionPruneResult, StreamArtifactSummary,
-    StreamJobBridgeHandleRecord, StreamJobBridgeLedgerRecord, StreamJobCheckpointRecord,
-    StreamJobQueryRecord, StreamJobRecord, StreamJobViewProjectionSummaryRecord, TaskQueueKind,
-    ThroughputBridgeLedgerRecord, WorkflowActivityRecord, WorkflowActivityStatus,
-    WorkflowArtifactSummary, WorkflowBulkBatchRecord, WorkflowBulkBatchRuntimeControlRecord,
-    WorkflowBulkBatchStatus, WorkflowBulkChunkRecord, WorkflowChildRecord,
-    WorkflowDefinitionSummary, WorkflowInstanceFilters, WorkflowRunFilters, WorkflowRunRecord,
-    WorkflowRunSummaryRecord, WorkflowSignalRecord, WorkflowSignalStatus, WorkflowStateSnapshot,
-    WorkflowStore, WorkflowUpdateRecord, WorkflowUpdateStatus,
+    StreamDeploymentRecord, StreamJobBridgeHandleRecord, StreamJobBridgeLedgerRecord,
+    StreamJobCheckpointRecord, StreamJobQueryRecord, StreamJobRecord,
+    StreamJobViewProjectionSummaryRecord, TaskQueueKind, ThroughputBridgeLedgerRecord,
+    WorkflowActivityRecord, WorkflowActivityStatus, WorkflowArtifactSummary,
+    WorkflowBulkBatchRecord, WorkflowBulkBatchRuntimeControlRecord, WorkflowBulkBatchStatus,
+    WorkflowBulkChunkRecord, WorkflowChildRecord, WorkflowDefinitionSummary,
+    WorkflowInstanceFilters, WorkflowRunFilters, WorkflowRunRecord, WorkflowRunSummaryRecord,
+    WorkflowSignalRecord, WorkflowSignalStatus, WorkflowStateSnapshot, WorkflowStore,
+    WorkflowUpdateRecord, WorkflowUpdateStatus,
 };
 use fabrik_throughput::{
     CollectResultsBatchManifest, CompiledStreamJobArtifact, PayloadHandle, PayloadStore,
@@ -487,6 +488,55 @@ struct TenantStreamJobsResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct StreamDeploymentSummary {
+    deployment_id: String,
+    definition_id: String,
+    definition_version: Option<u32>,
+    artifact_hash: Option<String>,
+    desired_state: String,
+    rollout_phase: String,
+    rollout_generation: u64,
+    active_revision_id: Option<String>,
+    active_job_id: Option<String>,
+    active_handle_id: Option<String>,
+    previous_revision_id: Option<String>,
+    rollout_checkpoint_name: Option<String>,
+    rollout_handoff_checkpoint_sequence: Option<i64>,
+    failed_revision_id: Option<String>,
+    rollout_failure: Option<String>,
+    active_status: Option<String>,
+    active_checkpoint_name: Option<String>,
+    active_checkpoint_at: Option<DateTime<Utc>>,
+    active_runtime: Option<Value>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamDeploymentsResponse {
+    tenant_id: String,
+    page: PageInfo,
+    deployment_count: usize,
+    deployments: Vec<StreamDeploymentSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamDeploymentResponse {
+    tenant_id: String,
+    deployment_id: String,
+    deployment: StreamDeploymentSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamDeploymentRevisionsResponse {
+    tenant_id: String,
+    deployment_id: String,
+    page: PageInfo,
+    revision_count: usize,
+    revisions: Vec<StreamJobSummary>,
+}
+
+#[derive(Debug, Serialize)]
 struct StreamJobResponse {
     tenant_id: String,
     instance_id: String,
@@ -533,6 +583,12 @@ struct StrongStreamJobViewEntriesResponse {
     entries: Vec<StreamJobViewEntryRecord>,
 }
 
+#[derive(Debug, Deserialize)]
+struct StrongStreamJobSignalsResponse {
+    total: usize,
+    signals: Vec<StreamJobSignalView>,
+}
+
 #[derive(Debug, Serialize)]
 struct StreamJobViewResponse {
     handle_id: String,
@@ -546,6 +602,62 @@ struct StreamJobViewResponse {
     output: Value,
     checkpoint_sequence: i64,
     updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StreamJobSignalView {
+    operator_id: String,
+    view_name: String,
+    logical_key: String,
+    signal_id: String,
+    signal_type: String,
+    payload: Value,
+    stream_owner_epoch: u64,
+    signaled_at: DateTime<Utc>,
+    published_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
+    callback_dedupe_key: Option<String>,
+    callback_event_id: Option<String>,
+    target_tenant_id: Option<String>,
+    target_instance_id: Option<String>,
+    target_run_id: Option<String>,
+    bridge_status: Option<String>,
+    workflow_signal_status: Option<String>,
+    workflow_signal_dedupe_key: Option<String>,
+    workflow_signal_source_event_id: Option<String>,
+    workflow_signal_dispatch_event_id: Option<String>,
+    workflow_signal_consumed_event_id: Option<String>,
+    workflow_signal_enqueued_at: Option<DateTime<Utc>>,
+    workflow_signal_consumed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamJobSignalsResponse {
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    job_id: String,
+    page: PageInfo,
+    signal_count: usize,
+    signals: Vec<StreamJobSignalView>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamJobCheckpointResponse {
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    job_id: String,
+    checkpoint: StreamJobBridgeCheckpointView,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamJobRuntimeResponse {
+    tenant_id: String,
+    instance_id: String,
+    run_id: String,
+    job_id: String,
+    runtime: Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1104,6 +1216,18 @@ struct ConsistencyQuery {
     consistency: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+struct StreamJobSignalsQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    #[serde(alias = "signalType")]
+    signal_type: Option<String>,
+    #[serde(alias = "operatorId")]
+    operator_id: Option<String>,
+    #[serde(alias = "logicalKey")]
+    logical_key: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReadConsistency {
     Eventual,
@@ -1239,6 +1363,30 @@ async fn main() -> Result<()> {
         get(get_stream_artifact_version),
     )
     .route(
+        "/tenants/{tenant_id}/streams/deployments",
+        get(get_tenant_stream_deployments),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-deployments",
+        get(get_tenant_stream_deployments),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/deployments/{deployment_id}",
+        get(get_stream_deployment),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-deployments/{deployment_id}",
+        get(get_stream_deployment),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/deployments/{deployment_id}/revisions",
+        get(get_stream_deployment_revisions),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-deployments/{deployment_id}/revisions",
+        get(get_stream_deployment_revisions),
+    )
+    .route(
         "/tenants/{tenant_id}/streams/jobs",
         get(get_tenant_stream_jobs),
     )
@@ -1263,6 +1411,30 @@ async fn main() -> Result<()> {
         get(get_stream_job),
     )
     .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/runtime",
+        get(get_stream_job_runtime),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/runtime",
+        get(get_stream_job_runtime),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/checkpoints/{checkpoint_name}",
+        get(get_stream_job_checkpoint),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/checkpoints/{checkpoint_name}",
+        get(get_stream_job_checkpoint),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/signals",
+        get(get_stream_job_signals),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/signals",
+        get(get_stream_job_signals),
+    )
+    .route(
         "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/keys/{logical_key}",
         get(get_stream_job_view),
     )
@@ -1285,6 +1457,14 @@ async fn main() -> Result<()> {
     .route(
         "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/scan",
         get(get_stream_job_view_scan),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/runtime",
+        get(get_stream_job_view_runtime),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/runtime",
+        get(get_stream_job_view_runtime),
     )
     .route(
         "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/entries",
@@ -1482,6 +1662,42 @@ async fn get_tenant_stream_jobs(
     Ok(Json(response))
 }
 
+async fn get_tenant_stream_deployments(
+    Path(tenant_id): Path<String>,
+    Query(query): Query<PaginationQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<StreamDeploymentsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let response =
+        load_tenant_stream_deployments(&state, &tenant_id, query).await.map_err(internal_error)?;
+    Ok(Json(response))
+}
+
+async fn get_stream_deployment(
+    Path((tenant_id, deployment_id)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<StreamDeploymentResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let response =
+        load_stream_deployment(&state, &tenant_id, &deployment_id).await.map_err(|error| {
+            if error.to_string().contains("not found") {
+                not_found(error.to_string())
+            } else {
+                internal_error(error)
+            }
+        })?;
+    Ok(Json(response))
+}
+
+async fn get_stream_deployment_revisions(
+    Path((tenant_id, deployment_id)): Path<(String, String)>,
+    Query(query): Query<StreamJobListQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<StreamDeploymentRevisionsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let response = load_stream_deployment_revisions(&state, &tenant_id, &deployment_id, query)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(response))
+}
+
 async fn get_stream_job(
     Path((tenant_id, instance_id, run_id, job_id)): Path<(String, String, String, String)>,
     State(state): State<AppState>,
@@ -1496,6 +1712,119 @@ async fn get_stream_job(
             }
         })?;
     Ok(Json(response))
+}
+
+async fn get_stream_job_runtime(
+    Path((tenant_id, instance_id, run_id, job_id)): Path<(String, String, String, String)>,
+    Query(query): Query<ConsistencyQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<StreamJobRuntimeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let job = resolve_stream_job(&state, &tenant_id, &instance_id, &run_id, &job_id)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                not_found(error.to_string())
+            } else {
+                internal_error(error)
+            }
+        })?;
+    let consistency =
+        parse_read_consistency(Some(query.consistency.as_deref().unwrap_or("strong")))
+            .map_err(invalid_request)?;
+    if !matches!(consistency, ReadConsistency::Strong) {
+        return Err(invalid_request(anyhow::anyhow!(
+            "stream job runtime only supports strong consistency"
+        )));
+    }
+    let runtime =
+        fetch_strong_stream_job_runtime(&state, &tenant_id, &job.instance_id, &job.run_id, &job_id)
+            .await
+            .map_err(internal_error)?;
+    Ok(Json(StreamJobRuntimeResponse {
+        tenant_id,
+        instance_id: job.instance_id,
+        run_id: job.run_id,
+        job_id,
+        runtime,
+    }))
+}
+
+async fn get_stream_job_checkpoint(
+    Path((tenant_id, instance_id, run_id, job_id, checkpoint_name)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+    State(state): State<AppState>,
+) -> Result<Json<StreamJobCheckpointResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let job = resolve_stream_job(&state, &tenant_id, &instance_id, &run_id, &job_id)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                not_found(error.to_string())
+            } else {
+                internal_error(error)
+            }
+        })?;
+    let checkpoint =
+        load_stream_job_checkpoint_view(&state, &job, &checkpoint_name).await.map_err(|error| {
+            if error.to_string().contains("not found") {
+                not_found(error.to_string())
+            } else {
+                internal_error(error)
+            }
+        })?;
+    Ok(Json(StreamJobCheckpointResponse {
+        tenant_id,
+        instance_id: job.instance_id,
+        run_id: job.run_id,
+        job_id,
+        checkpoint,
+    }))
+}
+
+async fn get_stream_job_signals(
+    Path((tenant_id, instance_id, run_id, job_id)): Path<(String, String, String, String)>,
+    Query(query): Query<StreamJobSignalsQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<StreamJobSignalsResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let job = resolve_stream_job(&state, &tenant_id, &instance_id, &run_id, &job_id)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                not_found(error.to_string())
+            } else {
+                internal_error(error)
+            }
+        })?;
+    let page =
+        resolve_page(&state.query, &PaginationQuery { limit: query.limit, offset: query.offset });
+    let strong = fetch_strong_stream_job_signals(
+        &state,
+        &tenant_id,
+        &job.instance_id,
+        &job.run_id,
+        &job_id,
+        page.limit,
+        page.offset,
+        query.signal_type.as_deref(),
+        query.operator_id.as_deref(),
+        query.logical_key.as_deref(),
+    )
+    .await
+    .map_err(internal_error)?;
+    let page = build_page_info(&page, strong.total, strong.signals.len());
+    Ok(Json(StreamJobSignalsResponse {
+        tenant_id,
+        instance_id: job.instance_id,
+        run_id: job.run_id,
+        job_id,
+        page,
+        signal_count: strong.total,
+        signals: strong.signals,
+    }))
 }
 
 async fn get_stream_job_view(
@@ -1589,6 +1918,53 @@ async fn get_stream_job_view(
         }
     };
     Ok(Json(response))
+}
+
+async fn get_stream_job_view_runtime(
+    Path((tenant_id, instance_id, run_id, job_id, view_name)): Path<(
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+    Query(query): Query<ConsistencyQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<StreamJobRuntimeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let job = resolve_stream_job(&state, &tenant_id, &instance_id, &run_id, &job_id)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                not_found(error.to_string())
+            } else {
+                internal_error(error)
+            }
+        })?;
+    let consistency =
+        parse_read_consistency(Some(query.consistency.as_deref().unwrap_or("strong")))
+            .map_err(invalid_request)?;
+    if !matches!(consistency, ReadConsistency::Strong) {
+        return Err(invalid_request(anyhow::anyhow!(
+            "stream job view runtime only supports strong consistency"
+        )));
+    }
+    let runtime = fetch_strong_stream_job_view_runtime(
+        &state,
+        &tenant_id,
+        &job.instance_id,
+        &job.run_id,
+        &job_id,
+        &view_name,
+    )
+    .await
+    .map_err(internal_error)?;
+    Ok(Json(StreamJobRuntimeResponse {
+        tenant_id,
+        instance_id: job.instance_id,
+        run_id: job.run_id,
+        job_id,
+        runtime,
+    }))
 }
 
 async fn get_stream_job_view_keys(
@@ -5454,6 +5830,173 @@ async fn load_tenant_stream_jobs(
     })
 }
 
+async fn summarize_stream_deployment(
+    state: &AppState,
+    deployment: StreamDeploymentRecord,
+) -> Result<StreamDeploymentSummary> {
+    let mut active_status = None;
+    let mut active_checkpoint_name = None;
+    let mut active_checkpoint_at = None;
+    let mut active_runtime = None;
+    if let (Some(active_revision_id), Some(active_job_id)) =
+        (deployment.active_stream_run_id.as_ref(), deployment.active_job_id.as_ref())
+    {
+        if let Some(active_job) = state
+            .store
+            .get_stream_job_by_stream_identity(
+                &deployment.tenant_id,
+                &deployment.deployment_id,
+                active_revision_id,
+                active_job_id,
+            )
+            .await?
+        {
+            active_status = Some(active_job.status.clone());
+            active_checkpoint_name = active_job.latest_checkpoint_name.clone();
+            active_checkpoint_at = active_job.latest_checkpoint_at;
+            active_runtime = fetch_strong_stream_job_runtime(
+                state,
+                &deployment.tenant_id,
+                &active_job.instance_id,
+                &active_job.run_id,
+                &active_job.job_id,
+            )
+            .await
+            .ok();
+        }
+    }
+    Ok(StreamDeploymentSummary {
+        deployment_id: deployment.deployment_id,
+        definition_id: deployment.definition_id,
+        definition_version: deployment.definition_version,
+        artifact_hash: deployment.artifact_hash,
+        desired_state: deployment.desired_state,
+        rollout_phase: deployment.rollout_phase,
+        rollout_generation: deployment.rollout_generation,
+        active_revision_id: deployment.active_stream_run_id,
+        active_job_id: deployment.active_job_id,
+        active_handle_id: deployment.active_handle_id,
+        previous_revision_id: deployment.previous_stream_run_id,
+        rollout_checkpoint_name: deployment.rollout_checkpoint_name,
+        rollout_handoff_checkpoint_sequence: deployment.rollout_handoff_checkpoint_sequence,
+        failed_revision_id: deployment.failed_revision_id,
+        rollout_failure: deployment.rollout_failure,
+        active_status,
+        active_checkpoint_name,
+        active_checkpoint_at,
+        active_runtime,
+        created_at: deployment.created_at,
+        updated_at: deployment.updated_at,
+    })
+}
+
+async fn load_tenant_stream_deployments(
+    state: &AppState,
+    tenant_id: &str,
+    query: PaginationQuery,
+) -> Result<StreamDeploymentsResponse> {
+    const BATCH_SIZE: i64 = 256;
+    let page = resolve_page(&state.query, &query);
+    let mut scan_offset = 0_i64;
+    let mut summaries = Vec::new();
+    loop {
+        let batch = state
+            .store
+            .list_stream_deployments_for_tenant_page(tenant_id, BATCH_SIZE, scan_offset)
+            .await?;
+        if batch.is_empty() {
+            break;
+        }
+        let batch_len = batch.len();
+        for deployment in batch {
+            summaries.push(summarize_stream_deployment(state, deployment).await?);
+        }
+        if batch_len < BATCH_SIZE as usize {
+            break;
+        }
+        scan_offset += BATCH_SIZE;
+    }
+    let deployment_count = summaries.len();
+    let deployments = summaries.into_iter().skip(page.offset).take(page.limit).collect::<Vec<_>>();
+    Ok(StreamDeploymentsResponse {
+        tenant_id: tenant_id.to_owned(),
+        page: build_page_info(&page, deployment_count, deployments.len()),
+        deployment_count,
+        deployments,
+    })
+}
+
+async fn load_stream_deployment(
+    state: &AppState,
+    tenant_id: &str,
+    deployment_id: &str,
+) -> Result<StreamDeploymentResponse> {
+    let deployment = state
+        .store
+        .get_stream_deployment(tenant_id, deployment_id)
+        .await?
+        .with_context(|| format!("stream deployment {deployment_id} not found"))?;
+    let summary = summarize_stream_deployment(state, deployment).await?;
+    Ok(StreamDeploymentResponse {
+        tenant_id: tenant_id.to_owned(),
+        deployment_id: deployment_id.to_owned(),
+        deployment: summary,
+    })
+}
+
+async fn load_stream_deployment_revisions(
+    state: &AppState,
+    tenant_id: &str,
+    deployment_id: &str,
+    query: StreamJobListQuery,
+) -> Result<StreamDeploymentRevisionsResponse> {
+    const BATCH_SIZE: i64 = 256;
+    let sort = StreamJobSort::parse(query.sort.as_deref())?;
+    let page =
+        resolve_page(&state.query, &PaginationQuery { limit: query.limit, offset: query.offset });
+    let mut scan_offset = 0_i64;
+    let mut summaries = Vec::new();
+    loop {
+        let batch = state
+            .store
+            .list_stream_jobs_for_stream_instance_page(
+                tenant_id,
+                deployment_id,
+                BATCH_SIZE,
+                scan_offset,
+            )
+            .await?;
+        if batch.is_empty() {
+            break;
+        }
+        let batch_len = batch.len();
+        summaries.extend(summarize_stream_job_batch(state, tenant_id, batch, &query).await?);
+        if batch_len < BATCH_SIZE as usize {
+            break;
+        }
+        scan_offset += BATCH_SIZE;
+    }
+    match sort {
+        StreamJobSort::CreatedAtAsc => summaries.sort_by(|left, right| {
+            stream_job_sort_key(left, sort).cmp(&stream_job_sort_key(right, sort))
+        }),
+        StreamJobSort::CreatedAtDesc
+        | StreamJobSort::UpdatedAtDesc
+        | StreamJobSort::LatestCheckpointDesc => summaries.sort_by(|left, right| {
+            stream_job_sort_key(right, sort).cmp(&stream_job_sort_key(left, sort))
+        }),
+    }
+    let revision_count = summaries.len();
+    let revisions = summaries.into_iter().skip(page.offset).take(page.limit).collect::<Vec<_>>();
+    Ok(StreamDeploymentRevisionsResponse {
+        tenant_id: tenant_id.to_owned(),
+        deployment_id: deployment_id.to_owned(),
+        page: build_page_info(&page, revision_count, revisions.len()),
+        revision_count,
+        revisions,
+    })
+}
+
 async fn load_stream_job(
     state: &AppState,
     tenant_id: &str,
@@ -5508,6 +6051,62 @@ async fn load_stream_job(
             .into_iter()
             .map(|query| stream_job_query_view(query, handle_stream_owner_epoch))
             .collect(),
+    })
+}
+
+async fn load_stream_job_checkpoint_view(
+    state: &AppState,
+    job: &StreamJobRecord,
+    checkpoint_name: &str,
+) -> Result<StreamJobBridgeCheckpointView> {
+    let checkpoints = state
+        .store
+        .list_stream_job_callback_checkpoints_for_handle_page(&job.handle_id, 10_000, 0)
+        .await?;
+    if let Some(checkpoint) = checkpoints
+        .into_iter()
+        .filter(|checkpoint| checkpoint.checkpoint_name == checkpoint_name)
+        .max_by_key(|checkpoint| {
+            (
+                checkpoint.checkpoint_sequence.unwrap_or_default(),
+                checkpoint.reached_at.unwrap_or(checkpoint.updated_at),
+                checkpoint.await_request_id.clone(),
+            )
+        })
+    {
+        return Ok(stream_job_checkpoint_view(checkpoint, job.stream_owner_epoch));
+    }
+
+    let declared = stream_job_checkpoint_summaries(
+        job.checkpoint_policy.as_ref(),
+        job.latest_checkpoint_name.as_deref(),
+        job.latest_checkpoint_sequence,
+        job.latest_checkpoint_at,
+    );
+    let Some(checkpoint) =
+        declared.into_iter().find(|checkpoint| checkpoint.checkpoint_name == checkpoint_name)
+    else {
+        anyhow::bail!("stream job checkpoint {checkpoint_name} not found");
+    };
+    let now = job.updated_at;
+    Ok(StreamJobBridgeCheckpointView {
+        protocol_version: job.protocol_version.clone(),
+        operation_kind: job.operation_kind.clone(),
+        source_workflow_event_id: job.workflow_event_id,
+        bridge_request_id: job.bridge_request_id.clone(),
+        await_request_id: format!("stream-job-awaiting:{}:{}", job.handle_id, checkpoint_name),
+        checkpoint_name: checkpoint.checkpoint_name,
+        checkpoint_sequence: checkpoint.sequence,
+        status: if checkpoint.reached { "reached" } else { "awaiting" }.to_owned(),
+        workflow_owner_epoch: job.workflow_owner_epoch,
+        stream_owner_epoch: job.stream_owner_epoch,
+        reached_at: checkpoint.reached_at,
+        output: None,
+        accepted_at: None,
+        cancelled_at: None,
+        next_repair: None,
+        created_at: now,
+        updated_at: now,
     })
 }
 
@@ -6795,6 +7394,105 @@ async fn fetch_strong_stream_job_view(
         .json::<StrongStreamJobViewResponse>()
         .await
         .context("failed to decode strong stream job view response")
+}
+
+async fn fetch_strong_stream_job_runtime(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    job_id: &str,
+) -> Result<Value> {
+    let endpoint = stream_job_owner_query_endpoint(state, job_id).await?;
+    let response = state
+        .client
+        .get(format!(
+            "{endpoint}/debug/streams-runtime/stream-jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}/runtime"
+        ))
+        .send()
+        .await
+        .context("failed to fetch strong stream job runtime")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("stream job {job_id} runtime not found");
+    }
+    response
+        .error_for_status()
+        .context("strong stream job runtime request failed")?
+        .json::<Value>()
+        .await
+        .context("failed to decode strong stream job runtime response")
+}
+
+async fn fetch_strong_stream_job_view_runtime(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    job_id: &str,
+    view_name: &str,
+) -> Result<Value> {
+    let endpoint = stream_job_owner_query_endpoint(state, job_id).await?;
+    let response = state
+        .client
+        .get(format!(
+            "{endpoint}/debug/streams-runtime/stream-jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}/views/{view_name}/runtime"
+        ))
+        .send()
+        .await
+        .context("failed to fetch strong stream job view runtime")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("stream job {job_id} view {view_name} runtime not found");
+    }
+    response
+        .error_for_status()
+        .context("strong stream job view runtime request failed")?
+        .json::<Value>()
+        .await
+        .context("failed to decode strong stream job view runtime response")
+}
+
+async fn fetch_strong_stream_job_signals(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    job_id: &str,
+    limit: usize,
+    offset: usize,
+    signal_type: Option<&str>,
+    operator_id: Option<&str>,
+    logical_key: Option<&str>,
+) -> Result<StrongStreamJobSignalsResponse> {
+    let endpoint = stream_job_owner_query_endpoint(state, job_id).await?;
+    let mut query =
+        vec![("limit".to_owned(), limit.to_string()), ("offset".to_owned(), offset.to_string())];
+    if let Some(signal_type) = signal_type {
+        query.push(("signalType".to_owned(), signal_type.to_owned()));
+    }
+    if let Some(operator_id) = operator_id {
+        query.push(("operatorId".to_owned(), operator_id.to_owned()));
+    }
+    if let Some(logical_key) = logical_key {
+        query.push(("logicalKey".to_owned(), logical_key.to_owned()));
+    }
+    let response = state
+        .client
+        .get(format!(
+            "{endpoint}/debug/streams-runtime/stream-jobs/{tenant_id}/{instance_id}/{run_id}/{job_id}/signals"
+        ))
+        .query(&query)
+        .send()
+        .await
+        .context("failed to fetch strong stream job signals")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        anyhow::bail!("stream job {job_id} signals not found");
+    }
+    response
+        .error_for_status()
+        .context("strong stream job signals request failed")?
+        .json::<StrongStreamJobSignalsResponse>()
+        .await
+        .context("failed to decode strong stream job signals response")
 }
 
 async fn fetch_strong_stream_job_view_keys(
@@ -9018,6 +9716,133 @@ mod tests {
         .await?;
         assert_eq!(filtered.job_count, 1);
         assert_eq!(filtered.jobs[0].job_id, "job-workflow");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn load_stream_deployments_returns_active_revision_and_revisions() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state = test_state(store.clone()).await?;
+        let now = Utc::now();
+
+        for (revision, version, artifact_hash, status, created_offset) in [
+            ("rev-1", 1_u32, "artifact-v1", "draining", 0_i64),
+            ("rev-2", 2_u32, "artifact-v2", "running", 20_i64),
+        ] {
+            store
+                .upsert_stream_job(&StreamJobRecord {
+                    tenant_id: "tenant-a".to_owned(),
+                    instance_id: "deploy-a".to_owned(),
+                    run_id: revision.to_owned(),
+                    stream_instance_id: "deploy-a".to_owned(),
+                    stream_run_id: revision.to_owned(),
+                    job_id: "deploy-a-job".to_owned(),
+                    handle_id: format!("handle-{revision}"),
+                    protocol_version: fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION
+                        .to_owned(),
+                    operation_kind: fabrik_throughput::ThroughputBridgeOperationKind::StreamJob
+                        .as_str()
+                        .to_owned(),
+                    workflow_event_id: Uuid::now_v7(),
+                    bridge_request_id: format!("bridge-{revision}"),
+                    origin_kind: fabrik_throughput::StreamJobOriginKind::Standalone
+                        .as_str()
+                        .to_owned(),
+                    definition_id: "fraud-stream".to_owned(),
+                    definition_version: Some(version),
+                    artifact_hash: Some(artifact_hash.to_owned()),
+                    job_name: "fraud-stream".to_owned(),
+                    input_ref: "topic:payments".to_owned(),
+                    config_ref: None,
+                    checkpoint_policy: None,
+                    view_definitions: None,
+                    status: status.to_owned(),
+                    workflow_owner_epoch: None,
+                    stream_owner_epoch: Some(version as u64),
+                    starting_at: Some(now + chrono::Duration::seconds(created_offset)),
+                    running_at: Some(now + chrono::Duration::seconds(created_offset + 1)),
+                    draining_at: (status == "draining")
+                        .then_some(now + chrono::Duration::seconds(created_offset + 2)),
+                    latest_checkpoint_name: Some("rollup-ready".to_owned()),
+                    latest_checkpoint_sequence: Some(version as i64),
+                    latest_checkpoint_at: Some(now + chrono::Duration::seconds(created_offset + 3)),
+                    latest_checkpoint_output: None,
+                    cancellation_requested_at: (status == "draining")
+                        .then_some(now + chrono::Duration::seconds(created_offset + 2)),
+                    cancellation_reason: (status == "draining")
+                        .then_some("deploy rollout".to_owned()),
+                    workflow_accepted_at: None,
+                    terminal_event_id: None,
+                    terminal_at: None,
+                    terminal_output: None,
+                    terminal_error: None,
+                    created_at: now + chrono::Duration::seconds(created_offset),
+                    updated_at: now + chrono::Duration::seconds(created_offset + 3),
+                })
+                .await?;
+        }
+
+        store
+            .upsert_stream_deployment(&StreamDeploymentRecord {
+                tenant_id: "tenant-a".to_owned(),
+                deployment_id: "deploy-a".to_owned(),
+                definition_id: "fraud-stream".to_owned(),
+                definition_version: Some(2),
+                artifact_hash: Some("artifact-v2".to_owned()),
+                desired_state: "running".to_owned(),
+                rollout_phase: "running".to_owned(),
+                rollout_generation: 2,
+                active_stream_run_id: Some("rev-2".to_owned()),
+                active_job_id: Some("deploy-a-job".to_owned()),
+                active_handle_id: Some("handle-rev-2".to_owned()),
+                previous_stream_run_id: Some("rev-1".to_owned()),
+                rollout_checkpoint_name: Some("rollup-ready".to_owned()),
+                rollout_handoff_checkpoint_sequence: Some(1),
+                failed_revision_id: None,
+                rollout_failure: None,
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(23),
+            })
+            .await?;
+
+        let list = load_tenant_stream_deployments(
+            &state,
+            "tenant-a",
+            PaginationQuery { limit: Some(10), offset: Some(0) },
+        )
+        .await?;
+        assert_eq!(list.deployment_count, 1);
+        assert_eq!(list.deployments[0].deployment_id, "deploy-a");
+        assert_eq!(list.deployments[0].active_revision_id.as_deref(), Some("rev-2"));
+        assert_eq!(list.deployments[0].previous_revision_id.as_deref(), Some("rev-1"));
+        assert_eq!(list.deployments[0].active_status.as_deref(), Some("running"));
+        assert_eq!(list.deployments[0].rollout_phase, "running");
+        assert_eq!(list.deployments[0].rollout_handoff_checkpoint_sequence, Some(1));
+
+        let deployment = load_stream_deployment(&state, "tenant-a", "deploy-a").await?;
+        assert_eq!(deployment.deployment.rollout_generation, 2);
+        assert_eq!(deployment.deployment.rollout_checkpoint_name.as_deref(), Some("rollup-ready"));
+        assert_eq!(deployment.deployment.rollout_phase, "running");
+
+        let revisions = load_stream_deployment_revisions(
+            &state,
+            "tenant-a",
+            "deploy-a",
+            StreamJobListQuery {
+                limit: Some(10),
+                offset: Some(0),
+                sort: Some("created_at_desc".to_owned()),
+                ..StreamJobListQuery::default()
+            },
+        )
+        .await?;
+        assert_eq!(revisions.revision_count, 2);
+        assert_eq!(revisions.revisions[0].stream_run_id, "rev-2");
+        assert_eq!(revisions.revisions[1].stream_run_id, "rev-1");
 
         Ok(())
     }

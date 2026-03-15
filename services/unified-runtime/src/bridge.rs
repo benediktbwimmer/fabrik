@@ -96,6 +96,7 @@ fn default_stream_job_status(handle: &StreamJobBridgeHandleRecord) -> StreamJobS
     match handle.parsed_status().unwrap_or(StreamJobBridgeHandleStatus::Admitted) {
         StreamJobBridgeHandleStatus::Admitted => StreamJobStatus::Created,
         StreamJobBridgeHandleStatus::Running => StreamJobStatus::Running,
+        StreamJobBridgeHandleStatus::Paused => StreamJobStatus::Paused,
         StreamJobBridgeHandleStatus::CancellationRequested => StreamJobStatus::Draining,
         StreamJobBridgeHandleStatus::Completed => StreamJobStatus::Completed,
         StreamJobBridgeHandleStatus::Failed => StreamJobStatus::Failed,
@@ -187,6 +188,14 @@ async fn sync_stream_job_record(
         StreamJobStatus::Starting => {
             if record.starting_at.is_none() {
                 record.starting_at = Some(occurred_at);
+            }
+        }
+        StreamJobStatus::Paused => {
+            if record.starting_at.is_none() {
+                record.starting_at = Some(occurred_at);
+            }
+            if record.running_at.is_none() {
+                record.running_at = Some(occurred_at);
             }
         }
         StreamJobStatus::Running => {
@@ -1540,6 +1549,7 @@ pub(super) async fn accept_stream_job_terminal_via_bridge(
             StreamJobBridgeHandleStatus::Cancelled => StreamJobStatus::Cancelled,
             StreamJobBridgeHandleStatus::Admitted
             | StreamJobBridgeHandleStatus::Running
+            | StreamJobBridgeHandleStatus::Paused
             | StreamJobBridgeHandleStatus::CancellationRequested => StreamJobStatus::Running,
         },
         None,

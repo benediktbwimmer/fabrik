@@ -7,10 +7,18 @@ This document defines the current narrow contract for stream-native workflow pri
 The currently implemented workflow-facing slice is:
 
 - `ctx.startStreamJob(...)`
+- `job.awaitCheckpoint(name)`
 - `job.untilCheckpoint(name)`
 - `job.query(name, args?, options?)`
 - `job.cancel(reason?)`
+- `job.awaitTerminal()`
 - `job.result()`
+
+The runtime and bridge layer now also support lifecycle control for long-lived topic-backed jobs:
+
+- `pause_stream_job`
+- `resume_stream_job`
+- strong `__bridge_state` inspection for lifecycle, awaited checkpoints, query acceptance, signal delivery causality, and repair debt
 
 The current shipping bridge contract for throughput mode remains defined by [streams-bridge.md](/Users/bene/code/fabrik/docs/spec/streams-bridge.md) and [throughput-mode.md](/Users/bene/code/fabrik/docs/spec/throughput-mode.md).
 
@@ -58,24 +66,52 @@ const job = await ctx.startStreamJob("fraud-detector", {
 ```
 
 ```ts
-await job.untilCheckpoint("hourly-rollup-ready");
+await job.awaitCheckpoint("hourly-rollup-ready");
 const stats = await job.query("currentStats", { consistency: "strong" });
 await job.cancel("workflow closed");
-const result = await job.result();
+const result = await job.awaitTerminal();
+```
+
+Current hybrid shape:
+
+```ts
+const job = await ctx.startStreamJob("keyed-rollup", {
+  input: { topic: input.topic },
+  config: {
+    operators: [
+      { kind: "reduce", name: "sum-account-totals", config: { reducer: "sum", valueField: "amount", outputField: "totalAmount" } },
+      { kind: "emit_checkpoint", name: "hourly-rollup-ready", config: { sequence: 1 } },
+      { kind: "signal_workflow", name: "notify-account-rollup", config: { view: "accountTotals", signalType: "account.rollup.ready", whenOutputField: "totalAmount" } },
+    ],
+  },
+});
+
+const signal = await ctx.waitForSignal("account.rollup.ready");
+const account = await job.query("accountTotals", { key: signal.logicalKey }, {
+  consistency: "strong",
+});
+await job.cancel({ reason: "workflow-threshold-handled" });
+const result = await job.awaitTerminal();
 ```
 
 Currently implemented semantic operations:
 
 - `ctx.startStreamJob(name, input)`:
   starts or recovers a stable stream job handle
+- `job.awaitCheckpoint(name)`:
+  preferred durable checkpoint barrier for one named milestone
 - `job.untilCheckpoint(name)`:
-  waits on a named, durable, monotonic stream milestone
+  compatibility alias for `job.awaitCheckpoint(name)`
 - `job.query(name, args?, options?)`:
   performs a non-authoritative stream read with explicit consistency
 - `job.cancel(reason?)`:
   requests stream-job cancellation idempotently
+- `job.awaitTerminal()`:
+  preferred durable terminal barrier for stream jobs that should block on final completion
 - `job.result()`:
-  terminal wait surface for stream jobs that should block on final completion
+  compatibility alias for `job.awaitTerminal()`
+- `ctx.waitForSignal(name)`:
+  the current workflow-facing path for reacting to declared `signal_workflow` emissions from a stream job
 
 ## Bridge-Owned Entities
 
@@ -134,6 +170,7 @@ The workflow advances only through accepted bridge events.
 The stream job itself may proceed through richer internal states, but the bridge only relies on:
 
 - running
+- paused
 - checkpoint reached
 - completed
 - failed
@@ -188,7 +225,7 @@ Required behavior:
 
 ### `await_stream_terminal`
 
-Represents the workflow barrier behind `job.result()`.
+Represents the workflow barrier behind `job.awaitTerminal()`.
 
 Required behavior:
 
@@ -264,6 +301,13 @@ The stream-job bridge payloads also expose pending bridge work explicitly:
 - per-checkpoint `next_repair`
 - per-query `next_repair`
 
+Signal-facing diagnostics now also expose:
+
+- callback dedupe key and callback event id per emitted `signal_workflow`
+- target workflow instance and run identity
+- workflow signal queue status such as `queued`, `dispatching`, or `consumed`
+- workflow-side dispatch and consumed event ids when known
+
 That lets operators distinguish:
 
 - stream callback persisted but not yet workflow-accepted
@@ -327,7 +371,12 @@ Workflow code must not branch durably on stream-job query results unless a separ
 
 `StartStreamJob` itself is durable and replay-safe.
 
-`job.untilCheckpoint(name)` and `job.result()` are durable barriers.
+`job.awaitCheckpoint(name)` and `job.awaitTerminal()` are durable barriers.
+
+Compatibility note:
+
+- `job.untilCheckpoint(name)` remains supported as an alias for `job.awaitCheckpoint(name)`
+- `job.result()` remains supported as an alias for `job.awaitTerminal()`
 
 `job.query(...)` is not replay-safe and must not be treated as deterministic workflow input.
 

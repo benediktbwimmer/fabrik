@@ -46,7 +46,12 @@ export interface StreamMapOperatorDefinition {
   readonly inputs?: readonly string[];
   readonly outputs?: readonly string[];
   readonly stateIds?: readonly string[];
-  readonly config: JsonValue;
+  readonly config: {
+    readonly inputField: string;
+    readonly outputField: string;
+    readonly multiplyBy?: number;
+    readonly add?: number;
+  };
 }
 
 export interface StreamFilterOperatorDefinition {
@@ -66,7 +71,14 @@ export interface StreamRouteOperatorDefinition {
   readonly inputs?: readonly string[];
   readonly outputs?: readonly string[];
   readonly stateIds?: readonly string[];
-  readonly config: JsonValue;
+  readonly config: {
+    readonly outputField: string;
+    readonly branches: readonly {
+      readonly predicate: string;
+      readonly value: string;
+    }[];
+    readonly defaultValue?: string;
+  };
 }
 
 export interface StreamWindowOperatorDefinition {

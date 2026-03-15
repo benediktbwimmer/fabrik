@@ -422,11 +422,79 @@ fn build_app(state: AppState, service_name: String) -> Router {
         get(proxy_to_query_get),
     )
     .route(
+        "/tenants/{tenant_id}/streams/deployments",
+        get(proxy_to_query_get).post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-deployments",
+        get(proxy_to_query_get).post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/deployments/{deployment_id}",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-deployments/{deployment_id}",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/deployments/{deployment_id}/revisions",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-deployments/{deployment_id}/revisions",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/deployments/{deployment_id}/drain",
+        post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-deployments/{deployment_id}/drain",
+        post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/deployments/{deployment_id}/pause",
+        post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-deployments/{deployment_id}/pause",
+        post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/deployments/{deployment_id}/resume",
+        post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-deployments/{deployment_id}/resume",
+        post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/deployments/{deployment_id}/rollback",
+        post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-deployments/{deployment_id}/rollback",
+        post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/jobs",
+        get(proxy_to_query_get).post(proxy_to_ingest),
+    )
+    .route(
         "/tenants/{tenant_id}/stream-jobs",
         get(proxy_to_query_get).post(proxy_to_ingest),
     )
     .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}",
+        get(proxy_to_query_get),
+    )
+    .route(
         "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}",
         get(proxy_to_query_get),
     )
     .route(
@@ -434,7 +502,47 @@ fn build_app(state: AppState, service_name: String) -> Router {
         get(proxy_to_query_get),
     )
     .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/runtime",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/runtime",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/checkpoints/{checkpoint_name}",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/checkpoints/{checkpoint_name}",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/signals",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/signals",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/runtime",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/runtime",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/keys/{logical_key}",
+        get(proxy_to_query_get),
+    )
+    .route(
         "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/keys/{logical_key}",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/keys",
         get(proxy_to_query_get),
     )
     .route(
@@ -442,8 +550,40 @@ fn build_app(state: AppState, service_name: String) -> Router {
         get(proxy_to_query_get),
     )
     .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/entries",
+        get(proxy_to_query_get),
+    )
+    .route(
         "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/entries",
         get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/scan",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/scan",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/drain",
+        post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/drain",
+        post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/resume",
+        post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/resume",
+        post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/cancel",
+        post(proxy_to_ingest),
     )
     .route(
         "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/cancel",

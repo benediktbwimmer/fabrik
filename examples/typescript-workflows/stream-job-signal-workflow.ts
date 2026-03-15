@@ -1,10 +1,10 @@
-import {
-  type StreamJobQueryDefinition,
-  type StreamJobTypes,
-  type WorkflowContext,
-} from "../workflow-authoring.js";
+import type {
+  StreamJobQueryDefinition,
+  StreamJobTypes,
+  WorkflowContext,
+} from "../../sdk/typescript-compiler/workflow-authoring.js";
 
-type TopicKeyedRollupJob = StreamJobTypes<
+type AccountRollupSignalJob = StreamJobTypes<
   { topic: string },
   {
     name: "keyed-rollup";
@@ -29,6 +29,15 @@ type TopicKeyedRollupJob = StreamJobTypes<
         name: "hourly-rollup-ready";
         config: {
           sequence: 1;
+        };
+      },
+      {
+        kind: "signal_workflow";
+        name: "notify-account-rollup";
+        config: {
+          view: "accountTotals";
+          signalType: "account.rollup.ready";
+          whenOutputField: "totalAmount";
         };
       },
     ];
@@ -86,14 +95,28 @@ type TopicKeyedRollupJob = StreamJobTypes<
   }
 >;
 
-export async function topicStreamJobWorkflow(
+type AccountRollupReadySignal = {
+  jobId: string;
+  handleId: string;
+  jobName: "keyed-rollup";
+  operatorId: "notify-account-rollup";
+  viewName: "accountTotals";
+  logicalKey: string;
+  output: {
+    accountId: string;
+    totalAmount: number;
+    asOfCheckpoint: number;
+  };
+};
+
+export async function streamJobSignalWorkflow(
   ctx: WorkflowContext,
   input: {
     topic: string;
     accountId: string;
   },
 ) {
-  const job = await ctx.startStreamJob<TopicKeyedRollupJob>("keyed-rollup", {
+  const job = await ctx.startStreamJob<AccountRollupSignalJob>("keyed-rollup", {
     input: {
       topic: input.topic,
     },
@@ -120,6 +143,15 @@ export async function topicStreamJobWorkflow(
           name: "hourly-rollup-ready",
           config: {
             sequence: 1,
+          },
+        },
+        {
+          kind: "signal_workflow",
+          name: "notify-account-rollup",
+          config: {
+            view: "accountTotals",
+            signalType: "account.rollup.ready",
+            whenOutputField: "totalAmount",
           },
         },
       ],
@@ -153,18 +185,17 @@ export async function topicStreamJobWorkflow(
     },
   });
 
-  const checkpoint = await job.awaitCheckpoint("hourly-rollup-ready");
+  const signal = await ctx.waitForSignal<AccountRollupReadySignal>("account.rollup.ready");
   const account = await job.query("accountTotals", { key: input.accountId }, {
     consistency: "strong",
   });
-  await job.cancel({ reason: "workflow-requested-cancel" });
+  await job.cancel({ reason: "workflow-threshold-handled" });
   const result = await job.awaitTerminal();
 
   return ctx.complete({
-    checkpoint,
+    signal,
     account,
-    jobId: job.jobId,
-    cancelRequested: true,
     terminalStatus: result.status,
+    jobId: job.jobId,
   });
 }

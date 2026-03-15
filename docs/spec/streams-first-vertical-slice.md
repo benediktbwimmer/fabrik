@@ -61,7 +61,7 @@ const job = await ctx.startStreamJob("keyed-rollup", {
   },
 });
 
-await job.untilCheckpoint("hourly-rollup-ready");
+await job.awaitCheckpoint("hourly-rollup-ready");
 
 const account = await job.query("accountTotals", {
   key: "acct_123",
@@ -73,7 +73,7 @@ const account = await job.query("accountTotals", {
 Rules:
 
 - `ctx.startStreamJob()` is durable and replay-safe
-- `job.untilCheckpoint(name)` is a durable workflow barrier
+- `job.awaitCheckpoint(name)` is a durable workflow barrier
 - `job.query(...)` is non-durable and non-replay-stable
 - the workflow must not branch durably on query results
 
@@ -182,7 +182,7 @@ Bridge rules:
 
 Workflow rule:
 
-- `await job.untilCheckpoint("hourly-rollup-ready")` resumes only from an accepted bridge wakeup
+- `await job.awaitCheckpoint("hourly-rollup-ready")` resumes only from an accepted bridge wakeup
 
 ## Query Contract
 
@@ -292,7 +292,7 @@ It only requires:
 The workflow may choose to:
 
 - stop after the checkpoint barrier
-- or later await terminal completion through `job.result()`
+- or later await terminal completion through `job.awaitTerminal()`
 
 ## Initial Implementation Guidance
 
@@ -326,7 +326,7 @@ The first slice is successful when all of the following are true:
 - one bounded keyed input can be fully reduced into owner-local materialized state
 - `hourly-rollup-ready` is emitted as a durable monotonic checkpoint
 - `hourly-rollup-ready` becomes bridge-visible only after every active key partition reaches it
-- `job.untilCheckpoint("hourly-rollup-ready")` resumes only through accepted bridge wakeup
+- `job.awaitCheckpoint("hourly-rollup-ready")` resumes only through accepted bridge wakeup
 - `job.query("accountTotals", { key }, { consistency: "strong" })` returns owner-routed keyed state
 - `job.query("accountTotals", { key }, { consistency: "eventual" })` returns projected keyed state with explicit eventual metadata
 - failover preserves checkpoint and query correctness through checkpoint plus durable progress recovery
