@@ -49,6 +49,14 @@ The visibility API should support:
 - pagination for large result sets
 - run lineage inspection across continue-as-new chains
 
+For stream jobs, that visibility surface should not depend on workflow origin.
+
+The same list/detail/runtime/view endpoints should work for:
+
+- workflow-originated stream jobs
+- standalone stream jobs
+- deployment-backed standalone revisions
+
 ## History View
 
 The history view should expose:

@@ -2022,6 +2022,7 @@ dependencies = [
  "fabrik-streams",
  "fabrik-workflow",
  "futures-util",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

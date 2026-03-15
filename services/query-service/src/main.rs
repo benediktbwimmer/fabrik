@@ -390,6 +390,7 @@ struct StreamJobSummary {
     view_definitions: Option<Value>,
     stream_surface: StreamJobSurfaceSummary,
     bridge_surface: StreamJobBridgeSurfaceSummary,
+    durability_surface: StreamJobDurabilitySurfaceSummary,
     status: String,
     workflow_owner_epoch: Option<u64>,
     stream_owner_epoch: Option<u64>,
@@ -440,6 +441,18 @@ struct StreamJobBridgeSurfaceSummary {
     latest_query_requested_at: Option<DateTime<Utc>>,
     latest_query_completed_at: Option<DateTime<Utc>>,
     latest_query_accepted_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct StreamJobDurabilitySurfaceSummary {
+    shard_checkpoint_age_seconds: Option<i64>,
+    total_checkpoint_bytes: Option<i64>,
+    max_checkpoint_bytes: Option<i64>,
+    total_restore_tail_lag_entries: Option<i64>,
+    restored_from_checkpoint: Option<bool>,
+    checkpointed_partition_count: Option<i64>,
+    last_stream_checkpoint_at: Option<DateTime<Utc>>,
+    last_shard_checkpoint_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -504,6 +517,9 @@ struct StreamDeploymentSummary {
     rollout_handoff_checkpoint_sequence: Option<i64>,
     failed_revision_id: Option<String>,
     rollout_failure: Option<String>,
+    rollout_health: Value,
+    active_durability_surface: StreamJobDurabilitySurfaceSummary,
+    previous_durability_surface: StreamJobDurabilitySurfaceSummary,
     active_status: Option<String>,
     active_checkpoint_name: Option<String>,
     active_checkpoint_at: Option<DateTime<Utc>>,
@@ -5430,6 +5446,7 @@ async fn load_pending_stream_bridge_repairs(
 fn stream_job_summary(
     job: StreamJobRecord,
     bridge_surface: StreamJobBridgeSurfaceSummary,
+    durability_surface: StreamJobDurabilitySurfaceSummary,
     checkpoint_count: usize,
     query_count: usize,
     views: Vec<StreamJobViewSummary>,
@@ -5484,6 +5501,7 @@ fn stream_job_summary(
         view_definitions: job.view_definitions,
         stream_surface,
         bridge_surface,
+        durability_surface,
         status,
         workflow_owner_epoch: job.workflow_owner_epoch,
         stream_owner_epoch: job.stream_owner_epoch,
@@ -5708,6 +5726,7 @@ async fn summarize_stream_job_batch(
         summaries.push(stream_job_summary(
             job,
             bridge_surface,
+            StreamJobDurabilitySurfaceSummary::default(),
             checkpoint_count,
             query_count,
             view_summaries,
@@ -5715,6 +5734,101 @@ async fn summarize_stream_job_batch(
         ));
     }
     Ok(summaries)
+}
+
+fn optional_i64_from_value(value: Option<&Value>) -> Option<i64> {
+    value.and_then(Value::as_i64)
+}
+
+fn optional_bool_from_value(value: Option<&Value>) -> Option<bool> {
+    value.and_then(Value::as_bool)
+}
+
+fn optional_datetime_from_value(value: Option<&Value>) -> Option<DateTime<Utc>> {
+    value
+        .and_then(Value::as_str)
+        .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn stream_job_durability_surface_from_runtime(
+    runtime: &Value,
+) -> StreamJobDurabilitySurfaceSummary {
+    let summary = runtime
+        .as_object()
+        .and_then(|root| root.get("ownerPartitionStats"))
+        .and_then(Value::as_object)
+        .and_then(|owner| owner.get("summary"))
+        .and_then(Value::as_object);
+    StreamJobDurabilitySurfaceSummary {
+        shard_checkpoint_age_seconds: optional_i64_from_value(
+            summary.and_then(|summary| summary.get("shardCheckpointAgeSeconds")),
+        ),
+        total_checkpoint_bytes: optional_i64_from_value(
+            summary.and_then(|summary| summary.get("totalCheckpointBytes")),
+        ),
+        max_checkpoint_bytes: optional_i64_from_value(
+            summary.and_then(|summary| summary.get("maxCheckpointBytes")),
+        ),
+        total_restore_tail_lag_entries: optional_i64_from_value(
+            summary.and_then(|summary| summary.get("totalRestoreTailLagEntries")),
+        ),
+        restored_from_checkpoint: optional_bool_from_value(
+            summary.and_then(|summary| summary.get("restoredFromCheckpoint")),
+        ),
+        checkpointed_partition_count: optional_i64_from_value(
+            summary.and_then(|summary| summary.get("checkpointedPartitionCount")),
+        ),
+        last_stream_checkpoint_at: optional_datetime_from_value(
+            summary.and_then(|summary| summary.get("lastStreamCheckpointAt")),
+        ),
+        last_shard_checkpoint_at: optional_datetime_from_value(
+            summary.and_then(|summary| summary.get("lastShardCheckpointAt")),
+        ),
+    }
+}
+
+fn stream_job_durability_surface_value(surface: &StreamJobDurabilitySurfaceSummary) -> Value {
+    json!({
+        "shardCheckpointAgeSeconds": surface.shard_checkpoint_age_seconds,
+        "totalCheckpointBytes": surface.total_checkpoint_bytes,
+        "maxCheckpointBytes": surface.max_checkpoint_bytes,
+        "totalRestoreTailLagEntries": surface.total_restore_tail_lag_entries,
+        "restoredFromCheckpoint": surface.restored_from_checkpoint,
+        "checkpointedPartitionCount": surface.checkpointed_partition_count,
+        "lastStreamCheckpointAt": surface
+            .last_stream_checkpoint_at
+            .map(|value| value.to_rfc3339()),
+        "lastShardCheckpointAt": surface
+            .last_shard_checkpoint_at
+            .map(|value| value.to_rfc3339()),
+    })
+}
+
+async fn attach_stream_job_durability_surfaces(
+    state: &AppState,
+    tenant_id: &str,
+    mut jobs: Vec<StreamJobSummary>,
+) -> Vec<StreamJobSummary> {
+    for job in &mut jobs {
+        let instance_id = job
+            .workflow_binding
+            .as_ref()
+            .map(|binding| binding.instance_id.as_str())
+            .unwrap_or(job.stream_instance_id.as_str());
+        let run_id = job
+            .workflow_binding
+            .as_ref()
+            .map(|binding| binding.run_id.as_str())
+            .unwrap_or(job.stream_run_id.as_str());
+        if let Ok(runtime) =
+            fetch_strong_stream_job_runtime(state, tenant_id, instance_id, run_id, &job.job_id)
+                .await
+        {
+            job.durability_surface = stream_job_durability_surface_from_runtime(&runtime);
+        }
+    }
+    jobs
 }
 
 async fn load_stream_jobs(
@@ -5771,7 +5885,12 @@ async fn load_stream_jobs(
         }),
     }
     let job_count = summaries.len();
-    let jobs = summaries.into_iter().skip(page.offset).take(page.limit).collect::<Vec<_>>();
+    let jobs = attach_stream_job_durability_surfaces(
+        state,
+        tenant_id,
+        summaries.into_iter().skip(page.offset).take(page.limit).collect::<Vec<_>>(),
+    )
+    .await;
     Ok(StreamJobsResponse {
         tenant_id: tenant_id.to_owned(),
         instance_id: resolved_workflow_instance_id,
@@ -5821,7 +5940,12 @@ async fn load_tenant_stream_jobs(
         }),
     }
     let job_count = summaries.len();
-    let jobs = summaries.into_iter().skip(page.offset).take(page.limit).collect::<Vec<_>>();
+    let jobs = attach_stream_job_durability_surfaces(
+        state,
+        tenant_id,
+        summaries.into_iter().skip(page.offset).take(page.limit).collect::<Vec<_>>(),
+    )
+    .await;
     Ok(TenantStreamJobsResponse {
         tenant_id: tenant_id.to_owned(),
         page: build_page_info(&page, job_count, jobs.len()),
@@ -5838,6 +5962,7 @@ async fn summarize_stream_deployment(
     let mut active_checkpoint_name = None;
     let mut active_checkpoint_at = None;
     let mut active_runtime = None;
+    let mut previous_runtime = None;
     if let (Some(active_revision_id), Some(active_job_id)) =
         (deployment.active_stream_run_id.as_ref(), deployment.active_job_id.as_ref())
     {
@@ -5864,7 +5989,39 @@ async fn summarize_stream_deployment(
             .await
             .ok();
         }
+        if let Some(previous_revision_id) = deployment.previous_stream_run_id.as_ref()
+            && let Some(previous_job) = state
+                .store
+                .get_stream_job_by_stream_identity(
+                    &deployment.tenant_id,
+                    &deployment.deployment_id,
+                    previous_revision_id,
+                    active_job_id,
+                )
+                .await?
+        {
+            previous_runtime = fetch_strong_stream_job_runtime(
+                state,
+                &deployment.tenant_id,
+                &previous_job.instance_id,
+                &previous_job.run_id,
+                &previous_job.job_id,
+            )
+            .await
+            .ok();
+        }
     }
+    let rollout_health = build_stream_deployment_rollout_health(
+        &deployment,
+        active_runtime.as_ref(),
+        previous_runtime.as_ref(),
+    );
+    let active_durability_surface =
+        active_runtime.as_ref().map(stream_job_durability_surface_from_runtime).unwrap_or_default();
+    let previous_durability_surface = previous_runtime
+        .as_ref()
+        .map(stream_job_durability_surface_from_runtime)
+        .unwrap_or_default();
     Ok(StreamDeploymentSummary {
         deployment_id: deployment.deployment_id,
         definition_id: deployment.definition_id,
@@ -5881,6 +6038,9 @@ async fn summarize_stream_deployment(
         rollout_handoff_checkpoint_sequence: deployment.rollout_handoff_checkpoint_sequence,
         failed_revision_id: deployment.failed_revision_id,
         rollout_failure: deployment.rollout_failure,
+        rollout_health,
+        active_durability_surface,
+        previous_durability_surface,
         active_status,
         active_checkpoint_name,
         active_checkpoint_at,
@@ -5923,6 +6083,171 @@ async fn load_tenant_stream_deployments(
         page: build_page_info(&page, deployment_count, deployments.len()),
         deployment_count,
         deployments,
+    })
+}
+
+fn deployment_runtime_partition_ids(runtime: Option<&Value>) -> BTreeSet<i32> {
+    let mut partition_ids = BTreeSet::new();
+    let Some(runtime) = runtime else {
+        return partition_ids;
+    };
+    if let Some(cursors) = runtime.get("sourceCursors").and_then(Value::as_array) {
+        for cursor in cursors {
+            if let Some(source_partition_id) = cursor
+                .get("sourcePartitionId")
+                .and_then(Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok())
+            {
+                partition_ids.insert(source_partition_id);
+            }
+        }
+    }
+    if let Some(leases) = runtime.get("sourceLeases").and_then(Value::as_array) {
+        for lease in leases {
+            if let Some(source_partition_id) = lease
+                .get("sourcePartitionId")
+                .and_then(Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok())
+            {
+                partition_ids.insert(source_partition_id);
+            }
+        }
+    }
+    partition_ids
+}
+
+fn deployment_runtime_partition_offset(
+    runtime: Option<&Value>,
+    source_partition_id: i32,
+) -> Option<i64> {
+    runtime
+        .and_then(|runtime| runtime.get("sourceCursors"))
+        .and_then(Value::as_array)
+        .and_then(|cursors| {
+            cursors.iter().find(|cursor| {
+                cursor
+                    .get("sourcePartitionId")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| i32::try_from(value).ok())
+                    == Some(source_partition_id)
+            })
+        })
+        .and_then(|cursor| cursor.get("lastAppliedOffset"))
+        .and_then(Value::as_i64)
+}
+
+fn deployment_runtime_partition_owner(
+    runtime: Option<&Value>,
+    source_partition_id: i32,
+) -> Option<i32> {
+    runtime
+        .and_then(|runtime| runtime.get("sourceLeases"))
+        .and_then(Value::as_array)
+        .and_then(|leases| {
+            leases.iter().find(|lease| {
+                lease
+                    .get("sourcePartitionId")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| i32::try_from(value).ok())
+                    == Some(source_partition_id)
+            })
+        })
+        .and_then(|lease| lease.get("ownerPartitionId"))
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+fn deployment_rollout_blocked_reason(
+    rollout_phase: &str,
+    pending_partition_count: usize,
+) -> Option<&'static str> {
+    match rollout_phase {
+        "pending_checkpoint" => Some("waiting_for_rollout_checkpoint"),
+        "handoff_in_progress" => Some("waiting_for_previous_revision_drain"),
+        "stabilizing" if pending_partition_count > 0 => {
+            Some("waiting_for_source_partition_stabilization")
+        }
+        "stabilizing" => Some("waiting_for_post_handoff_stability"),
+        "rollback_pending" => Some("rollback_requested"),
+        "paused" => Some("deployment_paused"),
+        "draining" => Some("deployment_draining"),
+        "failed" => Some("failed_revision"),
+        "rolled_back" => Some("rolled_back"),
+        _ => None,
+    }
+}
+
+fn build_stream_deployment_rollout_health(
+    deployment: &StreamDeploymentRecord,
+    active_runtime: Option<&Value>,
+    previous_runtime: Option<&Value>,
+) -> Value {
+    let active_durability =
+        active_runtime.map(stream_job_durability_surface_from_runtime).unwrap_or_default();
+    let previous_durability =
+        previous_runtime.map(stream_job_durability_surface_from_runtime).unwrap_or_default();
+    let partition_ids = deployment_runtime_partition_ids(previous_runtime)
+        .into_iter()
+        .chain(deployment_runtime_partition_ids(active_runtime))
+        .collect::<BTreeSet<_>>();
+    let mut advanced_partition_ids = Vec::new();
+    let mut pending_partition_ids = Vec::new();
+    let partitions = partition_ids
+        .iter()
+        .map(|source_partition_id| {
+            let previous_last_applied_offset =
+                deployment_runtime_partition_offset(previous_runtime, *source_partition_id);
+            let active_last_applied_offset =
+                deployment_runtime_partition_offset(active_runtime, *source_partition_id);
+            let advanced_beyond_handoff =
+                matches!((active_last_applied_offset, previous_last_applied_offset),
+                    (Some(active), Some(previous)) if active > previous)
+                    || matches!(
+                        (active_last_applied_offset, previous_last_applied_offset),
+                        (Some(_), None)
+                    );
+            if advanced_beyond_handoff {
+                advanced_partition_ids.push(*source_partition_id);
+            } else {
+                pending_partition_ids.push(*source_partition_id);
+            }
+            json!({
+                "sourcePartitionId": source_partition_id,
+                "previousLastAppliedOffset": previous_last_applied_offset,
+                "activeLastAppliedOffset": active_last_applied_offset,
+                "advancedBeyondHandoff": advanced_beyond_handoff,
+                "previousOwnerPartitionId": deployment_runtime_partition_owner(
+                    previous_runtime,
+                    *source_partition_id
+                ),
+                "activeOwnerPartitionId": deployment_runtime_partition_owner(
+                    active_runtime,
+                    *source_partition_id
+                ),
+            })
+        })
+        .collect::<Vec<_>>();
+    let blocked_reason =
+        deployment_rollout_blocked_reason(&deployment.rollout_phase, pending_partition_ids.len());
+    json!({
+        "handoffCheckpointSequence": deployment.rollout_handoff_checkpoint_sequence,
+        "partitionCount": partitions.len(),
+        "advancedPartitionCount": advanced_partition_ids.len(),
+        "allSourcePartitionsAdvanced": !partitions.is_empty() && pending_partition_ids.is_empty(),
+        "advancedSourcePartitionIds": advanced_partition_ids,
+        "pendingSourcePartitionIds": pending_partition_ids,
+        "blockedReason": blocked_reason,
+        "activeDurability": stream_job_durability_surface_value(&active_durability),
+        "previousDurability": stream_job_durability_surface_value(&previous_durability),
+        "activeRestoreTailLagEntries": active_durability.total_restore_tail_lag_entries,
+        "previousRestoreTailLagEntries": previous_durability.total_restore_tail_lag_entries,
+        "activeShardCheckpointAgeSeconds": active_durability.shard_checkpoint_age_seconds,
+        "previousShardCheckpointAgeSeconds": previous_durability.shard_checkpoint_age_seconds,
+        "activeRestoredFromCheckpoint": active_durability.restored_from_checkpoint,
+        "previousRestoredFromCheckpoint": previous_durability.restored_from_checkpoint,
+        "rollbackFailure": deployment.rollout_failure,
+        "failedRevisionId": deployment.failed_revision_id,
+        "partitions": partitions,
     })
 }
 
@@ -5987,7 +6312,12 @@ async fn load_stream_deployment_revisions(
         }),
     }
     let revision_count = summaries.len();
-    let revisions = summaries.into_iter().skip(page.offset).take(page.limit).collect::<Vec<_>>();
+    let revisions = attach_stream_job_durability_surfaces(
+        state,
+        tenant_id,
+        summaries.into_iter().skip(page.offset).take(page.limit).collect::<Vec<_>>(),
+    )
+    .await;
     Ok(StreamDeploymentRevisionsResponse {
         tenant_id: tenant_id.to_owned(),
         deployment_id: deployment_id.to_owned(),
@@ -6029,11 +6359,14 @@ async fn load_stream_job(
     let summary = stream_job_summary(
         job,
         stream_job_bridge_surface_summary(bridge_ledger.as_ref()),
+        StreamJobDurabilitySurfaceSummary::default(),
         checkpoints.len(),
         queries.len(),
         views.clone(),
         latest_stream_job_query_summary_from_ledger(bridge_ledger.as_ref()),
     );
+    let mut attached = attach_stream_job_durability_surfaces(state, tenant_id, vec![summary]).await;
+    let summary = attached.pop().expect("single stream job summary should exist");
     Ok(StreamJobResponse {
         tenant_id: tenant_id.to_owned(),
         instance_id: workflow_instance_id,
@@ -8778,6 +9111,126 @@ mod tests {
         assert_eq!(owner_query_endpoints(&config), vec!["http://unified".to_owned()]);
     }
 
+    #[test]
+    fn stream_job_durability_surface_is_parsed_from_runtime_summary() {
+        let runtime = json!({
+            "ownerPartitionStats": {
+                "summary": {
+                    "shardCheckpointAgeSeconds": 45,
+                    "totalCheckpointBytes": 4096,
+                    "maxCheckpointBytes": 3072,
+                    "totalRestoreTailLagEntries": 2,
+                    "restoredFromCheckpoint": true,
+                    "checkpointedPartitionCount": 3,
+                    "lastStreamCheckpointAt": "2026-03-15T10:00:00Z",
+                    "lastShardCheckpointAt": "2026-03-15T09:59:00Z"
+                }
+            }
+        });
+
+        let summary = stream_job_durability_surface_from_runtime(&runtime);
+        assert_eq!(summary.shard_checkpoint_age_seconds, Some(45));
+        assert_eq!(summary.total_checkpoint_bytes, Some(4096));
+        assert_eq!(summary.max_checkpoint_bytes, Some(3072));
+        assert_eq!(summary.total_restore_tail_lag_entries, Some(2));
+        assert_eq!(summary.restored_from_checkpoint, Some(true));
+        assert_eq!(summary.checkpointed_partition_count, Some(3));
+        assert_eq!(
+            summary.last_stream_checkpoint_at,
+            Some(
+                DateTime::parse_from_rfc3339("2026-03-15T10:00:00Z")
+                    .expect("checkpoint timestamp should parse")
+                    .with_timezone(&Utc)
+            )
+        );
+        assert_eq!(
+            summary.last_shard_checkpoint_at,
+            Some(
+                DateTime::parse_from_rfc3339("2026-03-15T09:59:00Z")
+                    .expect("checkpoint timestamp should parse")
+                    .with_timezone(&Utc)
+            )
+        );
+    }
+
+    #[test]
+    fn stream_deployment_rollout_health_surfaces_active_and_previous_durability() {
+        let deployment = StreamDeploymentRecord {
+            tenant_id: "tenant-a".to_owned(),
+            deployment_id: "deploy-a".to_owned(),
+            definition_id: "fraud-stream".to_owned(),
+            definition_version: Some(2),
+            artifact_hash: Some("artifact-v2".to_owned()),
+            desired_state: "rolling_forward".to_owned(),
+            rollout_phase: "stabilizing".to_owned(),
+            rollout_generation: 2,
+            active_stream_run_id: Some("rev-2".to_owned()),
+            active_job_id: Some("job-a".to_owned()),
+            active_handle_id: Some("handle-rev-2".to_owned()),
+            previous_stream_run_id: Some("rev-1".to_owned()),
+            rollout_checkpoint_name: Some("initial-risk-ready".to_owned()),
+            rollout_handoff_checkpoint_sequence: Some(1),
+            failed_revision_id: None,
+            rollout_failure: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let previous_runtime = json!({
+            "sourceCursors": [
+                { "sourcePartitionId": 0, "lastAppliedOffset": 10 }
+            ],
+            "sourceLeases": [
+                { "sourcePartitionId": 0, "ownerPartitionId": 0 }
+            ],
+            "ownerPartitionStats": {
+                "summary": {
+                    "shardCheckpointAgeSeconds": 12,
+                    "totalCheckpointBytes": 2048,
+                    "maxCheckpointBytes": 2048,
+                    "totalRestoreTailLagEntries": 0,
+                    "restoredFromCheckpoint": false,
+                    "checkpointedPartitionCount": 1
+                }
+            }
+        });
+        let active_runtime = json!({
+            "sourceCursors": [
+                { "sourcePartitionId": 0, "lastAppliedOffset": 12 }
+            ],
+            "sourceLeases": [
+                { "sourcePartitionId": 0, "ownerPartitionId": 1 }
+            ],
+            "ownerPartitionStats": {
+                "summary": {
+                    "shardCheckpointAgeSeconds": 45,
+                    "totalCheckpointBytes": 4096,
+                    "maxCheckpointBytes": 3072,
+                    "totalRestoreTailLagEntries": 2,
+                    "restoredFromCheckpoint": true,
+                    "checkpointedPartitionCount": 1
+                }
+            }
+        });
+
+        let rollout_health = build_stream_deployment_rollout_health(
+            &deployment,
+            Some(&active_runtime),
+            Some(&previous_runtime),
+        );
+        assert_eq!(rollout_health["partitionCount"], json!(1));
+        assert_eq!(rollout_health["advancedPartitionCount"], json!(1));
+        assert_eq!(rollout_health["activeRestoreTailLagEntries"], json!(2));
+        assert_eq!(rollout_health["previousRestoreTailLagEntries"], json!(0));
+        assert_eq!(rollout_health["activeShardCheckpointAgeSeconds"], json!(45));
+        assert_eq!(rollout_health["previousShardCheckpointAgeSeconds"], json!(12));
+        assert_eq!(rollout_health["activeRestoredFromCheckpoint"], json!(true));
+        assert_eq!(rollout_health["previousRestoredFromCheckpoint"], json!(false));
+        assert_eq!(rollout_health["activeDurability"]["maxCheckpointBytes"], json!(3072));
+        assert_eq!(rollout_health["previousDurability"]["totalCheckpointBytes"], json!(2048));
+        assert_eq!(rollout_health["partitions"][0]["activeOwnerPartitionId"], json!(1));
+        assert_eq!(rollout_health["partitions"][0]["previousOwnerPartitionId"], json!(0));
+    }
+
     #[tokio::test]
     async fn owner_query_endpoint_round_trip_returns_payload() {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind test listener");
@@ -9822,11 +10275,14 @@ mod tests {
         assert_eq!(list.deployments[0].active_status.as_deref(), Some("running"));
         assert_eq!(list.deployments[0].rollout_phase, "running");
         assert_eq!(list.deployments[0].rollout_handoff_checkpoint_sequence, Some(1));
+        assert_eq!(list.deployments[0].rollout_health["partitionCount"], json!(0));
+        assert_eq!(list.deployments[0].rollout_health["blockedReason"], Value::Null);
 
         let deployment = load_stream_deployment(&state, "tenant-a", "deploy-a").await?;
         assert_eq!(deployment.deployment.rollout_generation, 2);
         assert_eq!(deployment.deployment.rollout_checkpoint_name.as_deref(), Some("rollup-ready"));
         assert_eq!(deployment.deployment.rollout_phase, "running");
+        assert_eq!(deployment.deployment.rollout_health["advancedPartitionCount"], json!(0));
 
         let revisions = load_stream_deployment_revisions(
             &state,

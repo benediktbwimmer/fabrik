@@ -27,8 +27,8 @@ use fabrik_store::{
 };
 use fabrik_throughput::{
     ADMISSION_POLICY_VERSION, ActivityCapabilityRegistry, CancelStreamJobCommand,
-    CompiledStreamJobArtifact, FastPathRejectionReason, PayloadHandle, ScheduleStreamJobCommand,
-    StreamJobBridgeHandleStatus, StreamJobOriginKind, StreamJobStatus,
+    CompiledStreamJobArtifact, FastPathRejectionReason, PauseStreamJobCommand, PayloadHandle,
+    ScheduleStreamJobCommand, StreamJobBridgeHandleStatus, StreamJobOriginKind, StreamJobStatus,
     THROUGHPUT_BRIDGE_PROTOCOL_VERSION, ThroughputBackend, ThroughputBridgeOperationKind,
     ThroughputCommand, ThroughputCommandEnvelope, TinyWorkflowExecutionMode,
     TinyWorkflowStartBatchCommand, TinyWorkflowStartCommand, TinyWorkflowStartItem,
@@ -480,21 +480,14 @@ struct DrainStandaloneStreamJobRequest {
     reason: String,
 }
 
-#[derive(Debug, Serialize)]
-struct CancelStandaloneStreamJobResponse {
-    tenant_id: String,
-    instance_id: String,
-    stream_instance_id: String,
-    run_id: String,
-    stream_run_id: String,
-    job_id: String,
-    handle_id: String,
-    origin_kind: String,
-    status: String,
+#[derive(Debug, Deserialize, Serialize)]
+struct PauseStandaloneStreamJobRequest {
+    #[serde(default = "default_pause_reason")]
+    reason: String,
 }
 
 #[derive(Debug, Serialize)]
-struct ResumeStandaloneStreamJobResponse {
+struct StandaloneStreamJobLifecycleResponse {
     tenant_id: String,
     instance_id: String,
     stream_instance_id: String,
@@ -659,6 +652,14 @@ async fn main() -> Result<()> {
     .route(
         "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/resume",
         post(resume_standalone_stream_job),
+    )
+    .route(
+        "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/pause",
+        post(pause_standalone_stream_job),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/pause",
+        post(pause_standalone_stream_job),
     )
     .route(
         "/tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/cancel",
@@ -1611,8 +1612,8 @@ fn standalone_stream_job_control_response(
     instance_id: String,
     run_id: String,
     handle: &StreamJobBridgeHandleRecord,
-) -> ResumeStandaloneStreamJobResponse {
-    ResumeStandaloneStreamJobResponse {
+) -> StandaloneStreamJobLifecycleResponse {
+    StandaloneStreamJobLifecycleResponse {
         tenant_id,
         instance_id,
         stream_instance_id: handle.stream_instance_id.clone(),
@@ -1673,6 +1674,68 @@ async fn request_standalone_stream_job_drain(
         dedupe_key: format!("stream-job-cancel:{}", handle.handle_id),
         partition_key: fabrik_throughput::throughput_partition_key(job_id, 0),
         payload: ThroughputCommand::CancelStreamJob(CancelStreamJobCommand {
+            tenant_id: tenant_id.to_owned(),
+            stream_instance_id: handle.stream_instance_id.clone(),
+            stream_run_id: handle.stream_run_id.clone(),
+            job_id: job_id.to_owned(),
+            handle_id: handle.handle_id.clone(),
+            reason: Some(reason),
+        }),
+    };
+    state
+        .streams_command_publisher
+        .publish(&command, &command.partition_key)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Some(handle))
+}
+
+async fn request_standalone_stream_job_pause(
+    state: &AppState,
+    tenant_id: &str,
+    instance_id: &str,
+    run_id: &str,
+    job_id: &str,
+    reason: String,
+    occurred_at: DateTime<Utc>,
+) -> Result<Option<StreamJobBridgeHandleRecord>, (StatusCode, String)> {
+    let Some(mut handle) = state
+        .store
+        .get_stream_job_bridge_handle(tenant_id, instance_id, run_id, job_id)
+        .await
+        .map_err(internal_error)?
+    else {
+        return Ok(None);
+    };
+
+    if handle.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal)
+        || matches!(handle.parsed_status(), Some(StreamJobBridgeHandleStatus::Paused))
+    {
+        return Ok(Some(handle));
+    }
+
+    handle.status = StreamJobBridgeHandleStatus::Paused.as_str().to_owned();
+    handle.updated_at = occurred_at;
+    state.store.upsert_stream_job_bridge_handle(&handle).await.map_err(internal_error)?;
+
+    if let Some(mut job) = state
+        .store
+        .get_stream_job(tenant_id, instance_id, run_id, job_id)
+        .await
+        .map_err(internal_error)?
+    {
+        job.status = StreamJobStatus::Paused.as_str().to_owned();
+        job.updated_at = occurred_at;
+        state.store.upsert_stream_job(&job).await.map_err(internal_error)?;
+    }
+
+    let command = ThroughputCommandEnvelope {
+        command_id: Uuid::now_v7(),
+        occurred_at,
+        dedupe_key: format!("stream-job-pause:{}", handle.handle_id),
+        partition_key: fabrik_throughput::throughput_partition_key(job_id, 0),
+        payload: ThroughputCommand::PauseStreamJob(PauseStreamJobCommand {
             tenant_id: tenant_id.to_owned(),
             stream_instance_id: handle.stream_instance_id.clone(),
             stream_run_id: handle.stream_run_id.clone(),
@@ -2289,7 +2352,7 @@ async fn cancel_standalone_stream_job(
     Path((tenant_id, instance_id, run_id, job_id)): Path<(String, String, String, String)>,
     State(state): State<AppState>,
     Json(request): Json<CancelStandaloneStreamJobRequest>,
-) -> Result<Json<CancelStandaloneStreamJobResponse>, (StatusCode, String)> {
+) -> Result<Json<StandaloneStreamJobLifecycleResponse>, (StatusCode, String)> {
     let handle = request_standalone_stream_job_drain(
         &state,
         &tenant_id,
@@ -2307,47 +2370,52 @@ async fn cancel_standalone_stream_job(
         )
     })?;
 
-    Ok(Json(CancelStandaloneStreamJobResponse {
-        tenant_id,
-        instance_id: instance_id.clone(),
-        stream_instance_id: handle.stream_instance_id.clone(),
-        run_id: run_id.clone(),
-        stream_run_id: handle.stream_run_id.clone(),
-        job_id: job_id.clone(),
-        handle_id: handle.handle_id,
-        origin_kind: handle.origin_kind.clone(),
-        status: handle.status,
-    }))
+    Ok(Json(standalone_stream_job_control_response(tenant_id, instance_id, run_id, &handle)))
 }
 
 async fn drain_standalone_stream_job(
     Path((tenant_id, instance_id, run_id, job_id)): Path<(String, String, String, String)>,
     State(state): State<AppState>,
     Json(request): Json<DrainStandaloneStreamJobRequest>,
-) -> Result<Json<ResumeStandaloneStreamJobResponse>, (StatusCode, String)> {
+) -> Result<Json<StandaloneStreamJobLifecycleResponse>, (StatusCode, String)> {
     let response = cancel_standalone_stream_job(
         Path((tenant_id.clone(), instance_id.clone(), run_id.clone(), job_id)),
         State(state),
         Json(CancelStandaloneStreamJobRequest { reason: request.reason }),
     )
     .await?;
-    Ok(Json(ResumeStandaloneStreamJobResponse {
-        tenant_id,
-        instance_id,
-        stream_instance_id: response.0.stream_instance_id,
-        run_id,
-        stream_run_id: response.0.stream_run_id,
-        job_id: response.0.job_id,
-        handle_id: response.0.handle_id,
-        origin_kind: response.0.origin_kind,
-        status: response.0.status,
-    }))
+    Ok(response)
+}
+
+async fn pause_standalone_stream_job(
+    Path((tenant_id, instance_id, run_id, job_id)): Path<(String, String, String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<PauseStandaloneStreamJobRequest>,
+) -> Result<Json<StandaloneStreamJobLifecycleResponse>, (StatusCode, String)> {
+    let handle = request_standalone_stream_job_pause(
+        &state,
+        &tenant_id,
+        &instance_id,
+        &run_id,
+        &job_id,
+        request.reason,
+        Utc::now(),
+    )
+    .await?
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("stream job {job_id} not found for {tenant_id}/{instance_id}/{run_id}"),
+        )
+    })?;
+
+    Ok(Json(standalone_stream_job_control_response(tenant_id, instance_id, run_id, &handle)))
 }
 
 async fn resume_standalone_stream_job(
     Path((tenant_id, instance_id, run_id, job_id)): Path<(String, String, String, String)>,
     State(state): State<AppState>,
-) -> Result<Json<ResumeStandaloneStreamJobResponse>, (StatusCode, String)> {
+) -> Result<Json<StandaloneStreamJobLifecycleResponse>, (StatusCode, String)> {
     let handle = request_standalone_stream_job_resume(
         &state,
         &tenant_id,
@@ -4445,6 +4513,10 @@ fn default_cancel_reason() -> String {
     "cancelled by operator".to_owned()
 }
 
+fn default_pause_reason() -> String {
+    "paused by operator".to_owned()
+}
+
 fn default_terminate_reason() -> String {
     "terminated by operator".to_owned()
 }
@@ -4470,14 +4542,18 @@ mod tests {
     use serde_json::json;
     use std::{
         collections::{BTreeMap, BTreeSet},
-        process::Command,
+        fs::{self, File},
+        net::TcpStream,
+        path::{Path, PathBuf},
+        process::{Child, Command, Stdio},
         time::{Duration as StdDuration, Instant},
     };
-    use tokio::time::sleep;
+    use tokio::time::{sleep, timeout};
 
     struct TestPostgres {
         container_name: String,
         database_url: String,
+        owned_container: bool,
     }
 
     impl TestPostgres {
@@ -4489,39 +4565,101 @@ mod tests {
                 return Ok(None);
             }
 
-            let container_name = format!("fabrik-ingest-test-pg-{}", Uuid::now_v7());
             let image = std::env::var("FABRIK_TEST_POSTGRES_IMAGE")
                 .unwrap_or_else(|_| "postgres:16-alpine".to_owned());
-            let output = Command::new("docker")
-                .args([
-                    "run",
-                    "--detach",
-                    "--rm",
-                    "--name",
-                    &container_name,
-                    "--env",
-                    "POSTGRES_USER=fabrik",
-                    "--env",
-                    "POSTGRES_PASSWORD=fabrik",
-                    "--env",
-                    "POSTGRES_DB=fabrik_test",
-                    "--publish-all",
-                    &image,
-                ])
-                .output()
-                .with_context(|| format!("failed to start docker container {container_name}"))?;
-            if !output.status.success() {
-                anyhow::bail!(
-                    "docker failed to start postgres test container: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
+            let existing =
+                Command::new("docker")
+                    .args(["ps", "--format", "{{.Names}}"])
+                    .output()
+                    .context("failed to inspect running docker containers for postgres reuse")?;
+            let existing_names = String::from_utf8_lossy(&existing.stdout);
+            if let Some(container_name) = existing_names
+                .lines()
+                .map(str::trim)
+                .find(|name| {
+                    name.starts_with("fabrik-ingest-test-pg-")
+                        || name.starts_with("throughput-runtime-test-")
+                })
+                .map(str::to_owned)
+            {
+                let host_port = wait_for_host_port(&container_name, "5432/tcp")?;
+                let database_url = format!(
+                    "postgres://fabrik:fabrik@127.0.0.1:{host_port}/fabrik_test?sslmode=disable"
                 );
+                return Ok(Some(Self { container_name, database_url, owned_container: false }));
+            }
+            Self::start_fresh_with_image(&image)
+        }
+
+        fn start_fresh() -> Result<Option<Self>> {
+            if !docker_available() {
+                eprintln!(
+                    "skipping ingest-service integration tests because docker is unavailable"
+                );
+                return Ok(None);
+            }
+            let image = std::env::var("FABRIK_TEST_POSTGRES_IMAGE")
+                .unwrap_or_else(|_| "postgres:16-alpine".to_owned());
+            Self::start_fresh_with_image(&image)
+        }
+
+        fn start_fresh_with_image(image: &str) -> Result<Option<Self>> {
+            let mut last_error = None;
+            for _ in 0..3 {
+                let container_name = format!("fabrik-ingest-test-pg-{}", Uuid::now_v7());
+                let output = Command::new("docker")
+                    .args([
+                        "run",
+                        "--detach",
+                        "--name",
+                        &container_name,
+                        "--env",
+                        "POSTGRES_USER=fabrik",
+                        "--env",
+                        "POSTGRES_PASSWORD=fabrik",
+                        "--env",
+                        "POSTGRES_DB=fabrik_test",
+                        "--publish-all",
+                        &image,
+                    ])
+                    .output()
+                    .with_context(|| {
+                        format!("failed to start docker container {container_name}")
+                    })?;
+                if !output.status.success() {
+                    last_error = Some(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+                    continue;
+                }
+
+                match (
+                    wait_for_host_port(&container_name, "5432/tcp"),
+                    wait_for_postgres_ready(&container_name),
+                ) {
+                    (Ok(host_port), Ok(())) => {
+                        let database_url = format!(
+                            "postgres://fabrik:fabrik@127.0.0.1:{host_port}/fabrik_test?sslmode=disable"
+                        );
+                        return Ok(Some(Self {
+                            container_name,
+                            database_url,
+                            owned_container: true,
+                        }));
+                    }
+                    (host_result, ready_result) => {
+                        last_error = Some(format!(
+                            "host_port={:?} readiness={:?}",
+                            host_result.err(),
+                            ready_result.err()
+                        ));
+                        let _ = cleanup_container(&container_name);
+                    }
+                }
             }
 
-            let host_port = wait_for_host_port(&container_name, "5432/tcp")?;
-            let database_url = format!(
-                "postgres://fabrik:fabrik@127.0.0.1:{host_port}/fabrik_test?sslmode=disable"
+            anyhow::bail!(
+                "docker failed to start postgres test container after retries: {}",
+                last_error.unwrap_or_else(|| "unknown error".to_owned())
             );
-            Ok(Some(Self { container_name, database_url }))
         }
 
         async fn connect_store(&self) -> Result<WorkflowStore> {
@@ -4552,13 +4690,16 @@ mod tests {
 
     impl Drop for TestPostgres {
         fn drop(&mut self) {
-            let _ = cleanup_container(&self.container_name);
+            if self.owned_container {
+                let _ = cleanup_container(&self.container_name);
+            }
         }
     }
 
     struct TestRedpanda {
         container_name: String,
         broker: BrokerConfig,
+        owned_container: bool,
     }
 
     impl TestRedpanda {
@@ -4570,67 +4711,132 @@ mod tests {
                 return Ok(None);
             }
 
-            let kafka_port = choose_free_port().context("failed to allocate kafka host port")?;
-            let container_name = format!("fabrik-ingest-test-rp-{}", Uuid::now_v7());
+            let local_output = Command::new("docker")
+                .args(["ps", "--format", "{{.Names}}"])
+                .output()
+                .context("failed to inspect running docker containers for redpanda reuse")?;
+            let local_names = String::from_utf8_lossy(&local_output.stdout);
+            if local_names.lines().any(|line| line.trim() == "fabrik-redpanda-1") {
+                return Ok(Some(Self {
+                    container_name: "fabrik-redpanda-1".to_owned(),
+                    broker: BrokerConfig::new(
+                        "127.0.0.1:29092".to_owned(),
+                        format!("workflow-events-test-{}", Uuid::now_v7()),
+                        1,
+                    ),
+                    owned_container: false,
+                }));
+            }
+
             let image = std::env::var("FABRIK_TEST_REDPANDA_IMAGE")
                 .unwrap_or_else(|_| "docker.redpanda.com/redpandadata/redpanda:v25.1.2".to_owned());
-            let workflow_topic = format!("workflow-events-test-{}", Uuid::now_v7());
-            let output = Command::new("docker")
-                .args([
-                    "run",
-                    "--detach",
-                    "--rm",
-                    "--name",
-                    &container_name,
-                    "--publish",
-                    &format!("{kafka_port}:{kafka_port}"),
-                    &image,
-                    "redpanda",
-                    "start",
-                    "--overprovisioned",
-                    "--smp",
-                    "1",
-                    "--memory",
-                    "1G",
-                    "--reserve-memory",
-                    "0M",
-                    "--node-id",
-                    "0",
-                    "--check=false",
-                    "--kafka-addr",
-                    &format!("PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:{kafka_port}"),
-                    "--advertise-kafka-addr",
-                    &format!("PLAINTEXT://127.0.0.1:9092,OUTSIDE://127.0.0.1:{kafka_port}"),
-                    "--rpc-addr",
-                    "0.0.0.0:33145",
-                    "--advertise-rpc-addr",
-                    "127.0.0.1:33145",
-                ])
-                .output()
-                .with_context(|| format!("failed to start docker container {container_name}"))?;
-            if !output.status.success() {
+            let mut last_error = None;
+            let mut container_name = String::new();
+            let mut kafka_port = 0_u16;
+            let mut started = false;
+            for _ in 0..5 {
+                kafka_port =
+                    choose_free_port().context("failed to allocate redpanda kafka host port")?;
+                container_name = format!("fabrik-ingest-test-rp-{}", Uuid::now_v7());
+                let output = Command::new("docker")
+                    .args([
+                        "run",
+                        "--detach",
+                        "--name",
+                        &container_name,
+                        "--publish",
+                        &format!("{kafka_port}:{kafka_port}"),
+                        &image,
+                        "redpanda",
+                        "start",
+                        "--overprovisioned",
+                        "--smp",
+                        "1",
+                        "--memory",
+                        "1G",
+                        "--reserve-memory",
+                        "0M",
+                        "--node-id",
+                        "0",
+                        "--check=false",
+                        "--kafka-addr",
+                        &format!("PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:{kafka_port}"),
+                        "--advertise-kafka-addr",
+                        &format!("PLAINTEXT://127.0.0.1:9092,OUTSIDE://127.0.0.1:{kafka_port}"),
+                        "--rpc-addr",
+                        "0.0.0.0:33145",
+                        "--advertise-rpc-addr",
+                        "127.0.0.1:33145",
+                    ])
+                    .output()
+                    .with_context(|| {
+                        format!("failed to start docker container {container_name}")
+                    })?;
+                if output.status.success() {
+                    match wait_for_redpanda_ready(&container_name) {
+                        Ok(()) => {
+                            started = true;
+                            break;
+                        }
+                        Err(error) => {
+                            last_error = Some(error.to_string());
+                            let _ = cleanup_container(&container_name);
+                            continue;
+                        }
+                    }
+                }
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                if stderr.contains("address already in use") {
+                    last_error = Some(stderr);
+                    continue;
+                }
+                anyhow::bail!("docker failed to start redpanda test container: {stderr}");
+            }
+            if !started {
+                if let Some(error) = last_error.as_deref()
+                    && error.contains("No space left on device")
+                {
+                    eprintln!(
+                        "skipping ingest-service redpanda-backed tests because docker storage is full"
+                    );
+                    return Ok(None);
+                }
                 anyhow::bail!(
-                    "docker failed to start redpanda test container: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
+                    "docker failed to start redpanda test container after retries: {}",
+                    last_error.unwrap_or_else(|| "unknown error".to_owned())
                 );
             }
 
             Ok(Some(Self {
                 container_name,
-                broker: BrokerConfig::new(format!("127.0.0.1:{kafka_port}"), workflow_topic, 1),
+                broker: BrokerConfig::new(
+                    format!("127.0.0.1:{kafka_port}"),
+                    format!("workflow-events-test-{}", Uuid::now_v7()),
+                    1,
+                ),
+                owned_container: true,
             }))
         }
 
         async fn connect_workflow_publisher(&self) -> Result<WorkflowPublisher> {
             let deadline = Instant::now() + StdDuration::from_secs(45);
             loop {
-                match WorkflowPublisher::new(&self.broker, "ingest-service-test").await {
-                    Ok(publisher) => return Ok(publisher),
+                match timeout(
+                    StdDuration::from_secs(10),
+                    WorkflowPublisher::new(&self.broker, "ingest-service-test"),
+                )
+                .await
+                {
+                    Ok(Ok(publisher)) => return Ok(publisher),
+                    Ok(Err(error)) if Instant::now() < deadline => {
+                        let _ = error;
+                        sleep(StdDuration::from_millis(500)).await;
+                    }
                     Err(error) if Instant::now() < deadline => {
                         let _ = error;
                         sleep(StdDuration::from_millis(500)).await;
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         let logs = docker_logs(&self.container_name).unwrap_or_default();
                         return Err(error).with_context(|| {
                             format!(
@@ -4638,6 +4844,63 @@ mod tests {
                                 self.container_name, logs
                             )
                         });
+                    }
+                    Err(error) => {
+                        let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        anyhow::bail!(
+                            "timed out waiting for redpanda test container {} workflow publisher readiness: {}; logs:\n{}",
+                            self.container_name,
+                            error,
+                            logs
+                        );
+                    }
+                }
+            }
+        }
+
+        async fn connect_json_publisher_with_config<T>(
+            &self,
+            config: &JsonTopicConfig,
+            client_id: &str,
+        ) -> Result<JsonTopicPublisher<T>>
+        where
+            T: serde::Serialize,
+        {
+            let deadline = Instant::now() + StdDuration::from_secs(45);
+            loop {
+                match timeout(
+                    StdDuration::from_secs(10),
+                    JsonTopicPublisher::<T>::new(config, client_id),
+                )
+                .await
+                {
+                    Ok(Ok(publisher)) => return Ok(publisher),
+                    Ok(Err(error)) if Instant::now() < deadline => {
+                        let _ = error;
+                        sleep(StdDuration::from_millis(500)).await;
+                    }
+                    Err(error) if Instant::now() < deadline => {
+                        let _ = error;
+                        sleep(StdDuration::from_millis(500)).await;
+                    }
+                    Ok(Err(error)) => {
+                        let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        return Err(error).with_context(|| {
+                            format!(
+                                "redpanda test container {} did not become ready for topic {}; logs:\n{}",
+                                self.container_name, config.topic_name, logs
+                            )
+                        });
+                    }
+                    Err(error) => {
+                        let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        anyhow::bail!(
+                            "timed out waiting for redpanda test container {} topic {} readiness: {}; logs:\n{}",
+                            self.container_name,
+                            config.topic_name,
+                            error,
+                            logs
+                        );
                     }
                 }
             }
@@ -4653,25 +4916,7 @@ mod tests {
                 topic_name.to_owned(),
                 partitions,
             );
-            let deadline = Instant::now() + StdDuration::from_secs(45);
-            loop {
-                match JsonTopicPublisher::<Value>::new(&config, "ingest-service-test").await {
-                    Ok(publisher) => return Ok(publisher),
-                    Err(error) if Instant::now() < deadline => {
-                        let _ = error;
-                        sleep(StdDuration::from_millis(500)).await;
-                    }
-                    Err(error) => {
-                        let logs = docker_logs(&self.container_name).unwrap_or_default();
-                        return Err(error).with_context(|| {
-                            format!(
-                                "redpanda test container {} did not become ready for json topic {}; logs:\n{}",
-                                self.container_name, topic_name, logs
-                            )
-                        });
-                    }
-                }
-            }
+            self.connect_json_publisher_with_config(&config, "ingest-service-test").await
         }
 
         async fn connect_throughput_command_publisher(
@@ -4682,30 +4927,11 @@ mod tests {
                 format!("throughput-commands-test-{}", Uuid::now_v7()),
                 1,
             );
-            let deadline = Instant::now() + StdDuration::from_secs(45);
-            loop {
-                match JsonTopicPublisher::<ThroughputCommandEnvelope>::new(
-                    &config,
-                    "ingest-service-test-throughput-commands",
-                )
-                .await
-                {
-                    Ok(publisher) => return Ok(publisher),
-                    Err(error) if Instant::now() < deadline => {
-                        let _ = error;
-                        sleep(StdDuration::from_millis(500)).await;
-                    }
-                    Err(error) => {
-                        let logs = docker_logs(&self.container_name).unwrap_or_default();
-                        return Err(error).with_context(|| {
-                            format!(
-                                "redpanda test container {} did not become ready for throughput command topic; logs:\n{}",
-                                self.container_name, logs
-                            )
-                        });
-                    }
-                }
-            }
+            self.connect_json_publisher_with_config(
+                &config,
+                "ingest-service-test-throughput-commands",
+            )
+            .await
         }
 
         async fn connect_streams_command_publisher(
@@ -4716,36 +4942,231 @@ mod tests {
                 format!("streams-commands-test-{}", Uuid::now_v7()),
                 1,
             );
-            let deadline = Instant::now() + StdDuration::from_secs(45);
-            loop {
-                match JsonTopicPublisher::<ThroughputCommandEnvelope>::new(
-                    &config,
-                    "ingest-service-test-streams-commands",
-                )
+            self.connect_json_publisher_with_config(&config, "ingest-service-test-streams-commands")
                 .await
-                {
-                    Ok(publisher) => return Ok(publisher),
-                    Err(error) if Instant::now() < deadline => {
-                        let _ = error;
-                        sleep(StdDuration::from_millis(500)).await;
-                    }
-                    Err(error) => {
-                        let logs = docker_logs(&self.container_name).unwrap_or_default();
-                        return Err(error).with_context(|| {
-                            format!(
-                                "redpanda test container {} did not become ready for streams command topic; logs:\n{}",
-                                self.container_name, logs
-                            )
-                        });
-                    }
-                }
-            }
         }
     }
 
     impl Drop for TestRedpanda {
         fn drop(&mut self) {
-            let _ = cleanup_container(&self.container_name);
+            if self.owned_container {
+                let _ = cleanup_container(&self.container_name);
+            }
+        }
+    }
+
+    struct TestThroughputRuntimeProcess {
+        child: Child,
+        log_path: PathBuf,
+    }
+
+    impl TestThroughputRuntimeProcess {
+        async fn start(
+            postgres: &TestPostgres,
+            redpanda: &TestRedpanda,
+            streams_commands_topic: &str,
+            state_dir: &Path,
+        ) -> Result<Self> {
+            let binary_path = build_service_binary("streams-runtime", "throughput-runtime")?;
+            let runtime_root = state_dir.join("throughput-runtime");
+            let local_state_dir = runtime_root.join("state");
+            let checkpoint_dir = runtime_root.join("checkpoints");
+            let payload_dir = runtime_root.join("payloads");
+            fs::create_dir_all(&local_state_dir)?;
+            fs::create_dir_all(&checkpoint_dir)?;
+            fs::create_dir_all(&payload_dir)?;
+
+            let debug_port = choose_free_port()?;
+            let grpc_port = choose_free_port()?;
+            let log_path = runtime_root.join("throughput-runtime.log");
+            let stdout = File::create(&log_path)?;
+            let stderr = stdout.try_clone()?;
+            let streams_reports_topic = format!("streams-reports-e2e-{}", Uuid::now_v7());
+            let streams_changelog_topic = format!("streams-changelog-e2e-{}", Uuid::now_v7());
+            let streams_projections_topic = format!("streams-projections-e2e-{}", Uuid::now_v7());
+
+            let mut child = Command::new(binary_path)
+                .current_dir(workspace_root()?)
+                .env("POSTGRES_URL", &postgres.database_url)
+                .env("REDPANDA_BROKERS", &redpanda.broker.brokers)
+                .env("WORKFLOW_EVENTS_TOPIC", &redpanda.broker.workflow_events_topic)
+                .env("WORKFLOW_EVENTS_PARTITIONS", "1")
+                .env(
+                    "THROUGHPUT_COMMANDS_TOPIC",
+                    format!("throughput-commands-e2e-{}", Uuid::now_v7()),
+                )
+                .env("STREAMS_COMMANDS_TOPIC", streams_commands_topic)
+                .env("STREAMS_REPORTS_TOPIC", &streams_reports_topic)
+                .env(
+                    "THROUGHPUT_CHANGELOG_TOPIC",
+                    format!("throughput-changelog-e2e-{}", Uuid::now_v7()),
+                )
+                .env("STREAMS_CHANGELOG_TOPIC", &streams_changelog_topic)
+                .env(
+                    "THROUGHPUT_PROJECTIONS_TOPIC",
+                    format!("throughput-projections-e2e-{}", Uuid::now_v7()),
+                )
+                .env("STREAMS_PROJECTIONS_TOPIC", &streams_projections_topic)
+                .env("STREAMS_PARTITIONS", "1")
+                .env("STREAMS_RUNTIME_PORT", grpc_port.to_string())
+                .env("STREAMS_DEBUG_PORT", debug_port.to_string())
+                .env("STREAMS_LOCAL_STATE_DIR", &local_state_dir)
+                .env("STREAMS_CHECKPOINT_DIR", &checkpoint_dir)
+                .env(
+                    "STREAMS_CHECKPOINT_KEY_PREFIX",
+                    format!("streams-e2e-checkpoints-{}", Uuid::now_v7()),
+                )
+                .env("STREAMS_PAYLOAD_STORE_DIR", &payload_dir)
+                .env("STREAMS_OWNERSHIP_PARTITIONS", "0")
+                .env("STREAMS_RUNTIME_CAPACITY", "1")
+                .env("STREAMS_OWNERSHIP_ASSIGNMENT_POLL_INTERVAL_SECONDS", "1")
+                .env("STREAMS_OWNERSHIP_REBALANCE_INTERVAL_SECONDS", "1")
+                .env("STREAMS_OWNERSHIP_RENEW_INTERVAL_SECONDS", "1")
+                .env("STREAMS_OWNERSHIP_LEASE_TTL_SECONDS", "5")
+                .env("RUST_LOG", "info")
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr))
+                .spawn()
+                .context("failed to spawn throughput-runtime test process")?;
+
+            wait_for_process_port(&mut child, debug_port, &log_path, "throughput-runtime").await?;
+            Ok(Self { child, log_path })
+        }
+
+        fn logs(&self) -> String {
+            fs::read_to_string(&self.log_path).unwrap_or_default()
+        }
+    }
+
+    impl Drop for TestThroughputRuntimeProcess {
+        fn drop(&mut self) {
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    struct TestQueryServiceProcess {
+        child: Child,
+        log_path: PathBuf,
+        port: u16,
+    }
+
+    impl TestQueryServiceProcess {
+        async fn start(
+            postgres: &TestPostgres,
+            redpanda: &TestRedpanda,
+            state_dir: &Path,
+        ) -> Result<Self> {
+            let binary_path = build_service_binary("query-service", "query-service")?;
+            let query_root = state_dir.join("query-service");
+            let payload_dir = query_root.join("payloads");
+            fs::create_dir_all(&payload_dir)?;
+            let port = choose_free_port()?;
+            let log_path = query_root.join("query-service.log");
+            let stdout = File::create(&log_path)?;
+            let stderr = stdout.try_clone()?;
+
+            let mut child = Command::new(binary_path)
+                .current_dir(workspace_root()?)
+                .env("POSTGRES_URL", &postgres.database_url)
+                .env("REDPANDA_BROKERS", &redpanda.broker.brokers)
+                .env("WORKFLOW_EVENTS_TOPIC", &redpanda.broker.workflow_events_topic)
+                .env("WORKFLOW_EVENTS_PARTITIONS", "1")
+                .env("STREAMS_PARTITIONS", "1")
+                .env("QUERY_SERVICE_PORT", port.to_string())
+                .env("STREAMS_PAYLOAD_STORE_DIR", &payload_dir)
+                .env("QUERY_STRONG_QUERY_UNIFIED_URL", "http://127.0.0.1:9")
+                .env("RUST_LOG", "info")
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr))
+                .spawn()
+                .context("failed to spawn query-service test process")?;
+
+            wait_for_process_port(&mut child, port, &log_path, "query-service").await?;
+            Ok(Self { child, log_path, port })
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://127.0.0.1:{}", self.port)
+        }
+
+        fn logs(&self) -> String {
+            fs::read_to_string(&self.log_path).unwrap_or_default()
+        }
+    }
+
+    impl Drop for TestQueryServiceProcess {
+        fn drop(&mut self) {
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
+
+    fn workspace_root() -> Result<PathBuf> {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .context("failed to resolve workspace root")
+    }
+
+    fn build_service_binary(package: &str, binary: &str) -> Result<PathBuf> {
+        let root = workspace_root()?;
+        let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.join("target"));
+        let binary_path = target_dir.join("debug").join(binary);
+        if binary_path.exists() {
+            return Ok(binary_path);
+        }
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+        let output = Command::new(cargo)
+            .args(["build", "-p", package, "--bin", binary])
+            .current_dir(&root)
+            .output()
+            .with_context(|| format!("failed to build {binary} test binary"))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "failed to build {}:\nstdout:\n{}\nstderr:\n{}",
+                binary,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        if !binary_path.exists() {
+            anyhow::bail!("expected binary at {}", binary_path.display());
+        }
+        Ok(binary_path)
+    }
+
+    async fn wait_for_process_port(
+        child: &mut Child,
+        port: u16,
+        log_path: &Path,
+        service_name: &str,
+    ) -> Result<()> {
+        let deadline = Instant::now() + StdDuration::from_secs(45);
+        loop {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return Ok(());
+            }
+            if let Some(status) = child.try_wait()? {
+                let logs = fs::read_to_string(log_path).unwrap_or_default();
+                anyhow::bail!(
+                    "{service_name} test process exited early with status {status}; logs:\n{logs}"
+                );
+            }
+            if Instant::now() >= deadline {
+                let logs = fs::read_to_string(log_path).unwrap_or_default();
+                anyhow::bail!(
+                    "timed out waiting for {service_name} test process to become ready; logs:\n{logs}"
+                );
+            }
+            sleep(StdDuration::from_millis(100)).await;
         }
     }
 
@@ -4792,6 +5213,67 @@ mod tests {
                 anyhow::bail!("timed out waiting for port {container_port} on {container_name}");
             }
             std::thread::sleep(StdDuration::from_millis(100));
+        }
+    }
+
+    fn wait_for_postgres_ready(container_name: &str) -> Result<()> {
+        let deadline = Instant::now() + StdDuration::from_secs(30);
+        loop {
+            let output = Command::new("docker")
+                .args(["exec", container_name, "pg_isready", "-U", "fabrik", "-d", "fabrik_test"])
+                .output()
+                .with_context(|| {
+                    format!("failed to probe postgres readiness for {container_name}")
+                })?;
+            if output.status.success() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let logs = docker_logs(container_name).unwrap_or_default();
+                anyhow::bail!(
+                    "timed out waiting for postgres test container {container_name} to become ready; logs:\n{}",
+                    logs
+                );
+            }
+            std::thread::sleep(StdDuration::from_millis(250));
+        }
+    }
+
+    fn wait_for_redpanda_ready(container_name: &str) -> Result<()> {
+        let deadline = Instant::now() + StdDuration::from_secs(30);
+        loop {
+            let inspect = Command::new("docker")
+                .args(["inspect", "--format", "{{.State.Running}}", container_name])
+                .output()
+                .with_context(|| {
+                    format!("failed to inspect redpanda readiness for {container_name}")
+                })?;
+            if !inspect.status.success() {
+                let logs = docker_logs(container_name).unwrap_or_default();
+                anyhow::bail!(
+                    "redpanda test container {container_name} disappeared before it became ready; logs:\n{}",
+                    logs
+                );
+            }
+            if String::from_utf8_lossy(&inspect.stdout).trim() != "true" {
+                let logs = docker_logs(container_name).unwrap_or_default();
+                anyhow::bail!(
+                    "redpanda test container {container_name} exited before it became ready; logs:\n{}",
+                    logs
+                );
+            }
+
+            let logs = docker_logs(container_name).unwrap_or_default();
+            if logs.contains("Successfully started Redpanda!") {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for redpanda test container {container_name} to become ready; logs:\n{}",
+                    logs
+                );
+            }
+            std::thread::sleep(StdDuration::from_millis(250));
         }
     }
 
@@ -4896,7 +5378,11 @@ mod tests {
         )
     }
 
-    fn simple_stream_artifact(definition_id: &str, version: u32) -> CompiledStreamJobArtifact {
+    fn simple_stream_artifact_with_source(
+        definition_id: &str,
+        version: u32,
+        source_topic: &str,
+    ) -> CompiledStreamJobArtifact {
         let mut artifact = CompiledStreamJobArtifact {
             definition_id: definition_id.to_owned(),
             definition_version: version,
@@ -4914,8 +5400,8 @@ mod tests {
                 runtime: fabrik_throughput::STREAM_RUNTIME_KEYED_ROLLUP.to_owned(),
                 source: fabrik_throughput::CompiledStreamSource {
                     kind: fabrik_throughput::STREAM_SOURCE_TOPIC.to_owned(),
-                    name: Some("payments".to_owned()),
-                    binding: Some("payments".to_owned()),
+                    name: Some(source_topic.to_owned()),
+                    binding: Some(source_topic.to_owned()),
                     config: Some(json!({"partitions": 1})),
                 },
                 key_by: Some("accountId".to_owned()),
@@ -4984,6 +5470,10 @@ mod tests {
         artifact
     }
 
+    fn simple_stream_artifact(definition_id: &str, version: u32) -> CompiledStreamJobArtifact {
+        simple_stream_artifact_with_source(definition_id, version, "payments")
+    }
+
     async fn wait_for_adapter_counts(
         store: &WorkflowStore,
         tenant_id: &str,
@@ -5034,7 +5524,7 @@ mod tests {
     #[tokio::test]
     async fn deploy_standalone_stream_rolls_revision_and_drains_previous_active_revision()
     -> Result<()> {
-        let Some(postgres) = TestPostgres::start()? else {
+        let Some(postgres) = TestPostgres::start_fresh()? else {
             return Ok(());
         };
         let Some(redpanda) = TestRedpanda::start()? else {
@@ -5042,20 +5532,23 @@ mod tests {
         };
         let store = postgres.connect_store().await?;
         let state = test_state(store.clone(), &redpanda).await?;
+        let tenant_id = format!("tenant-a-{}", Uuid::now_v7());
+        let deployment_id = format!("fraud-deploy-{}", Uuid::now_v7());
+        let job_id = format!("fraud-job-{}", Uuid::now_v7());
 
-        store.put_stream_artifact("tenant-a", &simple_stream_artifact("fraud-stream", 1)).await?;
-        store.put_stream_artifact("tenant-a", &simple_stream_artifact("fraud-stream", 2)).await?;
+        store.put_stream_artifact(&tenant_id, &simple_stream_artifact("fraud-stream", 1)).await?;
+        store.put_stream_artifact(&tenant_id, &simple_stream_artifact("fraud-stream", 2)).await?;
 
         let (_, first_response) = deploy_standalone_stream(
-            Path("tenant-a".to_owned()),
+            Path(tenant_id.clone()),
             State(state.clone()),
             Json(DeployStandaloneStreamRequest {
                 definition_id: "fraud-stream".to_owned(),
                 version: Some(1),
                 input: json!({"source": "payments"}),
                 config: Some(json!({"threshold": 0.9})),
-                deployment_id: Some("fraud-deploy".to_owned()),
-                job_id: Some("fraud-job".to_owned()),
+                deployment_id: Some(deployment_id.clone()),
+                job_id: Some(job_id.clone()),
                 drain_reason: "deploy rollout".to_owned(),
             }),
         )
@@ -5065,15 +5558,15 @@ mod tests {
         assert_eq!(first_response.0.replaced_revision_id, None);
 
         let (_, second_response) = deploy_standalone_stream(
-            Path("tenant-a".to_owned()),
+            Path(tenant_id.clone()),
             State(state.clone()),
             Json(DeployStandaloneStreamRequest {
                 definition_id: "fraud-stream".to_owned(),
                 version: Some(2),
                 input: json!({"source": "payments"}),
                 config: Some(json!({"threshold": 0.95})),
-                deployment_id: Some("fraud-deploy".to_owned()),
-                job_id: Some("fraud-job".to_owned()),
+                deployment_id: Some(deployment_id.clone()),
+                job_id: Some(job_id.clone()),
                 drain_reason: "deploy rollout".to_owned(),
             }),
         )
@@ -5087,18 +5580,18 @@ mod tests {
         assert_eq!(second_response.0.rollout_phase, "pending_checkpoint");
 
         let deployment = store
-            .get_stream_deployment("tenant-a", "fraud-deploy")
+            .get_stream_deployment(&tenant_id, &deployment_id)
             .await?
             .context("deployment should exist after rollout")?;
         assert_eq!(deployment.rollout_generation, 2);
         assert_eq!(deployment.active_stream_run_id.as_deref(), Some("rev-2"));
         assert_eq!(deployment.previous_stream_run_id.as_deref(), Some("rev-1"));
-        assert_eq!(deployment.active_job_id.as_deref(), Some("fraud-job"));
+        assert_eq!(deployment.active_job_id.as_deref(), Some(job_id.as_str()));
         assert_eq!(deployment.desired_state, "rolling_forward");
         assert_eq!(deployment.rollout_phase, "pending_checkpoint");
 
         let rev1 = store
-            .get_stream_job_bridge_handle("tenant-a", "fraud-deploy", "rev-1", "fraud-job")
+            .get_stream_job_bridge_handle(&tenant_id, &deployment_id, "rev-1", &job_id)
             .await?
             .context("rev-1 handle should exist")?;
         assert_eq!(
@@ -5108,18 +5601,337 @@ mod tests {
         assert!(rev1.cancellation_requested_at.is_none());
 
         let rev1_job = store
-            .get_stream_job("tenant-a", "fraud-deploy", "rev-1", "fraud-job")
+            .get_stream_job(&tenant_id, &deployment_id, "rev-1", &job_id)
             .await?
             .context("rev-1 job should exist")?;
         assert_eq!(rev1_job.parsed_status(), Some(fabrik_throughput::StreamJobStatus::Created));
 
         let rev2 = store
-            .get_stream_job_bridge_handle("tenant-a", "fraud-deploy", "rev-2", "fraud-job")
+            .get_stream_job_bridge_handle(&tenant_id, &deployment_id, "rev-2", &job_id)
             .await?
             .context("rev-2 handle should exist")?;
         assert_eq!(rev2.stream_run_id, "rev-2");
         assert_ne!(rev1.handle_id, rev2.handle_id);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn standalone_stream_job_control_plane_supports_pause_resume_and_cancel() -> Result<()> {
+        let Some(postgres) = TestPostgres::start_fresh()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state = test_state(store.clone(), &redpanda).await?;
+        let tenant_id = format!("tenant-a-{}", Uuid::now_v7());
+        let instance_id = format!("fraud-standalone-{}", Uuid::now_v7());
+        let run_id = format!("run-{}", Uuid::now_v7());
+        let job_id = format!("fraud-job-{}", Uuid::now_v7());
+
+        store.put_stream_artifact(&tenant_id, &simple_stream_artifact("fraud-stream", 1)).await?;
+
+        let (_, created) = submit_standalone_stream_job(
+            Path(tenant_id.clone()),
+            State(state.clone()),
+            Json(SubmitStandaloneStreamJobRequest {
+                definition_id: "fraud-stream".to_owned(),
+                version: Some(1),
+                input: json!({"kind": "topic", "topic": "payments"}),
+                config: Some(json!({"threshold": 0.9})),
+                instance_id: Some(instance_id.clone()),
+                run_id: Some(run_id.clone()),
+                job_id: Some(job_id.clone()),
+            }),
+        )
+        .await
+        .map_err(|(status, message)| anyhow::anyhow!("{status}: {message}"))?;
+        assert_eq!(created.0.origin_kind, "standalone");
+        assert_eq!(created.0.status, "admitted");
+
+        let paused = pause_standalone_stream_job(
+            Path((tenant_id.clone(), instance_id.clone(), run_id.clone(), job_id.clone())),
+            State(state.clone()),
+            Json(PauseStandaloneStreamJobRequest { reason: "operator pause".to_owned() }),
+        )
+        .await
+        .map_err(|(status, message)| anyhow::anyhow!("{status}: {message}"))?;
+        assert_eq!(paused.0.status, "paused");
+
+        let paused_handle = store
+            .get_stream_job_bridge_handle(&tenant_id, &instance_id, &run_id, &job_id)
+            .await?
+            .context("paused standalone handle should exist")?;
+        assert_eq!(
+            paused_handle.parsed_status(),
+            Some(fabrik_throughput::StreamJobBridgeHandleStatus::Paused)
+        );
+        let paused_job = store
+            .get_stream_job(&tenant_id, &instance_id, &run_id, &job_id)
+            .await?
+            .context("paused standalone job should exist")?;
+        assert_eq!(paused_job.parsed_status(), Some(fabrik_throughput::StreamJobStatus::Paused));
+
+        let resumed = resume_standalone_stream_job(
+            Path((tenant_id.clone(), instance_id.clone(), run_id.clone(), job_id.clone())),
+            State(state.clone()),
+        )
+        .await
+        .map_err(|(status, message)| anyhow::anyhow!("{status}: {message}"))?;
+        assert_eq!(resumed.0.status, "admitted");
+
+        let resumed_handle = store
+            .get_stream_job_bridge_handle(&tenant_id, &instance_id, &run_id, &job_id)
+            .await?
+            .context("resumed standalone handle should exist")?;
+        assert_eq!(
+            resumed_handle.parsed_status(),
+            Some(fabrik_throughput::StreamJobBridgeHandleStatus::Admitted)
+        );
+
+        let cancelled = cancel_standalone_stream_job(
+            Path((tenant_id.clone(), instance_id.clone(), run_id.clone(), job_id.clone())),
+            State(state.clone()),
+            Json(CancelStandaloneStreamJobRequest { reason: "operator cancel".to_owned() }),
+        )
+        .await
+        .map_err(|(status, message)| anyhow::anyhow!("{status}: {message}"))?;
+        assert_eq!(cancelled.0.status, "cancellation_requested");
+
+        let cancelled_handle = store
+            .get_stream_job_bridge_handle(&tenant_id, &instance_id, &run_id, &job_id)
+            .await?
+            .context("cancelled standalone handle should exist")?;
+        assert_eq!(
+            cancelled_handle.parsed_status(),
+            Some(fabrik_throughput::StreamJobBridgeHandleStatus::CancellationRequested)
+        );
+        let cancelled_job = store
+            .get_stream_job(&tenant_id, &instance_id, &run_id, &job_id)
+            .await?
+            .context("cancelled standalone job should exist")?;
+        assert_eq!(
+            cancelled_job.parsed_status(),
+            Some(fabrik_throughput::StreamJobStatus::Draining)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn standalone_topic_stream_job_submit_executes_and_is_visible_via_query_service()
+    -> Result<()> {
+        let Some(postgres) = TestPostgres::start_fresh()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let tenant_id = format!("tenant-standalone-e2e-{}", Uuid::now_v7());
+        let instance_id = format!("fraud-standalone-{}", Uuid::now_v7());
+        let run_id = format!("run-{}", Uuid::now_v7());
+        let job_id = format!("fraud-job-{}", Uuid::now_v7());
+        let state_dir =
+            std::env::temp_dir().join(format!("fabrik-standalone-stream-e2e-{}", Uuid::now_v7()));
+        fs::create_dir_all(&state_dir)?;
+        eprintln!("standalone-e2e: state dir {}", state_dir.display());
+
+        let throughput_commands_topic = format!("throughput-commands-e2e-{}", Uuid::now_v7());
+        let streams_commands_topic = format!("streams-commands-e2e-{}", Uuid::now_v7());
+        let source_topic = format!("payments-e2e-{}", Uuid::now_v7());
+        let throughput_commands_config =
+            JsonTopicConfig::new(redpanda.broker.brokers.clone(), throughput_commands_topic, 1);
+        let streams_commands_config = JsonTopicConfig::new(
+            redpanda.broker.brokers.clone(),
+            streams_commands_topic.clone(),
+            1,
+        );
+
+        eprintln!("standalone-e2e: connecting publishers");
+        let workflow_publisher = redpanda.connect_workflow_publisher().await?;
+        let throughput_command_publisher = redpanda
+            .connect_json_publisher_with_config(
+                &throughput_commands_config,
+                "ingest-service-standalone-e2e-throughput",
+            )
+            .await?;
+        let streams_command_publisher = redpanda
+            .connect_json_publisher_with_config(
+                &streams_commands_config,
+                "ingest-service-standalone-e2e-streams",
+            )
+            .await?;
+        let source_publisher = redpanda.connect_json_publisher(&source_topic, 1).await?;
+        let (tiny_start_sender, tiny_start_receiver) =
+            tokio::sync::mpsc::channel(TINY_WORKFLOW_SINGLE_START_QUEUE_CAPACITY);
+        drop(tiny_start_receiver);
+
+        let state = AppState {
+            broker: redpanda.broker.clone(),
+            publisher: workflow_publisher,
+            throughput_command_publisher,
+            streams_command_publisher,
+            store: store.clone(),
+            runtime_id: format!("ingest-e2e-{}", Uuid::now_v7()),
+            activity_capability_registry: ActivityCapabilityRegistry::default(),
+            durable_start_analysis_mode: DurableStartAnalysisMode::Off,
+            tiny_start_sender,
+        };
+
+        eprintln!("standalone-e2e: storing stream artifact");
+        let artifact = simple_stream_artifact_with_source("fraud-stream", 1, &source_topic);
+        store.put_stream_artifact(&tenant_id, &artifact).await?;
+
+        eprintln!("standalone-e2e: starting throughput-runtime");
+        let runtime = TestThroughputRuntimeProcess::start(
+            &postgres,
+            &redpanda,
+            &streams_commands_topic,
+            &state_dir,
+        )
+        .await?;
+        eprintln!("standalone-e2e: starting query-service");
+        let query_service =
+            TestQueryServiceProcess::start(&postgres, &redpanda, &state_dir).await?;
+
+        eprintln!("standalone-e2e: submitting standalone job");
+        let (_, created) = submit_standalone_stream_job(
+            Path(tenant_id.clone()),
+            State(state.clone()),
+            Json(SubmitStandaloneStreamJobRequest {
+                definition_id: "fraud-stream".to_owned(),
+                version: Some(1),
+                input: json!({
+                    "kind": "topic",
+                    "topic": source_topic,
+                    "startOffset": "earliest"
+                }),
+                config: Some(json!({
+                    "name": "keyed-rollup",
+                    "runtime": "keyed_rollup",
+                    "source": {
+                        "kind": "topic",
+                        "name": source_topic
+                    },
+                    "keyBy": "accountId",
+                    "operators": [
+                        {
+                            "kind": "reduce",
+                            "name": "sum-account-totals",
+                            "config": {
+                                "reducer": "sum",
+                                "valueField": "amount",
+                                "outputField": "totalAmount"
+                            }
+                        },
+                        {
+                            "kind": "emit_checkpoint",
+                            "name": "rollup-ready",
+                            "config": {
+                                "sequence": 1
+                            }
+                        }
+                    ],
+                    "views": [
+                        {
+                            "name": "accountTotals",
+                            "consistency": "strong",
+                            "queryMode": "by_key",
+                            "keyField": "accountId",
+                            "valueFields": ["accountId", "totalAmount", "asOfCheckpoint"]
+                        }
+                    ],
+                    "queries": [
+                        {
+                            "name": "accountTotals",
+                            "viewName": "accountTotals",
+                            "consistency": "strong"
+                        }
+                    ],
+                    "checkpointPolicy": {
+                        "kind": "named_checkpoints",
+                        "checkpoints": [
+                            {
+                                "name": "rollup-ready",
+                                "delivery": "workflow_awaitable",
+                                "sequence": 1
+                            }
+                        ]
+                    }
+                })),
+                instance_id: Some(instance_id.clone()),
+                run_id: Some(run_id.clone()),
+                job_id: Some(job_id.clone()),
+            }),
+        )
+        .await
+        .map_err(|(status, message)| anyhow::anyhow!("{status}: {message}"))?;
+        assert_eq!(created.0.origin_kind, "standalone");
+
+        eprintln!("standalone-e2e: publishing source records");
+        source_publisher.publish(&json!({"accountId": "acct_1", "amount": 2.0}), "acct_1").await?;
+        source_publisher.publish(&json!({"accountId": "acct_1", "amount": 3.0}), "acct_1").await?;
+
+        let client = reqwest::Client::new();
+        let list_url = format!(
+            "{}/tenants/{}/streams/jobs?origin_kind=standalone",
+            query_service.base_url(),
+            tenant_id
+        );
+        let detail_url = format!(
+            "{}/tenants/{}/streams/jobs/{}/{}/{}",
+            query_service.base_url(),
+            tenant_id,
+            instance_id,
+            run_id,
+            job_id
+        );
+        let deadline = Instant::now() + StdDuration::from_secs(45);
+        let mut list_ready = false;
+        let mut detail_ready = false;
+        eprintln!("standalone-e2e: polling query-service at {}", query_service.base_url());
+        loop {
+            if !list_ready
+                && let Ok(response) = client.get(&list_url).send().await
+                && response.status().is_success()
+            {
+                let body = response.json::<serde_json::Value>().await?;
+                list_ready = body["job_count"] == json!(1)
+                    && body["jobs"][0]["origin_kind"] == json!("standalone")
+                    && body["jobs"][0]["workflow_binding"].is_null()
+                    && matches!(body["jobs"][0]["status"].as_str(), Some("running" | "completed"));
+            }
+
+            if !detail_ready
+                && let Ok(response) = client.get(&detail_url).send().await
+                && response.status().is_success()
+            {
+                let body = response.json::<serde_json::Value>().await?;
+                detail_ready = body["job"]["origin_kind"] == json!("standalone")
+                    && body["job"]["workflow_binding"].is_null()
+                    && matches!(body["job"]["status"].as_str(), Some("running" | "completed"))
+                    && body["job"]["latest_checkpoint_name"] == json!("rollup-ready")
+                    && body["job"]["latest_checkpoint_sequence"] == json!(1);
+            }
+
+            if list_ready && detail_ready {
+                break;
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for standalone stream visibility; redpanda logs:\n{}\nquery logs:\n{}\nruntime logs:\n{}",
+                    docker_logs(&redpanda.container_name).unwrap_or_default(),
+                    query_service.logs(),
+                    runtime.logs(),
+                );
+            }
+            sleep(StdDuration::from_millis(250)).await;
+        }
+
+        fs::remove_dir_all(&state_dir).ok();
         Ok(())
     }
 

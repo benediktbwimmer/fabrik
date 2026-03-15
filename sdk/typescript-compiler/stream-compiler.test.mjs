@@ -196,6 +196,32 @@ test("stream compiler emits aggregate-v2 route artifacts", async () => {
   assert.equal(artifact.job.operators[1].kind, "filter");
 });
 
+test("stream compiler emits aggregate-v2 hopping window artifacts", async () => {
+  const fixture = path.join(
+    root,
+    "sdk/typescript-compiler/test-fixtures/aggregate-v2-hopping-window-stream-job.ts",
+  );
+  const { stdout } = await runCompiler([
+    "--entry",
+    fixture,
+    "--export",
+    "fraudHoppingWindowStreamJob",
+    "--definition-id",
+    "fraud-hopping-window",
+    "--version",
+    "1",
+  ]);
+  const artifact = JSON.parse(stdout);
+
+  assert.equal(artifact.runtime_contract, "streams_kernel_v2");
+  assert.equal(artifact.job.runtime, "aggregate_v2");
+  assert.equal(artifact.job.operators[0].kind, "window");
+  assert.equal(artifact.job.operators[0].config.mode, "hopping");
+  assert.equal(artifact.job.operators[0].config.size, "2m");
+  assert.equal(artifact.job.operators[0].config.hop, "1m");
+  assert.deepEqual(artifact.job.queries[0].arg_fields, ["accountId", "windowStart"]);
+});
+
 test("stream compiler emits threshold aggregate-v2 artifacts", async () => {
   const fixture = path.join(
     root,

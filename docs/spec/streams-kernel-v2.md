@@ -34,7 +34,7 @@ Kernel v2 supports a constrained but broader stateful stream shape:
 - one source
 - explicit `key_by`
 - optional stateless pre-aggregation transforms
-- optional tumbling window
+- optional tumbling or hopping window
 - one or more built-in reducers
 - one or more materialized views
 - one or more queries
@@ -140,13 +140,15 @@ Allowed operator:
 
 - `window`
 
-For kernel v2, only one window mode is supported:
+For kernel v2, window support is intentionally narrow:
 
 - tumbling window
+- hopping window
 
 Required config:
 
 - window size
+- hop size for hopping windows
 - time field or event-time policy
 - allowed lateness policy if event-time is enabled
 - retention/close metadata
@@ -155,6 +157,7 @@ Rules:
 
 - jobs may omit the window operator entirely for current-value keyed state
 - when present, the window operator defines the state key as `(logical_key, window_id)`
+- hopping windows must use a hop that evenly divides the window size
 - window close must be checkpoint- and replay-safe
 
 ### Aggregate Operators

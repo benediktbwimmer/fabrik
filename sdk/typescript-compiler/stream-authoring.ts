@@ -89,8 +89,9 @@ export interface StreamWindowOperatorDefinition {
   readonly outputs?: readonly string[];
   readonly stateIds?: readonly string[];
   readonly config: {
-    readonly mode: "tumbling";
+    readonly mode: "tumbling" | "hopping";
     readonly size: string;
+    readonly hop?: string;
     readonly timeField?: string;
     readonly allowedLateness?: string;
     readonly retentionSeconds?: number;

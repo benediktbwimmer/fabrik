@@ -22,6 +22,44 @@ The runtime and bridge layer now also support lifecycle control for long-lived t
 
 The current shipping bridge contract for throughput mode remains defined by [streams-bridge.md](/Users/bene/code/fabrik/docs/spec/streams-bridge.md) and [throughput-mode.md](/Users/bene/code/fabrik/docs/spec/throughput-mode.md).
 
+## Standalone Surface
+
+The same stream-job model is also exposed without a workflow wrapper.
+
+Direct standalone job admission:
+
+- `POST /tenants/{tenant_id}/streams/jobs`
+- stable identity:
+  `tenant_id + instance_id + run_id + job_id + handle_id`
+- `origin_kind = standalone`
+
+Deployment-backed admission:
+
+- `POST /tenants/{tenant_id}/streams/deployments`
+- stable identity:
+  `tenant_id + deployment_id + revision_id + job_id + handle_id`
+- rollout identity:
+  `deployment_id + rollout_generation + revision_id`
+
+Standalone lifecycle operations use the same runtime/store machinery as workflow-started jobs:
+
+- direct job:
+  `pause`, `resume`, `cancel`, `drain`
+- deployment:
+  `pause`, `resume`, `drain`, `rollback`
+
+Visibility is intentionally shared.
+
+Query-service should expose the same job detail, runtime, checkpoint, signal, and materialized-view surfaces for both:
+
+- workflow-originated jobs
+- standalone jobs
+
+The only intentional difference is binding metadata:
+
+- workflow-originated jobs expose workflow binding and bridge acceptance state
+- standalone jobs expose `origin_kind = standalone` and no workflow binding
+
 ## Purpose
 
 `Fabrik Streams` should eventually expose a first-class stream-job contract to workflows without collapsing stream semantics into throughput mode.

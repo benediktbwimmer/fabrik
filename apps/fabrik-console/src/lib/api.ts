@@ -353,6 +353,17 @@ export type StreamJobBridgeSurfaceSummary = {
   latest_query_accepted_at: string | null;
 };
 
+export type StreamJobDurabilitySurfaceSummary = {
+  shard_checkpoint_age_seconds: number | null;
+  total_checkpoint_bytes: number | null;
+  max_checkpoint_bytes: number | null;
+  total_restore_tail_lag_entries: number | null;
+  restored_from_checkpoint: boolean | null;
+  checkpointed_partition_count: number | null;
+  last_stream_checkpoint_at: string | null;
+  last_shard_checkpoint_at: string | null;
+};
+
 export type StreamJobSummary = {
   protocol_version: string;
   operation_kind: string;
@@ -374,6 +385,7 @@ export type StreamJobSummary = {
   view_definitions: unknown | null;
   stream_surface: StreamJobSurfaceSummary;
   bridge_surface: StreamJobBridgeSurfaceSummary;
+  durability_surface: StreamJobDurabilitySurfaceSummary;
   status: string;
   workflow_owner_epoch: number | null;
   stream_owner_epoch: number | null;
@@ -545,6 +557,14 @@ export type StreamJobResponse = {
   views: StreamJobViewSummary[];
   checkpoints: StreamJobBridgeCheckpointView[];
   queries: StreamJobBridgeQueryView[];
+};
+
+export type StreamJobRuntimeResponse = {
+  tenant_id: string;
+  instance_id: string;
+  run_id: string;
+  job_id: string;
+  runtime: Record<string, unknown>;
 };
 
 export type StreamJobViewResponse = {
@@ -1300,6 +1320,10 @@ export const api = {
     request<StreamJobResponse>(
       `/tenants/${tenantId}/stream-jobs/${encodeURIComponent(instanceId)}/${encodeURIComponent(runId)}/${encodeURIComponent(jobId)}`
     ),
+  getStreamJobRuntime: (tenantId: string, instanceId: string, runId: string, jobId: string) =>
+    request<StreamJobRuntimeResponse>(
+      `/tenants/${tenantId}/stream-jobs/${encodeURIComponent(instanceId)}/${encodeURIComponent(runId)}/${encodeURIComponent(jobId)}/runtime?consistency=strong`
+    ),
   getStreamJobBridgeHandles: (tenantId: string, instanceId: string, runId: string, params = new URLSearchParams()) =>
     request<StreamJobBridgeHandlesResponse>(
       `/tenants/${tenantId}/stream-jobs/${encodeURIComponent(instanceId)}/${encodeURIComponent(runId)}/bridge/handles${
@@ -1355,6 +1379,16 @@ export const api = {
   ) =>
     request<StreamJobViewEntriesResponse>(
       `/tenants/${tenantId}/stream-jobs/${encodeURIComponent(instanceId)}/${encodeURIComponent(runId)}/${encodeURIComponent(jobId)}/views/${encodeURIComponent(viewName)}/entries?consistency=${encodeURIComponent(consistency)}${prefix ? `&prefix=${encodeURIComponent(prefix)}` : ""}&limit=${limit}&offset=${offset}`
+    ),
+  getStreamJobViewRuntime: (
+    tenantId: string,
+    instanceId: string,
+    runId: string,
+    jobId: string,
+    viewName: string
+  ) =>
+    request<StreamJobRuntimeResponse>(
+      `/tenants/${tenantId}/stream-jobs/${encodeURIComponent(instanceId)}/${encodeURIComponent(runId)}/${encodeURIComponent(jobId)}/views/${encodeURIComponent(viewName)}/runtime?consistency=strong`
     ),
   getWorkflowSignals: (tenantId: string, instanceId: string, runId?: string) =>
     request<WorkflowSignalsResponse>(

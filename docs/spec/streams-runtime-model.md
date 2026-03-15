@@ -401,6 +401,12 @@ For long-lived topic-backed jobs, the runtime should also support explicit lifec
 
 Those control operations must be idempotent at the bridge boundary and must not mutate authoritative stream state through any path other than the active owner.
 
+The same owner-side lifecycle machinery should serve both:
+
+- workflow-started stream jobs
+- standalone direct jobs
+- deployment-backed standalone revisions
+
 ## Execution Kernel Model
 
 ### Authoring and Execution Split

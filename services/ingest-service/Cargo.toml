@@ -16,6 +16,7 @@ fabrik-store = { path = "../../crates/fabrik-store" }
 fabrik-throughput = { package = "fabrik-streams", path = "../../crates/fabrik-throughput" }
 fabrik-workflow = { path = "../../crates/fabrik-workflow" }
 futures-util.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

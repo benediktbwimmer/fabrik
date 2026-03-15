@@ -42,6 +42,170 @@ function formatLag(value: number | null | undefined) {
   return `${(value / 60_000).toFixed(1)} m`;
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value != null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function asString(value: unknown) {
+  return typeof value === "string" ? value : null;
+}
+
+function asNumber(value: unknown) {
+  return typeof value === "number" ? value : null;
+}
+
+function asBoolean(value: unknown) {
+  return typeof value === "boolean" ? value : null;
+}
+
+function formatSeconds(value: unknown) {
+  const seconds = asNumber(value);
+  if (seconds == null) return "-";
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3_600) return `${(seconds / 60).toFixed(1)}m`;
+  return `${(seconds / 3_600).toFixed(1)}h`;
+}
+
+function formatBytes(value: unknown) {
+  const bytes = asNumber(value);
+  if (bytes == null) return "-";
+  if (bytes < 1_024) return `${bytes} B`;
+  if (bytes < 1_024 * 1_024) return `${(bytes / 1_024).toFixed(1)} KB`;
+  return `${(bytes / (1_024 * 1_024)).toFixed(1)} MB`;
+}
+
+function ownerPartitionRuntime(runtime: unknown) {
+  const ownerPartitionStats = asRecord(asRecord(runtime)?.ownerPartitionStats);
+  return {
+    summary: asRecord(ownerPartitionStats?.summary),
+    partitions: asArray(ownerPartitionStats?.partitions)
+      .map(asRecord)
+      .filter((value): value is Record<string, unknown> => value != null),
+  };
+}
+
+function runtimeFreshness(runtime: unknown) {
+  return asRecord(asRecord(runtime)?.freshness);
+}
+
+function preKeyRuntime(runtime: unknown) {
+  const preKeyStats = asRecord(asRecord(runtime)?.preKeyStats);
+  return {
+    totals: asRecord(preKeyStats?.totals),
+    operators: asArray(preKeyStats?.operators)
+      .map(asRecord)
+      .filter((value): value is Record<string, unknown> => value != null),
+  };
+}
+
+function hotKeyRuntime(runtime: unknown) {
+  const hotKeyStats = asRecord(asRecord(runtime)?.hotKeyStats);
+  return {
+    totals: asRecord(hotKeyStats?.totals),
+    topKeys: asArray(hotKeyStats?.topKeys)
+      .map(asRecord)
+      .filter((value): value is Record<string, unknown> => value != null),
+  };
+}
+
+function sourcePartitionRuntime(runtime: unknown) {
+  const sourcePartitionStats = asRecord(asRecord(runtime)?.sourcePartitionStats);
+  return {
+    summary: asRecord(sourcePartitionStats?.summary),
+    partitions: asArray(sourcePartitionStats?.partitions)
+      .map(asRecord)
+      .filter((value): value is Record<string, unknown> => value != null),
+  };
+}
+
+function durabilitySummary(runtime: unknown) {
+  const summary = ownerPartitionRuntime(runtime).summary;
+  return {
+    shardCheckpointAgeSeconds: asNumber(summary?.shardCheckpointAgeSeconds),
+    totalCheckpointBytes: asNumber(summary?.totalCheckpointBytes),
+    maxCheckpointBytes: asNumber(summary?.maxCheckpointBytes),
+    totalRestoreTailLagEntries: asNumber(summary?.totalRestoreTailLagEntries),
+    restoredFromCheckpoint: asBoolean(summary?.restoredFromCheckpoint),
+    checkpointedPartitionCount: asNumber(summary?.checkpointedPartitionCount),
+    lastStreamCheckpointAt: asString(summary?.lastStreamCheckpointAt),
+    lastShardCheckpointAt: asString(summary?.lastShardCheckpointAt),
+  };
+}
+
+function durabilitySeverity(summary: ReturnType<typeof durabilitySummary>) {
+  const restoreTailLag = summary.totalRestoreTailLagEntries ?? 0;
+  const checkpointAge = summary.shardCheckpointAgeSeconds ?? 0;
+  if (restoreTailLag > 0) return 3;
+  if (checkpointAge >= 300) return 2;
+  if (checkpointAge >= 60) return 1;
+  return 0;
+}
+
+function matchesDurabilityFilter(
+  summary: ReturnType<typeof durabilitySummary>,
+  filter: string | null,
+) {
+  switch (filter) {
+    case "restore_tail":
+      return (summary.totalRestoreTailLagEntries ?? 0) > 0;
+    case "stale_checkpoint":
+      return (summary.shardCheckpointAgeSeconds ?? 0) >= 60;
+    case "restored":
+      return summary.restoredFromCheckpoint === true;
+    default:
+      return true;
+  }
+}
+
+function compareDurability(
+  left: { updated_at: string; durability: ReturnType<typeof durabilitySummary> },
+  right: { updated_at: string; durability: ReturnType<typeof durabilitySummary> },
+  sort: string | null,
+) {
+  if (sort === "checkpoint_age_desc") {
+    return (
+      (right.durability.shardCheckpointAgeSeconds ?? -1) -
+        (left.durability.shardCheckpointAgeSeconds ?? -1) ||
+      right.updated_at.localeCompare(left.updated_at)
+    );
+  }
+  if (sort === "checkpoint_bytes_desc") {
+    return (
+      (right.durability.maxCheckpointBytes ?? -1) -
+        (left.durability.maxCheckpointBytes ?? -1) ||
+      right.updated_at.localeCompare(left.updated_at)
+    );
+  }
+  if (sort === "restore_tail_desc") {
+    return (
+      (right.durability.totalRestoreTailLagEntries ?? -1) -
+        (left.durability.totalRestoreTailLagEntries ?? -1) ||
+      (right.durability.shardCheckpointAgeSeconds ?? -1) -
+        (left.durability.shardCheckpointAgeSeconds ?? -1) ||
+      right.updated_at.localeCompare(left.updated_at)
+    );
+  }
+  if (sort === "durability_worst") {
+    return (
+      durabilitySeverity(right.durability) - durabilitySeverity(left.durability) ||
+      (right.durability.totalRestoreTailLagEntries ?? -1) -
+        (left.durability.totalRestoreTailLagEntries ?? -1) ||
+      (right.durability.shardCheckpointAgeSeconds ?? -1) -
+        (left.durability.shardCheckpointAgeSeconds ?? -1) ||
+      (right.durability.maxCheckpointBytes ?? -1) -
+        (left.durability.maxCheckpointBytes ?? -1) ||
+      right.updated_at.localeCompare(left.updated_at)
+    );
+  }
+  return 0;
+}
+
 function updateParams(
   searchParams: URLSearchParams,
   setSearchParams: ReturnType<typeof useSearchParams>[1],
@@ -122,6 +286,8 @@ export function StreamJobsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const viewConsistency = searchParams.get("consistency") === "eventual" ? "eventual" : "strong";
   const viewPrefix = searchParams.get("prefix")?.trim() || null;
+  const durabilityFilter = searchParams.get("durability_filter");
+  const durabilitySort = searchParams.get("durability_sort");
   const jobListParams = useMemo(() => buildJobListParams(searchParams), [searchParams]);
 
   const jobsQuery = useQuery({
@@ -131,7 +297,25 @@ export function StreamJobsPage() {
     queryFn: () => api.listTenantStreamJobs(tenantId, jobListParams),
   });
 
-  const selectedJob = findSelectedJob(searchParams.get("job_id"), jobsQuery.data?.jobs ?? []);
+  const visibleJobs = jobsQuery.data?.jobs ?? [];
+  const runtimeSummaries = visibleJobs.map((job) => durabilitySummary(job.durability_surface));
+  const displayedJobRows = useMemo(() => {
+    const rows = visibleJobs.map((job, index) => ({
+      job,
+      durability: runtimeSummaries[index] ?? durabilitySummary(null),
+    }));
+    return rows
+      .filter((row) => matchesDurabilityFilter(row.durability, durabilityFilter))
+      .sort((left, right) =>
+        compareDurability(
+          { updated_at: left.job.updated_at, durability: left.durability },
+          { updated_at: right.job.updated_at, durability: right.durability },
+          durabilitySort,
+        ),
+      );
+  }, [durabilityFilter, durabilitySort, runtimeSummaries, visibleJobs]);
+  const displayedJobs = displayedJobRows.map((row) => row.job);
+  const selectedJob = findSelectedJob(searchParams.get("job_id"), displayedJobs);
   const selectedJobIdentity = selectedIdentity(selectedJob);
 
   const jobDetailQuery = useQuery({
@@ -159,6 +343,25 @@ export function StreamJobsPage() {
   const selectedJobDetailIdentity = selectedIdentity(selectedJobDetail);
   const selectedViews = jobDetailQuery.data?.views ?? selectedJobDetail?.views ?? [];
   const selectedView = findSelectedView(searchParams.get("view"), selectedViews);
+
+  const jobRuntimeQuery = useQuery({
+    queryKey: [
+      "stream-job-runtime",
+      tenantId,
+      selectedJobDetailIdentity?.instanceId,
+      selectedJobDetailIdentity?.runId,
+      selectedJobDetail?.job_id,
+    ],
+    enabled: tenantId !== "" && selectedJobDetail != null && selectedJobDetailIdentity != null,
+    refetchInterval: 5_000,
+    queryFn: () =>
+      api.getStreamJobRuntime(
+        tenantId,
+        selectedJobDetailIdentity!.instanceId,
+        selectedJobDetailIdentity!.runId,
+        selectedJobDetail!.job_id,
+      ),
+  });
 
   const viewEntriesQuery = useQuery({
     queryKey: [
@@ -188,6 +391,31 @@ export function StreamJobsPage() {
         viewPrefix,
         VIEW_ENTRY_PAGE_SIZE,
         0,
+      ),
+  });
+
+  const viewRuntimeQuery = useQuery({
+    queryKey: [
+      "stream-job-view-runtime",
+      tenantId,
+      selectedJobDetailIdentity?.instanceId,
+      selectedJobDetailIdentity?.runId,
+      selectedJobDetail?.job_id,
+      selectedView?.view_name,
+    ],
+    enabled:
+      tenantId !== "" &&
+      selectedJobDetail != null &&
+      selectedJobDetailIdentity != null &&
+      selectedView != null,
+    refetchInterval: 5_000,
+    queryFn: () =>
+      api.getStreamJobViewRuntime(
+        tenantId,
+        selectedJobDetailIdentity!.instanceId,
+        selectedJobDetailIdentity!.runId,
+        selectedJobDetail!.job_id,
+        selectedView!.view_name,
       ),
   });
 
@@ -253,8 +481,28 @@ export function StreamJobsPage() {
   const laggingStateCount = (jobsQuery.data?.jobs ?? []).filter(hasLaggingState).length;
   const runningCount = (jobsQuery.data?.jobs ?? []).filter((job) => ["starting", "running", "draining"].includes(job.status)).length;
   const terminalCount = (jobsQuery.data?.jobs ?? []).filter((job) => ["completed", "failed", "cancelled"].includes(job.status)).length;
+  const jobsWithRestoreTailLag = runtimeSummaries.filter((summary) => (summary.totalRestoreTailLagEntries ?? 0) > 0).length;
+  const jobsWithStaleShardCheckpoints = runtimeSummaries.filter(
+    (summary) => (summary.shardCheckpointAgeSeconds ?? 0) >= 60,
+  ).length;
+  const largestCheckpointBytes = runtimeSummaries.reduce<number | null>((largest, summary) => {
+    const candidate = summary.maxCheckpointBytes;
+    if (candidate == null) return largest;
+    if (largest == null) return candidate;
+    return Math.max(largest, candidate);
+  }, null);
   const pageConsistency = viewValueQuery.data?.consistency ?? (selectedJobDetail ? "mixed" : "eventual");
   const pageSource = viewValueQuery.data?.source ?? "tenant-index";
+  const jobRuntime = jobRuntimeQuery.data?.runtime ?? null;
+  const jobRuntimeSummary = ownerPartitionRuntime(jobRuntime).summary;
+  const jobRuntimePartitions = ownerPartitionRuntime(jobRuntime).partitions;
+  const jobPreKeyRuntime = preKeyRuntime(jobRuntime);
+  const jobHotKeyRuntime = hotKeyRuntime(jobRuntime);
+  const jobSourcePartitionRuntime = sourcePartitionRuntime(jobRuntime);
+  const viewRuntime = viewRuntimeQuery.data?.runtime ?? null;
+  const viewRuntimeSummary = ownerPartitionRuntime(viewRuntime).summary;
+  const viewRuntimePartitions = ownerPartitionRuntime(viewRuntime).partitions;
+  const viewFreshness = runtimeFreshness(viewRuntime);
 
   return (
     <div className="page">
@@ -384,15 +632,53 @@ export function StreamJobsPage() {
               })
             }
           />
+          <select
+            className="select"
+            value={durabilityFilter ?? ""}
+            onChange={(event) =>
+              updateParams(searchParams, setSearchParams, {
+                durability_filter: event.target.value || null,
+                job_id: null,
+                view: null,
+                key: null,
+              })
+            }
+          >
+            <option value="">All durability states</option>
+            <option value="restore_tail">restore tail lag</option>
+            <option value="stale_checkpoint">stale checkpoint</option>
+            <option value="restored">restored from checkpoint</option>
+          </select>
+          <select
+            className="select"
+            value={durabilitySort ?? ""}
+            onChange={(event) =>
+              updateParams(searchParams, setSearchParams, {
+                durability_sort: event.target.value || null,
+                job_id: null,
+                view: null,
+                key: null,
+              })
+            }
+          >
+            <option value="">Server sort</option>
+            <option value="durability_worst">durability worst first</option>
+            <option value="restore_tail_desc">restore tail desc</option>
+            <option value="checkpoint_age_desc">checkpoint age desc</option>
+            <option value="checkpoint_bytes_desc">checkpoint bytes desc</option>
+          </select>
         </div>
       </Panel>
 
       <div className="grid metrics">
         <Panel>
           <div className="muted">Visible jobs</div>
-          <div className="metric-value">{formatNumber(jobsQuery.data?.job_count)}</div>
+          <div className="metric-value">{formatNumber(displayedJobs.length)}</div>
           <div className="muted">
             running {formatNumber(runningCount)} · terminal {formatNumber(terminalCount)}
+          </div>
+          <div className="muted">
+            tenant total {formatNumber(jobsQuery.data?.job_count)}
           </div>
         </Panel>
         <Panel>
@@ -425,6 +711,14 @@ export function StreamJobsPage() {
           <div className="metric-value">{formatNumber(laggingStateCount)}</div>
           <div className="muted">lagging views over 60s</div>
         </Panel>
+        <Panel>
+          <div className="muted">Durability health</div>
+          <div className="metric-value">{formatNumber(jobsWithRestoreTailLag)}</div>
+          <div className="muted">
+            restore-tail lag · stale checkpoints {formatNumber(jobsWithStaleShardCheckpoints)}
+          </div>
+          <div className="muted">largest snapshot {formatBytes(largestCheckpointBytes)}</div>
+        </Panel>
       </div>
 
       <div className="split">
@@ -445,69 +739,89 @@ export function StreamJobsPage() {
                 <th>Identity</th>
                 <th>Surface</th>
                 <th>Health</th>
+                <th>Durability</th>
                 <th>Updated</th>
               </tr>
             </thead>
             <tbody>
-              {(jobsQuery.data?.jobs ?? []).map((job) => (
-                <tr
-                  key={`${job.job_id}:${job.stream_instance_id}:${job.stream_run_id}`}
-                  className={selectedJobDetail?.job_id === job.job_id ? "row-selected" : ""}
-                  onClick={() =>
-                    updateParams(searchParams, setSearchParams, {
-                      job_id: job.job_id,
-                      view: null,
-                      key: null,
-                    })
-                  }
-                  style={{ cursor: "pointer" }}
-                >
-                  <td>
-                    <strong>{job.job_name}</strong>
-                    <div className="muted">{job.job_id}</div>
-                    <div className="muted">{job.definition_id}</div>
-                  </td>
-                  <td>
-                    <Badge value={job.origin_kind} />
-                    <div className="muted">{job.workflow_binding ? "workflow bridge" : "standalone stream"}</div>
-                  </td>
-                  <td>
-                    <Badge value={job.status} />
-                    <div className="muted">{labelFromSnakeCase(job.operation_kind)}</div>
-                  </td>
-                  <td>
-                    {identityLabel(job)}
-                    <div className="muted">stream {job.stream_instance_id} / {job.stream_run_id}</div>
-                  </td>
-                  <td>
-                    {formatNumber(job.stream_surface.reached_checkpoint_count)} /{" "}
-                    {formatNumber(job.stream_surface.declared_checkpoint_count)} checkpoints
-                    <div className="muted">
-                      {formatNumber(job.stream_surface.view_count)} views · {formatNumber(job.stream_surface.total_projected_keys)} keys
-                    </div>
-                  </td>
-                  <td>
-                    <div className="row">
-                      {job.bridge_surface.pending_repair_count > 0 ? <Badge value="repair-pending" /> : null}
-                      {job.bridge_surface.latest_query_status === "failed" ? <Badge value="query-failed" /> : null}
-                      {hasLaggingState(job) ? <Badge value="lagging" /> : null}
-                    </div>
-                    <div className="muted">
-                      repair {job.bridge_surface.next_repair ?? "-"} · query {job.bridge_surface.latest_query_status ?? "-"}
-                    </div>
-                    <div className="muted">lag {formatLag(job.stream_surface.slowest_eventual_view_lag_ms)}</div>
-                  </td>
-                  <td>
-                    {formatDate(job.updated_at)}
-                    <div className="muted">
-                      checkpoint {job.latest_checkpoint_name ?? "-"} · lag {formatLag(job.stream_surface.slowest_eventual_view_lag_ms)}
-                    </div>
-                  </td>
-                </tr>
-              ))}
+              {displayedJobRows.map(({ job, durability }) => {
+                const checkpointAgeSeconds = durability.shardCheckpointAgeSeconds;
+                const restoreTailLagEntries = durability.totalRestoreTailLagEntries;
+                return (
+                  <tr
+                    key={`${job.job_id}:${job.stream_instance_id}:${job.stream_run_id}`}
+                    className={selectedJobDetail?.job_id === job.job_id ? "row-selected" : ""}
+                    onClick={() =>
+                      updateParams(searchParams, setSearchParams, {
+                        job_id: job.job_id,
+                        view: null,
+                        key: null,
+                      })
+                    }
+                    style={{ cursor: "pointer" }}
+                  >
+                    <td>
+                      <strong>{job.job_name}</strong>
+                      <div className="muted">{job.job_id}</div>
+                      <div className="muted">{job.definition_id}</div>
+                    </td>
+                    <td>
+                      <Badge value={job.origin_kind} />
+                      <div className="muted">{job.workflow_binding ? "workflow bridge" : "standalone stream"}</div>
+                    </td>
+                    <td>
+                      <Badge value={job.status} />
+                      <div className="muted">{labelFromSnakeCase(job.operation_kind)}</div>
+                    </td>
+                    <td>
+                      {identityLabel(job)}
+                      <div className="muted">stream {job.stream_instance_id} / {job.stream_run_id}</div>
+                    </td>
+                    <td>
+                      {formatNumber(job.stream_surface.reached_checkpoint_count)} /{" "}
+                      {formatNumber(job.stream_surface.declared_checkpoint_count)} checkpoints
+                      <div className="muted">
+                        {formatNumber(job.stream_surface.view_count)} views · {formatNumber(job.stream_surface.total_projected_keys)} keys
+                      </div>
+                    </td>
+                    <td>
+                      <div className="row">
+                        {job.bridge_surface.pending_repair_count > 0 ? <Badge value="repair-pending" /> : null}
+                        {job.bridge_surface.latest_query_status === "failed" ? <Badge value="query-failed" /> : null}
+                        {hasLaggingState(job) ? <Badge value="lagging" /> : null}
+                      </div>
+                      <div className="muted">
+                        repair {job.bridge_surface.next_repair ?? "-"} · query {job.bridge_surface.latest_query_status ?? "-"}
+                      </div>
+                      <div className="muted">lag {formatLag(job.stream_surface.slowest_eventual_view_lag_ms)}</div>
+                    </td>
+                    <td>
+                      <div className="row">
+                        {(restoreTailLagEntries ?? 0) > 0 ? <Badge value="restore-tail" /> : null}
+                        {(checkpointAgeSeconds ?? 0) >= 60 ? <Badge value="stale-checkpoint" /> : null}
+                        {durability.restoredFromCheckpoint ? <Badge value="restored" /> : null}
+                      </div>
+                      <div className="muted">
+                        checkpoint age {formatSeconds(checkpointAgeSeconds)} · bytes {formatBytes(durability.maxCheckpointBytes)}
+                      </div>
+                      <div className="muted">
+                        tail {formatNumber(restoreTailLagEntries)} · partitions {formatNumber(durability.checkpointedPartitionCount)}
+                      </div>
+                    </td>
+                    <td>
+                      {formatDate(job.updated_at)}
+                      <div className="muted">
+                        checkpoint {job.latest_checkpoint_name ?? "-"} · lag {formatLag(job.stream_surface.slowest_eventual_view_lag_ms)}
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
-          {(jobsQuery.data?.jobs.length ?? 0) === 0 ? <div className="empty">No stream jobs matched the current tenant filters.</div> : null}
+          {displayedJobRows.length === 0 ? (
+            <div className="empty">No stream jobs matched the current tenant and durability filters.</div>
+          ) : null}
         </Panel>
 
         <Panel>
@@ -589,6 +903,269 @@ export function StreamJobsPage() {
                   </div>
                 </Panel>
               </div>
+
+              <Panel className="nested-panel">
+                <div className="row space-between">
+                  <div>
+                    <h3>Runtime durability</h3>
+                    <div className="muted">Checkpoint age, snapshot size, and restore-tail pressure from the strong owner read.</div>
+                  </div>
+                  {jobRuntime ? (
+                    <ConsistencyBadge
+                      consistency={asString(asRecord(jobRuntime)?.consistency) ?? "strong"}
+                      source={asString(asRecord(jobRuntime)?.consistencySource) ?? "stream_owner_local_state"}
+                    />
+                  ) : null}
+                </div>
+                {jobRuntime ? (
+                  <div className="stack">
+                    <div className="grid metrics">
+                      <Panel className="nested-panel">
+                        <div className="muted">Checkpointed partitions</div>
+                        <div className="metric-value">{formatNumber(asNumber(jobRuntimeSummary?.checkpointedPartitionCount))}</div>
+                        <div className="muted">last stream checkpoint {formatDate(asString(jobRuntimeSummary?.lastStreamCheckpointAt))}</div>
+                      </Panel>
+                      <Panel className="nested-panel">
+                        <div className="muted">Shard checkpoint age</div>
+                        <div className="metric-value">{formatSeconds(jobRuntimeSummary?.shardCheckpointAgeSeconds)}</div>
+                        <div className="muted">last shard checkpoint {formatDate(asString(jobRuntimeSummary?.lastShardCheckpointAt))}</div>
+                      </Panel>
+                      <Panel className="nested-panel">
+                        <div className="muted">Checkpoint bytes</div>
+                        <div className="metric-value">{formatBytes(jobRuntimeSummary?.totalCheckpointBytes)}</div>
+                        <div className="muted">largest shard snapshot {formatBytes(jobRuntimeSummary?.maxCheckpointBytes)}</div>
+                      </Panel>
+                      <Panel className="nested-panel">
+                        <div className="muted">Restore tail lag</div>
+                        <div className="metric-value">{formatNumber(asNumber(jobRuntimeSummary?.totalRestoreTailLagEntries))}</div>
+                        <div className="muted">
+                          {asBoolean(jobRuntimeSummary?.restoredFromCheckpoint) ? "restored from checkpoint" : "live owner state"}
+                        </div>
+                      </Panel>
+                    </div>
+                    <table className="table">
+                      <thead>
+                        <tr>
+                          <th>Owner partition</th>
+                          <th>State</th>
+                          <th>Checkpoint</th>
+                          <th>Restore tail</th>
+                          <th>Sources</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {jobRuntimePartitions.map((partition) => (
+                          <tr key={String(partition.streamPartitionId)}>
+                            <td>
+                              <strong>{formatInlineValue(partition.streamPartitionId)}</strong>
+                              <div className="muted">stream checkpoint {formatDate(asString(partition.lastStreamCheckpointAt))}</div>
+                            </td>
+                            <td>
+                              {formatNumber(asNumber(partition.stateKeyCount))} keys
+                              <div className="muted">
+                                {formatNumber(asNumber(partition.observedItemCount))} items · {formatNumber(asNumber(partition.observedBatchCount))} batches
+                              </div>
+                            </td>
+                            <td>
+                              {formatBytes(partition.checkpointBytes)}
+                              <div className="muted">age {formatSeconds(partition.shardCheckpointAgeSeconds)}</div>
+                            </td>
+                            <td>
+                              {formatNumber(asNumber(partition.restoreTailLagEntries))}
+                              <div className="muted">stream age {formatSeconds(partition.streamCheckpointAgeSeconds)}</div>
+                            </td>
+                            <td>{jsonPreview(partition.sourcePartitionIds)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                    {jobRuntimePartitions.length === 0 ? (
+                      <div className="empty">No owner-partition runtime diagnostics are available for this job yet.</div>
+                    ) : null}
+                  </div>
+                ) : (
+                  <div className="empty">Runtime durability diagnostics are unavailable for this job.</div>
+                )}
+              </Panel>
+
+              <Panel className="nested-panel">
+                <div className="row space-between">
+                  <div>
+                    <h3>Operator diagnostics</h3>
+                    <div className="muted">Pre-key operator results, hot keys, and source-partition lag from the strong owner read.</div>
+                  </div>
+                  {jobRuntime ? (
+                    <ConsistencyBadge
+                      consistency={asString(asRecord(jobRuntime)?.consistency) ?? "strong"}
+                      source={asString(asRecord(jobRuntime)?.consistencySource) ?? "stream_owner_local_state"}
+                    />
+                  ) : null}
+                </div>
+                {jobRuntime ? (
+                  <div className="stack">
+                    <div className="grid metrics">
+                      <Panel className="nested-panel">
+                        <div className="muted">Pre-key failures</div>
+                        <div className="metric-value">{formatNumber(asNumber(jobPreKeyRuntime.totals?.failureCount))}</div>
+                        <div className="muted">drops {formatNumber(asNumber(jobPreKeyRuntime.totals?.droppedCount))}</div>
+                      </Panel>
+                      <Panel className="nested-panel">
+                        <div className="muted">Pre-key processed</div>
+                        <div className="metric-value">{formatNumber(asNumber(jobPreKeyRuntime.totals?.processedCount))}</div>
+                        <div className="muted">
+                          operators {formatNumber(jobPreKeyRuntime.operators.length)}
+                        </div>
+                      </Panel>
+                      <Panel className="nested-panel">
+                        <div className="muted">Hot keys</div>
+                        <div className="metric-value">{formatNumber(asNumber(jobHotKeyRuntime.totals?.trackedKeyCount))}</div>
+                        <div className="muted">
+                          observations {formatNumber(asNumber(jobHotKeyRuntime.totals?.observedCount))}
+                        </div>
+                      </Panel>
+                      <Panel className="nested-panel">
+                        <div className="muted">Source lag</div>
+                        <div className="metric-value">{formatNumber(asNumber(jobSourcePartitionRuntime.summary?.totalOffsetLag))}</div>
+                        <div className="muted">
+                          checkpoint lag {formatNumber(asNumber(jobSourcePartitionRuntime.summary?.totalCheckpointLag))}
+                        </div>
+                      </Panel>
+                    </div>
+
+                    <div className="grid two">
+                      <Panel className="nested-panel">
+                        <h3>Pre-key operators</h3>
+                        <table className="table">
+                          <thead>
+                            <tr>
+                              <th>Operator</th>
+                              <th>Processed</th>
+                              <th>Drops</th>
+                              <th>Failures</th>
+                              <th>Details</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {jobPreKeyRuntime.operators.map((operator) => (
+                              <tr key={String(operator.operatorId)}>
+                                <td>
+                                  <strong>{formatInlineValue(operator.operatorId)}</strong>
+                                  <div className="muted">{labelFromSnakeCase(asString(operator.kind) ?? "-")}</div>
+                                </td>
+                                <td>{formatNumber(asNumber(operator.processedCount))}</td>
+                                <td>{formatNumber(asNumber(operator.droppedCount))}</td>
+                                <td>{formatNumber(asNumber(operator.failureCount))}</td>
+                                <td>
+                                  <div className="muted">
+                                    route {formatNumber(asNumber(operator.routeDefaultCount))}
+                                  </div>
+                                  <div className="muted">
+                                    branches {jsonPreview(operator.routeBranchCounts)}
+                                  </div>
+                                  <div className="muted">
+                                    drops {jsonPreview(operator.dropReasons)}
+                                  </div>
+                                  <div className="muted">
+                                    failures {jsonPreview(operator.failureReasons)}
+                                  </div>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        {jobPreKeyRuntime.operators.length === 0 ? (
+                          <div className="empty">No pre-key operator diagnostics are available for this job.</div>
+                        ) : null}
+                      </Panel>
+
+                      <Panel className="nested-panel">
+                        <h3>Hot keys</h3>
+                        <table className="table">
+                          <thead>
+                            <tr>
+                              <th>Key</th>
+                              <th>Observed</th>
+                              <th>Sources</th>
+                              <th>Last seen</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {jobHotKeyRuntime.topKeys.map((entry) => (
+                              <tr key={String(entry.logicalKey)}>
+                                <td>
+                                  <strong>{formatInlineValue(entry.displayKey ?? entry.logicalKey)}</strong>
+                                  <div className="muted">{formatInlineValue(entry.logicalKey)}</div>
+                                </td>
+                                <td>{formatNumber(asNumber(entry.observedCount))}</td>
+                                <td>{jsonPreview(entry.sourcePartitionIds)}</td>
+                                <td>{formatDate(asString(entry.lastSeenAt))}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        {jobHotKeyRuntime.topKeys.length === 0 ? (
+                          <div className="empty">No hot-key diagnostics are available for this job yet.</div>
+                        ) : null}
+                      </Panel>
+                    </div>
+
+                    <Panel className="nested-panel">
+                      <h3>Source partitions</h3>
+                      <table className="table">
+                        <thead>
+                          <tr>
+                            <th>Source partition</th>
+                            <th>Owner</th>
+                            <th>Lag</th>
+                            <th>Offsets</th>
+                            <th>Window state</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {jobSourcePartitionRuntime.partitions.map((partition) => (
+                            <tr key={String(partition.sourcePartitionId)}>
+                              <td>
+                                <strong>{formatInlineValue(partition.sourcePartitionId)}</strong>
+                                <div className="muted">lease {formatInlineValue(partition.leaseToken)}</div>
+                              </td>
+                              <td>{formatInlineValue(partition.ownerPartitionId)}</td>
+                              <td>
+                                offset {formatNumber(asNumber(partition.offsetLag))}
+                                <div className="muted">
+                                  checkpoint {formatNumber(asNumber(partition.checkpointLag))}
+                                </div>
+                              </td>
+                              <td>
+                                next {formatNumber(asNumber(partition.nextOffset))}
+                                <div className="muted">
+                                  applied {formatNumber(asNumber(partition.lastAppliedOffset))} / target{" "}
+                                  {formatNumber(asNumber(partition.checkpointTargetOffset))}
+                                </div>
+                              </td>
+                              <td>
+                                <div className="muted">
+                                  watermark {formatDate(asString(partition.lastEventTimeWatermark))}
+                                </div>
+                                <div className="muted">
+                                  closed {formatDate(asString(partition.lastClosedWindowEnd))}
+                                </div>
+                                <div className="muted">
+                                  pending {formatNumber(asArray(partition.pendingWindowEnds).length)}
+                                </div>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                      {jobSourcePartitionRuntime.partitions.length === 0 ? (
+                        <div className="empty">No source-partition diagnostics are available for this job yet.</div>
+                      ) : null}
+                    </Panel>
+                  </div>
+                ) : (
+                  <div className="empty">Operator diagnostics are unavailable for this job.</div>
+                )}
+              </Panel>
 
               <Panel className="nested-panel">
                 <h3>Checkpoints</h3>
@@ -800,6 +1377,83 @@ export function StreamJobsPage() {
               {(viewEntriesQuery.data?.entries.length ?? 0) === 0 ? (
                 <div className="empty">No entries were materialized for the selected view.</div>
               ) : null}
+            </Panel>
+
+            <Panel className="nested-panel">
+              <div className="row space-between">
+                <div>
+                  <h3>View runtime</h3>
+                  <div className="muted">Freshness and owner-partition durability for the selected materialized view.</div>
+                </div>
+                {viewRuntime ? (
+                  <ConsistencyBadge
+                    consistency={asString(asRecord(viewRuntime)?.consistency) ?? "strong"}
+                    source={asString(asRecord(viewRuntime)?.consistencySource) ?? "stream_owner_local_state"}
+                  />
+                ) : null}
+              </div>
+              {viewRuntime ? (
+                <div className="stack">
+                  <div className="grid metrics">
+                    <Panel className="nested-panel">
+                      <div className="muted">Checkpoint lag</div>
+                      <div className="metric-value">{formatNumber(asNumber(viewFreshness?.checkpointSequenceLag))}</div>
+                      <div className="muted">latest checkpoint {formatInlineValue(asRecord(viewRuntime)?.latestCheckpointSequence)}</div>
+                    </Panel>
+                    <Panel className="nested-panel">
+                      <div className="muted">Event time lag</div>
+                      <div className="metric-value">{formatSeconds(viewFreshness?.eventTimeLagSeconds)}</div>
+                      <div className="muted">latest materialized {formatDate(asString(viewFreshness?.latestMaterializedWindowEnd))}</div>
+                    </Panel>
+                    <Panel className="nested-panel">
+                      <div className="muted">Checkpoint bytes</div>
+                      <div className="metric-value">{formatBytes(viewRuntimeSummary?.totalCheckpointBytes)}</div>
+                      <div className="muted">largest owner snapshot {formatBytes(viewRuntimeSummary?.maxCheckpointBytes)}</div>
+                    </Panel>
+                    <Panel className="nested-panel">
+                      <div className="muted">Restore tail lag</div>
+                      <div className="metric-value">{formatNumber(asNumber(viewRuntimeSummary?.totalRestoreTailLagEntries))}</div>
+                      <div className="muted">
+                        {asBoolean(viewRuntimeSummary?.restoredFromCheckpoint) ? "restored owner" : "active owner"}
+                      </div>
+                    </Panel>
+                  </div>
+                  <table className="table">
+                    <thead>
+                      <tr>
+                        <th>Owner partition</th>
+                        <th>Checkpoint bytes</th>
+                        <th>Restore tail</th>
+                        <th>State keys</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {viewRuntimePartitions.map((partition) => (
+                        <tr key={String(partition.streamPartitionId)}>
+                          <td>
+                            <strong>{formatInlineValue(partition.streamPartitionId)}</strong>
+                            <div className="muted">checkpoint {formatDate(asString(partition.lastStreamCheckpointAt))}</div>
+                          </td>
+                          <td>
+                            {formatBytes(partition.checkpointBytes)}
+                            <div className="muted">age {formatSeconds(partition.shardCheckpointAgeSeconds)}</div>
+                          </td>
+                          <td>
+                            {formatNumber(asNumber(partition.restoreTailLagEntries))}
+                            <div className="muted">stream age {formatSeconds(partition.streamCheckpointAgeSeconds)}</div>
+                          </td>
+                          <td>{formatNumber(asNumber(partition.stateKeyCount))}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {viewRuntimePartitions.length === 0 ? (
+                    <div className="empty">No view runtime durability diagnostics are available yet.</div>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="empty">Select a view to inspect its runtime durability diagnostics.</div>
+              )}
             </Panel>
           </div>
         ) : (

@@ -226,6 +226,8 @@ pub struct CompiledAggregateV2Window {
     pub mode: String,
     pub size: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hop: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_field: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_lateness: Option<String>,
@@ -903,19 +905,28 @@ impl CompiledStreamJob {
                     )?;
                     let mode =
                         json_string_field(config, "mode", "runtime aggregate_v2 window.config")?;
-                    if mode != "tumbling" {
+                    if mode != "tumbling" && mode != "hopping" {
                         anyhow::bail!(
-                            "stream runtime aggregate_v2 only supports window.config.mode=tumbling"
+                            "stream runtime aggregate_v2 only supports window.config.mode=tumbling or hopping"
                         );
                     }
                     let size =
                         json_string_field(config, "size", "runtime aggregate_v2 window.config")?
                             .to_owned();
+                    let hop = if mode == "hopping" {
+                        Some(
+                            json_string_field(config, "hop", "runtime aggregate_v2 window.config")?
+                                .to_owned(),
+                        )
+                    } else {
+                        None
+                    };
                     window = Some(CompiledAggregateV2Window {
                         operator_id,
                         state_id,
                         mode: mode.to_owned(),
                         size,
+                        hop,
                         time_field: json_optional_string_field(
                             config,
                             "timeField",
@@ -4229,6 +4240,7 @@ mod tests {
                     state_id: "minute-window".to_owned(),
                     mode: "tumbling".to_owned(),
                     size: "1m".to_owned(),
+                    hop: None,
                     time_field: None,
                     allowed_lateness: None,
                 }),

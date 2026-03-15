@@ -16648,7 +16648,10 @@ impl WorkflowStore {
         self.upsert_stream_job_view_queries(std::slice::from_ref(view)).await
     }
 
-    pub async fn upsert_stream_job_view_queries(&self, views: &[StreamJobViewRecord]) -> Result<()> {
+    pub async fn upsert_stream_job_view_queries(
+        &self,
+        views: &[StreamJobViewRecord],
+    ) -> Result<()> {
         if views.is_empty() {
             return Ok(());
         }

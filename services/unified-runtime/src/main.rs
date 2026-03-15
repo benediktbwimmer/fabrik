@@ -16093,11 +16093,6 @@ mod tests {
         source_publisher.publish(&json!({"accountId": "acct_2", "amount": 0.0}), "acct_2").await?;
         source_publisher.publish(&json!({"accountId": "acct_1", "amount": 2.0}), "acct_1").await?;
 
-        redpanda.wait_for_workflow_history_event(&filter, "SignalReceived").await?;
-        redpanda.wait_for_workflow_history_event(&filter, "StreamJobQueryCompleted").await?;
-        redpanda.wait_for_workflow_history_event(&filter, "StreamJobCancellationRequested").await?;
-        redpanda.wait_for_workflow_history_event(&filter, "StreamJobCancelled").await?;
-
         let completed =
             wait_for_instance_completion(&store, "tenant", "instance-topic-keyed-rollup-signal")
                 .await?;

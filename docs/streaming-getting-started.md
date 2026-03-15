@@ -121,7 +121,61 @@ node sdk/typescript-compiler/compiler.mjs \
 
 At that point the artifact can be published through the normal workflow-definition path for your environment.
 
-## 3. Create A Topic Adapter
+## 3. Run A Standalone Stream Directly
+
+If you want `Fabrik Streams` without a workflow wrapper, publish a stream artifact and submit or deploy it directly through ingest-service.
+
+One-off or manually managed stream job:
+
+```bash
+curl -sS -X POST http://localhost:3001/tenants/tenant-a/streams/jobs \
+  -H 'content-type: application/json' \
+  -d '{
+    "definition_id": "fraud-detector",
+    "version": 1,
+    "instance_id": "fraud-standalone",
+    "run_id": "run-1",
+    "job_id": "fraud-job",
+    "input": { "kind": "topic", "topic": "payments" },
+    "config": { "threshold": 0.97 }
+  }'
+```
+
+Long-lived deployed stream with rollout identity:
+
+```bash
+curl -sS -X POST http://localhost:3001/tenants/tenant-a/streams/deployments \
+  -H 'content-type: application/json' \
+  -d '{
+    "definition_id": "fraud-detector",
+    "version": 1,
+    "deployment_id": "fraud-prod",
+    "job_id": "fraud-detector-job",
+    "input": { "kind": "topic", "topic": "payments" },
+    "config": { "threshold": 0.97 }
+  }'
+```
+
+The standalone control plane is split deliberately:
+
+- `POST /tenants/{tenant_id}/streams/jobs` creates one standalone job handle
+- `POST /tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/pause` pauses a direct standalone job
+- `POST /tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/resume` resumes it
+- `POST /tenants/{tenant_id}/streams/jobs/{instance_id}/{run_id}/{job_id}/cancel` or `/drain` requests shutdown
+- `POST /tenants/{tenant_id}/streams/deployments` creates or rolls a deployment revision
+- `POST /tenants/{tenant_id}/streams/deployments/{deployment_id}/pause|resume|drain|rollback` controls the deployment lifecycle
+
+Visibility stays the same whether a job came from a workflow or from the standalone API:
+
+```bash
+curl -sS http://localhost:3002/tenants/tenant-a/streams/jobs?origin_kind=standalone
+curl -sS http://localhost:3002/tenants/tenant-a/streams/jobs/fraud-standalone/run-1/fraud-job
+curl -sS http://localhost:3002/tenants/tenant-a/streams/deployments/fraud-prod
+```
+
+The job detail, runtime, checkpoint, signal, and materialized-view endpoints under query-service work for both workflow-originated and standalone jobs.
+
+## 4. Create A Topic Adapter
 
 Sample adapter configs live under [`examples/topic-adapters`](/Users/bene/code/fabrik/examples/topic-adapters):
 
@@ -147,7 +201,7 @@ The same adapter pattern works for stream-job-backed workflows too: the topic ad
 
 The signal example keeps the adapter narrow: map the record to a workflow instance and signal payload, then let the workflow decide how to batch the work.
 
-## 4. Preview Before Saving
+## 5. Preview Before Saving
 
 Use the Topic Adapters page in the console to:
 
@@ -158,7 +212,7 @@ Use the Topic Adapters page in the console to:
 
 The preview path uses the same mapping resolver as live ingestion, so a passing preview is a real signal that the adapter configuration is valid.
 
-## 5. Watch The Streaming Surfaces
+## 6. Watch The Streaming Surfaces
 
 Once records start flowing, the main operator surfaces are:
 
@@ -167,7 +221,7 @@ Once records start flowing, the main operator surfaces are:
 - `/task-queues` for throughput backend pressure, pause/resume, and routing explanation
 - workflow run detail for batch-level reducer output and live progress
 
-## 6. Recover From Bad Records
+## 7. Recover From Bad Records
 
 If a record fails mapping or dispatch:
 
@@ -177,7 +231,7 @@ If a record fails mapping or dispatch:
 
 Dead letters keep replay metadata, so operators can see replay attempts, last replay error, and whether a record has been resolved.
 
-## 7. Choose A Good Workload Shape
+## 8. Choose A Good Workload Shape
 
 The streaming backend is strongest on fewer, wider workflows.
 
@@ -192,7 +246,7 @@ If the business semantics allow it, prefer:
 - mergeable reducers such as `sum`, `avg`, or `histogram`
 - batch-level visibility instead of per-item workflow history
 
-## 8. Recommended Next Reads
+## 9. Recommended Next Reads
 
 - [streaming-product-guide.md](streaming-product-guide.md)
 - [spec/throughput-mode.md](spec/throughput-mode.md)

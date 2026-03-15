@@ -637,11 +637,18 @@ function validateAggregateV2Job(job) {
       continue;
     }
     const config = expectObject(operator.config, "aggregate_v2 window.config");
-    if (config.mode !== "tumbling") {
-      throw new CompilerError(`aggregate_v2 window.config.mode must be "tumbling"`);
+    if (config.mode !== "tumbling" && config.mode !== "hopping") {
+      throw new CompilerError(`aggregate_v2 window.config.mode must be "tumbling" or "hopping"`);
     }
     if (typeof config.size !== "string" || config.size.length === 0) {
       throw new CompilerError(`aggregate_v2 window.config.size must be present`);
+    }
+    if (config.mode === "hopping") {
+      if (typeof config.hop !== "string" || config.hop.length === 0) {
+        throw new CompilerError(`aggregate_v2 window.config.hop must be present for hopping windows`);
+      }
+    } else if (config.hop !== undefined) {
+      throw new CompilerError(`aggregate_v2 window.config.hop is only valid for hopping windows`);
     }
   }
   for (const operator of job.operators) {
