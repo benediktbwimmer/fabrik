@@ -12,6 +12,18 @@ pub fn workflow_partition_key(tenant_id: &str, instance_id: &str) -> String {
     format!("{tenant_id}:{instance_id}")
 }
 
+pub fn stream_partition_key(tenant_id: &str, stream_instance_id: &str) -> String {
+    format!("stream:{tenant_id}:{stream_instance_id}")
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EventIdentityKind {
+    #[default]
+    Workflow,
+    Stream,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowIdentity {
     pub tenant_id: String,
@@ -20,6 +32,9 @@ pub struct WorkflowIdentity {
     pub artifact_hash: String,
     pub instance_id: String,
     pub run_id: String,
+    pub identity_kind: EventIdentityKind,
+    pub stream_instance_id: Option<String>,
+    pub stream_run_id: Option<String>,
     pub partition_key: String,
     pub producer: String,
 }
@@ -48,6 +63,40 @@ impl WorkflowIdentity {
             artifact_hash,
             instance_id,
             run_id,
+            identity_kind: EventIdentityKind::Workflow,
+            stream_instance_id: None,
+            stream_run_id: None,
+            partition_key,
+            producer: producer.into(),
+        }
+    }
+
+    pub fn new_stream(
+        tenant_id: impl Into<String>,
+        definition_id: impl Into<String>,
+        definition_version: u32,
+        artifact_hash: impl Into<String>,
+        stream_instance_id: impl Into<String>,
+        stream_run_id: impl Into<String>,
+        producer: impl Into<String>,
+    ) -> Self {
+        let tenant_id = tenant_id.into();
+        let definition_id = definition_id.into();
+        let artifact_hash = artifact_hash.into();
+        let stream_instance_id = stream_instance_id.into();
+        let stream_run_id = stream_run_id.into();
+        let partition_key = stream_partition_key(&tenant_id, &stream_instance_id);
+
+        Self {
+            tenant_id,
+            definition_id,
+            definition_version,
+            artifact_hash,
+            instance_id: stream_instance_id.clone(),
+            run_id: stream_run_id.clone(),
+            identity_kind: EventIdentityKind::Stream,
+            stream_instance_id: Some(stream_instance_id),
+            stream_run_id: Some(stream_run_id),
             partition_key,
             producer: producer.into(),
         }
@@ -66,6 +115,12 @@ pub struct EventEnvelope<T> {
     pub artifact_hash: String,
     pub instance_id: String,
     pub run_id: String,
+    #[serde(default)]
+    pub identity_kind: EventIdentityKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_instance_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_run_id: Option<String>,
     pub partition_key: String,
     pub producer: String,
     pub causation_id: Option<Uuid>,
@@ -88,6 +143,9 @@ impl<T> EventEnvelope<T> {
             artifact_hash: identity.artifact_hash,
             instance_id: identity.instance_id,
             run_id: identity.run_id,
+            identity_kind: identity.identity_kind,
+            stream_instance_id: identity.stream_instance_id,
+            stream_run_id: identity.stream_run_id,
             partition_key: identity.partition_key,
             producer: identity.producer,
             causation_id: None,
@@ -534,7 +592,8 @@ pub fn workflow_turn_routing(payload: &WorkflowEvent) -> WorkflowTurnRouting {
 #[cfg(test)]
 mod tests {
     use super::{
-        EventEnvelope, WorkflowEvent, WorkflowIdentity, WorkflowTurnRouting, workflow_turn_routing,
+        EventEnvelope, EventIdentityKind, WorkflowEvent, WorkflowIdentity, WorkflowTurnRouting,
+        stream_partition_key, workflow_turn_routing,
     };
     use serde_json::json;
 
@@ -591,10 +650,43 @@ mod tests {
                 config: None,
                 state: None,
                 schedule_to_start_timeout_ms: None,
+                schedule_to_close_timeout_ms: None,
                 start_to_close_timeout_ms: None,
                 heartbeat_timeout_ms: None,
             }),
             WorkflowTurnRouting::LocalExecutor
+        );
+    }
+
+    #[test]
+    fn serializes_stream_identity_envelope() {
+        let payload = WorkflowEvent::StreamJobScheduled {
+            job_id: "job-1".to_owned(),
+            job_name: "rollup".to_owned(),
+            input: json!({"source": "payments"}),
+            config: None,
+            state: None,
+        };
+        let envelope = EventEnvelope::new(
+            payload.event_type(),
+            WorkflowIdentity::new_stream(
+                "tenant-a",
+                "payments-rollup",
+                1,
+                "artifact-1",
+                "stream-payments-rollup",
+                "run-1",
+                "test",
+            ),
+            payload,
+        );
+
+        assert_eq!(envelope.identity_kind, EventIdentityKind::Stream);
+        assert_eq!(envelope.stream_instance_id.as_deref(), Some("stream-payments-rollup"));
+        assert_eq!(envelope.stream_run_id.as_deref(), Some("run-1"));
+        assert_eq!(
+            envelope.partition_key,
+            stream_partition_key("tenant-a", "stream-payments-rollup")
         );
     }
 }

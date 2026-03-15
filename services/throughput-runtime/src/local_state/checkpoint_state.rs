@@ -17,19 +17,46 @@ impl LocalThroughputState {
         self.restore_from_checkpoint_if_empty(checkpoint)
     }
 
+    #[allow(dead_code)]
     pub fn next_start_offsets(&self, partitions: &[i32]) -> Result<HashMap<i32, i64>> {
+        self.next_start_offsets_for_plane(LocalChangelogPlane::Throughput, partitions)
+    }
+
+    pub fn next_start_offsets_for_plane(
+        &self,
+        plane: LocalChangelogPlane,
+        partitions: &[i32],
+    ) -> Result<HashMap<i32, i64>> {
         let mut offsets = HashMap::new();
         for partition in partitions {
-            if let Some(offset) = self.last_applied_offset(*partition)? {
+            if let Some(offset) = self.last_applied_offset_for_plane(plane, *partition)? {
                 offsets.insert(*partition, offset.saturating_add(1));
             }
         }
         Ok(offsets)
     }
 
+    #[allow(dead_code)]
     pub fn record_observed_high_watermark(&self, partition_id: i32, high_watermark: i64) {
+        self.record_observed_high_watermark_for_plane(
+            LocalChangelogPlane::Throughput,
+            partition_id,
+            high_watermark,
+        );
+    }
+
+    pub fn record_observed_high_watermark_for_plane(
+        &self,
+        plane: LocalChangelogPlane,
+        partition_id: i32,
+        high_watermark: i64,
+    ) {
         let mut meta = self.meta.lock().expect("local throughput meta lock poisoned");
-        let entry = meta.observed_high_watermarks.entry(partition_id).or_insert(high_watermark);
+        let observed_high_watermarks = match plane {
+            LocalChangelogPlane::Throughput => &mut meta.observed_high_watermarks,
+            LocalChangelogPlane::Streams => &mut meta.streams_observed_high_watermarks,
+        };
+        let entry = observed_high_watermarks.entry(partition_id).or_insert(high_watermark);
         if high_watermark > *entry {
             *entry = high_watermark;
         }
@@ -99,10 +126,24 @@ impl LocalThroughputState {
     }
 
     pub fn partition_is_caught_up(&self, partition_id: i32) -> Result<bool> {
-        let applied = self.last_applied_offset(partition_id)?;
+        self.partition_is_caught_up_for_plane(LocalChangelogPlane::Throughput, partition_id)
+    }
+
+    pub fn partition_is_caught_up_for_plane(
+        &self,
+        plane: LocalChangelogPlane,
+        partition_id: i32,
+    ) -> Result<bool> {
+        let applied = self.last_applied_offset_for_plane(plane, partition_id)?;
         let high_watermark = {
             let meta = self.meta.lock().expect("local throughput meta lock poisoned");
-            meta.observed_high_watermarks.get(&partition_id).copied()
+            match plane {
+                LocalChangelogPlane::Throughput => meta.observed_high_watermarks.get(&partition_id),
+                LocalChangelogPlane::Streams => {
+                    meta.streams_observed_high_watermarks.get(&partition_id)
+                }
+            }
+            .copied()
         };
         let Some(high_watermark) = high_watermark else {
             return Ok(true);
@@ -115,12 +156,27 @@ impl LocalThroughputState {
 
     pub fn debug_snapshot(&self) -> Result<LocalThroughputDebugSnapshot> {
         let meta = self.meta.lock().expect("local throughput meta lock poisoned");
-        let last_applied_offsets = self.load_offsets()?;
+        let last_applied_offsets = self.load_offsets_for_plane(LocalChangelogPlane::Throughput)?;
         let observed_high_watermarks = meta.observed_high_watermarks.clone();
         let partition_lag = observed_high_watermarks
             .iter()
             .map(|(partition_id, high_watermark)| {
                 let applied = last_applied_offsets.get(partition_id).copied().unwrap_or(-1);
+                let lag = if *high_watermark <= 0 {
+                    0
+                } else {
+                    high_watermark.saturating_sub(applied.saturating_add(1))
+                };
+                (*partition_id, lag.max(0))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let streams_last_applied_offsets =
+            self.load_offsets_for_plane(LocalChangelogPlane::Streams)?;
+        let streams_observed_high_watermarks = meta.streams_observed_high_watermarks.clone();
+        let streams_partition_lag = streams_observed_high_watermarks
+            .iter()
+            .map(|(partition_id, high_watermark)| {
+                let applied = streams_last_applied_offsets.get(partition_id).copied().unwrap_or(-1);
                 let lag = if *high_watermark <= 0 {
                     0
                 } else {
@@ -181,6 +237,9 @@ impl LocalThroughputState {
             last_applied_offsets,
             observed_high_watermarks,
             partition_lag,
+            streams_last_applied_offsets,
+            streams_observed_high_watermarks,
+            streams_partition_lag,
         })
     }
 
@@ -204,44 +263,97 @@ impl LocalThroughputState {
         Ok(true)
     }
 
+    #[allow(dead_code)]
     pub(super) fn last_applied_offset(&self, partition_id: i32) -> Result<Option<i64>> {
+        self.last_applied_offset_for_plane(LocalChangelogPlane::Throughput, partition_id)
+    }
+
+    pub(super) fn last_applied_offset_for_plane(
+        &self,
+        plane: LocalChangelogPlane,
+        partition_id: i32,
+    ) -> Result<Option<i64>> {
         self.get_cf_with_legacy_fallback(
             META_CF,
-            &offset_key(partition_id),
-            "throughput changelog offset",
+            &offset_key(plane, partition_id),
+            match plane {
+                LocalChangelogPlane::Throughput => "throughput changelog offset",
+                LocalChangelogPlane::Streams => "streams changelog offset",
+            },
         )?
         .map(|value| {
             String::from_utf8(value)
-                .context("throughput changelog offset is not utf-8")?
+                .context(match plane {
+                    LocalChangelogPlane::Throughput => "throughput changelog offset is not utf-8",
+                    LocalChangelogPlane::Streams => "streams changelog offset is not utf-8",
+                })?
                 .parse::<i64>()
-                .context("throughput changelog offset is not numeric")
+                .context(match plane {
+                    LocalChangelogPlane::Throughput => "throughput changelog offset is not numeric",
+                    LocalChangelogPlane::Streams => "streams changelog offset is not numeric",
+                })
         })
         .transpose()
     }
 
+    #[allow(dead_code)]
     pub(super) fn is_mirrored_entry_pending(&self, entry_id: uuid::Uuid) -> Result<bool> {
+        self.is_mirrored_entry_pending_for_plane(LocalChangelogPlane::Throughput, entry_id)
+    }
+
+    pub(super) fn is_mirrored_entry_pending_for_plane(
+        &self,
+        plane: LocalChangelogPlane,
+        entry_id: uuid::Uuid,
+    ) -> Result<bool> {
         Ok(self
             .get_cf_with_legacy_fallback(
                 META_CF,
-                &mirrored_entry_key(entry_id),
-                "mirrored throughput entry marker",
+                &mirrored_entry_key(plane, entry_id),
+                match plane {
+                    LocalChangelogPlane::Throughput => "mirrored throughput entry marker",
+                    LocalChangelogPlane::Streams => "mirrored streams entry marker",
+                },
             )?
             .is_some())
     }
 
     fn load_offsets(&self) -> Result<BTreeMap<i32, i64>> {
+        self.load_offsets_for_plane(LocalChangelogPlane::Throughput)
+    }
+
+    pub(super) fn load_offsets_for_plane(
+        &self,
+        plane: LocalChangelogPlane,
+    ) -> Result<BTreeMap<i32, i64>> {
         let mut offsets = BTreeMap::new();
-        for (key, value) in
-            self.load_prefixed_entries(META_CF, OFFSET_KEY_PREFIX, "throughput state offsets")?
-        {
-            if let Some(partition) = key.strip_prefix(OFFSET_KEY_PREFIX) {
-                let partition = partition
-                    .parse::<i32>()
-                    .context("throughput offset partition is not numeric")?;
+        let prefix = match plane {
+            LocalChangelogPlane::Throughput => OFFSET_KEY_PREFIX,
+            LocalChangelogPlane::Streams => STREAMS_OFFSET_KEY_PREFIX,
+        };
+        for (key, value) in self.load_prefixed_entries(
+            META_CF,
+            prefix,
+            match plane {
+                LocalChangelogPlane::Throughput => "throughput state offsets",
+                LocalChangelogPlane::Streams => "streams state offsets",
+            },
+        )? {
+            if let Some(partition) = key.strip_prefix(prefix) {
+                let partition = partition.parse::<i32>().context(match plane {
+                    LocalChangelogPlane::Throughput => "throughput offset partition is not numeric",
+                    LocalChangelogPlane::Streams => "streams offset partition is not numeric",
+                })?;
                 let offset = String::from_utf8(value.to_vec())
-                    .context("throughput offset value is not utf-8")?
+                    .context(match plane {
+                        LocalChangelogPlane::Throughput => "throughput offset value is not utf-8",
+                        LocalChangelogPlane::Streams => "streams offset value is not utf-8",
+                    })?
                     .parse::<i64>()
-                    .context("throughput offset value is not numeric")?;
+                    .context(match plane {
+                        LocalChangelogPlane::Throughput => "throughput offset value is not numeric",
+                        LocalChangelogPlane::Streams => "streams offset value is not numeric",
+                    })?;
                 offsets.insert(partition, offset);
             }
         }
@@ -249,13 +361,30 @@ impl LocalThroughputState {
     }
 
     pub(super) fn load_mirrored_entry_ids(&self) -> Result<Vec<String>> {
+        self.load_mirrored_entry_ids_for_plane(LocalChangelogPlane::Throughput)
+    }
+
+    pub(super) fn load_mirrored_entry_ids_for_plane(
+        &self,
+        plane: LocalChangelogPlane,
+    ) -> Result<Vec<String>> {
         let mut entry_ids = Vec::new();
         for (key, _value) in self.load_prefixed_entries(
             META_CF,
-            MIRRORED_ENTRY_KEY_PREFIX,
-            "throughput mirrored-entry markers",
+            match plane {
+                LocalChangelogPlane::Throughput => MIRRORED_ENTRY_KEY_PREFIX,
+                LocalChangelogPlane::Streams => STREAMS_MIRRORED_ENTRY_KEY_PREFIX,
+            },
+            match plane {
+                LocalChangelogPlane::Throughput => "throughput mirrored-entry markers",
+                LocalChangelogPlane::Streams => "streams mirrored-entry markers",
+            },
         )? {
-            if let Some(entry_id) = key.strip_prefix(MIRRORED_ENTRY_KEY_PREFIX) {
+            let prefix = match plane {
+                LocalChangelogPlane::Throughput => MIRRORED_ENTRY_KEY_PREFIX,
+                LocalChangelogPlane::Streams => STREAMS_MIRRORED_ENTRY_KEY_PREFIX,
+            };
+            if let Some(entry_id) = key.strip_prefix(prefix) {
                 entry_ids.push(entry_id.to_owned());
             }
         }
@@ -268,10 +397,15 @@ impl LocalThroughputState {
             created_at: Utc::now(),
             offsets: self.load_offsets()?,
             mirrored_entry_ids: self.load_mirrored_entry_ids()?,
+            streams_offsets: self.load_offsets_for_plane(LocalChangelogPlane::Streams)?,
+            streams_mirrored_entry_ids: self
+                .load_mirrored_entry_ids_for_plane(LocalChangelogPlane::Streams)?,
             batches: self.load_all_batches()?,
             chunks: self.load_all_chunks()?,
             groups: self.load_all_groups()?,
             stream_job_views: self.load_all_stream_job_views()?,
+            stream_job_runtime_states: self.load_all_stream_job_runtime_states()?,
+            stream_job_checkpoints: self.load_all_stream_job_checkpoints()?,
         })
     }
 
@@ -310,18 +444,49 @@ impl LocalThroughputState {
                             == partition_id)
             })
             .collect::<Vec<_>>();
+        let stream_job_views = self
+            .load_all_stream_job_views()?
+            .into_iter()
+            .filter(|view| {
+                throughput_partition_id(&view.logical_key, 0, partition_count) == partition_id
+            })
+            .collect::<Vec<_>>();
+        let stream_job_runtime_states = self
+            .load_all_stream_job_runtime_states()?
+            .into_iter()
+            .filter(|state| {
+                state.active_partitions.contains(&partition_id)
+                    || state
+                        .dispatch_batches
+                        .iter()
+                        .any(|batch| batch.stream_partition_id == partition_id)
+            })
+            .collect::<Vec<_>>();
+        let stream_job_checkpoints = self
+            .load_all_stream_job_checkpoints()?
+            .into_iter()
+            .filter(|state| state.stream_partition_id == partition_id)
+            .collect::<Vec<_>>();
         Ok(CheckpointFile {
             created_at,
             offsets: self
-                .load_offsets()?
+                .load_offsets_for_plane(LocalChangelogPlane::Throughput)?
                 .into_iter()
                 .filter(|(offset_partition_id, _)| *offset_partition_id == partition_id)
                 .collect(),
             mirrored_entry_ids: Vec::new(),
+            streams_offsets: self
+                .load_offsets_for_plane(LocalChangelogPlane::Streams)?
+                .into_iter()
+                .filter(|(offset_partition_id, _)| *offset_partition_id == partition_id)
+                .collect(),
+            streams_mirrored_entry_ids: Vec::new(),
             batches,
             chunks,
             groups,
-            stream_job_views: Vec::new(),
+            stream_job_views,
+            stream_job_runtime_states,
+            stream_job_checkpoints,
         })
     }
 
@@ -334,7 +499,7 @@ impl LocalThroughputState {
             self.write_batch_put_cf(
                 &mut batch,
                 META_CF,
-                &offset_key(*partition),
+                &offset_key(LocalChangelogPlane::Throughput, *partition),
                 offset.to_string().into_bytes(),
             );
         }
@@ -342,7 +507,23 @@ impl LocalThroughputState {
             self.write_batch_put_cf(
                 &mut batch,
                 META_CF,
-                &mirrored_entry_key(entry_id),
+                &mirrored_entry_key(LocalChangelogPlane::Throughput, entry_id),
+                b"1".to_vec(),
+            );
+        }
+        for (partition, offset) in &checkpoint.streams_offsets {
+            self.write_batch_put_cf(
+                &mut batch,
+                META_CF,
+                &offset_key(LocalChangelogPlane::Streams, *partition),
+                offset.to_string().into_bytes(),
+            );
+        }
+        for entry_id in &checkpoint.streams_mirrored_entry_ids {
+            self.write_batch_put_cf(
+                &mut batch,
+                META_CF,
+                &mirrored_entry_key(LocalChangelogPlane::Streams, entry_id),
                 b"1".to_vec(),
             );
         }
@@ -361,11 +542,50 @@ impl LocalThroughputState {
             self.write_group_state(&mut batch, state)?;
         }
         for state in &checkpoint.stream_job_views {
-            self.write_batch_put_cf(
+            self.write_batch_delete_cf_and_legacy(
+                &mut batch,
+                STREAM_JOBS_CF,
+                &legacy_stream_job_view_key(&state.handle_id, &state.view_name, &state.logical_key),
+            );
+            self.write_batch_put_cf_bytes(
                 &mut batch,
                 STREAM_JOBS_CF,
                 &stream_job_view_key(&state.handle_id, &state.view_name, &state.logical_key),
                 encode_rocksdb_value(state, "checkpoint stream job view state")?,
+            );
+        }
+        for state in &checkpoint.stream_job_runtime_states {
+            self.write_batch_delete_cf_and_legacy(
+                &mut batch,
+                STREAM_JOBS_CF,
+                &legacy_stream_job_runtime_key(&state.handle_id),
+            );
+            self.write_batch_put_cf_bytes(
+                &mut batch,
+                STREAM_JOBS_CF,
+                &stream_job_runtime_key(&state.handle_id),
+                encode_rocksdb_value(state, "checkpoint stream job runtime state")?,
+            );
+        }
+        for state in &checkpoint.stream_job_checkpoints {
+            self.write_batch_delete_cf_and_legacy(
+                &mut batch,
+                STREAM_JOBS_CF,
+                &legacy_stream_job_checkpoint_key(
+                    &state.handle_id,
+                    &state.checkpoint_name,
+                    state.stream_partition_id,
+                ),
+            );
+            self.write_batch_put_cf_bytes(
+                &mut batch,
+                STREAM_JOBS_CF,
+                &stream_job_checkpoint_key(
+                    &state.handle_id,
+                    &state.checkpoint_name,
+                    state.stream_partition_id,
+                ),
+                encode_rocksdb_value(state, "checkpoint stream job checkpoint state")?,
             );
         }
         self.db.write(batch).context("failed to restore throughput checkpoint into state db")?;

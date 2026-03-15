@@ -58,6 +58,9 @@ Required workflow primitives include:
 - `ctx.update(name, handler)`
 - `ctx.activity(name, input, options?)`
 - `ctx.bulkActivity(name, items, options?)` — throughput mode fan-out
+- `ctx.startStreamJob(name, input, options?)`
+- `streamJobHandle.untilCheckpoint(name)`
+- `streamJobHandle.query(name, args?, options?)`
 - `ctx.startChild(name, input, options?)`
 - `ctx.sideEffect(fn)`
 - `ctx.version(changeId, min, max)`
@@ -65,9 +68,29 @@ Required workflow primitives include:
 - `ctx.complete(output?)`
 - `ctx.fail(reason)`
 
-Future stream-native primitives such as `ctx.startStreamJob(...)` are intentionally not part of the current workflow replacement claim. They should ship only after the bridge contract and stream semantics are explicit enough to justify a distinct workflow primitive.
+The current stream-job slice is intentionally narrow:
 
-The target semantic contract for those primitives is defined in [spec/stream-jobs.md](spec/stream-jobs.md).
+- `ctx.startStreamJob(...)` starts a stable stream-job handle through the workflow/streams bridge
+- `job.untilCheckpoint(name)` is a durable checkpoint barrier
+- `job.query(name, args, { consistency })` issues a durable stream query request
+
+The current semantic contract for those primitives is defined in [spec/stream-jobs.md](spec/stream-jobs.md), and the first implemented vertical slice is the `keyed-rollup` job described in [spec/streams-first-vertical-slice.md](spec/streams-first-vertical-slice.md).
+
+For TypeScript authoring, a lightweight workflow type shim now lives at [`sdk/typescript-compiler/workflow-authoring.ts`](/Users/bene/code/fabrik/sdk/typescript-compiler/workflow-authoring.ts). It provides editor types for `WorkflowContext`, bulk handles, child handles, and stream-job handles, including:
+
+- `ctx.startStreamJob(...)`
+- `job.untilCheckpoint(...)`
+- `job.query(...)`
+- `job.cancel(...)`
+
+The stream-job handle types support named checkpoint and query maps, so workflow code can describe per-job outputs instead of falling back to generic JSON. The `keyed-rollup` example in [`stream-job-rollup-workflow.ts`](/Users/bene/code/fabrik/examples/typescript-workflows/stream-job-rollup-workflow.ts) shows the pattern.
+
+The shim now also exports:
+
+- `defineStreamJobTypes<...>()` for custom job-specific type bundles
+- `StreamJobHandleFor<TJob>` and `StreamJobStartRequestFor<TJob>` for derived handle/request shapes
+- `StreamJobTerminalFor<TJob>` for typed terminal wait payloads
+- built-in `KeyedRollupJob` and `KeyedRollupHandle` aliases for the first shipping stream-job type
 
 ## Temporal Compatibility Progress
 

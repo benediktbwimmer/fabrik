@@ -16,6 +16,7 @@ use aws_sdk_s3::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub use bridge::*;
@@ -45,8 +46,463 @@ pub const DEFAULT_AGGREGATION_GROUP_COUNT: u32 = 1;
 pub const DEFAULT_GROUP_ID: u32 = 0;
 pub const INITIAL_OWNER_EPOCH: u64 = 1;
 pub const TINY_WORKFLOW_MAX_ITEMS: usize = 32;
+pub const STREAMS_KERNEL_V1_CONTRACT: &str = "streams_kernel_v1";
+pub const STREAMS_KERNEL_V2_CONTRACT: &str = "streams_kernel_v2";
+pub const STREAM_RUNTIME_KEYED_ROLLUP: &str = "keyed_rollup";
+pub const STREAM_RUNTIME_AGGREGATE_V2: &str = "aggregate_v2";
+pub const STREAM_JOB_KEYED_ROLLUP: &str = "keyed-rollup";
+pub const STREAM_SOURCE_BOUNDED_INPUT: &str = "bounded_input";
+pub const STREAM_SOURCE_TOPIC: &str = "topic";
+pub const STREAM_OPERATOR_MAP: &str = "map";
+pub const STREAM_OPERATOR_FILTER: &str = "filter";
+pub const STREAM_OPERATOR_ROUTE: &str = "route";
+pub const STREAM_OPERATOR_KEY_BY: &str = "key_by";
+pub const STREAM_OPERATOR_WINDOW: &str = "window";
+pub const STREAM_OPERATOR_REDUCE: &str = "reduce";
+pub const STREAM_OPERATOR_AGGREGATE: &str = "aggregate";
+pub const STREAM_OPERATOR_DEDUPE: &str = "dedupe";
+pub const STREAM_OPERATOR_MATERIALIZE: &str = "materialize";
+pub const STREAM_OPERATOR_EMIT_CHECKPOINT: &str = "emit_checkpoint";
+pub const STREAM_OPERATOR_SIGNAL_WORKFLOW: &str = "signal_workflow";
+pub const STREAM_OPERATOR_SINK: &str = "sink";
+pub const STREAM_REDUCER_COUNT: &str = "count";
+pub const STREAM_REDUCER_SUM: &str = "sum";
+pub const STREAM_REDUCER_MIN: &str = "min";
+pub const STREAM_REDUCER_MAX: &str = "max";
+pub const STREAM_REDUCER_AVG: &str = "avg";
+pub const STREAM_REDUCER_HISTOGRAM: &str = "histogram";
+pub const STREAM_REDUCER_THRESHOLD: &str = "threshold";
+pub const STREAM_CHECKPOINT_POLICY_NAMED: &str = "named_checkpoints";
+pub const STREAM_CHECKPOINT_DELIVERY_WORKFLOW_AWAITABLE: &str = "workflow_awaitable";
+pub const STREAM_QUERY_MODE_BY_KEY: &str = "by_key";
+pub const STREAM_QUERY_MODE_PREFIX_SCAN: &str = "prefix_scan";
+pub const STREAM_CONSISTENCY_STRONG: &str = "strong";
+pub const STREAM_CONSISTENCY_EVENTUAL: &str = "eventual";
+pub const STREAM_STATE_KIND_KEYED: &str = "keyed";
+pub const STREAM_STATE_KIND_WINDOW: &str = "window";
+pub const STREAM_STATE_KIND_DEDUPE: &str = "dedupe";
 const REDUCTION_GROUP_LEVEL_SHIFT: u32 = 24;
 const REDUCTION_GROUP_SLOT_MASK: u32 = (1 << REDUCTION_GROUP_LEVEL_SHIFT) - 1;
+
+fn vec_is_empty<T>(values: &[T]) -> bool {
+    values.is_empty()
+}
+
+fn btree_map_is_empty<K, V>(values: &BTreeMap<K, V>) -> bool {
+    values.is_empty()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamArtifactEntrypoint {
+    pub module: String,
+    pub export: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StreamArtifactSourceLocation {
+    pub file: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CompiledStreamSource {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct CompiledStreamOperator {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub inputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub outputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub state_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CompiledStreamState {
+    pub id: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub key_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub value_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CompiledStreamView {
+    pub name: String,
+    pub consistency: String,
+    pub query_mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_field: Option<String>,
+    #[serde(default)]
+    pub value_fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub supported_consistencies: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CompiledStreamQuery {
+    pub name: String,
+    pub view_name: String,
+    pub consistency: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_id: Option<String>,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub arg_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct CompiledStreamJob {
+    pub name: String,
+    pub runtime: String,
+    pub source: CompiledStreamSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_by: Option<String>,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub states: Vec<CompiledStreamState>,
+    #[serde(default)]
+    pub operators: Vec<CompiledStreamOperator>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_policy: Option<Value>,
+    #[serde(default)]
+    pub views: Vec<CompiledStreamView>,
+    #[serde(default)]
+    pub queries: Vec<CompiledStreamQuery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct CompiledKeyedRollupKernel {
+    pub key_field: String,
+    pub value_field: String,
+    pub output_field: String,
+    pub view_name: String,
+    pub query_name: String,
+    pub checkpoint_name: String,
+    pub checkpoint_sequence: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct CompiledStreamJobArtifact {
+    pub definition_id: String,
+    pub definition_version: u32,
+    pub compiler_version: String,
+    #[serde(default = "default_streams_runtime_contract")]
+    pub runtime_contract: String,
+    pub source_language: String,
+    pub entrypoint: StreamArtifactEntrypoint,
+    #[serde(default, skip_serializing_if = "vec_is_empty")]
+    pub source_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "btree_map_is_empty")]
+    pub source_map: BTreeMap<String, StreamArtifactSourceLocation>,
+    pub job: CompiledStreamJob,
+    pub artifact_hash: String,
+}
+
+fn default_streams_runtime_contract() -> String {
+    STREAMS_KERNEL_V1_CONTRACT.to_owned()
+}
+
+fn json_object<'a>(value: &'a Value, subject: &str) -> Result<&'a serde_json::Map<String, Value>> {
+    value.as_object().with_context(|| format!("stream {subject} must be an object"))
+}
+
+fn json_string_field<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+    subject: &str,
+) -> Result<&'a str> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .with_context(|| format!("stream {subject}.{field} must be a string"))
+}
+
+fn json_i64_field(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    subject: &str,
+) -> Result<i64> {
+    object
+        .get(field)
+        .and_then(Value::as_i64)
+        .with_context(|| format!("stream {subject}.{field} must be an integer"))
+}
+
+impl CompiledStreamJob {
+    pub fn validate_well_formed(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            anyhow::bail!("compiled stream job.name cannot be empty");
+        }
+        if self.runtime.trim().is_empty() {
+            anyhow::bail!("compiled stream job.runtime cannot be empty");
+        }
+        if self.source.kind.trim().is_empty() {
+            anyhow::bail!("compiled stream job.source.kind cannot be empty");
+        }
+        if self.views.iter().any(|view| view.name.trim().is_empty()) {
+            anyhow::bail!("compiled stream job views must have non-empty names");
+        }
+        if self.queries.iter().any(|query| query.name.trim().is_empty()) {
+            anyhow::bail!("compiled stream job queries must have non-empty names");
+        }
+        if self.states.iter().any(|state| state.id.trim().is_empty()) {
+            anyhow::bail!("compiled stream job states must have non-empty ids");
+        }
+        if self.states.iter().any(|state| state.kind.trim().is_empty()) {
+            anyhow::bail!("compiled stream job states must have non-empty kinds");
+        }
+        if self
+            .operators
+            .iter()
+            .filter_map(|operator| operator.operator_id.as_deref())
+            .any(|id| id.trim().is_empty())
+        {
+            anyhow::bail!("compiled stream job operator ids must be non-empty when present");
+        }
+        Ok(())
+    }
+
+    pub fn validate_supported_contract(&self) -> Result<()> {
+        self.validate_well_formed()?;
+        if self.runtime == STREAM_RUNTIME_KEYED_ROLLUP {
+            self.keyed_rollup_kernel()?;
+        }
+        Ok(())
+    }
+
+    pub fn keyed_rollup_kernel(&self) -> Result<Option<CompiledKeyedRollupKernel>> {
+        if self.runtime != STREAM_RUNTIME_KEYED_ROLLUP {
+            return Ok(None);
+        }
+
+        if self.name != STREAM_JOB_KEYED_ROLLUP {
+            anyhow::bail!(
+                "stream runtime {STREAM_RUNTIME_KEYED_ROLLUP} requires job.name={STREAM_JOB_KEYED_ROLLUP}"
+            );
+        }
+        if self.source.kind != STREAM_SOURCE_BOUNDED_INPUT {
+            anyhow::bail!(
+                "stream runtime {STREAM_RUNTIME_KEYED_ROLLUP} requires source.kind={STREAM_SOURCE_BOUNDED_INPUT}"
+            );
+        }
+
+        let key_field =
+            self.key_by.clone().context("stream runtime keyed_rollup requires key_by")?;
+        if self.operators.len() != 2 {
+            anyhow::bail!("stream runtime keyed_rollup requires exactly 2 operators");
+        }
+
+        let reduce = &self.operators[0];
+        if reduce.kind != STREAM_OPERATOR_REDUCE {
+            anyhow::bail!("stream runtime keyed_rollup requires operator[0]=reduce");
+        }
+        let reduce_config = json_object(
+            reduce
+                .config
+                .as_ref()
+                .context("stream runtime keyed_rollup reduce operator requires config")?,
+            "runtime keyed_rollup reduce.config",
+        )?;
+        if json_string_field(reduce_config, "reducer", "runtime keyed_rollup reduce.config")?
+            != STREAM_REDUCER_SUM
+        {
+            anyhow::bail!("stream runtime keyed_rollup only supports reduce.config.reducer=sum");
+        }
+        let value_field =
+            json_string_field(reduce_config, "valueField", "runtime keyed_rollup reduce.config")?
+                .to_owned();
+        let output_field =
+            reduce_config.get("outputField").and_then(Value::as_str).unwrap_or("value").to_owned();
+
+        let checkpoint = &self.operators[1];
+        if checkpoint.kind != STREAM_OPERATOR_EMIT_CHECKPOINT {
+            anyhow::bail!("stream runtime keyed_rollup requires operator[1]=emit_checkpoint");
+        }
+        let checkpoint_name = checkpoint
+            .name
+            .clone()
+            .context("stream runtime keyed_rollup emit_checkpoint requires a name")?;
+        let checkpoint_config = json_object(
+            checkpoint
+                .config
+                .as_ref()
+                .context("stream runtime keyed_rollup emit_checkpoint requires config")?,
+            "runtime keyed_rollup emit_checkpoint.config",
+        )?;
+        let checkpoint_sequence = json_i64_field(
+            checkpoint_config,
+            "sequence",
+            "runtime keyed_rollup emit_checkpoint.config",
+        )?;
+
+        if self.views.len() != 1 {
+            anyhow::bail!("stream runtime keyed_rollup requires exactly 1 materialized view");
+        }
+        let view = &self.views[0];
+        if view.consistency != STREAM_CONSISTENCY_STRONG {
+            anyhow::bail!("stream runtime keyed_rollup requires a strong materialized view");
+        }
+        if view.query_mode != STREAM_QUERY_MODE_BY_KEY {
+            anyhow::bail!("stream runtime keyed_rollup requires query_mode=by_key");
+        }
+        if view.key_field.as_deref() != Some(key_field.as_str()) {
+            anyhow::bail!("stream runtime keyed_rollup requires view.key_field to match key_by");
+        }
+
+        if self.queries.len() != 1 {
+            anyhow::bail!("stream runtime keyed_rollup requires exactly 1 query");
+        }
+        let query = &self.queries[0];
+        if query.view_name != view.name {
+            anyhow::bail!("stream runtime keyed_rollup query must target the declared view");
+        }
+        if query.consistency != STREAM_CONSISTENCY_STRONG {
+            anyhow::bail!("stream runtime keyed_rollup query consistency must be strong");
+        }
+
+        let checkpoint_policy = json_object(
+            self.checkpoint_policy
+                .as_ref()
+                .context("stream runtime keyed_rollup requires checkpoint_policy")?,
+            "runtime keyed_rollup checkpoint_policy",
+        )?;
+        if json_string_field(checkpoint_policy, "kind", "runtime keyed_rollup checkpoint_policy")?
+            != STREAM_CHECKPOINT_POLICY_NAMED
+        {
+            anyhow::bail!(
+                "stream runtime keyed_rollup requires checkpoint_policy.kind={STREAM_CHECKPOINT_POLICY_NAMED}"
+            );
+        }
+        let checkpoints = checkpoint_policy.get("checkpoints").and_then(Value::as_array).context(
+            "stream runtime keyed_rollup checkpoint_policy.checkpoints must be an array",
+        )?;
+        if checkpoints.len() != 1 {
+            anyhow::bail!("stream runtime keyed_rollup requires exactly 1 named checkpoint");
+        }
+        let declared_checkpoint =
+            json_object(&checkpoints[0], "runtime keyed_rollup checkpoint_policy.checkpoints[0]")?;
+        if json_string_field(
+            declared_checkpoint,
+            "delivery",
+            "runtime keyed_rollup checkpoint_policy.checkpoints[0]",
+        )? != STREAM_CHECKPOINT_DELIVERY_WORKFLOW_AWAITABLE
+        {
+            anyhow::bail!(
+                "stream runtime keyed_rollup requires checkpoint delivery=workflow_awaitable"
+            );
+        }
+        let declared_checkpoint_name = json_string_field(
+            declared_checkpoint,
+            "name",
+            "runtime keyed_rollup checkpoint_policy.checkpoints[0]",
+        )?;
+        let declared_checkpoint_sequence = json_i64_field(
+            declared_checkpoint,
+            "sequence",
+            "runtime keyed_rollup checkpoint_policy.checkpoints[0]",
+        )?;
+        if declared_checkpoint_name != checkpoint_name {
+            anyhow::bail!(
+                "stream runtime keyed_rollup checkpoint policy must match emit_checkpoint name"
+            );
+        }
+        if declared_checkpoint_sequence != checkpoint_sequence {
+            anyhow::bail!(
+                "stream runtime keyed_rollup checkpoint policy must match emit_checkpoint sequence"
+            );
+        }
+
+        Ok(Some(CompiledKeyedRollupKernel {
+            key_field,
+            value_field,
+            output_field,
+            view_name: view.name.clone(),
+            query_name: query.name.clone(),
+            checkpoint_name,
+            checkpoint_sequence,
+        }))
+    }
+}
+
+impl CompiledStreamJobArtifact {
+    pub fn validate_persistable(&self) -> Result<()> {
+        if self.definition_id.trim().is_empty() {
+            anyhow::bail!("stream artifact definition_id cannot be empty");
+        }
+        if self.definition_version == 0 {
+            anyhow::bail!("stream artifact definition_version must be greater than 0");
+        }
+        if self.runtime_contract != STREAMS_KERNEL_V1_CONTRACT
+            && self.runtime_contract != STREAMS_KERNEL_V2_CONTRACT
+        {
+            anyhow::bail!(
+                "stream artifact runtime_contract must be {STREAMS_KERNEL_V1_CONTRACT} or {STREAMS_KERNEL_V2_CONTRACT}"
+            );
+        }
+        if self.entrypoint.module.trim().is_empty() || self.entrypoint.export.trim().is_empty() {
+            anyhow::bail!("stream artifact entrypoint must include module and export");
+        }
+        self.job.validate_well_formed()?;
+        if self.hash() != self.artifact_hash {
+            anyhow::bail!("stream artifact hash does not match payload");
+        }
+        Ok(())
+    }
+
+    pub fn hash(&self) -> String {
+        let mut clone = self.clone();
+        clone.artifact_hash.clear();
+        let encoded =
+            serde_json::to_vec(&clone).expect("compiled stream job artifact serialization failed");
+        let digest = Sha256::digest(encoded);
+        format!("{digest:x}")
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validate_persistable()?;
+        if self.runtime_contract != STREAMS_KERNEL_V1_CONTRACT {
+            anyhow::bail!("stream artifact runtime_contract must be {STREAMS_KERNEL_V1_CONTRACT}");
+        }
+        self.job.validate_supported_contract()?;
+        Ok(())
+    }
+}
 
 fn default_throughput_bridge_protocol_version() -> String {
     THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned()
@@ -1334,11 +1790,32 @@ impl CreateBatchCommand {
 pub enum ThroughputCommand {
     StartThroughputRun(StartThroughputRunCommand),
     CreateBatch(CreateBatchCommand),
+    ScheduleStreamJob(ScheduleStreamJobCommand),
+    CancelStreamJob(CancelStreamJobCommand),
     TinyWorkflowStart(TinyWorkflowStartCommand),
     TinyWorkflowStartBatch(TinyWorkflowStartBatchCommand),
     CancelBatch { identity: ThroughputBatchIdentity, reason: String },
     TimeoutBatch { identity: ThroughputBatchIdentity, reason: String },
     ReplanGroups { identity: ThroughputBatchIdentity, aggregation_group_count: u32 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ScheduleStreamJobCommand {
+    pub tenant_id: String,
+    pub stream_instance_id: String,
+    pub stream_run_id: String,
+    pub job_id: String,
+    pub handle_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CancelStreamJobCommand {
+    pub tenant_id: String,
+    pub stream_instance_id: String,
+    pub stream_run_id: String,
+    pub job_id: String,
+    pub handle_id: String,
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1398,6 +1875,46 @@ pub struct ThroughputReportEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ThroughputChangelogPayload {
+    StreamJobExecutionPlanned {
+        handle_id: String,
+        job_id: String,
+        job_name: String,
+        view_name: String,
+        checkpoint_name: String,
+        checkpoint_sequence: i64,
+        input_item_count: u64,
+        materialized_key_count: u64,
+        active_partitions: Vec<i32>,
+        owner_epoch: u64,
+        planned_at: DateTime<Utc>,
+    },
+    StreamJobViewUpdated {
+        handle_id: String,
+        job_id: String,
+        view_name: String,
+        logical_key: String,
+        output: Value,
+        checkpoint_sequence: i64,
+        updated_at: DateTime<Utc>,
+    },
+    StreamJobCheckpointReached {
+        handle_id: String,
+        job_id: String,
+        checkpoint_name: String,
+        checkpoint_sequence: i64,
+        stream_partition_id: i32,
+        owner_epoch: u64,
+        reached_at: DateTime<Utc>,
+    },
+    StreamJobTerminalized {
+        handle_id: String,
+        job_id: String,
+        owner_epoch: u64,
+        status: String,
+        output: Option<Value>,
+        error: Option<String>,
+        terminal_at: DateTime<Utc>,
+    },
     BatchCreated {
         identity: ThroughputBatchIdentity,
         task_queue: String,
@@ -1490,6 +2007,79 @@ pub struct ThroughputChangelogEntry {
     pub occurred_at: DateTime<Utc>,
     pub partition_key: String,
     pub payload: ThroughputChangelogPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamsViewRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub job_id: String,
+    pub handle_id: String,
+    pub view_name: String,
+    pub logical_key: String,
+    pub output: Value,
+    pub checkpoint_sequence: i64,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StreamsProjectionEvent {
+    UpsertStreamJobView { view: StreamsViewRecord },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StreamsChangelogPayload {
+    StreamJobExecutionPlanned {
+        handle_id: String,
+        job_id: String,
+        job_name: String,
+        view_name: String,
+        checkpoint_name: String,
+        checkpoint_sequence: i64,
+        input_item_count: u64,
+        materialized_key_count: u64,
+        active_partitions: Vec<i32>,
+        owner_epoch: u64,
+        planned_at: DateTime<Utc>,
+    },
+    StreamJobViewUpdated {
+        handle_id: String,
+        job_id: String,
+        view_name: String,
+        logical_key: String,
+        output: Value,
+        checkpoint_sequence: i64,
+        updated_at: DateTime<Utc>,
+    },
+    StreamJobCheckpointReached {
+        handle_id: String,
+        job_id: String,
+        checkpoint_name: String,
+        checkpoint_sequence: i64,
+        stream_partition_id: i32,
+        owner_epoch: u64,
+        reached_at: DateTime<Utc>,
+    },
+    StreamJobTerminalized {
+        handle_id: String,
+        job_id: String,
+        owner_epoch: u64,
+        status: String,
+        output: Option<Value>,
+        error: Option<String>,
+        terminal_at: DateTime<Utc>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamsChangelogEntry {
+    pub entry_id: Uuid,
+    pub occurred_at: DateTime<Utc>,
+    pub partition_key: String,
+    pub payload: StreamsChangelogPayload,
 }
 
 pub fn throughput_partition_key(batch_id: &str, group_id: u32) -> String {
@@ -2079,6 +2669,401 @@ mod tests {
         assert_eq!(round_tripped, command);
         assert!(encoded.to_string().contains("\"start_throughput_run\""));
         assert!(!encoded.to_string().contains("\"items\""));
+        Ok(())
+    }
+
+    #[test]
+    fn schedule_stream_job_command_round_trips() -> Result<()> {
+        let command = ThroughputCommandEnvelope {
+            command_id: Uuid::now_v7(),
+            occurred_at: Utc::now(),
+            dedupe_key: "stream-job-submit:handle-a".to_owned(),
+            partition_key: throughput_partition_key("job-a", 0),
+            payload: ThroughputCommand::ScheduleStreamJob(ScheduleStreamJobCommand {
+                tenant_id: "tenant-a".to_owned(),
+                stream_instance_id: "stream-a".to_owned(),
+                stream_run_id: "run-a".to_owned(),
+                job_id: "job-a".to_owned(),
+                handle_id: "handle-a".to_owned(),
+            }),
+        };
+
+        let encoded = serde_json::to_value(&command)?;
+        let round_tripped: ThroughputCommandEnvelope = serde_json::from_value(encoded.clone())?;
+        assert_eq!(round_tripped, command);
+        assert!(encoded.to_string().contains("\"schedule_stream_job\""));
+        Ok(())
+    }
+
+    #[test]
+    fn compiled_stream_artifact_validates_keyed_rollup_kernel_contract() -> Result<()> {
+        let mut artifact = CompiledStreamJobArtifact {
+            definition_id: "payments-rollup".to_owned(),
+            definition_version: 3,
+            compiler_version: "0.1.0".to_owned(),
+            runtime_contract: STREAMS_KERNEL_V1_CONTRACT.to_owned(),
+            source_language: "typescript".to_owned(),
+            entrypoint: StreamArtifactEntrypoint {
+                module: "examples/typescript-stream-jobs/keyed-rollup-stream-job.ts".to_owned(),
+                export: "keyedRollupStreamJob".to_owned(),
+            },
+            source_files: vec![
+                "examples/typescript-stream-jobs/keyed-rollup-stream-job.ts".to_owned(),
+            ],
+            source_map: BTreeMap::new(),
+            job: CompiledStreamJob {
+                name: STREAM_JOB_KEYED_ROLLUP.to_owned(),
+                runtime: STREAM_RUNTIME_KEYED_ROLLUP.to_owned(),
+                source: CompiledStreamSource {
+                    kind: STREAM_SOURCE_BOUNDED_INPUT.to_owned(),
+                    name: None,
+                    binding: None,
+                    config: None,
+                },
+                key_by: Some("accountId".to_owned()),
+                states: vec![],
+                operators: vec![
+                    CompiledStreamOperator {
+                        kind: STREAM_OPERATOR_REDUCE.to_owned(),
+                        operator_id: None,
+                        name: Some("sum-account-totals".to_owned()),
+                        inputs: vec![],
+                        outputs: vec![],
+                        state_ids: vec![],
+                        config: Some(serde_json::json!({
+                            "reducer": STREAM_REDUCER_SUM,
+                            "valueField": "amount",
+                            "outputField": "totalAmount",
+                        })),
+                    },
+                    CompiledStreamOperator {
+                        kind: STREAM_OPERATOR_EMIT_CHECKPOINT.to_owned(),
+                        operator_id: None,
+                        name: Some("hourly-rollup-ready".to_owned()),
+                        inputs: vec![],
+                        outputs: vec![],
+                        state_ids: vec![],
+                        config: Some(serde_json::json!({
+                            "sequence": 1,
+                        })),
+                    },
+                ],
+                checkpoint_policy: Some(serde_json::json!({
+                    "kind": STREAM_CHECKPOINT_POLICY_NAMED,
+                    "checkpoints": [
+                        {
+                            "name": "hourly-rollup-ready",
+                            "delivery": STREAM_CHECKPOINT_DELIVERY_WORKFLOW_AWAITABLE,
+                            "sequence": 1,
+                        }
+                    ],
+                })),
+                views: vec![CompiledStreamView {
+                    name: "accountTotals".to_owned(),
+                    consistency: STREAM_CONSISTENCY_STRONG.to_owned(),
+                    query_mode: STREAM_QUERY_MODE_BY_KEY.to_owned(),
+                    view_id: None,
+                    key_field: Some("accountId".to_owned()),
+                    value_fields: vec![
+                        "accountId".to_owned(),
+                        "totalAmount".to_owned(),
+                        "asOfCheckpoint".to_owned(),
+                    ],
+                    supported_consistencies: vec![],
+                    retention_seconds: None,
+                }],
+                queries: vec![CompiledStreamQuery {
+                    name: "accountTotals".to_owned(),
+                    view_name: "accountTotals".to_owned(),
+                    consistency: STREAM_CONSISTENCY_STRONG.to_owned(),
+                    query_id: None,
+                    arg_fields: vec![],
+                }],
+                classification: None,
+                metadata: None,
+            },
+            artifact_hash: String::new(),
+        };
+        artifact.artifact_hash = artifact.hash();
+
+        artifact.validate()?;
+        assert_eq!(
+            artifact.job.keyed_rollup_kernel()?,
+            Some(CompiledKeyedRollupKernel {
+                key_field: "accountId".to_owned(),
+                value_field: "amount".to_owned(),
+                output_field: "totalAmount".to_owned(),
+                view_name: "accountTotals".to_owned(),
+                query_name: "accountTotals".to_owned(),
+                checkpoint_name: "hourly-rollup-ready".to_owned(),
+                checkpoint_sequence: 1,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compiled_stream_artifact_rejects_mismatched_keyed_rollup_checkpoint_policy() {
+        let mut artifact = CompiledStreamJobArtifact {
+            definition_id: "payments-rollup".to_owned(),
+            definition_version: 3,
+            compiler_version: "0.1.0".to_owned(),
+            runtime_contract: STREAMS_KERNEL_V1_CONTRACT.to_owned(),
+            source_language: "typescript".to_owned(),
+            entrypoint: StreamArtifactEntrypoint {
+                module: "examples/typescript-stream-jobs/keyed-rollup-stream-job.ts".to_owned(),
+                export: "keyedRollupStreamJob".to_owned(),
+            },
+            source_files: vec![],
+            source_map: BTreeMap::new(),
+            job: CompiledStreamJob {
+                name: STREAM_JOB_KEYED_ROLLUP.to_owned(),
+                runtime: STREAM_RUNTIME_KEYED_ROLLUP.to_owned(),
+                source: CompiledStreamSource {
+                    kind: STREAM_SOURCE_BOUNDED_INPUT.to_owned(),
+                    name: None,
+                    binding: None,
+                    config: None,
+                },
+                key_by: Some("accountId".to_owned()),
+                states: vec![],
+                operators: vec![
+                    CompiledStreamOperator {
+                        kind: STREAM_OPERATOR_REDUCE.to_owned(),
+                        operator_id: None,
+                        name: Some("sum-account-totals".to_owned()),
+                        inputs: vec![],
+                        outputs: vec![],
+                        state_ids: vec![],
+                        config: Some(serde_json::json!({
+                            "reducer": STREAM_REDUCER_SUM,
+                            "valueField": "amount",
+                        })),
+                    },
+                    CompiledStreamOperator {
+                        kind: STREAM_OPERATOR_EMIT_CHECKPOINT.to_owned(),
+                        operator_id: None,
+                        name: Some("hourly-rollup-ready".to_owned()),
+                        inputs: vec![],
+                        outputs: vec![],
+                        state_ids: vec![],
+                        config: Some(serde_json::json!({
+                            "sequence": 1,
+                        })),
+                    },
+                ],
+                checkpoint_policy: Some(serde_json::json!({
+                    "kind": STREAM_CHECKPOINT_POLICY_NAMED,
+                    "checkpoints": [
+                        {
+                            "name": "wrong-checkpoint",
+                            "delivery": STREAM_CHECKPOINT_DELIVERY_WORKFLOW_AWAITABLE,
+                            "sequence": 1,
+                        }
+                    ],
+                })),
+                views: vec![CompiledStreamView {
+                    name: "accountTotals".to_owned(),
+                    consistency: STREAM_CONSISTENCY_STRONG.to_owned(),
+                    query_mode: STREAM_QUERY_MODE_BY_KEY.to_owned(),
+                    view_id: None,
+                    key_field: Some("accountId".to_owned()),
+                    value_fields: vec![],
+                    supported_consistencies: vec![],
+                    retention_seconds: None,
+                }],
+                queries: vec![CompiledStreamQuery {
+                    name: "accountTotals".to_owned(),
+                    view_name: "accountTotals".to_owned(),
+                    consistency: STREAM_CONSISTENCY_STRONG.to_owned(),
+                    query_id: None,
+                    arg_fields: vec![],
+                }],
+                classification: None,
+                metadata: None,
+            },
+            artifact_hash: String::new(),
+        };
+        artifact.artifact_hash = artifact.hash();
+
+        let error = artifact.validate().expect_err("artifact should reject mismatched checkpoint");
+        assert!(error.to_string().contains("checkpoint policy must match emit_checkpoint name"));
+    }
+
+    #[test]
+    fn compiled_stream_artifact_allows_persistable_kernel_v2_shape() -> Result<()> {
+        let mut artifact = CompiledStreamJobArtifact {
+            definition_id: "fraud-detector".to_owned(),
+            definition_version: 1,
+            compiler_version: "0.2.0".to_owned(),
+            runtime_contract: STREAMS_KERNEL_V2_CONTRACT.to_owned(),
+            source_language: "typescript".to_owned(),
+            entrypoint: StreamArtifactEntrypoint {
+                module: "examples/typescript-stream-jobs/fraud-detector.ts".to_owned(),
+                export: "fraudDetector".to_owned(),
+            },
+            source_files: vec!["examples/typescript-stream-jobs/fraud-detector.ts".to_owned()],
+            source_map: BTreeMap::new(),
+            job: CompiledStreamJob {
+                name: "fraud-detector".to_owned(),
+                runtime: STREAM_RUNTIME_AGGREGATE_V2.to_owned(),
+                source: CompiledStreamSource {
+                    kind: STREAM_SOURCE_TOPIC.to_owned(),
+                    name: Some("payments".to_owned()),
+                    binding: Some("payments".to_owned()),
+                    config: Some(serde_json::json!({
+                        "topic": "payments"
+                    })),
+                },
+                key_by: Some("accountId".to_owned()),
+                states: vec![
+                    CompiledStreamState {
+                        id: "risk-aggregate".to_owned(),
+                        kind: STREAM_STATE_KIND_KEYED.to_owned(),
+                        key_fields: vec!["accountId".to_owned()],
+                        value_fields: vec!["avgRisk".to_owned()],
+                        retention_seconds: Some(3600),
+                        config: Some(serde_json::json!({
+                            "reducer": STREAM_REDUCER_AVG
+                        })),
+                    },
+                    CompiledStreamState {
+                        id: "minute-window".to_owned(),
+                        kind: STREAM_STATE_KIND_WINDOW.to_owned(),
+                        key_fields: vec!["accountId".to_owned(), "windowStart".to_owned()],
+                        value_fields: vec!["avgRisk".to_owned()],
+                        retention_seconds: Some(3600),
+                        config: Some(serde_json::json!({
+                            "mode": "tumbling",
+                            "size": "1m"
+                        })),
+                    },
+                ],
+                operators: vec![
+                    CompiledStreamOperator {
+                        kind: STREAM_OPERATOR_FILTER.to_owned(),
+                        operator_id: Some("filter-valid".to_owned()),
+                        name: Some("filter-valid".to_owned()),
+                        inputs: vec!["source:payments".to_owned()],
+                        outputs: vec!["filtered".to_owned()],
+                        state_ids: vec![],
+                        config: Some(serde_json::json!({
+                            "predicate": "amount > 0"
+                        })),
+                    },
+                    CompiledStreamOperator {
+                        kind: STREAM_OPERATOR_WINDOW.to_owned(),
+                        operator_id: Some("minute-window".to_owned()),
+                        name: Some("minute-window".to_owned()),
+                        inputs: vec!["filtered".to_owned()],
+                        outputs: vec!["windowed".to_owned()],
+                        state_ids: vec!["minute-window".to_owned()],
+                        config: Some(serde_json::json!({
+                            "mode": "tumbling",
+                            "size": "1m"
+                        })),
+                    },
+                    CompiledStreamOperator {
+                        kind: STREAM_OPERATOR_AGGREGATE.to_owned(),
+                        operator_id: Some("avg-risk".to_owned()),
+                        name: Some("avg-risk".to_owned()),
+                        inputs: vec!["windowed".to_owned()],
+                        outputs: vec!["risk-view".to_owned()],
+                        state_ids: vec!["risk-aggregate".to_owned()],
+                        config: Some(serde_json::json!({
+                            "reducer": STREAM_REDUCER_AVG,
+                            "valueField": "risk"
+                        })),
+                    },
+                    CompiledStreamOperator {
+                        kind: STREAM_OPERATOR_MATERIALIZE.to_owned(),
+                        operator_id: Some("materialize-risk".to_owned()),
+                        name: Some("materialize-risk".to_owned()),
+                        inputs: vec!["risk-view".to_owned()],
+                        outputs: vec!["riskScores".to_owned()],
+                        state_ids: vec!["risk-aggregate".to_owned()],
+                        config: Some(serde_json::json!({
+                            "view": "riskScores"
+                        })),
+                    },
+                ],
+                checkpoint_policy: Some(serde_json::json!({
+                    "kind": STREAM_CHECKPOINT_POLICY_NAMED,
+                    "checkpoints": [
+                        {
+                            "name": "minute-closed",
+                            "delivery": STREAM_CHECKPOINT_DELIVERY_WORKFLOW_AWAITABLE,
+                            "sequence": 1
+                        }
+                    ],
+                })),
+                views: vec![CompiledStreamView {
+                    name: "riskScores".to_owned(),
+                    consistency: STREAM_CONSISTENCY_STRONG.to_owned(),
+                    query_mode: STREAM_QUERY_MODE_BY_KEY.to_owned(),
+                    view_id: Some("risk-scores".to_owned()),
+                    key_field: Some("accountId".to_owned()),
+                    value_fields: vec!["accountId".to_owned(), "avgRisk".to_owned()],
+                    supported_consistencies: vec![
+                        STREAM_CONSISTENCY_STRONG.to_owned(),
+                        STREAM_CONSISTENCY_EVENTUAL.to_owned(),
+                    ],
+                    retention_seconds: Some(3600),
+                }],
+                queries: vec![
+                    CompiledStreamQuery {
+                        name: "riskScoresByKey".to_owned(),
+                        view_name: "riskScores".to_owned(),
+                        consistency: STREAM_CONSISTENCY_STRONG.to_owned(),
+                        query_id: Some("risk-scores-by-key".to_owned()),
+                        arg_fields: vec!["accountId".to_owned()],
+                    },
+                    CompiledStreamQuery {
+                        name: "riskScoresScan".to_owned(),
+                        view_name: "riskScores".to_owned(),
+                        consistency: STREAM_CONSISTENCY_EVENTUAL.to_owned(),
+                        query_id: Some("risk-scores-scan".to_owned()),
+                        arg_fields: vec!["prefix".to_owned()],
+                    },
+                ],
+                classification: Some("fast_lane".to_owned()),
+                metadata: Some(serde_json::json!({
+                    "kernel": "aggregate_v2"
+                })),
+            },
+            artifact_hash: String::new(),
+        };
+        artifact.artifact_hash = artifact.hash();
+
+        artifact.validate_persistable()?;
+        let error = artifact
+            .validate()
+            .expect_err("kernel v2 artifact should not validate as runnable yet");
+        assert!(error.to_string().contains(STREAMS_KERNEL_V1_CONTRACT));
+        Ok(())
+    }
+
+    #[test]
+    fn cancel_stream_job_command_round_trips() -> Result<()> {
+        let command = ThroughputCommandEnvelope {
+            command_id: Uuid::now_v7(),
+            occurred_at: Utc::now(),
+            dedupe_key: "stream-job-cancel:handle-a".to_owned(),
+            partition_key: throughput_partition_key("job-a", 0),
+            payload: ThroughputCommand::CancelStreamJob(CancelStreamJobCommand {
+                tenant_id: "tenant-a".to_owned(),
+                stream_instance_id: "stream-a".to_owned(),
+                stream_run_id: "run-a".to_owned(),
+                job_id: "job-a".to_owned(),
+                handle_id: "handle-a".to_owned(),
+                reason: Some("user requested cancel".to_owned()),
+            }),
+        };
+
+        let encoded = serde_json::to_value(&command)?;
+        let round_tripped: ThroughputCommandEnvelope = serde_json::from_value(encoded.clone())?;
+        assert_eq!(round_tripped, command);
+        assert!(encoded.to_string().contains("\"cancel_stream_job\""));
         Ok(())
     }
 

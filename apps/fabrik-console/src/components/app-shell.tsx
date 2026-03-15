@@ -1,4 +1,4 @@
-import { Activity, GitBranch, Home, Radar, Radio, RefreshCcw, Search, Waves, Workflow } from "lucide-react";
+import { Activity, Database, GitBranch, Home, Radar, Radio, RefreshCcw, Search, Waves, Workflow } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 
@@ -13,6 +13,7 @@ const NAV_ITEMS = [
   { to: "/replay", label: "Replay", icon: RefreshCcw, chord: "G P" },
   { to: "/builds", label: "Builds", icon: GitBranch, chord: "G B" },
   { to: "/conformance", label: "Conformance", icon: Search, chord: "G C" },
+  { to: "/stream-jobs", label: "Stream Jobs", icon: Database, chord: "G J" },
   { to: "/streaming", label: "Streaming Ops", icon: Waves, chord: "G S" },
   { to: "/task-queues", label: "Task Queues", icon: Radar, chord: "G Q" },
   { to: "/topic-adapters", label: "Topic Adapters", icon: Radio, chord: "G T" }
@@ -52,6 +53,7 @@ export function AppShell() {
             p: "/replay",
             b: "/builds",
             c: "/conformance",
+            j: "/stream-jobs",
             s: "/streaming",
             q: "/task-queues",
             t: "/topic-adapters",

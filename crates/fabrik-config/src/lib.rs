@@ -68,9 +68,12 @@ pub struct RedpandaConfig {
     pub workflow_events_topic: String,
     pub workflow_events_partitions: i32,
     pub throughput_commands_topic: String,
+    pub streams_commands_topic: String,
     pub throughput_reports_topic: String,
     pub throughput_changelog_topic: String,
+    pub streams_changelog_topic: String,
     pub throughput_projections_topic: String,
+    pub streams_projections_topic: String,
     pub throughput_partitions: i32,
 }
 
@@ -87,20 +90,32 @@ impl RedpandaConfig {
                 4,
             )?,
             throughput_commands_topic: read_string_with_default_aliases(
-                &["STREAMS_COMMANDS_TOPIC", "THROUGHPUT_COMMANDS_TOPIC"],
+                &["THROUGHPUT_COMMANDS_TOPIC"],
                 "throughput-commands",
+            )?,
+            streams_commands_topic: read_string_with_default_aliases(
+                &["STREAMS_COMMANDS_TOPIC"],
+                "streams-commands",
             )?,
             throughput_reports_topic: read_string_with_default_aliases(
                 &["STREAMS_REPORTS_TOPIC", "THROUGHPUT_REPORTS_TOPIC"],
                 "throughput-reports",
             )?,
             throughput_changelog_topic: read_string_with_default_aliases(
-                &["STREAMS_CHANGELOG_TOPIC", "THROUGHPUT_CHANGELOG_TOPIC"],
+                &["THROUGHPUT_CHANGELOG_TOPIC"],
                 "throughput-changelog",
             )?,
+            streams_changelog_topic: read_string_with_default_aliases(
+                &["STREAMS_CHANGELOG_TOPIC"],
+                "streams-changelog",
+            )?,
             throughput_projections_topic: read_string_with_default_aliases(
-                &["STREAMS_PROJECTIONS_TOPIC", "THROUGHPUT_PROJECTIONS_TOPIC"],
+                &["THROUGHPUT_PROJECTIONS_TOPIC"],
                 "throughput-projections",
+            )?,
+            streams_projections_topic: read_string_with_default_aliases(
+                &["STREAMS_PROJECTIONS_TOPIC"],
+                "streams-projections",
             )?,
             throughput_partitions: read_i32_with_default_aliases(
                 &["STREAMS_PARTITIONS", "THROUGHPUT_PARTITIONS"],

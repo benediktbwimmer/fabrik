@@ -9,6 +9,7 @@ It exists to connect:
 - the workflow-facing contract in [stream-jobs.md](/Users/bene/code/fabrik/docs/spec/stream-jobs.md)
 - the bridge contract in [streams-bridge.md](/Users/bene/code/fabrik/docs/spec/streams-bridge.md)
 - the runtime contract in [streams-runtime-model.md](/Users/bene/code/fabrik/docs/spec/streams-runtime-model.md)
+- the kernel contract in [streams-kernel-v1.md](/Users/bene/code/fabrik/docs/spec/streams-kernel-v1.md)
 
 ## Purpose
 
@@ -60,7 +61,7 @@ const job = await ctx.startStreamJob("keyed-rollup", {
   },
 });
 
-await job.untilCheckpoint("initial-rollup-ready");
+await job.untilCheckpoint("hourly-rollup-ready");
 
 const account = await job.query("accountTotals", {
   key: "acct_123",
@@ -82,7 +83,7 @@ The first stream job type is `keyed-rollup`.
 
 Its execution graph is fixed:
 
-`bounded source -> keyBy(account_id) -> reduce(sum amount) -> materialize(accountTotals) -> emit checkpoint(initial-rollup-ready)`
+`bounded source -> keyBy(account_id) -> reduce(sum amount) -> materialize(accountTotals) -> emit checkpoint(hourly-rollup-ready)`
 
 This slice intentionally fixes the operator graph so the engine contract can be proven before a broader authoring surface exists.
 
@@ -130,7 +131,7 @@ The runtime may chunk and partition the bounded input internally, but that is no
 - the materialized view is authoritative in owner state
 - eventual projections may mirror it later, but projections are not required for this slice
 
-### `emit checkpoint(initial-rollup-ready)`
+### `emit checkpoint(hourly-rollup-ready)`
 
 - the runtime emits this checkpoint only after the bounded input has been fully incorporated into authoritative partition state
 - the checkpoint is durable, monotonic, and bridge-visible
@@ -165,7 +166,7 @@ Rules:
 
 The first slice exposes one named checkpoint:
 
-- `initial-rollup-ready`
+- `hourly-rollup-ready`
 
 The runtime may emit the checkpoint only when:
 
@@ -181,7 +182,7 @@ Bridge rules:
 
 Workflow rule:
 
-- `await job.untilCheckpoint("initial-rollup-ready")` resumes only from an accepted bridge wakeup
+- `await job.untilCheckpoint("hourly-rollup-ready")` resumes only from an accepted bridge wakeup
 
 ## Query Contract
 
@@ -191,7 +192,6 @@ The first slice supports one query:
 
 Rules:
 
-- only `strong` keyed lookup is required in the first slice
 - the read routes to the active owner for the queried `accountId`
 - the response is not replay-stable workflow input
 - the response may include value metadata such as:
@@ -199,10 +199,12 @@ Rules:
   - `checkpoint_sequence`
   - `read_at`
 
+The same keyed query may also be requested with `consistency: "eventual"`.
+That path reads from the projected stream-job view in the query store and must annotate the result with a projection-backed `consistencySource`.
+
 Initial non-goals:
 
 - scans
-- eventual query path
 - ad hoc filtering
 - workflow-authoritative query branching
 
@@ -223,6 +225,9 @@ The first slice must be idempotent for the same workflow request identity.
 - partitioning is derived from `accountId`
 - one partition has one active owner at a time
 - authoritative keyed totals live with the active owner
+- stream view updates are routed by logical key, not by job id
+- bounded input is decomposed into partition-local work items and applied by the owning shard
+- the coordinator does not pre-aggregate keyed totals before owner execution
 
 ### State
 
@@ -233,21 +238,34 @@ The authoritative state required for this slice is:
 - checkpoint metadata
 - owner-epoch and idempotency metadata needed for replay-safe recovery
 
+For the first keyed-rollup slice, the owner may reuse the current materialized value as the reducer accumulator as long as replay remains checkpoint-plus-tail correct.
+
 ### Durability
 
 The first slice uses the runtime durability contract:
 
 - authoritative hot state in the active owner's local state store
-- durable progress tail for accepted post-checkpoint progress
+- durable stream progress entries for:
+  - execution planned
+  - per-key materialization
+  - checkpoint reached
+  - terminalized
 - periodic or completion-driven checkpoint
 
 Because the source is bounded, the implementation may force a checkpoint at the completion of the initial rollup.
+
+### Checkpoint Barrier
+
+- `checkpoint reached` is recorded per active stream partition
+- the bridge-visible named checkpoint is materialized only after every active partition has recorded that checkpoint
+- terminal completion is withheld until that checkpoint barrier is complete
 
 ### Restore
 
 On owner failover:
 
 - the new owner restores from the latest checkpoint plus durable progress after that checkpoint
+- shard checkpoints include stream-job view rows by logical-key ownership and checkpoint rows by `stream_partition_id`
 - stale reports from prior owners are fenced by `owner_epoch`
 - the strong query route follows the new owner
 
@@ -286,7 +304,6 @@ The first slice does not require:
 - joins
 - windows beyond the checkpoint boundary itself
 - timers exposed to users
-- eventual read APIs
 - generic sink connectors
 - generic TypeScript DSL design
 - arbitrary reducer plugins
@@ -297,9 +314,11 @@ The first slice is successful when all of the following are true:
 
 - one workflow call to `ctx.startStreamJob()` yields one stable stream-job handle
 - one bounded keyed input can be fully reduced into owner-local materialized state
-- `initial-rollup-ready` is emitted as a durable monotonic checkpoint
-- `job.untilCheckpoint("initial-rollup-ready")` resumes only through accepted bridge wakeup
+- `hourly-rollup-ready` is emitted as a durable monotonic checkpoint
+- `hourly-rollup-ready` becomes bridge-visible only after every active key partition reaches it
+- `job.untilCheckpoint("hourly-rollup-ready")` resumes only through accepted bridge wakeup
 - `job.query("accountTotals", { key }, { consistency: "strong" })` returns owner-routed keyed state
+- `job.query("accountTotals", { key }, { consistency: "eventual" })` returns projected keyed state with explicit eventual metadata
 - failover preserves checkpoint and query correctness through checkpoint plus durable progress recovery
 
 ## Consequence

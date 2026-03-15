@@ -147,11 +147,43 @@ impl LocalThroughputState {
             .with_context(|| format!("failed to load legacy {subject} from default column family"))
     }
 
+    pub(super) fn get_cf_bytes_with_legacy_fallback(
+        &self,
+        cf_name: &'static str,
+        key: &[u8],
+        legacy_key: Option<&str>,
+        subject: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        if let Some(value) = self
+            .db
+            .get_cf(self.cf(cf_name), key)
+            .with_context(|| format!("failed to load {subject} from column family {cf_name}"))?
+        {
+            return Ok(Some(value));
+        }
+        let Some(legacy_key) = legacy_key else {
+            return Ok(None);
+        };
+        self.db.get_cf(self.cf(cf_name), legacy_key).with_context(|| {
+            format!("failed to load legacy {subject} from column family {cf_name}")
+        })
+    }
+
     pub(super) fn write_batch_put_cf(
         &self,
         write_batch: &mut WriteBatch,
         cf_name: &'static str,
         key: &str,
+        value: Vec<u8>,
+    ) {
+        write_batch.put_cf(self.cf(cf_name), key, value);
+    }
+
+    pub(super) fn write_batch_put_cf_bytes(
+        &self,
+        write_batch: &mut WriteBatch,
+        cf_name: &'static str,
+        key: &[u8],
         value: Vec<u8>,
     ) {
         write_batch.put_cf(self.cf(cf_name), key, value);
@@ -187,6 +219,27 @@ impl LocalThroughputState {
                 break;
             }
             entries.push((key, value.to_vec()));
+        }
+        Ok(entries)
+    }
+
+    pub(super) fn load_prefixed_entries_bytes(
+        &self,
+        cf_name: &'static str,
+        prefix: &[u8],
+        subject: &str,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut entries = Vec::new();
+        for entry in
+            self.db.iterator_cf(self.cf(cf_name), IteratorMode::From(prefix, Direction::Forward))
+        {
+            let (key, value) = entry.with_context(|| {
+                format!("failed to iterate {subject} in column family {cf_name}")
+            })?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            entries.push((key.to_vec(), value.to_vec()));
         }
         Ok(entries)
     }

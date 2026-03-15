@@ -2,7 +2,7 @@
 
 This guide shows the shortest path to a working Fabrik streaming setup:
 
-1. compile a workflow that uses `ctx.bulkActivity()`
+1. compile a workflow that uses `ctx.bulkActivity()` or `ctx.startStreamJob()`
 2. register or publish that workflow definition
 3. create a topic adapter that starts or signals the workflow
 4. watch ingress, lag, routing, and reducer progress in the console
@@ -14,12 +14,13 @@ If you want one runnable end-to-end flow against the local stack, use [streaming
 
 ## 1. Start With The Example Workflows
 
-Two example workflows live under [`examples/typescript-workflows`](/Users/bene/code/fabrik/examples/typescript-workflows):
+Three example workflows live under [`examples/typescript-workflows`](/Users/bene/code/fabrik/examples/typescript-workflows):
 
 - [`bulk-enrichment-workflow.ts`](/Users/bene/code/fabrik/examples/typescript-workflows/bulk-enrichment-workflow.ts) shows topic-driven fan-out with a `histogram` reducer.
 - [`inventory-signal-workflow.ts`](/Users/bene/code/fabrik/examples/typescript-workflows/inventory-signal-workflow.ts) shows a signal-driven workflow that uses a `sum` reducer over inventory adjustments.
+- [`stream-job-rollup-workflow.ts`](/Users/bene/code/fabrik/examples/typescript-workflows/stream-job-rollup-workflow.ts) shows the stream-native path: a workflow starts the `keyed-rollup` stream job, waits for `hourly-rollup-ready`, then issues a strong keyed query against `accountTotals`.
 
-Both examples use the same supported pattern:
+The bulk examples use the current throughput-mode pattern:
 
 ```ts
 const batch = await ctx.bulkActivity("process.enrich", items, {
@@ -30,6 +31,31 @@ const batch = await ctx.bulkActivity("process.enrich", items, {
 
 const summary = await batch.result();
 return ctx.complete(summary);
+```
+
+The stream-job example uses the current workflow/streams bridge surface:
+
+```ts
+import type {
+  KeyedRollupJob,
+  WorkflowContext,
+} from "../../sdk/typescript-compiler/workflow-authoring.js";
+
+export async function streamJobRollupWorkflow(ctx: WorkflowContext, input) {
+const job = await ctx.startStreamJob<KeyedRollupJob>("keyed-rollup", {
+  input: {
+    kind: "bounded_items",
+    items: input.payments,
+  },
+});
+
+await job.untilCheckpoint("hourly-rollup-ready");
+const account = await job.query("accountTotals", { key: input.accountId }, {
+  consistency: "strong",
+});
+
+return ctx.complete({ account });
+}
 ```
 
 ## 2. Compile A Workflow Artifact
@@ -56,6 +82,17 @@ node sdk/typescript-compiler/compiler.mjs \
   --out target/workflow-artifacts/inventory-signal-workflow.json
 ```
 
+Example for the stream-job workflow:
+
+```bash
+node sdk/typescript-compiler/compiler.mjs \
+  --entry examples/typescript-workflows/stream-job-rollup-workflow.ts \
+  --export streamJobRollupWorkflow \
+  --definition-id stream-job-rollup-workflow \
+  --version 1 \
+  --out target/workflow-artifacts/stream-job-rollup-workflow.json
+```
+
 At that point the artifact can be published through the normal workflow-definition path for your environment.
 
 ## 3. Create A Topic Adapter
@@ -79,6 +116,8 @@ The start-workflow example uses deterministic templates for workflow input, memo
   "request_id_json_pointer": "/request_id"
 }
 ```
+
+The same adapter pattern works for stream-job-backed workflows too: the topic adapter still starts the workflow, and the workflow decides whether to fan out with `bulkActivity()` or hand the payload to `ctx.startStreamJob(...)`.
 
 The signal example keeps the adapter narrow: map the record to a workflow instance and signal payload, then let the workflow decide how to batch the work.
 

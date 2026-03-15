@@ -122,3 +122,4 @@ If `startStreamJob`-style primitives are added later, they should land as distin
 They must not be smuggled into the bulk-activity nodes in a way that weakens the current throughput-mode contract.
 
 See [stream-jobs.md](/Users/bene/code/fabrik/docs/spec/stream-jobs.md) for the target semantic contract behind those nodes.
+The stream-side compiled artifact model that those nodes talk to is defined separately in [streams-ir.md](/Users/bene/code/fabrik/docs/spec/streams-ir.md).

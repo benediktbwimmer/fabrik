@@ -1284,6 +1284,7 @@ dependencies = [
  "serde",
  "serde_cbor",
  "serde_json",
+ "sha2",
  "uuid",
 ]
 
@@ -4233,6 +4234,7 @@ dependencies = [
  "fabrik-worker-protocol",
  "fabrik-workflow",
  "futures-util",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

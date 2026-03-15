@@ -20,18 +20,22 @@ use fabrik_config::{HttpServiceConfig, PostgresConfig, RedpandaConfig};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{
-    TopicAdapterRecord, TopicAdapterResolvedDispatch, WorkflowFastStartMode,
-    WorkflowFastStartRecord, WorkflowFastStartStatus, WorkflowFastStartTerminalUpdate,
-    WorkflowRunFilters, WorkflowStore, resolve_topic_adapter_dispatch,
+    StreamJobBridgeHandleRecord, StreamJobRecord, TopicAdapterRecord, TopicAdapterResolvedDispatch,
+    WorkflowFastStartMode, WorkflowFastStartRecord, WorkflowFastStartStatus,
+    WorkflowFastStartTerminalUpdate, WorkflowRunFilters, WorkflowStore,
+    resolve_topic_adapter_dispatch,
 };
 use fabrik_throughput::{
-    ADMISSION_POLICY_VERSION, ActivityCapabilityRegistry, FastPathRejectionReason, PayloadHandle,
-    ThroughputBackend, ThroughputCommand, ThroughputCommandEnvelope, TinyWorkflowExecutionMode,
+    ADMISSION_POLICY_VERSION, ActivityCapabilityRegistry, CancelStreamJobCommand,
+    CompiledStreamJobArtifact, FastPathRejectionReason, PayloadHandle, ScheduleStreamJobCommand,
+    StreamJobBridgeHandleStatus, StreamJobOriginKind, StreamJobStatus,
+    THROUGHPUT_BRIDGE_PROTOCOL_VERSION, ThroughputBackend, ThroughputBridgeOperationKind,
+    ThroughputCommand, ThroughputCommandEnvelope, TinyWorkflowExecutionMode,
     TinyWorkflowStartBatchCommand, TinyWorkflowStartCommand, TinyWorkflowStartItem,
     WorkflowAdmissionMode, can_inline_durable_tiny_fanout, can_inline_stream_v2_microbatch,
     load_activity_capability_registry_from_env, parse_benchmark_compact_input_spec,
     parse_benchmark_compact_total_items_from_handle, resolve_activity_capabilities,
-    tiny_workflow_routing_decision,
+    stream_job_bridge_request_id, stream_job_handle_id, tiny_workflow_routing_decision,
 };
 use fabrik_workflow::{
     CompiledExecutionPlan, CompiledWorkflowArtifact, ExecutionTurnContext, ReplayDivergence,
@@ -66,6 +70,7 @@ struct AppState {
     broker: BrokerConfig,
     publisher: WorkflowPublisher,
     throughput_command_publisher: JsonTopicPublisher<ThroughputCommandEnvelope>,
+    streams_command_publisher: JsonTopicPublisher<ThroughputCommandEnvelope>,
     store: WorkflowStore,
     runtime_id: String,
     activity_capability_registry: ActivityCapabilityRegistry,
@@ -372,6 +377,67 @@ struct PublishWorkflowArtifactResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct PublishStreamArtifactResponse {
+    tenant_id: String,
+    definition_id: String,
+    version: u32,
+    artifact_hash: String,
+    status: &'static str,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SubmitStandaloneStreamJobRequest {
+    definition_id: String,
+    #[serde(default)]
+    version: Option<u32>,
+    input: Value,
+    #[serde(default)]
+    config: Option<Value>,
+    #[serde(default, alias = "stream_instance_id")]
+    instance_id: Option<String>,
+    #[serde(default)]
+    run_id: Option<String>,
+    #[serde(default)]
+    job_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitStandaloneStreamJobResponse {
+    tenant_id: String,
+    definition_id: String,
+    version: u32,
+    artifact_hash: String,
+    instance_id: String,
+    stream_instance_id: String,
+    run_id: String,
+    stream_run_id: String,
+    job_id: String,
+    handle_id: String,
+    job_name: String,
+    origin_kind: String,
+    status: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CancelStandaloneStreamJobRequest {
+    #[serde(default = "default_cancel_reason")]
+    reason: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CancelStandaloneStreamJobResponse {
+    tenant_id: String,
+    instance_id: String,
+    stream_instance_id: String,
+    run_id: String,
+    stream_run_id: String,
+    job_id: String,
+    handle_id: String,
+    origin_kind: String,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
 struct ValidateWorkflowArtifactResponse {
     tenant_id: String,
     definition_id: String,
@@ -424,6 +490,11 @@ async fn main() -> Result<()> {
         redpanda.throughput_commands_topic,
         redpanda.throughput_partitions,
     );
+    let streams_commands = JsonTopicConfig::new(
+        redpanda.brokers.clone(),
+        redpanda.streams_commands_topic,
+        redpanda.throughput_partitions,
+    );
     let store = WorkflowStore::connect(&postgres.url).await?;
     store.init().await?;
     let activity_capability_registry =
@@ -437,6 +508,11 @@ async fn main() -> Result<()> {
         throughput_command_publisher: JsonTopicPublisher::new(
             &throughput_commands,
             "ingest-service-throughput-commands",
+        )
+        .await?,
+        streams_command_publisher: JsonTopicPublisher::new(
+            &streams_commands,
+            "ingest-service-streams-commands",
         )
         .await?,
         store,
@@ -456,6 +532,12 @@ async fn main() -> Result<()> {
     .route("/tenants/{tenant_id}/workflow-definitions", post(publish_workflow_definition))
     .route("/tenants/{tenant_id}/workflow-artifacts", post(publish_workflow_artifact))
     .route("/tenants/{tenant_id}/workflow-artifacts/validate", post(validate_workflow_artifact))
+    .route("/tenants/{tenant_id}/stream-artifacts", post(publish_stream_artifact))
+    .route("/tenants/{tenant_id}/stream-jobs", post(submit_standalone_stream_job))
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/cancel",
+        post(cancel_standalone_stream_job),
+    )
     .route("/workflows/{workflow_id}/trigger", post(trigger_workflow))
     .route("/workflows/{workflow_id}/trigger-batch", post(trigger_workflow_batch))
     .route(
@@ -1263,6 +1345,331 @@ async fn validate_workflow_artifact(
         compatible: validation.failed_run_count == 0,
         status: if validation.failed_run_count == 0 { "validated" } else { "incompatible" },
         validation,
+    }))
+}
+
+async fn publish_stream_artifact(
+    Path(tenant_id): Path<String>,
+    State(state): State<AppState>,
+    Json(artifact): Json<CompiledStreamJobArtifact>,
+) -> Result<(StatusCode, Json<PublishStreamArtifactResponse>), (StatusCode, String)> {
+    artifact.validate_persistable().map_err(validation_error)?;
+    state.store.put_stream_artifact(&tenant_id, &artifact).await.map_err(internal_error)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(PublishStreamArtifactResponse {
+            tenant_id,
+            definition_id: artifact.definition_id.clone(),
+            version: artifact.definition_version,
+            artifact_hash: artifact.artifact_hash.clone(),
+            status: "stored",
+        }),
+    ))
+}
+
+fn default_standalone_stream_instance_id(definition_id: &str) -> String {
+    format!("stream-{definition_id}")
+}
+
+fn standalone_stream_job_record(
+    tenant_id: &str,
+    handle: &StreamJobBridgeHandleRecord,
+    checkpoint_policy: Option<Value>,
+    view_definitions: Option<Value>,
+    occurred_at: DateTime<Utc>,
+) -> StreamJobRecord {
+    StreamJobRecord {
+        tenant_id: tenant_id.to_owned(),
+        instance_id: handle.instance_id.clone(),
+        run_id: handle.run_id.clone(),
+        stream_instance_id: handle.stream_instance_id.clone(),
+        stream_run_id: handle.stream_run_id.clone(),
+        job_id: handle.job_id.clone(),
+        handle_id: handle.handle_id.clone(),
+        protocol_version: handle.protocol_version.clone(),
+        operation_kind: handle.operation_kind.clone(),
+        workflow_event_id: handle.workflow_event_id,
+        bridge_request_id: handle.bridge_request_id.clone(),
+        origin_kind: StreamJobOriginKind::Standalone.as_str().to_owned(),
+        definition_id: handle.definition_id.clone(),
+        definition_version: handle.definition_version,
+        artifact_hash: handle.artifact_hash.clone(),
+        job_name: handle.job_name.clone(),
+        input_ref: handle.input_ref.clone(),
+        config_ref: handle.config_ref.clone(),
+        checkpoint_policy,
+        view_definitions,
+        status: StreamJobStatus::Created.as_str().to_owned(),
+        workflow_owner_epoch: handle.workflow_owner_epoch,
+        stream_owner_epoch: handle.stream_owner_epoch,
+        starting_at: None,
+        running_at: None,
+        draining_at: None,
+        latest_checkpoint_name: None,
+        latest_checkpoint_sequence: None,
+        latest_checkpoint_at: None,
+        latest_checkpoint_output: None,
+        cancellation_requested_at: None,
+        cancellation_reason: None,
+        workflow_accepted_at: None,
+        terminal_event_id: None,
+        terminal_at: None,
+        terminal_output: None,
+        terminal_error: None,
+        created_at: occurred_at,
+        updated_at: occurred_at,
+    }
+}
+
+async fn submit_standalone_stream_job(
+    Path(tenant_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<SubmitStandaloneStreamJobRequest>,
+) -> Result<(StatusCode, Json<SubmitStandaloneStreamJobResponse>), (StatusCode, String)> {
+    let artifact = match request.version {
+        Some(version) => state
+            .store
+            .get_stream_artifact_version(&tenant_id, &request.definition_id, version)
+            .await
+            .map_err(internal_error)?,
+        None => state
+            .store
+            .get_latest_stream_artifact(&tenant_id, &request.definition_id)
+            .await
+            .map_err(internal_error)?,
+    }
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            format!(
+                "stream artifact {}{} not found for tenant {}",
+                request.definition_id,
+                request
+                    .version
+                    .map(|value| format!(" version {value}"))
+                    .unwrap_or_else(|| String::from("")),
+                tenant_id
+            ),
+        )
+    })?;
+
+    let instance_id = request
+        .instance_id
+        .clone()
+        .unwrap_or_else(|| default_standalone_stream_instance_id(&artifact.definition_id));
+    let run_id = request.run_id.clone().unwrap_or_else(|| Uuid::now_v7().to_string());
+    let job_id = request.job_id.clone().unwrap_or_else(|| format!("job-{}", Uuid::now_v7()));
+    let handle_id = stream_job_handle_id(&tenant_id, &instance_id, &run_id, &job_id);
+    let bridge_request_id =
+        stream_job_bridge_request_id(&tenant_id, &instance_id, &run_id, &job_id);
+
+    if let Some(existing) = state
+        .store
+        .get_stream_job_bridge_handle(&tenant_id, &instance_id, &run_id, &job_id)
+        .await
+        .map_err(internal_error)?
+    {
+        return Ok((
+            StatusCode::OK,
+            Json(SubmitStandaloneStreamJobResponse {
+                tenant_id,
+                definition_id: existing.definition_id,
+                version: existing.definition_version.unwrap_or(artifact.definition_version),
+                artifact_hash: existing
+                    .artifact_hash
+                    .unwrap_or_else(|| artifact.artifact_hash.clone()),
+                instance_id: instance_id.clone(),
+                stream_instance_id: existing.stream_instance_id,
+                run_id: run_id.clone(),
+                stream_run_id: existing.stream_run_id,
+                job_id: job_id.clone(),
+                handle_id: existing.handle_id,
+                job_name: existing.job_name,
+                origin_kind: existing.origin_kind,
+                status: existing.status,
+            }),
+        ));
+    }
+
+    let occurred_at = Utc::now();
+    let workflow_event_id = Uuid::now_v7();
+    let checkpoint_policy = if artifact.job.checkpoint_policy.is_some() {
+        Some(
+            serde_json::to_value(&artifact.job.checkpoint_policy)
+                .map_err(|error| internal_error(anyhow::Error::new(error)))?,
+        )
+    } else {
+        None
+    };
+    let view_definitions = if artifact.job.views.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_value(&artifact.job.views)
+                .map_err(|error| internal_error(anyhow::Error::new(error)))?,
+        )
+    };
+    let handle = StreamJobBridgeHandleRecord {
+        workflow_event_id,
+        protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+        operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+        tenant_id: tenant_id.clone(),
+        instance_id: instance_id.clone(),
+        run_id: run_id.clone(),
+        stream_instance_id: instance_id.clone(),
+        stream_run_id: run_id.clone(),
+        job_id: job_id.clone(),
+        handle_id: handle_id.clone(),
+        bridge_request_id: bridge_request_id.clone(),
+        origin_kind: StreamJobOriginKind::Standalone.as_str().to_owned(),
+        definition_id: artifact.definition_id.clone(),
+        definition_version: Some(artifact.definition_version),
+        artifact_hash: Some(artifact.artifact_hash.clone()),
+        job_name: artifact.job.name.clone(),
+        input_ref: serde_json::to_string(&request.input)
+            .map_err(|error| internal_error(anyhow::Error::new(error)))?,
+        config_ref: request
+            .config
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| internal_error(anyhow::Error::new(error)))?,
+        checkpoint_policy: checkpoint_policy.clone(),
+        view_definitions: view_definitions.clone(),
+        status: StreamJobBridgeHandleStatus::Admitted.as_str().to_owned(),
+        workflow_owner_epoch: None,
+        stream_owner_epoch: None,
+        cancellation_requested_at: None,
+        cancellation_reason: None,
+        terminal_event_id: None,
+        terminal_at: None,
+        workflow_accepted_at: None,
+        terminal_output: None,
+        terminal_error: None,
+        created_at: occurred_at,
+        updated_at: occurred_at,
+    };
+    state.store.upsert_stream_job_bridge_handle(&handle).await.map_err(internal_error)?;
+    state
+        .store
+        .upsert_stream_job(&standalone_stream_job_record(
+            &tenant_id,
+            &handle,
+            checkpoint_policy,
+            view_definitions,
+            occurred_at,
+        ))
+        .await
+        .map_err(internal_error)?;
+
+    let command = ThroughputCommandEnvelope {
+        command_id: Uuid::now_v7(),
+        occurred_at,
+        dedupe_key: format!("stream-job-submit:{handle_id}"),
+        partition_key: fabrik_throughput::throughput_partition_key(&job_id, 0),
+        payload: ThroughputCommand::ScheduleStreamJob(ScheduleStreamJobCommand {
+            tenant_id: tenant_id.clone(),
+            stream_instance_id: instance_id.clone(),
+            stream_run_id: run_id.clone(),
+            job_id: job_id.clone(),
+            handle_id: handle_id.clone(),
+        }),
+    };
+    state
+        .streams_command_publisher
+        .publish(&command, &command.partition_key)
+        .await
+        .map_err(internal_error)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(SubmitStandaloneStreamJobResponse {
+            tenant_id,
+            definition_id: artifact.definition_id,
+            version: artifact.definition_version,
+            artifact_hash: artifact.artifact_hash,
+            instance_id: instance_id.clone(),
+            stream_instance_id: handle.stream_instance_id.clone(),
+            run_id: run_id.clone(),
+            stream_run_id: handle.stream_run_id.clone(),
+            job_id: job_id.clone(),
+            handle_id,
+            job_name: handle.job_name,
+            origin_kind: handle.origin_kind.clone(),
+            status: handle.status,
+        }),
+    ))
+}
+
+async fn cancel_standalone_stream_job(
+    Path((tenant_id, instance_id, run_id, job_id)): Path<(String, String, String, String)>,
+    State(state): State<AppState>,
+    Json(request): Json<CancelStandaloneStreamJobRequest>,
+) -> Result<Json<CancelStandaloneStreamJobResponse>, (StatusCode, String)> {
+    let mut handle = state
+        .store
+        .get_stream_job_bridge_handle(&tenant_id, &instance_id, &run_id, &job_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("stream job {job_id} not found for {tenant_id}/{instance_id}/{run_id}"),
+            )
+        })?;
+
+    if !handle.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal) {
+        let occurred_at = Utc::now();
+        handle.status = StreamJobBridgeHandleStatus::CancellationRequested.as_str().to_owned();
+        handle.cancellation_requested_at = Some(occurred_at);
+        handle.cancellation_reason = Some(request.reason.clone());
+        handle.updated_at = occurred_at;
+        state.store.upsert_stream_job_bridge_handle(&handle).await.map_err(internal_error)?;
+        if let Some(mut job) = state
+            .store
+            .get_stream_job(&tenant_id, &instance_id, &run_id, &job_id)
+            .await
+            .map_err(internal_error)?
+        {
+            job.status = StreamJobStatus::Draining.as_str().to_owned();
+            job.draining_at = job.draining_at.or(Some(occurred_at));
+            job.cancellation_requested_at = Some(occurred_at);
+            job.cancellation_reason = Some(request.reason.clone());
+            job.updated_at = occurred_at;
+            state.store.upsert_stream_job(&job).await.map_err(internal_error)?;
+        }
+        let command = ThroughputCommandEnvelope {
+            command_id: Uuid::now_v7(),
+            occurred_at,
+            dedupe_key: format!("stream-job-cancel:{}", handle.handle_id),
+            partition_key: fabrik_throughput::throughput_partition_key(&job_id, 0),
+            payload: ThroughputCommand::CancelStreamJob(CancelStreamJobCommand {
+                tenant_id: tenant_id.clone(),
+                stream_instance_id: handle.stream_instance_id.clone(),
+                stream_run_id: handle.stream_run_id.clone(),
+                job_id: job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                reason: Some(request.reason),
+            }),
+        };
+        state
+            .streams_command_publisher
+            .publish(&command, &command.partition_key)
+            .await
+            .map_err(internal_error)?;
+    }
+
+    Ok(Json(CancelStandaloneStreamJobResponse {
+        tenant_id,
+        instance_id: instance_id.clone(),
+        stream_instance_id: handle.stream_instance_id.clone(),
+        run_id: run_id.clone(),
+        stream_run_id: handle.stream_run_id.clone(),
+        job_id: job_id.clone(),
+        handle_id: handle.handle_id,
+        origin_kind: handle.origin_kind.clone(),
+        status: handle.status,
     }))
 }
 
@@ -3612,6 +4019,40 @@ mod tests {
                 }
             }
         }
+
+        async fn connect_streams_command_publisher(
+            &self,
+        ) -> Result<JsonTopicPublisher<ThroughputCommandEnvelope>> {
+            let config = JsonTopicConfig::new(
+                self.broker.brokers.clone(),
+                format!("streams-commands-test-{}", Uuid::now_v7()),
+                1,
+            );
+            let deadline = Instant::now() + StdDuration::from_secs(45);
+            loop {
+                match JsonTopicPublisher::<ThroughputCommandEnvelope>::new(
+                    &config,
+                    "ingest-service-test-streams-commands",
+                )
+                .await
+                {
+                    Ok(publisher) => return Ok(publisher),
+                    Err(error) if Instant::now() < deadline => {
+                        let _ = error;
+                        sleep(StdDuration::from_millis(500)).await;
+                    }
+                    Err(error) => {
+                        let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        return Err(error).with_context(|| {
+                            format!(
+                                "redpanda test container {} did not become ready for streams command topic; logs:\n{}",
+                                self.container_name, logs
+                            )
+                        });
+                    }
+                }
+            }
+        }
     }
 
     impl Drop for TestRedpanda {
@@ -3704,6 +4145,7 @@ mod tests {
         runtime_id: &str,
     ) -> Result<AppState> {
         let throughput_command_publisher = redpanda.connect_throughput_command_publisher().await?;
+        let streams_command_publisher = redpanda.connect_streams_command_publisher().await?;
         let (tiny_start_sender, tiny_start_receiver) =
             mpsc::channel(TINY_WORKFLOW_SINGLE_START_QUEUE_CAPACITY);
         drop(tiny_start_receiver);
@@ -3711,6 +4153,7 @@ mod tests {
             broker: redpanda.broker.clone(),
             publisher: redpanda.connect_workflow_publisher().await?,
             throughput_command_publisher,
+            streams_command_publisher,
             store,
             runtime_id: runtime_id.to_owned(),
             activity_capability_registry: ActivityCapabilityRegistry::default(),

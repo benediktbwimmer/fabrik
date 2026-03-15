@@ -355,12 +355,14 @@ test("compiler lowers stream job handles, checkpoint waits, and strong queries",
   assert.match(serialized, /"type":"start_stream_job"/);
   assert.match(serialized, /"job_name":"keyed-rollup"/);
   assert.match(serialized, /"type":"wait_for_stream_checkpoint"/);
-  assert.match(serialized, /"checkpoint_name":"initial-rollup-ready"/);
+  assert.match(serialized, /"checkpoint_name":"hourly-rollup-ready"/);
   assert.match(serialized, /"output_var":"checkpoint"/);
   assert.match(serialized, /"type":"query_stream_job"/);
   assert.match(serialized, /"query_name":"accountTotals"/);
   assert.match(serialized, /"consistency":"strong"/);
   assert.match(serialized, /"output_var":"account"/);
+  assert.match(serialized, /"type":"await_stream_job_terminal"/);
+  assert.match(serialized, /"output_var":"result"/);
 });
 
 test("compiler rejects non-static bulk options", async () => {

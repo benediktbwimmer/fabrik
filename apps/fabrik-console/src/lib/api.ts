@@ -303,6 +303,307 @@ export type RunListResponse = {
   items: RunListItem[];
 };
 
+export type StreamJobCheckpointSummary = {
+  checkpoint_name: string;
+  definition: unknown | null;
+  delivery: string | null;
+  sequence: number | null;
+  reached: boolean;
+  reached_at: string | null;
+};
+
+export type StreamJobViewSummary = {
+  view_name: string;
+  definition: unknown | null;
+  projected_key_count: number;
+  latest_projected_checkpoint_sequence: number | null;
+  latest_projected_at: string | null;
+  eventual_projection_lag_ms: number | null;
+};
+
+export type StreamJobSurfaceSummary = {
+  declared_checkpoint_count: number;
+  reached_checkpoint_count: number;
+  latest_checkpoint_name: string | null;
+  latest_checkpoint_sequence: number | null;
+  latest_checkpoint_at: string | null;
+  view_count: number;
+  projected_view_count: number;
+  total_projected_keys: number;
+  slowest_eventual_view_lag_ms: number | null;
+  checkpoints: StreamJobCheckpointSummary[];
+  views: StreamJobViewSummary[];
+};
+
+export type StreamJobWorkflowBinding = {
+  instance_id: string;
+  run_id: string;
+};
+
+export type StreamJobBridgeSurfaceSummary = {
+  pending_repair_count: number;
+  pending_repairs: string[];
+  next_repair: string | null;
+  latest_query_id: string | null;
+  latest_query_name: string | null;
+  latest_query_status: string | null;
+  latest_query_consistency: string | null;
+  latest_query_requested_at: string | null;
+  latest_query_completed_at: string | null;
+  latest_query_accepted_at: string | null;
+};
+
+export type StreamJobSummary = {
+  protocol_version: string;
+  operation_kind: string;
+  origin_kind: string;
+  stream_instance_id: string;
+  stream_run_id: string;
+  source_workflow_event_id: string;
+  bridge_request_id: string;
+  handle_id: string;
+  job_id: string;
+  definition_id: string;
+  definition_version: number | null;
+  artifact_hash: string | null;
+  job_name: string;
+  input_ref: string;
+  config_ref: string | null;
+  checkpoint_policy: unknown | null;
+  declared_checkpoints: StreamJobCheckpointSummary[];
+  view_definitions: unknown | null;
+  stream_surface: StreamJobSurfaceSummary;
+  bridge_surface: StreamJobBridgeSurfaceSummary;
+  status: string;
+  workflow_owner_epoch: number | null;
+  stream_owner_epoch: number | null;
+  starting_at: string | null;
+  running_at: string | null;
+  draining_at: string | null;
+  latest_checkpoint_name: string | null;
+  latest_checkpoint_sequence: number | null;
+  latest_checkpoint_at: string | null;
+  latest_checkpoint_output: unknown | null;
+  cancellation_requested_at: string | null;
+  cancellation_reason: string | null;
+  workflow_accepted_at: string | null;
+  terminal_event_id: string | null;
+  terminal_at: string | null;
+  terminal_output: unknown | null;
+  terminal_error: string | null;
+  checkpoint_count: number;
+  query_count: number;
+  latest_query_id: string | null;
+  latest_query_name: string | null;
+  latest_query_status: string | null;
+  latest_query_consistency: string | null;
+  latest_query_requested_at: string | null;
+  latest_query_completed_at: string | null;
+  latest_query_accepted_at: string | null;
+  views: StreamJobViewSummary[];
+  workflow_binding: StreamJobWorkflowBinding | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type StreamJobsResponse = {
+  tenant_id: string;
+  instance_id: string;
+  stream_instance_id: string;
+  run_id: string;
+  stream_run_id: string;
+  page: PageInfo;
+  job_count: number;
+  jobs: StreamJobSummary[];
+};
+
+export type TenantStreamJobsResponse = {
+  tenant_id: string;
+  page: PageInfo;
+  job_count: number;
+  jobs: StreamJobSummary[];
+};
+
+export type StreamJobBridgeCheckpointView = {
+  protocol_version: string;
+  operation_kind: string;
+  source_workflow_event_id: string;
+  bridge_request_id: string;
+  await_request_id: string;
+  checkpoint_name: string;
+  checkpoint_sequence: number | null;
+  status: string;
+  workflow_owner_epoch: number | null;
+  stream_owner_epoch: number | null;
+  reached_at: string | null;
+  output: unknown | null;
+  accepted_at: string | null;
+  cancelled_at: string | null;
+  next_repair: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type StreamJobBridgeQueryView = {
+  protocol_version: string;
+  operation_kind: string;
+  source_workflow_event_id: string;
+  bridge_request_id: string;
+  query_id: string;
+  query_name: string;
+  query_args: unknown | null;
+  consistency: string;
+  status: string;
+  workflow_owner_epoch: number | null;
+  stream_owner_epoch: number | null;
+  output: unknown | null;
+  error: string | null;
+  requested_at: string;
+  completed_at: string | null;
+  accepted_at: string | null;
+  cancelled_at: string | null;
+  next_repair: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type StreamJobBridgeHandleSummary = {
+  protocol_version: string;
+  operation_kind: string;
+  source_workflow_event_id: string;
+  bridge_request_id: string;
+  handle_id: string;
+  job_id: string;
+  definition_id: string;
+  definition_version: number | null;
+  artifact_hash: string | null;
+  job_name: string;
+  input_ref: string;
+  config_ref: string | null;
+  checkpoint_policy: unknown | null;
+  view_definitions: unknown | null;
+  status: string;
+  workflow_owner_epoch: number | null;
+  stream_owner_epoch: number | null;
+  cancellation_requested_at: string | null;
+  cancellation_reason: string | null;
+  terminal_event_id: string | null;
+  terminal_at: string | null;
+  workflow_accepted_at: string | null;
+  checkpoint_count: number;
+  query_count: number;
+  pending_repair_count: number;
+  pending_repairs: string[];
+  next_repair: string | null;
+  latest_query_id: string | null;
+  latest_query_name: string | null;
+  latest_query_status: string | null;
+  latest_query_consistency: string | null;
+  latest_query_requested_at: string | null;
+  latest_query_completed_at: string | null;
+  latest_query_accepted_at: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type StreamJobBridgeHandlesResponse = {
+  tenant_id: string;
+  instance_id: string;
+  run_id: string;
+  page: PageInfo;
+  handle_count: number;
+  handles: StreamJobBridgeHandleSummary[];
+};
+
+export type StreamJobBridgeRepairsResponse = {
+  tenant_id: string;
+  instance_id: string;
+  run_id: string;
+  page: PageInfo;
+  repair_count: number;
+  handles: StreamJobBridgeHandleSummary[];
+};
+
+export type StreamJobBridgeHandleResponse = {
+  tenant_id: string;
+  instance_id: string;
+  run_id: string;
+  job_id: string;
+  handle: StreamJobBridgeHandleSummary;
+  checkpoints: StreamJobBridgeCheckpointView[];
+  queries: StreamJobBridgeQueryView[];
+};
+
+export type StreamJobResponse = {
+  tenant_id: string;
+  instance_id: string;
+  stream_instance_id: string;
+  run_id: string;
+  stream_run_id: string;
+  job_id: string;
+  job: StreamJobSummary;
+  views: StreamJobViewSummary[];
+  checkpoints: StreamJobBridgeCheckpointView[];
+  queries: StreamJobBridgeQueryView[];
+};
+
+export type StreamJobViewResponse = {
+  handle_id: string;
+  job_id: string;
+  view_name: string;
+  logical_key: string;
+  consistency: string;
+  source: string;
+  projection_lag_ms: number | null;
+  watch_cursor: string;
+  output: unknown;
+  checkpoint_sequence: number;
+  updated_at: string;
+};
+
+export type StreamJobViewKeyRecord = {
+  logical_key: string;
+  checkpoint_sequence: number;
+  updated_at: string;
+};
+
+export type StreamJobViewKeysResponse = {
+  tenant_id: string;
+  instance_id: string;
+  run_id: string;
+  job_id: string;
+  view_name: string;
+  consistency: string;
+  source: string;
+  projection_lag_ms: number | null;
+  watch_cursor: string;
+  page: PageInfo;
+  key_count: number;
+  keys: StreamJobViewKeyRecord[];
+};
+
+export type StreamJobViewEntryRecord = {
+  logical_key: string;
+  output: unknown;
+  checkpoint_sequence: number;
+  updated_at: string;
+};
+
+export type StreamJobViewEntriesResponse = {
+  tenant_id: string;
+  instance_id: string;
+  run_id: string;
+  job_id: string;
+  view_name: string;
+  consistency: string;
+  source: string;
+  projection_lag_ms: number | null;
+  watch_cursor: string;
+  page: PageInfo;
+  entry_count: number;
+  entries: StreamJobViewEntryRecord[];
+};
+
 export type WorkflowReplayResponse = {
   tenant_id: string;
   instance_id: string;
@@ -984,6 +1285,74 @@ export const api = {
   ) =>
     request<WorkflowBulkBatchResponse>(
       `/tenants/${tenantId}/workflows/${instanceId}/runs/${runId}/bulk-batches/${batchId}?consistency=${consistency}`
+    ),
+  listStreamJobs: (tenantId: string, instanceId: string, runId: string, params = new URLSearchParams()) =>
+    request<StreamJobsResponse>(
+      `/tenants/${tenantId}/stream-jobs/${encodeURIComponent(instanceId)}/${encodeURIComponent(runId)}${
+        params.toString() ? `?${params.toString()}` : ""
+      }`
+    ),
+  listTenantStreamJobs: (tenantId: string, params = new URLSearchParams()) =>
+    request<TenantStreamJobsResponse>(
+      `/tenants/${tenantId}/stream-jobs${params.toString() ? `?${params.toString()}` : ""}`
+    ),
+  getStreamJob: (tenantId: string, instanceId: string, runId: string, jobId: string) =>
+    request<StreamJobResponse>(
+      `/tenants/${tenantId}/stream-jobs/${encodeURIComponent(instanceId)}/${encodeURIComponent(runId)}/${encodeURIComponent(jobId)}`
+    ),
+  getStreamJobBridgeHandles: (tenantId: string, instanceId: string, runId: string, params = new URLSearchParams()) =>
+    request<StreamJobBridgeHandlesResponse>(
+      `/tenants/${tenantId}/stream-jobs/${encodeURIComponent(instanceId)}/${encodeURIComponent(runId)}/bridge/handles${
+        params.toString() ? `?${params.toString()}` : ""
+      }`
+    ),
+  getStreamJobBridgeRepairs: (tenantId: string, instanceId: string, runId: string, params = new URLSearchParams()) =>
+    request<StreamJobBridgeRepairsResponse>(
+      `/tenants/${tenantId}/stream-jobs/${encodeURIComponent(instanceId)}/${encodeURIComponent(runId)}/bridge/repairs${
+        params.toString() ? `?${params.toString()}` : ""
+      }`
+    ),
+  getStreamJobBridgeHandle: (tenantId: string, instanceId: string, runId: string, jobId: string) =>
+    request<StreamJobBridgeHandleResponse>(
+      `/tenants/${tenantId}/stream-jobs/${encodeURIComponent(instanceId)}/${encodeURIComponent(runId)}/bridge/handles/${encodeURIComponent(jobId)}`
+    ),
+  getStreamJobView: (
+    tenantId: string,
+    instanceId: string,
+    runId: string,
+    jobId: string,
+    viewName: string,
+    logicalKey: string,
+    consistency = "strong"
+  ) =>
+    request<StreamJobViewResponse>(
+      `/tenants/${tenantId}/stream-jobs/${encodeURIComponent(instanceId)}/${encodeURIComponent(runId)}/${encodeURIComponent(jobId)}/views/${encodeURIComponent(viewName)}/keys/${encodeURIComponent(logicalKey)}?consistency=${encodeURIComponent(consistency)}`
+    ),
+  getStreamJobViewKeys: (
+    tenantId: string,
+    instanceId: string,
+    runId: string,
+    jobId: string,
+    viewName: string,
+    consistency = "strong",
+    limit = 50,
+    offset = 0
+  ) =>
+    request<StreamJobViewKeysResponse>(
+      `/tenants/${tenantId}/stream-jobs/${encodeURIComponent(instanceId)}/${encodeURIComponent(runId)}/${encodeURIComponent(jobId)}/views/${encodeURIComponent(viewName)}/keys?consistency=${encodeURIComponent(consistency)}&limit=${limit}&offset=${offset}`
+    ),
+  getStreamJobViewEntries: (
+    tenantId: string,
+    instanceId: string,
+    runId: string,
+    jobId: string,
+    viewName: string,
+    consistency = "strong",
+    limit = 50,
+    offset = 0
+  ) =>
+    request<StreamJobViewEntriesResponse>(
+      `/tenants/${tenantId}/stream-jobs/${encodeURIComponent(instanceId)}/${encodeURIComponent(runId)}/${encodeURIComponent(jobId)}/views/${encodeURIComponent(viewName)}/entries?consistency=${encodeURIComponent(consistency)}&limit=${limit}&offset=${offset}`
     ),
   getWorkflowSignals: (tenantId: string, instanceId: string, runId?: string) =>
     request<WorkflowSignalsResponse>(

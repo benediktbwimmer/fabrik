@@ -7,33 +7,30 @@ impl LocalThroughputState {
         offset: i64,
         entry: &ThroughputChangelogEntry,
     ) -> Result<bool> {
-        if self.last_applied_offset(partition_id)?.is_some_and(|current| current >= offset) {
-            return Ok(false);
-        }
+        self.apply_changelog_entry_for_plane(
+            LocalChangelogPlane::Throughput,
+            partition_id,
+            offset,
+            entry.entry_id,
+            entry.occurred_at,
+            |state, write_batch| state.write_entry_payload(write_batch, entry),
+        )
+    }
 
-        let mut write_batch = WriteBatch::default();
-        if self.is_mirrored_entry_pending(entry.entry_id)? {
-            self.write_batch_delete_cf_and_legacy(
-                &mut write_batch,
-                META_CF,
-                &mirrored_entry_key(entry.entry_id),
-            );
-        } else {
-            self.write_entry_payload(&mut write_batch, entry)?;
-        }
-        self.write_batch_put_cf(
-            &mut write_batch,
-            META_CF,
-            &offset_key(partition_id),
-            offset.to_string().into_bytes(),
-        );
-        self.db
-            .write(write_batch)
-            .context("failed to apply throughput changelog entry to local state")?;
-        let mut meta = self.meta.lock().expect("local throughput meta lock poisoned");
-        meta.changelog_entries_applied = meta.changelog_entries_applied.saturating_add(1);
-        meta.last_changelog_apply_at = Some(entry.occurred_at);
-        Ok(true)
+    pub fn apply_streams_changelog_entry(
+        &self,
+        partition_id: i32,
+        offset: i64,
+        entry: &StreamsChangelogEntry,
+    ) -> Result<bool> {
+        self.apply_changelog_entry_for_plane(
+            LocalChangelogPlane::Streams,
+            partition_id,
+            offset,
+            entry.entry_id,
+            entry.occurred_at,
+            |state, write_batch| state.write_streams_entry_payload(write_batch, entry),
+        )
     }
 
     pub fn mirror_changelog_entry(&self, entry: &ThroughputChangelogEntry) -> Result<()> {
@@ -41,22 +38,113 @@ impl LocalThroughputState {
     }
 
     pub fn mirror_changelog_records(&self, entries: &[ThroughputChangelogEntry]) -> Result<()> {
+        self.mirror_changelog_records_for_plane(
+            LocalChangelogPlane::Throughput,
+            entries.iter().map(|entry| {
+                (entry.entry_id, |state: &LocalThroughputState, write_batch: &mut WriteBatch| {
+                    state.write_entry_payload(write_batch, entry)
+                })
+            }),
+        )
+    }
+
+    pub fn mirror_streams_changelog_entry(&self, entry: &StreamsChangelogEntry) -> Result<()> {
+        self.mirror_streams_changelog_records(std::slice::from_ref(entry))
+    }
+
+    pub fn mirror_streams_changelog_records(
+        &self,
+        entries: &[StreamsChangelogEntry],
+    ) -> Result<()> {
+        self.mirror_changelog_records_for_plane(
+            LocalChangelogPlane::Streams,
+            entries.iter().map(|entry| {
+                (entry.entry_id, |state: &LocalThroughputState, write_batch: &mut WriteBatch| {
+                    state.write_streams_entry_payload(write_batch, entry)
+                })
+            }),
+        )
+    }
+
+    fn apply_changelog_entry_for_plane<F>(
+        &self,
+        plane: LocalChangelogPlane,
+        partition_id: i32,
+        offset: i64,
+        entry_id: uuid::Uuid,
+        occurred_at: DateTime<Utc>,
+        write_payload: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce(&LocalThroughputState, &mut WriteBatch) -> Result<()>,
+    {
+        if self
+            .last_applied_offset_for_plane(plane, partition_id)?
+            .is_some_and(|current| current >= offset)
+        {
+            return Ok(false);
+        }
+        let mut write_batch = WriteBatch::default();
+        if self.is_mirrored_entry_pending_for_plane(plane, entry_id)? {
+            self.write_batch_delete_cf_and_legacy(
+                &mut write_batch,
+                META_CF,
+                &mirrored_entry_key(plane, entry_id),
+            );
+        } else {
+            write_payload(self, &mut write_batch)?;
+        }
+        self.write_batch_put_cf(
+            &mut write_batch,
+            META_CF,
+            &offset_key(plane, partition_id),
+            offset.to_string().into_bytes(),
+        );
+        self.db.write(write_batch).context(match plane {
+            LocalChangelogPlane::Throughput => {
+                "failed to apply throughput changelog entry to local state"
+            }
+            LocalChangelogPlane::Streams => {
+                "failed to apply streams changelog entry to local state"
+            }
+        })?;
+        let mut meta = self.meta.lock().expect("local throughput meta lock poisoned");
+        meta.changelog_entries_applied = meta.changelog_entries_applied.saturating_add(1);
+        meta.last_changelog_apply_at = Some(occurred_at);
+        Ok(true)
+    }
+
+    fn mirror_changelog_records_for_plane<I, F>(
+        &self,
+        plane: LocalChangelogPlane,
+        entries: I,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = (uuid::Uuid, F)>,
+        F: FnOnce(&LocalThroughputState, &mut WriteBatch) -> Result<()>,
+    {
+        let entries = entries.into_iter().collect::<Vec<_>>();
         if entries.is_empty() {
             return Ok(());
         }
         let mut write_batch = WriteBatch::default();
-        for entry in entries {
-            self.write_entry_payload(&mut write_batch, entry)?;
+        for (entry_id, write_payload) in entries {
+            write_payload(self, &mut write_batch)?;
             self.write_batch_put_cf(
                 &mut write_batch,
                 META_CF,
-                &mirrored_entry_key(entry.entry_id),
+                &mirrored_entry_key(plane, entry_id),
                 b"1".to_vec(),
             );
         }
-        self.db
-            .write(write_batch)
-            .context("failed to mirror throughput changelog entries into local state")?;
+        self.db.write(write_batch).context(match plane {
+            LocalChangelogPlane::Throughput => {
+                "failed to mirror throughput changelog entries into local state"
+            }
+            LocalChangelogPlane::Streams => {
+                "failed to mirror streams changelog entries into local state"
+            }
+        })?;
         Ok(())
     }
 
@@ -259,6 +347,190 @@ impl LocalThroughputState {
         entry: &ThroughputChangelogEntry,
     ) -> Result<()> {
         match &entry.payload {
+            ThroughputChangelogPayload::StreamJobExecutionPlanned {
+                handle_id,
+                job_id,
+                job_name,
+                view_name,
+                checkpoint_name,
+                checkpoint_sequence,
+                input_item_count,
+                materialized_key_count,
+                active_partitions,
+                owner_epoch,
+                planned_at,
+            } => {
+                let existing = self.load_stream_job_runtime_state(handle_id)?;
+                let state = LocalStreamJobRuntimeState {
+                    handle_id: handle_id.clone(),
+                    job_id: job_id.clone(),
+                    job_name: job_name.clone(),
+                    view_name: view_name.clone(),
+                    checkpoint_name: checkpoint_name.clone(),
+                    checkpoint_sequence: *checkpoint_sequence,
+                    input_item_count: *input_item_count,
+                    materialized_key_count: *materialized_key_count,
+                    active_partitions: active_partitions.clone(),
+                    dispatch_batches: existing
+                        .as_ref()
+                        .map(|state| state.dispatch_batches.clone())
+                        .unwrap_or_default(),
+                    applied_dispatch_batch_ids: existing
+                        .as_ref()
+                        .map(|state| state.applied_dispatch_batch_ids.clone())
+                        .unwrap_or_default(),
+                    dispatch_completed_at: existing
+                        .as_ref()
+                        .and_then(|state| state.dispatch_completed_at),
+                    dispatch_cancelled_at: existing
+                        .as_ref()
+                        .and_then(|state| state.dispatch_cancelled_at),
+                    stream_owner_epoch: *owner_epoch,
+                    planned_at: *planned_at,
+                    latest_checkpoint_at: existing
+                        .as_ref()
+                        .and_then(|state| state.latest_checkpoint_at),
+                    terminal_status: existing
+                        .as_ref()
+                        .and_then(|state| state.terminal_status.clone()),
+                    terminal_output: existing
+                        .as_ref()
+                        .and_then(|state| state.terminal_output.clone()),
+                    terminal_error: existing
+                        .as_ref()
+                        .and_then(|state| state.terminal_error.clone()),
+                    terminal_at: existing.as_ref().and_then(|state| state.terminal_at),
+                    updated_at: *planned_at,
+                };
+                self.write_batch_delete_cf_and_legacy(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &legacy_stream_job_runtime_key(handle_id),
+                );
+                self.write_batch_put_cf_bytes(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &stream_job_runtime_key(handle_id),
+                    encode_rocksdb_value(&state, "stream job runtime state")?,
+                );
+            }
+            ThroughputChangelogPayload::StreamJobViewUpdated {
+                handle_id,
+                job_id,
+                view_name,
+                logical_key,
+                output,
+                checkpoint_sequence,
+                updated_at,
+            } => {
+                let state = LocalStreamJobViewState {
+                    handle_id: handle_id.clone(),
+                    job_id: job_id.clone(),
+                    view_name: view_name.clone(),
+                    logical_key: logical_key.clone(),
+                    output: output.clone(),
+                    checkpoint_sequence: *checkpoint_sequence,
+                    updated_at: *updated_at,
+                };
+                self.write_batch_delete_cf_and_legacy(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &legacy_stream_job_view_key(handle_id, view_name, logical_key),
+                );
+                self.write_batch_put_cf_bytes(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &stream_job_view_key(handle_id, view_name, logical_key),
+                    encode_rocksdb_value(&state, "stream job view state")?,
+                );
+            }
+            ThroughputChangelogPayload::StreamJobCheckpointReached {
+                handle_id,
+                job_id,
+                checkpoint_name,
+                checkpoint_sequence,
+                stream_partition_id,
+                owner_epoch,
+                reached_at,
+            } => {
+                let checkpoint_state = LocalStreamJobCheckpointState {
+                    handle_id: handle_id.clone(),
+                    job_id: job_id.clone(),
+                    checkpoint_name: checkpoint_name.clone(),
+                    checkpoint_sequence: *checkpoint_sequence,
+                    stream_partition_id: *stream_partition_id,
+                    stream_owner_epoch: *owner_epoch,
+                    reached_at: *reached_at,
+                    updated_at: *reached_at,
+                };
+                self.write_batch_delete_cf_and_legacy(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &legacy_stream_job_checkpoint_key(
+                        handle_id,
+                        checkpoint_name,
+                        *stream_partition_id,
+                    ),
+                );
+                self.write_batch_put_cf_bytes(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &stream_job_checkpoint_key(handle_id, checkpoint_name, *stream_partition_id),
+                    encode_rocksdb_value(&checkpoint_state, "stream job checkpoint state")?,
+                );
+                if let Some(mut runtime_state) = self.load_stream_job_runtime_state(handle_id)? {
+                    runtime_state.job_id = job_id.clone();
+                    runtime_state.checkpoint_name = checkpoint_name.clone();
+                    runtime_state.checkpoint_sequence = *checkpoint_sequence;
+                    runtime_state.stream_owner_epoch = *owner_epoch;
+                    runtime_state.latest_checkpoint_at = Some(*reached_at);
+                    runtime_state.updated_at = *reached_at;
+                    self.write_batch_delete_cf_and_legacy(
+                        write_batch,
+                        STREAM_JOBS_CF,
+                        &legacy_stream_job_runtime_key(handle_id),
+                    );
+                    self.write_batch_put_cf_bytes(
+                        write_batch,
+                        STREAM_JOBS_CF,
+                        &stream_job_runtime_key(handle_id),
+                        encode_rocksdb_value(&runtime_state, "stream job runtime state")?,
+                    );
+                }
+            }
+            ThroughputChangelogPayload::StreamJobTerminalized {
+                handle_id,
+                job_id,
+                owner_epoch,
+                status,
+                output,
+                error,
+                terminal_at,
+            } => {
+                let Some(mut runtime_state) = self.load_stream_job_runtime_state(handle_id)? else {
+                    anyhow::bail!(
+                        "stream job terminalized before runtime state existed for handle {handle_id}"
+                    );
+                };
+                runtime_state.job_id = job_id.clone();
+                runtime_state.stream_owner_epoch = *owner_epoch;
+                runtime_state.terminal_status = Some(status.clone());
+                runtime_state.terminal_output = output.clone();
+                runtime_state.terminal_error = error.clone();
+                runtime_state.terminal_at = Some(*terminal_at);
+                runtime_state.updated_at = *terminal_at;
+                self.write_batch_delete_cf_and_legacy(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &legacy_stream_job_runtime_key(handle_id),
+                );
+                self.write_batch_put_cf_bytes(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &stream_job_runtime_key(handle_id),
+                    encode_rocksdb_value(&runtime_state, "stream job runtime state")?,
+                );
+            }
             ThroughputChangelogPayload::BatchCreated {
                 identity,
                 task_queue,
@@ -785,6 +1057,195 @@ impl LocalThroughputState {
                     terminal_at: *terminal_at,
                 };
                 self.write_group_state(write_batch, &state)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_streams_entry_payload(
+        &self,
+        write_batch: &mut WriteBatch,
+        entry: &StreamsChangelogEntry,
+    ) -> Result<()> {
+        match &entry.payload {
+            StreamsChangelogPayload::StreamJobExecutionPlanned {
+                handle_id,
+                job_id,
+                job_name,
+                view_name,
+                checkpoint_name,
+                checkpoint_sequence,
+                input_item_count,
+                materialized_key_count,
+                active_partitions,
+                owner_epoch,
+                planned_at,
+            } => {
+                let existing = self.load_stream_job_runtime_state(handle_id)?;
+                let state = LocalStreamJobRuntimeState {
+                    handle_id: handle_id.clone(),
+                    job_id: job_id.clone(),
+                    job_name: job_name.clone(),
+                    view_name: view_name.clone(),
+                    checkpoint_name: checkpoint_name.clone(),
+                    checkpoint_sequence: *checkpoint_sequence,
+                    input_item_count: *input_item_count,
+                    materialized_key_count: *materialized_key_count,
+                    active_partitions: active_partitions.clone(),
+                    dispatch_batches: existing
+                        .as_ref()
+                        .map(|state| state.dispatch_batches.clone())
+                        .unwrap_or_default(),
+                    applied_dispatch_batch_ids: existing
+                        .as_ref()
+                        .map(|state| state.applied_dispatch_batch_ids.clone())
+                        .unwrap_or_default(),
+                    dispatch_completed_at: existing
+                        .as_ref()
+                        .and_then(|state| state.dispatch_completed_at),
+                    dispatch_cancelled_at: existing
+                        .as_ref()
+                        .and_then(|state| state.dispatch_cancelled_at),
+                    stream_owner_epoch: *owner_epoch,
+                    planned_at: *planned_at,
+                    latest_checkpoint_at: existing
+                        .as_ref()
+                        .and_then(|state| state.latest_checkpoint_at),
+                    terminal_status: existing
+                        .as_ref()
+                        .and_then(|state| state.terminal_status.clone()),
+                    terminal_output: existing
+                        .as_ref()
+                        .and_then(|state| state.terminal_output.clone()),
+                    terminal_error: existing
+                        .as_ref()
+                        .and_then(|state| state.terminal_error.clone()),
+                    terminal_at: existing.as_ref().and_then(|state| state.terminal_at),
+                    updated_at: *planned_at,
+                };
+                self.write_batch_delete_cf_and_legacy(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &legacy_stream_job_runtime_key(handle_id),
+                );
+                self.write_batch_put_cf_bytes(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &stream_job_runtime_key(handle_id),
+                    encode_rocksdb_value(&state, "stream job runtime state")?,
+                );
+            }
+            StreamsChangelogPayload::StreamJobViewUpdated {
+                handle_id,
+                job_id,
+                view_name,
+                logical_key,
+                output,
+                checkpoint_sequence,
+                updated_at,
+            } => {
+                let state = LocalStreamJobViewState {
+                    handle_id: handle_id.clone(),
+                    job_id: job_id.clone(),
+                    view_name: view_name.clone(),
+                    logical_key: logical_key.clone(),
+                    output: output.clone(),
+                    checkpoint_sequence: *checkpoint_sequence,
+                    updated_at: *updated_at,
+                };
+                self.write_batch_put_cf_bytes(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &stream_job_view_key(handle_id, view_name, logical_key),
+                    encode_rocksdb_value(&state, "stream job view state")?,
+                );
+            }
+            StreamsChangelogPayload::StreamJobCheckpointReached {
+                handle_id,
+                job_id,
+                checkpoint_name,
+                checkpoint_sequence,
+                stream_partition_id,
+                owner_epoch,
+                reached_at,
+            } => {
+                let checkpoint_state = LocalStreamJobCheckpointState {
+                    handle_id: handle_id.clone(),
+                    job_id: job_id.clone(),
+                    checkpoint_name: checkpoint_name.clone(),
+                    checkpoint_sequence: *checkpoint_sequence,
+                    stream_partition_id: *stream_partition_id,
+                    stream_owner_epoch: *owner_epoch,
+                    reached_at: *reached_at,
+                    updated_at: *reached_at,
+                };
+                self.write_batch_delete_cf_and_legacy(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &legacy_stream_job_checkpoint_key(
+                        handle_id,
+                        checkpoint_name,
+                        *stream_partition_id,
+                    ),
+                );
+                self.write_batch_put_cf_bytes(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &stream_job_checkpoint_key(handle_id, checkpoint_name, *stream_partition_id),
+                    encode_rocksdb_value(&checkpoint_state, "stream job checkpoint state")?,
+                );
+                if let Some(mut runtime_state) = self.load_stream_job_runtime_state(handle_id)? {
+                    runtime_state.job_id = job_id.clone();
+                    runtime_state.checkpoint_name = checkpoint_name.clone();
+                    runtime_state.checkpoint_sequence = *checkpoint_sequence;
+                    runtime_state.stream_owner_epoch = *owner_epoch;
+                    runtime_state.latest_checkpoint_at = Some(*reached_at);
+                    runtime_state.updated_at = *reached_at;
+                    self.write_batch_delete_cf_and_legacy(
+                        write_batch,
+                        STREAM_JOBS_CF,
+                        &legacy_stream_job_runtime_key(handle_id),
+                    );
+                    self.write_batch_put_cf_bytes(
+                        write_batch,
+                        STREAM_JOBS_CF,
+                        &stream_job_runtime_key(handle_id),
+                        encode_rocksdb_value(&runtime_state, "stream job runtime state")?,
+                    );
+                }
+            }
+            StreamsChangelogPayload::StreamJobTerminalized {
+                handle_id,
+                job_id,
+                owner_epoch,
+                status,
+                output,
+                error,
+                terminal_at,
+            } => {
+                let Some(mut runtime_state) = self.load_stream_job_runtime_state(handle_id)? else {
+                    anyhow::bail!(
+                        "stream job terminalized before runtime state existed for handle {handle_id}"
+                    );
+                };
+                runtime_state.job_id = job_id.clone();
+                runtime_state.stream_owner_epoch = *owner_epoch;
+                runtime_state.terminal_status = Some(status.clone());
+                runtime_state.terminal_output = output.clone();
+                runtime_state.terminal_error = error.clone();
+                runtime_state.terminal_at = Some(*terminal_at);
+                runtime_state.updated_at = *terminal_at;
+                self.write_batch_delete_cf_and_legacy(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &legacy_stream_job_runtime_key(handle_id),
+                );
+                self.write_batch_put_cf_bytes(
+                    write_batch,
+                    STREAM_JOBS_CF,
+                    &stream_job_runtime_key(handle_id),
+                    encode_rocksdb_value(&runtime_state, "stream job runtime state")?,
+                );
             }
         }
         Ok(())

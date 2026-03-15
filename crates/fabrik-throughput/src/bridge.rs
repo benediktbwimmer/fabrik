@@ -171,6 +171,24 @@ impl ThroughputBridgeRepairKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamJobBridgeRepairKind {
+    AcceptQuery,
+    AcceptCheckpoint,
+    AcceptTerminal,
+}
+
+impl StreamJobBridgeRepairKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AcceptQuery => "accept_stream_query",
+            Self::AcceptCheckpoint => "accept_stream_checkpoint",
+            Self::AcceptTerminal => "accept_stream_terminal",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamJobBridgeHandleStatus {
@@ -251,6 +269,30 @@ impl StreamJobStatus {
 
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamJobOriginKind {
+    Workflow,
+    Standalone,
+}
+
+impl StreamJobOriginKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Workflow => "workflow",
+            Self::Standalone => "standalone",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "workflow" => Some(Self::Workflow),
+            "standalone" => Some(Self::Standalone),
+            _ => None,
+        }
     }
 }
 
@@ -358,6 +400,7 @@ pub struct SubmitStreamJobRequest {
     pub workflow_event_id: Uuid,
     pub workflow_owner_epoch: Option<u64>,
     pub stream_owner_epoch: Option<u64>,
+    pub origin_kind: Option<StreamJobOriginKind>,
     pub identity: StreamJobBridgeIdentity,
     pub definition_id: String,
     pub definition_version: Option<u32>,

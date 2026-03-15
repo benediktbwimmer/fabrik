@@ -552,6 +552,628 @@ const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
       { status: 200 }
     );
   }
+  if (
+    url.includes("/tenants/tenant-a/stream-jobs?")
+    && !url.includes("/tenants/tenant-a/stream-jobs/instance-1/run-2")
+  ) {
+    return new Response(
+      JSON.stringify({
+        tenant_id: "tenant-a",
+        page: { limit: 100, offset: 0, returned: 1, total: 1, has_more: false, next_offset: null },
+        job_count: 1,
+        jobs: [
+          {
+            protocol_version: "2026-03-01",
+            operation_kind: "stream_job",
+            origin_kind: "workflow",
+            stream_instance_id: "stream-instance-1",
+            stream_run_id: "stream-run-1",
+            source_workflow_event_id: "evt-stream-1",
+            bridge_request_id: "bridge-req-1",
+            handle_id: "handle-a",
+            job_id: "job-a",
+            definition_id: "payments",
+            definition_version: 2,
+            artifact_hash: "artifact-b",
+            job_name: "fraud-detector",
+            input_ref: "input://payments",
+            config_ref: "config://fraud-detector",
+            checkpoint_policy: { mode: "named" },
+            declared_checkpoints: [
+              {
+                checkpoint_name: "hourly-rollup-ready",
+                definition: { kind: "named" },
+                delivery: "bridge_callback",
+                sequence: 11,
+                reached: true,
+                reached_at: "2026-03-13T09:04:00Z"
+              }
+            ],
+            view_definitions: { currentStats: { kind: "keyed_sum" } },
+            stream_surface: {
+              declared_checkpoint_count: 1,
+              reached_checkpoint_count: 1,
+              latest_checkpoint_name: "hourly-rollup-ready",
+              latest_checkpoint_sequence: 11,
+              latest_checkpoint_at: "2026-03-13T09:04:00Z",
+              view_count: 1,
+              projected_view_count: 1,
+              total_projected_keys: 1,
+              slowest_eventual_view_lag_ms: 120,
+              checkpoints: [
+                {
+                  checkpoint_name: "hourly-rollup-ready",
+                  definition: { kind: "named" },
+                  delivery: "bridge_callback",
+                  sequence: 11,
+                  reached: true,
+                  reached_at: "2026-03-13T09:04:00Z"
+                }
+              ],
+              views: [
+                {
+                  view_name: "currentStats",
+                  definition: { kind: "keyed_sum" },
+                  projected_key_count: 1,
+                  latest_projected_checkpoint_sequence: 11,
+                  latest_projected_at: "2026-03-13T09:05:01Z",
+                  eventual_projection_lag_ms: 120
+                }
+              ]
+            },
+            bridge_surface: {
+              pending_repair_count: 1,
+              pending_repairs: ["accept_query"],
+              next_repair: "accept_query",
+              latest_query_id: "query-1",
+              latest_query_name: "currentStats",
+              latest_query_status: "accepted",
+              latest_query_consistency: "strong",
+              latest_query_requested_at: "2026-03-13T09:05:00Z",
+              latest_query_completed_at: "2026-03-13T09:05:01Z",
+              latest_query_accepted_at: "2026-03-13T09:05:01Z"
+            },
+            status: "running",
+            workflow_owner_epoch: 3,
+            stream_owner_epoch: 7,
+            starting_at: "2026-03-13T09:00:30Z",
+            running_at: "2026-03-13T09:01:00Z",
+            draining_at: null,
+            latest_checkpoint_name: "hourly-rollup-ready",
+            latest_checkpoint_sequence: 11,
+            latest_checkpoint_at: "2026-03-13T09:04:00Z",
+            latest_checkpoint_output: { accounts: 1 },
+            cancellation_requested_at: null,
+            cancellation_reason: null,
+            workflow_accepted_at: "2026-03-13T09:01:00Z",
+            terminal_event_id: null,
+            terminal_at: null,
+            terminal_output: null,
+            terminal_error: null,
+            checkpoint_count: 1,
+            query_count: 1,
+            latest_query_id: "query-1",
+            latest_query_name: "currentStats",
+            latest_query_status: "accepted",
+            latest_query_consistency: "strong",
+            latest_query_requested_at: "2026-03-13T09:05:00Z",
+            latest_query_completed_at: "2026-03-13T09:05:01Z",
+            latest_query_accepted_at: "2026-03-13T09:05:01Z",
+            views: [
+              {
+                view_name: "currentStats",
+                definition: { kind: "keyed_sum" },
+                projected_key_count: 1,
+                latest_projected_checkpoint_sequence: 11,
+                latest_projected_at: "2026-03-13T09:05:01Z",
+                eventual_projection_lag_ms: 120
+              }
+            ],
+            workflow_binding: { instance_id: "instance-1", run_id: "run-2" },
+            created_at: "2026-03-13T09:00:30Z",
+            updated_at: "2026-03-13T09:05:01Z"
+          }
+        ]
+      }),
+      { status: 200 }
+    );
+  }
+  if (url.includes("/tenants/tenant-a/stream-jobs/instance-1/run-2/bridge/handles/job-a")) {
+    return new Response(
+      JSON.stringify({
+        tenant_id: "tenant-a",
+        instance_id: "instance-1",
+        run_id: "run-2",
+        job_id: "job-a",
+        handle: {
+          protocol_version: "2026-03-01",
+          operation_kind: "stream_job",
+          source_workflow_event_id: "evt-stream-1",
+          bridge_request_id: "bridge-req-1",
+          handle_id: "handle-a",
+          job_id: "job-a",
+          definition_id: "payments",
+          definition_version: 2,
+          artifact_hash: "artifact-b",
+          job_name: "fraud-detector",
+          input_ref: "input://payments",
+          config_ref: "config://fraud-detector",
+          checkpoint_policy: { mode: "named" },
+          view_definitions: { currentStats: { kind: "keyed_sum" } },
+          status: "running",
+          workflow_owner_epoch: 3,
+          stream_owner_epoch: 7,
+          cancellation_requested_at: null,
+          cancellation_reason: null,
+          terminal_event_id: null,
+          terminal_at: null,
+          workflow_accepted_at: "2026-03-13T09:01:00Z",
+          checkpoint_count: 1,
+          query_count: 1,
+          pending_repair_count: 1,
+          pending_repairs: ["query_acceptance"],
+          next_repair: "query_acceptance",
+          latest_query_id: "query-1",
+          latest_query_name: "currentStats",
+          latest_query_status: "accepted",
+          latest_query_consistency: "strong",
+          latest_query_requested_at: "2026-03-13T09:05:00Z",
+          latest_query_completed_at: "2026-03-13T09:05:01Z",
+          latest_query_accepted_at: "2026-03-13T09:05:01Z",
+          created_at: "2026-03-13T09:00:30Z",
+          updated_at: "2026-03-13T09:05:01Z"
+        },
+        checkpoints: [
+          {
+            protocol_version: "2026-03-01",
+            operation_kind: "stream_job",
+            source_workflow_event_id: "evt-stream-1",
+            bridge_request_id: "bridge-req-1",
+            await_request_id: "await-1",
+            checkpoint_name: "hourly-rollup-ready",
+            checkpoint_sequence: 11,
+            status: "accepted",
+            workflow_owner_epoch: 3,
+            stream_owner_epoch: 7,
+            reached_at: "2026-03-13T09:04:00Z",
+            output: { accounts: 1 },
+            accepted_at: "2026-03-13T09:04:01Z",
+            cancelled_at: null,
+            next_repair: null,
+            created_at: "2026-03-13T09:04:00Z",
+            updated_at: "2026-03-13T09:04:01Z"
+          }
+        ],
+        queries: [
+          {
+            protocol_version: "2026-03-01",
+            operation_kind: "stream_job",
+            source_workflow_event_id: "evt-stream-1",
+            bridge_request_id: "bridge-req-1",
+            query_id: "query-1",
+            query_name: "currentStats",
+            query_args: { view: "currentStats" },
+            consistency: "strong",
+            status: "accepted",
+            workflow_owner_epoch: 3,
+            stream_owner_epoch: 7,
+            output: { accountId: "acct-1", score: 42 },
+            error: null,
+            requested_at: "2026-03-13T09:05:00Z",
+            completed_at: "2026-03-13T09:05:01Z",
+            accepted_at: "2026-03-13T09:05:01Z",
+            cancelled_at: null,
+            next_repair: null,
+            created_at: "2026-03-13T09:05:00Z",
+            updated_at: "2026-03-13T09:05:01Z"
+          }
+        ]
+      }),
+      { status: 200 }
+    );
+  }
+  if (url.includes("/tenants/tenant-a/stream-jobs/instance-1/run-2/bridge/handles")) {
+    return new Response(
+      JSON.stringify({
+        tenant_id: "tenant-a",
+        instance_id: "instance-1",
+        run_id: "run-2",
+        page: { limit: 50, offset: 0, returned: 1, total: 1, has_more: false, next_offset: null },
+        handle_count: 1,
+        handles: [
+          {
+            protocol_version: "2026-03-01",
+            operation_kind: "stream_job",
+            source_workflow_event_id: "evt-stream-1",
+            bridge_request_id: "bridge-req-1",
+            handle_id: "handle-a",
+            job_id: "job-a",
+            definition_id: "payments",
+            definition_version: 2,
+            artifact_hash: "artifact-b",
+            job_name: "fraud-detector",
+            input_ref: "input://payments",
+            config_ref: "config://fraud-detector",
+            checkpoint_policy: { mode: "named" },
+            view_definitions: { currentStats: { kind: "keyed_sum" } },
+            status: "running",
+            workflow_owner_epoch: 3,
+            stream_owner_epoch: 7,
+            cancellation_requested_at: null,
+            cancellation_reason: null,
+            terminal_event_id: null,
+            terminal_at: null,
+            workflow_accepted_at: "2026-03-13T09:01:00Z",
+            checkpoint_count: 1,
+            query_count: 1,
+            pending_repair_count: 1,
+            pending_repairs: ["query_acceptance"],
+            next_repair: "query_acceptance",
+            latest_query_id: "query-1",
+            latest_query_name: "currentStats",
+            latest_query_status: "accepted",
+            latest_query_consistency: "strong",
+            latest_query_requested_at: "2026-03-13T09:05:00Z",
+            latest_query_completed_at: "2026-03-13T09:05:01Z",
+            latest_query_accepted_at: "2026-03-13T09:05:01Z",
+            created_at: "2026-03-13T09:00:30Z",
+            updated_at: "2026-03-13T09:05:01Z"
+          }
+        ]
+      }),
+      { status: 200 }
+    );
+  }
+  if (url.includes("/tenants/tenant-a/stream-jobs/instance-1/run-2/job-a/views/currentStats/keys/acct-1")) {
+    return new Response(
+      JSON.stringify({
+        handle_id: "handle-a",
+        job_id: "job-a",
+        view_name: "currentStats",
+        logical_key: "acct-1",
+        consistency: "strong",
+        source: "stream-owner",
+        projection_lag_ms: null,
+        watch_cursor: "2026-03-13T09:05:01Z",
+        output: { accountId: "acct-1", totalRisk: 42, lastUpdatedAt: "2026-03-13T09:05:01Z" },
+        checkpoint_sequence: 11,
+        updated_at: "2026-03-13T09:05:01Z"
+      }),
+      { status: 200 }
+    );
+  }
+  if (url.includes("/tenants/tenant-a/stream-jobs/instance-1/run-2/job-a/views/currentStats/entries")) {
+    return new Response(
+      JSON.stringify({
+        tenant_id: "tenant-a",
+        instance_id: "instance-1",
+        run_id: "run-2",
+        job_id: "job-a",
+        view_name: "currentStats",
+        consistency: "strong",
+        source: "stream-owner",
+        projection_lag_ms: null,
+        watch_cursor: "2026-03-13T09:05:01Z",
+        page: { limit: 20, offset: 0, returned: 1, total: 1, has_more: false, next_offset: null },
+        entry_count: 1,
+        entries: [
+          {
+            logical_key: "acct-1",
+            output: { accountId: "acct-1", totalRisk: 42 },
+            checkpoint_sequence: 11,
+            updated_at: "2026-03-13T09:05:01Z"
+          }
+        ]
+      }),
+      { status: 200 }
+    );
+  }
+  if (url.includes("/tenants/tenant-a/stream-jobs/instance-1/run-2/job-a")) {
+    return new Response(
+      JSON.stringify({
+        tenant_id: "tenant-a",
+        instance_id: "instance-1",
+        stream_instance_id: "stream-instance-1",
+        run_id: "run-2",
+        stream_run_id: "stream-run-1",
+        job_id: "job-a",
+        job: {
+          protocol_version: "2026-03-01",
+          operation_kind: "stream_job",
+          origin_kind: "workflow_bound",
+          stream_instance_id: "stream-instance-1",
+          stream_run_id: "stream-run-1",
+          source_workflow_event_id: "evt-stream-1",
+          bridge_request_id: "bridge-req-1",
+          handle_id: "handle-a",
+          job_id: "job-a",
+          definition_id: "payments",
+          definition_version: 2,
+          artifact_hash: "artifact-b",
+          job_name: "fraud-detector",
+          input_ref: "input://payments",
+          config_ref: "config://fraud-detector",
+          checkpoint_policy: { mode: "named" },
+          declared_checkpoints: [
+            {
+              checkpoint_name: "hourly-rollup-ready",
+              definition: { kind: "named" },
+              delivery: "bridge_callback",
+              sequence: 11,
+              reached: true,
+              reached_at: "2026-03-13T09:04:00Z"
+            }
+          ],
+          view_definitions: { currentStats: { kind: "keyed_sum" } },
+          stream_surface: {
+            declared_checkpoint_count: 1,
+            reached_checkpoint_count: 1,
+            latest_checkpoint_name: "hourly-rollup-ready",
+            latest_checkpoint_sequence: 11,
+            latest_checkpoint_at: "2026-03-13T09:04:00Z",
+            view_count: 1,
+            projected_view_count: 1,
+            total_projected_keys: 1,
+            slowest_eventual_view_lag_ms: 120,
+            checkpoints: [
+              {
+                checkpoint_name: "hourly-rollup-ready",
+                definition: { kind: "named" },
+                delivery: "bridge_callback",
+                sequence: 11,
+                reached: true,
+                reached_at: "2026-03-13T09:04:00Z"
+              }
+            ],
+            views: [
+              {
+                view_name: "currentStats",
+                definition: { kind: "keyed_sum" },
+                projected_key_count: 1,
+                latest_projected_checkpoint_sequence: 11,
+                latest_projected_at: "2026-03-13T09:05:01Z",
+                eventual_projection_lag_ms: 120
+              }
+            ]
+          },
+          bridge_surface: {
+            pending_repair_count: 1,
+            pending_repairs: ["accept_query"],
+            next_repair: "accept_query",
+            latest_query_id: "query-1",
+            latest_query_name: "currentStats",
+            latest_query_status: "accepted",
+            latest_query_consistency: "strong",
+            latest_query_requested_at: "2026-03-13T09:05:00Z",
+            latest_query_completed_at: "2026-03-13T09:05:01Z",
+            latest_query_accepted_at: "2026-03-13T09:05:01Z"
+          },
+          status: "running",
+          workflow_owner_epoch: 3,
+          stream_owner_epoch: 7,
+          starting_at: "2026-03-13T09:00:30Z",
+          running_at: "2026-03-13T09:01:00Z",
+          draining_at: null,
+          latest_checkpoint_name: "hourly-rollup-ready",
+          latest_checkpoint_sequence: 11,
+          latest_checkpoint_at: "2026-03-13T09:04:00Z",
+          latest_checkpoint_output: { accounts: 1 },
+          cancellation_requested_at: null,
+          cancellation_reason: null,
+          workflow_accepted_at: "2026-03-13T09:01:00Z",
+          terminal_event_id: null,
+          terminal_at: null,
+          terminal_output: null,
+          terminal_error: null,
+          checkpoint_count: 1,
+          query_count: 1,
+          latest_query_id: "query-1",
+          latest_query_name: "currentStats",
+          latest_query_status: "accepted",
+          latest_query_consistency: "strong",
+          latest_query_requested_at: "2026-03-13T09:05:00Z",
+          latest_query_completed_at: "2026-03-13T09:05:01Z",
+          latest_query_accepted_at: "2026-03-13T09:05:01Z",
+          views: [
+            {
+              view_name: "currentStats",
+              definition: { kind: "keyed_sum" },
+              projected_key_count: 1,
+              latest_projected_checkpoint_sequence: 11,
+              latest_projected_at: "2026-03-13T09:05:01Z",
+              eventual_projection_lag_ms: 120
+            }
+          ],
+          workflow_binding: { instance_id: "instance-1", run_id: "run-2" },
+          created_at: "2026-03-13T09:00:30Z",
+          updated_at: "2026-03-13T09:05:01Z"
+        },
+        views: [
+          {
+            view_name: "currentStats",
+            definition: { kind: "keyed_sum" },
+            projected_key_count: 1,
+            latest_projected_checkpoint_sequence: 11,
+            latest_projected_at: "2026-03-13T09:05:01Z",
+            eventual_projection_lag_ms: 120
+          }
+        ],
+        checkpoints: [
+          {
+            protocol_version: "2026-03-01",
+            operation_kind: "stream_job",
+            source_workflow_event_id: "evt-stream-1",
+            bridge_request_id: "bridge-req-1",
+            await_request_id: "await-1",
+            checkpoint_name: "hourly-rollup-ready",
+            checkpoint_sequence: 11,
+            status: "accepted",
+            workflow_owner_epoch: 3,
+            stream_owner_epoch: 7,
+            reached_at: "2026-03-13T09:04:00Z",
+            output: { accounts: 1 },
+            accepted_at: "2026-03-13T09:04:01Z",
+            cancelled_at: null,
+            next_repair: null,
+            created_at: "2026-03-13T09:04:00Z",
+            updated_at: "2026-03-13T09:04:01Z"
+          }
+        ],
+        queries: [
+          {
+            protocol_version: "2026-03-01",
+            operation_kind: "stream_job",
+            source_workflow_event_id: "evt-stream-1",
+            bridge_request_id: "bridge-req-1",
+            query_id: "query-1",
+            query_name: "currentStats",
+            query_args: { view: "currentStats" },
+            consistency: "strong",
+            status: "accepted",
+            workflow_owner_epoch: 3,
+            stream_owner_epoch: 7,
+            output: { accountId: "acct-1", score: 42 },
+            error: null,
+            requested_at: "2026-03-13T09:05:00Z",
+            completed_at: "2026-03-13T09:05:01Z",
+            accepted_at: "2026-03-13T09:05:01Z",
+            cancelled_at: null,
+            next_repair: null,
+            created_at: "2026-03-13T09:05:00Z",
+            updated_at: "2026-03-13T09:05:01Z"
+          }
+        ]
+      }),
+      { status: 200 }
+    );
+  }
+  if (url.includes("/tenants/tenant-a/stream-jobs/instance-1/run-2")) {
+    return new Response(
+      JSON.stringify({
+        tenant_id: "tenant-a",
+        instance_id: "instance-1",
+        stream_instance_id: "stream-instance-1",
+        run_id: "run-2",
+        stream_run_id: "stream-run-1",
+        page: { limit: 50, offset: 0, returned: 1, total: 1, has_more: false, next_offset: null },
+        job_count: 1,
+        jobs: [
+          {
+            protocol_version: "2026-03-01",
+            operation_kind: "stream_job",
+            origin_kind: "workflow_bound",
+            stream_instance_id: "stream-instance-1",
+            stream_run_id: "stream-run-1",
+            source_workflow_event_id: "evt-stream-1",
+            bridge_request_id: "bridge-req-1",
+            handle_id: "handle-a",
+            job_id: "job-a",
+            definition_id: "payments",
+            definition_version: 2,
+            artifact_hash: "artifact-b",
+            job_name: "fraud-detector",
+            input_ref: "input://payments",
+            config_ref: "config://fraud-detector",
+            checkpoint_policy: { mode: "named" },
+            declared_checkpoints: [
+              {
+                checkpoint_name: "hourly-rollup-ready",
+                definition: { kind: "named" },
+                delivery: "bridge_callback",
+                sequence: 11,
+                reached: true,
+                reached_at: "2026-03-13T09:04:00Z"
+              }
+            ],
+            view_definitions: { currentStats: { kind: "keyed_sum" } },
+            stream_surface: {
+              declared_checkpoint_count: 1,
+              reached_checkpoint_count: 1,
+              latest_checkpoint_name: "hourly-rollup-ready",
+              latest_checkpoint_sequence: 11,
+              latest_checkpoint_at: "2026-03-13T09:04:00Z",
+              view_count: 1,
+              projected_view_count: 1,
+              total_projected_keys: 1,
+              slowest_eventual_view_lag_ms: 120,
+              checkpoints: [
+                {
+                  checkpoint_name: "hourly-rollup-ready",
+                  definition: { kind: "named" },
+                  delivery: "bridge_callback",
+                  sequence: 11,
+                  reached: true,
+                  reached_at: "2026-03-13T09:04:00Z"
+                }
+              ],
+              views: [
+                {
+                  view_name: "currentStats",
+                  definition: { kind: "keyed_sum" },
+                  projected_key_count: 1,
+                  latest_projected_checkpoint_sequence: 11,
+                  latest_projected_at: "2026-03-13T09:05:01Z",
+                  eventual_projection_lag_ms: 120
+                }
+              ]
+            },
+            bridge_surface: {
+              pending_repair_count: 1,
+              pending_repairs: ["accept_query"],
+              next_repair: "accept_query",
+              latest_query_id: "query-1",
+              latest_query_name: "currentStats",
+              latest_query_status: "accepted",
+              latest_query_consistency: "strong",
+              latest_query_requested_at: "2026-03-13T09:05:00Z",
+              latest_query_completed_at: "2026-03-13T09:05:01Z",
+              latest_query_accepted_at: "2026-03-13T09:05:01Z"
+            },
+            status: "running",
+            workflow_owner_epoch: 3,
+            stream_owner_epoch: 7,
+            starting_at: "2026-03-13T09:00:30Z",
+            running_at: "2026-03-13T09:01:00Z",
+            draining_at: null,
+            latest_checkpoint_name: "hourly-rollup-ready",
+            latest_checkpoint_sequence: 11,
+            latest_checkpoint_at: "2026-03-13T09:04:00Z",
+            latest_checkpoint_output: { accounts: 1 },
+            cancellation_requested_at: null,
+            cancellation_reason: null,
+            workflow_accepted_at: "2026-03-13T09:01:00Z",
+            terminal_event_id: null,
+            terminal_at: null,
+            terminal_output: null,
+            terminal_error: null,
+            checkpoint_count: 1,
+            query_count: 1,
+            latest_query_id: "query-1",
+            latest_query_name: "currentStats",
+            latest_query_status: "accepted",
+            latest_query_consistency: "strong",
+            latest_query_requested_at: "2026-03-13T09:05:00Z",
+            latest_query_completed_at: "2026-03-13T09:05:01Z",
+            latest_query_accepted_at: "2026-03-13T09:05:01Z",
+            views: [
+              {
+                view_name: "currentStats",
+                definition: { kind: "keyed_sum" },
+                projected_key_count: 1,
+                latest_projected_checkpoint_sequence: 11,
+                latest_projected_at: "2026-03-13T09:05:01Z",
+                eventual_projection_lag_ms: 120
+              }
+            ],
+            workflow_binding: { instance_id: "instance-1", run_id: "run-2" },
+            created_at: "2026-03-13T09:00:30Z",
+            updated_at: "2026-03-13T09:05:01Z"
+          }
+        ]
+      }),
+      { status: 200 }
+    );
+  }
   if (url.includes("/tenants/tenant-a/runs") && url.includes("instance_id=instance-1")) {
     return new Response(
       JSON.stringify({
@@ -1043,6 +1665,18 @@ test("keeps build routing surfaces read-only", async () => {
     "href",
     "/conformance?layer=layer_c_trust&case=store-reconciles-stale-resume-backlog"
   );
+});
+
+test("renders workflow-bound stream job bridge and materialized state", async () => {
+  renderApp("/stream-jobs?instance_id=instance-1&run_id=run-2");
+
+  await waitFor(() => expect(screen.getByRole("heading", { name: "Stream Jobs" })).toBeInTheDocument());
+  await waitFor(() => expect(screen.getByRole("heading", { name: "fraud-detector" })).toBeInTheDocument());
+  expect(screen.getByText("Tenant stream job index")).toBeInTheDocument();
+  expect(screen.getByText("Bridge request bridge-req-1")).toBeInTheDocument();
+  expect(screen.getAllByText("currentStats").length).toBeGreaterThan(0);
+  expect(screen.getByText("Materialized views")).toBeInTheDocument();
+  expect(screen.getByText("View entries")).toBeInTheDocument();
 });
 
 test("renders conformance drill-down evidence", async () => {

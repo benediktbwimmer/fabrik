@@ -4,23 +4,28 @@ use fabrik_broker::{decode_consumed_workflow_event, decode_json_record};
 use fabrik_events::{EventEnvelope, WorkflowEvent, WorkflowIdentity};
 use fabrik_store::{StreamJobCheckpointRecord, StreamJobRecord};
 use fabrik_throughput::{
-    StreamJobBridgeHandleStatus, StreamJobQueryConsistency, StreamJobQueryStatus, StreamJobStatus,
-    ThroughputBackend, ThroughputBatchIdentity, ThroughputCommand, ThroughputCommandEnvelope,
-    ThroughputRunStatus, stream_job_bridge_request_id, stream_job_callback_event_id,
+    CancelStreamJobCommand, ScheduleStreamJobCommand, StreamJobBridgeHandleStatus,
+    StreamJobCheckpointStatus, StreamJobOriginKind, StreamJobQueryConsistency,
+    StreamJobQueryStatus, StreamJobStatus, ThroughputBackend, ThroughputBatchIdentity,
+    ThroughputCommand, ThroughputCommandEnvelope, ThroughputRunStatus,
+    stream_job_bridge_request_id, stream_job_callback_event_id,
     stream_job_checkpoint_callback_dedupe_key, stream_job_query_callback_dedupe_key,
     stream_job_terminal_callback_dedupe_key,
 };
 use futures_util::StreamExt;
-use serde::Deserialize;
-use serde_json::json;
-use std::collections::BTreeMap;
+use serde_json::{Value, json};
 use tokio::task::JoinSet;
 use tokio::time::{Duration, sleep};
-use tracing::{error, warn};
-use uuid::Uuid;
+use tracing::{error, info, warn};
 
 use crate::{
     AppState, BRIDGE_EVENT_CONCURRENCY, activate_native_stream_run, activate_stream_batch,
+    publish_changelog_records, publish_projection_records, stream_job_owner_epoch,
+    stream_jobs::{
+        activate_stream_job_on_local_state, build_stream_job_query_output,
+        materialization_outcome_from_local_state,
+        should_defer_terminal_callback_until_query_boundary, terminal_result_after_query,
+    },
     workflow_event_from_throughput_command,
 };
 
@@ -44,6 +49,15 @@ pub(super) async fn run_bridge_loop(
                 continue;
             }
         };
+        info!(
+            partition_id = record.partition_id,
+            event_id = %event.event_id,
+            event_type = event.event_type,
+            tenant_id = %event.tenant_id,
+            instance_id = %event.instance_id,
+            run_id = %event.run_id,
+            "streams-runtime consumed workflow event"
+        );
         while in_flight.len() >= BRIDGE_EVENT_CONCURRENCY {
             if let Some(result) = in_flight.join_next().await {
                 if let Err(error) = result {
@@ -70,28 +84,32 @@ pub(super) async fn run_bridge_loop(
     }
 }
 
-async fn handle_bridge_event(state: AppState, event: EventEnvelope<WorkflowEvent>) -> Result<()> {
+pub(super) async fn handle_bridge_event(
+    state: AppState,
+    event: EventEnvelope<WorkflowEvent>,
+) -> Result<()> {
     if let WorkflowEvent::WorkflowCancellationRequested { reason } = &event.payload {
         crate::cancel_stream_batches_for_run(&state, &event, reason).await?;
         return Ok(());
     }
 
     if let WorkflowEvent::StreamJobScheduled { job_id, .. } = &event.payload {
+        info!(
+            tenant_id = %event.tenant_id,
+            instance_id = %event.instance_id,
+            run_id = %event.run_id,
+            job_id = %job_id,
+            "streams-runtime received stream job schedule event"
+        );
         publish_stream_job_callbacks_from_bridge(&state, &event, job_id).await?;
         return Ok(());
     }
 
     if let WorkflowEvent::StreamJobCancellationRequested { job_id, .. } = &event.payload {
         if let Some(handle) = await_stream_job_bridge_handle(&state, &event, job_id).await? {
-            sync_stream_job_record(
-                &state,
-                &handle,
-                StreamJobStatus::Draining,
-                None,
-                event.occurred_at,
-            )
-            .await?;
-            publish_stream_job_terminal_event(&state, &handle).await?;
+            let finalized =
+                finalize_stream_job_cancellation(&state, &handle, event.occurred_at).await?;
+            publish_stream_job_terminal_event(&state, &finalized).await?;
         }
         return Ok(());
     }
@@ -200,12 +218,19 @@ async fn sync_stream_job_record(
             tenant_id: handle.tenant_id.clone(),
             instance_id: handle.instance_id.clone(),
             run_id: handle.run_id.clone(),
+            stream_instance_id: handle.stream_instance_id.clone(),
+            stream_run_id: handle.stream_run_id.clone(),
             job_id: handle.job_id.clone(),
             handle_id: handle.handle_id.clone(),
             protocol_version: handle.protocol_version.clone(),
             operation_kind: handle.operation_kind.clone(),
             workflow_event_id: handle.workflow_event_id,
             bridge_request_id: handle.bridge_request_id.clone(),
+            origin_kind: handle
+                .parsed_origin_kind()
+                .unwrap_or(StreamJobOriginKind::Workflow)
+                .as_str()
+                .to_owned(),
             definition_id: handle.definition_id.clone(),
             definition_version: handle.definition_version,
             artifact_hash: handle.artifact_hash.clone(),
@@ -235,11 +260,18 @@ async fn sync_stream_job_record(
             updated_at: handle.updated_at,
         });
 
+    record.tenant_id = handle.tenant_id.clone();
+    record.instance_id = handle.instance_id.clone();
+    record.run_id = handle.run_id.clone();
+    record.stream_instance_id = handle.stream_instance_id.clone();
+    record.stream_run_id = handle.stream_run_id.clone();
     record.handle_id = handle.handle_id.clone();
     record.protocol_version = handle.protocol_version.clone();
     record.operation_kind = handle.operation_kind.clone();
     record.workflow_event_id = handle.workflow_event_id;
     record.bridge_request_id = handle.bridge_request_id.clone();
+    record.origin_kind =
+        handle.parsed_origin_kind().unwrap_or(StreamJobOriginKind::Workflow).as_str().to_owned();
     record.definition_id = handle.definition_id.clone();
     record.definition_version = handle.definition_version;
     record.artifact_hash = handle.artifact_hash.clone();
@@ -321,41 +353,174 @@ async fn publish_stream_job_callbacks_from_bridge(
     job_id: &str,
 ) -> Result<()> {
     let Some(handle) = await_stream_job_bridge_handle(state, event, job_id).await? else {
+        info!(
+            tenant_id = %event.tenant_id,
+            instance_id = %event.instance_id,
+            run_id = %event.run_id,
+            job_id = %job_id,
+            "streams-runtime did not find stream job handle after schedule event"
+        );
         return Ok(());
     };
-    sync_stream_job_record(state, &handle, StreamJobStatus::Starting, None, event.occurred_at)
-        .await?;
-    if handle.job_name == KEYED_ROLLUP_JOB_NAME {
-        materialize_keyed_rollup_checkpoint(state, &handle).await?;
-    }
-    if handle.terminal_at.is_some() || handle.terminal_event_id.is_some() {
-        let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
-        debug.duplicate_bridge_events = debug.duplicate_bridge_events.saturating_add(1);
-        return Ok(());
-    }
+    materialize_stream_job_from_handle(state, handle, event.occurred_at).await
+}
 
-    // Give the workflow runtime a short window to persist awaited checkpoints before
-    // we synthesize callbacks from the current Streams bridge implementation.
-    sleep(Duration::from_millis(100)).await;
-    let checkpoints = state
-        .store
-        .list_stream_job_bridge_checkpoints_for_handle_page(&handle.handle_id, 10_000, 0)
-        .await?;
-    for checkpoint in checkpoints {
-        if checkpoint.reached_at.is_some() || checkpoint.accepted_at.is_some() {
-            continue;
+fn should_emit_workflow_callbacks(handle: &fabrik_store::StreamJobBridgeHandleRecord) -> bool {
+    !matches!(handle.parsed_origin_kind(), Some(StreamJobOriginKind::Standalone))
+}
+
+async fn materialize_stream_job_from_handle(
+    state: &AppState,
+    mut handle: fabrik_store::StreamJobBridgeHandleRecord,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    info!(
+        handle_id = %handle.handle_id,
+        job_id = %handle.job_id,
+        job_name = %handle.job_name,
+        "streams-runtime materializing stream job"
+    );
+    sync_stream_job_record(state, &handle, StreamJobStatus::Starting, None, occurred_at).await?;
+    if let Some(activation) = activate_stream_job(state, &handle).await? {
+        publish_changelog_records(state, activation.changelog_records).await;
+        if let Err(error) = publish_projection_records(state, activation.projection_records).await {
+            error!(
+                error = %error,
+                handle_id = %handle.handle_id,
+                job_id = %handle.job_id,
+                "failed to publish stream job projection records"
+            );
         }
-        publish_stream_job_checkpoint_event(state, &handle, &checkpoint).await?;
+        let materialized = materialization_outcome_from_local_state(&state.local_state, &handle)?;
+        let mut checkpoint_to_publish = None;
+        if let Some(checkpoint) =
+            materialized.as_ref().and_then(|outcome| outcome.checkpoint.clone())
+        {
+            let checkpoint = merge_stream_job_checkpoint_bridge_state(state, checkpoint).await?;
+            state.store.upsert_stream_job_callback_checkpoint(&checkpoint).await?;
+            if handle.stream_owner_epoch.is_none() && checkpoint.stream_owner_epoch.is_some() {
+                handle.stream_owner_epoch = checkpoint.stream_owner_epoch;
+                handle.updated_at = checkpoint.reached_at.unwrap_or(occurred_at);
+                state.store.upsert_stream_job_callback_handle(&handle).await?;
+            }
+            sync_stream_job_record(
+                state,
+                &handle,
+                StreamJobStatus::Running,
+                Some(&checkpoint),
+                checkpoint.reached_at.unwrap_or(occurred_at),
+            )
+            .await?;
+            checkpoint_to_publish = Some(checkpoint);
+        }
+        if let Some(terminal) = materialized.and_then(|outcome| outcome.terminal) {
+            let finalized =
+                persist_stream_job_terminal_result(state, &handle, terminal, occurred_at).await?;
+            sync_stream_job_record(
+                state,
+                &finalized,
+                default_stream_job_status(&finalized),
+                None,
+                finalized.terminal_at.unwrap_or(occurred_at),
+            )
+            .await?;
+            if !should_emit_workflow_callbacks(&finalized) {
+                return Ok(());
+            }
+            if let Some(checkpoint) = checkpoint_to_publish.as_ref() {
+                if checkpoint.reached_at.is_some()
+                    && checkpoint.accepted_at.is_none()
+                    && checkpoint.cancelled_at.is_none()
+                {
+                    info!(
+                        handle_id = %finalized.handle_id,
+                        job_id = %finalized.job_id,
+                        checkpoint_name = %checkpoint.checkpoint_name,
+                        checkpoint_sequence = checkpoint.checkpoint_sequence,
+                        "streams-runtime publishing stream job checkpoint callback"
+                    );
+                    publish_stream_job_checkpoint_event(state, &finalized, checkpoint).await?;
+                } else if checkpoint.reached_at.is_some() {
+                    record_duplicate_stream_job_checkpoint_publication(
+                        state, &finalized, checkpoint,
+                    );
+                }
+            }
+            if should_defer_terminal_callback_until_query_boundary(&finalized) {
+                info!(
+                    handle_id = %finalized.handle_id,
+                    job_id = %finalized.job_id,
+                    "streams-runtime deferring stream job terminal callback until workflow bridge is ready"
+                );
+            } else {
+                publish_stream_job_terminal_event(state, &finalized).await?;
+            }
+        } else if let Some(checkpoint) = checkpoint_to_publish.as_ref()
+            && should_emit_workflow_callbacks(&handle)
+        {
+            if checkpoint.reached_at.is_some()
+                && checkpoint.accepted_at.is_none()
+                && checkpoint.cancelled_at.is_none()
+            {
+                info!(
+                    handle_id = %handle.handle_id,
+                    job_id = %handle.job_id,
+                    checkpoint_name = %checkpoint.checkpoint_name,
+                    checkpoint_sequence = checkpoint.checkpoint_sequence,
+                    "streams-runtime publishing stream job checkpoint callback"
+                );
+                publish_stream_job_checkpoint_event(state, &handle, checkpoint).await?;
+            } else if checkpoint.reached_at.is_some() {
+                record_duplicate_stream_job_checkpoint_publication(state, &handle, checkpoint);
+            }
+        }
     }
-    let refreshed_handle = state
-        .store
-        .get_stream_job_bridge_handle_by_handle_id(&handle.handle_id)
-        .await?
-        .unwrap_or(handle);
-    if refreshed_handle.terminal_at.is_some() || refreshed_handle.terminal_event_id.is_some() {
+    Ok(())
+}
+
+async fn handle_schedule_stream_job_command(
+    state: &AppState,
+    command: &ScheduleStreamJobCommand,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    let Some(handle) =
+        state.store.get_stream_job_callback_handle_by_handle_id(&command.handle_id).await?
+    else {
+        info!(
+            tenant_id = %command.tenant_id,
+            stream_instance_id = %command.stream_instance_id,
+            stream_run_id = %command.stream_run_id,
+            job_id = %command.job_id,
+            handle_id = %command.handle_id,
+            "streams-runtime did not find stream job handle for schedule command"
+        );
         return Ok(());
+    };
+    materialize_stream_job_from_handle(state, handle, occurred_at).await
+}
+
+async fn handle_cancel_stream_job_command(
+    state: &AppState,
+    command: &CancelStreamJobCommand,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    let Some(handle) =
+        state.store.get_stream_job_callback_handle_by_handle_id(&command.handle_id).await?
+    else {
+        info!(
+            tenant_id = %command.tenant_id,
+            stream_instance_id = %command.stream_instance_id,
+            stream_run_id = %command.stream_run_id,
+            job_id = %command.job_id,
+            handle_id = %command.handle_id,
+            "streams-runtime did not find stream job handle for cancel command"
+        );
+        return Ok(());
+    };
+    let finalized = finalize_stream_job_cancellation(state, &handle, occurred_at).await?;
+    if should_emit_workflow_callbacks(&finalized) {
+        publish_stream_job_terminal_event(state, &finalized).await?;
     }
-    publish_stream_job_terminal_event(state, &refreshed_handle).await?;
     Ok(())
 }
 
@@ -367,7 +532,7 @@ async fn await_stream_job_bridge_handle(
     for _ in 0..10 {
         if let Some(handle) = state
             .store
-            .get_stream_job_bridge_handle(
+            .get_stream_job_callback_handle(
                 &event.tenant_id,
                 &event.instance_id,
                 &event.run_id,
@@ -387,7 +552,7 @@ async fn await_stream_job_bridge_query(
     query_id: &str,
 ) -> Result<Option<fabrik_store::StreamJobQueryRecord>> {
     for _ in 0..10 {
-        if let Some(query) = state.store.get_stream_job_bridge_query(query_id).await? {
+        if let Some(query) = state.store.get_stream_job_callback_query(query_id).await? {
             return Ok(Some(query));
         }
         sleep(Duration::from_millis(25)).await;
@@ -395,11 +560,127 @@ async fn await_stream_job_bridge_query(
     Ok(None)
 }
 
+async fn activate_stream_job(
+    state: &AppState,
+    handle: &fabrik_store::StreamJobBridgeHandleRecord,
+) -> Result<Option<crate::StreamJobActivationResult>> {
+    let Some(shard_workers) = state.shard_workers.get() else {
+        return activate_stream_job_on_local_state(
+            Some(&state.store),
+            &state.local_state,
+            handle,
+            state.throughput_partitions,
+            stream_job_owner_epoch(state, &handle.job_id),
+            Utc::now(),
+        )
+        .await;
+    };
+    shard_workers.activate_stream_job(handle.clone(), state.throughput_partitions).await
+}
+
+fn default_stream_job_status(
+    handle: &fabrik_store::StreamJobBridgeHandleRecord,
+) -> StreamJobStatus {
+    match handle.parsed_status() {
+        Some(StreamJobBridgeHandleStatus::Completed) => StreamJobStatus::Completed,
+        Some(StreamJobBridgeHandleStatus::Failed) => StreamJobStatus::Failed,
+        Some(StreamJobBridgeHandleStatus::Cancelled) => StreamJobStatus::Cancelled,
+        Some(StreamJobBridgeHandleStatus::CancellationRequested) => StreamJobStatus::Draining,
+        Some(StreamJobBridgeHandleStatus::Admitted) => StreamJobStatus::Starting,
+        Some(StreamJobBridgeHandleStatus::Running) | None => StreamJobStatus::Running,
+    }
+}
+
+async fn persist_stream_job_terminal_result(
+    state: &AppState,
+    handle: &fabrik_store::StreamJobBridgeHandleRecord,
+    terminal: crate::StreamJobTerminalResult,
+    occurred_at: DateTime<Utc>,
+) -> Result<fabrik_store::StreamJobBridgeHandleRecord> {
+    let mut finalized = state
+        .store
+        .get_stream_job_callback_handle_by_handle_id(&handle.handle_id)
+        .await?
+        .unwrap_or_else(|| handle.clone());
+    if finalized.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal) {
+        return Ok(finalized);
+    }
+    finalized.status = terminal.status.as_str().to_owned();
+    finalized.stream_owner_epoch = finalized
+        .stream_owner_epoch
+        .or_else(|| stream_job_owner_epoch(state, &finalized.job_id))
+        .or(Some(1));
+    finalized.terminal_at = Some(occurred_at);
+    finalized.terminal_output = terminal.output;
+    finalized.terminal_error = terminal.error;
+    finalized.updated_at = occurred_at;
+    state.store.upsert_stream_job_callback_handle(&finalized).await?;
+    Ok(finalized)
+}
+
+async fn merge_stream_job_checkpoint_bridge_state(
+    state: &AppState,
+    mut checkpoint: fabrik_store::StreamJobCheckpointRecord,
+) -> Result<fabrik_store::StreamJobCheckpointRecord> {
+    let Some(existing) =
+        state.store.get_stream_job_callback_checkpoint(&checkpoint.await_request_id).await?
+    else {
+        return Ok(checkpoint);
+    };
+    checkpoint.accepted_at = checkpoint.accepted_at.or(existing.accepted_at);
+    checkpoint.cancelled_at = checkpoint.cancelled_at.or(existing.cancelled_at);
+    checkpoint.workflow_owner_epoch =
+        checkpoint.workflow_owner_epoch.or(existing.workflow_owner_epoch);
+    checkpoint.stream_owner_epoch = checkpoint.stream_owner_epoch.or(existing.stream_owner_epoch);
+    if checkpoint.accepted_at.is_some() {
+        checkpoint.status = StreamJobCheckpointStatus::Accepted.as_str().to_owned();
+    } else if checkpoint.cancelled_at.is_some() {
+        checkpoint.status = StreamJobCheckpointStatus::Cancelled.as_str().to_owned();
+    }
+    Ok(checkpoint)
+}
+
+async fn finalize_stream_job_cancellation(
+    state: &AppState,
+    handle: &fabrik_store::StreamJobBridgeHandleRecord,
+    occurred_at: DateTime<Utc>,
+) -> Result<fabrik_store::StreamJobBridgeHandleRecord> {
+    let reason =
+        handle.cancellation_reason.clone().unwrap_or_else(|| "stream job cancelled".to_owned());
+    let finalized = persist_stream_job_terminal_result(
+        state,
+        handle,
+        crate::StreamJobTerminalResult {
+            status: StreamJobBridgeHandleStatus::Cancelled,
+            output: None,
+            error: Some(reason),
+        },
+        occurred_at,
+    )
+    .await?;
+    sync_stream_job_record(state, &finalized, StreamJobStatus::Cancelled, None, occurred_at)
+        .await?;
+    Ok(finalized)
+}
+
 async fn publish_stream_job_checkpoint_event(
     state: &AppState,
     handle: &fabrik_store::StreamJobBridgeHandleRecord,
     checkpoint: &fabrik_store::StreamJobCheckpointRecord,
 ) -> Result<()> {
+    let checkpoint = state
+        .store
+        .get_stream_job_callback_checkpoint(&checkpoint.await_request_id)
+        .await?
+        .unwrap_or_else(|| checkpoint.clone());
+    if checkpoint.parsed_status().is_some_and(|status| {
+        matches!(status, StreamJobCheckpointStatus::Accepted | StreamJobCheckpointStatus::Cancelled)
+    }) || checkpoint.accepted_at.is_some()
+        || checkpoint.cancelled_at.is_some()
+    {
+        record_duplicate_stream_job_checkpoint_publication(state, handle, &checkpoint);
+        return Ok(());
+    }
     let identity = WorkflowIdentity::new(
         handle.tenant_id.clone(),
         handle.definition_id.clone(),
@@ -420,7 +701,11 @@ async fn publish_stream_job_checkpoint_event(
             "checkpoint": checkpoint.checkpoint_name,
             "sequence": checkpoint.checkpoint_sequence.unwrap_or(0),
         })),
-        stream_owner_epoch: Some(1),
+        stream_owner_epoch: resolved_stream_job_owner_epoch(
+            state,
+            handle,
+            checkpoint.stream_owner_epoch,
+        ),
     };
     let dedupe_key = stream_job_checkpoint_callback_dedupe_key(
         &handle.tenant_id,
@@ -432,26 +717,9 @@ async fn publish_stream_job_checkpoint_event(
     );
     let mut envelope = EventEnvelope::new(payload.event_type(), identity, payload);
     envelope.event_id = stream_job_callback_event_id(&dedupe_key);
-    envelope.occurred_at = Utc::now();
+    envelope.occurred_at = checkpoint.reached_at.unwrap_or_else(Utc::now);
     envelope.dedupe_key = Some(dedupe_key);
-    envelope.metadata.insert(
-        "bridge_request_id".to_owned(),
-        stream_job_bridge_request_id(
-            &handle.tenant_id,
-            &handle.instance_id,
-            &handle.run_id,
-            &handle.job_id,
-        ),
-    );
-    envelope.metadata.insert(
-        "bridge_protocol_version".to_owned(),
-        fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
-    );
-    envelope.metadata.insert(
-        "bridge_operation_kind".to_owned(),
-        fabrik_throughput::ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
-    );
-    envelope.metadata.insert("bridge_owner_epoch".to_owned(), "1".to_owned());
+    attach_stream_job_bridge_metadata(state, handle, checkpoint.stream_owner_epoch, &mut envelope);
     enqueue_stream_job_callback_event(state, &envelope).await
 }
 
@@ -459,6 +727,15 @@ async fn publish_stream_job_terminal_event(
     state: &AppState,
     handle: &fabrik_store::StreamJobBridgeHandleRecord,
 ) -> Result<()> {
+    let handle = state
+        .store
+        .get_stream_job_callback_handle_by_handle_id(&handle.handle_id)
+        .await?
+        .unwrap_or_else(|| handle.clone());
+    if handle.workflow_accepted_at.is_some() || handle.terminal_event_id.is_some() {
+        record_duplicate_stream_job_terminal_publication(state, &handle);
+        return Ok(());
+    }
     let identity = WorkflowIdentity::new(
         handle.tenant_id.clone(),
         handle.definition_id.clone(),
@@ -468,12 +745,11 @@ async fn publish_stream_job_terminal_event(
         handle.run_id.clone(),
         "throughput-runtime",
     );
-    let status =
-        if handle.parsed_status() == Some(StreamJobBridgeHandleStatus::CancellationRequested) {
-            StreamJobBridgeHandleStatus::Cancelled
-        } else {
-            StreamJobBridgeHandleStatus::Completed
-        };
+    let Some(status) = handle.parsed_status() else {
+        return Ok(());
+    };
+    let stream_owner_epoch =
+        resolved_stream_job_owner_epoch(state, &handle, handle.stream_owner_epoch);
     let payload = match status {
         StreamJobBridgeHandleStatus::Cancelled => WorkflowEvent::StreamJobCancelled {
             job_id: handle.job_id.clone(),
@@ -482,19 +758,27 @@ async fn publish_stream_job_terminal_event(
                 .cancellation_reason
                 .clone()
                 .unwrap_or_else(|| "stream job cancelled".to_owned()),
-            stream_owner_epoch: Some(1),
+            stream_owner_epoch,
         },
         StreamJobBridgeHandleStatus::Completed => WorkflowEvent::StreamJobCompleted {
             job_id: handle.job_id.clone(),
             handle_id: handle.handle_id.clone(),
-            output: json!({
-                "jobId": handle.job_id,
-                "jobName": handle.job_name,
-                "status": "completed",
+            output: handle.terminal_output.clone().unwrap_or_else(|| {
+                json!({
+                    "jobId": handle.job_id,
+                    "jobName": handle.job_name,
+                    "status": "completed",
+                })
             }),
-            stream_owner_epoch: Some(1),
+            stream_owner_epoch,
         },
-        _ => unreachable!("only completed/cancelled terminal callbacks are synthesized"),
+        StreamJobBridgeHandleStatus::Failed => WorkflowEvent::StreamJobFailed {
+            job_id: handle.job_id.clone(),
+            handle_id: handle.handle_id.clone(),
+            error: handle.terminal_error.clone().unwrap_or_else(|| "stream job failed".to_owned()),
+            stream_owner_epoch,
+        },
+        _ => return Ok(()),
     };
     let dedupe_key = stream_job_terminal_callback_dedupe_key(
         &handle.tenant_id,
@@ -505,26 +789,9 @@ async fn publish_stream_job_terminal_event(
     );
     let mut envelope = EventEnvelope::new(payload.event_type(), identity, payload);
     envelope.event_id = stream_job_callback_event_id(&dedupe_key);
-    envelope.occurred_at = Utc::now();
+    envelope.occurred_at = handle.terminal_at.unwrap_or_else(Utc::now);
     envelope.dedupe_key = Some(dedupe_key);
-    envelope.metadata.insert(
-        "bridge_request_id".to_owned(),
-        stream_job_bridge_request_id(
-            &handle.tenant_id,
-            &handle.instance_id,
-            &handle.run_id,
-            &handle.job_id,
-        ),
-    );
-    envelope.metadata.insert(
-        "bridge_protocol_version".to_owned(),
-        fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
-    );
-    envelope.metadata.insert(
-        "bridge_operation_kind".to_owned(),
-        fabrik_throughput::ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
-    );
-    envelope.metadata.insert("bridge_owner_epoch".to_owned(), "1".to_owned());
+    attach_stream_job_bridge_metadata(state, &handle, stream_owner_epoch, &mut envelope);
     enqueue_stream_job_callback_event(state, &envelope).await
 }
 
@@ -549,8 +816,29 @@ async fn publish_stream_job_query_callback_from_bridge(
                 | StreamJobQueryStatus::Cancelled
         )
     }) {
+        record_duplicate_stream_job_query_request(state, event, &query);
         return Ok(());
     }
+
+    let owner_epoch = stream_job_owner_epoch(state, &handle.job_id);
+    let (status, output, error) = match build_stream_job_query_payload(state, &handle, &query).await
+    {
+        WorkflowEvent::StreamJobQueryCompleted { output, .. } => {
+            (StreamJobQueryStatus::Completed, Some(output), None)
+        }
+        WorkflowEvent::StreamJobQueryFailed { error, .. } => {
+            (StreamJobQueryStatus::Failed, None, Some(error))
+        }
+        other => anyhow::bail!("unexpected stream job query payload {other:?}"),
+    };
+    let mut query = query;
+    query.status = status.as_str().to_owned();
+    query.stream_owner_epoch = owner_epoch;
+    query.output = output;
+    query.error = error;
+    query.completed_at = Some(event.occurred_at);
+    query.updated_at = event.occurred_at;
+    state.store.upsert_stream_job_callback_query(&query).await?;
 
     let identity = WorkflowIdentity::new(
         handle.tenant_id.clone(),
@@ -561,7 +849,7 @@ async fn publish_stream_job_query_callback_from_bridge(
         handle.run_id.clone(),
         "throughput-runtime",
     );
-    let payload = build_stream_job_query_payload(state, &handle, &query);
+    let payload = build_stream_job_query_payload(state, &handle, &query).await;
     let dedupe_key = stream_job_query_callback_dedupe_key(
         &handle.tenant_id,
         &handle.instance_id,
@@ -575,8 +863,228 @@ async fn publish_stream_job_query_callback_from_bridge(
     );
     let mut envelope = EventEnvelope::new(payload.event_type(), identity, payload);
     envelope.event_id = stream_job_callback_event_id(&dedupe_key);
-    envelope.occurred_at = Utc::now();
+    envelope.occurred_at = query.completed_at.unwrap_or(event.occurred_at);
     envelope.dedupe_key = Some(dedupe_key);
+    attach_stream_job_bridge_metadata(state, &handle, query.stream_owner_epoch, &mut envelope);
+    enqueue_stream_job_callback_event(state, &envelope).await?;
+    publish_stream_job_terminal_after_query_if_pending(state, &handle, event.occurred_at).await
+}
+
+fn record_duplicate_stream_job_query_request(
+    state: &AppState,
+    event: &EventEnvelope<WorkflowEvent>,
+    query: &fabrik_store::StreamJobQueryRecord,
+) {
+    let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
+    debug.duplicate_bridge_events = debug.duplicate_bridge_events.saturating_add(1);
+    debug.duplicate_stream_job_query_requests_ignored =
+        debug.duplicate_stream_job_query_requests_ignored.saturating_add(1);
+    debug.last_duplicate_stream_job_query_request_at = Some(event.occurred_at);
+    debug.last_duplicate_stream_job_query_request = Some(format!(
+        "{}:{}:{}:{}:{}:{}",
+        event.tenant_id,
+        event.instance_id,
+        event.run_id,
+        query.job_id,
+        query.query_id,
+        query.status
+    ));
+    drop(debug);
+
+    info!(
+        tenant_id = %event.tenant_id,
+        instance_id = %event.instance_id,
+        run_id = %event.run_id,
+        job_id = %query.job_id,
+        query_id = %query.query_id,
+        query_name = %query.query_name,
+        status = %query.status,
+        "streams-runtime ignored duplicate stream job query request"
+    );
+}
+
+fn record_duplicate_stream_job_checkpoint_publication(
+    state: &AppState,
+    handle: &fabrik_store::StreamJobBridgeHandleRecord,
+    checkpoint: &fabrik_store::StreamJobCheckpointRecord,
+) {
+    let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
+    debug.duplicate_bridge_events = debug.duplicate_bridge_events.saturating_add(1);
+    debug.duplicate_stream_job_checkpoint_publications_ignored =
+        debug.duplicate_stream_job_checkpoint_publications_ignored.saturating_add(1);
+    debug.last_duplicate_stream_job_checkpoint_publication_at =
+        checkpoint.accepted_at.or(checkpoint.cancelled_at).or(checkpoint.reached_at);
+    debug.last_duplicate_stream_job_checkpoint_publication = Some(format!(
+        "{}:{}:{}:{}:{}:{}",
+        handle.tenant_id,
+        handle.instance_id,
+        handle.run_id,
+        checkpoint.job_id,
+        checkpoint.checkpoint_name,
+        checkpoint.status
+    ));
+    drop(debug);
+
+    info!(
+        tenant_id = %handle.tenant_id,
+        instance_id = %handle.instance_id,
+        run_id = %handle.run_id,
+        job_id = %checkpoint.job_id,
+        checkpoint_name = %checkpoint.checkpoint_name,
+        checkpoint_sequence = checkpoint.checkpoint_sequence,
+        status = %checkpoint.status,
+        accepted_at = ?checkpoint.accepted_at,
+        cancelled_at = ?checkpoint.cancelled_at,
+        "streams-runtime ignored duplicate stream job checkpoint callback publication"
+    );
+}
+
+fn record_duplicate_stream_job_terminal_publication(
+    state: &AppState,
+    handle: &fabrik_store::StreamJobBridgeHandleRecord,
+) {
+    let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
+    debug.duplicate_bridge_events = debug.duplicate_bridge_events.saturating_add(1);
+    debug.duplicate_stream_job_terminal_publications_ignored =
+        debug.duplicate_stream_job_terminal_publications_ignored.saturating_add(1);
+    debug.last_duplicate_stream_job_terminal_publication_at =
+        handle.workflow_accepted_at.or(handle.terminal_at);
+    debug.last_duplicate_stream_job_terminal_publication = Some(format!(
+        "{}:{}:{}:{}:{}",
+        handle.tenant_id, handle.instance_id, handle.run_id, handle.job_id, handle.status
+    ));
+    drop(debug);
+
+    info!(
+        tenant_id = %handle.tenant_id,
+        instance_id = %handle.instance_id,
+        run_id = %handle.run_id,
+        job_id = %handle.job_id,
+        status = %handle.status,
+        terminal_event_id = ?handle.terminal_event_id,
+        workflow_accepted_at = ?handle.workflow_accepted_at,
+        "streams-runtime ignored duplicate stream job terminal callback publication"
+    );
+}
+
+async fn publish_stream_job_terminal_after_query_if_pending(
+    state: &AppState,
+    handle: &fabrik_store::StreamJobBridgeHandleRecord,
+    occurred_at: DateTime<Utc>,
+) -> Result<()> {
+    info!(
+        handle_id = %handle.handle_id,
+        job_id = %handle.job_id,
+        status = %handle.status,
+        workflow_accepted_at = ?handle.workflow_accepted_at,
+        "streams-runtime evaluating deferred stream job terminal callback after query"
+    );
+    let Some(terminal) = terminal_result_after_query(&handle) else {
+        info!(
+            handle_id = %handle.handle_id,
+            job_id = %handle.job_id,
+            status = %handle.status,
+            workflow_accepted_at = ?handle.workflow_accepted_at,
+            "streams-runtime found no deferred stream job terminal callback to publish after query"
+        );
+        return Ok(());
+    };
+    let finalized =
+        persist_stream_job_terminal_result(state, handle, terminal, occurred_at).await?;
+    sync_stream_job_record(
+        state,
+        &finalized,
+        default_stream_job_status(&finalized),
+        None,
+        finalized.terminal_at.unwrap_or(occurred_at),
+    )
+    .await?;
+    info!(
+        handle_id = %finalized.handle_id,
+        job_id = %finalized.job_id,
+        status = %finalized.status,
+        "streams-runtime publishing pending stream job terminal callback after query"
+    );
+    publish_stream_job_terminal_event(state, &finalized).await
+}
+
+async fn build_stream_job_query_payload(
+    state: &AppState,
+    handle: &fabrik_store::StreamJobBridgeHandleRecord,
+    query: &fabrik_store::StreamJobQueryRecord,
+) -> WorkflowEvent {
+    let consistency = query.parsed_consistency().unwrap_or(StreamJobQueryConsistency::Eventual);
+    let owner_epoch = resolved_stream_job_owner_epoch(state, handle, query.stream_owner_epoch);
+    let owner_backed_payload = |result: Result<Option<Value>>| match result {
+        Ok(Some(output)) => WorkflowEvent::StreamJobQueryCompleted {
+            job_id: handle.job_id.clone(),
+            handle_id: handle.handle_id.clone(),
+            query_id: query.query_id.clone(),
+            query_name: query.query_name.clone(),
+            output,
+            stream_owner_epoch: owner_epoch,
+        },
+        Ok(None) => WorkflowEvent::StreamJobQueryFailed {
+            job_id: handle.job_id.clone(),
+            handle_id: handle.handle_id.clone(),
+            query_id: query.query_id.clone(),
+            query_name: query.query_name.clone(),
+            error: format!(
+                "strong query consistency is not supported for stream job {}",
+                handle.job_name
+            ),
+            stream_owner_epoch: owner_epoch,
+        },
+        Err(error) => WorkflowEvent::StreamJobQueryFailed {
+            job_id: handle.job_id.clone(),
+            handle_id: handle.handle_id.clone(),
+            query_id: query.query_id.clone(),
+            query_name: query.query_name.clone(),
+            error: format!("{error}"),
+            stream_owner_epoch: owner_epoch,
+        },
+    };
+    let query_result = build_stream_job_query_output(state, handle, query).await;
+    match consistency {
+        StreamJobQueryConsistency::Strong => owner_backed_payload(query_result),
+        StreamJobQueryConsistency::Eventual => match query_result {
+            Ok(Some(output)) => owner_backed_payload(Ok(Some(output))),
+            Err(error) => owner_backed_payload(Err(error)),
+            Ok(None) => WorkflowEvent::StreamJobQueryCompleted {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                query_id: query.query_id.clone(),
+                query_name: query.query_name.clone(),
+                output: json!({
+                    "jobId": handle.job_id,
+                    "jobName": handle.job_name,
+                    "query": query.query_name,
+                    "consistency": query.consistency,
+                    "consistencySource": "streams-runtime-snapshot",
+                    "status": handle.status,
+                }),
+                stream_owner_epoch: owner_epoch,
+            },
+        },
+    }
+}
+
+fn resolved_stream_job_owner_epoch(
+    state: &AppState,
+    handle: &fabrik_store::StreamJobBridgeHandleRecord,
+    callback_owner_epoch: Option<u64>,
+) -> Option<u64> {
+    callback_owner_epoch
+        .or(handle.stream_owner_epoch)
+        .or_else(|| stream_job_owner_epoch(state, &handle.job_id))
+}
+
+fn attach_stream_job_bridge_metadata(
+    state: &AppState,
+    handle: &fabrik_store::StreamJobBridgeHandleRecord,
+    callback_owner_epoch: Option<u64>,
+    envelope: &mut EventEnvelope<WorkflowEvent>,
+) {
     envelope.metadata.insert(
         "bridge_request_id".to_owned(),
         stream_job_bridge_request_id(
@@ -594,350 +1102,9 @@ async fn publish_stream_job_query_callback_from_bridge(
         "bridge_operation_kind".to_owned(),
         fabrik_throughput::ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
     );
-    envelope.metadata.insert("bridge_owner_epoch".to_owned(), "1".to_owned());
-    enqueue_stream_job_callback_event(state, &envelope).await
-}
-
-fn build_stream_job_query_payload(
-    state: &AppState,
-    handle: &fabrik_store::StreamJobBridgeHandleRecord,
-    query: &fabrik_store::StreamJobQueryRecord,
-) -> WorkflowEvent {
-    let consistency = query.parsed_consistency().unwrap_or(StreamJobQueryConsistency::Eventual);
-    let owner_backed_payload =
-        || match build_keyed_rollup_query_output(&state.local_state, handle, query) {
-            Ok(output) => WorkflowEvent::StreamJobQueryCompleted {
-                job_id: handle.job_id.clone(),
-                handle_id: handle.handle_id.clone(),
-                query_id: query.query_id.clone(),
-                query_name: query.query_name.clone(),
-                output,
-                stream_owner_epoch: Some(1),
-            },
-            Err(error) => WorkflowEvent::StreamJobQueryFailed {
-                job_id: handle.job_id.clone(),
-                handle_id: handle.handle_id.clone(),
-                query_id: query.query_id.clone(),
-                query_name: query.query_name.clone(),
-                error: error.to_string(),
-                stream_owner_epoch: Some(1),
-            },
-        };
-    match consistency {
-        StreamJobQueryConsistency::Strong => {
-            if handle.job_name == KEYED_ROLLUP_JOB_NAME {
-                owner_backed_payload()
-            } else {
-                WorkflowEvent::StreamJobQueryFailed {
-                    job_id: handle.job_id.clone(),
-                    handle_id: handle.handle_id.clone(),
-                    query_id: query.query_id.clone(),
-                    query_name: query.query_name.clone(),
-                    error: format!(
-                        "strong query consistency is not supported for stream job {}",
-                        handle.job_name
-                    ),
-                    stream_owner_epoch: Some(1),
-                }
-            }
-        }
-        StreamJobQueryConsistency::Eventual => {
-            if handle.job_name == KEYED_ROLLUP_JOB_NAME {
-                owner_backed_payload()
-            } else {
-                WorkflowEvent::StreamJobQueryCompleted {
-                    job_id: handle.job_id.clone(),
-                    handle_id: handle.handle_id.clone(),
-                    query_id: query.query_id.clone(),
-                    query_name: query.query_name.clone(),
-                    output: json!({
-                        "jobId": handle.job_id,
-                        "jobName": handle.job_name,
-                        "query": query.query_name,
-                        "consistency": query.consistency,
-                        "consistencySource": "streams-runtime-snapshot",
-                        "status": handle.status,
-                    }),
-                    stream_owner_epoch: Some(1),
-                }
-            }
-        }
-    }
-}
-
-const KEYED_ROLLUP_JOB_NAME: &str = "keyed-rollup";
-const KEYED_ROLLUP_CHECKPOINT_NAME: &str = "initial-rollup-ready";
-const KEYED_ROLLUP_CHECKPOINT_SEQUENCE: i64 = 1;
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct KeyedRollupItem {
-    account_id: String,
-    amount: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct KeyedRollupInputEnvelope {
-    kind: Option<String>,
-    items: Vec<KeyedRollupItem>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AccountTotalsQueryArgs {
-    key: String,
-}
-
-fn parse_keyed_rollup_items(input_ref: &str) -> Result<Vec<KeyedRollupItem>> {
-    let value: serde_json::Value =
-        serde_json::from_str(input_ref).context("failed to decode stream job input_ref JSON")?;
-    if let Ok(items) = serde_json::from_value::<Vec<KeyedRollupItem>>(value.clone()) {
-        return Ok(items);
-    }
-    let envelope: KeyedRollupInputEnvelope = serde_json::from_value(value)
-        .context("keyed-rollup input must be an item array or bounded_items envelope")?;
-    if envelope.kind.as_deref().is_some_and(|kind| kind != "bounded_items") {
-        anyhow::bail!("keyed-rollup input kind must be bounded_items");
-    }
-    Ok(envelope.items)
-}
-
-fn keyed_rollup_totals(items: &[KeyedRollupItem]) -> BTreeMap<String, f64> {
-    let mut totals = BTreeMap::new();
-    for item in items {
-        *totals.entry(item.account_id.clone()).or_insert(0.0) += item.amount;
-    }
-    totals
-}
-
-async fn materialize_keyed_rollup_checkpoint(
-    state: &AppState,
-    handle: &fabrik_store::StreamJobBridgeHandleRecord,
-) -> Result<()> {
-    let items = parse_keyed_rollup_items(&handle.input_ref)?;
-    let totals = keyed_rollup_totals(&items);
-    let updated_at = Utc::now();
-    for (account_id, total_amount) in totals {
-        state.local_state.upsert_stream_job_view_value(
-            &handle.handle_id,
-            &handle.job_id,
-            "accountTotals",
-            &account_id,
-            json!({
-                "accountId": account_id,
-                "totalAmount": total_amount,
-                "asOfCheckpoint": KEYED_ROLLUP_CHECKPOINT_SEQUENCE,
-            }),
-            KEYED_ROLLUP_CHECKPOINT_SEQUENCE,
-            updated_at,
-        )?;
-    }
-    let existing = state
-        .store
-        .list_stream_job_bridge_checkpoints_for_handle_page(&handle.handle_id, 10_000, 0)
-        .await?
-        .into_iter()
-        .find(|checkpoint| checkpoint.checkpoint_name == KEYED_ROLLUP_CHECKPOINT_NAME);
-    let mut checkpoint = existing.unwrap_or(StreamJobCheckpointRecord {
-        workflow_event_id: Uuid::now_v7(),
-        protocol_version: fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
-        operation_kind: fabrik_throughput::ThroughputBridgeOperationKind::StreamJob
-            .as_str()
-            .to_owned(),
-        tenant_id: handle.tenant_id.clone(),
-        instance_id: handle.instance_id.clone(),
-        run_id: handle.run_id.clone(),
-        job_id: handle.job_id.clone(),
-        handle_id: handle.handle_id.clone(),
-        bridge_request_id: handle.bridge_request_id.clone(),
-        await_request_id: format!(
-            "stream-job-reached:{}:{}:{}",
-            handle.handle_id, KEYED_ROLLUP_CHECKPOINT_NAME, KEYED_ROLLUP_CHECKPOINT_SEQUENCE
-        ),
-        checkpoint_name: KEYED_ROLLUP_CHECKPOINT_NAME.to_owned(),
-        checkpoint_sequence: Some(KEYED_ROLLUP_CHECKPOINT_SEQUENCE),
-        status: fabrik_throughput::StreamJobCheckpointStatus::Awaiting.as_str().to_owned(),
-        workflow_owner_epoch: handle.workflow_owner_epoch,
-        stream_owner_epoch: Some(1),
-        reached_at: None,
-        output: None,
-        accepted_at: None,
-        cancelled_at: None,
-        created_at: Utc::now(),
-        updated_at: Utc::now(),
-    });
-    if checkpoint.reached_at.is_none() {
-        checkpoint.status =
-            fabrik_throughput::StreamJobCheckpointStatus::Reached.as_str().to_owned();
-        checkpoint.checkpoint_sequence = Some(KEYED_ROLLUP_CHECKPOINT_SEQUENCE);
-        checkpoint.stream_owner_epoch = Some(1);
-        checkpoint.reached_at = Some(Utc::now());
-        checkpoint.output = Some(json!({
-            "jobId": handle.job_id,
-            "checkpoint": KEYED_ROLLUP_CHECKPOINT_NAME,
-            "checkpointSequence": KEYED_ROLLUP_CHECKPOINT_SEQUENCE,
-            "viewName": "accountTotals",
-        }));
-        checkpoint.updated_at = Utc::now();
-        state.store.upsert_stream_job_bridge_checkpoint(&checkpoint).await?;
-    }
-    sync_stream_job_record(state, handle, StreamJobStatus::Running, Some(&checkpoint), Utc::now())
-        .await?;
-    Ok(())
-}
-
-fn build_keyed_rollup_query_output(
-    local_state: &crate::local_state::LocalThroughputState,
-    handle: &fabrik_store::StreamJobBridgeHandleRecord,
-    query: &fabrik_store::StreamJobQueryRecord,
-) -> Result<serde_json::Value> {
-    if query.query_name != "accountTotals" {
-        anyhow::bail!("unsupported keyed-rollup query {}", query.query_name);
-    }
-    let args: AccountTotalsQueryArgs =
-        serde_json::from_value(query.query_args.clone().unwrap_or(serde_json::Value::Null))
-            .context("accountTotals query requires args with a key field")?;
-    let Some(view) =
-        local_state.load_stream_job_view_state(&handle.handle_id, "accountTotals", &args.key)?
-    else {
-        anyhow::bail!("accountTotals key {} is not materialized", args.key);
-    };
-    let mut output = view.output;
-    if let Some(object) = output.as_object_mut() {
-        object
-            .insert("consistency".to_owned(), serde_json::Value::String(query.consistency.clone()));
-        object.insert(
-            "consistencySource".to_owned(),
-            serde_json::Value::String("stream_owner_local_state".to_owned()),
-        );
-    }
-    Ok(output)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    fn temp_path(prefix: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("{prefix}-{}", Uuid::now_v7()))
-    }
-
-    #[test]
-    fn keyed_rollup_items_parse_from_bounded_items_envelope() {
-        let items = parse_keyed_rollup_items(
-            r#"{"kind":"bounded_items","items":[{"accountId":"acct_1","amount":4},{"accountId":"acct_1","amount":5.5},{"accountId":"acct_2","amount":1}]}"#,
-        )
-        .expect("items should parse");
-        let totals = keyed_rollup_totals(&items);
-        assert_eq!(totals.get("acct_1"), Some(&9.5));
-        assert_eq!(totals.get("acct_2"), Some(&1.0));
-    }
-
-    #[test]
-    fn keyed_rollup_query_output_returns_owner_view_shape() {
-        let db_path = temp_path("bridge-keyed-rollup-db");
-        let checkpoint_dir = temp_path("bridge-keyed-rollup-checkpoints");
-        let local_state =
-            crate::local_state::LocalThroughputState::open(&db_path, &checkpoint_dir, 3)
-                .expect("local state should open");
-        let handle = fabrik_store::StreamJobBridgeHandleRecord {
-            workflow_event_id: Uuid::now_v7(),
-            protocol_version: fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
-            operation_kind: fabrik_throughput::ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
-            tenant_id: "tenant-a".to_owned(),
-            instance_id: "instance-a".to_owned(),
-            run_id: "run-a".to_owned(),
-            job_id: "job-a".to_owned(),
-            handle_id: "handle-a".to_owned(),
-            bridge_request_id: "bridge-a".to_owned(),
-            definition_id: "demo".to_owned(),
-            definition_version: Some(1),
-            artifact_hash: Some("artifact-a".to_owned()),
-            job_name: KEYED_ROLLUP_JOB_NAME.to_owned(),
-            input_ref: r#"{"kind":"bounded_items","items":[{"accountId":"acct_1","amount":2},{"accountId":"acct_1","amount":3}]}"#.to_owned(),
-            config_ref: None,
-            checkpoint_policy: Some(json!({
-                "kind": "named_checkpoints",
-                "checkpoints": [
-                    {
-                        "name": KEYED_ROLLUP_CHECKPOINT_NAME,
-                        "delivery": "workflow_awaitable",
-                        "sequence": KEYED_ROLLUP_CHECKPOINT_SEQUENCE
-                    }
-                ]
-            })),
-            view_definitions: Some(json!([
-                {
-                    "name": "accountTotals",
-                    "consistency": "strong",
-                    "queryMode": "by_key",
-                    "keyField": "accountId",
-                    "valueFields": ["accountId", "totalAmount", "asOfCheckpoint"]
-                }
-            ])),
-            status: fabrik_throughput::StreamJobBridgeHandleStatus::Admitted.as_str().to_owned(),
-            workflow_owner_epoch: Some(1),
-            stream_owner_epoch: Some(1),
-            cancellation_requested_at: None,
-            cancellation_reason: None,
-            terminal_event_id: None,
-            terminal_at: None,
-            workflow_accepted_at: None,
-            terminal_output: None,
-            terminal_error: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-        local_state
-            .upsert_stream_job_view_value(
-                &handle.handle_id,
-                &handle.job_id,
-                "accountTotals",
-                "acct_1",
-                json!({"accountId": "acct_1", "totalAmount": 5.0, "asOfCheckpoint": 1}),
-                1,
-                Utc::now(),
-            )
-            .expect("view state should persist");
-        let query = fabrik_store::StreamJobQueryRecord {
-            workflow_event_id: Uuid::now_v7(),
-            protocol_version: fabrik_throughput::THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
-            operation_kind: fabrik_throughput::ThroughputBridgeOperationKind::StreamJob
-                .as_str()
-                .to_owned(),
-            tenant_id: "tenant-a".to_owned(),
-            instance_id: "instance-a".to_owned(),
-            run_id: "run-a".to_owned(),
-            job_id: "job-a".to_owned(),
-            handle_id: "handle-a".to_owned(),
-            bridge_request_id: "bridge-a".to_owned(),
-            query_id: "query-a".to_owned(),
-            query_name: "accountTotals".to_owned(),
-            query_args: Some(json!({"key": "acct_1"})),
-            consistency: "strong".to_owned(),
-            status: fabrik_throughput::StreamJobQueryStatus::Requested.as_str().to_owned(),
-            workflow_owner_epoch: Some(1),
-            stream_owner_epoch: Some(1),
-            output: None,
-            error: None,
-            requested_at: Utc::now(),
-            completed_at: None,
-            accepted_at: None,
-            cancelled_at: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
-
-        let output = build_keyed_rollup_query_output(&local_state, &handle, &query)
-            .expect("query should succeed");
-        assert_eq!(output["accountId"], "acct_1");
-        assert_eq!(output["totalAmount"], 5.0);
-        assert_eq!(output["asOfCheckpoint"], KEYED_ROLLUP_CHECKPOINT_SEQUENCE);
-        assert_eq!(output["consistency"], "strong");
-        assert_eq!(output["consistencySource"], "stream_owner_local_state");
-
-        let _ = std::fs::remove_dir_all(&db_path);
-        let _ = std::fs::remove_dir_all(&checkpoint_dir);
+    if let Some(owner_epoch) = resolved_stream_job_owner_epoch(state, handle, callback_owner_epoch)
+    {
+        envelope.metadata.insert("bridge_owner_epoch".to_owned(), owner_epoch.to_string());
     }
 }
 
@@ -950,35 +1117,71 @@ async fn enqueue_stream_job_callback_event(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CommandPlane {
+    Throughput,
+    Streams,
+}
+
+fn note_command_received(
+    state: &AppState,
+    plane: CommandPlane,
+    occurred_at: chrono::DateTime<chrono::Utc>,
+) {
+    let mut debug = state.debug.lock().expect("throughput debug lock poisoned");
+    match plane {
+        CommandPlane::Throughput => {
+            debug.throughput_commands_received =
+                debug.throughput_commands_received.saturating_add(1);
+            debug.last_throughput_command_at = Some(occurred_at);
+        }
+        CommandPlane::Streams => {
+            debug.streams_commands_received = debug.streams_commands_received.saturating_add(1);
+            debug.last_streams_command_at = Some(occurred_at);
+        }
+    }
+}
+
 pub(super) async fn run_command_loop(
     state: AppState,
     mut consumer: fabrik_broker::JsonConsumerStream,
+    plane: CommandPlane,
 ) {
     while let Some(message) = consumer.next().await {
         let record = match message {
             Ok(record) => record,
             Err(error) => {
-                error!(error = %error, "streams-runtime command consumer error");
+                error!(error = %error, command_plane = ?plane, "streams-runtime command consumer error");
                 continue;
             }
         };
         let command = match decode_json_record::<ThroughputCommandEnvelope>(&record.record) {
             Ok(command) => command,
             Err(error) => {
-                warn!(error = %error, "streams-runtime skipping invalid command");
+                warn!(error = %error, command_plane = ?plane, "streams-runtime skipping invalid command");
                 continue;
             }
         };
+        note_command_received(&state, plane, command.occurred_at);
         if let Err(error) = handle_throughput_command(state.clone(), command).await {
-            error!(error = %error, "streams-runtime failed to handle throughput command");
+            error!(error = %error, command_plane = ?plane, "streams-runtime failed to handle throughput command");
         }
     }
 }
 
-async fn handle_throughput_command(
+pub(crate) async fn handle_throughput_command(
     state: AppState,
     command: ThroughputCommandEnvelope,
 ) -> Result<()> {
+    match &command.payload {
+        ThroughputCommand::ScheduleStreamJob(schedule) => {
+            return handle_schedule_stream_job_command(&state, schedule, command.occurred_at).await;
+        }
+        ThroughputCommand::CancelStreamJob(cancel) => {
+            return handle_cancel_stream_job_command(&state, cancel, command.occurred_at).await;
+        }
+        _ => {}
+    }
     let (tenant_id, instance_id, run_id, batch_id, throughput_backend) = match &command.payload {
         ThroughputCommand::StartThroughputRun(command) => (
             command.tenant_id.as_str(),
@@ -1001,7 +1204,10 @@ async fn handle_throughput_command(
             identity.batch_id.as_str(),
             ThroughputBackend::StreamV2.as_str(),
         ),
-        ThroughputCommand::TinyWorkflowStart(_) | ThroughputCommand::TinyWorkflowStartBatch(_) => {
+        ThroughputCommand::TinyWorkflowStart(_)
+        | ThroughputCommand::TinyWorkflowStartBatch(_)
+        | ThroughputCommand::ScheduleStreamJob(_)
+        | ThroughputCommand::CancelStreamJob(_) => {
             return Ok(());
         }
         _ => return Ok(()),
@@ -1025,9 +1231,10 @@ async fn handle_throughput_command(
         ThroughputCommand::CancelBatch { identity, reason } => {
             cancel_stream_batch_via_bridge(&state, identity, reason, command.occurred_at).await
         }
-        ThroughputCommand::TinyWorkflowStart(_) | ThroughputCommand::TinyWorkflowStartBatch(_) => {
-            Ok(())
-        }
+        ThroughputCommand::TinyWorkflowStart(_)
+        | ThroughputCommand::TinyWorkflowStartBatch(_)
+        | ThroughputCommand::ScheduleStreamJob(_)
+        | ThroughputCommand::CancelStreamJob(_) => Ok(()),
         _ => Ok(()),
     }
 }

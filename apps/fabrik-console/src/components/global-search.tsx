@@ -14,6 +14,7 @@ const NAV_ITEMS = [
   { title: "Home", subtitle: "Operator overview", href: "/" },
   { title: "Workflows", subtitle: "Definition catalog", href: "/workflows" },
   { title: "Runs", subtitle: "Operational run index", href: "/runs" },
+  { title: "Stream Jobs", subtitle: "Bridge and materialized state inspection", href: "/stream-jobs" },
   { title: "Task Queues", subtitle: "Queue health and pollers", href: "/task-queues" }
 ];
 

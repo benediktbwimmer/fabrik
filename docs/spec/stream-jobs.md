@@ -2,9 +2,15 @@
 
 ## Status
 
-This document defines the target contract for future stream-native workflow primitives such as `ctx.startStreamJob(...)`.
+This document defines the current narrow contract for stream-native workflow primitives such as `ctx.startStreamJob(...)`.
 
-It is not part of the current workflow replacement claim.
+The currently implemented workflow-facing slice is:
+
+- `ctx.startStreamJob(...)`
+- `job.untilCheckpoint(name)`
+- `job.query(name, args?, options?)`
+- `job.cancel(reason?)`
+- `job.result()`
 
 The current shipping bridge contract for throughput mode remains defined by [streams-bridge.md](/Users/bene/code/fabrik/docs/spec/streams-bridge.md) and [throughput-mode.md](/Users/bene/code/fabrik/docs/spec/throughput-mode.md).
 
@@ -42,7 +48,7 @@ The stream-job contract must not be smuggled into throughput mode by overloading
 
 ## Workflow Surface
 
-Target workflow-facing shape:
+Current workflow-facing shape:
 
 ```ts
 const job = await ctx.startStreamJob("fraud-detector", {
@@ -58,7 +64,7 @@ await job.cancel("workflow closed");
 const result = await job.result();
 ```
 
-Expected semantic operations:
+Currently implemented semantic operations:
 
 - `ctx.startStreamJob(name, input)`:
   starts or recovers a stable stream job handle
@@ -69,7 +75,7 @@ Expected semantic operations:
 - `job.cancel(reason?)`:
   requests stream-job cancellation idempotently
 - `job.result()`:
-  waits for the final terminal outcome
+  terminal wait surface for stream jobs that should block on final completion
 
 ## Bridge-Owned Entities
 

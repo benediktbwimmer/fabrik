@@ -410,6 +410,46 @@ fn build_app(state: AppState, service_name: String) -> Router {
         get(proxy_to_query_get),
     )
     .route(
+        "/tenants/{tenant_id}/stream-artifacts",
+        get(proxy_to_query_get).post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-artifacts/{definition_id}/latest",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-artifacts/{definition_id}/versions/{version}",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs",
+        get(proxy_to_query_get).post(proxy_to_ingest),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/keys/{logical_key}",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/keys",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/views/{view_name}/entries",
+        get(proxy_to_query_get),
+    )
+    .route(
+        "/tenants/{tenant_id}/stream-jobs/{instance_id}/{run_id}/{job_id}/cancel",
+        post(proxy_to_ingest),
+    )
+    .route(
         "/tenants/{tenant_id}/workflows/{workflow_instance_id}/routing",
         get(get_workflow_routing),
     )

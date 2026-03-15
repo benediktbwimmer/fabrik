@@ -1,8 +1,10 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     env, fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex, OnceLock},
+    sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -67,10 +69,11 @@ use fabrik_worker_protocol::activity_worker::{
 };
 use fabrik_workflow::{
     ArtifactExecutionState, CompiledExecutionPlan, CompiledStateNode, CompiledWorkflowArtifact,
-    CompiledWorkflowError, ExecutionTurnContext, RetryPolicy, StreamJobExecutionState,
-    WorkflowInstanceState, WorkflowStatus, evaluate_expression, execution_state_for_event,
-    parse_timer_ref, replay_compiled_history_trace, replay_compiled_history_trace_from_snapshot,
-    replay_history_trace_from_snapshot, retry_policy_allows_failure_retry,
+    CompiledWorkflowError, ExecutionEmission, ExecutionTurnContext, RetryPolicy,
+    StreamJobExecutionState, WorkflowInstanceState, WorkflowStatus, evaluate_expression,
+    execution_state_for_event, parse_timer_ref, replay_compiled_history_trace,
+    replay_compiled_history_trace_from_snapshot, replay_history_trace_from_snapshot,
+    retry_policy_allows_failure_retry,
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -5347,30 +5350,167 @@ fn decode_stream_job_binding(
     Some((binding, node))
 }
 
-fn stream_job_metadata(job_name: &str) -> (Option<Value>, Option<Value>) {
+fn declared_stream_job_metadata(config: Option<&Value>) -> (Option<Value>, Option<Value>) {
+    let checkpoint_policy = config.and_then(|value| {
+        value.get("checkpointPolicy").or_else(|| value.get("checkpoint_policy")).cloned()
+    });
+    let view_definitions = config.and_then(|value| {
+        value.get("viewDefinitions").or_else(|| value.get("view_definitions")).cloned()
+    });
+    (checkpoint_policy, view_definitions)
+}
+
+fn stream_job_metadata(job_name: &str, config: Option<&Value>) -> (Option<Value>, Option<Value>) {
+    let declared = declared_stream_job_metadata(config);
+    if declared.0.is_some() || declared.1.is_some() {
+        return declared;
+    }
+
     match job_name {
-        "keyed-rollup" => (
-            Some(serde_json::json!({
-                "kind": "named_checkpoints",
-                "checkpoints": [
+        "keyed-rollup" => {
+            let checkpoint_name = config
+                .and_then(|value| value.get("checkpoint"))
+                .and_then(Value::as_str)
+                .unwrap_or("initial-rollup-ready");
+            (
+                Some(serde_json::json!({
+                    "kind": "named_checkpoints",
+                    "checkpoints": [
+                        {
+                            "name": checkpoint_name,
+                            "delivery": "workflow_awaitable",
+                            "sequence": 1
+                        }
+                    ]
+                })),
+                Some(serde_json::json!([
                     {
-                        "name": "hourly-rollup-ready",
-                        "delivery": "workflow_awaitable",
-                        "sequence": 1
+                        "name": "accountTotals",
+                        "consistency": "strong",
+                        "queryMode": "by_key",
+                        "keyField": "accountId",
+                        "valueFields": ["accountId", "totalAmount", "asOfCheckpoint"]
                     }
-                ]
-            })),
-            Some(serde_json::json!([
-                {
-                    "name": "accountTotals",
-                    "consistency": "strong",
-                    "queryMode": "by_key",
-                    "keyField": "accountId",
-                    "valueFields": ["accountId", "totalAmount", "asOfCheckpoint"]
-                }
-            ])),
-        ),
+                ])),
+            )
+        }
         _ => (None, None),
+    }
+}
+
+fn stream_job_runtime_config(job_name: &str, config: Option<&Value>) -> Option<Value> {
+    let mut merged = config.cloned().unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    let Some(object) = merged.as_object_mut() else {
+        return Some(merged);
+    };
+
+    match job_name {
+        "keyed-rollup" => {
+            let checkpoint_name = object
+                .get("checkpoint")
+                .and_then(Value::as_str)
+                .unwrap_or("initial-rollup-ready")
+                .to_owned();
+            object.entry("name".to_owned()).or_insert_with(|| Value::String(job_name.to_owned()));
+            object
+                .entry("runtime".to_owned())
+                .or_insert_with(|| Value::String("keyed_rollup".to_owned()));
+            object.entry("source".to_owned()).or_insert_with(|| {
+                serde_json::json!({
+                    "kind": "bounded_input"
+                })
+            });
+            object
+                .entry("keyBy".to_owned())
+                .or_insert_with(|| Value::String("accountId".to_owned()));
+            object.entry("operators".to_owned()).or_insert_with(|| {
+                serde_json::json!([
+                    {
+                        "kind": "reduce",
+                        "name": "sum-account-totals",
+                        "config": {
+                            "reducer": "sum",
+                            "valueField": "amount",
+                            "outputField": "totalAmount"
+                        }
+                    },
+                    {
+                        "kind": "emit_checkpoint",
+                        "name": checkpoint_name,
+                        "config": {
+                            "sequence": 1
+                        }
+                    }
+                ])
+            });
+            object.entry("checkpointPolicy".to_owned()).or_insert_with(|| {
+                serde_json::json!({
+                    "kind": "named_checkpoints",
+                    "checkpoints": [
+                        {
+                            "name": checkpoint_name,
+                            "delivery": "workflow_awaitable",
+                            "sequence": 1
+                        }
+                    ]
+                })
+            });
+            object.entry("views".to_owned()).or_insert_with(|| {
+                serde_json::json!([
+                    {
+                        "name": "accountTotals",
+                        "consistency": "strong",
+                        "queryMode": "by_key",
+                        "keyField": "accountId",
+                        "valueFields": ["accountId", "totalAmount", "asOfCheckpoint"]
+                    }
+                ])
+            });
+            object.entry("queries".to_owned()).or_insert_with(|| {
+                serde_json::json!([
+                    {
+                        "name": "accountTotals",
+                        "viewName": "accountTotals",
+                        "consistency": "strong"
+                    }
+                ])
+            });
+        }
+        _ => {}
+    }
+
+    Some(merged)
+}
+
+fn plan_emits_stream_job_query_request(
+    plan: &CompiledExecutionPlan,
+    job_id: &str,
+    query_name: &str,
+) -> bool {
+    plan.emissions.iter().any(|emission| {
+        matches!(
+            &emission.event,
+            WorkflowEvent::StreamJobQueryRequested {
+                job_id: emitted_job_id,
+                query_name: emitted_query_name,
+                ..
+            } if emitted_job_id == job_id && emitted_query_name == query_name
+        )
+    })
+}
+
+fn should_replay_stream_job_binding_from_state(
+    plan: &CompiledExecutionPlan,
+    stream_job: &StreamJobExecutionState,
+    node: &CompiledStateNode,
+) -> bool {
+    match node {
+        CompiledStateNode::QueryStreamJob { query_name, .. } => {
+            !plan_emits_stream_job_query_request(plan, &stream_job.job_id, query_name)
+        }
+        CompiledStateNode::WaitForStreamCheckpoint { .. }
+        | CompiledStateNode::AwaitStreamJobTerminal { .. } => true,
+        _ => false,
     }
 }
 
@@ -5389,7 +5529,7 @@ async fn materialize_stream_jobs_from_plan(
         else {
             continue;
         };
-        let (checkpoint_policy, view_definitions) = stream_job_metadata(job_name);
+        let (checkpoint_policy, view_definitions) = stream_job_metadata(job_name, config.as_ref());
         bridge::submit_stream_job_via_bridge(
             state,
             &SubmitStreamJobRequest {
@@ -5410,6 +5550,7 @@ async fn materialize_stream_jobs_from_plan(
                 workflow_event_id: source_event_id,
                 workflow_owner_epoch: None,
                 stream_owner_epoch: None,
+                origin_kind: Some(fabrik_throughput::StreamJobOriginKind::Workflow),
                 identity: fabrik_throughput::StreamJobBridgeIdentity {
                     tenant_id: instance.tenant_id.clone(),
                     instance_id: instance.instance_id.clone(),
@@ -5422,7 +5563,7 @@ async fn materialize_stream_jobs_from_plan(
                 job_name: job_name.clone(),
                 input_ref: serde_json::to_string(input)
                     .context("failed to serialize stream job input for bridge submission")?,
-                config_ref: config
+                config_ref: stream_job_runtime_config(job_name, config.as_ref())
                     .as_ref()
                     .map(serde_json::to_string)
                     .transpose()
@@ -5433,6 +5574,11 @@ async fn materialize_stream_jobs_from_plan(
             },
         )
         .await?;
+        if let Some(publisher) = state.publisher.as_ref() {
+            let envelope =
+                emitted_stream_job_event(instance, &emission.event, source_event_id, occurred_at);
+            publisher.publish(&envelope, &envelope.partition_key).await?;
+        }
         materialized = materialized.saturating_add(1);
     }
 
@@ -5465,6 +5611,11 @@ async fn materialize_stream_jobs_from_plan(
             },
         )
         .await?;
+        if let Some(publisher) = state.publisher.as_ref() {
+            let envelope =
+                emitted_stream_job_event(instance, &emission.event, source_event_id, occurred_at);
+            publisher.publish(&envelope, &envelope.partition_key).await?;
+        }
         materialized = materialized.saturating_add(1);
     }
 
@@ -5508,6 +5659,11 @@ async fn materialize_stream_jobs_from_plan(
             },
         )
         .await?;
+        if let Some(publisher) = state.publisher.as_ref() {
+            let envelope =
+                emitted_stream_job_event(instance, &emission.event, source_event_id, occurred_at);
+            publisher.publish(&envelope, &envelope.partition_key).await?;
+        }
         let handle = state
             .store
             .get_stream_job_bridge_handle_by_handle_id(&query.handle_id)
@@ -5532,6 +5688,9 @@ async fn materialize_stream_jobs_from_plan(
         &instance.run_id,
         &stream_job.job_id,
     );
+    if !should_replay_stream_job_binding_from_state(plan, &stream_job, &node) {
+        return Ok(materialized);
+    }
     match node {
         CompiledStateNode::QueryStreamJob { query_name, args, consistency, .. } => {
             let query = bridge::query_stream_job_via_bridge(
@@ -5574,6 +5733,19 @@ async fn materialize_stream_jobs_from_plan(
                 },
             )
             .await?;
+            if let Some(publisher) = state.publisher.as_ref() {
+                let payload = WorkflowEvent::StreamJobQueryRequested {
+                    job_id: stream_job.job_id.clone(),
+                    query_id: query.query_id.clone(),
+                    query_name: query.query_name.clone(),
+                    args: query.query_args.clone(),
+                    consistency: query.consistency.clone(),
+                    state: None,
+                };
+                let envelope =
+                    emitted_stream_job_event(instance, &payload, source_event_id, occurred_at);
+                publisher.publish(&envelope, &envelope.partition_key).await?;
+            }
             let handle = state
                 .store
                 .get_stream_job_bridge_handle_by_handle_id(&query.handle_id)
@@ -8745,6 +8917,46 @@ fn emitted_bulk_batch_event(
     envelope
 }
 
+fn emitted_stream_job_event(
+    instance: &WorkflowInstanceState,
+    payload: &WorkflowEvent,
+    source_event_id: Uuid,
+    occurred_at: DateTime<Utc>,
+) -> EventEnvelope<WorkflowEvent> {
+    let mut envelope = EventEnvelope::new(
+        payload.event_type(),
+        WorkflowIdentity::new(
+            instance.tenant_id.clone(),
+            instance.definition_id.clone(),
+            instance.definition_version.unwrap_or_default(),
+            instance.artifact_hash.clone().unwrap_or_default(),
+            instance.instance_id.clone(),
+            instance.run_id.clone(),
+            "unified-runtime",
+        ),
+        payload.clone(),
+    )
+    .with_occurred_at(occurred_at);
+    envelope.event_id = match payload {
+        WorkflowEvent::StreamJobScheduled { job_id, .. } => Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("unified-stream-job-scheduled:{source_event_id}:{job_id}").as_bytes(),
+        ),
+        WorkflowEvent::StreamJobCancellationRequested { job_id, .. } => Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("unified-stream-job-cancel:{source_event_id}:{job_id}").as_bytes(),
+        ),
+        WorkflowEvent::StreamJobQueryRequested { job_id, query_id, .. } => Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("unified-stream-job-query:{source_event_id}:{job_id}:{query_id}").as_bytes(),
+        ),
+        other => panic!("stream job emitter does not support {other:?}"),
+    };
+    envelope.causation_id = Some(source_event_id);
+    envelope.correlation_id = Some(source_event_id);
+    envelope
+}
+
 fn unified_failure_allows_retry(attempt: u32, retry: &RetryPolicy, error: &str) -> bool {
     attempt < retry.max_attempts && retry_policy_allows_failure_retry(retry, error)
 }
@@ -8952,8 +9164,8 @@ mod tests {
     use fabrik_broker::WorkflowPublisher;
     use fabrik_events::WorkflowIdentity;
     use fabrik_store::{
-        StreamJobBridgeHandleRecord, StreamJobCheckpointRecord, StreamJobQueryRecord,
-        ThroughputTerminalRecord, WorkflowMailboxStatus, WorkflowUpdateStatus,
+        StreamJobBridgeHandleRecord, StreamJobQueryRecord, ThroughputTerminalRecord,
+        WorkflowMailboxStatus, WorkflowUpdateStatus,
     };
     use fabrik_throughput::{
         StreamJobBridgeHandleStatus, StreamJobCheckpointStatus, StreamJobQueryStatus,
@@ -8965,11 +9177,12 @@ mod tests {
     use serde_json::json;
     use std::{
         collections::{BTreeMap, BTreeSet},
-        net::TcpListener,
-        process::Command,
-        time::{Duration as StdDuration, Instant},
+        fs::{self, File},
+        net::{TcpListener, TcpStream},
+        path::{Path, PathBuf},
+        process::{Child, Command, Stdio},
+        time::{Duration as StdDuration, Instant, SystemTime},
     };
-    use tokio::sync::oneshot;
     use tokio::time::sleep;
     use tonic::Request;
 
@@ -9663,7 +9876,30 @@ mod tests {
                     object: Box::new(Expression::Identifier { name: "input".to_owned() }),
                     property: "streamInput".to_owned(),
                 },
-                config: None,
+                config: Some(Expression::Literal {
+                    value: json!({
+                        "checkpoint": "initial-rollup-ready",
+                        "checkpointPolicy": {
+                            "kind": "named_checkpoints",
+                            "checkpoints": [
+                                {
+                                    "name": "initial-rollup-ready",
+                                    "delivery": "workflow_awaitable",
+                                    "sequence": 1
+                                }
+                            ]
+                        },
+                        "viewDefinitions": [
+                            {
+                                "name": "accountTotals",
+                                "consistency": "strong",
+                                "queryMode": "by_key",
+                                "keyField": "accountId",
+                                "valueFields": ["accountId", "totalAmount", "asOfCheckpoint"]
+                            }
+                        ]
+                    }),
+                }),
                 next: "wait_checkpoint".to_owned(),
                 handle_var: "job".to_owned(),
             },
@@ -9733,49 +9969,49 @@ mod tests {
         )
     }
 
-    fn keyed_rollup_totals_from_input_ref(input_ref: &str) -> Result<BTreeMap<String, f64>> {
-        let value: Value =
-            serde_json::from_str(input_ref).context("failed to decode keyed-rollup input_ref")?;
-        let items = value
-            .as_object()
-            .and_then(|object| object.get("items"))
-            .and_then(Value::as_array)
-            .cloned()
-            .or_else(|| value.as_array().cloned())
-            .context("keyed-rollup input_ref must contain an items array")?;
-        let mut totals = BTreeMap::new();
-        for item in items {
-            let object = item.as_object().context("keyed-rollup item must be an object")?;
-            let account_id = object
-                .get("accountId")
-                .and_then(Value::as_str)
-                .context("keyed-rollup item must contain accountId")?;
-            let amount = object
-                .get("amount")
-                .and_then(Value::as_f64)
-                .context("keyed-rollup item must contain numeric amount")?;
-            *totals.entry(account_id.to_owned()).or_insert(0.0) += amount;
-        }
-        Ok(totals)
+    #[test]
+    fn stream_job_metadata_prefers_declared_config_fields() {
+        let config = json!({
+            "checkpointPolicy": {
+                "kind": "named_checkpoints",
+                "checkpoints": [
+                    {
+                        "name": "declared-ready",
+                        "delivery": "workflow_awaitable",
+                        "sequence": 7
+                    }
+                ]
+            },
+            "viewDefinitions": [
+                {
+                    "name": "declaredView",
+                    "consistency": "strong"
+                }
+            ]
+        });
+
+        let (checkpoint_policy, view_definitions) =
+            stream_job_metadata("keyed-rollup", Some(&config));
+
+        assert_eq!(checkpoint_policy, Some(config["checkpointPolicy"].clone()));
+        assert_eq!(view_definitions, Some(config["viewDefinitions"].clone()));
     }
 
-    fn keyed_rollup_query_output_for_test(
-        query: &StreamJobQueryRecord,
-        totals: &BTreeMap<String, f64>,
-    ) -> Result<Value> {
-        let key = query
-            .query_args
-            .as_ref()
-            .and_then(|args| args.get("key"))
-            .and_then(Value::as_str)
-            .context("accountTotals query must include args.key")?;
-        let total = totals.get(key).copied().unwrap_or_default();
-        Ok(json!({
-            "accountId": key,
-            "totalAmount": total,
-            "asOfCheckpoint": 1,
-            "consistency": query.consistency,
-        }))
+    #[test]
+    fn stream_job_runtime_config_enriches_keyed_rollup_defaults() {
+        let config = json!({
+            "checkpoint": "hourly-rollup-ready"
+        });
+
+        let enriched =
+            stream_job_runtime_config("keyed-rollup", Some(&config)).expect("config should exist");
+
+        assert_eq!(enriched["runtime"], "keyed_rollup");
+        assert_eq!(enriched["source"]["kind"], "bounded_input");
+        assert_eq!(enriched["keyBy"], "accountId");
+        assert_eq!(enriched["operators"][0]["kind"], "reduce");
+        assert_eq!(enriched["operators"][1]["name"], "hourly-rollup-ready");
+        assert_eq!(enriched["queries"][0]["viewName"], "accountTotals");
     }
 
     async fn wait_for_instance_completion(
@@ -9799,118 +10035,428 @@ mod tests {
         }
     }
 
-    async fn run_keyed_rollup_test_callback_agent(
-        store: WorkflowStore,
-        publisher: WorkflowPublisher,
-        tenant_id: &str,
-        instance_id: &str,
-        run_id: &str,
-        mut stop_rx: oneshot::Receiver<()>,
-    ) -> Result<()> {
+    async fn wait_for_throughput_runtime_debug_value<F>(
+        runtime: &TestThroughputRuntime,
+        predicate: F,
+    ) -> Result<serde_json::Value>
+    where
+        F: Fn(&serde_json::Value) -> bool,
+    {
         let deadline = Instant::now() + StdDuration::from_secs(15);
-        let mut checkpoint_published = false;
-        let mut terminal_published = false;
-        let mut query_published = false;
         loop {
-            tokio::select! {
-                _ = &mut stop_rx => return Ok(()),
-                _ = sleep(StdDuration::from_millis(50)) => {}
+            let snapshot = runtime.debug_snapshot().await?;
+            if predicate(&snapshot) {
+                return Ok(snapshot);
             }
-
             if Instant::now() >= deadline {
-                anyhow::bail!("timed out waiting for keyed-rollup bridge records");
+                anyhow::bail!(
+                    "timed out waiting for throughput-runtime debug condition; snapshot: {}; logs:\n{}",
+                    snapshot,
+                    runtime.logs()
+                );
+            }
+            sleep(StdDuration::from_millis(100)).await;
+        }
+    }
+
+    #[test]
+    fn docker_test_target_dir_defaults_to_isolated_subdir() -> Result<()> {
+        let workspace_root = TestThroughputRuntime::workspace_root()?;
+        let target_dir = TestThroughputRuntime::default_cargo_target_dir(&workspace_root);
+        assert_eq!(target_dir, workspace_root.join("target/unified-runtime-docker-build"));
+        Ok(())
+    }
+
+    #[derive(Clone)]
+    struct TestThroughputRuntimeConfig {
+        runtime_root: PathBuf,
+        local_state_dir: PathBuf,
+        checkpoint_dir: PathBuf,
+        payload_dir: PathBuf,
+        checkpoint_key_prefix: String,
+        changelog_topic: String,
+        projections_topic: String,
+        reports_topic: String,
+    }
+
+    struct TestThroughputRuntime {
+        child: Child,
+        log_path: PathBuf,
+        debug_port: u16,
+    }
+
+    impl TestThroughputRuntime {
+        fn workspace_root() -> Result<PathBuf> {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../..")
+                .canonicalize()
+                .context("failed to resolve workspace root")
+        }
+
+        fn default_cargo_target_dir(workspace_root: &Path) -> PathBuf {
+            workspace_root.join("target/unified-runtime-docker-build")
+        }
+
+        fn runtime_binary_cache_dir(workspace_root: &Path) -> PathBuf {
+            workspace_root.join("target/unified-runtime-docker-runtime-cache")
+        }
+
+        fn runtime_binary_build_lock_dir(workspace_root: &Path) -> PathBuf {
+            workspace_root.join("target/unified-runtime-docker-runtime-build.lock")
+        }
+
+        fn throughput_runtime_cache_key(latest_source_mtime: SystemTime) -> String {
+            let duration = latest_source_mtime
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_else(|_| StdDuration::from_secs(0));
+            format!("{}-{}", duration.as_secs(), duration.subsec_nanos())
+        }
+
+        fn cached_runtime_binary_path(
+            workspace_root: &Path,
+            latest_source_mtime: SystemTime,
+        ) -> PathBuf {
+            Self::runtime_binary_cache_dir(workspace_root).join(format!(
+                "throughput-runtime-{}",
+                Self::throughput_runtime_cache_key(latest_source_mtime)
+            ))
+        }
+
+        fn cargo_target_dir(workspace_root: &Path) -> PathBuf {
+            std::env::var_os("FABRIK_DOCKER_TEST_TARGET_DIR")
+                .map(PathBuf::from)
+                .or_else(|| std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from))
+                .unwrap_or_else(|| Self::default_cargo_target_dir(workspace_root))
+        }
+
+        fn ensure_cargo_target_dir(target_dir: &Path) -> Result<()> {
+            fs::create_dir_all(target_dir).with_context(|| {
+                format!("failed to create docker test target dir {}", target_dir.display())
+            })
+        }
+
+        fn binary_path() -> Result<PathBuf> {
+            let workspace_root = Self::workspace_root()?;
+            let latest_source_mtime =
+                Self::throughput_runtime_latest_source_mtime(&workspace_root)?;
+            let cached_binary_path =
+                Self::cached_runtime_binary_path(&workspace_root, latest_source_mtime);
+            if cached_binary_path.exists() {
+                return Ok(cached_binary_path);
             }
 
-            let Some(handle) = store
-                .list_stream_job_bridge_handles_for_run_page(tenant_id, instance_id, run_id, 10, 0)
-                .await?
-                .into_iter()
-                .find(|handle| handle.job_name == "keyed-rollup")
-            else {
-                continue;
-            };
-            let totals = keyed_rollup_totals_from_input_ref(&handle.input_ref)?;
+            let cargo_target_dir = Self::cargo_target_dir(&workspace_root);
+            Self::ensure_cargo_target_dir(&cargo_target_dir)?;
+            fs::create_dir_all(Self::runtime_binary_cache_dir(&workspace_root)).with_context(
+                || {
+                    format!(
+                        "failed to create runtime binary cache dir {}",
+                        Self::runtime_binary_cache_dir(&workspace_root).display()
+                    )
+                },
+            )?;
 
-            if !checkpoint_published {
-                if let Some(checkpoint) = store
-                    .list_stream_job_bridge_checkpoints_for_handle_page(&handle.handle_id, 10, 0)
-                    .await?
-                    .into_iter()
-                    .find(|checkpoint| checkpoint.checkpoint_name == "initial-rollup-ready")
-                {
-                    let reached_at = Utc::now();
-                    let checkpoint = StreamJobCheckpointRecord {
-                        status: StreamJobCheckpointStatus::Reached.as_str().to_owned(),
-                        checkpoint_sequence: Some(1),
-                        stream_owner_epoch: Some(1),
-                        reached_at: Some(reached_at),
-                        output: Some(json!({
-                            "jobId": handle.job_id,
-                            "jobName": handle.job_name,
-                            "checkpoint": "initial-rollup-ready",
-                            "sequence": 1,
-                        })),
-                        updated_at: reached_at,
-                        ..checkpoint
-                    };
-                    let event =
-                        crate::bridge::stream_job_checkpoint_callback_event(&handle, &checkpoint)
-                            .context("checkpoint callback event should materialize")?;
-                    publisher.publish(&event, &event.partition_key).await?;
-                    checkpoint_published = true;
+            let _build_lock = FilesystemLockGuard::acquire(
+                &Self::runtime_binary_build_lock_dir(&workspace_root),
+                StdDuration::from_secs(900),
+            )?;
+            if cached_binary_path.exists() {
+                return Ok(cached_binary_path);
+            }
+
+            let build_binary_path = cargo_target_dir.join("debug/throughput-runtime");
+            if !build_binary_path.exists()
+                || latest_source_mtime
+                    > fs::metadata(&build_binary_path)
+                        .and_then(|metadata| metadata.modified())
+                        .unwrap_or(SystemTime::UNIX_EPOCH)
+            {
+                let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+                let output = Command::new(cargo)
+                    .args(["build", "-p", "streams-runtime", "--bin", "throughput-runtime"])
+                    .env("CARGO_TARGET_DIR", &cargo_target_dir)
+                    .current_dir(&workspace_root)
+                    .output()
+                    .context("failed to build throughput-runtime test binary")?;
+                if !output.status.success() {
+                    anyhow::bail!(
+                        "failed to build throughput-runtime test binary in {}:\nstdout:\n{}\nstderr:\n{}",
+                        cargo_target_dir.display(),
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    );
                 }
             }
+            if !build_binary_path.exists() {
+                anyhow::bail!(
+                    "throughput-runtime test binary missing at {}",
+                    build_binary_path.display()
+                );
+            }
+            let temp_cached_binary_path = cached_binary_path.with_extension("tmp");
+            let _ = fs::remove_file(&temp_cached_binary_path);
+            fs::copy(&build_binary_path, &temp_cached_binary_path).with_context(|| {
+                format!(
+                    "failed to copy throughput-runtime test binary from {} to {}",
+                    build_binary_path.display(),
+                    temp_cached_binary_path.display()
+                )
+            })?;
+            let permissions = fs::metadata(&build_binary_path)
+                .map(|metadata| metadata.permissions())
+                .context("failed to read throughput-runtime test binary permissions")?;
+            fs::set_permissions(&temp_cached_binary_path, permissions).with_context(|| {
+                format!(
+                    "failed to apply throughput-runtime permissions to {}",
+                    temp_cached_binary_path.display()
+                )
+            })?;
+            fs::rename(&temp_cached_binary_path, &cached_binary_path).with_context(|| {
+                format!(
+                    "failed to finalize cached throughput-runtime test binary {}",
+                    cached_binary_path.display()
+                )
+            })?;
+            Self::cleanup_stale_cached_runtime_binaries(&workspace_root, &cached_binary_path)?;
+            Ok(cached_binary_path)
+        }
 
-            if !terminal_published {
-                let terminal_at = Utc::now() + ChronoDuration::milliseconds(1);
-                let terminal_handle = StreamJobBridgeHandleRecord {
-                    status: StreamJobBridgeHandleStatus::Completed.as_str().to_owned(),
-                    stream_owner_epoch: Some(1),
-                    terminal_at: Some(terminal_at),
-                    terminal_output: Some(json!({
-                        "jobId": handle.job_id,
-                        "jobName": handle.job_name,
-                        "status": "completed",
-                    })),
-                    updated_at: terminal_at,
-                    ..handle.clone()
+        fn throughput_runtime_latest_source_mtime(root: &Path) -> Result<SystemTime> {
+            let source_roots = [
+                "services/throughput-runtime",
+                "crates/fabrik-broker",
+                "crates/fabrik-config",
+                "crates/fabrik-events",
+                "crates/fabrik-service",
+                "crates/fabrik-store",
+                "crates/fabrik-throughput",
+                "Cargo.lock",
+            ];
+
+            fn visit(path: &Path, latest: &mut SystemTime) -> Result<()> {
+                if !path.exists() {
+                    return Ok(());
+                }
+                if path.is_file() {
+                    let modified = fs::metadata(path)
+                        .and_then(|metadata| metadata.modified())
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    if modified > *latest {
+                        *latest = modified;
+                    }
+                    return Ok(());
+                }
+                for entry in fs::read_dir(path)
+                    .with_context(|| format!("failed to read directory {}", path.display()))?
+                {
+                    let entry = entry?;
+                    let child = entry.path();
+                    let file_name = entry.file_name();
+                    let file_name = file_name.to_string_lossy();
+                    if file_name == "target" || file_name == ".git" {
+                        continue;
+                    }
+                    let metadata = entry.metadata()?;
+                    if metadata.is_dir() {
+                        visit(&child, latest)?;
+                        continue;
+                    }
+                    if metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH) > *latest {
+                        *latest = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    }
+                }
+                Ok(())
+            }
+
+            let mut latest = SystemTime::UNIX_EPOCH;
+            for source_root in source_roots {
+                visit(&root.join(source_root), &mut latest)?;
+            }
+            Ok(latest)
+        }
+
+        fn cleanup_stale_cached_runtime_binaries(
+            workspace_root: &Path,
+            current_binary_path: &Path,
+        ) -> Result<()> {
+            let cache_dir = Self::runtime_binary_cache_dir(workspace_root);
+            for entry in fs::read_dir(&cache_dir)
+                .with_context(|| format!("failed to read {}", cache_dir.display()))?
+            {
+                let entry = entry?;
+                let path = entry.path();
+                if path == current_binary_path {
+                    continue;
+                }
+                let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
                 };
-                let event = crate::bridge::stream_job_terminal_callback_event(&terminal_handle)
-                    .context("terminal callback event should materialize")?;
-                publisher.publish(&event, &event.partition_key).await?;
-                terminal_published = true;
-            }
-
-            if !query_published {
-                if let Some(query) = store
-                    .list_stream_job_bridge_queries_for_handle_page(&handle.handle_id, 10, 0)
-                    .await?
-                    .into_iter()
-                    .find(|query| {
-                        query.query_name == "accountTotals"
-                            && query.parsed_status() == Some(StreamJobQueryStatus::Requested)
-                    })
-                {
-                    let completed_at = Utc::now();
-                    let query = StreamJobQueryRecord {
-                        status: StreamJobQueryStatus::Completed.as_str().to_owned(),
-                        stream_owner_epoch: Some(1),
-                        output: Some(keyed_rollup_query_output_for_test(&query, &totals)?),
-                        error: None,
-                        completed_at: Some(completed_at),
-                        updated_at: completed_at,
-                        ..query
-                    };
-                    let event = crate::bridge::stream_job_query_callback_event(&handle, &query)
-                        .context("query callback event should materialize")?;
-                    publisher.publish(&event, &event.partition_key).await?;
-                    query_published = true;
+                if !file_name.starts_with("throughput-runtime-") {
+                    continue;
                 }
+                let _ = fs::remove_file(path);
+            }
+            Ok(())
+        }
+
+        fn config(state_dir: &Path) -> Result<TestThroughputRuntimeConfig> {
+            let runtime_root = state_dir.join("throughput-runtime");
+            fs::create_dir_all(&runtime_root).with_context(|| {
+                format!(
+                    "failed to create throughput-runtime test state dir {}",
+                    runtime_root.display()
+                )
+            })?;
+            let local_state_dir = runtime_root.join("state");
+            let checkpoint_dir = runtime_root.join("checkpoints");
+            let payload_dir = runtime_root.join("payloads");
+            fs::create_dir_all(&local_state_dir)?;
+            fs::create_dir_all(&checkpoint_dir)?;
+            fs::create_dir_all(&payload_dir)?;
+            Ok(TestThroughputRuntimeConfig {
+                runtime_root,
+                local_state_dir,
+                checkpoint_dir,
+                payload_dir,
+                checkpoint_key_prefix: format!("throughput-test-checkpoints-{}", Uuid::now_v7()),
+                changelog_topic: format!("throughput-changelog-test-{}", Uuid::now_v7()),
+                projections_topic: format!("throughput-projections-test-{}", Uuid::now_v7()),
+                reports_topic: format!("throughput-reports-test-{}", Uuid::now_v7()),
+            })
+        }
+
+        async fn start(
+            postgres: &TestPostgres,
+            redpanda: &TestRedpanda,
+            state_dir: &Path,
+        ) -> Result<Self> {
+            let config = Self::config(state_dir)?;
+            Self::start_with_config(postgres, redpanda, &config).await
+        }
+
+        async fn start_with_config(
+            postgres: &TestPostgres,
+            redpanda: &TestRedpanda,
+            config: &TestThroughputRuntimeConfig,
+        ) -> Result<Self> {
+            let grpc_port =
+                choose_free_port().context("failed to allocate throughput grpc port")?;
+            let debug_port =
+                choose_free_port().context("failed to allocate throughput debug port")?;
+            let log_path = config.runtime_root.join("throughput-runtime.log");
+            let stdout = File::create(&log_path)
+                .with_context(|| format!("failed to create {}", log_path.display()))?;
+            let stderr = stdout
+                .try_clone()
+                .with_context(|| format!("failed to clone {}", log_path.display()))?;
+
+            let mut child = Command::new(Self::binary_path()?)
+                .current_dir(Self::workspace_root()?)
+                .env("POSTGRES_URL", &postgres.database_url)
+                .env("REDPANDA_BROKERS", &redpanda.broker.brokers)
+                .env("WORKFLOW_EVENTS_TOPIC", &redpanda.broker.workflow_events_topic)
+                .env(
+                    "WORKFLOW_EVENTS_PARTITIONS",
+                    redpanda.broker.workflow_events_partitions.to_string(),
+                )
+                .env("THROUGHPUT_COMMANDS_TOPIC", &redpanda.throughput_commands.topic_name)
+                .env("STREAMS_COMMANDS_TOPIC", &redpanda.throughput_commands.topic_name)
+                .env("STREAMS_REPORTS_TOPIC", &config.reports_topic)
+                .env("THROUGHPUT_CHANGELOG_TOPIC", &config.changelog_topic)
+                .env("STREAMS_CHANGELOG_TOPIC", &config.changelog_topic)
+                .env("THROUGHPUT_PROJECTIONS_TOPIC", &config.projections_topic)
+                .env("STREAMS_PROJECTIONS_TOPIC", &config.projections_topic)
+                .env("STREAMS_PARTITIONS", redpanda.throughput_commands.partitions.to_string())
+                .env("STREAMS_RUNTIME_PORT", grpc_port.to_string())
+                .env("STREAMS_DEBUG_PORT", debug_port.to_string())
+                .env("STREAMS_LOCAL_STATE_DIR", &config.local_state_dir)
+                .env("STREAMS_CHECKPOINT_DIR", &config.checkpoint_dir)
+                .env("STREAMS_CHECKPOINT_KEY_PREFIX", &config.checkpoint_key_prefix)
+                .env("STREAMS_PAYLOAD_STORE_DIR", &config.payload_dir)
+                .env("STREAMS_OWNERSHIP_PARTITIONS", "0")
+                .env("STREAMS_RUNTIME_CAPACITY", "1")
+                .env("STREAMS_OWNERSHIP_ASSIGNMENT_POLL_INTERVAL_SECONDS", "1")
+                .env("STREAMS_OWNERSHIP_REBALANCE_INTERVAL_SECONDS", "1")
+                .env("STREAMS_OWNERSHIP_RENEW_INTERVAL_SECONDS", "1")
+                .env("STREAMS_OWNERSHIP_LEASE_TTL_SECONDS", "5")
+                .env("RUST_LOG", "info")
+                .stdout(Stdio::from(stdout))
+                .stderr(Stdio::from(stderr))
+                .spawn()
+                .context("failed to spawn throughput-runtime test process")?;
+
+            let deadline = Instant::now() + StdDuration::from_secs(30);
+            loop {
+                if TcpStream::connect(("127.0.0.1", debug_port)).is_ok() {
+                    break;
+                }
+                if let Some(status) =
+                    child.try_wait().context("failed to poll throughput-runtime test process")?
+                {
+                    let logs = fs::read_to_string(&log_path).unwrap_or_default();
+                    anyhow::bail!(
+                        "throughput-runtime test process exited early with status {status}; logs:\n{logs}"
+                    );
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let logs = fs::read_to_string(&log_path).unwrap_or_default();
+                    anyhow::bail!(
+                        "timed out waiting for throughput-runtime test process to become ready; logs:\n{logs}"
+                    );
+                }
+                sleep(StdDuration::from_millis(100)).await;
             }
 
-            if checkpoint_published && terminal_published && query_published {
-                return Ok(());
+            Ok(Self { child, log_path, debug_port })
+        }
+
+        fn stop(&mut self) -> Result<()> {
+            if self.child.try_wait()?.is_none() {
+                self.child.kill()?;
+                let _ = self.child.wait()?;
             }
+            Ok(())
+        }
+
+        fn logs(&self) -> String {
+            fs::read_to_string(&self.log_path).unwrap_or_default()
+        }
+
+        async fn debug_snapshot(&self) -> Result<serde_json::Value> {
+            let response =
+                reqwest::get(format!("http://127.0.0.1:{}/debug/streams-runtime", self.debug_port))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to fetch throughput-runtime debug snapshot; logs:\n{}",
+                            self.logs()
+                        )
+                    })?;
+            let status = response.status();
+            if !status.is_success() {
+                anyhow::bail!(
+                    "throughput-runtime debug snapshot returned {status}; logs:\n{}",
+                    self.logs()
+                );
+            }
+            response.json::<serde_json::Value>().await.with_context(|| {
+                format!(
+                    "failed to decode throughput-runtime debug snapshot; logs:\n{}",
+                    self.logs()
+                )
+            })
+        }
+    }
+
+    impl Drop for TestThroughputRuntime {
+        fn drop(&mut self) {
+            if self.child.try_wait().ok().flatten().is_none() {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+            let _ = fs::read_to_string(&self.log_path);
         }
     }
 
@@ -10512,6 +11058,8 @@ mod tests {
     struct TestPostgres {
         container_name: String,
         database_url: String,
+        data_dir: PathBuf,
+        _docker_guard: DockerIntegrationTestGuard,
     }
 
     impl TestPostgres {
@@ -10521,14 +11069,20 @@ mod tests {
                 return Ok(None);
             }
 
+            let docker_guard = DockerIntegrationTestGuard::acquire()?;
             let container_name = format!("fabrik-unified-test-pg-{}", Uuid::now_v7());
+            let data_dir =
+                std::env::temp_dir().join(format!("fabrik-unified-test-pgdata-{}", Uuid::now_v7()));
+            fs::create_dir_all(&data_dir).with_context(|| {
+                format!("failed to create postgres test data dir {}", data_dir.display())
+            })?;
+            set_test_container_data_dir_permissions(&data_dir)?;
             let image = std::env::var("FABRIK_TEST_POSTGRES_IMAGE")
                 .unwrap_or_else(|_| "postgres:16-alpine".to_owned());
             let output = Command::new("docker")
                 .args([
                     "run",
                     "--detach",
-                    "--rm",
                     "--name",
                     &container_name,
                     "--env",
@@ -10537,12 +11091,15 @@ mod tests {
                     "POSTGRES_PASSWORD=fabrik",
                     "--env",
                     "POSTGRES_DB=fabrik_test",
+                    "--volume",
+                    &format!("{}:/var/lib/postgresql/data", data_dir.display()),
                     "--publish-all",
                     &image,
                 ])
                 .output()
                 .with_context(|| format!("failed to start docker container {container_name}"))?;
             if !output.status.success() {
+                fs::remove_dir_all(&data_dir).ok();
                 anyhow::bail!(
                     "docker failed to start postgres test container: {}",
                     String::from_utf8_lossy(&output.stderr).trim()
@@ -10553,17 +11110,23 @@ mod tests {
                 Ok(port) => port,
                 Err(error) => {
                     let _ = cleanup_container(&container_name);
+                    fs::remove_dir_all(&data_dir).ok();
                     return Err(error);
                 }
             };
+            if let Err(error) = wait_for_postgres_ready(&container_name) {
+                let _ = cleanup_container(&container_name);
+                fs::remove_dir_all(&data_dir).ok();
+                return Err(error);
+            }
             let database_url = format!(
                 "postgres://fabrik:fabrik@127.0.0.1:{host_port}/fabrik_test?sslmode=disable"
             );
-            Ok(Some(Self { container_name, database_url }))
+            Ok(Some(Self { container_name, database_url, data_dir, _docker_guard: docker_guard }))
         }
 
         async fn connect_store(&self) -> Result<WorkflowStore> {
-            let deadline = Instant::now() + StdDuration::from_secs(30);
+            let deadline = Instant::now() + StdDuration::from_secs(45);
             loop {
                 match WorkflowStore::connect(&self.database_url).await {
                     Ok(store) => {
@@ -10571,15 +11134,30 @@ mod tests {
                         return Ok(store);
                     }
                     Err(error) if Instant::now() < deadline => {
+                        if let Ok(state) = docker_inspect_state(&self.container_name)
+                            && (state.starts_with("exited")
+                                || state.starts_with("dead")
+                                || state.starts_with("removing"))
+                        {
+                            let logs = docker_logs(&self.container_name).unwrap_or_default();
+                            return Err(error).with_context(|| {
+                                format!(
+                                    "postgres test container {} exited before readiness; state: {}; logs:\n{}",
+                                    self.container_name, state, logs
+                                )
+                            });
+                        }
                         let _ = error;
                         sleep(StdDuration::from_millis(250)).await;
                     }
                     Err(error) => {
                         let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        let state = docker_inspect_state(&self.container_name)
+                            .unwrap_or_else(|inspect_error| inspect_error.to_string());
                         return Err(error).with_context(|| {
                             format!(
-                                "postgres test container {} did not become ready; logs:\n{}",
-                                self.container_name, logs
+                                "postgres test container {} did not become ready; state: {}; logs:\n{}",
+                                self.container_name, state, logs
                             )
                         });
                     }
@@ -10591,11 +11169,13 @@ mod tests {
     impl Drop for TestPostgres {
         fn drop(&mut self) {
             let _ = cleanup_container(&self.container_name);
+            fs::remove_dir_all(&self.data_dir).ok();
         }
     }
 
     struct TestRedpanda {
         container_name: String,
+        data_dir: PathBuf,
         broker: BrokerConfig,
         throughput_commands: JsonTopicConfig,
     }
@@ -10612,18 +11192,28 @@ mod tests {
             let topic = format!("workflow-events-test-{}", Uuid::now_v7());
             let mut last_error = None;
             let mut container_name = String::new();
+            let mut data_dir = PathBuf::new();
             let mut kafka_port = 0_u16;
             let mut started = false;
             for _ in 0..5 {
                 kafka_port = choose_free_port().context("failed to allocate kafka host port")?;
                 container_name = format!("fabrik-unified-test-rp-{}", Uuid::now_v7());
+                data_dir = std::env::temp_dir()
+                    .join(format!("fabrik-unified-test-rpdata-{}", Uuid::now_v7()));
+                fs::create_dir_all(&data_dir).with_context(|| {
+                    format!("failed to create redpanda test data dir {}", data_dir.display())
+                })?;
+                set_test_container_data_dir_permissions(&data_dir)?;
                 let output = Command::new("docker")
                     .args([
                         "run",
                         "--detach",
-                        "--rm",
                         "--name",
                         &container_name,
+                        "--user",
+                        "0:0",
+                        "--volume",
+                        &format!("{}:/var/lib/redpanda/data", data_dir.display()),
                         "--publish",
                         &format!("{kafka_port}:{kafka_port}"),
                         &image,
@@ -10658,12 +11248,15 @@ mod tests {
                 }
                 let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
                 if stderr.contains("address already in use") {
+                    fs::remove_dir_all(&data_dir).ok();
                     last_error = Some(stderr);
                     continue;
                 }
+                fs::remove_dir_all(&data_dir).ok();
                 anyhow::bail!("docker failed to start redpanda test container: {stderr}");
             }
             if !started {
+                fs::remove_dir_all(&data_dir).ok();
                 anyhow::bail!(
                     "docker failed to start redpanda test container after retries: {}",
                     last_error.unwrap_or_else(|| "unknown error".to_owned())
@@ -10672,6 +11265,7 @@ mod tests {
 
             Ok(Some(Self {
                 container_name,
+                data_dir,
                 broker: BrokerConfig::new(format!("127.0.0.1:{kafka_port}"), topic, 1),
                 throughput_commands: JsonTopicConfig::new(
                     format!("127.0.0.1:{kafka_port}"),
@@ -10684,20 +11278,41 @@ mod tests {
         async fn connect_publisher(&self) -> Result<WorkflowPublisher> {
             let deadline = Instant::now() + StdDuration::from_secs(45);
             loop {
-                match WorkflowPublisher::new(&self.broker, "unified-runtime-test").await {
-                    Ok(publisher) => return Ok(publisher),
-                    Err(error) if Instant::now() < deadline => {
+                match tokio::time::timeout(
+                    StdDuration::from_secs(5),
+                    WorkflowPublisher::new(&self.broker, "unified-runtime-test"),
+                )
+                .await
+                {
+                    Ok(Ok(publisher)) => return Ok(publisher),
+                    Ok(Err(error)) if Instant::now() < deadline => {
                         let _ = error;
                         sleep(StdDuration::from_millis(500)).await;
                     }
-                    Err(error) => {
+                    Err(_) if Instant::now() < deadline => {
+                        sleep(StdDuration::from_millis(500)).await;
+                    }
+                    Ok(Err(error)) => {
                         let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        let state = docker_inspect_state(&self.container_name)
+                            .unwrap_or_else(|inspect_error| inspect_error.to_string());
                         return Err(error).with_context(|| {
                             format!(
-                                "redpanda test container {} did not become ready; logs:\n{}",
-                                self.container_name, logs
+                                "redpanda test container {} did not become ready; state: {}; logs:\n{}",
+                                self.container_name, state, logs
                             )
                         });
+                    }
+                    Err(_) => {
+                        let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        let state = docker_inspect_state(&self.container_name)
+                            .unwrap_or_else(|inspect_error| inspect_error.to_string());
+                        anyhow::bail!(
+                            "redpanda test container {} did not become ready before publisher timeout; state: {}; logs:\n{}",
+                            self.container_name,
+                            state,
+                            logs
+                        );
                     }
                 }
             }
@@ -10708,25 +11323,44 @@ mod tests {
         ) -> Result<JsonTopicPublisher<ThroughputCommandEnvelope>> {
             let deadline = Instant::now() + StdDuration::from_secs(45);
             loop {
-                match JsonTopicPublisher::new(
-                    &self.throughput_commands,
-                    "unified-runtime-throughput-command-test",
+                match tokio::time::timeout(
+                    StdDuration::from_secs(5),
+                    JsonTopicPublisher::new(
+                        &self.throughput_commands,
+                        "unified-runtime-throughput-command-test",
+                    ),
                 )
                 .await
                 {
-                    Ok(publisher) => return Ok(publisher),
-                    Err(error) if Instant::now() < deadline => {
+                    Ok(Ok(publisher)) => return Ok(publisher),
+                    Ok(Err(error)) if Instant::now() < deadline => {
                         let _ = error;
                         sleep(StdDuration::from_millis(500)).await;
                     }
-                    Err(error) => {
+                    Err(_) if Instant::now() < deadline => {
+                        sleep(StdDuration::from_millis(500)).await;
+                    }
+                    Ok(Err(error)) => {
                         let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        let state = docker_inspect_state(&self.container_name)
+                            .unwrap_or_else(|inspect_error| inspect_error.to_string());
                         return Err(error).with_context(|| {
                             format!(
-                                "redpanda test container {} did not become ready for throughput commands; logs:\n{}",
-                                self.container_name, logs
+                                "redpanda test container {} did not become ready for throughput commands; state: {}; logs:\n{}",
+                                self.container_name, state, logs
                             )
                         });
+                    }
+                    Err(_) => {
+                        let logs = docker_logs(&self.container_name).unwrap_or_default();
+                        let state = docker_inspect_state(&self.container_name)
+                            .unwrap_or_else(|inspect_error| inspect_error.to_string());
+                        anyhow::bail!(
+                            "redpanda test container {} did not become ready for throughput commands before timeout; state: {}; logs:\n{}",
+                            self.container_name,
+                            state,
+                            logs
+                        );
                     }
                 }
             }
@@ -10799,6 +11433,65 @@ mod tests {
     impl Drop for TestRedpanda {
         fn drop(&mut self) {
             let _ = cleanup_container(&self.container_name);
+            fs::remove_dir_all(&self.data_dir).ok();
+        }
+    }
+
+    struct FilesystemLockGuard {
+        path: PathBuf,
+    }
+
+    impl FilesystemLockGuard {
+        fn acquire(path: &Path, timeout: StdDuration) -> Result<Self> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                match fs::create_dir(path) {
+                    Ok(()) => return Ok(Self { path: path.to_path_buf() }),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        if stale_lock_dir(path, timeout)? {
+                            let _ = fs::remove_dir_all(path);
+                            continue;
+                        }
+                        if Instant::now() >= deadline {
+                            anyhow::bail!(
+                                "timed out waiting for filesystem lock {}",
+                                path.display()
+                            );
+                        }
+                        std::thread::sleep(StdDuration::from_millis(100));
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("failed to create filesystem lock {}", path.display())
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for FilesystemLockGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct DockerIntegrationTestGuard {
+        _process_guard: StdMutexGuard<'static, ()>,
+        _filesystem_guard: FilesystemLockGuard,
+    }
+
+    impl DockerIntegrationTestGuard {
+        fn acquire() -> Result<Self> {
+            let process_guard = docker_test_lock()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("docker test lock poisoned"))?;
+            let filesystem_guard = FilesystemLockGuard::acquire(
+                &docker_test_lock_dir()?,
+                StdDuration::from_secs(300),
+            )?;
+            cleanup_stale_test_containers()?;
+            Ok(Self { _process_guard: process_guard, _filesystem_guard: filesystem_guard })
         }
     }
 
@@ -10808,6 +11501,56 @@ mod tests {
             .output()
             .map(|output| output.status.success())
             .unwrap_or(false)
+    }
+
+    fn docker_test_lock() -> &'static StdMutex<()> {
+        static DOCKER_TEST_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        DOCKER_TEST_LOCK.get_or_init(|| StdMutex::new(()))
+    }
+
+    fn docker_test_lock_dir() -> Result<PathBuf> {
+        Ok(TestThroughputRuntime::workspace_root()?.join("target/unified-runtime-docker-test.lock"))
+    }
+
+    fn stale_lock_dir(path: &Path, timeout: StdDuration) -> Result<bool> {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect lock dir {}", path.display()));
+            }
+        };
+        let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let age = SystemTime::now()
+            .duration_since(modified)
+            .unwrap_or_else(|_| StdDuration::from_secs(0));
+        Ok(age > timeout)
+    }
+
+    fn cleanup_stale_test_containers() -> Result<()> {
+        const TEST_CONTAINER_PREFIXES: [&str; 2] =
+            ["fabrik-unified-test-pg-", "fabrik-unified-test-rp-"];
+
+        let output = Command::new("docker")
+            .args(["ps", "-a", "--format", "{{.Names}}"])
+            .output()
+            .context("failed to list docker test containers")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "docker ps failed while listing test containers: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        for container_name in String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|name| TEST_CONTAINER_PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
+        {
+            cleanup_container(container_name)?;
+        }
+
+        Ok(())
     }
 
     fn wait_for_docker_port(container_name: &str, container_port: &str) -> Result<u16> {
@@ -10839,6 +11582,54 @@ mod tests {
         }
     }
 
+    fn set_test_container_data_dir_permissions(path: &Path) -> Result<()> {
+        #[cfg(unix)]
+        {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o777)).with_context(|| {
+                format!("failed to set permissive permissions on {}", path.display())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn wait_for_postgres_ready(container_name: &str) -> Result<()> {
+        let deadline = Instant::now() + StdDuration::from_secs(30);
+        loop {
+            let output = Command::new("docker")
+                .args(["exec", container_name, "pg_isready", "-U", "fabrik", "-d", "fabrik_test"])
+                .output()
+                .with_context(|| {
+                    format!("failed to probe postgres readiness for {container_name}")
+                })?;
+            if output.status.success() {
+                return Ok(());
+            }
+            let state = docker_inspect_state(container_name)
+                .unwrap_or_else(|inspect_error| inspect_error.to_string());
+            if state.starts_with("exited")
+                || state.starts_with("dead")
+                || state.starts_with("removing")
+                || state.contains("No such container")
+            {
+                let logs = docker_logs(container_name).unwrap_or_default();
+                anyhow::bail!(
+                    "postgres test container {container_name} exited before readiness; state: {}; logs:\n{}",
+                    state,
+                    logs
+                );
+            }
+            if Instant::now() >= deadline {
+                let logs = docker_logs(container_name).unwrap_or_default();
+                anyhow::bail!(
+                    "timed out waiting for postgres test container {container_name} to become ready; state: {}; logs:\n{}",
+                    state,
+                    logs
+                );
+            }
+            std::thread::sleep(StdDuration::from_millis(250));
+        }
+    }
+
     fn choose_free_port() -> Result<u16> {
         let listener = TcpListener::bind("127.0.0.1:0").context("failed to bind ephemeral port")?;
         let port = listener.local_addr().context("failed to read ephemeral socket address")?.port();
@@ -10856,12 +11647,34 @@ mod tests {
         Ok(format!("{stdout}{stderr}"))
     }
 
+    fn docker_inspect_state(container_name: &str) -> Result<String> {
+        let output = Command::new("docker")
+            .args([
+                "inspect",
+                "--format",
+                "{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}",
+                container_name,
+            ])
+            .output()
+            .with_context(|| format!("failed to inspect docker state for {container_name}"))?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "docker inspect failed for {}: {}",
+                container_name,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+
     fn cleanup_container(container_name: &str) -> Result<()> {
         let output = Command::new("docker")
             .args(["rm", "--force", container_name])
             .output()
             .with_context(|| format!("failed to remove docker container {container_name}"))?;
         if output.status.success() {
+            Ok(())
+        } else if String::from_utf8_lossy(&output.stderr).contains("No such container") {
             Ok(())
         } else {
             anyhow::bail!(
@@ -12296,9 +13109,12 @@ mod tests {
                 tenant_id: "tenant".to_owned(),
                 instance_id: "instance-repair-stream-query".to_owned(),
                 run_id: "run-repair-stream-query".to_owned(),
+                stream_instance_id: "instance-repair-stream-query".to_owned(),
+                stream_run_id: "run-repair-stream-query".to_owned(),
                 job_id: "job-repair-stream-query".to_owned(),
                 handle_id: "stream-job-handle:tenant:instance-repair-stream-query:run-repair-stream-query:job-repair-stream-query".to_owned(),
                 bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-query:run-repair-stream-query:job-repair-stream-query".to_owned(),
+                origin_kind: fabrik_throughput::StreamJobOriginKind::Workflow.as_str().to_owned(),
                 definition_id: "demo".to_owned(),
                 definition_version: Some(1),
                 artifact_hash: Some("artifact-a".to_owned()),
@@ -12414,9 +13230,12 @@ mod tests {
                 tenant_id: "tenant".to_owned(),
                 instance_id: "instance-repair-stream-checkpoint".to_owned(),
                 run_id: "run-repair-stream-checkpoint".to_owned(),
+                stream_instance_id: "instance-repair-stream-checkpoint".to_owned(),
+                stream_run_id: "run-repair-stream-checkpoint".to_owned(),
                 job_id: "job-repair-stream-checkpoint".to_owned(),
                 handle_id: handle_id.clone(),
                 bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-checkpoint:run-repair-stream-checkpoint:job-repair-stream-checkpoint".to_owned(),
+                origin_kind: fabrik_throughput::StreamJobOriginKind::Workflow.as_str().to_owned(),
                 definition_id: "demo".to_owned(),
                 definition_version: Some(1),
                 artifact_hash: Some("artifact-a".to_owned()),
@@ -12520,9 +13339,12 @@ mod tests {
                 tenant_id: "tenant".to_owned(),
                 instance_id: "instance-repair-stream-terminal".to_owned(),
                 run_id: "run-repair-stream-terminal".to_owned(),
+                stream_instance_id: "instance-repair-stream-terminal".to_owned(),
+                stream_run_id: "run-repair-stream-terminal".to_owned(),
                 job_id: "job-repair-stream-terminal".to_owned(),
                 handle_id: handle_id.clone(),
                 bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-terminal:run-repair-stream-terminal:job-repair-stream-terminal".to_owned(),
+                origin_kind: fabrik_throughput::StreamJobOriginKind::Workflow.as_str().to_owned(),
                 definition_id: "demo".to_owned(),
                 definition_version: Some(1),
                 artifact_hash: Some("artifact-a".to_owned()),
@@ -12566,6 +13388,150 @@ mod tests {
         let debug = app_state.debug.lock().expect("unified debug lock poisoned").clone();
         assert_eq!(debug.repaired_bridge_stream_job_terminal_callbacks, 1);
         assert_eq!(debug.last_bridge_repair_kind.as_deref(), Some("accept_stream_terminal"));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_repair_republishes_multiple_stream_job_repairs_from_single_ledger() -> Result<()>
+    {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-bridge-repair-stream-ledger-{}", Uuid::now_v7()));
+        let app_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher,
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+        let now = Utc::now();
+
+        let handle_id =
+            "stream-job-handle:tenant:instance-repair-stream-ledger:run-repair-stream-ledger:job-repair-stream-ledger"
+                .to_owned();
+        store
+            .upsert_stream_job_bridge_handle(&StreamJobBridgeHandleRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-ledger".to_owned(),
+                run_id: "run-repair-stream-ledger".to_owned(),
+                stream_instance_id: "instance-repair-stream-ledger".to_owned(),
+                stream_run_id: "run-repair-stream-ledger".to_owned(),
+                job_id: "job-repair-stream-ledger".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-ledger:run-repair-stream-ledger:job-repair-stream-ledger".to_owned(),
+                origin_kind: fabrik_throughput::StreamJobOriginKind::Workflow.as_str().to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                job_name: "fraud-detector".to_owned(),
+                input_ref: "topic:payments".to_owned(),
+                config_ref: Some("config:fraud-detector:v1".to_owned()),
+                checkpoint_policy: None,
+                view_definitions: None,
+                status: fabrik_throughput::StreamJobBridgeHandleStatus::Running.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                cancellation_requested_at: None,
+                cancellation_reason: None,
+                terminal_event_id: None,
+                terminal_at: None,
+                workflow_accepted_at: None,
+                terminal_output: None,
+                terminal_error: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        store
+            .upsert_stream_job_bridge_checkpoint(&fabrik_store::StreamJobCheckpointRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-ledger".to_owned(),
+                run_id: "run-repair-stream-ledger".to_owned(),
+                job_id: "job-repair-stream-ledger".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-ledger:run-repair-stream-ledger:job-repair-stream-ledger".to_owned(),
+                await_request_id: "stream-job-await:job-repair-stream-ledger:hourly-rollup-ready:event-a".to_owned(),
+                checkpoint_name: "hourly-rollup-ready".to_owned(),
+                checkpoint_sequence: Some(7),
+                status: fabrik_throughput::StreamJobCheckpointStatus::Reached.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                reached_at: Some(now + chrono::Duration::seconds(1)),
+                output: Some(json!({"ready": true})),
+                accepted_at: None,
+                cancelled_at: None,
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(1),
+            })
+            .await?;
+        store
+            .upsert_stream_job_bridge_query(&StreamJobQueryRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-ledger".to_owned(),
+                run_id: "run-repair-stream-ledger".to_owned(),
+                job_id: "job-repair-stream-ledger".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-ledger:run-repair-stream-ledger:job-repair-stream-ledger".to_owned(),
+                query_id: "stream-job-query:job-repair-stream-ledger:currentStats:event-a".to_owned(),
+                query_name: "currentStats".to_owned(),
+                query_args: Some(json!({"window": "1h"})),
+                consistency: fabrik_throughput::StreamJobQueryConsistency::Strong.as_str().to_owned(),
+                status: fabrik_throughput::StreamJobQueryStatus::Completed.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                output: Some(json!({"anomalies": 2})),
+                error: None,
+                requested_at: now,
+                completed_at: Some(now + chrono::Duration::seconds(2)),
+                accepted_at: None,
+                cancelled_at: None,
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(2),
+            })
+            .await?;
+
+        let repaired = crate::bridge::repair_pending_stream_v2_bridge(&app_state).await?;
+        assert_eq!(repaired, (0, 0, 0, 1, 1, 0));
+
+        let filter = WorkflowHistoryFilter::new(
+            "tenant",
+            "instance-repair-stream-ledger",
+            "run-repair-stream-ledger",
+        );
+        let checkpoint_event =
+            redpanda.wait_for_workflow_history_event(&filter, "StreamJobCheckpointReached").await?;
+        assert_eq!(
+            checkpoint_event.metadata.get("bridge_operation_kind").map(String::as_str),
+            Some(ThroughputBridgeOperationKind::StreamJob.as_str())
+        );
+        let query_event =
+            redpanda.wait_for_workflow_history_event(&filter, "StreamJobQueryCompleted").await?;
+        assert_eq!(
+            query_event.metadata.get("bridge_operation_kind").map(String::as_str),
+            Some(ThroughputBridgeOperationKind::StreamJob.as_str())
+        );
+
+        let debug = app_state.debug.lock().expect("unified debug lock poisoned").clone();
+        assert_eq!(debug.repaired_bridge_stream_job_checkpoint_callbacks, 1);
+        assert_eq!(debug.repaired_bridge_stream_job_query_callbacks, 1);
 
         fs::remove_dir_all(state_dir).ok();
         Ok(())
@@ -13163,6 +14129,7 @@ mod tests {
             workflow_event_id: Uuid::now_v7(),
             workflow_owner_epoch: Some(3),
             stream_owner_epoch: None,
+            origin_kind: Some(fabrik_throughput::StreamJobOriginKind::Workflow),
             identity: fabrik_throughput::StreamJobBridgeIdentity {
                 tenant_id: "tenant".to_owned(),
                 instance_id: "instance-stream-job".to_owned(),
@@ -13455,6 +14422,8 @@ mod tests {
                 tenant_id: "tenant".to_owned(),
                 instance_id: instance_id.to_owned(),
                 run_id: run_id.to_owned(),
+                stream_instance_id: instance_id.to_owned(),
+                stream_run_id: run_id.to_owned(),
                 job_id: job_id.to_owned(),
                 handle_id: handle_id.clone(),
                 bridge_request_id: stream_job_bridge_request_id(
@@ -13463,6 +14432,7 @@ mod tests {
                     run_id,
                     job_id,
                 ),
+                origin_kind: fabrik_throughput::StreamJobOriginKind::Workflow.as_str().to_owned(),
                 definition_id: artifact.definition_id.clone(),
                 definition_version: Some(artifact.definition_version),
                 artifact_hash: Some(artifact.artifact_hash.clone()),
@@ -13613,6 +14583,8 @@ mod tests {
                 tenant_id: "tenant".to_owned(),
                 instance_id: instance_id.to_owned(),
                 run_id: run_id.to_owned(),
+                stream_instance_id: instance_id.to_owned(),
+                stream_run_id: run_id.to_owned(),
                 job_id: job_id.to_owned(),
                 handle_id,
                 bridge_request_id: stream_job_bridge_request_id(
@@ -13621,6 +14593,7 @@ mod tests {
                     run_id,
                     job_id,
                 ),
+                origin_kind: fabrik_throughput::StreamJobOriginKind::Workflow.as_str().to_owned(),
                 definition_id: artifact.definition_id.clone(),
                 definition_version: Some(artifact.definition_version),
                 artifact_hash: Some(artifact.artifact_hash.clone()),
@@ -13675,6 +14648,127 @@ mod tests {
             }
             other => panic!("unexpected outbox payload: {other:?}"),
         }
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn materialize_stream_job_query_does_not_duplicate_plan_emission() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-stream-job-query-materialize-{}", Uuid::now_v7()));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        let artifact = stream_job_query_artifact();
+        let now = Utc::now();
+        let run_id = "run-stream-job-query-materialize";
+        let instance_id = "instance-stream-job-query-materialize";
+        let job_id = "job-stream-job-query-materialize";
+        let handle_id = stream_job_handle_id("tenant", instance_id, run_id, job_id);
+        let query_id =
+            fabrik_throughput::stream_job_query_request_id(job_id, "currentStats", Uuid::now_v7());
+
+        let mut execution_state = ArtifactExecutionState::default();
+        execution_state.bindings.insert(
+            "job".to_owned(),
+            serde_json::to_value(StreamJobExecutionState {
+                job_id: job_id.to_owned(),
+                origin_state: "start_stream".to_owned(),
+                wait_state: "query_stream".to_owned(),
+                job_name: "fraud-detector".to_owned(),
+                terminal_wait_state: None,
+                last_checkpoint_name: None,
+                last_checkpoint_sequence: None,
+            })?,
+        );
+        let mut instance = workflow_instance_for_run(run_id, WorkflowStatus::Running, 1, now);
+        instance.instance_id = instance_id.to_owned();
+        instance.definition_id = artifact.definition_id.clone();
+        instance.definition_version = Some(artifact.definition_version);
+        instance.artifact_hash = Some(artifact.artifact_hash.clone());
+        instance.current_state = Some("query_stream".to_owned());
+        instance.artifact_execution = Some(execution_state.clone());
+
+        let plan = CompiledExecutionPlan {
+            workflow_version: artifact.definition_version,
+            final_state: "query_stream".to_owned(),
+            emissions: vec![ExecutionEmission {
+                event: WorkflowEvent::StreamJobQueryRequested {
+                    job_id: job_id.to_owned(),
+                    query_id: query_id.clone(),
+                    query_name: "currentStats".to_owned(),
+                    args: Some(json!({"window": "1h"})),
+                    consistency: "strong".to_owned(),
+                    state: None,
+                },
+                state: None,
+            }],
+            execution_state,
+            context: None,
+            output: None,
+        };
+
+        store
+            .upsert_stream_job_bridge_handle(&StreamJobBridgeHandleRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: instance_id.to_owned(),
+                run_id: run_id.to_owned(),
+                stream_instance_id: instance_id.to_owned(),
+                stream_run_id: run_id.to_owned(),
+                job_id: job_id.to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: stream_job_bridge_request_id(
+                    "tenant",
+                    instance_id,
+                    run_id,
+                    job_id,
+                ),
+                origin_kind: fabrik_throughput::StreamJobOriginKind::Workflow.as_str().to_owned(),
+                definition_id: artifact.definition_id.clone(),
+                definition_version: Some(artifact.definition_version),
+                artifact_hash: Some(artifact.artifact_hash.clone()),
+                job_name: "fraud-detector".to_owned(),
+                input_ref: "topic:payments".to_owned(),
+                config_ref: Some("config:fraud-detector:v1".to_owned()),
+                checkpoint_policy: None,
+                view_definitions: None,
+                status: fabrik_throughput::StreamJobBridgeHandleStatus::Running.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                cancellation_requested_at: None,
+                cancellation_reason: None,
+                terminal_event_id: None,
+                terminal_at: None,
+                workflow_accepted_at: None,
+                terminal_output: None,
+                terminal_error: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+
+        let materialized = materialize_stream_jobs_from_plan(
+            &app_state,
+            &artifact,
+            &instance,
+            &plan,
+            Uuid::now_v7(),
+            now + ChronoDuration::seconds(1),
+        )
+        .await?;
+        assert_eq!(materialized, 1);
+
+        let queries =
+            store.list_stream_job_bridge_queries_for_handle_page(&handle_id, 10, 0).await?;
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].query_id, query_id);
 
         fs::remove_dir_all(state_dir).ok();
         Ok(())
@@ -13756,6 +14850,304 @@ mod tests {
         assert_eq!(
             stored_query.parsed_status(),
             Some(fabrik_throughput::StreamJobQueryStatus::Accepted)
+        );
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_job_query_callback_materializes_existing_terminal_callback() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = keyed_rollup_stream_job_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "unified-runtime-stream-job-query-terminal-materialize-{}",
+            Uuid::now_v7()
+        ));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-stream-query-terminal-materialize",
+            "run-stream-query-terminal-materialize",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered {
+                input: json!({
+                    "streamInput": {
+                        "kind": "bounded_items",
+                        "items": [
+                            { "accountId": "acct_1", "amount": 2.0 },
+                            { "accountId": "acct_1", "amount": 3.0 }
+                        ]
+                    }
+                }),
+            },
+            Utc::now(),
+        );
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let mut handle = store
+            .list_stream_job_bridge_handles_for_run_page(
+                "tenant",
+                "instance-stream-query-terminal-materialize",
+                "run-stream-query-terminal-materialize",
+                10,
+                0,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job bridge handle should exist")?;
+
+        let checkpoint = test_event(
+            &identity,
+            WorkflowEvent::StreamJobCheckpointReached {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                checkpoint_name: "initial-rollup-ready".to_owned(),
+                checkpoint_sequence: 1,
+                output: Some(json!({"ready": true})),
+                stream_owner_epoch: Some(7),
+            },
+            Utc::now(),
+        );
+        handle_stream_job_checkpoint_event(&app_state, checkpoint).await?;
+
+        handle.status =
+            fabrik_throughput::StreamJobBridgeHandleStatus::Completed.as_str().to_owned();
+        handle.stream_owner_epoch = Some(7);
+        handle.terminal_event_id = Some(Uuid::now_v7());
+        handle.terminal_at = Some(Utc::now());
+        handle.terminal_output = Some(json!({"jobId": handle.job_id, "status": "completed"}));
+        handle.updated_at = Utc::now();
+        store.upsert_stream_job_bridge_handle(&handle).await?;
+
+        let query = store
+            .list_stream_job_bridge_queries_for_handle_page(&handle.handle_id, 10, 0)
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job query should exist")?;
+
+        let callback = test_event(
+            &identity,
+            WorkflowEvent::StreamJobQueryCompleted {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                query_id: query.query_id.clone(),
+                query_name: "accountTotals".to_owned(),
+                output: json!({"accountId": "acct_1", "totalAmount": 5.0}),
+                stream_owner_epoch: Some(7),
+            },
+            Utc::now(),
+        );
+        handle_stream_job_query_event(&app_state, callback).await?;
+
+        let outbox = store
+            .lease_workflow_event_outbox(
+                "stream-job-query-terminal-materialize-test",
+                ChronoDuration::seconds(30),
+                10,
+                Utc::now(),
+            )
+            .await?;
+        let terminal =
+            outbox.into_iter().find(|record| record.event_type == "StreamJobCompleted").context(
+                "terminal callback should be enqueued after query advances to await_terminal",
+            )?;
+        match terminal.event.payload {
+            WorkflowEvent::StreamJobCompleted { output, .. } => {
+                assert_eq!(output, json!({"jobId": handle.job_id, "status": "completed"}));
+            }
+            other => panic!("unexpected outbox payload: {other:?}"),
+        }
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn materialized_stream_job_terminal_then_duplicate_callback_is_noop() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = keyed_rollup_stream_job_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "unified-runtime-stream-job-terminal-materialize-duplicate-{}",
+            Uuid::now_v7()
+        ));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-stream-terminal-materialize-duplicate",
+            "run-stream-terminal-materialize-duplicate",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered {
+                input: json!({
+                    "streamInput": {
+                        "kind": "bounded_items",
+                        "items": [
+                            { "accountId": "acct_1", "amount": 2.0 },
+                            { "accountId": "acct_1", "amount": 3.0 }
+                        ]
+                    }
+                }),
+            },
+            Utc::now(),
+        );
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let mut handle = store
+            .list_stream_job_bridge_handles_for_run_page(
+                "tenant",
+                "instance-stream-terminal-materialize-duplicate",
+                "run-stream-terminal-materialize-duplicate",
+                10,
+                0,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job bridge handle should exist")?;
+
+        let checkpoint = test_event(
+            &identity,
+            WorkflowEvent::StreamJobCheckpointReached {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                checkpoint_name: "initial-rollup-ready".to_owned(),
+                checkpoint_sequence: 1,
+                output: Some(json!({"ready": true})),
+                stream_owner_epoch: Some(7),
+            },
+            Utc::now(),
+        );
+        handle_stream_job_checkpoint_event(&app_state, checkpoint).await?;
+
+        handle.status =
+            fabrik_throughput::StreamJobBridgeHandleStatus::Completed.as_str().to_owned();
+        handle.stream_owner_epoch = Some(7);
+        handle.terminal_event_id = Some(Uuid::now_v7());
+        handle.terminal_at = Some(Utc::now());
+        handle.terminal_output =
+            Some(json!({"jobId": handle.job_id.clone(), "status": "completed"}));
+        handle.updated_at = Utc::now();
+        store.upsert_stream_job_bridge_handle(&handle).await?;
+
+        let query = store
+            .list_stream_job_bridge_queries_for_handle_page(&handle.handle_id, 10, 0)
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job query should exist")?;
+
+        let query_callback = test_event(
+            &identity,
+            WorkflowEvent::StreamJobQueryCompleted {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                query_id: query.query_id.clone(),
+                query_name: "accountTotals".to_owned(),
+                output: json!({"accountId": "acct_1", "totalAmount": 5.0}),
+                stream_owner_epoch: Some(7),
+            },
+            Utc::now(),
+        );
+        handle_stream_job_query_event(&app_state, query_callback).await?;
+
+        let outbox = store
+            .lease_workflow_event_outbox(
+                "stream-job-terminal-materialize-duplicate-test",
+                ChronoDuration::seconds(30),
+                10,
+                Utc::now(),
+            )
+            .await?;
+        let terminal =
+            outbox.into_iter().find(|record| record.event_type == "StreamJobCompleted").context(
+                "terminal callback should be enqueued after query advances to await_terminal",
+            )?;
+        let expected_terminal_output = match &terminal.event.payload {
+            WorkflowEvent::StreamJobCompleted { output, .. } => output.clone(),
+            other => panic!("unexpected outbox payload: {other:?}"),
+        };
+
+        handle_stream_job_terminal_event(&app_state, terminal.event.clone()).await?;
+
+        let accepted_once = store
+            .get_stream_job_bridge_handle_by_handle_id(&handle.handle_id)
+            .await?
+            .context("stream job bridge handle should still exist")?;
+        let first_accepted_at = accepted_once.workflow_accepted_at;
+        assert_eq!(
+            accepted_once.parsed_status(),
+            Some(fabrik_throughput::StreamJobBridgeHandleStatus::Completed)
+        );
+        assert_eq!(accepted_once.terminal_output, Some(expected_terminal_output.clone()));
+        assert!(first_accepted_at.is_some());
+
+        let duplicate_terminal = test_event(
+            &identity,
+            WorkflowEvent::StreamJobCompleted {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                output: json!({"jobId": handle.job_id.clone(), "status": "duplicate"}),
+                stream_owner_epoch: Some(7),
+            },
+            Utc::now() + ChronoDuration::seconds(1),
+        );
+        handle_stream_job_terminal_event(&app_state, duplicate_terminal).await?;
+
+        let completed = store
+            .get_instance("tenant", "instance-stream-terminal-materialize-duplicate")
+            .await?
+            .context("stream job instance should still exist")?;
+        assert_eq!(completed.status, WorkflowStatus::Completed);
+        assert_eq!(
+            completed.output,
+            Some(json!({
+                "checkpoint": { "ready": true },
+                "account": {
+                    "accountId": "acct_1",
+                    "totalAmount": 5.0
+                },
+                "result": expected_terminal_output
+            }))
+        );
+
+        let accepted_twice = store
+            .get_stream_job_bridge_handle_by_handle_id(&handle.handle_id)
+            .await?
+            .context("stream job bridge handle should still exist")?;
+        assert_eq!(
+            accepted_twice.parsed_status(),
+            Some(fabrik_throughput::StreamJobBridgeHandleStatus::Completed)
+        );
+        assert_eq!(accepted_twice.workflow_accepted_at, first_accepted_at);
+        assert_eq!(
+            accepted_twice.terminal_output,
+            Some(json!({"jobId": handle.job_id, "status": "completed"}))
         );
 
         fs::remove_dir_all(state_dir).ok();
@@ -13873,6 +15265,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn docker_broker_harness_smoke_test() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let _store = postgres.connect_store().await?;
+        let _publisher = redpanda.connect_publisher().await?;
+        let _throughput_commands = redpanda.connect_throughput_command_publisher().await?;
+
+        let state_dir =
+            std::env::temp_dir().join(format!("unified-runtime-docker-smoke-{}", Uuid::now_v7()));
+        let throughput_runtime =
+            TestThroughputRuntime::start(&postgres, &redpanda, &state_dir).await?;
+        let snapshot = wait_for_throughput_runtime_debug_value(&throughput_runtime, |snapshot| {
+            snapshot.get("runtime").is_some()
+        })
+        .await?;
+        assert!(snapshot.get("runtime").is_some());
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn keyed_rollup_stream_job_callbacks_complete_workflow_end_to_end() -> Result<()> {
         let Some(postgres) = TestPostgres::start()? else {
             return Ok(());
@@ -13886,9 +15304,10 @@ mod tests {
 
         let state_dir = std::env::temp_dir()
             .join(format!("unified-runtime-keyed-rollup-e2e-{}", Uuid::now_v7()));
+        let publisher = redpanda.connect_publisher().await?;
         let app_state = test_app_state_with_publisher(
             store.clone(),
-            redpanda.connect_publisher().await?,
+            publisher,
             RuntimeInner::default(),
             state_dir.clone(),
         )
@@ -13901,16 +15320,8 @@ mod tests {
         .await?;
         let trigger_loop = tokio::spawn(run_trigger_consumer(app_state.clone(), consumer));
         let outbox_loop = tokio::spawn(run_workflow_event_outbox_publisher(app_state.clone()));
-
-        let (stop_tx, stop_rx) = oneshot::channel();
-        let callback_agent = tokio::spawn(run_keyed_rollup_test_callback_agent(
-            store.clone(),
-            redpanda.connect_publisher().await?,
-            "tenant",
-            "instance-keyed-rollup",
-            "run-keyed-rollup",
-            stop_rx,
-        ));
+        let throughput_runtime =
+            TestThroughputRuntime::start(&postgres, &redpanda, &state_dir).await?;
 
         let input = json!({
             "streamInput": {
@@ -13933,6 +15344,33 @@ mod tests {
         );
         let trigger = test_event(&identity, WorkflowEvent::WorkflowTriggered { input }, Utc::now());
         redpanda.connect_publisher().await?.publish(&trigger, &trigger.partition_key).await?;
+
+        let filter =
+            WorkflowHistoryFilter::new("tenant", "instance-keyed-rollup", "run-keyed-rollup");
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobScheduled").await?;
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobCheckpointReached").await?;
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobQueryCompleted").await?;
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobCompleted").await?;
+        let history = read_workflow_history(
+            &redpanda.broker,
+            "unified-runtime-keyed-rollup-e2e-history",
+            &filter,
+            StdDuration::from_millis(500),
+            StdDuration::from_secs(5),
+        )
+        .await?;
+        assert_eq!(
+            history.iter().filter(|event| event.event_type == "StreamJobQueryRequested").count(),
+            1
+        );
+        assert_eq!(
+            history.iter().filter(|event| event.event_type == "StreamJobCheckpointReached").count(),
+            1
+        );
+        assert_eq!(
+            history.iter().filter(|event| event.event_type == "StreamJobCompleted").count(),
+            1
+        );
 
         let completed =
             wait_for_instance_completion(&store, "tenant", "instance-keyed-rollup").await?;
@@ -13962,7 +15400,10 @@ mod tests {
                     "accountId": "acct_1",
                     "totalAmount": 5.0,
                     "asOfCheckpoint": 1,
-                    "consistency": "strong"
+                    "checkpointSequence": 1,
+                    "consistency": "strong",
+                    "consistencySource": "stream_owner_local_state",
+                    "streamOwnerEpoch": 1
                 },
                 "result": {
                     "jobId": handle.job_id.clone(),
@@ -13986,15 +15427,387 @@ mod tests {
             .next()
             .context("stream job query should exist")?;
         assert_eq!(query.parsed_status(), Some(StreamJobQueryStatus::Accepted));
+        let checkpoint_accepted_at = checkpoint.accepted_at;
+        let terminal_accepted_at = handle.workflow_accepted_at;
 
-        let filter =
-            WorkflowHistoryFilter::new("tenant", "instance-keyed-rollup", "run-keyed-rollup");
+        let duplicate_schedule = ThroughputCommandEnvelope {
+            command_id: Uuid::now_v7(),
+            occurred_at: Utc::now() + ChronoDuration::seconds(1),
+            dedupe_key: format!("stream-job-submit-duplicate:{}", handle.handle_id),
+            partition_key: fabrik_throughput::throughput_partition_key(&handle.job_id, 0),
+            payload: ThroughputCommand::ScheduleStreamJob(
+                fabrik_throughput::ScheduleStreamJobCommand {
+                    tenant_id: "tenant".to_owned(),
+                    stream_instance_id: "instance-keyed-rollup".to_owned(),
+                    stream_run_id: "run-keyed-rollup".to_owned(),
+                    job_id: handle.job_id.clone(),
+                    handle_id: handle.handle_id.clone(),
+                },
+            ),
+        };
+        redpanda
+            .connect_throughput_command_publisher()
+            .await?
+            .publish(&duplicate_schedule, &duplicate_schedule.partition_key)
+            .await?;
+
+        let debug = wait_for_throughput_runtime_debug_value(&throughput_runtime, |snapshot| {
+            snapshot
+                .get("runtime")
+                .and_then(|runtime| {
+                    Some(
+                        runtime
+                            .get("duplicate_stream_job_checkpoint_publications_ignored")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or_default()
+                            >= 1
+                            && runtime
+                                .get("duplicate_stream_job_terminal_publications_ignored")
+                                .and_then(serde_json::Value::as_u64)
+                                .unwrap_or_default()
+                                >= 1,
+                    )
+                })
+                .unwrap_or(false)
+        })
+        .await?;
+        assert!(
+            debug["runtime"]["duplicate_stream_job_checkpoint_publications_ignored"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+        );
+        assert!(
+            debug["runtime"]["duplicate_stream_job_terminal_publications_ignored"]
+                .as_u64()
+                .unwrap_or_default()
+                >= 1
+        );
+
+        let handle_after_duplicate = store
+            .list_stream_job_bridge_handles_for_run_page(
+                "tenant",
+                "instance-keyed-rollup",
+                "run-keyed-rollup",
+                10,
+                0,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job handle should still exist after duplicate schedule")?;
+        assert_eq!(handle_after_duplicate.workflow_accepted_at, terminal_accepted_at);
+        let checkpoint_after_duplicate = store
+            .list_stream_job_bridge_checkpoints_for_handle_page(&handle.handle_id, 10, 0)
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job checkpoint should still exist after duplicate schedule")?;
+        assert_eq!(checkpoint_after_duplicate.accepted_at, checkpoint_accepted_at);
+
+        let history_after_duplicate = read_workflow_history(
+            &redpanda.broker,
+            "unified-runtime-keyed-rollup-e2e-history-duplicate-check",
+            &filter,
+            StdDuration::from_millis(500),
+            StdDuration::from_secs(5),
+        )
+        .await?;
+        assert_eq!(
+            history_after_duplicate
+                .iter()
+                .filter(|event| event.event_type == "StreamJobCheckpointReached")
+                .count(),
+            1
+        );
+        assert_eq!(
+            history_after_duplicate
+                .iter()
+                .filter(|event| event.event_type == "StreamJobCompleted")
+                .count(),
+            1
+        );
+
+        trigger_loop.abort();
+        outbox_loop.abort();
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keyed_rollup_stream_job_recovers_after_runtime_restart() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = keyed_rollup_stream_job_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-keyed-rollup-restart-{}", Uuid::now_v7()));
+        let runtime_config = TestThroughputRuntime::config(&state_dir)?;
+        let publisher = redpanda.connect_publisher().await?;
+        let app_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher,
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+        let consumer = build_workflow_consumer(
+            &redpanda.broker,
+            "unified-runtime-keyed-rollup-restart-consumer",
+            &redpanda.broker.all_partition_ids(),
+        )
+        .await?;
+        let trigger_loop = tokio::spawn(run_trigger_consumer(app_state.clone(), consumer));
+        let outbox_loop = tokio::spawn(run_workflow_event_outbox_publisher(app_state.clone()));
+        let mut throughput_runtime =
+            TestThroughputRuntime::start_with_config(&postgres, &redpanda, &runtime_config).await?;
+
+        let input = json!({
+            "streamInput": {
+                "kind": "bounded_items",
+                "items": [
+                    { "accountId": "acct_1", "amount": 2.0 },
+                    { "accountId": "acct_1", "amount": 3.0 },
+                    { "accountId": "acct_2", "amount": 11.0 }
+                ]
+            }
+        });
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-keyed-rollup-restart",
+            "run-keyed-rollup-restart",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(&identity, WorkflowEvent::WorkflowTriggered { input }, Utc::now());
+        redpanda.connect_publisher().await?.publish(&trigger, &trigger.partition_key).await?;
+
+        let filter = WorkflowHistoryFilter::new(
+            "tenant",
+            "instance-keyed-rollup-restart",
+            "run-keyed-rollup-restart",
+        );
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobScheduled").await?;
         redpanda.wait_for_workflow_history_event(&filter, "StreamJobCheckpointReached").await?;
+
+        throughput_runtime.stop()?;
+        let _restarted_runtime =
+            TestThroughputRuntime::start_with_config(&postgres, &redpanda, &runtime_config).await?;
+
         redpanda.wait_for_workflow_history_event(&filter, "StreamJobQueryCompleted").await?;
         redpanda.wait_for_workflow_history_event(&filter, "StreamJobCompleted").await?;
 
-        let _ = stop_tx.send(());
-        callback_agent.await??;
+        let completed =
+            wait_for_instance_completion(&store, "tenant", "instance-keyed-rollup-restart").await?;
+        assert_eq!(completed.status, WorkflowStatus::Completed);
+        assert_eq!(
+            completed.output.as_ref().and_then(|output| {
+                output
+                    .get("account")
+                    .and_then(|account| account.get("totalAmount"))
+                    .and_then(serde_json::Value::as_f64)
+            }),
+            Some(5.0)
+        );
+        assert_eq!(
+            completed.output.as_ref().and_then(|output| {
+                output
+                    .get("result")
+                    .and_then(|result| result.get("status"))
+                    .and_then(serde_json::Value::as_str)
+            }),
+            Some("completed")
+        );
+
+        trigger_loop.abort();
+        outbox_loop.abort();
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn keyed_rollup_stream_job_ignores_duplicate_terminal_after_restart() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = keyed_rollup_stream_job_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "unified-runtime-keyed-rollup-restart-duplicate-terminal-{}",
+            Uuid::now_v7()
+        ));
+        let runtime_config = TestThroughputRuntime::config(&state_dir)?;
+        let publisher = redpanda.connect_publisher().await?;
+        let app_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher,
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+        let consumer = build_workflow_consumer(
+            &redpanda.broker,
+            "unified-runtime-keyed-rollup-restart-duplicate-terminal-consumer",
+            &redpanda.broker.all_partition_ids(),
+        )
+        .await?;
+        let trigger_loop = tokio::spawn(run_trigger_consumer(app_state.clone(), consumer));
+        let outbox_loop = tokio::spawn(run_workflow_event_outbox_publisher(app_state.clone()));
+        let mut throughput_runtime =
+            TestThroughputRuntime::start_with_config(&postgres, &redpanda, &runtime_config).await?;
+
+        let input = json!({
+            "streamInput": {
+                "kind": "bounded_items",
+                "items": [
+                    { "accountId": "acct_1", "amount": 2.0 },
+                    { "accountId": "acct_1", "amount": 3.0 },
+                    { "accountId": "acct_2", "amount": 11.0 }
+                ]
+            }
+        });
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-keyed-rollup-restart-duplicate-terminal",
+            "run-keyed-rollup-restart-duplicate-terminal",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(&identity, WorkflowEvent::WorkflowTriggered { input }, Utc::now());
+        redpanda.connect_publisher().await?.publish(&trigger, &trigger.partition_key).await?;
+
+        let filter = WorkflowHistoryFilter::new(
+            "tenant",
+            "instance-keyed-rollup-restart-duplicate-terminal",
+            "run-keyed-rollup-restart-duplicate-terminal",
+        );
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobScheduled").await?;
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobCheckpointReached").await?;
+
+        throughput_runtime.stop()?;
+        let _restarted =
+            TestThroughputRuntime::start_with_config(&postgres, &redpanda, &runtime_config).await?;
+
+        redpanda.wait_for_workflow_history_event(&filter, "StreamJobQueryCompleted").await?;
+        let terminal_event =
+            redpanda.wait_for_workflow_history_event(&filter, "StreamJobCompleted").await?;
+
+        let completed = wait_for_instance_completion(
+            &store,
+            "tenant",
+            "instance-keyed-rollup-restart-duplicate-terminal",
+        )
+        .await?;
+        let handle = store
+            .list_stream_job_bridge_handles_for_run_page(
+                "tenant",
+                "instance-keyed-rollup-restart-duplicate-terminal",
+                "run-keyed-rollup-restart-duplicate-terminal",
+                10,
+                0,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job handle should exist after restart completion")?;
+        let first_accepted_at = handle.workflow_accepted_at;
+        let first_terminal_output = handle.terminal_output.clone();
+        let first_workflow_output = completed.output.clone();
+
+        let duplicate_terminal = test_event(
+            &identity,
+            WorkflowEvent::StreamJobCompleted {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                output: json!({
+                    "jobId": handle.job_id.clone(),
+                    "jobName": "keyed-rollup",
+                    "status": "duplicate-after-restart",
+                }),
+                stream_owner_epoch: match &terminal_event.payload {
+                    WorkflowEvent::StreamJobCompleted { stream_owner_epoch, .. } => {
+                        *stream_owner_epoch
+                    }
+                    _ => None,
+                },
+            },
+            Utc::now() + ChronoDuration::seconds(1),
+        );
+        redpanda
+            .connect_publisher()
+            .await?
+            .publish(&duplicate_terminal, &duplicate_terminal.partition_key)
+            .await?;
+
+        let duplicate_history = {
+            let deadline = Instant::now() + StdDuration::from_secs(10);
+            loop {
+                let history = read_workflow_history(
+                    &redpanda.broker,
+                    "unified-runtime-keyed-rollup-restart-duplicate-terminal-history",
+                    &filter,
+                    StdDuration::from_millis(500),
+                    StdDuration::from_secs(5),
+                )
+                .await?;
+                if history.iter().filter(|event| event.event_type == "StreamJobCompleted").count()
+                    >= 2
+                {
+                    break history;
+                }
+                if Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "timed out waiting for duplicate stream job terminal event after restart"
+                    );
+                }
+                sleep(StdDuration::from_millis(100)).await;
+            }
+        };
+        assert_eq!(
+            duplicate_history
+                .iter()
+                .filter(|event| event.event_type == "StreamJobCompleted")
+                .count(),
+            2
+        );
+
+        let handle_after_duplicate = store
+            .list_stream_job_bridge_handles_for_run_page(
+                "tenant",
+                "instance-keyed-rollup-restart-duplicate-terminal",
+                "run-keyed-rollup-restart-duplicate-terminal",
+                10,
+                0,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job handle should still exist after duplicate terminal")?;
+        let completed_after_duplicate = store
+            .get_instance("tenant", "instance-keyed-rollup-restart-duplicate-terminal")
+            .await?
+            .context("workflow instance should still exist after duplicate terminal")?;
+        assert_eq!(handle_after_duplicate.workflow_accepted_at, first_accepted_at);
+        assert_eq!(handle_after_duplicate.terminal_output, first_terminal_output);
+        assert_eq!(completed_after_duplicate.output, first_workflow_output);
+
         trigger_loop.abort();
         outbox_loop.abort();
 
@@ -14082,6 +15895,92 @@ mod tests {
             Some(fabrik_throughput::StreamJobQueryStatus::Requested)
         );
         assert_eq!(stored_query.completed_at, None);
+
+        let stored_handle = store
+            .get_stream_job_bridge_handle_by_handle_id(&handle.handle_id)
+            .await?
+            .context("stream job bridge handle should still exist")?;
+        assert_eq!(stored_handle.stream_owner_epoch, Some(5));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_owner_epoch_stream_job_checkpoint_callback_is_ignored() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = stream_job_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-stream-job-checkpoint-stale-{}", Uuid::now_v7()));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-stream-checkpoint-stale",
+            "run-stream-checkpoint-stale",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({}) },
+            Utc::now(),
+        );
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let mut handle = store
+            .list_stream_job_bridge_handles_for_run_page(
+                "tenant",
+                "instance-stream-checkpoint-stale",
+                "run-stream-checkpoint-stale",
+                10,
+                0,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job bridge handle should exist")?;
+        handle.stream_owner_epoch = Some(5);
+        store.upsert_stream_job_bridge_handle(&handle).await?;
+
+        let checkpoint = test_event(
+            &identity,
+            WorkflowEvent::StreamJobCheckpointReached {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                checkpoint_name: "hourly-rollup-ready".to_owned(),
+                checkpoint_sequence: 7,
+                output: Some(json!({"ready": true})),
+                stream_owner_epoch: Some(4),
+            },
+            Utc::now(),
+        );
+        handle_stream_job_checkpoint_event(&app_state, checkpoint).await?;
+
+        let waiting = store
+            .get_instance("tenant", "instance-stream-checkpoint-stale")
+            .await?
+            .context("stream job instance should still exist")?;
+        assert_eq!(waiting.current_state.as_deref(), Some("wait_checkpoint"));
+        assert_ne!(waiting.status, WorkflowStatus::Completed);
+
+        let stored_checkpoints = store
+            .list_stream_job_bridge_checkpoints_for_handle_page(&handle.handle_id, 10, 0)
+            .await?;
+        assert_eq!(stored_checkpoints.len(), 1);
+        assert_eq!(
+            stored_checkpoints[0].parsed_status(),
+            Some(fabrik_throughput::StreamJobCheckpointStatus::Awaiting)
+        );
+        assert_eq!(stored_checkpoints[0].reached_at, None);
+        assert_eq!(stored_checkpoints[0].accepted_at, None);
 
         let stored_handle = store
             .get_stream_job_bridge_handle_by_handle_id(&handle.handle_id)
@@ -14184,6 +16083,1110 @@ mod tests {
         );
         assert_eq!(stored_handle.stream_owner_epoch, Some(5));
         assert_eq!(stored_handle.terminal_at, None);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_completed_terminal_after_cancelled_stream_job_is_ignored() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = stream_job_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-stream-job-cancel-terminal-race-{}", Uuid::now_v7()));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-stream-terminal-cancel-race",
+            "run-stream-terminal-cancel-race",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({}) },
+            Utc::now(),
+        );
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let handle = store
+            .list_stream_job_bridge_handles_for_run_page(
+                "tenant",
+                "instance-stream-terminal-cancel-race",
+                "run-stream-terminal-cancel-race",
+                10,
+                0,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job bridge handle should exist")?;
+
+        let checkpoint = test_event(
+            &identity,
+            WorkflowEvent::StreamJobCheckpointReached {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                checkpoint_name: "hourly-rollup-ready".to_owned(),
+                checkpoint_sequence: 7,
+                output: Some(json!({"ready": true})),
+                stream_owner_epoch: Some(6),
+            },
+            Utc::now(),
+        );
+        handle_stream_job_checkpoint_event(&app_state, checkpoint).await?;
+
+        let cancelled = test_event(
+            &identity,
+            WorkflowEvent::StreamJobCancelled {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                reason: "manual stop".to_owned(),
+                stream_owner_epoch: Some(6),
+            },
+            Utc::now(),
+        );
+        handle_stream_job_terminal_event(&app_state, cancelled).await?;
+
+        let stale_completed = test_event(
+            &identity,
+            WorkflowEvent::StreamJobCompleted {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                output: json!({"score": 0.97}),
+                stream_owner_epoch: Some(5),
+            },
+            Utc::now() + ChronoDuration::seconds(1),
+        );
+        handle_stream_job_terminal_event(&app_state, stale_completed).await?;
+
+        let stored = store
+            .get_instance("tenant", "instance-stream-terminal-cancel-race")
+            .await?
+            .context("stream job instance should exist")?;
+        assert_eq!(stored.status, WorkflowStatus::Failed);
+        assert_eq!(stored.output, Some(Value::String("manual stop".to_owned())));
+
+        let stored_handle = store
+            .get_stream_job_bridge_handle_by_handle_id(&handle.handle_id)
+            .await?
+            .context("stream job bridge handle should still exist")?;
+        assert_eq!(
+            stored_handle.parsed_status(),
+            Some(fabrik_throughput::StreamJobBridgeHandleStatus::Cancelled)
+        );
+        assert_eq!(stored_handle.stream_owner_epoch, Some(6));
+        assert_eq!(stored_handle.terminal_error.as_deref(), Some("manual stop"));
+        assert_eq!(stored_handle.terminal_output, None);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_repair_republishes_stream_job_query_callback_after_restart() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-bridge-repair-stream-query-restart-{}", Uuid::now_v7()));
+        let initial_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher.clone(),
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+        let now = Utc::now();
+
+        store
+            .upsert_stream_job_bridge_handle(&StreamJobBridgeHandleRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-query-restart".to_owned(),
+                run_id: "run-repair-stream-query-restart".to_owned(),
+                stream_instance_id: "instance-repair-stream-query-restart".to_owned(),
+                stream_run_id: "run-repair-stream-query-restart".to_owned(),
+                job_id: "job-repair-stream-query-restart".to_owned(),
+                handle_id: "stream-job-handle:tenant:instance-repair-stream-query-restart:run-repair-stream-query-restart:job-repair-stream-query-restart".to_owned(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-query-restart:run-repair-stream-query-restart:job-repair-stream-query-restart".to_owned(),
+                origin_kind: fabrik_throughput::StreamJobOriginKind::Workflow.as_str().to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                job_name: "fraud-detector".to_owned(),
+                input_ref: "topic:payments".to_owned(),
+                config_ref: Some("config:fraud-detector:v1".to_owned()),
+                checkpoint_policy: None,
+                view_definitions: None,
+                status: fabrik_throughput::StreamJobBridgeHandleStatus::Running.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                cancellation_requested_at: None,
+                cancellation_reason: None,
+                terminal_event_id: None,
+                terminal_at: None,
+                workflow_accepted_at: None,
+                terminal_output: None,
+                terminal_error: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .await?;
+        store
+            .upsert_stream_job_bridge_query(&StreamJobQueryRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-query-restart".to_owned(),
+                run_id: "run-repair-stream-query-restart".to_owned(),
+                job_id: "job-repair-stream-query-restart".to_owned(),
+                handle_id: "stream-job-handle:tenant:instance-repair-stream-query-restart:run-repair-stream-query-restart:job-repair-stream-query-restart".to_owned(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-query-restart:run-repair-stream-query-restart:job-repair-stream-query-restart".to_owned(),
+                query_id: "stream-job-query:job-repair-stream-query-restart:currentStats:event-a".to_owned(),
+                query_name: "currentStats".to_owned(),
+                query_args: Some(json!({"window": "1h"})),
+                consistency: fabrik_throughput::StreamJobQueryConsistency::Strong.as_str().to_owned(),
+                status: fabrik_throughput::StreamJobQueryStatus::Completed.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                output: Some(json!({"anomalies": 2})),
+                error: None,
+                requested_at: now,
+                completed_at: Some(now + chrono::Duration::seconds(1)),
+                accepted_at: None,
+                cancelled_at: None,
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(1),
+            })
+            .await?;
+
+        drop(initial_state);
+
+        let restarted_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher,
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+
+        let repaired = crate::bridge::repair_pending_stream_v2_bridge(&restarted_state).await?;
+        assert_eq!(repaired, (0, 0, 0, 1, 0, 0));
+
+        let repaired_event = redpanda
+            .wait_for_workflow_history_event(
+                &WorkflowHistoryFilter::new(
+                    "tenant",
+                    "instance-repair-stream-query-restart",
+                    "run-repair-stream-query-restart",
+                ),
+                "StreamJobQueryCompleted",
+            )
+            .await?;
+        assert_eq!(
+            repaired_event.metadata.get("bridge_operation_kind").map(String::as_str),
+            Some(ThroughputBridgeOperationKind::StreamJob.as_str())
+        );
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_repair_skips_stale_stream_job_query_debt_after_owner_failover() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let state_dir = std::env::temp_dir().join(format!(
+            "unified-runtime-bridge-repair-stream-query-stale-debt-{}",
+            Uuid::now_v7()
+        ));
+        let app_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher,
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+        let now = Utc::now();
+
+        let handle_id = "stream-job-handle:tenant:instance-repair-stream-query-stale-debt:run-repair-stream-query-stale-debt:job-repair-stream-query-stale-debt".to_owned();
+        store
+            .upsert_stream_job_bridge_handle(&StreamJobBridgeHandleRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-query-stale-debt".to_owned(),
+                run_id: "run-repair-stream-query-stale-debt".to_owned(),
+                stream_instance_id: "instance-repair-stream-query-stale-debt".to_owned(),
+                stream_run_id: "run-repair-stream-query-stale-debt".to_owned(),
+                job_id: "job-repair-stream-query-stale-debt".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-query-stale-debt:run-repair-stream-query-stale-debt:job-repair-stream-query-stale-debt".to_owned(),
+                origin_kind: fabrik_throughput::StreamJobOriginKind::Workflow.as_str().to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                job_name: "fraud-detector".to_owned(),
+                input_ref: "topic:payments".to_owned(),
+                config_ref: Some("config:fraud-detector:v1".to_owned()),
+                checkpoint_policy: None,
+                view_definitions: None,
+                status: fabrik_throughput::StreamJobBridgeHandleStatus::Completed.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                cancellation_requested_at: None,
+                cancellation_reason: None,
+                terminal_event_id: Some(Uuid::now_v7()),
+                terminal_at: Some(now + chrono::Duration::seconds(2)),
+                workflow_accepted_at: None,
+                terminal_output: Some(json!({"score": 0.97})),
+                terminal_error: None,
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(2),
+            })
+            .await?;
+        store
+            .upsert_stream_job_bridge_query(&StreamJobQueryRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-query-stale-debt".to_owned(),
+                run_id: "run-repair-stream-query-stale-debt".to_owned(),
+                job_id: "job-repair-stream-query-stale-debt".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-query-stale-debt:run-repair-stream-query-stale-debt:job-repair-stream-query-stale-debt".to_owned(),
+                query_id: "stream-job-query:job-repair-stream-query-stale-debt:currentStats:event-a".to_owned(),
+                query_name: "currentStats".to_owned(),
+                query_args: Some(json!({"window": "1h"})),
+                consistency: fabrik_throughput::StreamJobQueryConsistency::Strong.as_str().to_owned(),
+                status: fabrik_throughput::StreamJobQueryStatus::Completed.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(6),
+                output: Some(json!({"anomalies": 2})),
+                error: None,
+                requested_at: now,
+                completed_at: Some(now + chrono::Duration::seconds(1)),
+                accepted_at: None,
+                cancelled_at: None,
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(1),
+            })
+            .await?;
+
+        let repaired = crate::bridge::repair_pending_stream_v2_bridge(&app_state).await?;
+        assert_eq!(repaired, (0, 0, 0, 0, 0, 1));
+
+        let ledger = store
+            .load_stream_job_bridge_ledger_for_handle(&handle_id)
+            .await?
+            .context("stream job bridge ledger should exist")?;
+        assert_eq!(ledger.pending_query_repairs, 0);
+        assert_eq!(
+            ledger.pending_repairs(),
+            vec![fabrik_throughput::StreamJobBridgeRepairKind::AcceptTerminal]
+        );
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_repair_republishes_stream_job_terminal_callback_after_restart() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let state_dir = std::env::temp_dir().join(format!(
+            "unified-runtime-bridge-repair-stream-terminal-restart-{}",
+            Uuid::now_v7()
+        ));
+        let initial_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher.clone(),
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+        let now = Utc::now();
+
+        let handle_id = "stream-job-handle:tenant:instance-repair-stream-terminal-restart:run-repair-stream-terminal-restart:job-repair-stream-terminal-restart".to_owned();
+        store
+            .upsert_stream_job_bridge_handle(&StreamJobBridgeHandleRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-terminal-restart".to_owned(),
+                run_id: "run-repair-stream-terminal-restart".to_owned(),
+                stream_instance_id: "instance-repair-stream-terminal-restart".to_owned(),
+                stream_run_id: "run-repair-stream-terminal-restart".to_owned(),
+                job_id: "job-repair-stream-terminal-restart".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-terminal-restart:run-repair-stream-terminal-restart:job-repair-stream-terminal-restart".to_owned(),
+                origin_kind: fabrik_throughput::StreamJobOriginKind::Workflow.as_str().to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                job_name: "fraud-detector".to_owned(),
+                input_ref: "topic:payments".to_owned(),
+                config_ref: Some("config:fraud-detector:v1".to_owned()),
+                checkpoint_policy: None,
+                view_definitions: None,
+                status: fabrik_throughput::StreamJobBridgeHandleStatus::Completed.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                cancellation_requested_at: None,
+                cancellation_reason: None,
+                terminal_event_id: Some(Uuid::now_v7()),
+                terminal_at: Some(now + chrono::Duration::seconds(1)),
+                workflow_accepted_at: None,
+                terminal_output: Some(json!({"score": 0.97})),
+                terminal_error: None,
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(1),
+            })
+            .await?;
+
+        drop(initial_state);
+
+        let restarted_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher,
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+
+        let repaired = crate::bridge::repair_pending_stream_v2_bridge(&restarted_state).await?;
+        assert_eq!(repaired, (0, 0, 0, 0, 0, 1));
+
+        let repaired_event = redpanda
+            .wait_for_workflow_history_event(
+                &WorkflowHistoryFilter::new(
+                    "tenant",
+                    "instance-repair-stream-terminal-restart",
+                    "run-repair-stream-terminal-restart",
+                ),
+                "StreamJobCompleted",
+            )
+            .await?;
+        assert_eq!(
+            repaired_event.metadata.get("bridge_operation_kind").map(String::as_str),
+            Some(ThroughputBridgeOperationKind::StreamJob.as_str())
+        );
+
+        let debug = restarted_state.debug.lock().expect("unified debug lock poisoned").clone();
+        assert_eq!(debug.repaired_bridge_stream_job_terminal_callbacks, 1);
+        assert_eq!(debug.last_bridge_repair_kind.as_deref(), Some("accept_stream_terminal"));
+        assert_eq!(debug.last_bridge_repair_batch_id.as_deref(), Some(handle_id.as_str()));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_repair_republishes_cancelled_stream_job_terminal_after_restart() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let state_dir = std::env::temp_dir().join(format!(
+            "unified-runtime-bridge-repair-stream-cancelled-terminal-restart-{}",
+            Uuid::now_v7()
+        ));
+        let initial_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher.clone(),
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+        let now = Utc::now();
+
+        let handle_id = "stream-job-handle:tenant:instance-repair-stream-cancelled-terminal-restart:run-repair-stream-cancelled-terminal-restart:job-repair-stream-cancelled-terminal-restart".to_owned();
+        store
+            .upsert_stream_job_bridge_handle(&StreamJobBridgeHandleRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-cancelled-terminal-restart".to_owned(),
+                run_id: "run-repair-stream-cancelled-terminal-restart".to_owned(),
+                stream_instance_id: "instance-repair-stream-cancelled-terminal-restart".to_owned(),
+                stream_run_id: "run-repair-stream-cancelled-terminal-restart".to_owned(),
+                job_id: "job-repair-stream-cancelled-terminal-restart".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-cancelled-terminal-restart:run-repair-stream-cancelled-terminal-restart:job-repair-stream-cancelled-terminal-restart".to_owned(),
+                origin_kind: fabrik_throughput::StreamJobOriginKind::Workflow.as_str().to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                job_name: "fraud-detector".to_owned(),
+                input_ref: "topic:payments".to_owned(),
+                config_ref: Some("config:fraud-detector:v1".to_owned()),
+                checkpoint_policy: None,
+                view_definitions: None,
+                status: fabrik_throughput::StreamJobBridgeHandleStatus::Cancelled.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(8),
+                cancellation_requested_at: Some(now),
+                cancellation_reason: Some("manual stop".to_owned()),
+                terminal_event_id: Some(Uuid::now_v7()),
+                terminal_at: Some(now + chrono::Duration::seconds(1)),
+                workflow_accepted_at: None,
+                terminal_output: None,
+                terminal_error: Some("manual stop".to_owned()),
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(1),
+            })
+            .await?;
+        store
+            .upsert_stream_job_bridge_checkpoint(&fabrik_store::StreamJobCheckpointRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-cancelled-terminal-restart".to_owned(),
+                run_id: "run-repair-stream-cancelled-terminal-restart".to_owned(),
+                job_id: "job-repair-stream-cancelled-terminal-restart".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-cancelled-terminal-restart:run-repair-stream-cancelled-terminal-restart:job-repair-stream-cancelled-terminal-restart".to_owned(),
+                await_request_id: "stream-job-await:job-repair-stream-cancelled-terminal-restart:hourly-rollup-ready:event-a".to_owned(),
+                checkpoint_name: "hourly-rollup-ready".to_owned(),
+                checkpoint_sequence: Some(7),
+                status: fabrik_throughput::StreamJobCheckpointStatus::Cancelled.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(8),
+                reached_at: Some(now),
+                output: Some(json!({"ready": true})),
+                accepted_at: None,
+                cancelled_at: Some(now + chrono::Duration::seconds(1)),
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(1),
+            })
+            .await?;
+
+        drop(initial_state);
+
+        let restarted_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher,
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+
+        let repaired = crate::bridge::repair_pending_stream_v2_bridge(&restarted_state).await?;
+        assert_eq!(repaired, (0, 0, 0, 0, 0, 1));
+
+        let repaired_event = redpanda
+            .wait_for_workflow_history_event(
+                &WorkflowHistoryFilter::new(
+                    "tenant",
+                    "instance-repair-stream-cancelled-terminal-restart",
+                    "run-repair-stream-cancelled-terminal-restart",
+                ),
+                "StreamJobCancelled",
+            )
+            .await?;
+        assert_eq!(
+            repaired_event.metadata.get("bridge_operation_kind").map(String::as_str),
+            Some(ThroughputBridgeOperationKind::StreamJob.as_str())
+        );
+
+        let debug = restarted_state.debug.lock().expect("unified debug lock poisoned").clone();
+        assert_eq!(debug.repaired_bridge_stream_job_terminal_callbacks, 1);
+        assert_eq!(debug.repaired_bridge_stream_job_checkpoint_callbacks, 0);
+        assert_eq!(debug.last_bridge_repair_kind.as_deref(), Some("accept_stream_terminal"));
+        assert_eq!(debug.last_bridge_repair_batch_id.as_deref(), Some(handle_id.as_str()));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_repair_replays_only_unaccepted_terminal_after_restart_when_query_is_accepted()
+    -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let state_dir = std::env::temp_dir().join(format!(
+            "unified-runtime-bridge-repair-stream-query-accepted-terminal-pending-{}",
+            Uuid::now_v7()
+        ));
+        let initial_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher.clone(),
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+        let now = Utc::now();
+
+        let handle_id = "stream-job-handle:tenant:instance-repair-stream-query-accepted-terminal-pending:run-repair-stream-query-accepted-terminal-pending:job-repair-stream-query-accepted-terminal-pending".to_owned();
+        store
+            .upsert_stream_job_bridge_handle(&StreamJobBridgeHandleRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-query-accepted-terminal-pending".to_owned(),
+                run_id: "run-repair-stream-query-accepted-terminal-pending".to_owned(),
+                stream_instance_id: "instance-repair-stream-query-accepted-terminal-pending".to_owned(),
+                stream_run_id: "run-repair-stream-query-accepted-terminal-pending".to_owned(),
+                job_id: "job-repair-stream-query-accepted-terminal-pending".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-query-accepted-terminal-pending:run-repair-stream-query-accepted-terminal-pending:job-repair-stream-query-accepted-terminal-pending".to_owned(),
+                origin_kind: fabrik_throughput::StreamJobOriginKind::Workflow.as_str().to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                job_name: "fraud-detector".to_owned(),
+                input_ref: "topic:payments".to_owned(),
+                config_ref: Some("config:fraud-detector:v1".to_owned()),
+                checkpoint_policy: None,
+                view_definitions: None,
+                status: fabrik_throughput::StreamJobBridgeHandleStatus::Completed.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                cancellation_requested_at: None,
+                cancellation_reason: None,
+                terminal_event_id: Some(Uuid::now_v7()),
+                terminal_at: Some(now + chrono::Duration::seconds(3)),
+                workflow_accepted_at: None,
+                terminal_output: Some(json!({"score": 0.97})),
+                terminal_error: None,
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(3),
+            })
+            .await?;
+        store
+            .upsert_stream_job_bridge_query(&StreamJobQueryRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-query-accepted-terminal-pending".to_owned(),
+                run_id: "run-repair-stream-query-accepted-terminal-pending".to_owned(),
+                job_id: "job-repair-stream-query-accepted-terminal-pending".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-query-accepted-terminal-pending:run-repair-stream-query-accepted-terminal-pending:job-repair-stream-query-accepted-terminal-pending".to_owned(),
+                query_id: "stream-job-query:job-repair-stream-query-accepted-terminal-pending:currentStats:event-a".to_owned(),
+                query_name: "currentStats".to_owned(),
+                query_args: Some(json!({"window": "1h"})),
+                consistency: fabrik_throughput::StreamJobQueryConsistency::Strong.as_str().to_owned(),
+                status: fabrik_throughput::StreamJobQueryStatus::Accepted.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                output: Some(json!({"anomalies": 2})),
+                error: None,
+                requested_at: now,
+                completed_at: Some(now + chrono::Duration::seconds(1)),
+                accepted_at: Some(now + chrono::Duration::seconds(2)),
+                cancelled_at: None,
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(2),
+            })
+            .await?;
+
+        drop(initial_state);
+
+        let restarted_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher,
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+
+        let pre_repair_ledger = store
+            .load_stream_job_bridge_ledger_for_handle(&handle_id)
+            .await?
+            .context("stream job bridge ledger should exist before repair")?;
+        assert_eq!(pre_repair_ledger.pending_query_repairs, 0);
+        assert_eq!(
+            pre_repair_ledger.pending_repairs(),
+            vec![fabrik_throughput::StreamJobBridgeRepairKind::AcceptTerminal]
+        );
+
+        let repaired = crate::bridge::repair_pending_stream_v2_bridge(&restarted_state).await?;
+        assert_eq!(repaired, (0, 0, 0, 0, 0, 1));
+
+        let repaired_event = redpanda
+            .wait_for_workflow_history_event(
+                &WorkflowHistoryFilter::new(
+                    "tenant",
+                    "instance-repair-stream-query-accepted-terminal-pending",
+                    "run-repair-stream-query-accepted-terminal-pending",
+                ),
+                "StreamJobCompleted",
+            )
+            .await?;
+        assert_eq!(
+            repaired_event.metadata.get("bridge_operation_kind").map(String::as_str),
+            Some(ThroughputBridgeOperationKind::StreamJob.as_str())
+        );
+
+        let debug = restarted_state.debug.lock().expect("unified debug lock poisoned").clone();
+        assert_eq!(debug.repaired_bridge_stream_job_query_callbacks, 0);
+        assert_eq!(debug.repaired_bridge_stream_job_terminal_callbacks, 1);
+        assert_eq!(debug.last_bridge_repair_kind.as_deref(), Some("accept_stream_terminal"));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_repair_only_republishes_remaining_stream_job_debt_from_ledger() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let state_dir = std::env::temp_dir().join(format!(
+            "unified-runtime-bridge-repair-stream-partial-ledger-{}",
+            Uuid::now_v7()
+        ));
+        let app_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher,
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+        let now = Utc::now();
+
+        let handle_id = "stream-job-handle:tenant:instance-repair-stream-partial-ledger:run-repair-stream-partial-ledger:job-repair-stream-partial-ledger".to_owned();
+        store
+            .upsert_stream_job_bridge_handle(&StreamJobBridgeHandleRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-partial-ledger".to_owned(),
+                run_id: "run-repair-stream-partial-ledger".to_owned(),
+                stream_instance_id: "instance-repair-stream-partial-ledger".to_owned(),
+                stream_run_id: "run-repair-stream-partial-ledger".to_owned(),
+                job_id: "job-repair-stream-partial-ledger".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-partial-ledger:run-repair-stream-partial-ledger:job-repair-stream-partial-ledger".to_owned(),
+                origin_kind: fabrik_throughput::StreamJobOriginKind::Workflow.as_str().to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                job_name: "fraud-detector".to_owned(),
+                input_ref: "topic:payments".to_owned(),
+                config_ref: Some("config:fraud-detector:v1".to_owned()),
+                checkpoint_policy: None,
+                view_definitions: None,
+                status: fabrik_throughput::StreamJobBridgeHandleStatus::Completed.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                cancellation_requested_at: None,
+                cancellation_reason: None,
+                terminal_event_id: Some(Uuid::now_v7()),
+                terminal_at: Some(now + chrono::Duration::seconds(3)),
+                workflow_accepted_at: None,
+                terminal_output: Some(json!({"score": 0.97})),
+                terminal_error: None,
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(3),
+            })
+            .await?;
+        store
+            .upsert_stream_job_bridge_checkpoint(&fabrik_store::StreamJobCheckpointRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-partial-ledger".to_owned(),
+                run_id: "run-repair-stream-partial-ledger".to_owned(),
+                job_id: "job-repair-stream-partial-ledger".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-partial-ledger:run-repair-stream-partial-ledger:job-repair-stream-partial-ledger".to_owned(),
+                await_request_id: "stream-job-await:job-repair-stream-partial-ledger:hourly-rollup-ready:event-a".to_owned(),
+                checkpoint_name: "hourly-rollup-ready".to_owned(),
+                checkpoint_sequence: Some(7),
+                status: fabrik_throughput::StreamJobCheckpointStatus::Accepted.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                reached_at: Some(now + chrono::Duration::seconds(1)),
+                output: Some(json!({"ready": true})),
+                accepted_at: Some(now + chrono::Duration::seconds(2)),
+                cancelled_at: None,
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(2),
+            })
+            .await?;
+        store
+            .upsert_stream_job_bridge_query(&StreamJobQueryRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-partial-ledger".to_owned(),
+                run_id: "run-repair-stream-partial-ledger".to_owned(),
+                job_id: "job-repair-stream-partial-ledger".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-partial-ledger:run-repair-stream-partial-ledger:job-repair-stream-partial-ledger".to_owned(),
+                query_id: "stream-job-query:job-repair-stream-partial-ledger:currentStats:event-a".to_owned(),
+                query_name: "currentStats".to_owned(),
+                query_args: Some(json!({"window": "1h"})),
+                consistency: fabrik_throughput::StreamJobQueryConsistency::Strong.as_str().to_owned(),
+                status: fabrik_throughput::StreamJobQueryStatus::Completed.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(7),
+                output: Some(json!({"anomalies": 2})),
+                error: None,
+                requested_at: now,
+                completed_at: Some(now + chrono::Duration::seconds(2)),
+                accepted_at: None,
+                cancelled_at: None,
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(2),
+            })
+            .await?;
+
+        let repaired = crate::bridge::repair_pending_stream_v2_bridge(&app_state).await?;
+        assert_eq!(repaired, (0, 0, 0, 1, 0, 1));
+
+        let filter = WorkflowHistoryFilter::new(
+            "tenant",
+            "instance-repair-stream-partial-ledger",
+            "run-repair-stream-partial-ledger",
+        );
+        let query_event =
+            redpanda.wait_for_workflow_history_event(&filter, "StreamJobQueryCompleted").await?;
+        assert_eq!(
+            query_event.metadata.get("bridge_operation_kind").map(String::as_str),
+            Some(ThroughputBridgeOperationKind::StreamJob.as_str())
+        );
+        let terminal_event =
+            redpanda.wait_for_workflow_history_event(&filter, "StreamJobCompleted").await?;
+        assert_eq!(
+            terminal_event.metadata.get("bridge_operation_kind").map(String::as_str),
+            Some(ThroughputBridgeOperationKind::StreamJob.as_str())
+        );
+
+        let debug = app_state.debug.lock().expect("unified debug lock poisoned").clone();
+        assert_eq!(debug.repaired_bridge_stream_job_checkpoint_callbacks, 0);
+        assert_eq!(debug.repaired_bridge_stream_job_query_callbacks, 1);
+        assert_eq!(debug.repaired_bridge_stream_job_terminal_callbacks, 1);
+        assert_eq!(debug.last_bridge_repair_kind.as_deref(), Some("accept_stream_terminal"));
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bridge_repair_replays_only_fresh_stream_job_debt_after_owner_epoch_bump() -> Result<()>
+    {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let Some(redpanda) = TestRedpanda::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let publisher = redpanda.connect_publisher().await?;
+        let state_dir = std::env::temp_dir().join(format!(
+            "unified-runtime-bridge-repair-stream-mixed-fresh-stale-{}",
+            Uuid::now_v7()
+        ));
+        let app_state = test_app_state_with_publisher(
+            store.clone(),
+            publisher,
+            RuntimeInner::default(),
+            state_dir.clone(),
+        )
+        .await;
+        let now = Utc::now();
+
+        let handle_id = "stream-job-handle:tenant:instance-repair-stream-mixed-fresh-stale:run-repair-stream-mixed-fresh-stale:job-repair-stream-mixed-fresh-stale".to_owned();
+        store
+            .upsert_stream_job_bridge_handle(&StreamJobBridgeHandleRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-mixed-fresh-stale".to_owned(),
+                run_id: "run-repair-stream-mixed-fresh-stale".to_owned(),
+                stream_instance_id: "instance-repair-stream-mixed-fresh-stale".to_owned(),
+                stream_run_id: "run-repair-stream-mixed-fresh-stale".to_owned(),
+                job_id: "job-repair-stream-mixed-fresh-stale".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-mixed-fresh-stale:run-repair-stream-mixed-fresh-stale:job-repair-stream-mixed-fresh-stale".to_owned(),
+                origin_kind: fabrik_throughput::StreamJobOriginKind::Workflow.as_str().to_owned(),
+                definition_id: "demo".to_owned(),
+                definition_version: Some(1),
+                artifact_hash: Some("artifact-a".to_owned()),
+                job_name: "fraud-detector".to_owned(),
+                input_ref: "topic:payments".to_owned(),
+                config_ref: Some("config:fraud-detector:v1".to_owned()),
+                checkpoint_policy: None,
+                view_definitions: None,
+                status: fabrik_throughput::StreamJobBridgeHandleStatus::Completed.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(9),
+                cancellation_requested_at: None,
+                cancellation_reason: None,
+                terminal_event_id: Some(Uuid::now_v7()),
+                terminal_at: Some(now + chrono::Duration::seconds(3)),
+                workflow_accepted_at: None,
+                terminal_output: Some(json!({"score": 0.97})),
+                terminal_error: None,
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(3),
+            })
+            .await?;
+        store
+            .upsert_stream_job_bridge_checkpoint(&fabrik_store::StreamJobCheckpointRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-mixed-fresh-stale".to_owned(),
+                run_id: "run-repair-stream-mixed-fresh-stale".to_owned(),
+                job_id: "job-repair-stream-mixed-fresh-stale".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-mixed-fresh-stale:run-repair-stream-mixed-fresh-stale:job-repair-stream-mixed-fresh-stale".to_owned(),
+                await_request_id: "stream-job-await:job-repair-stream-mixed-fresh-stale:hourly-rollup-ready:event-stale".to_owned(),
+                checkpoint_name: "hourly-rollup-ready".to_owned(),
+                checkpoint_sequence: Some(7),
+                status: fabrik_throughput::StreamJobCheckpointStatus::Reached.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(8),
+                reached_at: Some(now + chrono::Duration::seconds(1)),
+                output: Some(json!({"ready": false})),
+                accepted_at: None,
+                cancelled_at: None,
+                created_at: now,
+                updated_at: now + chrono::Duration::seconds(1),
+            })
+            .await?;
+        store
+            .upsert_stream_job_bridge_query(&StreamJobQueryRecord {
+                workflow_event_id: Uuid::now_v7(),
+                protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+                operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+                tenant_id: "tenant".to_owned(),
+                instance_id: "instance-repair-stream-mixed-fresh-stale".to_owned(),
+                run_id: "run-repair-stream-mixed-fresh-stale".to_owned(),
+                job_id: "job-repair-stream-mixed-fresh-stale".to_owned(),
+                handle_id: handle_id.clone(),
+                bridge_request_id: "stream-job-bridge:tenant:instance-repair-stream-mixed-fresh-stale:run-repair-stream-mixed-fresh-stale:job-repair-stream-mixed-fresh-stale".to_owned(),
+                query_id: "stream-job-query:job-repair-stream-mixed-fresh-stale:currentStats:event-fresh".to_owned(),
+                query_name: "currentStats".to_owned(),
+                query_args: Some(json!({"window": "1h"})),
+                consistency: fabrik_throughput::StreamJobQueryConsistency::Strong.as_str().to_owned(),
+                status: fabrik_throughput::StreamJobQueryStatus::Completed.as_str().to_owned(),
+                workflow_owner_epoch: Some(3),
+                stream_owner_epoch: Some(9),
+                output: Some(json!({"anomalies": 2})),
+                error: None,
+                requested_at: now + chrono::Duration::milliseconds(500),
+                completed_at: Some(now + chrono::Duration::seconds(2)),
+                accepted_at: None,
+                cancelled_at: None,
+                created_at: now + chrono::Duration::milliseconds(500),
+                updated_at: now + chrono::Duration::seconds(2),
+            })
+            .await?;
+
+        let pre_repair_ledger = store
+            .load_stream_job_bridge_ledger_for_handle(&handle_id)
+            .await?
+            .context("stream job bridge ledger should exist before repair")?;
+        assert_eq!(pre_repair_ledger.pending_checkpoint_repairs, 0);
+        assert_eq!(pre_repair_ledger.pending_query_repairs, 1);
+        assert_eq!(
+            pre_repair_ledger.pending_repairs(),
+            vec![
+                fabrik_throughput::StreamJobBridgeRepairKind::AcceptQuery,
+                fabrik_throughput::StreamJobBridgeRepairKind::AcceptTerminal,
+            ]
+        );
+
+        let repaired = crate::bridge::repair_pending_stream_v2_bridge(&app_state).await?;
+        assert_eq!(repaired, (0, 0, 0, 1, 0, 1));
+
+        let filter = WorkflowHistoryFilter::new(
+            "tenant",
+            "instance-repair-stream-mixed-fresh-stale",
+            "run-repair-stream-mixed-fresh-stale",
+        );
+        let query_event =
+            redpanda.wait_for_workflow_history_event(&filter, "StreamJobQueryCompleted").await?;
+        assert_eq!(
+            query_event.metadata.get("bridge_operation_kind").map(String::as_str),
+            Some(ThroughputBridgeOperationKind::StreamJob.as_str())
+        );
+        let terminal_event =
+            redpanda.wait_for_workflow_history_event(&filter, "StreamJobCompleted").await?;
+        assert_eq!(
+            terminal_event.metadata.get("bridge_operation_kind").map(String::as_str),
+            Some(ThroughputBridgeOperationKind::StreamJob.as_str())
+        );
+
+        let debug = app_state.debug.lock().expect("unified debug lock poisoned").clone();
+        assert_eq!(debug.repaired_bridge_stream_job_query_callbacks, 1);
+        assert_eq!(debug.repaired_bridge_stream_job_checkpoint_callbacks, 0);
+        assert_eq!(debug.repaired_bridge_stream_job_terminal_callbacks, 1);
+
+        fs::remove_dir_all(state_dir).ok();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_stream_job_checkpoint_callback_after_acceptance_is_noop() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = stream_job_artifact();
+        store.put_artifact("tenant", &artifact).await?;
+
+        let state_dir = std::env::temp_dir()
+            .join(format!("unified-runtime-stream-job-checkpoint-duplicate-{}", Uuid::now_v7()));
+        let app_state =
+            test_app_state(store.clone(), RuntimeInner::default(), state_dir.clone()).await;
+        let identity = WorkflowIdentity::new(
+            "tenant",
+            &artifact.definition_id,
+            artifact.definition_version,
+            artifact.artifact_hash.clone(),
+            "instance-stream-checkpoint-duplicate",
+            "run-stream-checkpoint-duplicate",
+            "unified-runtime-test",
+        );
+        let trigger = test_event(
+            &identity,
+            WorkflowEvent::WorkflowTriggered { input: json!({}) },
+            Utc::now(),
+        );
+        handle_trigger_event(&app_state, trigger).await?;
+
+        let handle = store
+            .list_stream_job_bridge_handles_for_run_page(
+                "tenant",
+                "instance-stream-checkpoint-duplicate",
+                "run-stream-checkpoint-duplicate",
+                10,
+                0,
+            )
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job bridge handle should exist")?;
+
+        let checkpoint = test_event(
+            &identity,
+            WorkflowEvent::StreamJobCheckpointReached {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                checkpoint_name: "hourly-rollup-ready".to_owned(),
+                checkpoint_sequence: 7,
+                output: Some(json!({"ready": true})),
+                stream_owner_epoch: Some(5),
+            },
+            Utc::now(),
+        );
+        handle_stream_job_checkpoint_event(&app_state, checkpoint).await?;
+
+        let accepted_once = store
+            .list_stream_job_bridge_checkpoints_for_handle_page(&handle.handle_id, 10, 0)
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job checkpoint should exist")?;
+        let first_accepted_at = accepted_once.accepted_at;
+        assert_eq!(
+            accepted_once.parsed_status(),
+            Some(fabrik_throughput::StreamJobCheckpointStatus::Accepted)
+        );
+        assert!(first_accepted_at.is_some());
+
+        let duplicate_checkpoint = test_event(
+            &identity,
+            WorkflowEvent::StreamJobCheckpointReached {
+                job_id: handle.job_id.clone(),
+                handle_id: handle.handle_id.clone(),
+                checkpoint_name: "hourly-rollup-ready".to_owned(),
+                checkpoint_sequence: 7,
+                output: Some(json!({"ready": false})),
+                stream_owner_epoch: Some(5),
+            },
+            Utc::now() + ChronoDuration::seconds(1),
+        );
+        handle_stream_job_checkpoint_event(&app_state, duplicate_checkpoint).await?;
+
+        let waiting = store
+            .get_instance("tenant", "instance-stream-checkpoint-duplicate")
+            .await?
+            .context("stream job instance should still exist")?;
+        assert_eq!(waiting.current_state.as_deref(), Some("await_terminal"));
+        assert_eq!(
+            waiting
+                .artifact_execution
+                .as_ref()
+                .and_then(|execution| execution.bindings.get("checkpoint"))
+                .cloned(),
+            Some(json!({"ready": true}))
+        );
+
+        let accepted_twice = store
+            .list_stream_job_bridge_checkpoints_for_handle_page(&handle.handle_id, 10, 0)
+            .await?
+            .into_iter()
+            .next()
+            .context("stream job checkpoint should exist")?;
+        assert_eq!(
+            accepted_twice.parsed_status(),
+            Some(fabrik_throughput::StreamJobCheckpointStatus::Accepted)
+        );
+        assert_eq!(accepted_twice.accepted_at, first_accepted_at);
+        assert_eq!(accepted_twice.output, Some(json!({"ready": true})));
 
         fs::remove_dir_all(state_dir).ok();
         Ok(())

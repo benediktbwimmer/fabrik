@@ -2,8 +2,9 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use fabrik_events::{EventEnvelope, WorkflowEvent};
 use fabrik_throughput::{
-    ADMISSION_POLICY_VERSION, ActivityExecutionCapabilities, StreamJobBridgeHandleStatus,
-    StreamJobCheckpointStatus, StreamJobQueryConsistency, StreamJobQueryStatus, StreamJobStatus,
+    ADMISSION_POLICY_VERSION, ActivityExecutionCapabilities, CompiledStreamJobArtifact,
+    StreamJobBridgeHandleStatus, StreamJobBridgeRepairKind, StreamJobCheckpointStatus,
+    StreamJobOriginKind, StreamJobQueryConsistency, StreamJobQueryStatus, StreamJobStatus,
     THROUGHPUT_BRIDGE_PROTOCOL_VERSION, ThroughputBackend, ThroughputBridgeOperationKind,
     ThroughputBridgeRepairKind, ThroughputBridgeState, ThroughputBridgeSubmissionStatus,
     ThroughputBridgeTerminalStatus, ThroughputChunkReport, ThroughputCommandEnvelope,
@@ -572,9 +573,12 @@ pub struct StreamJobBridgeHandleRecord {
     pub tenant_id: String,
     pub instance_id: String,
     pub run_id: String,
+    pub stream_instance_id: String,
+    pub stream_run_id: String,
     pub job_id: String,
     pub handle_id: String,
     pub bridge_request_id: String,
+    pub origin_kind: String,
     pub definition_id: String,
     pub definition_version: Option<u32>,
     pub artifact_hash: Option<String>,
@@ -597,6 +601,8 @@ pub struct StreamJobBridgeHandleRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+pub type StreamJobCallbackHandleRecord = StreamJobBridgeHandleRecord;
+
 impl StreamJobBridgeHandleRecord {
     pub fn parsed_operation_kind(&self) -> Option<ThroughputBridgeOperationKind> {
         ThroughputBridgeOperationKind::parse(&self.operation_kind)
@@ -606,12 +612,16 @@ impl StreamJobBridgeHandleRecord {
         StreamJobBridgeHandleStatus::parse(&self.status)
     }
 
-    pub fn next_repair(&self) -> Option<ThroughputBridgeRepairKind> {
+    pub fn parsed_origin_kind(&self) -> Option<StreamJobOriginKind> {
+        StreamJobOriginKind::parse(&self.origin_kind)
+    }
+
+    pub fn next_repair(&self) -> Option<StreamJobBridgeRepairKind> {
         if self.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal)
             && self.terminal_at.is_some()
             && self.workflow_accepted_at.is_none()
         {
-            Some(ThroughputBridgeRepairKind::AcceptStreamTerminal)
+            Some(StreamJobBridgeRepairKind::AcceptTerminal)
         } else {
             None
         }
@@ -643,6 +653,8 @@ pub struct StreamJobCheckpointRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+pub type StreamJobCallbackCheckpointRecord = StreamJobCheckpointRecord;
+
 impl StreamJobCheckpointRecord {
     pub fn parsed_operation_kind(&self) -> Option<ThroughputBridgeOperationKind> {
         ThroughputBridgeOperationKind::parse(&self.operation_kind)
@@ -652,12 +664,30 @@ impl StreamJobCheckpointRecord {
         StreamJobCheckpointStatus::parse(&self.status)
     }
 
-    pub fn next_repair(&self) -> Option<ThroughputBridgeRepairKind> {
+    pub fn next_repair(&self) -> Option<StreamJobBridgeRepairKind> {
         match self.parsed_status() {
             Some(StreamJobCheckpointStatus::Reached) if self.accepted_at.is_none() => {
-                Some(ThroughputBridgeRepairKind::AcceptStreamCheckpoint)
+                Some(StreamJobBridgeRepairKind::AcceptCheckpoint)
             }
             _ => None,
+        }
+    }
+
+    pub fn next_repair_for_handle_epoch(
+        &self,
+        handle_stream_owner_epoch: Option<u64>,
+    ) -> Option<StreamJobBridgeRepairKind> {
+        if self.is_stale_for_handle_epoch(handle_stream_owner_epoch) {
+            None
+        } else {
+            self.next_repair()
+        }
+    }
+
+    pub fn is_stale_for_handle_epoch(&self, handle_stream_owner_epoch: Option<u64>) -> bool {
+        match (self.stream_owner_epoch, handle_stream_owner_epoch) {
+            (Some(callback_epoch), Some(handle_epoch)) => callback_epoch < handle_epoch,
+            _ => false,
         }
     }
 }
@@ -690,6 +720,8 @@ pub struct StreamJobQueryRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+pub type StreamJobCallbackQueryRecord = StreamJobQueryRecord;
+
 impl StreamJobQueryRecord {
     pub fn parsed_operation_kind(&self) -> Option<ThroughputBridgeOperationKind> {
         ThroughputBridgeOperationKind::parse(&self.operation_kind)
@@ -703,14 +735,32 @@ impl StreamJobQueryRecord {
         StreamJobQueryConsistency::parse(&self.consistency)
     }
 
-    pub fn next_repair(&self) -> Option<ThroughputBridgeRepairKind> {
+    pub fn next_repair(&self) -> Option<StreamJobBridgeRepairKind> {
         match self.parsed_status() {
             Some(StreamJobQueryStatus::Completed | StreamJobQueryStatus::Failed)
                 if self.accepted_at.is_none() =>
             {
-                Some(ThroughputBridgeRepairKind::AcceptStreamQuery)
+                Some(StreamJobBridgeRepairKind::AcceptQuery)
             }
             _ => None,
+        }
+    }
+
+    pub fn next_repair_for_handle_epoch(
+        &self,
+        handle_stream_owner_epoch: Option<u64>,
+    ) -> Option<StreamJobBridgeRepairKind> {
+        if self.is_stale_for_handle_epoch(handle_stream_owner_epoch) {
+            None
+        } else {
+            self.next_repair()
+        }
+    }
+
+    pub fn is_stale_for_handle_epoch(&self, handle_stream_owner_epoch: Option<u64>) -> bool {
+        match (self.stream_owner_epoch, handle_stream_owner_epoch) {
+            (Some(callback_epoch), Some(handle_epoch)) => callback_epoch < handle_epoch,
+            _ => false,
         }
     }
 }
@@ -720,12 +770,15 @@ pub struct StreamJobRecord {
     pub tenant_id: String,
     pub instance_id: String,
     pub run_id: String,
+    pub stream_instance_id: String,
+    pub stream_run_id: String,
     pub job_id: String,
     pub handle_id: String,
     pub protocol_version: String,
     pub operation_kind: String,
     pub workflow_event_id: Uuid,
     pub bridge_request_id: String,
+    pub origin_kind: String,
     pub definition_id: String,
     pub definition_version: Option<u32>,
     pub artifact_hash: Option<String>,
@@ -763,6 +816,33 @@ impl StreamJobRecord {
     pub fn parsed_status(&self) -> Option<StreamJobStatus> {
         StreamJobStatus::parse(&self.status)
     }
+
+    pub fn parsed_origin_kind(&self) -> Option<StreamJobOriginKind> {
+        StreamJobOriginKind::parse(&self.origin_kind)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamJobViewRecord {
+    pub tenant_id: String,
+    pub instance_id: String,
+    pub run_id: String,
+    pub job_id: String,
+    pub handle_id: String,
+    pub view_name: String,
+    pub logical_key: String,
+    pub output: Value,
+    pub checkpoint_sequence: i64,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamJobViewProjectionSummaryRecord {
+    pub job_id: String,
+    pub view_name: String,
+    pub key_count: u64,
+    pub latest_checkpoint_sequence: Option<i64>,
+    pub latest_updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -805,6 +885,8 @@ pub struct StreamJobBridgeLedgerRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+pub type StreamJobCallbackLedgerRecord = StreamJobBridgeLedgerRecord;
+
 impl StreamJobBridgeLedgerRecord {
     pub fn parsed_operation_kind(&self) -> Option<ThroughputBridgeOperationKind> {
         ThroughputBridgeOperationKind::parse(&self.operation_kind)
@@ -822,24 +904,24 @@ impl StreamJobBridgeLedgerRecord {
         self.latest_query_consistency.as_deref().and_then(StreamJobQueryConsistency::parse)
     }
 
-    pub fn pending_repairs(&self) -> Vec<ThroughputBridgeRepairKind> {
+    pub fn pending_repairs(&self) -> Vec<StreamJobBridgeRepairKind> {
         let mut repairs = Vec::new();
         if self.pending_checkpoint_repairs > 0 {
-            repairs.push(ThroughputBridgeRepairKind::AcceptStreamCheckpoint);
+            repairs.push(StreamJobBridgeRepairKind::AcceptCheckpoint);
         }
         if self.pending_query_repairs > 0 {
-            repairs.push(ThroughputBridgeRepairKind::AcceptStreamQuery);
+            repairs.push(StreamJobBridgeRepairKind::AcceptQuery);
         }
         if self.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal)
             && self.terminal_at.is_some()
             && self.workflow_accepted_at.is_none()
         {
-            repairs.push(ThroughputBridgeRepairKind::AcceptStreamTerminal);
+            repairs.push(StreamJobBridgeRepairKind::AcceptTerminal);
         }
         repairs
     }
 
-    pub fn next_repair(&self) -> Option<ThroughputBridgeRepairKind> {
+    pub fn next_repair(&self) -> Option<StreamJobBridgeRepairKind> {
         self.pending_repairs().into_iter().next()
     }
 }
@@ -850,6 +932,8 @@ pub struct StreamJobBridgePruneSummary {
     pub pruned_checkpoints: u64,
     pub pruned_queries: u64,
 }
+
+pub type StreamJobCallbackPruneSummary = StreamJobBridgePruneSummary;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ThroughputReportLogEntry {
@@ -1014,6 +1098,7 @@ pub struct ThroughputProjectionChunkStateUpdate {
 pub enum ThroughputProjectionEvent {
     UpsertBatch { batch: WorkflowBulkBatchRecord },
     UpsertChunk { chunk: WorkflowBulkChunkRecord },
+    UpsertStreamJobView { view: StreamJobViewRecord },
     UpdateBatchState { update: ThroughputProjectionBatchStateUpdate },
     UpdateChunkState { update: ThroughputProjectionChunkStateUpdate },
 }
@@ -2393,6 +2478,16 @@ pub struct WorkflowArtifactSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamArtifactSummary {
+    pub tenant_id: String,
+    pub definition_id: String,
+    pub latest_version: u32,
+    pub active_version: Option<u32>,
+    pub version_count: u64,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResumeCoalescingMetrics {
     pub workflow_task_rows: u64,
     pub queued_resume_rows: u64,
@@ -2720,6 +2815,23 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize workflow_artifacts table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS stream_artifacts (
+                tenant_id TEXT NOT NULL,
+                definition_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                artifact JSONB NOT NULL,
+                PRIMARY KEY (tenant_id, definition_id, version)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize stream_artifacts table")?;
 
         sqlx::query(
             r#"
@@ -3284,12 +3396,15 @@ impl WorkflowStore {
                 tenant_id TEXT NOT NULL,
                 workflow_instance_id TEXT NOT NULL,
                 run_id TEXT NOT NULL,
+                stream_instance_id TEXT NOT NULL DEFAULT '',
+                stream_run_id TEXT NOT NULL DEFAULT '',
                 job_id TEXT NOT NULL,
                 handle_id TEXT NOT NULL,
                 protocol_version TEXT NOT NULL,
                 operation_kind TEXT NOT NULL,
                 workflow_event_id UUID NOT NULL,
                 bridge_request_id TEXT NOT NULL,
+                origin_kind TEXT NOT NULL DEFAULT 'workflow',
                 workflow_id TEXT NOT NULL,
                 workflow_version INTEGER,
                 artifact_hash TEXT,
@@ -3326,6 +3441,33 @@ impl WorkflowStore {
         .await
         .context("failed to initialize stream_jobs table")?;
 
+        sqlx::query("ALTER TABLE stream_jobs ADD COLUMN IF NOT EXISTS origin_kind TEXT NOT NULL DEFAULT 'workflow'")
+            .execute(&self.pool)
+            .await
+            .context("failed to add stream_jobs.origin_kind")?;
+        sqlx::query(
+            "ALTER TABLE stream_jobs ADD COLUMN IF NOT EXISTS stream_instance_id TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add stream_jobs.stream_instance_id")?;
+        sqlx::query(
+            "ALTER TABLE stream_jobs ADD COLUMN IF NOT EXISTS stream_run_id TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add stream_jobs.stream_run_id")?;
+        sqlx::query(
+            "UPDATE stream_jobs SET stream_instance_id = workflow_instance_id WHERE stream_instance_id = ''",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to backfill stream_jobs.stream_instance_id")?;
+        sqlx::query("UPDATE stream_jobs SET stream_run_id = run_id WHERE stream_run_id = ''")
+            .execute(&self.pool)
+            .await
+            .context("failed to backfill stream_jobs.stream_run_id")?;
+
         sqlx::query(
             r#"
             CREATE INDEX IF NOT EXISTS stream_jobs_run_created_idx
@@ -3348,6 +3490,52 @@ impl WorkflowStore {
 
         sqlx::query(
             r#"
+            CREATE TABLE IF NOT EXISTS stream_job_view_query (
+                tenant_id TEXT NOT NULL,
+                workflow_instance_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                job_id TEXT NOT NULL,
+                handle_id TEXT NOT NULL,
+                view_name TEXT NOT NULL,
+                logical_key TEXT NOT NULL,
+                output JSONB NOT NULL,
+                checkpoint_sequence BIGINT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (
+                    tenant_id,
+                    workflow_instance_id,
+                    run_id,
+                    job_id,
+                    view_name,
+                    logical_key
+                )
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize stream_job_view_query table")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS stream_job_view_query_handle_idx
+            ON stream_job_view_query (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                handle_id,
+                view_name,
+                updated_at,
+                logical_key
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize stream_job_view_query handle index")?;
+
+        sqlx::query(
+            r#"
             CREATE TABLE IF NOT EXISTS stream_job_bridge_handles (
                 workflow_event_id UUID NOT NULL PRIMARY KEY,
                 protocol_version TEXT NOT NULL,
@@ -3355,9 +3543,12 @@ impl WorkflowStore {
                 tenant_id TEXT NOT NULL,
                 workflow_instance_id TEXT NOT NULL,
                 run_id TEXT NOT NULL,
+                stream_instance_id TEXT NOT NULL DEFAULT '',
+                stream_run_id TEXT NOT NULL DEFAULT '',
                 job_id TEXT NOT NULL,
                 handle_id TEXT NOT NULL,
                 bridge_request_id TEXT NOT NULL,
+                origin_kind TEXT NOT NULL DEFAULT 'workflow',
                 workflow_id TEXT NOT NULL,
                 workflow_version INTEGER,
                 artifact_hash TEXT,
@@ -3386,6 +3577,35 @@ impl WorkflowStore {
         .execute(&self.pool)
         .await
         .context("failed to initialize stream_job_bridge_handles table")?;
+
+        sqlx::query("ALTER TABLE stream_job_bridge_handles ADD COLUMN IF NOT EXISTS origin_kind TEXT NOT NULL DEFAULT 'workflow'")
+            .execute(&self.pool)
+            .await
+            .context("failed to add stream_job_bridge_handles.origin_kind")?;
+        sqlx::query(
+            "ALTER TABLE stream_job_bridge_handles ADD COLUMN IF NOT EXISTS stream_instance_id TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add stream_job_bridge_handles.stream_instance_id")?;
+        sqlx::query(
+            "ALTER TABLE stream_job_bridge_handles ADD COLUMN IF NOT EXISTS stream_run_id TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to add stream_job_bridge_handles.stream_run_id")?;
+        sqlx::query(
+            "UPDATE stream_job_bridge_handles SET stream_instance_id = workflow_instance_id WHERE stream_instance_id = ''",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to backfill stream_job_bridge_handles.stream_instance_id")?;
+        sqlx::query(
+            "UPDATE stream_job_bridge_handles SET stream_run_id = run_id WHERE stream_run_id = ''",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to backfill stream_job_bridge_handles.stream_run_id")?;
 
         sqlx::query(
             r#"
@@ -4617,6 +4837,21 @@ impl WorkflowStore {
 
         sqlx::query(
             r#"
+            CREATE TABLE IF NOT EXISTS streams_projection_offsets (
+                projector_id TEXT NOT NULL,
+                partition_id INTEGER NOT NULL,
+                log_offset BIGINT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (projector_id, partition_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to initialize streams_projection_offsets table")?;
+
+        sqlx::query(
+            r#"
             CREATE TABLE IF NOT EXISTS workflow_updates (
                 tenant_id TEXT NOT NULL,
                 workflow_instance_id TEXT NOT NULL,
@@ -5682,6 +5917,126 @@ impl WorkflowStore {
         .transpose()
     }
 
+    pub async fn put_stream_artifact(
+        &self,
+        tenant_id: &str,
+        artifact: &CompiledStreamJobArtifact,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO stream_artifacts (
+                tenant_id,
+                definition_id,
+                version,
+                artifact
+            )
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (tenant_id, definition_id, version)
+            DO UPDATE SET
+                is_active = TRUE,
+                artifact = EXCLUDED.artifact
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(&artifact.definition_id)
+        .bind(
+            i32::try_from(artifact.definition_version)
+                .context("stream artifact version exceeds i32")?,
+        )
+        .bind(Json(artifact))
+        .execute(&self.pool)
+        .await
+        .context("failed to store stream artifact")?;
+
+        Ok(())
+    }
+
+    pub async fn get_latest_stream_artifact(
+        &self,
+        tenant_id: &str,
+        definition_id: &str,
+    ) -> Result<Option<CompiledStreamJobArtifact>> {
+        let row = sqlx::query(
+            r#"
+            SELECT artifact
+            FROM stream_artifacts
+            WHERE tenant_id = $1 AND definition_id = $2 AND is_active = TRUE
+            ORDER BY version DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(definition_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load latest stream artifact")?;
+
+        row.map(|row| {
+            row.try_get::<Json<CompiledStreamJobArtifact>, _>("artifact")
+                .map(|value| value.0)
+                .context("failed to decode stream artifact")
+        })
+        .transpose()
+    }
+
+    pub async fn get_stream_artifact_version(
+        &self,
+        tenant_id: &str,
+        definition_id: &str,
+        version: u32,
+    ) -> Result<Option<CompiledStreamJobArtifact>> {
+        let row = sqlx::query(
+            r#"
+            SELECT artifact
+            FROM stream_artifacts
+            WHERE tenant_id = $1 AND definition_id = $2 AND version = $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(definition_id)
+        .bind(i32::try_from(version).context("stream artifact version exceeds i32")?)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load stream artifact version")?;
+
+        row.map(|row| {
+            row.try_get::<Json<CompiledStreamJobArtifact>, _>("artifact")
+                .map(|value| value.0)
+                .context("failed to decode stream artifact")
+        })
+        .transpose()
+    }
+
+    pub async fn get_latest_stream_artifact_for_job_name(
+        &self,
+        tenant_id: &str,
+        job_name: &str,
+    ) -> Result<Option<CompiledStreamJobArtifact>> {
+        let row = sqlx::query(
+            r#"
+            SELECT artifact
+            FROM stream_artifacts
+            WHERE tenant_id = $1
+              AND is_active = TRUE
+              AND artifact->'job'->>'name' = $2
+            ORDER BY version DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(job_name)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load latest stream artifact by job name")?;
+
+        row.map(|row| {
+            row.try_get::<Json<CompiledStreamJobArtifact>, _>("artifact")
+                .map(|value| value.0)
+                .context("failed to decode stream artifact")
+        })
+        .transpose()
+    }
+
     pub async fn upsert_instance(&self, state: &WorkflowInstanceState) -> Result<()> {
         let mut persisted_state = state.clone();
         persisted_state.compact_for_persistence();
@@ -6263,6 +6618,93 @@ impl WorkflowStore {
         .fetch_one(&self.pool)
         .await
         .context("failed to count workflow artifact summaries")?;
+
+        Ok(count as u64)
+    }
+
+    pub async fn list_stream_artifact_summaries(
+        &self,
+        tenant_id: &str,
+        query: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StreamArtifactSummary>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                tenant_id,
+                definition_id,
+                MAX(version) AS latest_version,
+                MAX(version) FILTER (WHERE is_active) AS active_version,
+                COUNT(*) AS version_count,
+                MAX(created_at) AS updated_at
+            FROM stream_artifacts
+            WHERE tenant_id = $1
+              AND ($2::text IS NULL OR definition_id ILIKE '%' || $2 || '%')
+            GROUP BY tenant_id, definition_id
+            ORDER BY definition_id ASC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(query)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list stream artifact summaries")?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(StreamArtifactSummary {
+                    tenant_id: row
+                        .try_get("tenant_id")
+                        .context("stream artifact summary tenant_id missing")?,
+                    definition_id: row
+                        .try_get("definition_id")
+                        .context("stream artifact summary definition_id missing")?,
+                    latest_version: row
+                        .try_get::<i32, _>("latest_version")
+                        .context("stream artifact summary latest_version missing")?
+                        as u32,
+                    active_version: row
+                        .try_get::<Option<i32>, _>("active_version")
+                        .context("stream artifact summary active_version missing")?
+                        .map(|value| value as u32),
+                    version_count: row
+                        .try_get::<i64, _>("version_count")
+                        .context("stream artifact summary version_count missing")?
+                        as u64,
+                    updated_at: row
+                        .try_get("updated_at")
+                        .context("stream artifact summary updated_at missing")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn count_stream_artifact_summaries(
+        &self,
+        tenant_id: &str,
+        query: Option<&str>,
+    ) -> Result<u64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM (
+                SELECT definition_id
+                FROM stream_artifacts
+                WHERE tenant_id = $1
+                  AND ($2::text IS NULL OR definition_id ILIKE '%' || $2 || '%')
+                GROUP BY definition_id
+            ) artifacts
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(query)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to count stream artifact summaries")?;
 
         Ok(count as u64)
     }
@@ -15564,12 +16006,15 @@ impl WorkflowStore {
                 tenant_id,
                 workflow_instance_id,
                 run_id,
+                stream_instance_id,
+                stream_run_id,
                 job_id,
                 handle_id,
                 protocol_version,
                 operation_kind,
                 workflow_event_id,
                 bridge_request_id,
+                origin_kind,
                 workflow_id,
                 workflow_version,
                 artifact_hash,
@@ -15600,14 +16045,17 @@ impl WorkflowStore {
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
                 $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32,
-                $33, $34, $35, $36
+                $33, $34, $35, $36, $37, $38, $39
             )
             ON CONFLICT (tenant_id, workflow_instance_id, run_id, job_id) DO UPDATE SET
+                stream_instance_id = EXCLUDED.stream_instance_id,
+                stream_run_id = EXCLUDED.stream_run_id,
                 handle_id = EXCLUDED.handle_id,
                 protocol_version = EXCLUDED.protocol_version,
                 operation_kind = EXCLUDED.operation_kind,
                 workflow_event_id = EXCLUDED.workflow_event_id,
                 bridge_request_id = EXCLUDED.bridge_request_id,
+                origin_kind = EXCLUDED.origin_kind,
                 workflow_id = EXCLUDED.workflow_id,
                 workflow_version = EXCLUDED.workflow_version,
                 artifact_hash = EXCLUDED.artifact_hash,
@@ -15639,12 +16087,15 @@ impl WorkflowStore {
         .bind(&job.tenant_id)
         .bind(&job.instance_id)
         .bind(&job.run_id)
+        .bind(&job.stream_instance_id)
+        .bind(&job.stream_run_id)
         .bind(&job.job_id)
         .bind(&job.handle_id)
         .bind(&job.protocol_version)
         .bind(&job.operation_kind)
         .bind(job.workflow_event_id)
         .bind(&job.bridge_request_id)
+        .bind(&job.origin_kind)
         .bind(&job.definition_id)
         .bind(job.definition_version.map(|value| value as i32))
         .bind(&job.artifact_hash)
@@ -15705,6 +16156,33 @@ impl WorkflowStore {
         row.map(Self::decode_stream_job_row).transpose()
     }
 
+    pub async fn get_stream_job_by_stream_identity(
+        &self,
+        tenant_id: &str,
+        stream_instance_id: &str,
+        stream_run_id: &str,
+        job_id: &str,
+    ) -> Result<Option<StreamJobRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_jobs
+            WHERE tenant_id = $1
+              AND stream_instance_id = $2
+              AND stream_run_id = $3
+              AND job_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(stream_instance_id)
+        .bind(stream_run_id)
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load stream job by stream identity")?;
+        row.map(Self::decode_stream_job_row).transpose()
+    }
+
     pub async fn list_stream_jobs_for_run_page(
         &self,
         tenant_id: &str,
@@ -15736,6 +16214,322 @@ impl WorkflowStore {
         rows.into_iter().map(Self::decode_stream_job_row).collect()
     }
 
+    pub async fn list_stream_jobs_for_stream_run_page(
+        &self,
+        tenant_id: &str,
+        stream_instance_id: &str,
+        stream_run_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StreamJobRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_jobs
+            WHERE tenant_id = $1
+              AND stream_instance_id = $2
+              AND stream_run_id = $3
+            ORDER BY created_at ASC, job_id ASC
+            LIMIT $4
+            OFFSET $5
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(stream_instance_id)
+        .bind(stream_run_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list stream jobs by stream identity")?;
+        rows.into_iter().map(Self::decode_stream_job_row).collect()
+    }
+
+    pub async fn list_stream_jobs_for_tenant_page(
+        &self,
+        tenant_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StreamJobRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_jobs
+            WHERE tenant_id = $1
+            ORDER BY created_at ASC, job_id ASC
+            LIMIT $2
+            OFFSET $3
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list tenant stream jobs")?;
+        rows.into_iter().map(Self::decode_stream_job_row).collect()
+    }
+
+    pub async fn upsert_stream_job_view_query(&self, view: &StreamJobViewRecord) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO stream_job_view_query (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                job_id,
+                handle_id,
+                view_name,
+                logical_key,
+                output,
+                checkpoint_sequence,
+                updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+            )
+            ON CONFLICT (
+                tenant_id,
+                workflow_instance_id,
+                run_id,
+                job_id,
+                view_name,
+                logical_key
+            ) DO UPDATE SET
+                handle_id = EXCLUDED.handle_id,
+                output = EXCLUDED.output,
+                checkpoint_sequence = EXCLUDED.checkpoint_sequence,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(&view.tenant_id)
+        .bind(&view.instance_id)
+        .bind(&view.run_id)
+        .bind(&view.job_id)
+        .bind(&view.handle_id)
+        .bind(&view.view_name)
+        .bind(&view.logical_key)
+        .bind(Json(&view.output))
+        .bind(view.checkpoint_sequence)
+        .bind(view.updated_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert stream job view query record")?;
+        Ok(())
+    }
+
+    pub async fn get_stream_job_view_query(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        job_id: &str,
+        view_name: &str,
+        logical_key: &str,
+    ) -> Result<Option<StreamJobViewRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_job_view_query
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND job_id = $4
+              AND view_name = $5
+              AND logical_key = $6
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(job_id)
+        .bind(view_name)
+        .bind(logical_key)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load stream job view query record")?;
+        row.map(Self::decode_stream_job_view_row).transpose()
+    }
+
+    pub async fn count_stream_job_view_query_keys(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        job_id: &str,
+        view_name: &str,
+    ) -> Result<u64> {
+        let count = sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM stream_job_view_query
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND job_id = $4
+              AND view_name = $5
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(job_id)
+        .bind(view_name)
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to count stream job view query keys")?;
+        Ok(count as u64)
+    }
+
+    pub async fn list_stream_job_view_query_page(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        job_id: &str,
+        view_name: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StreamJobViewRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_job_view_query
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND job_id = $4
+              AND view_name = $5
+            ORDER BY logical_key ASC
+            LIMIT $6
+            OFFSET $7
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(job_id)
+        .bind(view_name)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list stream job view query page")?;
+        rows.into_iter().map(Self::decode_stream_job_view_row).collect()
+    }
+
+    pub async fn list_stream_job_view_projection_summaries(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        job_id: &str,
+    ) -> Result<Vec<StreamJobViewProjectionSummaryRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                job_id,
+                view_name,
+                COUNT(*)::BIGINT AS key_count,
+                MAX(checkpoint_sequence) AS latest_checkpoint_sequence,
+                MAX(updated_at) AS latest_updated_at
+            FROM stream_job_view_query
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND job_id = $4
+            GROUP BY job_id, view_name
+            ORDER BY view_name ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(job_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list stream job view projection summaries")?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(StreamJobViewProjectionSummaryRecord {
+                    job_id: row
+                        .try_get("job_id")
+                        .context("stream job view projection summary job_id missing")?,
+                    view_name: row
+                        .try_get("view_name")
+                        .context("stream job view projection summary view_name missing")?,
+                    key_count: row
+                        .try_get::<i64, _>("key_count")
+                        .context("stream job view projection summary key_count missing")?
+                        as u64,
+                    latest_checkpoint_sequence: row.try_get("latest_checkpoint_sequence").context(
+                        "stream job view projection summary latest_checkpoint_sequence missing",
+                    )?,
+                    latest_updated_at: row
+                        .try_get("latest_updated_at")
+                        .context("stream job view projection summary latest_updated_at missing")?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn list_stream_job_view_projection_summaries_for_jobs(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        job_ids: &[String],
+    ) -> Result<Vec<StreamJobViewProjectionSummaryRecord>> {
+        if job_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                job_id,
+                view_name,
+                COUNT(*)::BIGINT AS key_count,
+                MAX(checkpoint_sequence) AS latest_checkpoint_sequence,
+                MAX(updated_at) AS latest_updated_at
+            FROM stream_job_view_query
+            WHERE tenant_id = $1
+              AND workflow_instance_id = $2
+              AND run_id = $3
+              AND job_id = ANY($4)
+            GROUP BY job_id, view_name
+            ORDER BY job_id ASC, view_name ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(instance_id)
+        .bind(run_id)
+        .bind(job_ids)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list stream job view projection summaries for jobs")?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(StreamJobViewProjectionSummaryRecord {
+                    job_id: row
+                        .try_get("job_id")
+                        .context("stream job view projection summary job_id missing")?,
+                    view_name: row
+                        .try_get("view_name")
+                        .context("stream job view projection summary view_name missing")?,
+                    key_count: row
+                        .try_get::<i64, _>("key_count")
+                        .context("stream job view projection summary key_count missing")?
+                        as u64,
+                    latest_checkpoint_sequence: row.try_get("latest_checkpoint_sequence").context(
+                        "stream job view projection summary latest_checkpoint_sequence missing",
+                    )?,
+                    latest_updated_at: row
+                        .try_get("latest_updated_at")
+                        .context("stream job view projection summary latest_updated_at missing")?,
+                })
+            })
+            .collect()
+    }
+
     pub async fn upsert_stream_job_bridge_handle(
         &self,
         handle: &StreamJobBridgeHandleRecord,
@@ -15749,9 +16543,12 @@ impl WorkflowStore {
                 tenant_id,
                 workflow_instance_id,
                 run_id,
+                stream_instance_id,
+                stream_run_id,
                 job_id,
                 handle_id,
                 bridge_request_id,
+                origin_kind,
                 workflow_id,
                 workflow_version,
                 artifact_hash,
@@ -15774,7 +16571,7 @@ impl WorkflowStore {
                 updated_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
-                $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29
+                $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32
             )
             ON CONFLICT (workflow_event_id) DO UPDATE SET
                 protocol_version = EXCLUDED.protocol_version,
@@ -15782,9 +16579,12 @@ impl WorkflowStore {
                 tenant_id = EXCLUDED.tenant_id,
                 workflow_instance_id = EXCLUDED.workflow_instance_id,
                 run_id = EXCLUDED.run_id,
+                stream_instance_id = EXCLUDED.stream_instance_id,
+                stream_run_id = EXCLUDED.stream_run_id,
                 job_id = EXCLUDED.job_id,
                 handle_id = EXCLUDED.handle_id,
                 bridge_request_id = EXCLUDED.bridge_request_id,
+                origin_kind = EXCLUDED.origin_kind,
                 workflow_id = EXCLUDED.workflow_id,
                 workflow_version = EXCLUDED.workflow_version,
                 artifact_hash = EXCLUDED.artifact_hash,
@@ -15812,9 +16612,12 @@ impl WorkflowStore {
         .bind(&handle.tenant_id)
         .bind(&handle.instance_id)
         .bind(&handle.run_id)
+        .bind(&handle.stream_instance_id)
+        .bind(&handle.stream_run_id)
         .bind(&handle.job_id)
         .bind(&handle.handle_id)
         .bind(&handle.bridge_request_id)
+        .bind(&handle.origin_kind)
         .bind(&handle.definition_id)
         .bind(handle.definition_version.map(|value| value as i32))
         .bind(&handle.artifact_hash)
@@ -15839,6 +16642,13 @@ impl WorkflowStore {
         .await
         .context("failed to upsert stream job bridge handle")?;
         Ok(())
+    }
+
+    pub async fn upsert_stream_job_callback_handle(
+        &self,
+        handle: &StreamJobCallbackHandleRecord,
+    ) -> Result<()> {
+        self.upsert_stream_job_bridge_handle(handle).await
     }
 
     pub async fn get_stream_job_bridge_handle(
@@ -15868,6 +16678,59 @@ impl WorkflowStore {
         row.map(Self::decode_stream_job_bridge_handle_row).transpose()
     }
 
+    pub async fn get_stream_job_callback_handle(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        job_id: &str,
+    ) -> Result<Option<StreamJobCallbackHandleRecord>> {
+        self.get_stream_job_bridge_handle(tenant_id, instance_id, run_id, job_id).await
+    }
+
+    pub async fn get_stream_job_bridge_handle_by_stream_identity(
+        &self,
+        tenant_id: &str,
+        stream_instance_id: &str,
+        stream_run_id: &str,
+        job_id: &str,
+    ) -> Result<Option<StreamJobBridgeHandleRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT *
+            FROM stream_job_bridge_handles
+            WHERE tenant_id = $1
+              AND stream_instance_id = $2
+              AND stream_run_id = $3
+              AND job_id = $4
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(stream_instance_id)
+        .bind(stream_run_id)
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to load stream job bridge handle by stream identity")?;
+        row.map(Self::decode_stream_job_bridge_handle_row).transpose()
+    }
+
+    pub async fn get_stream_job_callback_handle_by_stream_identity(
+        &self,
+        tenant_id: &str,
+        stream_instance_id: &str,
+        stream_run_id: &str,
+        job_id: &str,
+    ) -> Result<Option<StreamJobCallbackHandleRecord>> {
+        self.get_stream_job_bridge_handle_by_stream_identity(
+            tenant_id,
+            stream_instance_id,
+            stream_run_id,
+            job_id,
+        )
+        .await
+    }
+
     pub async fn get_stream_job_bridge_handle_by_handle_id(
         &self,
         handle_id: &str,
@@ -15884,6 +16747,13 @@ impl WorkflowStore {
         .await
         .context("failed to load stream job bridge handle by handle id")?;
         row.map(Self::decode_stream_job_bridge_handle_row).transpose()
+    }
+
+    pub async fn get_stream_job_callback_handle_by_handle_id(
+        &self,
+        handle_id: &str,
+    ) -> Result<Option<StreamJobCallbackHandleRecord>> {
+        self.get_stream_job_bridge_handle_by_handle_id(handle_id).await
     }
 
     pub async fn list_stream_job_bridge_handles_for_run_page(
@@ -15915,6 +16785,24 @@ impl WorkflowStore {
         .await
         .context("failed to list stream job bridge handles")?;
         rows.into_iter().map(Self::decode_stream_job_bridge_handle_row).collect()
+    }
+
+    pub async fn list_stream_job_callback_handles_for_run_page(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StreamJobCallbackHandleRecord>> {
+        self.list_stream_job_bridge_handles_for_run_page(
+            tenant_id,
+            instance_id,
+            run_id,
+            limit,
+            offset,
+        )
+        .await
     }
 
     pub async fn upsert_stream_job_bridge_checkpoint(
@@ -15998,6 +16886,13 @@ impl WorkflowStore {
         Ok(())
     }
 
+    pub async fn upsert_stream_job_callback_checkpoint(
+        &self,
+        checkpoint: &StreamJobCallbackCheckpointRecord,
+    ) -> Result<()> {
+        self.upsert_stream_job_bridge_checkpoint(checkpoint).await
+    }
+
     pub async fn get_stream_job_bridge_checkpoint(
         &self,
         await_request_id: &str,
@@ -16014,6 +16909,13 @@ impl WorkflowStore {
         .await
         .context("failed to load stream job bridge checkpoint")?;
         row.map(Self::decode_stream_job_bridge_checkpoint_row).transpose()
+    }
+
+    pub async fn get_stream_job_callback_checkpoint(
+        &self,
+        await_request_id: &str,
+    ) -> Result<Option<StreamJobCallbackCheckpointRecord>> {
+        self.get_stream_job_bridge_checkpoint(await_request_id).await
     }
 
     pub async fn list_stream_job_bridge_checkpoints_for_handle_page(
@@ -16039,6 +16941,15 @@ impl WorkflowStore {
         .await
         .context("failed to list stream job bridge checkpoints")?;
         rows.into_iter().map(Self::decode_stream_job_bridge_checkpoint_row).collect()
+    }
+
+    pub async fn list_stream_job_callback_checkpoints_for_handle_page(
+        &self,
+        handle_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StreamJobCallbackCheckpointRecord>> {
+        self.list_stream_job_bridge_checkpoints_for_handle_page(handle_id, limit, offset).await
     }
 
     pub async fn upsert_stream_job_bridge_query(
@@ -16131,6 +17042,13 @@ impl WorkflowStore {
         Ok(())
     }
 
+    pub async fn upsert_stream_job_callback_query(
+        &self,
+        query_record: &StreamJobCallbackQueryRecord,
+    ) -> Result<()> {
+        self.upsert_stream_job_bridge_query(query_record).await
+    }
+
     pub async fn get_stream_job_bridge_query(
         &self,
         query_id: &str,
@@ -16147,6 +17065,13 @@ impl WorkflowStore {
         .await
         .context("failed to load stream job bridge query")?;
         row.map(Self::decode_stream_job_bridge_query_row).transpose()
+    }
+
+    pub async fn get_stream_job_callback_query(
+        &self,
+        query_id: &str,
+    ) -> Result<Option<StreamJobCallbackQueryRecord>> {
+        self.get_stream_job_bridge_query(query_id).await
     }
 
     pub async fn list_stream_job_bridge_queries_for_handle_page(
@@ -16172,6 +17097,15 @@ impl WorkflowStore {
         .await
         .context("failed to list stream job bridge queries")?;
         rows.into_iter().map(Self::decode_stream_job_bridge_query_row).collect()
+    }
+
+    pub async fn list_stream_job_callback_queries_for_handle_page(
+        &self,
+        handle_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StreamJobCallbackQueryRecord>> {
+        self.list_stream_job_bridge_queries_for_handle_page(handle_id, limit, offset).await
     }
 
     pub async fn load_stream_job_bridge_ledger_for_handle(
@@ -16225,6 +17159,11 @@ impl WorkflowStore {
                         WHERE status = 'reached'
                           AND accepted_at IS NULL
                           AND cancelled_at IS NULL
+                          AND (
+                              c.stream_owner_epoch IS NULL
+                              OR h.stream_owner_epoch IS NULL
+                              OR c.stream_owner_epoch >= h.stream_owner_epoch
+                          )
                     ) AS pending_checkpoint_repairs
                 FROM stream_job_bridge_checkpoints c
                 WHERE c.handle_id = h.handle_id
@@ -16236,6 +17175,11 @@ impl WorkflowStore {
                         WHERE status IN ('completed', 'failed')
                           AND accepted_at IS NULL
                           AND cancelled_at IS NULL
+                          AND (
+                              q.stream_owner_epoch IS NULL
+                              OR h.stream_owner_epoch IS NULL
+                              OR q.stream_owner_epoch >= h.stream_owner_epoch
+                          )
                     ) AS pending_query_repairs
                 FROM stream_job_bridge_queries q
                 WHERE q.handle_id = h.handle_id
@@ -16263,6 +17207,13 @@ impl WorkflowStore {
         .await
         .context("failed to load stream job bridge ledger for handle")?;
         row.map(Self::decode_stream_job_bridge_ledger_row).transpose()
+    }
+
+    pub async fn load_stream_job_callback_ledger_for_handle(
+        &self,
+        handle_id: &str,
+    ) -> Result<Option<StreamJobCallbackLedgerRecord>> {
+        self.load_stream_job_bridge_ledger_for_handle(handle_id).await
     }
 
     pub async fn list_stream_job_bridge_ledgers_for_run_page(
@@ -16320,6 +17271,11 @@ impl WorkflowStore {
                         WHERE status = 'reached'
                           AND accepted_at IS NULL
                           AND cancelled_at IS NULL
+                          AND (
+                              c.stream_owner_epoch IS NULL
+                              OR h.stream_owner_epoch IS NULL
+                              OR c.stream_owner_epoch >= h.stream_owner_epoch
+                          )
                     ) AS pending_checkpoint_repairs
                 FROM stream_job_bridge_checkpoints c
                 WHERE c.handle_id = h.handle_id
@@ -16331,6 +17287,11 @@ impl WorkflowStore {
                         WHERE status IN ('completed', 'failed')
                           AND accepted_at IS NULL
                           AND cancelled_at IS NULL
+                          AND (
+                              q.stream_owner_epoch IS NULL
+                              OR h.stream_owner_epoch IS NULL
+                              OR q.stream_owner_epoch >= h.stream_owner_epoch
+                          )
                     ) AS pending_query_repairs
                 FROM stream_job_bridge_queries q
                 WHERE q.handle_id = h.handle_id
@@ -16367,6 +17328,258 @@ impl WorkflowStore {
         .await
         .context("failed to list stream job bridge ledgers")?;
         rows.into_iter().map(Self::decode_stream_job_bridge_ledger_row).collect()
+    }
+
+    pub async fn list_stream_job_bridge_ledgers_for_handle_ids(
+        &self,
+        tenant_id: &str,
+        handle_ids: &[String],
+    ) -> Result<Vec<StreamJobBridgeLedgerRecord>> {
+        if handle_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                h.workflow_event_id,
+                COALESCE(NULLIF(h.protocol_version, ''), '1') AS protocol_version,
+                COALESCE(NULLIF(h.operation_kind, ''), 'stream_job') AS operation_kind,
+                h.tenant_id,
+                h.workflow_instance_id,
+                h.run_id,
+                h.job_id,
+                h.handle_id,
+                h.bridge_request_id,
+                h.workflow_id,
+                h.workflow_version,
+                h.artifact_hash,
+                h.job_name,
+                h.input_ref,
+                h.config_ref,
+                h.status,
+                h.workflow_owner_epoch,
+                h.stream_owner_epoch,
+                h.cancellation_requested_at,
+                h.cancellation_reason,
+                h.terminal_event_id,
+                h.terminal_at,
+                h.workflow_accepted_at,
+                COALESCE(checkpoints.checkpoint_count, 0) AS checkpoint_count,
+                COALESCE(checkpoints.pending_checkpoint_repairs, 0) AS pending_checkpoint_repairs,
+                COALESCE(queries.query_count, 0) AS query_count,
+                COALESCE(queries.pending_query_repairs, 0) AS pending_query_repairs,
+                latest_query.query_id AS latest_query_id,
+                latest_query.query_name AS latest_query_name,
+                latest_query.status AS latest_query_status,
+                latest_query.consistency AS latest_query_consistency,
+                latest_query.requested_at AS latest_query_requested_at,
+                latest_query.completed_at AS latest_query_completed_at,
+                latest_query.accepted_at AS latest_query_accepted_at,
+                h.created_at,
+                h.updated_at
+            FROM stream_job_bridge_handles h
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) AS checkpoint_count,
+                    COUNT(*) FILTER (
+                        WHERE status = 'reached'
+                          AND accepted_at IS NULL
+                          AND cancelled_at IS NULL
+                          AND (
+                              c.stream_owner_epoch IS NULL
+                              OR h.stream_owner_epoch IS NULL
+                              OR c.stream_owner_epoch >= h.stream_owner_epoch
+                          )
+                    ) AS pending_checkpoint_repairs
+                FROM stream_job_bridge_checkpoints c
+                WHERE c.handle_id = h.handle_id
+            ) checkpoints ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) AS query_count,
+                    COUNT(*) FILTER (
+                        WHERE status IN ('completed', 'failed')
+                          AND accepted_at IS NULL
+                          AND cancelled_at IS NULL
+                          AND (
+                              q.stream_owner_epoch IS NULL
+                              OR h.stream_owner_epoch IS NULL
+                              OR q.stream_owner_epoch >= h.stream_owner_epoch
+                          )
+                    ) AS pending_query_repairs
+                FROM stream_job_bridge_queries q
+                WHERE q.handle_id = h.handle_id
+            ) queries ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    q.query_id,
+                    q.query_name,
+                    q.status,
+                    q.consistency,
+                    q.requested_at,
+                    q.completed_at,
+                    q.accepted_at
+                FROM stream_job_bridge_queries q
+                WHERE q.handle_id = h.handle_id
+                ORDER BY COALESCE(q.accepted_at, q.completed_at, q.requested_at) DESC,
+                         q.query_id DESC
+                LIMIT 1
+            ) latest_query ON TRUE
+            WHERE h.tenant_id = $1
+              AND h.handle_id = ANY($2)
+            ORDER BY h.created_at ASC, h.job_id ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(handle_ids)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list stream job bridge ledgers for handles")?;
+        rows.into_iter().map(Self::decode_stream_job_bridge_ledger_row).collect()
+    }
+
+    pub async fn list_stream_job_callback_ledgers_for_handle_ids(
+        &self,
+        tenant_id: &str,
+        handle_ids: &[String],
+    ) -> Result<Vec<StreamJobCallbackLedgerRecord>> {
+        self.list_stream_job_bridge_ledgers_for_handle_ids(tenant_id, handle_ids).await
+    }
+
+    pub async fn list_stream_job_callback_ledgers_for_run_page(
+        &self,
+        tenant_id: &str,
+        instance_id: &str,
+        run_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<StreamJobCallbackLedgerRecord>> {
+        self.list_stream_job_bridge_ledgers_for_run_page(
+            tenant_id,
+            instance_id,
+            run_id,
+            limit,
+            offset,
+        )
+        .await
+    }
+
+    pub async fn list_pending_stream_job_bridge_repairs(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<StreamJobBridgeLedgerRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                h.workflow_event_id,
+                COALESCE(NULLIF(h.protocol_version, ''), '1') AS protocol_version,
+                COALESCE(NULLIF(h.operation_kind, ''), 'stream_job') AS operation_kind,
+                h.tenant_id,
+                h.workflow_instance_id,
+                h.run_id,
+                h.job_id,
+                h.handle_id,
+                h.bridge_request_id,
+                h.workflow_id,
+                h.workflow_version,
+                h.artifact_hash,
+                h.job_name,
+                h.input_ref,
+                h.config_ref,
+                h.status,
+                h.workflow_owner_epoch,
+                h.stream_owner_epoch,
+                h.cancellation_requested_at,
+                h.cancellation_reason,
+                h.terminal_event_id,
+                h.terminal_at,
+                h.workflow_accepted_at,
+                COALESCE(checkpoints.checkpoint_count, 0) AS checkpoint_count,
+                COALESCE(checkpoints.pending_checkpoint_repairs, 0) AS pending_checkpoint_repairs,
+                COALESCE(queries.query_count, 0) AS query_count,
+                COALESCE(queries.pending_query_repairs, 0) AS pending_query_repairs,
+                latest_query.query_id AS latest_query_id,
+                latest_query.query_name AS latest_query_name,
+                latest_query.status AS latest_query_status,
+                latest_query.consistency AS latest_query_consistency,
+                latest_query.requested_at AS latest_query_requested_at,
+                latest_query.completed_at AS latest_query_completed_at,
+                latest_query.accepted_at AS latest_query_accepted_at,
+                h.created_at,
+                h.updated_at
+            FROM stream_job_bridge_handles h
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) AS checkpoint_count,
+                    COUNT(*) FILTER (
+                        WHERE status = 'reached'
+                          AND accepted_at IS NULL
+                          AND cancelled_at IS NULL
+                          AND (
+                              c.stream_owner_epoch IS NULL
+                              OR h.stream_owner_epoch IS NULL
+                              OR c.stream_owner_epoch >= h.stream_owner_epoch
+                          )
+                    ) AS pending_checkpoint_repairs
+                FROM stream_job_bridge_checkpoints c
+                WHERE c.handle_id = h.handle_id
+            ) checkpoints ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) AS query_count,
+                    COUNT(*) FILTER (
+                        WHERE status IN ('completed', 'failed')
+                          AND accepted_at IS NULL
+                          AND cancelled_at IS NULL
+                          AND (
+                              q.stream_owner_epoch IS NULL
+                              OR h.stream_owner_epoch IS NULL
+                              OR q.stream_owner_epoch >= h.stream_owner_epoch
+                          )
+                    ) AS pending_query_repairs
+                FROM stream_job_bridge_queries q
+                WHERE q.handle_id = h.handle_id
+            ) queries ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    q.query_id,
+                    q.query_name,
+                    q.status,
+                    q.consistency,
+                    q.requested_at,
+                    q.completed_at,
+                    q.accepted_at
+                FROM stream_job_bridge_queries q
+                WHERE q.handle_id = h.handle_id
+                ORDER BY COALESCE(q.accepted_at, q.completed_at, q.requested_at) DESC,
+                         q.query_id DESC
+                LIMIT 1
+            ) latest_query ON TRUE
+            WHERE (
+                COALESCE(checkpoints.pending_checkpoint_repairs, 0) > 0
+                OR COALESCE(queries.pending_query_repairs, 0) > 0
+                OR (
+                    h.status IN ('completed', 'failed', 'cancelled')
+                    AND h.terminal_at IS NOT NULL
+                    AND h.workflow_accepted_at IS NULL
+                )
+            )
+            ORDER BY COALESCE(h.terminal_at, h.updated_at, h.created_at) ASC, h.handle_id ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list pending stream job bridge repairs")?;
+        rows.into_iter().map(Self::decode_stream_job_bridge_ledger_row).collect()
+    }
+
+    pub async fn list_pending_stream_job_callback_repairs(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<StreamJobCallbackLedgerRecord>> {
+        self.list_pending_stream_job_bridge_repairs(limit).await
     }
 
     pub async fn prune_stream_job_bridge_retention(
@@ -16420,18 +17633,31 @@ impl WorkflowStore {
         Ok(StreamJobBridgePruneSummary { pruned_handles, pruned_checkpoints, pruned_queries })
     }
 
+    pub async fn prune_stream_job_callback_retention(
+        &self,
+        accepted_before: DateTime<Utc>,
+    ) -> Result<StreamJobCallbackPruneSummary> {
+        self.prune_stream_job_bridge_retention(accepted_before).await
+    }
+
     pub async fn list_pending_stream_job_query_repairs(
         &self,
         limit: i64,
     ) -> Result<Vec<StreamJobQueryRecord>> {
         let rows = sqlx::query(
             r#"
-            SELECT *
-            FROM stream_job_bridge_queries
-            WHERE status IN ('completed', 'failed')
-              AND accepted_at IS NULL
-              AND cancelled_at IS NULL
-            ORDER BY completed_at ASC NULLS LAST, created_at ASC, query_id ASC
+            SELECT q.*
+            FROM stream_job_bridge_queries q
+            JOIN stream_job_bridge_handles h ON h.handle_id = q.handle_id
+            WHERE q.status IN ('completed', 'failed')
+              AND q.accepted_at IS NULL
+              AND q.cancelled_at IS NULL
+              AND (
+                  q.stream_owner_epoch IS NULL
+                  OR h.stream_owner_epoch IS NULL
+                  OR q.stream_owner_epoch >= h.stream_owner_epoch
+              )
+            ORDER BY q.completed_at ASC NULLS LAST, q.created_at ASC, q.query_id ASC
             LIMIT $1
             "#,
         )
@@ -16442,18 +17668,31 @@ impl WorkflowStore {
         rows.into_iter().map(Self::decode_stream_job_bridge_query_row).collect()
     }
 
+    pub async fn list_pending_stream_job_query_callback_repairs(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<StreamJobCallbackQueryRecord>> {
+        self.list_pending_stream_job_query_repairs(limit).await
+    }
+
     pub async fn list_pending_stream_job_checkpoint_repairs(
         &self,
         limit: i64,
     ) -> Result<Vec<StreamJobCheckpointRecord>> {
         let rows = sqlx::query(
             r#"
-            SELECT *
-            FROM stream_job_bridge_checkpoints
-            WHERE status = 'reached'
-              AND accepted_at IS NULL
-              AND cancelled_at IS NULL
-            ORDER BY reached_at ASC NULLS LAST, created_at ASC, await_request_id ASC
+            SELECT c.*
+            FROM stream_job_bridge_checkpoints c
+            JOIN stream_job_bridge_handles h ON h.handle_id = c.handle_id
+            WHERE c.status = 'reached'
+              AND c.accepted_at IS NULL
+              AND c.cancelled_at IS NULL
+              AND (
+                  c.stream_owner_epoch IS NULL
+                  OR h.stream_owner_epoch IS NULL
+                  OR c.stream_owner_epoch >= h.stream_owner_epoch
+              )
+            ORDER BY c.reached_at ASC NULLS LAST, c.created_at ASC, c.await_request_id ASC
             LIMIT $1
             "#,
         )
@@ -16462,6 +17701,13 @@ impl WorkflowStore {
         .await
         .context("failed to list pending stream job checkpoint repairs")?;
         rows.into_iter().map(Self::decode_stream_job_bridge_checkpoint_row).collect()
+    }
+
+    pub async fn list_pending_stream_job_checkpoint_callback_repairs(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<StreamJobCallbackCheckpointRecord>> {
+        self.list_pending_stream_job_checkpoint_repairs(limit).await
     }
 
     pub async fn list_pending_stream_job_terminal_repairs(
@@ -16484,6 +17730,13 @@ impl WorkflowStore {
         .await
         .context("failed to list pending stream job terminal repairs")?;
         rows.into_iter().map(Self::decode_stream_job_bridge_handle_row).collect()
+    }
+
+    pub async fn list_pending_stream_job_terminal_callback_repairs(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<StreamJobCallbackHandleRecord>> {
+        self.list_pending_stream_job_terminal_repairs(limit).await
     }
 
     pub async fn upsert_throughput_run(&self, run: &ThroughputRunRecord) -> Result<()> {
@@ -18942,6 +20195,56 @@ impl WorkflowStore {
         Ok(())
     }
 
+    pub async fn load_streams_projection_offsets(
+        &self,
+        projector_id: &str,
+    ) -> Result<std::collections::HashMap<i32, i64>> {
+        let rows = sqlx::query_as::<_, (i32, i64)>(
+            r#"
+            SELECT partition_id, log_offset
+            FROM streams_projection_offsets
+            WHERE projector_id = $1
+            "#,
+        )
+        .bind(projector_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to load streams projection offsets")?;
+        Ok(rows.into_iter().collect())
+    }
+
+    pub async fn commit_streams_projection_offset(
+        &self,
+        projector_id: &str,
+        partition_id: i32,
+        offset: i64,
+        updated_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO streams_projection_offsets (
+                projector_id,
+                partition_id,
+                log_offset,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (projector_id, partition_id)
+            DO UPDATE SET
+                log_offset = EXCLUDED.log_offset,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(projector_id)
+        .bind(partition_id)
+        .bind(offset)
+        .bind(updated_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to commit streams projection offset")?;
+        Ok(())
+    }
+
     pub async fn count_bulk_chunks_for_batch_query_view(
         &self,
         tenant_id: &str,
@@ -21250,11 +22553,20 @@ impl WorkflowStore {
                 .try_get("workflow_instance_id")
                 .context("stream job handle workflow_instance_id missing")?,
             run_id: row.try_get("run_id").context("stream job handle run_id missing")?,
+            stream_instance_id: row
+                .try_get("stream_instance_id")
+                .context("stream job handle stream_instance_id missing")?,
+            stream_run_id: row
+                .try_get("stream_run_id")
+                .context("stream job handle stream_run_id missing")?,
             job_id: row.try_get("job_id").context("stream job handle job_id missing")?,
             handle_id: row.try_get("handle_id").context("stream job handle handle_id missing")?,
             bridge_request_id: row
                 .try_get("bridge_request_id")
                 .context("stream job handle bridge_request_id missing")?,
+            origin_kind: row
+                .try_get("origin_kind")
+                .context("stream job handle origin_kind missing")?,
             definition_id: row
                 .try_get("workflow_id")
                 .context("stream job handle workflow_id missing")?,
@@ -21323,6 +22635,30 @@ impl WorkflowStore {
             updated_at: row
                 .try_get("updated_at")
                 .context("stream job handle updated_at missing")?,
+        })
+    }
+
+    fn decode_stream_job_view_row(row: sqlx::postgres::PgRow) -> Result<StreamJobViewRecord> {
+        Ok(StreamJobViewRecord {
+            tenant_id: row.try_get("tenant_id").context("stream job view tenant_id missing")?,
+            instance_id: row
+                .try_get("workflow_instance_id")
+                .context("stream job view workflow_instance_id missing")?,
+            run_id: row.try_get("run_id").context("stream job view run_id missing")?,
+            job_id: row.try_get("job_id").context("stream job view job_id missing")?,
+            handle_id: row.try_get("handle_id").context("stream job view handle_id missing")?,
+            view_name: row.try_get("view_name").context("stream job view view_name missing")?,
+            logical_key: row
+                .try_get("logical_key")
+                .context("stream job view logical_key missing")?,
+            output: row
+                .try_get::<Json<Value>, _>("output")
+                .context("stream job view output missing")?
+                .0,
+            checkpoint_sequence: row
+                .try_get("checkpoint_sequence")
+                .context("stream job view checkpoint_sequence missing")?,
+            updated_at: row.try_get("updated_at").context("stream job view updated_at missing")?,
         })
     }
 
@@ -21467,6 +22803,12 @@ impl WorkflowStore {
                 .try_get("workflow_instance_id")
                 .context("stream job workflow_instance_id missing")?,
             run_id: row.try_get("run_id").context("stream job run_id missing")?,
+            stream_instance_id: row
+                .try_get("stream_instance_id")
+                .context("stream job stream_instance_id missing")?,
+            stream_run_id: row
+                .try_get("stream_run_id")
+                .context("stream job stream_run_id missing")?,
             job_id: row.try_get("job_id").context("stream job job_id missing")?,
             handle_id: row.try_get("handle_id").context("stream job handle_id missing")?,
             protocol_version: row
@@ -21481,6 +22823,7 @@ impl WorkflowStore {
             bridge_request_id: row
                 .try_get("bridge_request_id")
                 .context("stream job bridge_request_id missing")?,
+            origin_kind: row.try_get("origin_kind").context("stream job origin_kind missing")?,
             definition_id: row.try_get("workflow_id").context("stream job workflow_id missing")?,
             definition_version: row
                 .try_get::<Option<i32>, _>("workflow_version")
@@ -22158,6 +23501,83 @@ mod tests {
                 non_cancellable_states: BTreeSet::new(),
             },
         )
+    }
+
+    fn stream_artifact_for_tests(
+        definition_id: &str,
+        version: u32,
+        checkpoint_name: &str,
+    ) -> CompiledStreamJobArtifact {
+        let mut artifact = CompiledStreamJobArtifact {
+            definition_id: definition_id.to_owned(),
+            definition_version: version,
+            compiler_version: "stream-test".to_owned(),
+            source_language: "typescript".to_owned(),
+            runtime_contract: fabrik_throughput::STREAMS_KERNEL_V1_CONTRACT.to_owned(),
+            entrypoint: fabrik_throughput::StreamArtifactEntrypoint {
+                module: "stream-job.ts".to_owned(),
+                export: "keyedRollupJob".to_owned(),
+            },
+            source_files: vec!["stream-job.ts".to_owned()],
+            source_map: BTreeMap::from([(
+                "job".to_owned(),
+                fabrik_throughput::StreamArtifactSourceLocation {
+                    file: "stream-job.ts".to_owned(),
+                    line: 1,
+                    column: 1,
+                },
+            )]),
+            job: fabrik_throughput::CompiledStreamJob {
+                name: "keyed-rollup".to_owned(),
+                runtime: "keyed_rollup".to_owned(),
+                source: fabrik_throughput::CompiledStreamSource {
+                    kind: "bounded_input".to_owned(),
+                    binding: None,
+                },
+                key_by: Some("accountId".to_owned()),
+                operators: vec![
+                    fabrik_throughput::CompiledStreamOperator {
+                        kind: "reduce".to_owned(),
+                        name: Some("sum-account-totals".to_owned()),
+                        config: Some(json!({
+                            "reducer": "sum",
+                            "value_field": "amount",
+                            "output_field": "totalAmount"
+                        })),
+                    },
+                    fabrik_throughput::CompiledStreamOperator {
+                        kind: "emit_checkpoint".to_owned(),
+                        name: Some(checkpoint_name.to_owned()),
+                        config: Some(json!({"sequence": 1})),
+                    },
+                ],
+                checkpoint_policy: Some(json!({
+                    "kind": "named_checkpoints",
+                    "checkpoints": [
+                        {"name": checkpoint_name, "delivery": "workflow_awaitable", "sequence": 1}
+                    ]
+                })),
+                views: vec![fabrik_throughput::CompiledStreamView {
+                    name: "accountTotals".to_owned(),
+                    consistency: "strong".to_owned(),
+                    query_mode: "by_key".to_owned(),
+                    key_field: Some("accountId".to_owned()),
+                    value_fields: vec![
+                        "accountId".to_owned(),
+                        "totalAmount".to_owned(),
+                        "asOfCheckpoint".to_owned(),
+                    ],
+                }],
+                queries: vec![fabrik_throughput::CompiledStreamQuery {
+                    name: "accountTotals".to_owned(),
+                    view_name: "accountTotals".to_owned(),
+                    consistency: "strong".to_owned(),
+                }],
+            },
+            artifact_hash: String::new(),
+        };
+        artifact.artifact_hash = artifact.hash();
+        artifact
     }
 
     fn signal_event(
@@ -24676,9 +26096,12 @@ mod tests {
             tenant_id: "tenant-a".to_owned(),
             instance_id: "instance-a".to_owned(),
             run_id: "run-a".to_owned(),
+            stream_instance_id: "instance-a".to_owned(),
+            stream_run_id: "run-a".to_owned(),
             job_id: "job-a".to_owned(),
             handle_id: "stream-job-handle:tenant-a:instance-a:run-a:job-a".to_owned(),
             bridge_request_id: "stream-job-bridge:tenant-a:instance-a:run-a:job-a".to_owned(),
+            origin_kind: StreamJobOriginKind::Workflow.as_str().to_owned(),
             definition_id: "demo".to_owned(),
             definition_version: Some(1),
             artifact_hash: Some("artifact-a".to_owned()),
@@ -24806,10 +26229,7 @@ mod tests {
             store.list_stream_job_bridge_queries_for_handle_page(&handle.handle_id, 10, 0).await?;
         assert_eq!(listed_queries.len(), 1);
         assert_eq!(listed_queries[0].query_id, query.query_id);
-        assert_eq!(
-            listed_queries[0].next_repair(),
-            Some(ThroughputBridgeRepairKind::AcceptStreamQuery)
-        );
+        assert_eq!(listed_queries[0].next_repair(), Some(StreamJobBridgeRepairKind::AcceptQuery));
 
         let pending_query_repairs = store.list_pending_stream_job_query_repairs(10).await?;
         assert_eq!(pending_query_repairs.len(), 1);
@@ -24835,13 +26255,144 @@ mod tests {
         assert_eq!(ledger.query_count, 1);
         assert_eq!(ledger.pending_checkpoint_repairs, 1);
         assert_eq!(ledger.pending_query_repairs, 1);
-        assert_eq!(ledger.next_repair(), Some(ThroughputBridgeRepairKind::AcceptStreamCheckpoint));
+        assert_eq!(ledger.next_repair(), Some(StreamJobBridgeRepairKind::AcceptCheckpoint));
 
         let listed_ledgers = store
             .list_stream_job_bridge_ledgers_for_run_page("tenant-a", "instance-a", "run-a", 10, 0)
             .await?;
         assert_eq!(listed_ledgers.len(), 1);
         assert_eq!(listed_ledgers[0].handle_id, handle.handle_id);
+
+        let pending_ledgers = store.list_pending_stream_job_bridge_repairs(10).await?;
+        assert_eq!(pending_ledgers.len(), 1);
+        assert_eq!(pending_ledgers[0].handle_id, handle.handle_id);
+        assert_eq!(
+            pending_ledgers[0].pending_repairs(),
+            vec![
+                StreamJobBridgeRepairKind::AcceptCheckpoint,
+                StreamJobBridgeRepairKind::AcceptQuery,
+            ]
+        );
+
+        let ledgers_by_handle = store
+            .list_stream_job_bridge_ledgers_for_handle_ids("tenant-a", &[handle.handle_id.clone()])
+            .await?;
+        assert_eq!(ledgers_by_handle.len(), 1);
+        assert_eq!(ledgers_by_handle[0].handle_id, handle.handle_id);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_stream_job_callback_debt_is_excluded_from_pending_repairs() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let now = Utc::now();
+        let handle = StreamJobBridgeHandleRecord {
+            workflow_event_id: Uuid::now_v7(),
+            protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "instance-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            stream_instance_id: "instance-a".to_owned(),
+            stream_run_id: "run-a".to_owned(),
+            job_id: "job-stale".to_owned(),
+            handle_id: "stream-job-handle:tenant-a:instance-a:run-a:job-stale".to_owned(),
+            bridge_request_id: "stream-job-bridge:tenant-a:instance-a:run-a:job-stale".to_owned(),
+            origin_kind: StreamJobOriginKind::Workflow.as_str().to_owned(),
+            definition_id: "demo".to_owned(),
+            definition_version: Some(1),
+            artifact_hash: Some("artifact-a".to_owned()),
+            job_name: "fraud-detector".to_owned(),
+            input_ref: "topic:payments".to_owned(),
+            config_ref: Some("config:fraud-detector:v1".to_owned()),
+            checkpoint_policy: None,
+            view_definitions: None,
+            status: StreamJobBridgeHandleStatus::Running.as_str().to_owned(),
+            workflow_owner_epoch: Some(3),
+            stream_owner_epoch: Some(9),
+            cancellation_requested_at: None,
+            cancellation_reason: None,
+            terminal_event_id: None,
+            terminal_at: None,
+            workflow_accepted_at: None,
+            terminal_output: None,
+            terminal_error: None,
+            created_at: now,
+            updated_at: now,
+        };
+        store.upsert_stream_job_bridge_handle(&handle).await?;
+
+        let stale_checkpoint = StreamJobCheckpointRecord {
+            workflow_event_id: Uuid::now_v7(),
+            protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "instance-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            job_id: "job-stale".to_owned(),
+            handle_id: handle.handle_id.clone(),
+            bridge_request_id: handle.bridge_request_id.clone(),
+            await_request_id: "stream-job-await:job-stale:hourly-rollup-ready:event-a".to_owned(),
+            checkpoint_name: "hourly-rollup-ready".to_owned(),
+            checkpoint_sequence: Some(7),
+            status: StreamJobCheckpointStatus::Reached.as_str().to_owned(),
+            workflow_owner_epoch: Some(3),
+            stream_owner_epoch: Some(8),
+            reached_at: Some(now),
+            output: Some(json!({"ready": true})),
+            accepted_at: None,
+            cancelled_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        store.upsert_stream_job_bridge_checkpoint(&stale_checkpoint).await?;
+
+        let stale_query = StreamJobQueryRecord {
+            workflow_event_id: Uuid::now_v7(),
+            protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
+            operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
+            tenant_id: "tenant-a".to_owned(),
+            instance_id: "instance-a".to_owned(),
+            run_id: "run-a".to_owned(),
+            job_id: "job-stale".to_owned(),
+            handle_id: handle.handle_id.clone(),
+            bridge_request_id: handle.bridge_request_id.clone(),
+            query_id: "stream-job-query:job-stale:currentStats:event-a".to_owned(),
+            query_name: "currentStats".to_owned(),
+            query_args: Some(json!({"window": "1h"})),
+            consistency: StreamJobQueryConsistency::Strong.as_str().to_owned(),
+            status: StreamJobQueryStatus::Completed.as_str().to_owned(),
+            workflow_owner_epoch: Some(3),
+            stream_owner_epoch: Some(8),
+            output: Some(json!({"anomalies": 2})),
+            error: None,
+            requested_at: now,
+            completed_at: Some(now + chrono::Duration::seconds(1)),
+            accepted_at: None,
+            cancelled_at: None,
+            created_at: now,
+            updated_at: now + chrono::Duration::seconds(1),
+        };
+        store.upsert_stream_job_bridge_query(&stale_query).await?;
+
+        let ledger = store
+            .load_stream_job_bridge_ledger_for_handle(&handle.handle_id)
+            .await?
+            .context("stale stream job bridge ledger should exist")?;
+        assert_eq!(ledger.pending_checkpoint_repairs, 0);
+        assert_eq!(ledger.pending_query_repairs, 0);
+        assert_eq!(ledger.pending_repairs(), Vec::<StreamJobBridgeRepairKind>::new());
+
+        let pending_queries = store.list_pending_stream_job_query_repairs(10).await?;
+        assert!(pending_queries.is_empty());
+        let pending_checkpoints = store.list_pending_stream_job_checkpoint_repairs(10).await?;
+        assert!(pending_checkpoints.is_empty());
+        let pending_ledgers = store.list_pending_stream_job_bridge_repairs(10).await?;
+        assert!(pending_ledgers.is_empty());
 
         Ok(())
     }
@@ -24860,9 +26411,12 @@ mod tests {
             tenant_id: "tenant-a".to_owned(),
             instance_id: "instance-a".to_owned(),
             run_id: "run-a".to_owned(),
+            stream_instance_id: "instance-a".to_owned(),
+            stream_run_id: "run-a".to_owned(),
             job_id: "job-prune".to_owned(),
             handle_id: "stream-job-handle:tenant-a:instance-a:run-a:job-prune".to_owned(),
             bridge_request_id: "stream-job-bridge:tenant-a:instance-a:run-a:job-prune".to_owned(),
+            origin_kind: StreamJobOriginKind::Workflow.as_str().to_owned(),
             definition_id: "demo".to_owned(),
             definition_version: Some(1),
             artifact_hash: Some("artifact-a".to_owned()),
@@ -24989,12 +26543,15 @@ mod tests {
             tenant_id: "tenant-a".to_owned(),
             instance_id: "instance-a".to_owned(),
             run_id: "run-a".to_owned(),
+            stream_instance_id: "instance-a".to_owned(),
+            stream_run_id: "run-a".to_owned(),
             job_id: "job-a".to_owned(),
             handle_id: "stream-job-handle:tenant-a:instance-a:run-a:job-a".to_owned(),
             protocol_version: THROUGHPUT_BRIDGE_PROTOCOL_VERSION.to_owned(),
             operation_kind: ThroughputBridgeOperationKind::StreamJob.as_str().to_owned(),
             workflow_event_id: Uuid::now_v7(),
             bridge_request_id: "stream-job-bridge:tenant-a:instance-a:run-a:job-a".to_owned(),
+            origin_kind: StreamJobOriginKind::Workflow.as_str().to_owned(),
             definition_id: "demo".to_owned(),
             definition_version: Some(1),
             artifact_hash: Some("artifact-a".to_owned()),
@@ -25038,6 +26595,85 @@ mod tests {
             store.list_stream_jobs_for_run_page("tenant-a", "instance-a", "run-a", 10, 0).await?;
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].job_id, "job-a");
+        let tenant_listed = store.list_stream_jobs_for_tenant_page("tenant-a", 10, 0).await?;
+        assert_eq!(tenant_listed.len(), 1);
+        assert_eq!(tenant_listed[0].job_id, "job-a");
+
+        store
+            .upsert_stream_job_view_query(&StreamJobViewRecord {
+                tenant_id: "tenant-a".to_owned(),
+                instance_id: "instance-a".to_owned(),
+                run_id: "run-a".to_owned(),
+                job_id: "job-a".to_owned(),
+                handle_id: job.handle_id.clone(),
+                view_name: "accountTotals".to_owned(),
+                logical_key: "acct_1".to_owned(),
+                output: json!({"accountId": "acct_1", "totalAmount": 42}),
+                checkpoint_sequence: 7,
+                updated_at: now + chrono::Duration::seconds(3),
+            })
+            .await?;
+        let view = store
+            .get_stream_job_view_query(
+                "tenant-a",
+                "instance-a",
+                "run-a",
+                "job-a",
+                "accountTotals",
+                "acct_1",
+            )
+            .await?
+            .context("stream job view query record should exist")?;
+        assert_eq!(view.checkpoint_sequence, 7);
+        assert_eq!(view.output["totalAmount"], 42);
+        let summaries = store
+            .list_stream_job_view_projection_summaries("tenant-a", "instance-a", "run-a", "job-a")
+            .await?;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].job_id, "job-a");
+        assert_eq!(summaries[0].view_name, "accountTotals");
+        assert_eq!(summaries[0].key_count, 1);
+        assert_eq!(summaries[0].latest_checkpoint_sequence, Some(7));
+        assert_eq!(summaries[0].latest_updated_at, Some(now + chrono::Duration::seconds(3)));
+        let batch_summaries = store
+            .list_stream_job_view_projection_summaries_for_jobs(
+                "tenant-a",
+                "instance-a",
+                "run-a",
+                &["job-a".to_owned()],
+            )
+            .await?;
+        assert_eq!(batch_summaries, summaries);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_artifacts_round_trip() -> Result<()> {
+        let Some(postgres) = TestPostgres::start()? else {
+            return Ok(());
+        };
+        let store = postgres.connect_store().await?;
+        let artifact = stream_artifact_for_tests("payments-rollup", 3, "hourly-rollup-ready");
+        store.put_stream_artifact("tenant-a", &artifact).await?;
+
+        let latest = store
+            .get_latest_stream_artifact("tenant-a", "payments-rollup")
+            .await?
+            .context("stream artifact should exist")?;
+        assert_eq!(latest, artifact);
+
+        let versioned = store
+            .get_stream_artifact_version("tenant-a", "payments-rollup", 3)
+            .await?
+            .context("stream artifact version should exist")?;
+        assert_eq!(versioned.artifact_hash, artifact.artifact_hash);
+        assert_eq!(versioned.job.name, "keyed-rollup");
+
+        let summaries = store.list_stream_artifact_summaries("tenant-a", None, 10, 0).await?;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].definition_id, "payments-rollup");
+        assert_eq!(summaries[0].latest_version, 3);
+        assert_eq!(store.count_stream_artifact_summaries("tenant-a", None).await?, 1);
         Ok(())
     }
 

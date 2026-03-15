@@ -5,6 +5,7 @@
 This document defines the target runtime contract for the internal stream subsystem that powers `stream-v2` today and future `Fabrik Streams` execution later.
 
 It is intentionally below the workflow-facing contract in [stream-jobs.md](/Users/bene/code/fabrik/docs/spec/stream-jobs.md) and alongside the bridge contract in [streams-bridge.md](/Users/bene/code/fabrik/docs/spec/streams-bridge.md).
+The first concrete compiler/runtime slice that implements this model is frozen in [streams-kernel-v1.md](/Users/bene/code/fabrik/docs/spec/streams-kernel-v1.md).
 
 ## Purpose
 
@@ -18,6 +19,8 @@ The runtime model must support:
 - strong owner-routed reads
 - eventual projected reads
 - workflow interop through the bridge without collapsing stream semantics into workflow semantics
+
+The authoritative storage and durability details for that model are frozen separately in [streams-state-model.md](/Users/bene/code/fabrik/docs/spec/streams-state-model.md).
 
 ## Scope
 

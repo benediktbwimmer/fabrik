@@ -11,7 +11,9 @@ use fabrik_broker::{JsonTopicConfig, build_json_consumer_from_offsets, decode_js
 use fabrik_config::{HttpServiceConfig, PostgresConfig, QueryRuntimeConfig, RedpandaConfig};
 use fabrik_service::{ServiceInfo, default_router, init_tracing, serve};
 use fabrik_store::{ThroughputProjectionEvent, WorkflowStore};
-use fabrik_throughput::{PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind};
+use fabrik_throughput::{
+    PayloadHandle, PayloadStore, PayloadStoreConfig, PayloadStoreKind, StreamsProjectionEvent,
+};
 use futures_util::StreamExt;
 use serde::Serialize;
 use tracing::error;
@@ -22,21 +24,27 @@ const STREAMS_PROJECTOR_SERVICE_NAME: &str = "streams-projector";
 const STREAMS_PROJECTOR_DEBUG_ROUTE: &str = "/debug/streams-projector";
 const LEGACY_THROUGHPUT_PROJECTOR_DEBUG_ROUTE: &str = "/debug/throughput-projector";
 const LEGACY_THROUGHPUT_PROJECTOR_ID: &str = "throughput-projector";
+const STREAMS_PROJECTOR_ID: &str = "streams-projector";
 
 #[derive(Clone)]
 struct AppState {
     store: WorkflowStore,
     payload_store: PayloadStore,
-    projector_id: String,
+    throughput_projector_id: String,
+    streams_projector_id: String,
     debug: Arc<Mutex<ProjectorDebugState>>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
 struct ProjectorDebugState {
     applied_events: u64,
+    throughput_applied_events: u64,
+    streams_applied_events: u64,
     apply_failures: u64,
     manifest_writes: u64,
     last_applied_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_throughput_applied_at: Option<chrono::DateTime<chrono::Utc>>,
+    last_streams_applied_at: Option<chrono::DateTime<chrono::Utc>>,
     last_failure: Option<String>,
 }
 
@@ -44,7 +52,19 @@ struct ProjectorDebugState {
 struct BufferedProjectionRecord {
     partition_id: i32,
     offset: i64,
-    event: ThroughputProjectionEvent,
+    event: BufferedProjectionEvent,
+}
+
+#[derive(Debug)]
+enum BufferedProjectionEvent {
+    Throughput(ThroughputProjectionEvent),
+    Streams(StreamsProjectionEvent),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectionPlane {
+    Throughput,
+    Streams,
 }
 
 #[tokio::main]
@@ -62,23 +82,38 @@ async fn main() -> Result<()> {
     let store = WorkflowStore::connect(&postgres.url).await?;
     store.init().await?;
     let payload_store = PayloadStore::from_config(build_payload_store_config(&query)).await?;
-    let projector_id = LEGACY_THROUGHPUT_PROJECTOR_ID.to_owned();
     let debug = Arc::new(Mutex::new(ProjectorDebugState::default()));
     let state = AppState {
         store: store.clone(),
         payload_store,
-        projector_id: projector_id.clone(),
+        throughput_projector_id: LEGACY_THROUGHPUT_PROJECTOR_ID.to_owned(),
+        streams_projector_id: STREAMS_PROJECTOR_ID.to_owned(),
         debug: debug.clone(),
     };
 
+    let throughput_config = JsonTopicConfig::new(
+        redpanda.brokers.clone(),
+        redpanda.throughput_projections_topic,
+        redpanda.throughput_partitions,
+    );
+    let streams_config = JsonTopicConfig::new(
+        redpanda.brokers,
+        redpanda.streams_projections_topic,
+        redpanda.throughput_partitions,
+    );
+
     tokio::spawn(run_projection_consumer(
         state.clone(),
-        JsonTopicConfig::new(
-            redpanda.brokers,
-            redpanda.throughput_projections_topic,
-            redpanda.throughput_partitions,
-        ),
+        throughput_config.clone(),
+        ProjectionPlane::Throughput,
     ));
+    if streams_config.topic_name != throughput_config.topic_name {
+        tokio::spawn(run_projection_consumer(
+            state.clone(),
+            streams_config,
+            ProjectionPlane::Streams,
+        ));
+    }
 
     let app = default_router::<AppState>(ServiceInfo::new(
         config.name,
@@ -97,21 +132,36 @@ async fn get_debug(
     Json(state.debug.lock().expect("streams projector debug lock poisoned").clone())
 }
 
-async fn run_projection_consumer(state: AppState, config: JsonTopicConfig) {
+fn projector_id_for_plane<'a>(state: &'a AppState, plane: ProjectionPlane) -> &'a str {
+    match plane {
+        ProjectionPlane::Throughput => &state.throughput_projector_id,
+        ProjectionPlane::Streams => &state.streams_projector_id,
+    }
+}
+
+async fn run_projection_consumer(state: AppState, config: JsonTopicConfig, plane: ProjectionPlane) {
     loop {
-        let offsets =
-            match state.store.load_throughput_projection_offsets(&state.projector_id).await {
-                Ok(offsets) => offsets,
-                Err(error) => {
-                    error!(error = %error, "failed to load streams projection offsets");
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    continue;
-                }
-            };
+        let projector_id = projector_id_for_plane(&state, plane);
+        let offsets_result = match plane {
+            ProjectionPlane::Throughput => {
+                state.store.load_throughput_projection_offsets(projector_id).await
+            }
+            ProjectionPlane::Streams => {
+                state.store.load_streams_projection_offsets(projector_id).await
+            }
+        };
+        let offsets = match offsets_result {
+            Ok(offsets) => offsets,
+            Err(error) => {
+                error!(error = %error, "failed to load streams projection offsets");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
         let start_offsets = next_unread_offsets(&offsets);
         let mut consumer = match build_json_consumer_from_offsets(
             &config,
-            &state.projector_id,
+            projector_id,
             &start_offsets,
             &config.all_partition_ids(),
         )
@@ -125,7 +175,7 @@ async fn run_projection_consumer(state: AppState, config: JsonTopicConfig) {
             }
         };
         while let Some(message) = consumer.next().await {
-            let Some(first_record) = decode_projection_record(message) else {
+            let Some(first_record) = decode_projection_record(message, plane) else {
                 break;
             };
             let mut batch = vec![first_record];
@@ -141,7 +191,7 @@ async fn run_projection_consumer(state: AppState, config: JsonTopicConfig) {
                 else {
                     break;
                 };
-                let Some(record) = decode_projection_record(message) else {
+                let Some(record) = decode_projection_record(message, plane) else {
                     break;
                 };
                 batch.push(record);
@@ -157,19 +207,32 @@ async fn run_projection_consumer(state: AppState, config: JsonTopicConfig) {
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 break;
             }
-            if let Err(error) = commit_projection_batch_offsets(&state, &batch).await {
+            if let Err(error) = commit_projection_batch_offsets(&state, &batch, plane).await {
                 error!(error = %error, "failed to commit streams projection offset");
                 break;
             }
             let mut debug = state.debug.lock().expect("streams projector debug lock poisoned");
             debug.applied_events = debug.applied_events.saturating_add(batch.len() as u64);
             debug.last_applied_at = Some(Utc::now());
+            match plane {
+                ProjectionPlane::Throughput => {
+                    debug.throughput_applied_events =
+                        debug.throughput_applied_events.saturating_add(batch.len() as u64);
+                    debug.last_throughput_applied_at = Some(Utc::now());
+                }
+                ProjectionPlane::Streams => {
+                    debug.streams_applied_events =
+                        debug.streams_applied_events.saturating_add(batch.len() as u64);
+                    debug.last_streams_applied_at = Some(Utc::now());
+                }
+            }
         }
     }
 }
 
 fn decode_projection_record(
     message: Result<fabrik_broker::ConsumedJsonRecord>,
+    plane: ProjectionPlane,
 ) -> Option<BufferedProjectionRecord> {
     let record = match message {
         Ok(record) => record,
@@ -178,11 +241,24 @@ fn decode_projection_record(
             return None;
         }
     };
-    let event: ThroughputProjectionEvent = match decode_json_record(&record.record) {
-        Ok(event) => event,
-        Err(error) => {
-            error!(error = %error, "failed to decode streams projection event");
-            return None;
+    let event = match plane {
+        ProjectionPlane::Throughput => {
+            match decode_json_record::<ThroughputProjectionEvent>(&record.record) {
+                Ok(event) => BufferedProjectionEvent::Throughput(event),
+                Err(error) => {
+                    error!(error = %error, "failed to decode throughput projection event");
+                    return None;
+                }
+            }
+        }
+        ProjectionPlane::Streams => {
+            match decode_json_record::<StreamsProjectionEvent>(&record.record) {
+                Ok(event) => BufferedProjectionEvent::Streams(event),
+                Err(error) => {
+                    error!(error = %error, "failed to decode streams projection event");
+                    return None;
+                }
+            }
         }
     };
     Some(BufferedProjectionRecord {
@@ -209,6 +285,7 @@ async fn apply_projection_batch(
 async fn commit_projection_batch_offsets(
     state: &AppState,
     batch: &[BufferedProjectionRecord],
+    plane: ProjectionPlane,
 ) -> Result<()> {
     let mut offsets: HashMap<i32, i64> = HashMap::new();
     for record in batch {
@@ -218,44 +295,84 @@ async fn commit_projection_batch_offsets(
             .or_insert(record.offset);
     }
     let updated_at = Utc::now();
+    let projector_id = projector_id_for_plane(state, plane);
     for (partition_id, offset) in offsets {
-        state
-            .store
-            .commit_throughput_projection_offset(
-                &state.projector_id,
-                partition_id,
-                offset,
-                updated_at,
-            )
-            .await?;
+        match plane {
+            ProjectionPlane::Throughput => {
+                state
+                    .store
+                    .commit_throughput_projection_offset(
+                        projector_id,
+                        partition_id,
+                        offset,
+                        updated_at,
+                    )
+                    .await?;
+            }
+            ProjectionPlane::Streams => {
+                state
+                    .store
+                    .commit_streams_projection_offset(
+                        projector_id,
+                        partition_id,
+                        offset,
+                        updated_at,
+                    )
+                    .await?;
+            }
+        }
     }
     Ok(())
 }
 
-async fn apply_projection_event(state: &AppState, event: &ThroughputProjectionEvent) -> Result<()> {
+async fn apply_projection_event(state: &AppState, event: &BufferedProjectionEvent) -> Result<()> {
     match event {
-        ThroughputProjectionEvent::UpsertBatch { batch } => {
-            state.store.upsert_throughput_projection_batch(batch).await?
-        }
-        ThroughputProjectionEvent::UpsertChunk { chunk } => {
-            state.store.upsert_throughput_projection_chunk(chunk).await?
-        }
-        ThroughputProjectionEvent::UpdateBatchState { update } => {
-            state.store.update_throughput_projection_batch_state(update).await?;
-            if update.terminal_at.is_some() {
-                sync_batch_result_manifest(
-                    state,
-                    &update.tenant_id,
-                    &update.instance_id,
-                    &update.run_id,
-                    &update.batch_id,
-                )
-                .await?;
+        BufferedProjectionEvent::Throughput(event) => match event {
+            ThroughputProjectionEvent::UpsertBatch { batch } => {
+                state.store.upsert_throughput_projection_batch(batch).await?
             }
-        }
-        ThroughputProjectionEvent::UpdateChunkState { update } => {
-            state.store.update_throughput_projection_chunk_state(update).await?;
-        }
+            ThroughputProjectionEvent::UpsertChunk { chunk } => {
+                state.store.upsert_throughput_projection_chunk(chunk).await?
+            }
+            ThroughputProjectionEvent::UpsertStreamJobView { view } => {
+                state.store.upsert_stream_job_view_query(view).await?
+            }
+            ThroughputProjectionEvent::UpdateBatchState { update } => {
+                state.store.update_throughput_projection_batch_state(update).await?;
+                if update.terminal_at.is_some() {
+                    sync_batch_result_manifest(
+                        state,
+                        &update.tenant_id,
+                        &update.instance_id,
+                        &update.run_id,
+                        &update.batch_id,
+                    )
+                    .await?;
+                }
+            }
+            ThroughputProjectionEvent::UpdateChunkState { update } => {
+                state.store.update_throughput_projection_chunk_state(update).await?;
+            }
+        },
+        BufferedProjectionEvent::Streams(event) => match event {
+            StreamsProjectionEvent::UpsertStreamJobView { view } => {
+                state
+                    .store
+                    .upsert_stream_job_view_query(&fabrik_store::StreamJobViewRecord {
+                        tenant_id: view.tenant_id.clone(),
+                        instance_id: view.instance_id.clone(),
+                        run_id: view.run_id.clone(),
+                        job_id: view.job_id.clone(),
+                        handle_id: view.handle_id.clone(),
+                        view_name: view.view_name.clone(),
+                        logical_key: view.logical_key.clone(),
+                        output: view.output.clone(),
+                        checkpoint_sequence: view.checkpoint_sequence,
+                        updated_at: view.updated_at,
+                    })
+                    .await?;
+            }
+        },
     }
     Ok(())
 }

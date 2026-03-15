@@ -8,15 +8,16 @@ use fabrik_store::{
 use fabrik_throughput::{
     ActivityExecutionCapabilities, AwaitStreamCheckpointRequest, AwaitStreamJobTerminalRequest,
     CancelStreamJobRequest, PayloadHandle, QueryStreamJobRequest, StartThroughputRunCommand,
-    StreamJobBridgeHandleStatus, StreamJobCheckpointStatus, StreamJobQueryStatus, StreamJobStatus,
-    SubmitStreamJobRequest, SubmitStreamJobResponse, THROUGHPUT_BRIDGE_PROTOCOL_VERSION,
-    ThroughputBackend, ThroughputBridgeOperationKind, ThroughputBridgeState,
-    ThroughputBridgeTerminalStatus, ThroughputCommand, ThroughputCommandEnvelope,
-    ThroughputExecutionPath, ThroughputRunStatus, stream_job_callback_event_id,
-    stream_job_checkpoint_callback_dedupe_key, stream_job_query_callback_dedupe_key,
-    stream_job_terminal_callback_dedupe_key, throughput_bridge_request_id,
-    throughput_bridge_request_matches, throughput_cancel_command_envelope,
-    throughput_partition_key, throughput_start_command_id, throughput_start_dedupe_key,
+    StreamJobBridgeHandleStatus, StreamJobCheckpointStatus, StreamJobOriginKind,
+    StreamJobQueryStatus, StreamJobStatus, SubmitStreamJobRequest, SubmitStreamJobResponse,
+    THROUGHPUT_BRIDGE_PROTOCOL_VERSION, ThroughputBackend, ThroughputBridgeOperationKind,
+    ThroughputBridgeState, ThroughputBridgeTerminalStatus, ThroughputCommand,
+    ThroughputCommandEnvelope, ThroughputExecutionPath, ThroughputRunStatus,
+    stream_job_callback_event_id, stream_job_checkpoint_callback_dedupe_key,
+    stream_job_query_callback_dedupe_key, stream_job_terminal_callback_dedupe_key,
+    throughput_bridge_request_id, throughput_bridge_request_matches,
+    throughput_cancel_command_envelope, throughput_partition_key, throughput_start_command_id,
+    throughput_start_dedupe_key,
 };
 use fabrik_workflow::{ExecutionTurnContext, WorkflowInstanceState, execution_state_for_event};
 use serde_json::Value;
@@ -117,12 +118,15 @@ async fn sync_stream_job_record(
             tenant_id: handle.tenant_id.clone(),
             instance_id: handle.instance_id.clone(),
             run_id: handle.run_id.clone(),
+            stream_instance_id: handle.stream_instance_id.clone(),
+            stream_run_id: handle.stream_run_id.clone(),
             job_id: handle.job_id.clone(),
             handle_id: handle.handle_id.clone(),
             protocol_version: handle.protocol_version.clone(),
             operation_kind: handle.operation_kind.clone(),
             workflow_event_id: handle.workflow_event_id,
             bridge_request_id: handle.bridge_request_id.clone(),
+            origin_kind: handle.origin_kind.clone(),
             definition_id: handle.definition_id.clone(),
             definition_version: handle.definition_version,
             artifact_hash: handle.artifact_hash.clone(),
@@ -157,6 +161,8 @@ async fn sync_stream_job_record(
     record.operation_kind = handle.operation_kind.clone();
     record.workflow_event_id = handle.workflow_event_id;
     record.bridge_request_id = handle.bridge_request_id.clone();
+    record.stream_instance_id = handle.stream_instance_id.clone();
+    record.stream_run_id = handle.stream_run_id.clone();
     record.definition_id = handle.definition_id.clone();
     record.definition_version = handle.definition_version;
     record.artifact_hash = handle.artifact_hash.clone();
@@ -545,7 +551,7 @@ pub(super) async fn submit_stream_job_via_bridge(
 ) -> Result<SubmitStreamJobResponse> {
     if let Some(existing) = state
         .store
-        .get_stream_job_bridge_handle(
+        .get_stream_job_callback_handle(
             &request.identity.tenant_id,
             &request.identity.instance_id,
             &request.identity.run_id,
@@ -572,9 +578,16 @@ pub(super) async fn submit_stream_job_via_bridge(
         tenant_id: request.identity.tenant_id.clone(),
         instance_id: request.identity.instance_id.clone(),
         run_id: request.identity.run_id.clone(),
+        stream_instance_id: request.identity.instance_id.clone(),
+        stream_run_id: request.identity.run_id.clone(),
         job_id: request.identity.job_id.clone(),
         handle_id: request.handle_id.clone(),
         bridge_request_id: request.bridge_request_id.clone(),
+        origin_kind: request
+            .origin_kind
+            .unwrap_or(StreamJobOriginKind::Workflow)
+            .as_str()
+            .to_owned(),
         definition_id: request.definition_id.clone(),
         definition_version: request.definition_version,
         artifact_hash: request.artifact_hash.clone(),
@@ -596,7 +609,7 @@ pub(super) async fn submit_stream_job_via_bridge(
         created_at: request.admitted_at,
         updated_at: request.admitted_at,
     };
-    state.store.upsert_stream_job_bridge_handle(&handle).await?;
+    state.store.upsert_stream_job_callback_handle(&handle).await?;
     sync_stream_job_record(state, &handle, StreamJobStatus::Created, None, request.admitted_at)
         .await?;
 
@@ -612,21 +625,20 @@ pub(super) async fn await_stream_job_checkpoint_via_bridge(
     request: &AwaitStreamCheckpointRequest,
 ) -> Result<StreamJobCheckpointRecord> {
     if let Some(existing) =
-        state.store.get_stream_job_bridge_checkpoint(&request.await_request_id).await?
+        state.store.get_stream_job_callback_checkpoint(&request.await_request_id).await?
     {
         return Ok(existing);
     }
 
-    let handle =
-        state
-            .store
-            .get_stream_job_bridge_handle_by_handle_id(&request.handle_id)
-            .await?
-            .with_context(|| format!("stream job handle {} was not admitted", request.handle_id))?;
+    let handle = state
+        .store
+        .get_stream_job_callback_handle_by_handle_id(&request.handle_id)
+        .await?
+        .with_context(|| format!("stream job handle {} was not admitted", request.handle_id))?;
     let handle_status = handle.parsed_status().unwrap_or(StreamJobBridgeHandleStatus::Admitted);
     let existing_checkpoint = state
         .store
-        .list_stream_job_bridge_checkpoints_for_handle_page(&handle.handle_id, 10_000, 0)
+        .list_stream_job_callback_checkpoints_for_handle_page(&handle.handle_id, 10_000, 0)
         .await?
         .into_iter()
         .find(|checkpoint| checkpoint.checkpoint_name == request.checkpoint_name);
@@ -676,7 +688,7 @@ pub(super) async fn await_stream_job_checkpoint_via_bridge(
         created_at: request.requested_at,
         updated_at: request.requested_at,
     };
-    state.store.upsert_stream_job_bridge_checkpoint(&record).await?;
+    state.store.upsert_stream_job_callback_checkpoint(&record).await?;
     Ok(record)
 }
 
@@ -685,13 +697,12 @@ pub(super) async fn query_stream_job_via_bridge(
     state: &AppState,
     request: &QueryStreamJobRequest,
 ) -> Result<StreamJobQueryRecord> {
-    let handle =
-        state
-            .store
-            .get_stream_job_bridge_handle_by_handle_id(&request.handle_id)
-            .await?
-            .with_context(|| format!("stream job handle {} was not admitted", request.handle_id))?;
-    let existing = state.store.get_stream_job_bridge_query(&request.query_id).await?;
+    let handle = state
+        .store
+        .get_stream_job_callback_handle_by_handle_id(&request.handle_id)
+        .await?
+        .with_context(|| format!("stream job handle {} was not admitted", request.handle_id))?;
+    let existing = state.store.get_stream_job_callback_query(&request.query_id).await?;
     let status = existing
         .as_ref()
         .and_then(StreamJobQueryRecord::parsed_status)
@@ -725,7 +736,7 @@ pub(super) async fn query_stream_job_via_bridge(
         created_at: existing.as_ref().map(|query| query.created_at).unwrap_or(request.requested_at),
         updated_at: request.requested_at,
     };
-    state.store.upsert_stream_job_bridge_query(&record).await?;
+    state.store.upsert_stream_job_callback_query(&record).await?;
     Ok(record)
 }
 
@@ -736,7 +747,7 @@ pub(super) async fn cancel_stream_job_via_bridge(
 ) -> Result<StreamJobBridgeHandleRecord> {
     let mut handle = state
         .store
-        .get_stream_job_bridge_handle_by_handle_id(&request.handle_id)
+        .get_stream_job_callback_handle_by_handle_id(&request.handle_id)
         .await?
         .with_context(|| format!("stream job handle {} was not admitted", request.handle_id))?;
     let parsed_status = handle.parsed_status().unwrap_or(StreamJobBridgeHandleStatus::Admitted);
@@ -746,7 +757,7 @@ pub(super) async fn cancel_stream_job_via_bridge(
         handle.cancellation_requested_at = Some(request.requested_at);
         handle.cancellation_reason = request.reason.clone();
         handle.updated_at = request.requested_at;
-        state.store.upsert_stream_job_bridge_handle(&handle).await?;
+        state.store.upsert_stream_job_callback_handle(&handle).await?;
         sync_stream_job_record(
             state,
             &handle,
@@ -758,7 +769,7 @@ pub(super) async fn cancel_stream_job_via_bridge(
 
         let checkpoints = state
             .store
-            .list_stream_job_bridge_checkpoints_for_handle_page(&handle.handle_id, 10_000, 0)
+            .list_stream_job_callback_checkpoints_for_handle_page(&handle.handle_id, 10_000, 0)
             .await?;
         for mut checkpoint in checkpoints {
             let checkpoint_status =
@@ -772,7 +783,7 @@ pub(super) async fn cancel_stream_job_via_bridge(
             checkpoint.status = StreamJobCheckpointStatus::Cancelled.as_str().to_owned();
             checkpoint.cancelled_at = Some(request.requested_at);
             checkpoint.updated_at = request.requested_at;
-            state.store.upsert_stream_job_bridge_checkpoint(&checkpoint).await?;
+            state.store.upsert_stream_job_callback_checkpoint(&checkpoint).await?;
         }
     }
     Ok(handle)
@@ -785,13 +796,13 @@ pub(super) async fn await_stream_job_terminal_via_bridge(
 ) -> Result<StreamJobBridgeHandleRecord> {
     let mut handle = state
         .store
-        .get_stream_job_bridge_handle_by_handle_id(&request.handle_id)
+        .get_stream_job_callback_handle_by_handle_id(&request.handle_id)
         .await?
         .with_context(|| format!("stream job handle {} was not admitted", request.handle_id))?;
     if request.workflow_owner_epoch.is_some() && handle.workflow_owner_epoch.is_none() {
         handle.workflow_owner_epoch = request.workflow_owner_epoch;
         handle.updated_at = request.requested_at;
-        state.store.upsert_stream_job_bridge_handle(&handle).await?;
+        state.store.upsert_stream_job_callback_handle(&handle).await?;
     }
     Ok(handle)
 }
@@ -874,7 +885,12 @@ pub(super) async fn accept_stream_job_query_via_bridge(
         };
     let Some(mut handle) = state
         .store
-        .get_stream_job_bridge_handle(&event.tenant_id, &event.instance_id, &event.run_id, &job_id)
+        .get_stream_job_callback_handle(
+            &event.tenant_id,
+            &event.instance_id,
+            &event.run_id,
+            &job_id,
+        )
         .await?
     else {
         return Ok(StreamJobBridgeAcceptance::IgnoredMissingRun);
@@ -884,9 +900,9 @@ pub(super) async fn accept_stream_job_query_via_bridge(
     }
     handle.stream_owner_epoch = stream_owner_epoch;
     handle.updated_at = event.occurred_at;
-    state.store.upsert_stream_job_bridge_handle(&handle).await?;
+    state.store.upsert_stream_job_callback_handle(&handle).await?;
 
-    let Some(mut query_record) = state.store.get_stream_job_bridge_query(&query_id).await? else {
+    let Some(mut query_record) = state.store.get_stream_job_callback_query(&query_id).await? else {
         return Ok(StreamJobBridgeAcceptance::IgnoredMissingRun);
     };
     if stream_job_query_already_accepted(&query_record) {
@@ -903,7 +919,7 @@ pub(super) async fn accept_stream_job_query_via_bridge(
         StreamJobQueryStatus::Completed.as_str().to_owned()
     };
     query_record.updated_at = event.occurred_at;
-    state.store.upsert_stream_job_bridge_query(&query_record).await?;
+    state.store.upsert_stream_job_callback_query(&query_record).await?;
 
     let run_key = RunKey {
         tenant_id: event.tenant_id.clone(),
@@ -994,7 +1010,7 @@ pub(super) async fn accept_stream_job_query_via_bridge(
     };
     let general = vec![PreparedDbAction::UpsertInstance(instance.clone())];
     apply_db_actions(state, general, schedules).await?;
-    apply_post_plan_effects(
+    Box::pin(apply_post_plan_effects(
         state,
         PostPlanEffect {
             run_key,
@@ -1004,12 +1020,12 @@ pub(super) async fn accept_stream_job_query_via_bridge(
             source_event_id: event.event_id,
             occurred_at: event.occurred_at,
         },
-    )
+    ))
     .await?;
     query_record.status = StreamJobQueryStatus::Accepted.as_str().to_owned();
     query_record.accepted_at = Some(event.occurred_at);
     query_record.updated_at = event.occurred_at;
-    state.store.upsert_stream_job_bridge_query(&query_record).await?;
+    state.store.upsert_stream_job_callback_query(&query_record).await?;
     if notifies {
         state.notify.notify_waiters();
     }
@@ -1233,7 +1249,7 @@ pub(super) async fn accept_stream_job_checkpoint_via_bridge(
     };
     let Some(mut handle) = state
         .store
-        .get_stream_job_bridge_handle(&event.tenant_id, &event.instance_id, &event.run_id, job_id)
+        .get_stream_job_callback_handle(&event.tenant_id, &event.instance_id, &event.run_id, job_id)
         .await?
     else {
         return Ok(StreamJobBridgeAcceptance::IgnoredMissingRun);
@@ -1241,14 +1257,16 @@ pub(super) async fn accept_stream_job_checkpoint_via_bridge(
     if stream_job_owner_epoch_is_stale(&handle, *stream_owner_epoch) {
         return Ok(StreamJobBridgeAcceptance::IgnoredStaleOwnerEpoch);
     }
-    handle.status = StreamJobBridgeHandleStatus::Running.as_str().to_owned();
+    if !handle.parsed_status().is_some_and(StreamJobBridgeHandleStatus::is_terminal) {
+        handle.status = StreamJobBridgeHandleStatus::Running.as_str().to_owned();
+    }
     handle.stream_owner_epoch = *stream_owner_epoch;
     handle.updated_at = event.occurred_at;
-    state.store.upsert_stream_job_bridge_handle(&handle).await?;
+    state.store.upsert_stream_job_callback_handle(&handle).await?;
 
     let existing = state
         .store
-        .list_stream_job_bridge_checkpoints_for_handle_page(&handle.handle_id, 10_000, 0)
+        .list_stream_job_callback_checkpoints_for_handle_page(&handle.handle_id, 10_000, 0)
         .await?
         .into_iter()
         .find(|checkpoint| checkpoint.checkpoint_name == *checkpoint_name);
@@ -1286,11 +1304,11 @@ pub(super) async fn accept_stream_job_checkpoint_via_bridge(
     checkpoint.reached_at = Some(event.occurred_at);
     checkpoint.output = output.clone();
     checkpoint.updated_at = event.occurred_at;
-    state.store.upsert_stream_job_bridge_checkpoint(&checkpoint).await?;
+    state.store.upsert_stream_job_callback_checkpoint(&checkpoint).await?;
     sync_stream_job_record(
         state,
         &handle,
-        StreamJobStatus::Running,
+        default_stream_job_status(&handle),
         Some(&checkpoint),
         event.occurred_at,
     )
@@ -1384,7 +1402,7 @@ pub(super) async fn accept_stream_job_checkpoint_via_bridge(
     };
     let general = vec![PreparedDbAction::UpsertInstance(instance.clone())];
     apply_db_actions(state, general, schedules).await?;
-    apply_post_plan_effects(
+    Box::pin(apply_post_plan_effects(
         state,
         PostPlanEffect {
             run_key,
@@ -1394,12 +1412,12 @@ pub(super) async fn accept_stream_job_checkpoint_via_bridge(
             source_event_id: event.event_id,
             occurred_at: event.occurred_at,
         },
-    )
+    ))
     .await?;
     checkpoint.status = StreamJobCheckpointStatus::Accepted.as_str().to_owned();
     checkpoint.accepted_at = Some(event.occurred_at);
     checkpoint.updated_at = event.occurred_at;
-    state.store.upsert_stream_job_bridge_checkpoint(&checkpoint).await?;
+    state.store.upsert_stream_job_callback_checkpoint(&checkpoint).await?;
     if notifies {
         state.notify.notify_waiters();
     }
@@ -1444,7 +1462,12 @@ pub(super) async fn accept_stream_job_terminal_via_bridge(
         };
     let Some(mut handle) = state
         .store
-        .get_stream_job_bridge_handle(&event.tenant_id, &event.instance_id, &event.run_id, &job_id)
+        .get_stream_job_callback_handle(
+            &event.tenant_id,
+            &event.instance_id,
+            &event.run_id,
+            &job_id,
+        )
         .await?
     else {
         return Ok(StreamJobBridgeAcceptance::IgnoredMissingRun);
@@ -1462,10 +1485,10 @@ pub(super) async fn accept_stream_job_terminal_via_bridge(
     handle.terminal_output = terminal_output.clone();
     handle.terminal_error = error.clone();
     handle.updated_at = event.occurred_at;
-    state.store.upsert_stream_job_bridge_handle(&handle).await?;
+    state.store.upsert_stream_job_callback_handle(&handle).await?;
     for mut checkpoint in state
         .store
-        .list_stream_job_bridge_checkpoints_for_handle_page(&handle.handle_id, 10_000, 0)
+        .list_stream_job_callback_checkpoints_for_handle_page(&handle.handle_id, 10_000, 0)
         .await?
     {
         if checkpoint.parsed_status().is_some_and(|status| {
@@ -1480,7 +1503,7 @@ pub(super) async fn accept_stream_job_terminal_via_bridge(
         checkpoint.cancelled_at = Some(event.occurred_at);
         checkpoint.stream_owner_epoch = stream_owner_epoch;
         checkpoint.updated_at = event.occurred_at;
-        state.store.upsert_stream_job_bridge_checkpoint(&checkpoint).await?;
+        state.store.upsert_stream_job_callback_checkpoint(&checkpoint).await?;
     }
     sync_stream_job_record(
         state,
@@ -1585,7 +1608,7 @@ pub(super) async fn accept_stream_job_terminal_via_bridge(
     };
     let general = vec![PreparedDbAction::UpsertInstance(instance.clone())];
     apply_db_actions(state, general, schedules).await?;
-    apply_post_plan_effects(
+    Box::pin(apply_post_plan_effects(
         state,
         PostPlanEffect {
             run_key,
@@ -1595,11 +1618,11 @@ pub(super) async fn accept_stream_job_terminal_via_bridge(
             source_event_id: event.event_id,
             occurred_at: event.occurred_at,
         },
-    )
+    ))
     .await?;
     handle.workflow_accepted_at = Some(event.occurred_at);
     handle.updated_at = event.occurred_at;
-    state.store.upsert_stream_job_bridge_handle(&handle).await?;
+    state.store.upsert_stream_job_callback_handle(&handle).await?;
     sync_stream_job_record(
         state,
         &handle,
@@ -1991,101 +2014,125 @@ pub(super) async fn repair_pending_stream_v2_bridge(
                 debug.last_bridge_repair_batch_id = Some(ledger.batch_id.clone());
                 repaired_acceptance = repaired_acceptance.saturating_add(1);
             }
-            Some(fabrik_throughput::ThroughputBridgeRepairKind::AcceptStreamQuery) => {}
-            Some(fabrik_throughput::ThroughputBridgeRepairKind::AcceptStreamCheckpoint) => {}
-            Some(fabrik_throughput::ThroughputBridgeRepairKind::AcceptStreamTerminal) => {}
             None => {}
+            Some(_) => {}
         }
     }
     if let Some(publisher) = workflow_publisher {
-        let pending_checkpoints =
-            state.store.list_pending_stream_job_checkpoint_repairs(10_000).await?;
-        for checkpoint in pending_checkpoints {
-            if checkpoint.next_repair()
-                != Some(fabrik_throughput::ThroughputBridgeRepairKind::AcceptStreamCheckpoint)
-            {
-                continue;
-            }
-            let Some(handle) = state
-                .store
-                .get_stream_job_bridge_handle_by_handle_id(&checkpoint.handle_id)
-                .await?
-            else {
-                continue;
-            };
-            let Some(event) = stream_job_checkpoint_callback_event(&handle, &checkpoint) else {
-                continue;
-            };
-            publisher.publish(&event, &event.partition_key).await.with_context(|| {
-                format!(
-                    "failed to republish bridge stream-job checkpoint callback for await {}",
-                    checkpoint.await_request_id
-                )
-            })?;
-            let repaired_at = Utc::now();
-            let mut debug = state.debug.lock().expect("unified debug lock poisoned");
-            debug.repaired_bridge_stream_job_checkpoint_callbacks =
-                debug.repaired_bridge_stream_job_checkpoint_callbacks.saturating_add(1);
-            debug.last_bridge_repair_at = Some(repaired_at);
-            debug.last_bridge_repair_kind = Some("accept_stream_checkpoint".to_owned());
-            debug.last_bridge_repair_batch_id = Some(checkpoint.await_request_id.clone());
-            repaired_stream_checkpoints = repaired_stream_checkpoints.saturating_add(1);
-        }
-        let pending_queries = state.store.list_pending_stream_job_query_repairs(10_000).await?;
-        for query in pending_queries {
-            if query.next_repair()
-                != Some(fabrik_throughput::ThroughputBridgeRepairKind::AcceptStreamQuery)
-            {
-                continue;
-            }
+        let pending_stream_job_ledgers =
+            state.store.list_pending_stream_job_callback_repairs(10_000).await?;
+        for ledger in pending_stream_job_ledgers {
             let Some(handle) =
-                state.store.get_stream_job_bridge_handle_by_handle_id(&query.handle_id).await?
+                state.store.get_stream_job_callback_handle_by_handle_id(&ledger.handle_id).await?
             else {
                 continue;
             };
-            let Some(event) = stream_job_query_callback_event(&handle, &query) else {
-                continue;
-            };
-            publisher.publish(&event, &event.partition_key).await.with_context(|| {
-                format!(
-                    "failed to republish bridge stream-job query callback for query {}",
-                    query.query_id
-                )
-            })?;
-            let repaired_at = Utc::now();
-            let mut debug = state.debug.lock().expect("unified debug lock poisoned");
-            debug.repaired_bridge_stream_job_query_callbacks =
-                debug.repaired_bridge_stream_job_query_callbacks.saturating_add(1);
-            debug.last_bridge_repair_at = Some(repaired_at);
-            debug.last_bridge_repair_kind = Some("accept_stream_query".to_owned());
-            debug.last_bridge_repair_batch_id = Some(query.query_id.clone());
-            repaired_stream_queries = repaired_stream_queries.saturating_add(1);
-        }
-        let pending_terminals =
-            state.store.list_pending_stream_job_terminal_repairs(10_000).await?;
-        for handle in pending_terminals {
-            if handle.next_repair()
-                != Some(fabrik_throughput::ThroughputBridgeRepairKind::AcceptStreamTerminal)
-            {
-                continue;
+            for repair in ledger.pending_repairs() {
+                match repair {
+                    fabrik_throughput::StreamJobBridgeRepairKind::AcceptCheckpoint => {
+                        let pending_checkpoints = state
+                            .store
+                            .list_stream_job_callback_checkpoints_for_handle_page(
+                                &handle.handle_id,
+                                10_000,
+                                0,
+                            )
+                            .await?;
+                        for checkpoint in pending_checkpoints {
+                            if checkpoint.next_repair_for_handle_epoch(handle.stream_owner_epoch)
+                                != Some(
+                                    fabrik_throughput::StreamJobBridgeRepairKind::AcceptCheckpoint,
+                                )
+                            {
+                                continue;
+                            }
+                            let Some(event) =
+                                stream_job_checkpoint_callback_event(&handle, &checkpoint)
+                            else {
+                                continue;
+                            };
+                            publisher.publish(&event, &event.partition_key).await.with_context(
+                                || {
+                                    format!(
+                                        "failed to republish bridge stream-job checkpoint callback for await {}",
+                                        checkpoint.await_request_id
+                                    )
+                                },
+                            )?;
+                            let repaired_at = Utc::now();
+                            let mut debug =
+                                state.debug.lock().expect("unified debug lock poisoned");
+                            debug.repaired_bridge_stream_job_checkpoint_callbacks = debug
+                                .repaired_bridge_stream_job_checkpoint_callbacks
+                                .saturating_add(1);
+                            debug.last_bridge_repair_at = Some(repaired_at);
+                            debug.last_bridge_repair_kind =
+                                Some("accept_stream_checkpoint".to_owned());
+                            debug.last_bridge_repair_batch_id =
+                                Some(checkpoint.await_request_id.clone());
+                            repaired_stream_checkpoints =
+                                repaired_stream_checkpoints.saturating_add(1);
+                        }
+                    }
+                    fabrik_throughput::StreamJobBridgeRepairKind::AcceptQuery => {
+                        let pending_queries = state
+                            .store
+                            .list_stream_job_callback_queries_for_handle_page(
+                                &handle.handle_id,
+                                10_000,
+                                0,
+                            )
+                            .await?;
+                        for query in pending_queries {
+                            if query.next_repair_for_handle_epoch(handle.stream_owner_epoch)
+                                != Some(fabrik_throughput::StreamJobBridgeRepairKind::AcceptQuery)
+                            {
+                                continue;
+                            }
+                            let Some(event) = stream_job_query_callback_event(&handle, &query)
+                            else {
+                                continue;
+                            };
+                            publisher.publish(&event, &event.partition_key).await.with_context(
+                                || {
+                                    format!(
+                                        "failed to republish bridge stream-job query callback for query {}",
+                                        query.query_id
+                                    )
+                                },
+                            )?;
+                            let repaired_at = Utc::now();
+                            let mut debug =
+                                state.debug.lock().expect("unified debug lock poisoned");
+                            debug.repaired_bridge_stream_job_query_callbacks =
+                                debug.repaired_bridge_stream_job_query_callbacks.saturating_add(1);
+                            debug.last_bridge_repair_at = Some(repaired_at);
+                            debug.last_bridge_repair_kind = Some("accept_stream_query".to_owned());
+                            debug.last_bridge_repair_batch_id = Some(query.query_id.clone());
+                            repaired_stream_queries = repaired_stream_queries.saturating_add(1);
+                        }
+                    }
+                    fabrik_throughput::StreamJobBridgeRepairKind::AcceptTerminal => {
+                        let Some(event) = stream_job_terminal_callback_event(&handle) else {
+                            continue;
+                        };
+                        publisher.publish(&event, &event.partition_key).await.with_context(|| {
+                            format!(
+                                "failed to republish bridge stream-job terminal callback for handle {}",
+                                handle.handle_id
+                            )
+                        })?;
+                        let repaired_at = Utc::now();
+                        let mut debug = state.debug.lock().expect("unified debug lock poisoned");
+                        debug.repaired_bridge_stream_job_terminal_callbacks =
+                            debug.repaired_bridge_stream_job_terminal_callbacks.saturating_add(1);
+                        debug.last_bridge_repair_at = Some(repaired_at);
+                        debug.last_bridge_repair_kind = Some("accept_stream_terminal".to_owned());
+                        debug.last_bridge_repair_batch_id = Some(handle.handle_id.clone());
+                        repaired_stream_terminals = repaired_stream_terminals.saturating_add(1);
+                    }
+                }
             }
-            let Some(event) = stream_job_terminal_callback_event(&handle) else {
-                continue;
-            };
-            publisher.publish(&event, &event.partition_key).await.with_context(|| {
-                format!(
-                    "failed to republish bridge stream-job terminal callback for handle {}",
-                    handle.handle_id
-                )
-            })?;
-            let repaired_at = Utc::now();
-            let mut debug = state.debug.lock().expect("unified debug lock poisoned");
-            debug.repaired_bridge_stream_job_terminal_callbacks =
-                debug.repaired_bridge_stream_job_terminal_callbacks.saturating_add(1);
-            debug.last_bridge_repair_at = Some(repaired_at);
-            debug.last_bridge_repair_kind = Some("accept_stream_terminal".to_owned());
-            debug.last_bridge_repair_batch_id = Some(handle.handle_id.clone());
-            repaired_stream_terminals = repaired_stream_terminals.saturating_add(1);
         }
     }
     Ok((

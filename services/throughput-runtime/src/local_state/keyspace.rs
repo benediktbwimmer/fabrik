@@ -1,7 +1,22 @@
 use super::*;
 
+pub(super) const STREAM_JOB_VIEW_BINARY_PREFIX: &[u8] = b"sjv1\0";
+pub(super) const STREAM_JOB_RUNTIME_BINARY_PREFIX: &[u8] = b"sjr1\0";
+pub(super) const STREAM_JOB_CHECKPOINT_BINARY_PREFIX: &[u8] = b"sjc1\0";
+
+fn append_binary_key_component(buffer: &mut Vec<u8>, component: &str) {
+    let bytes = component.as_bytes();
+    let len = u16::try_from(bytes.len()).expect("stream job view key component exceeds u16");
+    buffer.extend_from_slice(&len.to_be_bytes());
+    buffer.extend_from_slice(bytes);
+}
+
 pub(super) fn legacy_cf_for_key(key: &str) -> Option<&'static str> {
-    if key.starts_with(OFFSET_KEY_PREFIX) || key.starts_with(MIRRORED_ENTRY_KEY_PREFIX) {
+    if key.starts_with(OFFSET_KEY_PREFIX)
+        || key.starts_with(MIRRORED_ENTRY_KEY_PREFIX)
+        || key.starts_with(STREAMS_OFFSET_KEY_PREFIX)
+        || key.starts_with(STREAMS_MIRRORED_ENTRY_KEY_PREFIX)
+    {
         return Some(META_CF);
     }
     if key.starts_with(BATCH_KEY_PREFIX) {
@@ -25,15 +40,29 @@ pub(super) fn legacy_cf_for_key(key: &str) -> Option<&'static str> {
     if key.starts_with(STREAM_JOB_VIEW_KEY_PREFIX) {
         return Some(STREAM_JOBS_CF);
     }
+    if key.starts_with(STREAM_JOB_RUNTIME_KEY_PREFIX)
+        || key.starts_with(STREAM_JOB_CHECKPOINT_KEY_PREFIX)
+    {
+        return Some(STREAM_JOBS_CF);
+    }
     None
 }
 
-pub(super) fn offset_key(partition_id: i32) -> String {
-    format!("{OFFSET_KEY_PREFIX}{partition_id}")
+pub(super) fn offset_key(plane: LocalChangelogPlane, partition_id: i32) -> String {
+    match plane {
+        LocalChangelogPlane::Throughput => format!("{OFFSET_KEY_PREFIX}{partition_id}"),
+        LocalChangelogPlane::Streams => format!("{STREAMS_OFFSET_KEY_PREFIX}{partition_id}"),
+    }
 }
 
-pub(super) fn mirrored_entry_key(entry_id: impl std::fmt::Display) -> String {
-    format!("{MIRRORED_ENTRY_KEY_PREFIX}{entry_id}")
+pub(super) fn mirrored_entry_key(
+    plane: LocalChangelogPlane,
+    entry_id: impl std::fmt::Display,
+) -> String {
+    match plane {
+        LocalChangelogPlane::Throughput => format!("{MIRRORED_ENTRY_KEY_PREFIX}{entry_id}"),
+        LocalChangelogPlane::Streams => format!("{STREAMS_MIRRORED_ENTRY_KEY_PREFIX}{entry_id}"),
+    }
 }
 
 pub(super) fn batch_key(identity: &ThroughputBatchIdentity) -> String {
@@ -72,8 +101,67 @@ pub(super) fn timestamp_sort_key(timestamp: DateTime<Utc>) -> String {
     format!("{:020}", timestamp.timestamp_millis())
 }
 
-pub(super) fn stream_job_view_key(handle_id: &str, view_name: &str, logical_key: &str) -> String {
+pub(super) fn legacy_stream_job_view_key(
+    handle_id: &str,
+    view_name: &str,
+    logical_key: &str,
+) -> String {
     format!("{STREAM_JOB_VIEW_KEY_PREFIX}{handle_id}:{view_name}:{logical_key}")
+}
+
+pub(super) fn legacy_stream_job_view_prefix(handle_id: &str, view_name: &str) -> String {
+    format!("{STREAM_JOB_VIEW_KEY_PREFIX}{handle_id}:{view_name}:")
+}
+
+pub(super) fn legacy_stream_job_runtime_key(handle_id: &str) -> String {
+    format!("{STREAM_JOB_RUNTIME_KEY_PREFIX}{handle_id}")
+}
+
+pub(super) fn legacy_stream_job_checkpoint_key(
+    handle_id: &str,
+    checkpoint_name: &str,
+    stream_partition_id: i32,
+) -> String {
+    format!("{STREAM_JOB_CHECKPOINT_KEY_PREFIX}{handle_id}:{checkpoint_name}:{stream_partition_id}")
+}
+
+pub(super) fn stream_job_view_prefix(handle_id: &str, view_name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(
+        STREAM_JOB_VIEW_BINARY_PREFIX.len() + handle_id.len() + view_name.len() + 5,
+    );
+    key.extend_from_slice(STREAM_JOB_VIEW_BINARY_PREFIX);
+    append_binary_key_component(&mut key, handle_id);
+    append_binary_key_component(&mut key, view_name);
+    key.push(0);
+    key
+}
+
+pub(super) fn stream_job_view_key(handle_id: &str, view_name: &str, logical_key: &str) -> Vec<u8> {
+    let mut key = stream_job_view_prefix(handle_id, view_name);
+    key.extend_from_slice(logical_key.as_bytes());
+    key
+}
+
+pub(super) fn stream_job_runtime_key(handle_id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(STREAM_JOB_RUNTIME_BINARY_PREFIX.len() + handle_id.len() + 2);
+    key.extend_from_slice(STREAM_JOB_RUNTIME_BINARY_PREFIX);
+    append_binary_key_component(&mut key, handle_id);
+    key
+}
+
+pub(super) fn stream_job_checkpoint_key(
+    handle_id: &str,
+    checkpoint_name: &str,
+    stream_partition_id: i32,
+) -> Vec<u8> {
+    let mut key = Vec::with_capacity(
+        STREAM_JOB_CHECKPOINT_BINARY_PREFIX.len() + handle_id.len() + checkpoint_name.len() + 8,
+    );
+    key.extend_from_slice(STREAM_JOB_CHECKPOINT_BINARY_PREFIX);
+    append_binary_key_component(&mut key, handle_id);
+    append_binary_key_component(&mut key, checkpoint_name);
+    key.extend_from_slice(&stream_partition_id.to_be_bytes());
+    key
 }
 
 pub(super) fn throughput_partition_id(batch_id: &str, group_id: u32, partition_count: i32) -> i32 {

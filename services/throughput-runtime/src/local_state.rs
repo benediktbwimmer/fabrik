@@ -15,9 +15,12 @@ use self::derivation::{
     derive_batch_state_from_chunk_states, infer_ungrouped_batch_terminal_from_chunk_apply,
 };
 use self::keyspace::{
-    batch_chunk_index_key, batch_chunk_index_prefix, batch_key, chunk_key, group_key,
-    legacy_cf_for_key, mirrored_entry_key, offset_key, stream_job_view_key,
-    throughput_partition_id, timestamp_sort_key,
+    STREAM_JOB_CHECKPOINT_BINARY_PREFIX, STREAM_JOB_RUNTIME_BINARY_PREFIX,
+    STREAM_JOB_VIEW_BINARY_PREFIX, batch_chunk_index_key, batch_chunk_index_prefix, batch_key,
+    chunk_key, group_key, legacy_cf_for_key, legacy_stream_job_checkpoint_key,
+    legacy_stream_job_runtime_key, legacy_stream_job_view_key, legacy_stream_job_view_prefix,
+    mirrored_entry_key, offset_key, stream_job_checkpoint_key, stream_job_runtime_key,
+    stream_job_view_key, stream_job_view_prefix, throughput_partition_id, timestamp_sort_key,
 };
 #[cfg(test)]
 use self::scheduling_state::{lease_expiry_index_key, ready_index_key, started_index_key};
@@ -40,13 +43,13 @@ use fabrik_throughput::{
     throughput_reducer_execution_path, throughput_reducer_version, throughput_routing_reason,
 };
 use fabrik_throughput::{
-    ActivityExecutionCapabilities, ThroughputBatchIdentity, ThroughputChangelogEntry,
-    ThroughputChangelogPayload, ThroughputChunkReport, ThroughputChunkReportPayload,
-    bulk_reducer_default_summary_value, bulk_reducer_reduce_errors, bulk_reducer_reduce_values,
-    bulk_reducer_requires_error_outputs, bulk_reducer_requires_success_outputs,
-    bulk_reducer_settles, bulk_reducer_summary_field_name, decode_cbor, encode_cbor,
-    reduction_tree_child_group_ids, reduction_tree_level_counts, reduction_tree_node_id,
-    reduction_tree_node_level, reduction_tree_parent_group_id,
+    ActivityExecutionCapabilities, StreamsChangelogEntry, StreamsChangelogPayload,
+    ThroughputBatchIdentity, ThroughputChangelogEntry, ThroughputChangelogPayload,
+    ThroughputChunkReport, ThroughputChunkReportPayload, bulk_reducer_default_summary_value,
+    bulk_reducer_reduce_errors, bulk_reducer_reduce_values, bulk_reducer_requires_error_outputs,
+    bulk_reducer_requires_success_outputs, bulk_reducer_settles, bulk_reducer_summary_field_name,
+    decode_cbor, encode_cbor, reduction_tree_child_group_ids, reduction_tree_level_counts,
+    reduction_tree_node_id, reduction_tree_node_level, reduction_tree_parent_group_id,
 };
 use rocksdb::{
     BlockBasedOptions, ColumnFamily, ColumnFamilyDescriptor, DB, DBCompactionStyle, Direction,
@@ -66,6 +69,10 @@ const READY_INDEX_PREFIX: &str = "idx:ready:";
 const STARTED_INDEX_PREFIX: &str = "idx:started:";
 const LEASE_EXPIRY_INDEX_PREFIX: &str = "idx:lease-expiry:";
 const STREAM_JOB_VIEW_KEY_PREFIX: &str = "stream-job-view:";
+const STREAM_JOB_RUNTIME_KEY_PREFIX: &str = "stream-job-runtime:";
+const STREAM_JOB_CHECKPOINT_KEY_PREFIX: &str = "stream-job-checkpoint:";
+const STREAMS_OFFSET_KEY_PREFIX: &str = "meta:streams-offset:";
+const STREAMS_MIRRORED_ENTRY_KEY_PREFIX: &str = "meta:streams-mirrored-entry:";
 const LATEST_CHECKPOINT_FILE: &str = "latest.json";
 const ROCKSDB_ENCODING_PREFIX: &[u8] = b"fs2\0";
 const META_CF: &str = "meta";
@@ -243,6 +250,12 @@ pub struct LocalThroughputState {
     lease_lock: Arc<Mutex<()>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalChangelogPlane {
+    Throughput,
+    Streams,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LocalThroughputDebugSnapshot {
     pub db_path: String,
@@ -267,6 +280,9 @@ pub struct LocalThroughputDebugSnapshot {
     pub last_applied_offsets: BTreeMap<i32, i64>,
     pub observed_high_watermarks: BTreeMap<i32, i64>,
     pub partition_lag: BTreeMap<i32, i64>,
+    pub streams_last_applied_offsets: BTreeMap<i32, i64>,
+    pub streams_observed_high_watermarks: BTreeMap<i32, i64>,
+    pub streams_partition_lag: BTreeMap<i32, i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,6 +325,7 @@ struct LocalStateMeta {
     legacy_default_cf_entries_migrated: u64,
     last_legacy_default_cf_migration_at: Option<DateTime<Utc>>,
     observed_high_watermarks: BTreeMap<i32, i64>,
+    streams_observed_high_watermarks: BTreeMap<i32, i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,11 +334,19 @@ struct CheckpointFile {
     offsets: BTreeMap<i32, i64>,
     #[serde(default)]
     mirrored_entry_ids: Vec<String>,
+    #[serde(default)]
+    streams_offsets: BTreeMap<i32, i64>,
+    #[serde(default)]
+    streams_mirrored_entry_ids: Vec<String>,
     batches: Vec<LocalBatchState>,
     chunks: Vec<LocalChunkState>,
     groups: Vec<LocalGroupState>,
     #[serde(default)]
     stream_job_views: Vec<LocalStreamJobViewState>,
+    #[serde(default)]
+    stream_job_runtime_states: Vec<LocalStreamJobRuntimeState>,
+    #[serde(default)]
+    stream_job_checkpoints: Vec<LocalStreamJobCheckpointState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -441,6 +466,69 @@ pub(crate) struct LocalStreamJobViewState {
     pub(crate) logical_key: String,
     pub(crate) output: Value,
     pub(crate) checkpoint_sequence: i64,
+    pub(crate) updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalStreamJobRuntimeState {
+    pub(crate) handle_id: String,
+    pub(crate) job_id: String,
+    pub(crate) job_name: String,
+    pub(crate) view_name: String,
+    pub(crate) checkpoint_name: String,
+    pub(crate) checkpoint_sequence: i64,
+    pub(crate) input_item_count: u64,
+    pub(crate) materialized_key_count: u64,
+    pub(crate) active_partitions: Vec<i32>,
+    #[serde(default)]
+    pub(crate) dispatch_batches: Vec<LocalStreamJobDispatchBatch>,
+    #[serde(default)]
+    pub(crate) applied_dispatch_batch_ids: Vec<String>,
+    #[serde(default)]
+    pub(crate) dispatch_completed_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub(crate) dispatch_cancelled_at: Option<DateTime<Utc>>,
+    pub(crate) stream_owner_epoch: u64,
+    pub(crate) planned_at: DateTime<Utc>,
+    pub(crate) latest_checkpoint_at: Option<DateTime<Utc>>,
+    pub(crate) terminal_status: Option<String>,
+    pub(crate) terminal_output: Option<Value>,
+    pub(crate) terminal_error: Option<String>,
+    pub(crate) terminal_at: Option<DateTime<Utc>>,
+    pub(crate) updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalStreamJobDispatchBatch {
+    pub(crate) batch_id: String,
+    pub(crate) stream_partition_id: i32,
+    pub(crate) routing_key: String,
+    pub(crate) key_field: String,
+    pub(crate) output_field: String,
+    pub(crate) view_name: String,
+    pub(crate) checkpoint_name: String,
+    pub(crate) checkpoint_sequence: i64,
+    pub(crate) owner_epoch: u64,
+    pub(crate) occurred_at: DateTime<Utc>,
+    pub(crate) items: Vec<LocalStreamJobDispatchItem>,
+    pub(crate) is_final_partition_batch: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalStreamJobDispatchItem {
+    pub(crate) logical_key: String,
+    pub(crate) value: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct LocalStreamJobCheckpointState {
+    pub(crate) handle_id: String,
+    pub(crate) job_id: String,
+    pub(crate) checkpoint_name: String,
+    pub(crate) checkpoint_sequence: i64,
+    pub(crate) stream_partition_id: i32,
+    pub(crate) stream_owner_epoch: u64,
+    pub(crate) reached_at: DateTime<Utc>,
     pub(crate) updated_at: DateTime<Utc>,
 }
 
@@ -796,8 +884,9 @@ mod tests {
     use super::*;
     use crate::aggregation::AggregationCoordinator;
     use fabrik_throughput::{
-        ThroughputChangelogEntry, ThroughputChangelogPayload, group_id_for_chunk_index,
-        reduction_tree_node_id, reduction_tree_parent_group_id,
+        StreamsChangelogEntry, StreamsChangelogPayload, ThroughputChangelogEntry,
+        ThroughputChangelogPayload, group_id_for_chunk_index, reduction_tree_node_id,
+        reduction_tree_parent_group_id,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -826,6 +915,15 @@ mod tests {
             entry_id: Uuid::now_v7(),
             occurred_at: Utc::now(),
             partition_key: "batch-a:0".to_owned(),
+            payload,
+        }
+    }
+
+    fn streams_entry(payload: StreamsChangelogPayload) -> StreamsChangelogEntry {
+        StreamsChangelogEntry {
+            entry_id: Uuid::now_v7(),
+            occurred_at: Utc::now(),
+            partition_key: "stream-job-a:0".to_owned(),
             payload,
         }
     }
@@ -2856,6 +2954,80 @@ mod tests {
         assert_eq!(snapshot.partition_lag.get(&2), Some(&0));
 
         let _ = fs::remove_dir_all(&db_path);
+        let _ = fs::remove_dir_all(&checkpoint_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn local_state_tracks_streams_changelog_offsets_separately() -> Result<()> {
+        let db_path = temp_path("throughput-state-streams-changelog-db");
+        let checkpoint_dir = temp_path("throughput-state-streams-changelog-checkpoints");
+        let state = LocalThroughputState::open(&db_path, &checkpoint_dir, 3)?;
+
+        let throughput_identity = identity();
+        state.apply_changelog_entry(
+            2,
+            4,
+            &entry(ThroughputChangelogPayload::BatchCreated {
+                identity: throughput_identity,
+                task_queue: "bulk".to_owned(),
+                execution_policy: Some("eager".to_owned()),
+                reducer: Some("count".to_owned()),
+                reducer_class: "mergeable".to_owned(),
+                aggregation_tree_depth: 2,
+                fast_lane_enabled: true,
+                aggregation_group_count: 1,
+                total_items: 1,
+                chunk_count: 0,
+            }),
+        )?;
+
+        let streams_entry = streams_entry(StreamsChangelogPayload::StreamJobViewUpdated {
+            handle_id: "handle-a".to_owned(),
+            job_id: "stream-job-a".to_owned(),
+            view_name: "accountTotals".to_owned(),
+            logical_key: "acct-1".to_owned(),
+            output: json!({ "total": 42 }),
+            checkpoint_sequence: 9,
+            updated_at: Utc::now(),
+        });
+        state.mirror_streams_changelog_entry(&streams_entry)?;
+        assert_eq!(
+            state.load_mirrored_entry_ids_for_plane(LocalChangelogPlane::Streams)?,
+            vec![streams_entry.entry_id.to_string()]
+        );
+        assert!(state.apply_streams_changelog_entry(7, 12, &streams_entry)?);
+        assert_eq!(
+            state.load_mirrored_entry_ids_for_plane(LocalChangelogPlane::Streams)?,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            state.last_applied_offset_for_plane(LocalChangelogPlane::Throughput, 2)?,
+            Some(4)
+        );
+        assert_eq!(state.last_applied_offset_for_plane(LocalChangelogPlane::Streams, 7)?, Some(12));
+
+        let checkpoint_path = state.write_checkpoint()?;
+        assert!(checkpoint_path.exists());
+
+        let restored_db_path = temp_path("throughput-state-streams-changelog-restored-db");
+        let restored = LocalThroughputState::open(&restored_db_path, &checkpoint_dir, 3)?;
+        assert!(restored.restore_from_latest_checkpoint_if_empty()?);
+        assert_eq!(
+            restored.last_applied_offset_for_plane(LocalChangelogPlane::Throughput, 2)?,
+            Some(4)
+        );
+        assert_eq!(
+            restored.last_applied_offset_for_plane(LocalChangelogPlane::Streams, 7)?,
+            Some(12)
+        );
+
+        let snapshot = restored.debug_snapshot()?;
+        assert_eq!(snapshot.last_applied_offsets.get(&2), Some(&4));
+        assert_eq!(snapshot.streams_last_applied_offsets.get(&7), Some(&12));
+
+        let _ = fs::remove_dir_all(&db_path);
+        let _ = fs::remove_dir_all(&restored_db_path);
         let _ = fs::remove_dir_all(&checkpoint_dir);
         Ok(())
     }
